@@ -3,8 +3,9 @@
 //! The main type is [`Peer<S>`](peer::Peer): a store wrapper that owns an
 //! iroh network thread internally and exposes the standard storage traits.
 //! Reads auto-drain immutable collection evidence; writes announce blobs to
-//! the DHT and publish grant-backed commits to the team gossip topic. Local
-//! pins remain only as one input to capability-scoped blob serving.
+//! the DHT and publish commits whose collection descriptor declares that the
+//! collection travels. Local pins remain only as one input to
+//! capability-scoped blob serving.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 

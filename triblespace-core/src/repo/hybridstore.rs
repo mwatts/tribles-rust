@@ -1,7 +1,7 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionRecord, CollectionRecordSelector,
     CollectionStore,
 };
 use crate::id::Id;
@@ -196,27 +196,6 @@ where
     }
 }
 
-impl<B, R> CollectionGossipStore for HybridStore<B, R>
-where
-    R: CollectionGossipStore,
-{
-    type GossipsError = R::GossipsError;
-    type GossipError = R::GossipError;
-
-    type GossipIter<'a>
-        = R::GossipIter<'a>
-    where
-        B: 'a,
-        R: 'a;
-
-    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-        self.branches.gossips()
-    }
-
-    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-        self.branches.gossip(grant)
-    }
-}
 impl<B, R> WantStore for HybridStore<B, R>
 where
     B: WantStore,

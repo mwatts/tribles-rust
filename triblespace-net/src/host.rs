@@ -16,15 +16,17 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use iroh_base::{EndpointAddr, EndpointId};
 use tracing::{Instrument, debug, debug_span, error, info, info_span, instrument, trace, warn};
 use triblespace_core::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionHandle, CollectionRecord, CollectionStore,
+    COLLECTION_COMMIT_BYTES_LEN, CollectionCommit, CollectionHandle, CollectionRecord,
+    CollectionStore,
 };
 use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::collection_wire::{
-    COLLECTION_COMMIT_EVIDENCE_LEN, CollectionCommitEvidence, CollectionOperationReceiptResponse,
-    all_grant_backed_commits, collection_operation_receipts, decode_collection_operation_request,
-    encode_collection_operation_receipts, grant_backed_commits, op_collection_operation_receipts,
+    CollectionOperationReceiptResponse,
+    collection_operation_receipts, decode_collection_operation_request,
+    encode_collection_operation_receipts, op_collection_operation_receipts, relayable_commits,
+    relayable_commits_for,
 };
 use crate::identity::iroh_secret;
 use crate::protocol::*;
@@ -33,18 +35,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Team-topic domain tag for immutable collection commit evidence.
 const GOSSIP_COLLECTION_EVIDENCE: u8 = 0x03;
-/// tag(1) + grant-backed evidence(320) + anti-dedupe nonce(8).
-const COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN: usize = 1 + COLLECTION_COMMIT_EVIDENCE_LEN + 8;
+/// tag(1) + signed commit(192) + anti-dedupe nonce(8).
+const COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN: usize = 1 + COLLECTION_COMMIT_BYTES_LEN + 8;
 
 /// Encode one immutable collection-evidence gossip frame.
 ///
 /// The nonce is intentionally outside the signed evidence. It only gives
 /// periodic republishes distinct mesh message ids, so a late joiner can learn
-/// unchanged evidence without changing its canonical 320-byte identity.
-fn collection_evidence_gossip_frame(evidence: CollectionCommitEvidence, nonce: u64) -> Vec<u8> {
+/// unchanged evidence without changing its canonical 192-byte identity.
+fn collection_evidence_gossip_frame(evidence: CollectionCommit, nonce: u64) -> Vec<u8> {
     let mut frame = Vec::with_capacity(COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN);
     frame.push(GOSSIP_COLLECTION_EVIDENCE);
-    frame.extend_from_slice(&evidence.encode());
+    frame.extend_from_slice(&evidence.to_bytes());
     frame.extend_from_slice(&nonce.to_be_bytes());
     debug_assert_eq!(frame.len(), COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN);
     frame
@@ -54,13 +56,17 @@ fn collection_evidence_gossip_frame(evidence: CollectionCommitEvidence, nonce: u
 ///
 /// The transport carrier and anti-dedupe nonce are deliberately discarded:
 /// neither participates in author identity or local admission policy.
-fn decode_collection_evidence_gossip_frame(bytes: &[u8]) -> Option<CollectionCommitEvidence> {
+fn decode_collection_evidence_gossip_frame(bytes: &[u8]) -> Option<CollectionCommit> {
     if bytes.len() != COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN
         || bytes.first().copied() != Some(GOSSIP_COLLECTION_EVIDENCE)
     {
         return None;
     }
-    CollectionCommitEvidence::decode(&bytes[1..1 + COLLECTION_COMMIT_EVIDENCE_LEN]).ok()
+    bytes[1..1 + COLLECTION_COMMIT_BYTES_LEN]
+        .try_into()
+        .ok()
+        .map(CollectionCommit::from_bytes)
+        .filter(|commit: &CollectionCommit| commit.verify_strict().is_ok())
 }
 
 fn op_name(op: u8) -> &'static str {
@@ -192,7 +198,6 @@ pub struct StoreSnapshot<R> {
     pub reader: R,
     pub pin_heads: triblespace_core::repo::PinSnapshot,
     collection_records: Vec<CollectionRecord>,
-    collection_gossips: Vec<CollectionGossip>,
 }
 
 impl StoreSnapshot<()> {
@@ -200,8 +205,7 @@ impl StoreSnapshot<()> {
     where
         S: triblespace_core::repo::BlobStore
             + triblespace_core::repo::PinSnapshotSource
-            + CollectionStore
-            + CollectionGossipStore,
+            + CollectionStore,
     {
         // Collection evidence is an additive serving capability. Failure to
         // enumerate it must never suppress the pre-existing blob/branch
@@ -212,17 +216,12 @@ impl StoreSnapshot<()> {
             .records()
             .map(|records| records.filter_map(Result::ok).collect())
             .unwrap_or_default();
-        let collection_gossips = store
-            .gossips()
-            .map(|gossips| gossips.filter_map(Result::ok).collect())
-            .unwrap_or_default();
         let pin_heads = store.snapshot_pin_heads().ok()?;
         let reader = store.reader().ok()?;
         Some(StoreSnapshot {
             reader,
             pin_heads,
             collection_records,
-            collection_gossips,
         })
     }
 }
@@ -236,17 +235,37 @@ pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
     fn pin_heads(&self) -> &triblespace_core::repo::PinSnapshot;
-    /// Strict grant-backed commits for one exact descriptor handle, in
-    /// deterministic intrinsic-record order.
-    fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommitEvidence>;
-    /// Every strict grant-backed commit in deterministic commit-id order.
+    /// Strictly verified commits for one exact descriptor handle whose own
+    /// descriptor permits relay, in deterministic intrinsic-record order.
+    fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommit>;
+    /// Every relayable commit in deterministic commit-id order.
     /// Used only to periodically republish the current store truth for late
     /// gossip joiners; the host does not maintain a second ledger mirror.
-    fn all_collection_evidence(&self) -> Vec<CollectionCommitEvidence>;
+    fn all_collection_evidence(&self) -> Vec<CollectionCommit>;
     /// Exact unsigned merge/derive receipts answering one durable question,
     /// in deterministic intrinsic-record order. Conflicting answers remain
     /// distinct records.
     fn collection_operation_receipts(&self, request: WantRequest) -> Vec<CollectionRecord>;
+}
+
+impl<R> StoreSnapshot<R>
+where
+    R: triblespace_core::repo::BlobStoreGet,
+{
+    /// Resolve one collection descriptor out of this snapshot's reader.
+    ///
+    /// `None` means the descriptor is not resident here, which relay
+    /// selection reads as a refusal: a node that cannot see a collection's
+    /// permission does not have it.
+    fn descriptor(
+        &self,
+        collection: CollectionHandle,
+    ) -> Option<triblespace_core::trible::TribleSet> {
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        self.reader
+            .get::<triblespace_core::trible::TribleSet, SimpleArchive>(collection)
+            .ok()
+    }
 }
 
 impl<R> AnySnapshot for StoreSnapshot<R>
@@ -272,16 +291,16 @@ where
         &self.pin_heads
     }
 
-    fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommitEvidence> {
-        grant_backed_commits(
+    fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommit> {
+        relayable_commits_for(
             &self.collection_records,
-            &self.collection_gossips,
+            |handle| self.descriptor(handle),
             collection,
         )
     }
 
-    fn all_collection_evidence(&self) -> Vec<CollectionCommitEvidence> {
-        all_grant_backed_commits(&self.collection_records, &self.collection_gossips)
+    fn all_collection_evidence(&self) -> Vec<CollectionCommit> {
+        relayable_commits(&self.collection_records, |handle| self.descriptor(handle))
     }
 
     fn collection_operation_receipts(&self, request: WantRequest) -> Vec<CollectionRecord> {
@@ -374,7 +393,7 @@ fn remove_transient_routing_candidate(
 fn collection_evidence_for_rebroadcast(
     snapshot: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     publishes: bool,
-) -> Vec<CollectionCommitEvidence> {
+) -> Vec<CollectionCommit> {
     if !publishes {
         return Vec::new();
     }
@@ -531,7 +550,7 @@ impl NetSender {
     ///
     /// This announces immutable evidence only. Receiving it says nothing
     /// about whether the local view authorizes the signed author.
-    pub fn gossip_collection_evidence(&self, evidence: CollectionCommitEvidence) {
+    pub fn gossip_collection_evidence(&self, evidence: CollectionCommit) {
         let _ = self
             .cmd_tx
             .send(NetCommand::GossipCollectionEvidence { evidence });
@@ -576,8 +595,7 @@ impl NetSender {
     where
         S: triblespace_core::repo::BlobStore
             + triblespace_core::repo::PinSnapshotSource
-            + CollectionStore
-            + CollectionGossipStore,
+            + CollectionStore,
     {
         match StoreSnapshot::from_store(store) {
             Some(snapshot) => {
@@ -685,7 +703,7 @@ impl NetSender {
         &self,
         peer: PeerId,
         collection: CollectionHandle,
-    ) -> anyhow::Result<Vec<CollectionCommitEvidence>> {
+    ) -> anyhow::Result<Vec<CollectionCommit>> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.cmd_tx
             .send(NetCommand::FetchCollectionEvidence {
@@ -2065,7 +2083,7 @@ async fn serve_stream<T: Transport>(
                 }
                 send_u32_be(send, count).await?;
                 for item in evidence {
-                    send.write_all(&item.encode())
+                    send.write_all(&item.to_bytes())
                         .await
                         .map_err(|error| anyhow::anyhow!("send collection evidence: {error}"))?;
                 }
@@ -2223,8 +2241,7 @@ mod collection_evidence_gossip_tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        CollectionCommit, CollectionGossip, CollectionHandle, CollectionRecord,
-        empty_metadata_handle, simplearchive_union,
+        CollectionHandle, CollectionRecord, empty_metadata_handle, simplearchive_union,
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::{PinSnapshot, WantRequest};
@@ -2235,9 +2252,9 @@ mod collection_evidence_gossip_tests {
         decode_collection_evidence_gossip_frame, note_routing_candidate,
         remove_transient_routing_candidate,
     };
-    use crate::collection_wire::{COLLECTION_COMMIT_EVIDENCE_LEN, CollectionCommitEvidence};
+    use triblespace_core::collection::{COLLECTION_COMMIT_BYTES_LEN, CollectionCommit};
 
-    fn evidence() -> CollectionCommitEvidence {
+    fn evidence() -> CollectionCommit {
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::blob::IntoBlob;
         use triblespace_core::collection::records::CollectionName;
@@ -2249,21 +2266,21 @@ mod collection_evidence_gossip_tests {
             Reach::Private,
         );
         // Gossip only ever carries the identity; nothing here stores the
-        // descriptor it names.
+        // descriptor it names -- these frame tests are about framing, and the
+        // descriptor check lives in selection, one layer up.
         let collection =
             IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()).get_handle();
-        let commit = CollectionCommit::sign(
+        CollectionCommit::sign(
             &author,
             collection,
             Inline::new([0xD4; 32]),
             empty_metadata_handle(),
-        );
-        CollectionCommitEvidence::new(CollectionGossip::sign(&author, collection), commit).unwrap()
+        )
     }
 
     struct EvidenceSnapshot {
         pin_heads: PinSnapshot,
-        evidence: CollectionCommitEvidence,
+        evidence: CollectionCommit,
     }
 
     impl AnySnapshot for EvidenceSnapshot {
@@ -2279,14 +2296,14 @@ mod collection_evidence_gossip_tests {
             &self.pin_heads
         }
 
-        fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommitEvidence> {
-            (self.evidence.commit().collection() == collection)
+        fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommit> {
+            (self.evidence.collection() == collection)
                 .then_some(self.evidence)
                 .into_iter()
                 .collect()
         }
 
-        fn all_collection_evidence(&self) -> Vec<CollectionCommitEvidence> {
+        fn all_collection_evidence(&self) -> Vec<CollectionCommit> {
             vec![self.evidence]
         }
 
@@ -2301,16 +2318,16 @@ mod collection_evidence_gossip_tests {
         let nonce = 0x0102_0304_0506_0708;
         let frame = collection_evidence_gossip_frame(evidence, nonce);
 
-        assert_eq!(COLLECTION_COMMIT_EVIDENCE_LEN, 320);
-        assert_eq!(COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN, 329);
+        assert_eq!(COLLECTION_COMMIT_BYTES_LEN, 192);
+        assert_eq!(COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN, 201);
         assert_eq!(frame.len(), COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN);
         assert_eq!(frame[0], GOSSIP_COLLECTION_EVIDENCE);
         assert_eq!(
-            &frame[1..1 + COLLECTION_COMMIT_EVIDENCE_LEN],
-            &evidence.encode()
+            &frame[1..1 + COLLECTION_COMMIT_BYTES_LEN],
+            &evidence.to_bytes()
         );
         assert_eq!(
-            &frame[1 + COLLECTION_COMMIT_EVIDENCE_LEN..],
+            &frame[1 + COLLECTION_COMMIT_BYTES_LEN..],
             &nonce.to_be_bytes()
         );
         assert_eq!(
@@ -2383,9 +2400,7 @@ mod serving_snapshot_tests {
     use ed25519_dalek::SigningKey;
     use iroh_base::EndpointId;
     use triblespace_core::blob::{BlobEncoding, IntoBlob};
-    use triblespace_core::collection::{
-        CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
-    };
+    use triblespace_core::collection::{CollectionRecord, CollectionStore};
     use triblespace_core::id::Id;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::{Inline, InlineEncoding};
@@ -2448,20 +2463,6 @@ mod serving_snapshot_tests {
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.inner.insert(record)
-        }
-    }
-
-    impl CollectionGossipStore for FallibleSnapshotStore {
-        type GossipsError = Infallible;
-        type GossipError = Infallible;
-        type GossipIter<'a> = <MemoryRepo as CollectionGossipStore>::GossipIter<'a>;
-
-        fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-            self.inner.gossips()
-        }
-
-        fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-            self.inner.gossip(grant)
         }
     }
 

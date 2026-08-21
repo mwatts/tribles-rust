@@ -2,22 +2,29 @@
 //!
 //! The wire surface deliberately carries evidence rather than admission
 //! decisions. A server enumerates only strictly verified
-//! [`CollectionGossip`] / [`CollectionCommit`] pairs for one exact
-//! descriptor handle. A client verifies the pair again and may admit that
-//! sparse evidence without fetching any referenced blob. Nothing in this
-//! module mutates a destination store.
+//! [`CollectionCommit`]s whose collection's own descriptor says the
+//! collection travels. A client verifies each commit again and may admit it
+//! without fetching any referenced blob. Nothing in this module mutates a
+//! destination store.
+//!
+//! There used to be a second half to every item: a signed publication grant,
+//! paired with the commit and checked alongside it. It is gone. Committing
+//! into a collection whose identity declares it public *is* the consent, and
+//! it cannot be given by accident, because a collection that stays put is a
+//! different collection with a different handle.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use triblespace_core::collection::descriptor as collection_descriptor;
 use triblespace_core::collection::{
-    COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_GOSSIP_BYTES_LEN,
-    COLLECTION_MERGE_BYTES_LEN,
-    CollectionCommit, CollectionDerive, CollectionGossip, CollectionHandle, CollectionMerge,
-    CollectionRecord, CommitVerificationError, GossipVerificationError, RecordDecodeError,
+    COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
+    CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
+    CommitVerificationError, RecordDecodeError,
 };
+use triblespace_core::trible::TribleSet;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest, WantRequestDecodeError};
 
@@ -26,13 +33,6 @@ use crate::protocol::{
     OP_COLLECTION_OPERATION_RECEIPTS, recv_u32_be, send_hash, send_u8,
 };
 use crate::transport::Conn;
-
-/// Exact byte length of one grant-backed commit evidence item.
-///
-/// The layout is the canonical 128-byte gossip witness followed by the
-/// canonical 192-byte dense [`CollectionCommit`].
-pub const COLLECTION_COMMIT_EVIDENCE_LEN: usize =
-    COLLECTION_GOSSIP_BYTES_LEN + COLLECTION_COMMIT_BYTES_LEN;
 
 /// Defensive upper bound on the number of evidence items accepted from one
 /// response. The wire count remains a `u32`; this bound prevents a malicious
@@ -401,187 +401,62 @@ impl Error for CollectionOperationWireError {
     }
 }
 
-/// One author-signed collection commit accompanied by that same author's
-/// permanent redistribution grant for the exact same collection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CollectionCommitEvidence {
-    grant: CollectionGossip,
-    commit: CollectionCommit,
-}
-
-impl CollectionCommitEvidence {
-    /// Construct evidence only after strict signature and correspondence
-    /// validation.
-    pub fn new(
-        grant: CollectionGossip,
-        commit: CollectionCommit,
-    ) -> Result<Self, CollectionCommitEvidenceError> {
-        grant
-            .verify_strict()
-            .map_err(CollectionCommitEvidenceError::InvalidGrantSignature)?;
-        commit
-            .verify_strict()
-            .map_err(CollectionCommitEvidenceError::InvalidCommitSignature)?;
-        validate_correspondence(&grant, &commit)?;
-        Ok(Self { grant, commit })
-    }
-
-    /// Decode one exact fixed-width evidence item and strictly verify both
-    /// signatures plus author/collection correspondence.
-    pub fn decode(bytes: &[u8]) -> Result<Self, CollectionCommitEvidenceError> {
-        if bytes.len() != COLLECTION_COMMIT_EVIDENCE_LEN {
-            return Err(CollectionCommitEvidenceError::WrongLength {
-                expected: COLLECTION_COMMIT_EVIDENCE_LEN,
-                actual: bytes.len(),
-            });
-        }
-
-        let grant = CollectionGossip::from_bytes(
-            bytes[..COLLECTION_GOSSIP_BYTES_LEN]
-                .try_into()
-                .expect("checked evidence length"),
-        );
-        let commit = CollectionCommit::from_bytes(
-            bytes[COLLECTION_GOSSIP_BYTES_LEN..]
-                .try_into()
-                .expect("checked evidence length"),
-        );
-        Self::new(grant, commit)
-    }
-
-    /// Encode the already-verified pair into its fixed canonical layout.
-    pub fn encode(&self) -> [u8; COLLECTION_COMMIT_EVIDENCE_LEN] {
-        let mut bytes = [0u8; COLLECTION_COMMIT_EVIDENCE_LEN];
-        bytes[..COLLECTION_GOSSIP_BYTES_LEN].copy_from_slice(&self.grant.to_bytes());
-        bytes[COLLECTION_GOSSIP_BYTES_LEN..].copy_from_slice(&self.commit.to_bytes());
-        bytes
-    }
-
-    /// Exact author-signed redistribution witness.
-    pub fn grant(&self) -> CollectionGossip {
-        self.grant
-    }
-
-    /// Exact canonical signed membership assertion.
-    pub fn commit(&self) -> CollectionCommit {
-        self.commit
-    }
-}
-
-fn validate_correspondence(
-    grant: &CollectionGossip,
-    commit: &CollectionCommit,
-) -> Result<(), CollectionCommitEvidenceError> {
-    if grant.public_key() != commit.public_key() {
-        return Err(CollectionCommitEvidenceError::AuthorMismatch {
-            grant: grant.public_key().raw,
-            commit: commit.public_key().raw,
-        });
-    }
-    if grant.collection() != commit.collection() {
-        return Err(CollectionCommitEvidenceError::CollectionMismatch {
-            grant: grant.collection().raw,
-            commit: commit.collection().raw,
-        });
-    }
-    Ok(())
-}
-
-/// Strict evidence decoding, signature, or correspondence failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CollectionCommitEvidenceError {
-    /// The byte slice was not exactly one fixed-width evidence item.
-    WrongLength { expected: usize, actual: usize },
-    /// The grant failed strict Ed25519 verification.
-    InvalidGrantSignature(GossipVerificationError),
-    /// The commit failed strict Ed25519 verification.
-    InvalidCommitSignature(CommitVerificationError),
-    /// Grant and commit name different authors.
-    AuthorMismatch { grant: [u8; 32], commit: [u8; 32] },
-    /// Grant and commit name different collections.
-    CollectionMismatch { grant: [u8; 32], commit: [u8; 32] },
-}
-
-impl fmt::Display for CollectionCommitEvidenceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongLength { expected, actual } => {
-                write!(
-                    formatter,
-                    "collection evidence is {actual} bytes, expected {expected}"
-                )
-            }
-            Self::InvalidGrantSignature(error) => {
-                write!(
-                    formatter,
-                    "collection gossip grant failed verification: {error}"
-                )
-            }
-            Self::InvalidCommitSignature(error) => {
-                write!(formatter, "collection commit failed verification: {error}")
-            }
-            Self::AuthorMismatch { .. } => {
-                write!(formatter, "collection grant and commit authors differ")
-            }
-            Self::CollectionMismatch { .. } => {
-                write!(formatter, "collection grant and commit collections differ")
-            }
-        }
-    }
-}
-
-impl Error for CollectionCommitEvidenceError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidGrantSignature(error) => Some(error),
-            Self::InvalidCommitSignature(error) => Some(error),
-            Self::WrongLength { .. }
-            | Self::AuthorMismatch { .. }
-            | Self::CollectionMismatch { .. } => None,
-        }
-    }
-}
-
-/// Deterministically pair every valid commit with a valid same-author grant.
-/// Malformed structural evidence is inert and omitted; clients independently
-/// verify every returned item.
-pub(crate) fn all_grant_backed_commits(
+/// Deterministically select every commit a relay may pass on.
+///
+/// The question this answers used to be "is there a matching grant?" -- a
+/// separately signed record that anyone holding the key could mint later, for
+/// a collection that already existed. It is now "does this collection's own
+/// descriptor say it travels?", which is a question about the collection's
+/// *name*. A collection that stays put and one that travels hash differently,
+/// so the answer cannot be changed after the fact without changing which
+/// collection is under discussion.
+///
+/// `descriptor` resolves a collection handle to its descriptor facts, and
+/// `None` -- not resident -- is a refusal. That is the direction that fails
+/// safe: a relay that cannot see permission does not have it.
+///
+/// The receiving side deliberately does *not* run this check. Admitting what
+/// a peer handed you leaks nothing, and requiring a descriptor there would
+/// make admission depend on blob residency the protocol is careful not to
+/// require. The invariant still holds transitively, because a receiver that
+/// later relays is a relay, and answers this question then.
+pub fn relayable_commits(
     records: &[CollectionRecord],
-    grants: &[CollectionGossip],
-) -> Vec<CollectionCommitEvidence> {
-    let valid_grants: BTreeMap<([u8; 32], [u8; 32]), CollectionGossip> = grants
-        .iter()
-        .copied()
-        .filter(|grant| grant.verify_strict().is_ok())
-        .map(|grant| ((grant.collection().raw, grant.public_key().raw), grant))
-        .collect();
-
-    let mut evidence: Vec<_> = records
+    mut descriptor: impl FnMut(CollectionHandle) -> Option<TribleSet>,
+) -> Vec<CollectionCommit> {
+    let mut travels: BTreeMap<[u8; 32], bool> = BTreeMap::new();
+    let mut selected: Vec<CollectionCommit> = records
         .iter()
         .filter_map(|record| match record {
-            CollectionRecord::Commit(commit) => {
-                let grant =
-                    valid_grants.get(&(commit.collection().raw, commit.public_key().raw))?;
-                CollectionCommitEvidence::new(*grant, *commit).ok()
-            }
+            CollectionRecord::Commit(commit) => Some(commit),
             CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => None,
         })
+        .filter(|commit| commit.verify_strict().is_ok())
+        .filter(|commit| {
+            let collection = commit.collection();
+            *travels.entry(collection.raw).or_insert_with(|| {
+                descriptor(collection)
+                    .as_ref()
+                    .map(collection_descriptor::travels)
+                    .unwrap_or(false)
+            })
+        })
+        .copied()
         .collect();
-    evidence.sort_by_key(|item| item.commit.id());
-    evidence.dedup_by_key(|item| item.commit.id());
-    evidence
+    selected.sort_by_key(|commit| commit.id());
+    selected.dedup_by_key(|commit| commit.id());
+    selected
 }
 
-/// Deterministically pair valid commits with valid same-author grants for one
-/// exact collection.
-pub(crate) fn grant_backed_commits(
+/// [`relayable_commits`], narrowed to one exact collection.
+pub fn relayable_commits_for(
     records: &[CollectionRecord],
-    grants: &[CollectionGossip],
+    descriptor: impl FnMut(CollectionHandle) -> Option<TribleSet>,
     collection: CollectionHandle,
-) -> Vec<CollectionCommitEvidence> {
-    all_grant_backed_commits(records, grants)
+) -> Vec<CollectionCommit> {
+    relayable_commits(records, descriptor)
         .into_iter()
-        .filter(|evidence| evidence.commit().collection() == collection)
+        .filter(|commit| commit.collection() == collection)
         .collect()
 }
 
@@ -590,7 +465,7 @@ pub(crate) fn grant_backed_commits(
 pub async fn op_collection_evidence<C: Conn>(
     conn: &C,
     collection: CollectionHandle,
-) -> anyhow::Result<Vec<CollectionCommitEvidence>> {
+) -> anyhow::Result<Vec<CollectionCommit>> {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -615,15 +490,17 @@ pub async fn op_collection_evidence<C: Conn>(
 
     let mut evidence = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let mut bytes = [0u8; COLLECTION_COMMIT_EVIDENCE_LEN];
+        let mut bytes = [0u8; COLLECTION_COMMIT_BYTES_LEN];
         recv.read_exact(&mut bytes)
             .await
             .map_err(|error| anyhow::anyhow!("read collection evidence: {error}"))?;
-        let item = CollectionCommitEvidence::decode(&bytes)?;
-        if item.commit().collection() != collection {
+        let item = CollectionCommit::from_bytes(bytes);
+        item.verify_strict()
+            .map_err(|error| anyhow::anyhow!("collection evidence failed verification: {error}"))?;
+        if item.collection() != collection {
             return Err(anyhow::anyhow!(
                 "server returned evidence for collection {} while {} was requested",
-                hex::encode_upper(item.commit().collection().raw),
+                hex::encode_upper(item.collection().raw),
                 hex::encode_upper(collection.raw),
             ));
         }
@@ -643,7 +520,7 @@ pub async fn op_collection_evidence<C: Conn>(
     }
     if !evidence
         .windows(2)
-        .all(|pair| pair[0].commit().id() < pair[1].commit().id())
+        .all(|pair| pair[0].id() < pair[1].id())
     {
         return Err(anyhow::anyhow!(
             "collection evidence response is not in canonical commit-id order"
@@ -675,9 +552,32 @@ mod tests {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
-    /// A named root of the canonical `SimpleArchive` union kind.
+    /// A named root of the canonical `SimpleArchive` union kind that stays
+    /// put: it declares no reach, and so travels nowhere.
     fn root(name: &str) -> Fragment {
-        simplearchive_union::descriptor(&CollectionName::new(name).unwrap(), test_team(), Reach::Private)
+        simplearchive_union::descriptor(
+            &CollectionName::new(name).unwrap(),
+            test_team(),
+            Reach::Private,
+        )
+    }
+
+    /// The same root, named to travel. It is a *different collection*: same
+    /// name, same team, different handle.
+    fn public_root(name: &str) -> Fragment {
+        simplearchive_union::descriptor(
+            &CollectionName::new(name).unwrap(),
+            test_team(),
+            Reach::Public,
+        )
+    }
+
+    /// A descriptor lookup holding exactly the descriptors listed.
+    fn resident(descriptors: &[&Fragment]) -> std::collections::BTreeMap<[u8; 32], TribleSet> {
+        descriptors
+            .iter()
+            .map(|fragment| (collection_of(fragment).raw, fragment.facts().clone()))
+            .collect()
     }
 
     /// These wire tests only need identities to address records by; nothing
@@ -893,63 +793,65 @@ mod tests {
     }
 
     #[test]
-    fn evidence_codec_roundtrips_and_checks_correspondence() {
-        let author = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = root("c1");
-        let commit = commit(&author, &descriptor);
-        let grant = CollectionGossip::sign(&author, collection_of(&descriptor));
-        let evidence = CollectionCommitEvidence::new(grant, commit).unwrap();
-
-        assert_eq!(COLLECTION_COMMIT_EVIDENCE_LEN, 320);
-
-        assert_eq!(
-            CollectionCommitEvidence::decode(&evidence.encode()).unwrap(),
-            evidence
-        );
-
-        let other = SigningKey::from_bytes(&[8; 32]);
-        assert!(matches!(
-            CollectionCommitEvidence::new(
-                CollectionGossip::sign(&other, collection_of(&descriptor)),
-                commit,
-            ),
-            Err(CollectionCommitEvidenceError::AuthorMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn server_selection_is_exact_verified_and_deterministic() {
+    fn a_relay_serves_what_the_descriptor_permits_and_nothing_else() {
         let first_author = SigningKey::from_bytes(&[9; 32]);
         let second_author = SigningKey::from_bytes(&[10; 32]);
-        let ungranted_author = SigningKey::from_bytes(&[11; 32]);
-        let descriptor = root("c2");
-        let other_descriptor = root("c3");
-        let first = commit(&first_author, &descriptor);
-        let second = commit(&second_author, &descriptor);
-        let ungranted = commit(&ungranted_author, &descriptor);
-        let unrelated = commit(&first_author, &other_descriptor);
+        let public = public_root("c2");
+        let private = root("c3");
+
+        let first = commit(&first_author, &public);
+        let second = commit(&second_author, &public);
+        // The same author, writing into a collection that stays put.
+        let secret = commit(&first_author, &private);
 
         let records = vec![
             CollectionRecord::Commit(second),
-            CollectionRecord::Commit(unrelated),
-            CollectionRecord::Commit(ungranted),
+            CollectionRecord::Commit(secret),
             CollectionRecord::Commit(first),
         ];
-        let grants = vec![
-            CollectionGossip::sign(&second_author, collection_of(&descriptor)),
-            CollectionGossip::sign(&first_author, collection_of(&other_descriptor)),
-            CollectionGossip::sign(&first_author, collection_of(&descriptor)),
-        ];
+        let store = resident(&[&public, &private]);
+        let lookup = |handle: CollectionHandle| store.get(&handle.raw).cloned();
 
-        let selected = grant_backed_commits(&records, &grants, collection_of(&descriptor));
+        // Both authors' commits travel, because the *collection* travels.
+        // Reach is not per-author, and neither author signed anything beyond
+        // the commit itself.
         let mut expected = vec![first, second];
-        expected.sort_by_key(CollectionCommit::id);
+        expected.sort_by_key(|commit| commit.id());
+        assert_eq!(relayable_commits(&records, lookup), expected);
+
+        // The private collection's commit does not travel, though the author
+        // of one of the published commits wrote it.
+        assert!(relayable_commits_for(&records, lookup, collection_of(&private)).is_empty());
         assert_eq!(
-            selected
-                .iter()
-                .map(CollectionCommitEvidence::commit)
-                .collect::<Vec<_>>(),
+            relayable_commits_for(&records, lookup, collection_of(&public)),
             expected
+        );
+    }
+
+    #[test]
+    fn a_descriptor_a_relay_cannot_see_is_a_refusal() {
+        let author = SigningKey::from_bytes(&[12; 32]);
+        let public = public_root("c4");
+        let records = vec![CollectionRecord::Commit(commit(&author, &public))];
+
+        // Permission it cannot read is permission it does not have. Serving
+        // on the strength of an unresolvable descriptor would publish exactly
+        // the material whose descriptor might have refused.
+        let empty = resident(&[]);
+        assert!(
+            relayable_commits(&records, |handle: CollectionHandle| empty
+                .get(&handle.raw)
+                .cloned())
+            .is_empty()
+        );
+
+        let store = resident(&[&public]);
+        assert_eq!(
+            relayable_commits(&records, |handle: CollectionHandle| store
+                .get(&handle.raw)
+                .cloned())
+            .len(),
+            1
         );
     }
 }

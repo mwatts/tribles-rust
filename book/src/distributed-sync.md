@@ -56,18 +56,30 @@ The signature proves who authored the assertion. It does not force a receiver
 to treat that author as ground truth. Author trust belongs to the resolver that
 selects a collection view, where all relevant local policy is available.
 
-`CollectionGossipStore` supplies the independent publication permission. Its
-128-byte author-signed grant permanently permits redistribution of that
-author's commits in one exact collection. It is not collection membership, a
-bandwidth command, or a read capability, and it has no retraction: another
-node may already have observed it.
+Publication permission is a property of the collection, not a second record.
+The descriptor's optional `collection_reach` attribute names a reach law, and
+because a collection handle is the hash of its descriptor, a collection that
+travels and one that stays put are *different collections*. There is nothing to
+sign after the fact and nothing to forget: an author who commits into a
+collection whose identity declares it public has published, and one who commits
+into a collection that declares nothing has not.
 
-A peer may gossip a commit exactly when it holds a strictly valid grant with
-the same collection and author. The canonical evidence frame contains the
-128-byte grant followed by the 192-byte commit. The mesh frame adds one kind
-byte and an eight-byte anti-deduplication nonce, for 329 bytes in total. The
-nonce changes transport identity for periodic replay but is not signed and has
-no semantic meaning.
+A peer may relay a commit exactly when it can resolve that commit's collection
+descriptor and that descriptor declares a reach law it implements. A descriptor
+it cannot resolve is a refusal — permission it cannot read is permission it does
+not have — and so is a law it does not recognise, which is why reach names a law
+rather than carrying a boolean. `Collection::commit` writes its descriptor as a
+commit dependency, so a publisher's own store always holds its own permission.
+
+The receiving side does not consult descriptors. Admitting evidence a peer
+handed you leaks nothing, and requiring residency there would contradict the
+sparse-admission rule above. The guarantee holds transitively: a receiver that
+later serves is a relay, and answers the question then.
+
+The canonical evidence frame is the 192-byte commit. The mesh frame adds one
+kind byte and an eight-byte anti-deduplication nonce, for 201 bytes in total.
+The nonce changes transport identity for periodic replay but is not signed and
+has no semantic meaning.
 
 The receiver strictly verifies both signatures and their author/collection
 correspondence before admitting the pair to its two grow-only stores. The mesh
@@ -77,7 +89,7 @@ storage flush barrier.
 
 ## Sparse discovery is deliberate
 
-Gossiping a grant plus `COMMIT` does not transfer any referenced blob. In
+Gossiping a `COMMIT` does not transfer any referenced blob. In
 particular, the receiver may know the exact handles of the descriptor, data,
 metadata, and attachments while possessing none of their bytes. Admission also
 does not create a WANT for any of them.
@@ -93,7 +105,7 @@ replica.
 1. drain pending evidence frames, canonicalize and admit them;
 2. update the host's immutable serving snapshot;
 3. announce newly added blobs to the DHT; and
-4. gossip newly visible grant-backed commits.
+4. gossip newly visible relayable commits.
 
 Construction drives one initial refresh, so existing evidence is published
 without a separate startup ritual. The host later reads the current durable
@@ -140,7 +152,7 @@ The remaining protocol is read-only:
 |---|---|---|
 | `GET_BLOB` | exact 32-byte content handle | bytes or missing |
 | `CHILDREN` | exact parent handle | referenced present handles |
-| `COLLECTION_EVIDENCE` | exact collection descriptor handle | canonical grant+commit pairs |
+| `COLLECTION_EVIDENCE` | exact collection descriptor handle | canonical commits the descriptor permits |
 | `COLLECTION_OPERATION_RECEIPTS` | exact merge/derive WANT key | canonical matching receipts |
 
 `fetch_collection_evidence_from` returns strictly verified but inert sparse
@@ -156,8 +168,9 @@ read-only `PinSnapshotSource` remains part of capability evaluation even though
 pins are no longer a synchronization protocol or a remote source of truth.
 
 Capability request, issuance, renewal, and delivery state lives in private
-signer-owned collections. Those collections receive no publication grant, so
-ordinary evidence gossip cannot expose them. Capability-chain blobs may be
+signer-owned collections. Those collections declare no reach, so ordinary
+evidence gossip cannot expose them — and because reach is part of a descriptor,
+no later signature can change that without naming a different collection. Capability-chain blobs may be
 fetched during mutual authentication and cached after verification.
 
 ## Direction policy
@@ -202,7 +215,7 @@ not a distributed proof that every peer has converged.
 ## Invariants worth retaining
 
 - Network discovery is set union, not last-writer-wins state.
-- A publication grant authorizes relay, not semantic trust.
+- A collection's declared reach authorizes relay, not semantic trust.
 - The relay carrying evidence is not its author or a presumed blob holder.
 - Observing a commit never creates hidden content demand.
 - Merge and derive receipts are evidence; their output blobs remain lazy.

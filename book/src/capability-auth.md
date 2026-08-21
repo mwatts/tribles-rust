@@ -165,7 +165,7 @@ Protocol v5 (`/triblespace/pile-sync/5`) makes auth mandatory:
 | `OP_CHILDREN` | 0x03 | List present child handles |
 | retired | 0x04 | former branch-head operation |
 | `OP_AUTH` | 0x05 | Present a capability sig handle |
-| `OP_COLLECTION_EVIDENCE` | 0x06 | Fetch grant-backed commits for one collection |
+| `OP_COLLECTION_EVIDENCE` | 0x06 | Fetch relayable commits for one collection |
 | `OP_COLLECTION_OPERATION_RECEIPTS` | 0x07 | Fetch exact merge/derive receipts |
 
 The **first stream** on every connection must be `OP_AUTH`. The server
@@ -263,8 +263,10 @@ Pending requests, decisions, renewal entries, and current team capabilities are
 facts in one private, signer-owned node-policy collection. “Private” is an
 authority decision, not a second storage primitive: policy code commits to the
 inner collection store, while `Peer` deliberately does not expose those records
-as repository branches or write any collection-gossip grant. Merely belonging
-to a collection therefore does not authorize proactive gossip.
+as repository branches, and the policy collection's descriptor declares no
+reach. Merely belonging to a collection therefore does not authorize proactive
+gossip — and since reach is part of the descriptor, nothing can grant it to
+that collection after the fact.
 
 Policy history is immutable. A request has a stable intrinsic core, receipt is
 an observation event, and approval or rejection is an immutable decision DAG.

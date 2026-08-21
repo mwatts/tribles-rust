@@ -604,13 +604,12 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
             .map_err(|e| anyhow!("reframe: {e}"))?;
         println!(
             "Reframed into {}:\n  blobs: {}\n  pin updates: {}\n  wants: {}\n  \
-             collection records: {}\n  collection grants: {}\n  dropped inert records: {}",
+             collection records: {}\n  dropped inert records: {}",
             destination.display(),
             stats.blobs,
             stats.pin_updates,
             stats.wants,
             stats.collection_records,
-            stats.collection_gossips,
             stats.dropped_inert,
         );
 

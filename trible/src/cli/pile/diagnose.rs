@@ -551,14 +551,6 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  output: {}", hex::encode_upper(output.raw));
             }
         },
-        PileRecordContent::CollectionGossip { grant } => {
-            println!("  classification: collection-gossip-grant");
-            println!(
-                "  collection: {}",
-                hex::encode_upper(grant.collection().raw)
-            );
-            println!("  author: {}", hex::encode_upper(grant.public_key().raw));
-        }
         PileRecordContent::LegacyCollectionV3 { kind } => {
             let classification = match kind {
                 LegacyCollectionRecordKindV3::Definition => {

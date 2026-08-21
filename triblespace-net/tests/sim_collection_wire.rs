@@ -13,7 +13,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
-    Collection, CollectionData, CollectionDerive, CollectionGossip, CollectionGossipStore,
+    Collection, CollectionData, CollectionDerive,
     CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore, VerifyingKey,
     simplearchive_union,
 };
@@ -49,7 +49,7 @@ fn test_team() -> VerifyingKey {
 
 /// A named root of the canonical `SimpleArchive` union kind.
 fn named_root(name: &str) -> DescriptorFragment {
-    simplearchive_union::descriptor(&collection_name(name), test_team(), Reach::Private)
+    simplearchive_union::descriptor(&collection_name(name), test_team(), Reach::Public)
 }
 
 /// The identity of a descriptor these simulations only address, never store.
@@ -137,12 +137,9 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             &collection_name("c1"),
             test_team(),
             server_key.clone(),
-            Reach::Private,
+            Reach::Public,
         );
         let commit = collection.commit(fragment).unwrap();
-        server_store
-            .gossip(CollectionGossip::sign(&server_key, collection_of(&descriptor)))
-            .unwrap();
 
         let net = SimNet::new(0xC011EC7, SimConfig::default());
         let server = bring_up(
@@ -168,13 +165,12 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor)).await;
 
         assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].commit(), commit);
-        assert_eq!(fetched[0].grant().collection(), collection_of(&descriptor));
+        assert_eq!(fetched[0], commit);
+        assert_eq!(fetched[0].collection(), collection_of(&descriptor));
 
         // Fetch is inert sparse evidence: neither the commit/grant nor any
         // blob it names is admitted into the client store.
         assert!(client.store().records().unwrap().next().is_none());
-        assert!(client.store().gossips().unwrap().next().is_none());
         let reader = client.store().reader().unwrap();
         assert!(
             reader
@@ -232,7 +228,7 @@ fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
             &collection_name("c4"),
             test_team(),
             server_key.clone(),
-            Reach::Private,
+            Reach::Public,
         )
             .commit(Fragment::empty())
             .unwrap();
@@ -333,11 +329,9 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
             &collection_name("c6"),
             test_team(),
             server_key.clone(),
-            Reach::Private,
+            Reach::Public,
         );
         let commit = collection.commit(Fragment::from(facts)).unwrap();
-        let grant = CollectionGossip::sign(&server_key, collection_of(&descriptor));
-        server_store.gossip(grant).unwrap();
 
         let net = SimNet::new(0xC011ECA, SimConfig::default());
         let _server = bring_up(
@@ -361,7 +355,7 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
         let worker = std::thread::spawn(move || {
             let mut client = client;
             let outcome = client
-                .reconcile_collection_from(pk(&server_key), collection_of(&descriptor), |_, _| {
+                .reconcile_collection_from(pk(&server_key), collection_of(&descriptor), |_| {
                     Ok::<_, std::convert::Infallible>(true)
                 })
                 .unwrap();
@@ -379,7 +373,6 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
         assert!(store.records().unwrap().any(|record| {
             matches!(record, Ok(triblespace_core::collection::CollectionRecord::Commit(found)) if found == commit)
         }));
-        assert!(store.gossips().unwrap().any(|found| found == Ok(grant)));
         let reader = store.reader().unwrap();
         assert!(
             reader
@@ -442,10 +435,7 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
         ] {
             server_store.insert(record).unwrap();
         }
-        assert!(
-            server_store.gossips().unwrap().next().is_none(),
-            "unsigned operation receipts need no collection gossip grant"
-        );
+
 
         // A black-hole DHT makes the discovery choice observable: configured
         // operation probes still dial their named peers directly, while an
@@ -793,7 +783,7 @@ async fn fetch_evidence_result_while_stepping(
     collection: triblespace_core::collection::CollectionHandle,
 ) -> (
     triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
-    anyhow::Result<Vec<triblespace_net::collection_wire::CollectionCommitEvidence>>,
+    anyhow::Result<Vec<triblespace_core::collection::CollectionCommit>>,
 ) {
     let worker = std::thread::spawn(move || {
         let result = client.fetch_collection_evidence_from(peer, collection);
@@ -811,7 +801,7 @@ async fn fetch_evidence_while_stepping(
     collection: triblespace_core::collection::CollectionHandle,
 ) -> (
     triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
-    Vec<triblespace_net::collection_wire::CollectionCommitEvidence>,
+    Vec<triblespace_core::collection::CollectionCommit>,
 ) {
     let (client, result) = fetch_evidence_result_while_stepping(client, peer, collection).await;
     (client, result.unwrap())

@@ -67,6 +67,25 @@ pub const KIND_COLLECTION_DERIVE: Id = id_hex!("46C621338B6DD5B71C8E1E6DD74B087C
 /// Minted with `trible genid` on 2026-08-07, retired 2026-08-20.
 pub const KIND_COLLECTION_DERIVE_V1: Id = id_hex!("6DB0214CB4F3BD8259F0117CDC127331");
 
+/// Retired semantic kind of a signed collection-gossip grant.
+///
+/// A grant was an author-signed, irrevocable permission to redistribute that
+/// author's commits in one collection. It is gone because reach moved into the
+/// descriptor: committing into a collection whose identity says it travels
+/// *is* the consent, and cannot be given by accident, since a collection that
+/// stays put is a different collection with a different handle. The grant only
+/// ever restated what the descriptor now declares.
+///
+/// No pile has ever held one -- 21.2 GB across six piles were scanned for the
+/// record marker before the kind was removed, and the same scan found commit
+/// records, so the absence was the grant's and not the scan's. Nothing in
+/// production minted them: `sign` appeared only in tests, which is exactly the
+/// silent failure the move to the descriptor removes.
+///
+/// Minted with `trible genid` on 2026-08-12, retired 2026-08-21. Kept here so
+/// the id is not minted twice.
+pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B5CA");
+
 /// Byte length of a canonical bare root collection-descriptor `SimpleArchive`.
 ///
 /// Five facts: the kind tag, the name and team that anchor the root, and the

@@ -1,10 +1,20 @@
 //! Sparse destination admission for collection-native replication.
 //!
-//! Replication evidence is deliberately only a signed [`CollectionCommit`]
-//! and its matching signed [`CollectionGossip`] grant. The content-addressed
-//! blobs named by the commit are not an admission dependency: a receiver may
-//! learn the commit first and resolve any descriptor, data, metadata, or
-//! attachment blobs later through its ordinary want policy.
+//! Replication evidence is deliberately only a signed [`CollectionCommit`].
+//! The content-addressed blobs named by the commit are not an admission
+//! dependency: a receiver may learn the commit first and resolve any
+//! descriptor, data, metadata, or attachment blobs later through its ordinary
+//! want policy.
+//!
+//! Admission asks nothing about reach, and that is not an omission. Whether a
+//! collection travels is a question for whoever *relays* it, answered from the
+//! collection's own descriptor -- see
+//! [`relayable_commits`](crate::collection_wire::relayable_commits). A
+//! receiver holding bytes it was handed leaks nothing by recording them, and
+//! making admission wait on a descriptor would reintroduce exactly the blob
+//! dependency the paragraph above rules out. The guarantee still holds
+//! transitively: a receiver that later serves is a relay, and answers the
+//! question then.
 //!
 //! Admission has three explicit phases:
 //!
@@ -18,8 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use triblespace_core::collection::{
-    CollectionCommit, CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
-    CommitVerificationError, GossipVerificationError,
+    CollectionCommit, CollectionRecord, CollectionStore, CommitVerificationError,
 };
 use triblespace_core::id::Id;
 use triblespace_core::repo::StorageFlush;
@@ -31,11 +40,11 @@ use triblespace_core::repo::StorageFlush;
 /// the same collection and author. No blob lookup or destination mutation is
 /// performed.
 pub fn prepare_incoming_collection_batch(
-    evidence: Vec<(CollectionCommit, CollectionGossip)>,
+    evidence: Vec<CollectionCommit>,
 ) -> Result<PreparedIncomingCollectionBatch, IncomingBatchValidationError> {
     for pair in evidence.windows(2) {
-        let previous = pair[0].0.id();
-        let current = pair[1].0.id();
+        let previous = pair[0].id();
+        let current = pair[1].id();
         if previous >= current {
             return Err(IncomingBatchValidationError::NonCanonicalEvidenceOrder {
                 previous,
@@ -44,39 +53,25 @@ pub fn prepare_incoming_collection_batch(
         }
     }
 
-    for (index, (commit, grant)) in evidence.iter().enumerate() {
-        validate_evidence(commit, grant)
+    for (index, commit) in evidence.iter().enumerate() {
+        validate_evidence(commit)
             .map_err(|source| IncomingBatchValidationError::Evidence { index, source })?;
     }
 
     Ok(PreparedIncomingCollectionBatch { evidence })
 }
 
-fn validate_evidence(
-    commit: &CollectionCommit,
-    grant: &CollectionGossip,
-) -> Result<(), IncomingValidationError> {
+fn validate_evidence(commit: &CollectionCommit) -> Result<(), IncomingValidationError> {
     commit
         .verify_strict()
-        .map_err(IncomingValidationError::InvalidCommitSignature)?;
-    grant
-        .verify_strict()
-        .map_err(IncomingValidationError::InvalidGossipSignature)?;
-
-    if grant.collection() != commit.collection() {
-        return Err(IncomingValidationError::GossipCollectionMismatch);
-    }
-    if grant.public_key() != commit.public_key() {
-        return Err(IncomingValidationError::GossipAuthorMismatch);
-    }
-    Ok(())
+        .map_err(IncomingValidationError::InvalidCommitSignature)
 }
 
 /// A strictly verified batch whose authorization policy has not run yet.
 #[derive(Clone, Debug)]
 #[must_use = "a prepared incoming batch has no effect until authorized and admitted"]
 pub struct PreparedIncomingCollectionBatch {
-    evidence: Vec<(CollectionCommit, CollectionGossip)>,
+    evidence: Vec<CollectionCommit>,
 }
 
 impl PreparedIncomingCollectionBatch {
@@ -93,31 +88,28 @@ impl PreparedIncomingCollectionBatch {
     /// Decide every verified evidence pair without exposing a destination.
     ///
     /// Policy failure returns directly and cannot leave partial storage
-    /// effects because this phase has no store parameter. Accepted grants and
-    /// commits are reduced to their distinct grow-only set members before the
-    /// mutation phase.
+    /// effects because this phase has no store parameter. Accepted commits are
+    /// reduced to their distinct grow-only set members before the mutation
+    /// phase.
     pub fn authorize<AuthorizationError, Authorize>(
         self,
         mut authorize: Authorize,
     ) -> Result<AuthorizedIncomingCollectionBatch, AuthorizationError>
     where
-        Authorize: FnMut(&CollectionCommit, &CollectionGossip) -> Result<bool, AuthorizationError>,
+        Authorize: FnMut(&CollectionCommit) -> Result<bool, AuthorizationError>,
     {
         let observed = self.evidence.len();
         let mut admitted = 0;
-        let mut grants = BTreeSet::new();
         let mut commits = BTreeMap::new();
 
-        for (commit, grant) in self.evidence {
-            if authorize(&commit, &grant)? {
+        for commit in self.evidence {
+            if authorize(&commit)? {
                 admitted += 1;
-                grants.insert(grant);
                 commits.insert(commit.id(), commit);
             }
         }
 
         Ok(AuthorizedIncomingCollectionBatch {
-            grants,
             commits,
             counts: IncomingBatchCounts {
                 observed,
@@ -132,7 +124,6 @@ impl PreparedIncomingCollectionBatch {
 #[derive(Clone, Debug)]
 #[must_use = "an authorized incoming batch has no effect until admitted"]
 pub struct AuthorizedIncomingCollectionBatch {
-    grants: BTreeSet<CollectionGossip>,
     commits: BTreeMap<Id, CollectionCommit>,
     counts: IncomingBatchCounts,
 }
@@ -143,24 +134,19 @@ impl AuthorizedIncomingCollectionBatch {
         self.counts
     }
 
-    /// Insert distinct accepted grants and commits, then flush exactly once.
+    /// Insert distinct accepted commits, then flush exactly once.
     ///
     /// Empty and all-denied batches perform no mutation and no flush.
     /// Replaying an accepted batch is logically idempotent under the grow-only
     /// storage trait contracts.
     pub fn admit<S>(self, store: &mut S) -> IncomingBatchAdmissionResult<S>
     where
-        S: CollectionGossipStore + CollectionStore + StorageFlush,
+        S: CollectionStore + StorageFlush,
     {
         if self.commits.is_empty() {
             return Ok(self.counts);
         }
 
-        for grant in self.grants {
-            store
-                .gossip(grant)
-                .map_err(IncomingBatchAdmissionError::GossipInsert)?;
-        }
         for commit in self.commits.into_values() {
             store
                 .insert(CollectionRecord::Commit(commit))
@@ -191,7 +177,7 @@ pub enum IncomingBatchValidationError {
         "incoming evidence is not in strictly increasing commit-id order ({previous:?} then {current:?})"
     )]
     NonCanonicalEvidenceOrder { previous: Id, current: Id },
-    /// One evidence pair failed strict validation.
+    /// One evidence item failed strict validation.
     #[error("incoming evidence item {index} is invalid: {source}")]
     Evidence {
         /// Zero-based index in canonical evidence order.
@@ -202,21 +188,12 @@ pub enum IncomingBatchValidationError {
     },
 }
 
-/// Pure validation failure for one commit/grant pair.
+/// Pure validation failure for one incoming commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum IncomingValidationError {
     /// The commit signature is invalid.
     #[error("invalid commit signature: {0}")]
     InvalidCommitSignature(CommitVerificationError),
-    /// The gossip-grant signature is invalid.
-    #[error("invalid gossip signature: {0}")]
-    InvalidGossipSignature(GossipVerificationError),
-    /// Grant and commit name different collection descriptors.
-    #[error("gossip grant and commit name different collections")]
-    GossipCollectionMismatch,
-    /// Grant and commit were signed by different authors.
-    #[error("gossip grant and commit have different authors")]
-    GossipAuthorMismatch,
 }
 
 /// Destination-specific result type for
@@ -224,7 +201,6 @@ pub enum IncomingValidationError {
 pub type IncomingBatchAdmissionResult<S> = Result<
     IncomingBatchCounts,
     IncomingBatchAdmissionError<
-        <S as CollectionGossipStore>::GossipError,
         <S as CollectionStore>::InsertError,
         <S as StorageFlush>::Error,
     >,
@@ -232,10 +208,7 @@ pub type IncomingBatchAdmissionResult<S> = Result<
 
 /// Failure while durably publishing an already-authorized batch.
 #[derive(Debug, thiserror::Error)]
-pub enum IncomingBatchAdmissionError<GossipError, InsertError, FlushError> {
-    /// A matching gossip grant could not be inserted.
-    #[error("failed to insert incoming batch gossip grant: {0}")]
-    GossipInsert(#[source] GossipError),
+pub enum IncomingBatchAdmissionError<InsertError, FlushError> {
     /// A commit record could not be inserted.
     #[error("failed to insert incoming batch commit: {0}")]
     CommitInsert(#[source] InsertError),
@@ -259,7 +232,6 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
-        Gossip(CollectionGossip),
         Insert(Id),
         Flush,
     }
@@ -267,32 +239,8 @@ mod tests {
     #[derive(Default)]
     struct ProbeStore {
         events: Vec<Event>,
-        pending_gossips: BTreeSet<CollectionGossip>,
-        durable_gossips: BTreeSet<CollectionGossip>,
         pending_records: BTreeMap<Id, CollectionRecord>,
         durable_records: BTreeMap<Id, CollectionRecord>,
-    }
-
-    impl CollectionGossipStore for ProbeStore {
-        type GossipsError = Infallible;
-        type GossipError = Infallible;
-        type GossipIter<'a> = std::vec::IntoIter<Result<CollectionGossip, Infallible>>;
-
-        fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-            Ok(self
-                .durable_gossips
-                .iter()
-                .copied()
-                .map(Ok)
-                .collect::<Vec<_>>()
-                .into_iter())
-        }
-
-        fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-            self.events.push(Event::Gossip(grant));
-            self.pending_gossips.insert(grant);
-            Ok(())
-        }
     }
 
     impl CollectionStore for ProbeStore {
@@ -322,7 +270,6 @@ mod tests {
 
         fn flush(&mut self) -> Result<(), Self::Error> {
             self.events.push(Event::Flush);
-            self.durable_gossips.append(&mut self.pending_gossips);
             self.durable_records.append(&mut self.pending_records);
             Ok(())
         }
@@ -340,27 +287,27 @@ mod tests {
         Inline::new([byte; 32])
     }
 
-    fn pair(
+    fn signed(
         author: &ed25519_dalek::SigningKey,
         collection: CollectionHandle,
         byte: u8,
-    ) -> (CollectionCommit, CollectionGossip) {
-        (
-            CollectionCommit::sign(
-                author,
-                collection,
-                data(byte),
-                metadata(byte.wrapping_add(1)),
-            ),
-            CollectionGossip::sign(author, collection),
+    ) -> CollectionCommit {
+        CollectionCommit::sign(
+            author,
+            collection,
+            data(byte),
+            metadata(byte.wrapping_add(1)),
         )
     }
 
-    fn fixture() -> Vec<(CollectionCommit, CollectionGossip)> {
+    fn fixture() -> Vec<CollectionCommit> {
         let author = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
         let collection = collection(1);
-        let mut evidence = vec![pair(&author, collection, 2), pair(&author, collection, 4)];
-        evidence.sort_by_key(|(commit, _)| commit.id());
+        let mut evidence = vec![
+            signed(&author, collection, 2),
+            signed(&author, collection, 4),
+        ];
+        evidence.sort_by_key(|commit| commit.id());
         evidence
     }
 
@@ -369,15 +316,14 @@ mod tests {
         let evidence = fixture();
         let expected_commits = evidence
             .iter()
-            .map(|(commit, _)| commit.id())
+            .map(|commit| commit.id())
             .collect::<BTreeSet<_>>();
-        let expected_grant = evidence[0].1;
 
         let prepared = prepare_incoming_collection_batch(evidence).unwrap();
         assert_eq!(prepared.len(), 2);
         assert!(!prepared.is_empty());
         let authorized = prepared
-            .authorize(|_, _| Ok::<_, Infallible>(true))
+            .authorize(|_| Ok::<_, Infallible>(true))
             .unwrap();
         assert_eq!(
             authorized.counts(),
@@ -393,7 +339,6 @@ mod tests {
         // prerequisite.
         let mut store = ProbeStore::default();
         assert_eq!(authorized.admit(&mut store).unwrap().admitted, 2);
-        assert_eq!(store.durable_gossips, BTreeSet::from([expected_grant]));
         assert_eq!(
             store
                 .durable_records
@@ -418,7 +363,7 @@ mod tests {
         let prepared = prepare_incoming_collection_batch(fixture()).unwrap();
         let denied = prepared
             .clone()
-            .authorize(|_, _| Ok::<_, Infallible>(false))
+            .authorize(|_| Ok::<_, Infallible>(false))
             .unwrap();
         let mut store = ProbeStore::default();
         assert_eq!(
@@ -439,7 +384,7 @@ mod tests {
             }
         }
 
-        let result = prepared.authorize(|_, _| Err::<bool, _>(PolicyError));
+        let result = prepared.authorize(|_| Err::<bool, _>(PolicyError));
         assert!(matches!(result, Err(PolicyError)));
         assert!(store.events.is_empty());
     }
@@ -449,7 +394,7 @@ mod tests {
         let prepared = prepare_incoming_collection_batch(Vec::new()).unwrap();
         assert!(prepared.is_empty());
         let authorized = prepared
-            .authorize(|_, _| Ok::<_, Infallible>(true))
+            .authorize(|_| Ok::<_, Infallible>(true))
             .unwrap();
         let mut store = ProbeStore::default();
         assert_eq!(
@@ -466,12 +411,11 @@ mod tests {
         for _ in 0..2 {
             prepare_incoming_collection_batch(evidence.clone())
                 .unwrap()
-                .authorize(|_, _| Ok::<_, Infallible>(true))
+                .authorize(|_| Ok::<_, Infallible>(true))
                 .unwrap()
                 .admit(&mut store)
                 .unwrap();
         }
-        assert_eq!(store.durable_gossips.len(), 1);
         assert_eq!(store.durable_records.len(), 2);
         assert_eq!(
             store
@@ -503,53 +447,24 @@ mod tests {
     }
 
     #[test]
-    fn commit_and_grant_signatures_are_strictly_verified() {
-        let (commit, grant) = fixture()[0];
+    fn commit_signatures_are_strictly_verified() {
+        let commit = fixture()[0];
         let mut commit_bytes = commit.to_bytes();
         commit_bytes[191] ^= 1;
         let invalid_commit = CollectionCommit::from_bytes(commit_bytes);
         assert!(matches!(
-            prepare_incoming_collection_batch(vec![(invalid_commit, grant)]),
+            prepare_incoming_collection_batch(vec![invalid_commit]),
             Err(IncomingBatchValidationError::Evidence {
                 index: 0,
                 source: IncomingValidationError::InvalidCommitSignature(_),
             })
         ));
 
-        let mut grant_bytes = grant.to_bytes();
-        grant_bytes[127] ^= 1;
-        let invalid_grant = CollectionGossip::from_bytes(grant_bytes);
-        assert!(matches!(
-            prepare_incoming_collection_batch(vec![(commit, invalid_grant)]),
-            Err(IncomingBatchValidationError::Evidence {
-                index: 0,
-                source: IncomingValidationError::InvalidGossipSignature(_),
-            })
-        ));
+        // The author's signature is the whole of the check now. There is no
+        // second signature to disagree with it, because permission is no
+        // longer something a peer carries alongside a commit -- it is a
+        // property of the collection the commit names.
+        prepare_incoming_collection_batch(vec![commit]).unwrap();
     }
 
-    #[test]
-    fn grant_must_match_both_collection_and_author() {
-        let author = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
-        let other_author = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
-        let (commit, _) = pair(&author, collection(1), 2);
-
-        let wrong_collection = CollectionGossip::sign(&author, collection(9));
-        assert_eq!(
-            prepare_incoming_collection_batch(vec![(commit, wrong_collection)]).unwrap_err(),
-            IncomingBatchValidationError::Evidence {
-                index: 0,
-                source: IncomingValidationError::GossipCollectionMismatch,
-            }
-        );
-
-        let wrong_author = CollectionGossip::sign(&other_author, commit.collection());
-        assert_eq!(
-            prepare_incoming_collection_batch(vec![(commit, wrong_author)]).unwrap_err(),
-            IncomingBatchValidationError::Evidence {
-                index: 0,
-                source: IncomingValidationError::GossipAuthorMismatch,
-            }
-        );
-    }
 }

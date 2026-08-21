@@ -22,7 +22,7 @@ use anybytes::Bytes;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionRecord, CollectionRecordSelector,
     CollectionStore,
 };
 use crate::id::{Id, RawId};
@@ -829,43 +829,6 @@ impl CollectionStore for Yard {
     }
 }
 
-/// Deterministic owned snapshot of publication grants visible across all Yard
-/// generations.
-pub struct YardCollectionGossipIter {
-    inner: std::collections::btree_set::IntoIter<CollectionGossip>,
-}
-
-impl Iterator for YardCollectionGossipIter {
-    type Item = Result<CollectionGossip, ReadError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Ok)
-    }
-}
-
-impl CollectionGossipStore for Yard {
-    type GossipsError = ReadError;
-    type GossipError = CollectionInsertError;
-    type GossipIter<'a> = YardCollectionGossipIter;
-
-    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-        let mut grants = std::collections::BTreeSet::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                for result in segment.pile_mut().gossips()? {
-                    grants.insert(result?);
-                }
-            }
-        }
-        Ok(YardCollectionGossipIter {
-            inner: grants.into_iter(),
-        })
-    }
-
-    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-        self.generations[0].active_mut().pile_mut().gossip(grant)
-    }
-}
 impl PinStore for Yard {
     type PinsError = Infallible;
     type HeadError = Infallible;
@@ -1281,11 +1244,6 @@ fn reclaim_generation(
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
-    let collection_gossips = old_pile
-        .gossips()
-        .map_err(YardReclaimError::Pile)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(YardReclaimError::Pile)?;
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
@@ -1304,11 +1262,6 @@ fn reclaim_generation(
     for record in collection_records {
         new_pile
             .insert(record)
-            .map_err(YardReclaimError::CollectionRecord)?;
-    }
-    for grant in collection_gossips {
-        new_pile
-            .gossip(grant)
             .map_err(YardReclaimError::CollectionRecord)?;
     }
     new_pile.close().map_err(YardReclaimError::Close)?;
@@ -1531,8 +1484,7 @@ mod tests {
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
-        empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionGossip,
-        CollectionMerge,
+        empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionMerge,
     };
     use crate::trible::TribleSet;
     use ed25519_dalek::SigningKey;
@@ -1742,57 +1694,6 @@ mod tests {
             .select_records(&selectors)
             .unwrap()
             .contains(&unrelated));
-        reopened.close().unwrap();
-    }
-
-    #[test]
-    fn collection_gossips_union_across_generations_and_survive_reclaim() {
-        let config = YardConfig::default();
-        let (_dir, paths, mut yard) = yard_with_paths(2, config);
-        let collection =
-            identity_for_tests(&named_for_tests("gossiped", pin_id(62), pin_id(63)));
-        let first = CollectionGossip::sign(&SigningKey::from_bytes(&[64; 32]), collection);
-        let second = CollectionGossip::sign(&SigningKey::from_bytes(&[65; 32]), collection);
-
-        yard.generations[1]
-            .active_mut()
-            .pile_mut()
-            .gossip(first)
-            .unwrap();
-        yard.generations[0]
-            .active_mut()
-            .pile_mut()
-            .gossip(first)
-            .unwrap();
-        yard.gossip(second).unwrap();
-
-        let expected = vec![first, second].into_iter().collect::<BTreeSet<_>>();
-        assert_eq!(
-            yard.gossips()
-                .unwrap()
-                .collect::<Result<BTreeSet<_>, _>>()
-                .unwrap(),
-            expected
-        );
-        yard.reclaim().unwrap();
-        assert_eq!(
-            yard.gossips()
-                .unwrap()
-                .collect::<Result<BTreeSet<_>, _>>()
-                .unwrap(),
-            expected
-        );
-
-        yard.close().unwrap();
-        let mut reopened = Yard::open(&paths, config).unwrap();
-        assert_eq!(
-            reopened
-                .gossips()
-                .unwrap()
-                .collect::<Result<BTreeSet<_>, _>>()
-                .unwrap(),
-            expected
-        );
         reopened.close().unwrap();
     }
 

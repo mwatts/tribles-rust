@@ -32,7 +32,7 @@ use std::future::Future;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    CollectionRecord, CollectionStore,
 };
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
@@ -159,28 +159,6 @@ pub trait AsyncCollectionStore {
         &mut self,
         record: CollectionRecord,
     ) -> impl Future<Output = Result<(), Self::InsertError>> + Send;
-}
-
-/// Async counterpart of [`CollectionGossipStore`].
-pub trait AsyncCollectionGossipStore {
-    /// Failure while enumerating publication grants.
-    type GossipsError: Error + Debug + Send + Sync + 'static;
-    /// Failure while inserting immutable publication evidence.
-    type GossipError: Error + Debug + Send + Sync + 'static;
-
-    /// Enumerate the grants currently observed by the backend in
-    /// deterministic value order.
-    fn gossips(
-        &mut self,
-    ) -> impl Future<
-        Output = Result<Vec<Result<CollectionGossip, Self::GossipsError>>, Self::GossipsError>,
-    > + Send;
-
-    /// Insert one immutable publication grant idempotently.
-    fn gossip(
-        &mut self,
-        grant: CollectionGossip,
-    ) -> impl Future<Output = Result<(), Self::GossipError>> + Send;
 }
 
 /// Async counterpart of [`PinStore`]: named,
@@ -373,28 +351,6 @@ where
     }
 }
 
-impl<S> AsyncCollectionGossipStore for SyncAsAsync<S>
-where
-    S: CollectionGossipStore + Send,
-{
-    type GossipsError = S::GossipsError;
-    type GossipError = S::GossipError;
-
-    fn gossips(
-        &mut self,
-    ) -> impl Future<
-        Output = Result<Vec<Result<CollectionGossip, Self::GossipsError>>, Self::GossipsError>,
-    > + Send {
-        async move { self.0.gossips().map(Iterator::collect) }
-    }
-
-    fn gossip(
-        &mut self,
-        grant: CollectionGossip,
-    ) -> impl Future<Output = Result<(), Self::GossipError>> + Send {
-        async move { self.0.gossip(grant) }
-    }
-}
 impl<S> AsyncPinStore for SyncAsAsync<S>
 where
     S: PinStore + Send,
@@ -621,24 +577,6 @@ impl<A: AsyncCollectionStore> CollectionStore for Blocking<A> {
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.rt.block_on(self.inner.insert(record))
-    }
-}
-
-#[cfg(feature = "object-store")]
-impl<A: AsyncCollectionGossipStore> CollectionGossipStore for Blocking<A> {
-    type GossipsError = A::GossipsError;
-    type GossipError = A::GossipError;
-    type GossipIter<'a>
-        = std::vec::IntoIter<Result<CollectionGossip, A::GossipsError>>
-    where
-        A: 'a;
-
-    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-        self.rt.block_on(self.inner.gossips()).map(Vec::into_iter)
-    }
-
-    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-        self.rt.block_on(self.inner.gossip(grant))
     }
 }
 

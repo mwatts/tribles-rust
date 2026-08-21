@@ -92,7 +92,7 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionRecord, CollectionRecordSelector,
     CollectionStore,
 };
 use crate::id::Id;
@@ -496,28 +496,6 @@ where
     }
 }
 
-impl<S> CollectionGossipStore for Lazy<S>
-where
-    S: BlobStore + BlobStorePut + CollectionGossipStore + WantStore + StorageFlush + Send + 'static,
-{
-    type GossipsError = S::GossipsError;
-    type GossipError = S::GossipError;
-    // Collected eagerly: the inner iterator borrows the mutex guard.
-    type GossipIter<'a>
-        = std::vec::IntoIter<Result<CollectionGossip, S::GossipsError>>
-    where
-        S: 'a;
-
-    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-        let mut store = self.store.lock().expect("store mutex");
-        let grants = store.gossips()?.collect::<Vec<_>>();
-        Ok(grants.into_iter())
-    }
-
-    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-        self.store.lock().expect("store mutex").gossip(grant)
-    }
-}
 impl<S> WantStore for Lazy<S>
 where
     S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,

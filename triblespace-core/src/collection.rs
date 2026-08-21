@@ -15,8 +15,6 @@ pub mod discovery;
 pub mod exact_derived;
 /// Explicit size-tiered maintenance for exact canonical target covers.
 pub mod exact_target_compaction;
-/// Orthogonal grow-only publication grants for collection commits.
-pub mod gossip;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.
 pub mod observed_union;
@@ -42,7 +40,6 @@ pub use ed25519_dalek::VerifyingKey;
 pub use api::*;
 pub use descriptor::{Reach, REACH_PUBLIC};
 pub use discovery::*;
-pub use gossip::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;

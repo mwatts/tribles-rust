@@ -156,11 +156,6 @@ record_kinds! {
         "pile-collection-derive-v5",
         "An unsigned DERIVE equation asserting that an input state of a derived collection's source maps to an output state of that collection. Envelope bytes 64..96 hold the target collection's descriptor handle, 96..128 the input digest, 128..160 the output digest, and 160..256 are zeros. The source is not named here because the target's descriptor already names it, and naming it twice only creates a way for the two to disagree.";
 
-    /// A signed collection publication grant.
-    CollectionGossipRecordV1 = KIND_ID_COLLECTION_GOSSIP "9BB5B1F4D6FD8FB850B494C2CF51B5CA",
-        KIND_COLLECTION_GOSSIP "5E18D982337466E65CB8278658CF53027FC109385456B49D35C4E66D6E9CE599",
-        "pile-collection-gossip-v1",
-        "An author-signed, irrevocable permission to redistribute that author's strictly verified commits in one exact collection. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the author Ed25519 public key, 128..160 the signature R component, 160..192 the signature S component, and 192..256 are zeros. A grant retains no blob and does not require its collection to be resident.";
 }
 
 /// Every blob needed to resolve every known record kind.

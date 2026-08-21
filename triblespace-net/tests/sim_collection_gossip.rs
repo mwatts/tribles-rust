@@ -3,6 +3,15 @@
 //! Exercises the complete simulated host/gossip/Peer path and verifies that
 //! collection discovery transfers only the signed sparse evidence. Referenced
 //! content remains independently lazy and gossip replay remains idempotent.
+//!
+//! These collections declare [`Reach::Public`], and that declaration is the
+//! whole reason anything replicates. There is no separate grant to sign: the
+//! author committed into a collection whose identity says it travels, and
+//! `Collection::commit` wrote that descriptor into the author's own store as a
+//! dependency, so the serving node can read its own permission without anyone
+//! having remembered to grant it. A test that used `Reach::Private` here would
+//! observe nothing arriving, which is the point of
+//! `a_private_collection_does_not_replicate` below.
 #![cfg(feature = "sim")]
 
 mod common;
@@ -15,8 +24,8 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
-    Collection, CollectionGossip, CollectionGossipStore, CollectionHandle, CollectionRecord,
-    CollectionStore, VerifyingKey, simplearchive_union,
+    Collection, CollectionHandle, CollectionRecord, CollectionStore, VerifyingKey,
+    simplearchive_union,
 };
 use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, PinStore, WantStore};
@@ -35,7 +44,7 @@ fn test_team() -> VerifyingKey {
 }
 
 fn named_root(name: &str) -> DescriptorFragment {
-    simplearchive_union::descriptor(&collection_name(name), test_team(), Reach::Private)
+    simplearchive_union::descriptor(&collection_name(name), test_team(), Reach::Public)
 }
 
 /// The identity of a descriptor these simulations only address, never store.
@@ -69,15 +78,13 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
         let metadata = archive(0x51);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(&mut author_store, &collection_name("c31"), test_team(), author.clone(), Reach::Private)
+        let commit = Collection::new(&mut author_store, &collection_name("c31"), test_team(), author.clone(), Reach::Public)
             .commit(fragment)
             .unwrap();
         assert_eq!(commit.collection(), collection_of(&descriptor));
         assert_eq!(commit.data(), data.get_handle().into());
         assert_eq!(commit.metadata(), metadata.get_handle());
 
-        let grant = CollectionGossip::sign(&author, collection_of(&descriptor));
-        author_store.gossip(grant).unwrap();
 
         let net = SimNet::new(0xC011EC_6015, SimConfig::default());
         // Join the receiver first so the author's construction-time refresh
@@ -120,9 +127,7 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
         {
             let mut store = receiver_peer.store();
             let records: Vec<_> = store.records().unwrap().collect::<Result<_, _>>().unwrap();
-            let grants: Vec<_> = store.gossips().unwrap().collect::<Result<_, _>>().unwrap();
             assert_eq!(records, vec![CollectionRecord::Commit(commit)]);
-            assert_eq!(grants, vec![grant]);
 
             let reader = store.reader().unwrap();
             assert!(
@@ -153,7 +158,6 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
 
         let mut store = receiver_peer.store();
         assert_eq!(store.records().unwrap().count(), 1);
-        assert_eq!(store.gossips().unwrap().count(), 1);
         assert!(store.wants().unwrap().next().is_none());
     });
 }
@@ -176,11 +180,9 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
         let metadata = archive(0x52);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(&mut author_store, &collection_name("c32"), test_team(), author.clone(), Reach::Private)
+        let commit = Collection::new(&mut author_store, &collection_name("c32"), test_team(), author.clone(), Reach::Public)
             .commit(fragment)
             .unwrap();
-        let grant = CollectionGossip::sign(&author, collection_of(&descriptor));
-        author_store.gossip(grant).unwrap();
 
         let net = SimNet::new(0xC011EC_1A7E, SimConfig::default());
         let mut author_peer = bring_up(
@@ -212,7 +214,6 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
         {
             let mut store = receiver_peer.store();
             assert!(store.records().unwrap().next().is_none());
-            assert!(store.gossips().unwrap().next().is_none());
         }
 
         // The simulation clock becomes visible to protocol code after a
@@ -239,9 +240,7 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
 
         let mut store = receiver_peer.store();
         let records: Vec<_> = store.records().unwrap().collect::<Result<_, _>>().unwrap();
-        let grants: Vec<_> = store.gossips().unwrap().collect::<Result<_, _>>().unwrap();
         assert_eq!(records, vec![CollectionRecord::Commit(commit)]);
-        assert_eq!(grants, vec![grant]);
 
         let reader = store.reader().unwrap();
         assert!(

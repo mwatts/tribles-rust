@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::collection::{CollectionGossipStore, CollectionRecord, CollectionStore};
+use triblespace_core::collection::{CollectionRecord, CollectionStore};
 use triblespace_core::repo::{
     BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, PinSnapshotSource, StorageFlush,
     WantRequest, WantStore,
@@ -158,7 +158,6 @@ impl Reconciler {
     where
         S: BlobStore
             + BlobStorePut
-            + CollectionGossipStore
             + CollectionStore
             + PinSnapshotSource
             + WantStore

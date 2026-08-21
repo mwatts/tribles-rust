@@ -10,7 +10,7 @@ use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::collection::store::selectors_match_record;
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionRecord, CollectionRecordSelector,
     CollectionStore,
 };
 use crate::prelude::blobencodings::SimpleArchive;
@@ -40,29 +40,6 @@ pub struct MemoryRepo {
     pub wants: HashSet<WantRequest>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: BTreeMap<Id, CollectionRecord>,
-    /// Grow-only signed publication grants in deterministic value order.
-    collection_gossips: BTreeSet<CollectionGossip>,
-}
-
-impl CollectionGossipStore for MemoryRepo {
-    type GossipsError = Infallible;
-    type GossipError = Infallible;
-    type GossipIter<'a> = std::vec::IntoIter<Result<CollectionGossip, Self::GossipsError>>;
-
-    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-        Ok(self
-            .collection_gossips
-            .iter()
-            .copied()
-            .map(Ok)
-            .collect::<Vec<_>>()
-            .into_iter())
-    }
-
-    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-        self.collection_gossips.insert(grant);
-        Ok(())
-    }
 }
 
 impl CollectionStore for MemoryRepo {

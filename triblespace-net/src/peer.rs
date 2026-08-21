@@ -10,11 +10,11 @@
 //!   deltas from external writers (e.g. another process appended to the
 //!   same pile file). Mirrors `Pile::refresh` — the explicit method is
 //!   available for tight loops, but normal storage use Just Works.
-//! - **Publication** diffs [`CollectionStore`] and [`CollectionGossipStore`]
-//!   state, then gossips each strictly verified grant-backed commit as inert
-//!   signed evidence. Receivers may store and relay that evidence without
-//!   fetching its referenced blobs; semantic trust belongs to later
-//!   collection resolution.
+//! - **Publication** diffs [`CollectionStore`] state and gossips each
+//!   strictly verified commit whose collection descriptor says the collection
+//!   travels, as inert signed evidence. Receivers may store and relay that
+//!   evidence without fetching its referenced blobs; semantic trust belongs to
+//!   later collection resolution.
 //! - **Blob writes** delegate to the inner store and announce content to the
 //!   DHT. A read-only [`PinSnapshotSource`] supplies the pin-head view still
 //!   used by branch-restricted capability checks; pins are not replicated
@@ -52,7 +52,7 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    CollectionRecord, CollectionStore,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
@@ -68,7 +68,8 @@ use crate::channel::{NetEvent, PublisherKey};
 use crate::collection_sync::{
     IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_collection_batch,
 };
-use crate::collection_wire::{CollectionCommitEvidence, all_grant_backed_commits};
+use crate::collection_wire::relayable_commits;
+use triblespace_core::collection::CollectionCommit;
 use crate::host::{self, NetReceiver, NetSender};
 use crate::protocol::RawHash;
 
@@ -92,16 +93,22 @@ pub enum CollectionReconcileError {
     Admission(#[source] anyhow::Error),
 }
 
-/// Materialize the strictly verified intersection of the collection record
-/// and publication-grant stores. A top-level enumeration failure preserves
-/// the caller's prior diff baseline; malformed individual rows are inert.
-fn grant_backed_collection_evidence<S>(store: &mut S) -> Option<Vec<CollectionCommitEvidence>>
+/// Materialize every commit this node may pass on: strictly verified, and in
+/// a collection whose own descriptor says it travels. A top-level enumeration
+/// failure preserves the caller's prior diff baseline; malformed individual
+/// rows are inert, and a descriptor this node cannot resolve is a refusal.
+fn relayable_collection_evidence<S>(store: &mut S) -> Option<Vec<CollectionCommit>>
 where
-    S: CollectionGossipStore + CollectionStore,
+    S: BlobStore + CollectionStore,
 {
-    let grants: Vec<CollectionGossip> = store.gossips().ok()?.filter_map(Result::ok).collect();
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     let records: Vec<CollectionRecord> = store.records().ok()?.filter_map(Result::ok).collect();
-    Some(all_grant_backed_commits(&records, &grants))
+    let reader = store.reader().ok()?;
+    Some(relayable_commits(&records, |handle| {
+        reader
+            .get::<triblespace_core::trible::TribleSet, SimpleArchive>(handle)
+            .ok()
+    }))
 }
 
 /// Canonicalize, strictly verify, and durably admit one gossip drain.
@@ -110,20 +117,16 @@ where
 /// the strict batch boundary. The resulting batch performs exactly one flush.
 fn admit_incoming_collection_evidence<S>(
     store: &mut S,
-    mut evidence: Vec<CollectionCommitEvidence>,
+    mut evidence: Vec<CollectionCommit>,
 ) -> anyhow::Result<IncomingBatchCounts>
 where
-    S: CollectionGossipStore + CollectionStore + StorageFlush,
+    S: CollectionStore + StorageFlush,
 {
-    evidence.sort_by_key(|item| item.commit().id());
-    evidence.dedup_by_key(|item| item.commit().id());
-    let batch = evidence
-        .into_iter()
-        .map(|item| (item.commit(), item.grant()))
-        .collect();
-    let prepared = prepare_incoming_collection_batch(batch)?;
+    evidence.sort_by_key(|commit| commit.id());
+    evidence.dedup_by_key(|commit| commit.id());
+    let prepared = prepare_incoming_collection_batch(evidence)?;
     let authorized = prepared
-        .authorize(|_, _| Ok::<bool, std::convert::Infallible>(true))
+        .authorize(|_| Ok::<bool, std::convert::Infallible>(true))
         .expect("infallible evidence-storage policy");
     authorized.admit(store).map_err(anyhow::Error::new)
 }
@@ -188,7 +191,6 @@ pub struct Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + CollectionGossipStore
         + CollectionStore
         + PinSnapshotSource
         + WantStore
@@ -253,7 +255,6 @@ impl<S> Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + CollectionGossipStore
         + CollectionStore
         + PinSnapshotSource
         + WantStore
@@ -409,16 +410,16 @@ where
         &self,
         peer: [u8; 32],
         collection: triblespace_core::collection::CollectionHandle,
-    ) -> anyhow::Result<Vec<crate::collection_wire::CollectionCommitEvidence>> {
+    ) -> anyhow::Result<Vec<triblespace_core::collection::CollectionCommit>> {
         self.sender.fetch_collection_evidence(peer, collection)
     }
 
     /// Reconcile one exact collection from a specific peer.
     ///
-    /// Transport work completes before the store lock is taken. Each grant /
-    /// commit pair is independently verified, then caller policy decides the
-    /// complete batch before the first mutation. Accepted evidence is inserted
-    /// and flushed once; referenced blobs remain independent, lazy resources.
+    /// Transport work completes before the store lock is taken. Each commit is
+    /// independently verified, then caller policy decides the complete batch
+    /// before the first mutation. Accepted evidence is inserted and flushed
+    /// once; referenced blobs remain independent, lazy resources.
     pub fn reconcile_collection_from<AuthorizationError, Authorize>(
         &mut self,
         peer: [u8; 32],
@@ -427,18 +428,12 @@ where
     ) -> Result<CollectionReconcileOutcome, CollectionReconcileError>
     where
         AuthorizationError: std::error::Error + Send + Sync + 'static,
-        Authorize: FnMut(
-            &triblespace_core::collection::CollectionCommit,
-            &triblespace_core::collection::CollectionGossip,
-        ) -> Result<bool, AuthorizationError>,
+        Authorize:
+            FnMut(&triblespace_core::collection::CollectionCommit) -> Result<bool, AuthorizationError>,
     {
         let evidence = self
             .fetch_collection_evidence_from(peer, collection)
             .map_err(CollectionReconcileError::Fetch)?;
-        let evidence = evidence
-            .into_iter()
-            .map(|item| (item.commit(), item.grant()))
-            .collect();
         let prepared = prepare_incoming_collection_batch(evidence)
             .map_err(CollectionReconcileError::Validation)?;
         let authorized = prepared
@@ -619,21 +614,23 @@ where
         }
 
         // ── Phase 4: diff-and-publish collection evidence ────────────
-        // Commits and publication grants are orthogonal grow-only stores.
-        // Only their strictly verified, same-author intersection is eligible
-        // for publication. Received evidence may be relayed after admission:
-        // its transport carrier is deliberately not treated as its author.
-        if let Some(evidence) = grant_backed_collection_evidence(&mut *store) {
+        // A commit is eligible for publication when it verifies and its
+        // collection's own descriptor says the collection travels. There is no
+        // second store to intersect with: permission is part of the name.
+        // Received evidence may be relayed after admission -- its transport
+        // carrier is deliberately not treated as its author -- but only if
+        // this node can resolve a descriptor that permits it.
+        if let Some(evidence) = relayable_collection_evidence(&mut *store) {
             if self.direction != SyncDirection::ReadOnly {
                 for item in &evidence {
-                    if !self.last_collection_commits.contains(&item.commit().id()) {
+                    if !self.last_collection_commits.contains(&item.id()) {
                         self.sender.gossip_collection_evidence(*item);
                     }
                 }
             }
             self.last_collection_commits = evidence
                 .into_iter()
-                .map(|item| item.commit().id())
+                .map(|item| item.id())
                 .collect();
         }
 
@@ -1180,7 +1177,6 @@ impl<S> BlobStorePut for Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + CollectionGossipStore
         + CollectionStore
         + PinSnapshotSource
         + WantStore
@@ -1218,7 +1214,6 @@ impl<S> BlobStore for Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + CollectionGossipStore
         + CollectionStore
         + PinSnapshotSource
         + WantStore
@@ -1258,7 +1253,6 @@ mod collection_gossip_tests {
     #[derive(Default)]
     struct TestStore {
         records: Vec<CollectionRecord>,
-        grants: Vec<CollectionGossip>,
         flushes: usize,
     }
 
@@ -1280,29 +1274,6 @@ mod collection_gossip_tests {
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             if !self.records.iter().any(|known| known.id() == record.id()) {
                 self.records.push(record);
-            }
-            Ok(())
-        }
-    }
-
-    impl CollectionGossipStore for TestStore {
-        type GossipsError = Infallible;
-        type GossipError = Infallible;
-        type GossipIter<'a> = std::vec::IntoIter<Result<CollectionGossip, Infallible>>;
-
-        fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
-            Ok(self
-                .grants
-                .iter()
-                .copied()
-                .map(Ok)
-                .collect::<Vec<_>>()
-                .into_iter())
-        }
-
-        fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
-            if !self.grants.contains(&grant) {
-                self.grants.push(grant);
             }
             Ok(())
         }
@@ -1330,55 +1301,81 @@ mod collection_gossip_tests {
         )
     }
 
+    /// The peer reads relay permission out of the same store it reads records
+    /// from.
+    ///
+    /// `relayable_commits` is tested on its own in `collection_wire`; what is
+    /// checked here is the wiring, because a correct selection function
+    /// pointed at the wrong store is exactly as leaky as a wrong one. A real
+    /// `Collection::commit` writes its own descriptor as a dependency, so a
+    /// publisher's store holds its own permission by construction -- there is
+    /// no second act, and nothing to forget.
     #[test]
-    fn grant_backed_snapshot_filters_then_sorts_and_deduplicates() {
-        let author = SigningKey::from_bytes(&[7; 32]);
-        let ungranted_author = SigningKey::from_bytes(&[8; 32]);
-        let first_collection = collection(1);
-        let second_collection = collection(2);
-        let first = commit(&author, first_collection, 1);
-        let second = commit(&author, first_collection, 2);
-        let across_collection = commit(&author, second_collection, 3);
-        let ungranted = commit(&ungranted_author, first_collection, 4);
+    fn a_peer_relays_only_what_its_own_store_says_may_travel() {
+        use triblespace_core::collection::records::CollectionName;
+        use triblespace_core::collection::{Collection, Reach, simplearchive_union};
+        use triblespace_core::repo::memoryrepo::MemoryRepo;
+        use triblespace_core::trible::{Fragment, TribleSet};
 
-        let mut invalid_grant =
-            CollectionGossip::sign(&ungranted_author, first_collection).to_bytes();
-        invalid_grant[127] ^= 1;
-        let mut store = TestStore {
-            records: vec![
-                CollectionRecord::Commit(second),
-                CollectionRecord::Commit(ungranted),
-                CollectionRecord::Commit(first),
-                CollectionRecord::Commit(second),
-                CollectionRecord::Commit(across_collection),
-            ],
-            grants: vec![
-                CollectionGossip::from_bytes(invalid_grant),
-                CollectionGossip::sign(&author, second_collection),
-                CollectionGossip::sign(&author, first_collection),
-            ],
-            flushes: 0,
-        };
+        let author = SigningKey::from_bytes(&[11; 32]);
+        let team = author.verifying_key();
+        let mut store = MemoryRepo::default();
 
-        let evidence = grant_backed_collection_evidence(&mut store).unwrap();
-        let ids: Vec<_> = evidence.iter().map(|item| item.commit().id()).collect();
-        let mut expected = vec![first.id(), second.id(), across_collection.id()];
-        expected.sort();
+        let published = Collection::new(
+            &mut store,
+            &CollectionName::new("published").unwrap(),
+            team,
+            author.clone(),
+            Reach::Public,
+        )
+        .commit(Fragment::from(TribleSet::new()))
+        .unwrap();
 
-        assert_eq!(ids, expected);
-        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(evidence.iter().all(|item| {
-            item.commit().verify_strict().is_ok() && item.grant().verify_strict().is_ok()
-        }));
+        let withheld = Collection::new(
+            &mut store,
+            &CollectionName::new("withheld").unwrap(),
+            team,
+            author.clone(),
+            Reach::Private,
+        )
+        .commit(Fragment::from(TribleSet::new()))
+        .unwrap();
+
+        // Two collections, one author, one store. Only the one whose
+        // descriptor says so is served.
+        assert_ne!(published.collection(), withheld.collection());
+        assert_eq!(
+            relayable_collection_evidence(&mut store).unwrap(),
+            vec![published]
+        );
+
+        // And the descriptors really are resident, so the refusal above is
+        // about what the private descriptor says rather than about a lookup
+        // that failed.
+        let reader = store.reader().unwrap();
+        for collection in [published.collection(), withheld.collection()] {
+            let facts = reader
+                .get::<TribleSet, triblespace_core::blob::encodings::simplearchive::SimpleArchive>(
+                    collection,
+                )
+                .expect("commit writes its own descriptor");
+            assert!(!facts.is_empty());
+        }
+        assert!(triblespace_core::collection::descriptor::travels(
+            &reader
+                .get::<TribleSet, triblespace_core::blob::encodings::simplearchive::SimpleArchive>(
+                    published.collection()
+                )
+                .unwrap()
+        ));
     }
 
     #[test]
     fn one_gossip_drain_deduplicates_and_flushes_once() {
         let author = SigningKey::from_bytes(&[9; 32]);
         let collection = collection(3);
-        let grant = CollectionGossip::sign(&author, collection);
-        let first = CollectionCommitEvidence::new(grant, commit(&author, collection, 1)).unwrap();
-        let second = CollectionCommitEvidence::new(grant, commit(&author, collection, 2)).unwrap();
+        let first = commit(&author, collection, 1);
+        let second = commit(&author, collection, 2);
         let mut store = TestStore::default();
 
         let counts =
@@ -1388,7 +1385,6 @@ mod collection_gossip_tests {
         assert_eq!(counts.admitted, 2);
         assert_eq!(counts.denied, 0);
         assert_eq!(store.records.len(), 2);
-        assert_eq!(store.grants, vec![grant]);
         assert_eq!(store.flushes, 1);
     }
 
@@ -1396,9 +1392,7 @@ mod collection_gossip_tests {
     fn write_only_rejects_replication_data_but_keeps_capability_control() {
         let author = SigningKey::from_bytes(&[10; 32]);
         let collection = collection(4);
-        let grant = CollectionGossip::sign(&author, collection);
-        let evidence =
-            CollectionCommitEvidence::new(grant, commit(&author, collection, 1)).unwrap();
+        let evidence = commit(&author, collection, 1);
         let bytes = Bytes::from(vec![1, 2, 3]);
 
         let cases = [
