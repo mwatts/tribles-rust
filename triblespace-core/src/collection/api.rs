@@ -1871,7 +1871,7 @@ mod tests {
         collection.commit(right_fragment).unwrap();
         let descriptor = collection.descriptor().clone();
 
-        simplearchive_union::publish_merge(collection.storage_mut(), &descriptor, &left, &right)
+        simplearchive_union::publish_merge(collection.storage_mut(), &descriptor, Handle::<SimpleArchive>::to_hash(left.get_handle()), Handle::<SimpleArchive>::to_hash(right.get_handle()))
             .unwrap();
 
         assert_eq!(collection.materialize().unwrap(), expected);
@@ -1898,15 +1898,15 @@ mod tests {
         let (_, first_two) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &descriptor,
-            &first_blob,
-            &second_blob,
+            Handle::<SimpleArchive>::to_hash(first_blob.get_handle()),
+            Handle::<SimpleArchive>::to_hash(second_blob.get_handle()),
         )
         .unwrap();
         let (_, top) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &descriptor,
-            &first_two,
-            &third_blob,
+            Handle::<SimpleArchive>::to_hash(first_two.get_handle()),
+            Handle::<SimpleArchive>::to_hash(third_blob.get_handle()),
         )
         .unwrap();
         collection.storage_mut().blobs.keep([
@@ -1951,26 +1951,26 @@ mod tests {
         let (_, x) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &descriptor,
-            &blobs[0],
-            &blobs[1],
+            Handle::<SimpleArchive>::to_hash(blobs[0].get_handle()),
+            Handle::<SimpleArchive>::to_hash(blobs[1].get_handle()),
         )
         .unwrap();
         let (_, y) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &descriptor,
-            &x,
-            &blobs[2],
+            Handle::<SimpleArchive>::to_hash(x.get_handle()),
+            Handle::<SimpleArchive>::to_hash(blobs[2].get_handle()),
         )
         .unwrap();
         let (_, z) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &descriptor,
-            &x,
-            &blobs[3],
+            Handle::<SimpleArchive>::to_hash(x.get_handle()),
+            Handle::<SimpleArchive>::to_hash(blobs[3].get_handle()),
         )
         .unwrap();
         let (_, top) =
-            simplearchive_union::publish_merge(collection.storage_mut(), &descriptor, &y, &z)
+            simplearchive_union::publish_merge(collection.storage_mut(), &descriptor, Handle::<SimpleArchive>::to_hash(y.get_handle()), Handle::<SimpleArchive>::to_hash(z.get_handle()))
                 .unwrap();
 
         let mut keep = Vec::new();
@@ -2001,8 +2001,8 @@ mod tests {
         let (_, merged) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &descriptor,
-            &left_blob,
-            &right_blob,
+            Handle::<SimpleArchive>::to_hash(left_blob.get_handle()),
+            Handle::<SimpleArchive>::to_hash(right_blob.get_handle()),
         )
         .unwrap();
         let merged_handle = merged.get_handle();

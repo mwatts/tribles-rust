@@ -564,9 +564,9 @@ mod tests {
         let (second, second_blob) = publish(&mut store, &descriptor, 8, 2);
         let (_extra, extra_blob) = publish(&mut store, &descriptor, 9, 3);
         let (_, selected_cover) =
-            super::super::publish_merge(&mut store, &descriptor, &first_blob, &second_blob)
+            super::super::publish_merge(&mut store, &descriptor, Handle::<SimpleArchive>::to_hash(first_blob.get_handle()), Handle::<SimpleArchive>::to_hash(second_blob.get_handle()))
                 .unwrap();
-        super::super::publish_merge(&mut store, &descriptor, &selected_cover, &extra_blob).unwrap();
+        super::super::publish_merge(&mut store, &descriptor, Handle::<SimpleArchive>::to_hash(selected_cover.get_handle()), Handle::<SimpleArchive>::to_hash(extra_blob.get_handle())).unwrap();
 
         let attached = facade.attach_exact(&mut store, &[second, first]).unwrap();
         let mut expected = facts(1);
