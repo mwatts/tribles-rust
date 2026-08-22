@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Advance the pinned CubeCL zero-copy fork to the clean canonical line with
+  stricter CUDA alias eligibility and ownership-preserving slice uploads.
+
 - Keep telemetry session collections explicitly private now that collection
   reach is a required, identity-bearing fragment.
 
