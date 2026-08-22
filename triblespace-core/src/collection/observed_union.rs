@@ -64,7 +64,10 @@ use crate::id_hex;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::Inline;
 use crate::macros::entity;
-use crate::collection::descriptor::Reach;
+// Reach arrives here as a builder argument; only the tests name a
+// particular one.
+#[cfg(test)]
+use crate::collection::reach;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::RegisterOrder;
@@ -234,7 +237,7 @@ pub fn join(
 }
 
 /// Construct the observed-set collection for one dataset scope and edge.
-pub fn descriptor(source: CollectionHandle, observes: Id, reach: Reach) -> Fragment {
+pub fn descriptor(source: CollectionHandle, observes: Id, reach: Fragment) -> Fragment {
     let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
     let fragment = entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
@@ -242,7 +245,7 @@ pub fn descriptor(source: CollectionHandle, observes: Id, reach: Reach) -> Fragm
         collection_representation*: <ObservedSetBlob as MetaDescribe>::describe(),
         collection_recipe*: <ObservedUnionV1 as MetaDescribe>::describe(),
         register_observes: observes,
-        collection_reach?: reach.declared(),
+        collection_reach*: reach,
     };
     fragment
 }
@@ -322,8 +325,8 @@ pub struct ObservedSetCollection {
     name: CollectionName,
     team: VerifyingKey,
     observes: Id,
-    source_reach: Reach,
-    reach: Reach,
+    source_reach: Fragment,
+    reach: Fragment,
 }
 
 impl ObservedSetCollection {
@@ -331,13 +334,13 @@ impl ObservedSetCollection {
     ///
     /// `source_reach` completes the root's identity; `reach` is this
     /// projection's own. A derivation never inherits its source's reach --
-    /// see [`descriptor::travels`](crate::collection::descriptor::travels).
+    /// see [`reach::travels`](crate::collection::reach::travels).
     pub fn new(
         name: CollectionName,
         team: VerifyingKey,
         observes: Id,
-        source_reach: Reach,
-        reach: Reach,
+        source_reach: Fragment,
+        reach: Fragment,
     ) -> Self {
         Self {
             name,
@@ -349,13 +352,13 @@ impl ObservedSetCollection {
     }
 
     /// How far the source collection may travel.
-    pub fn source_reach(&self) -> Reach {
-        self.source_reach
+    pub fn source_reach(&self) -> &Fragment {
+        &self.source_reach
     }
 
     /// How far this projection may travel.
-    pub fn reach(&self) -> Reach {
-        self.reach
+    pub fn reach(&self) -> &Fragment {
+        &self.reach
     }
 
     /// Name of the root collection this projection is taken over.
@@ -375,7 +378,7 @@ impl ObservedSetCollection {
 
     /// Canonical source `SimpleArchive` collection descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.team, self.source_reach)
+        simplearchive_union::descriptor(&self.name, self.team, self.source_reach.clone())
     }
 
     /// Identity of the source collection this projection reads.
@@ -386,7 +389,7 @@ impl ObservedSetCollection {
 
     /// Canonical target observed-set collection descriptor.
     pub fn descriptor(&self) -> Fragment {
-        descriptor(self.source_collection(), self.observes, self.reach)
+        descriptor(self.source_collection(), self.observes, self.reach.clone())
     }
 
     /// Attach the observed set already resident for `ticket`.
@@ -639,7 +642,7 @@ mod tests {
                 simplearchive_union::descriptor(
                     &crate::collection::records::CollectionName::new(name).unwrap(),
                     ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
-                    Reach::Private,
+                    reach::private(),
                 )
                 .into_facts(),
             )
@@ -647,16 +650,16 @@ mod tests {
         };
         let source = root("source");
         assert_ne!(
-            descriptor(source, metadata::supersedes.id(), Reach::Private),
-            descriptor(source, metadata::tag.id(), Reach::Private),
+            descriptor(source, metadata::supersedes.id(), reach::private()),
+            descriptor(source, metadata::tag.id(), reach::private()),
             "two registers over different edges are different collections"
         );
         // A derived collection carries no anchor of its own; two derivations
         // of the same shape differ exactly when their sources differ.
         let other = root("other-source");
         assert_ne!(
-            descriptor(source, metadata::tag.id(), Reach::Private),
-            descriptor(other, metadata::tag.id(), Reach::Private),
+            descriptor(source, metadata::tag.id(), reach::private()),
+            descriptor(other, metadata::tag.id(), reach::private()),
             "the same derivation over different sources is a different collection"
         );
         // ... and the derivation genuinely reads the attribute it is told to.

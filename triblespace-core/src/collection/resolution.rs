@@ -1073,7 +1073,7 @@ fn check_functional(
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::Reach;
+    use crate::collection::reach;
 
     /// Resolve with a stated lineage.
     ///
@@ -2176,7 +2176,7 @@ mod tests {
         let definition = simplearchive_union::descriptor(
             &crate::collection::records::CollectionName::new("resolved").unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            Reach::Private,
+            reach::private(),
         );
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);

@@ -237,7 +237,7 @@ impl crate::repo::StorageClose for MemoryRepo {
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::Reach;
+    use crate::collection::reach;
     use super::*;
 
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
@@ -394,8 +394,8 @@ mod tests {
         let name = crate::collection::records::CollectionName::new("owned").unwrap();
         let key = SigningKey::from_bytes(&[23; 32]);
         let team = key.verifying_key();
-        let collection = Collection::new(&mut repo, &name, team, key.clone(), Reach::Private).collection();
-        let commit = Collection::new(&mut repo, &name, team, key, Reach::Private)
+        let collection = Collection::new(&mut repo, &name, team, key.clone(), reach::private()).collection();
+        let commit = Collection::new(&mut repo, &name, team, key, reach::private())
             .commit(fragment)
             .unwrap();
         let orphan = repo.put::<LongString, _>("orphan".to_owned()).unwrap();

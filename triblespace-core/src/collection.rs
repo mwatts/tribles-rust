@@ -18,6 +18,8 @@ pub mod exact_target_compaction;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.
 pub mod observed_union;
+/// How far a collection may travel, as a fragment rather than a flag.
+pub mod reach;
 pub mod records;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
 pub mod resolution;
@@ -38,7 +40,6 @@ pub mod succinctarchive_union;
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
-pub use descriptor::{Reach, REACH_PUBLIC};
 pub use discovery::*;
 pub use records::*;
 pub use resolution::*;

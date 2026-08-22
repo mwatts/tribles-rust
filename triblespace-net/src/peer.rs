@@ -1313,7 +1313,7 @@ mod collection_gossip_tests {
     #[test]
     fn a_peer_relays_only_what_its_own_store_says_may_travel() {
         use triblespace_core::collection::records::CollectionName;
-        use triblespace_core::collection::{Collection, Reach, simplearchive_union};
+        use triblespace_core::collection::{reach, Collection, simplearchive_union};
         use triblespace_core::repo::memoryrepo::MemoryRepo;
         use triblespace_core::trible::{Fragment, TribleSet};
 
@@ -1326,7 +1326,7 @@ mod collection_gossip_tests {
             &CollectionName::new("published").unwrap(),
             team,
             author.clone(),
-            Reach::Public,
+            reach::public(),
         )
         .commit(Fragment::from(TribleSet::new()))
         .unwrap();
@@ -1336,7 +1336,7 @@ mod collection_gossip_tests {
             &CollectionName::new("withheld").unwrap(),
             team,
             author.clone(),
-            Reach::Private,
+            reach::private(),
         )
         .commit(Fragment::from(TribleSet::new()))
         .unwrap();
@@ -1361,7 +1361,7 @@ mod collection_gossip_tests {
                 .expect("commit writes its own descriptor");
             assert!(!facts.is_empty());
         }
-        assert!(triblespace_core::collection::descriptor::travels(
+        assert!(triblespace_core::collection::reach::travels(
             &reader
                 .get::<TribleSet, triblespace_core::blob::encodings::simplearchive::SimpleArchive>(
                     published.collection()

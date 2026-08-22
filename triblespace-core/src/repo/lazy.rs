@@ -868,7 +868,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::Reach;
+    use crate::collection::reach;
     use super::*;
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
@@ -902,7 +902,7 @@ mod tests {
             team,
             id(2),
             id(3),
-            Reach::Private,
+            reach::private(),
         )
         .into_facts();
         // Nothing stores this descriptor: the test needs an identity to file

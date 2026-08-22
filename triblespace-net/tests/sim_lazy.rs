@@ -15,7 +15,7 @@
 
 mod common;
 
-use triblespace_core::collection::Reach;
+use triblespace_core::collection::reach;
 use std::time::Duration;
 
 use triblespace_core::blob::Blob;
@@ -110,7 +110,7 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("lazy").unwrap(),
             key(0xF1).verifying_key(),
-            Reach::Private,
+            reach::private(),
         )
         .into_facts()
         .to_blob()

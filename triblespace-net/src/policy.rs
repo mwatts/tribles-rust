@@ -17,7 +17,7 @@
 //! that confer policy membership are not branch heads and are not announced as
 //! policy.
 
-use triblespace_core::collection::Reach;
+use triblespace_core::collection::reach;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -164,7 +164,7 @@ where
         &policy_collection_name(),
         signing_key.verifying_key(),
         signing_key.clone(),
-        Reach::Private,
+        reach::private(),
     )
     .materialize()
         .map_err(|error| storage_error("materializing policy collection", error))
@@ -179,7 +179,7 @@ where
         &policy_collection_name(),
         signing_key.verifying_key(),
         signing_key.clone(),
-        Reach::Private,
+        reach::private(),
     );
     collection
         .commit(fragment)

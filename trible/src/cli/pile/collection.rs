@@ -924,7 +924,7 @@ fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<Co
 }
 #[cfg(test)]
 mod tests {
-    use triblespace_core::collection::Reach;
+    use triblespace_core::collection::reach;
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
@@ -945,7 +945,7 @@ mod tests {
         let team = SigningKey::from_bytes(&[7; 32]).verifying_key();
         let representation = <SimpleArchive as MetaDescribe>::id();
         let fragment =
-            descriptor::naming(&name, team, representation, TRIBLE_SET_UNION_RECIPE_V1, Reach::Private);
+            descriptor::naming(&name, team, representation, TRIBLE_SET_UNION_RECIPE_V1, reach::private());
         let entity_id = fragment.root().expect("the descriptor has one root");
 
         let mut store = MemoryBlobStore::new();
@@ -1060,7 +1060,7 @@ mod tests {
                 team,
                 <SimpleArchive as MetaDescribe>::id(),
                 TRIBLE_SET_UNION_RECIPE_V1,
-                Reach::Private,
+                reach::private(),
             )
             .into_facts(),
         )

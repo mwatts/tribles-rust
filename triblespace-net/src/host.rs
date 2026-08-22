@@ -2235,7 +2235,7 @@ fn blob_in_scope(
 
 #[cfg(test)]
 mod collection_evidence_gossip_tests {
-    use triblespace_core::collection::Reach;
+    use triblespace_core::collection::reach;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
@@ -2263,7 +2263,7 @@ mod collection_evidence_gossip_tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("gossiped").unwrap(),
             author.verifying_key(),
-            Reach::Private,
+            reach::private(),
         );
         // Gossip only ever carries the identity; nothing here stores the
         // descriptor it names -- these frame tests are about framing, and the

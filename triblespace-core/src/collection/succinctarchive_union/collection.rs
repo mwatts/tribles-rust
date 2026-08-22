@@ -29,7 +29,10 @@ use crate::collection::exact_target_compaction::{
 };
 use crate::collection::simplearchive_union;
 use crate::collection::records::CollectionName;
-use crate::collection::descriptor::Reach;
+// Reach arrives here as a builder argument; only the tests name a
+// particular one.
+#[cfg(test)]
+use crate::collection::reach;
 use crate::collection::records::{
     collection_recipe, collection_representation, collection_source, KIND_COLLECTION_DESCRIPTOR,
 };
@@ -98,8 +101,8 @@ impl From<super::Rank9FiberError> for SuccinctArchiveCollectionError {
 pub struct SuccinctArchiveCollection {
     name: CollectionName,
     team: VerifyingKey,
-    source_reach: Reach,
-    reach: Reach,
+    source_reach: Fragment,
+    reach: Fragment,
 }
 
 impl SuccinctArchiveCollection {
@@ -115,8 +118,8 @@ impl SuccinctArchiveCollection {
     pub fn new(
         name: CollectionName,
         team: VerifyingKey,
-        source_reach: Reach,
-        reach: Reach,
+        source_reach: Fragment,
+        reach: Fragment,
     ) -> Self {
         Self {
             name,
@@ -127,13 +130,13 @@ impl SuccinctArchiveCollection {
     }
 
     /// How far the source collection may travel.
-    pub fn source_reach(&self) -> Reach {
-        self.source_reach
+    pub fn source_reach(&self) -> &Fragment {
+        &self.source_reach
     }
 
     /// How far this projection may travel.
-    pub fn reach(&self) -> Reach {
-        self.reach
+    pub fn reach(&self) -> &Fragment {
+        &self.reach
     }
 
     /// Name of the root collection this projection is taken over.
@@ -148,7 +151,7 @@ impl SuccinctArchiveCollection {
 
     /// Canonical source SimpleArchive-union descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.team, self.source_reach)
+        simplearchive_union::descriptor(&self.name, self.team, self.source_reach.clone())
     }
 
     /// Identity of the source collection this projection reads.
@@ -159,7 +162,7 @@ impl SuccinctArchiveCollection {
 
     /// Canonical target raw-SuccinctArchive-union descriptor.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(self.source_collection(), self.reach)
+        super::descriptor(self.source_collection(), self.reach.clone())
     }
 
     /// Identity of the raw Succinct cover this projection maintains.
@@ -400,7 +403,7 @@ mod tests {
     }
 
     fn test_collection(name: &str) -> SuccinctArchiveCollection {
-        SuccinctArchiveCollection::new(CollectionName::new(name).unwrap(), test_team(), Reach::Private, Reach::Private)
+        SuccinctArchiveCollection::new(CollectionName::new(name).unwrap(), test_team(), reach::private(), reach::private())
     }
 
     #[test]
@@ -853,7 +856,7 @@ mod tests {
             .unwrap();
         CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
-            identity_for_tests(&simplearchive_union::descriptor(name, test_team(), Reach::Private)),
+            identity_for_tests(&simplearchive_union::descriptor(name, test_team(), reach::private())),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
             metadata,
         )
@@ -940,7 +943,7 @@ mod tests {
         Blob<SuccinctArchiveBlob>,
     ) {
         let name = CollectionName::new(&format!("c{scope_byte}")).unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let source = put_data(&mut store, &expected);
@@ -1054,7 +1057,7 @@ mod tests {
     #[test]
     fn real_lifted_rank9_derives_close_the_commuting_square() {
         let name = CollectionName::new("c9").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let a = facts([(1, 3)]).to_blob();
         let b = facts([(2, 4)]).to_blob();
         let raw_a = super::super::derive_element(&a).unwrap();
@@ -1168,7 +1171,7 @@ mod tests {
     #[test]
     fn ensured_fibers_are_one_to_one_deterministic_exact_and_zero_write_when_complete() {
         let name = CollectionName::new("c10").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
@@ -1409,7 +1412,7 @@ mod tests {
     #[test]
     fn partial_claim_publication_retries_to_exactly_one_claim_per_member() {
         let name = CollectionName::new("c18").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut base = CollectionOnly::default();
         let left = put_data(&mut base, &facts([(1, 3)]));
         let right = put_data(&mut base, &facts([(2, 4)]));
@@ -1451,7 +1454,7 @@ mod tests {
     #[test]
     fn rank9_publication_drops_readers_and_orders_all_endpoints_before_claims() {
         let name = CollectionName::new("c19").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut base = CollectionOnly::default();
         let left = put_data(&mut base, &facts([(1, 3)]));
         let right = put_data(&mut base, &facts([(2, 4)]));
@@ -1529,7 +1532,7 @@ mod tests {
     #[test]
     fn compaction_builds_only_the_selected_raw_cover_fiber_and_no_rank9_merge() {
         let name = CollectionName::new("c20").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &facts([(1, 3)]));
         let right = put_data(&mut store, &facts([(2, 4)]));
@@ -1586,7 +1589,7 @@ mod tests {
     #[test]
     fn signed_empty_source_still_publishes_nonempty_ticket_provenance() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let source = put_data(&mut store, &TribleSet::new());
         let commit = signed_commit(&mut store, &name, 1, &source);
@@ -1614,7 +1617,7 @@ mod tests {
     #[test]
     fn missing_attach_then_ensure_builds_exact_raw_cover() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
@@ -1640,7 +1643,7 @@ mod tests {
     #[test]
     fn explicit_compaction_returns_one_exact_real_succinct_shard() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
@@ -1666,7 +1669,7 @@ mod tests {
     #[test]
     fn duplicate_provenance_shares_one_raw_derive() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let source = put_data(&mut store, &expected);
@@ -1694,7 +1697,7 @@ mod tests {
     #[test]
     fn resident_source_merge_is_reused_as_one_shard() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
@@ -1737,7 +1740,7 @@ mod tests {
     #[test]
     fn existing_target_merge_is_selected_as_one_shard() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
@@ -1779,7 +1782,7 @@ mod tests {
     #[test]
     fn corrupt_upper_target_artifact_falls_back_to_valid_lower_cover() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
@@ -1825,7 +1828,7 @@ mod tests {
     #[test]
     fn old_ticket_stays_stable_after_later_commit_and_cache() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let old_facts = facts([(1, 3)]);
         let old = put_data(&mut store, &old_facts);
@@ -1857,7 +1860,7 @@ mod tests {
     #[test]
     fn missing_derive_output_is_not_support_and_ensure_rebuilds_it() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let source = put_data(&mut store, &expected);
@@ -1886,7 +1889,7 @@ mod tests {
     #[test]
     fn ungrounded_source_superset_never_enters_smaller_ticket() {
         let name = CollectionName::new("c7").unwrap();
-        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), Reach::Private, Reach::Private);
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team(), reach::private(), reach::private());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let a = put_data(&mut store, &expected);

@@ -17,7 +17,10 @@
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
 use crate::id::ExclusiveId;
-use crate::collection::descriptor::Reach;
+// Reach arrives here as a builder argument; only the tests name a
+// particular one.
+#[cfg(test)]
+use crate::collection::reach;
 use crate::metadata;
 use crate::prelude::entity;
 use ed25519_dalek::VerifyingKey;
@@ -398,14 +401,14 @@ where
 /// side effect of naming one rather than a second thing to remember. Hashing
 /// a descriptor you never stored would leave a phantom collection: records
 /// that reference it, and nothing that can decode what they reference.
-pub fn descriptor(name: &CollectionName, team: VerifyingKey, reach: Reach) -> Fragment {
+pub fn descriptor(name: &CollectionName, team: VerifyingKey, reach: Fragment) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_name: name.as_str(),
         collection_team: team,
         collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
         collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
-        collection_reach?: reach.declared(),
+        collection_reach*: reach,
     }
 }
 
@@ -1132,7 +1135,7 @@ mod tests {
 
     /// One named root of this collection kind.
     fn root(name: &str) -> Fragment {
-        super::descriptor(&CollectionName::new(name).unwrap(), test_team(), Reach::Private)
+        super::descriptor(&CollectionName::new(name).unwrap(), test_team(), reach::private())
     }
 
     /// The same anchor as `root("first")`, but naming a different
@@ -1144,7 +1147,7 @@ mod tests {
             test_team(),
             representation,
             recipe,
-            Reach::Private,
+            reach::private(),
         )
     }
 

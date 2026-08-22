@@ -4,7 +4,7 @@
 
 mod common;
 
-use triblespace_core::collection::Reach;
+use triblespace_core::collection::reach;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -49,7 +49,7 @@ fn test_team() -> VerifyingKey {
 
 /// A named root of the canonical `SimpleArchive` union kind.
 fn named_root(name: &str) -> DescriptorFragment {
-    simplearchive_union::descriptor(&collection_name(name), test_team(), Reach::Public)
+    simplearchive_union::descriptor(&collection_name(name), test_team(), reach::public())
 }
 
 /// The identity of a descriptor these simulations only address, never store.
@@ -137,7 +137,7 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             &collection_name("c1"),
             test_team(),
             server_key.clone(),
-            Reach::Public,
+            reach::public(),
         );
         let commit = collection.commit(fragment).unwrap();
 
@@ -225,11 +225,11 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
             (client_cap, client_sig.clone()),
         ]);
 
-        // Deliberately NOT `named_root`, which declares `Reach::Public`.
+        // Deliberately NOT `named_root`, which declares `reach::public()`.
         let descriptor = simplearchive_union::descriptor(
             &collection_name("c4"),
             test_team(),
-            Reach::Private,
+            reach::private(),
         );
         let data: Blob<SimpleArchive> = TribleSet::new().to_blob();
         server_store
@@ -241,7 +241,7 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
             &collection_name("c4"),
             test_team(),
             server_key.clone(),
-            Reach::Private,
+            reach::private(),
         )
             .commit(Fragment::empty())
             .unwrap();
@@ -342,7 +342,7 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
             &collection_name("c6"),
             test_team(),
             server_key.clone(),
-            Reach::Public,
+            reach::public(),
         );
         let commit = collection.commit(Fragment::from(facts)).unwrap();
 

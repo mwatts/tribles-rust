@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Reach is a fragment, not an enum.** `Reach::{Private, Public}` and its
+  `declared()` are gone. `collection::reach` states the same thing as data:
+  `reach::private()` is an empty `Fragment`, `reach::public()` one that exports
+  `reach::PUBLIC`, and every descriptor builder spreads what it is handed into
+  `collection_reach` instead of interpreting a variant. The design already said
+  a narrower law would be *a different id carrying its audience with it*, and
+  an enum cannot hold that case -- it would need a new variant, a new
+  signature, and every caller recompiled -- while a fragment already can, with
+  nothing between the caller and the descriptor changing shape. Reach remains a
+  required argument for the reason it became one: there is no default left to
+  forget. Identity is unmoved in both directions. A descriptor that declares
+  nothing writes nothing and keeps the handle it had before the attribute
+  existed; one that declares `REACH_PUBLIC` writes the same single row it wrote
+  before. Both are pinned against handles captured from the enum-era builder.
+  `descriptor::reach` and `descriptor::travels` moved to `reach::declared` and
+  `reach::travels`, and `REACH_PUBLIC` is now `reach::PUBLIC`.
+
 - **A decoded archive is one build per index, not sixteen builds and a merge.**
   Decoding the 1.68 GB canonical union of a 404-commit, 26.26 M-fact collection
   spent 4.0 s: 85 ms validating and hashing rows, 2.25 s building six PATCH

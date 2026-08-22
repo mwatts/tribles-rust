@@ -223,7 +223,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::Reach;
+    use crate::collection::reach;
     use super::*;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -243,7 +243,7 @@ mod tests {
     fn collection_records_delegate_only_to_the_record_side() {
         let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
         let facts =
-            descriptor::naming(&CollectionName::new("hybrid").unwrap(), team, id(2), id(3), Reach::Private)
+            descriptor::naming(&CollectionName::new("hybrid").unwrap(), team, id(2), id(3), reach::private())
                 .into_facts();
         // Only the identity matters here; nothing resolves this descriptor.
         let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();
@@ -291,7 +291,7 @@ mod tests {
             &CollectionName::new("hybrid").unwrap(),
             signing_key.verifying_key(),
             signing_key,
-            Reach::Private,
+            reach::private(),
         );
 
         let commit = collection.commit(Fragment::empty()).unwrap();

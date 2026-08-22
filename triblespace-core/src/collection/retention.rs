@@ -181,7 +181,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::Reach;
+    use crate::collection::reach;
 
     fn lineage_from_derives(
         _records: &DiscoveredCollectionRecords,
@@ -221,7 +221,7 @@ mod tests {
         simplearchive_union::descriptor(
             &crate::collection::records::CollectionName::new(name).unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            Reach::Private,
+            reach::private(),
         )
     }
 

@@ -938,7 +938,7 @@ fn one_inline<S: InlineEncoding>(
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::Reach;
+    use crate::collection::reach;
     use super::*;
 
     use hex_literal::hex;
@@ -974,11 +974,11 @@ mod tests {
         let name = CollectionName::new("first").unwrap();
         let other_name = CollectionName::new("second").unwrap();
 
-        let a = descriptor::naming(&name, team, id(2), id(3), Reach::Private).into_facts();
-        let renamed = descriptor::naming(&other_name, team, id(2), id(3), Reach::Private).into_facts();
-        let reteamed = descriptor::naming(&name, other_team, id(2), id(3), Reach::Private).into_facts();
-        let other_representation = descriptor::naming(&name, team, id(4), id(3), Reach::Private).into_facts();
-        let other_recipe = descriptor::naming(&name, team, id(2), id(4), Reach::Private).into_facts();
+        let a = descriptor::naming(&name, team, id(2), id(3), reach::private()).into_facts();
+        let renamed = descriptor::naming(&other_name, team, id(2), id(3), reach::private()).into_facts();
+        let reteamed = descriptor::naming(&name, other_team, id(2), id(3), reach::private()).into_facts();
+        let other_representation = descriptor::naming(&name, team, id(4), id(3), reach::private()).into_facts();
+        let other_recipe = descriptor::naming(&name, team, id(2), id(4), reach::private()).into_facts();
 
         let handle = |facts: &TribleSet| {
             <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
@@ -1202,7 +1202,7 @@ mod tests {
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
             id(2),
             id(3),
-            Reach::Private,
+            reach::private(),
         )
         .into_facts();
         let descriptor_blob =

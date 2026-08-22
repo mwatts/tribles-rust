@@ -6,7 +6,7 @@
 //! invocation is accumulated as one self-contained [`Fragment`] and published
 //! as one signed collection commit; partial configuration is inert.
 
-use triblespace_core::collection::Reach;
+use triblespace_core::collection::reach;
 use proc_macro::Span;
 use proc_macro::TokenStream;
 
@@ -105,7 +105,7 @@ fn publish_metadata(
         Ok(pile) => pile,
         Err(_) => return,
     };
-    let mut collection = Collection::new(pile, collection_name, collection_team, signing_key, Reach::Private);
+    let mut collection = Collection::new(pile, collection_name, collection_team, signing_key, reach::private());
     let _ = collection.commit(fragment);
     let _ = collection.close();
 }
@@ -632,7 +632,7 @@ mod instrumentation_tests {
             .unwrap();
         assert_eq!(
             descriptor,
-            collection::simplearchive_union::descriptor(&name, team, Reach::Private).into_facts(),
+            collection::simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
             "the commit names the descriptor the facade published"
         );
 

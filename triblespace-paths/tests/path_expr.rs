@@ -1,4 +1,4 @@
-use triblespace_core::collection::Reach;
+use triblespace_core::collection::reach;
 use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
@@ -94,7 +94,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     let signing_key = SigningKey::from_bytes(&[17; 32]);
     let team = signing_key.verifying_key();
     let name = CollectionName::new("graph").unwrap();
-    let paths = PathSummaryCollection::new(name.clone(), team, expression.compile(), Reach::Private, Reach::Private);
+    let paths = PathSummaryCollection::new(name.clone(), team, expression.compile(), reach::private(), reach::private());
     let mut store = MemoryRepo::default();
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
@@ -104,7 +104,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
         .unwrap();
     let source = store
         .put::<SimpleArchive, _>(
-            simplearchive_union::descriptor(&name, team, Reach::Private).into_facts().to_blob(),
+            simplearchive_union::descriptor(&name, team, reach::private()).into_facts().to_blob(),
         )
         .unwrap();
     let commit = CollectionCommit::sign(

@@ -14,7 +14,10 @@
 //! performed once when a [`PathIndex`](crate::PathIndex) is materialized, so
 //! paths whose edges live in different source fragments remain discoverable.
 
-use triblespace_core::collection::Reach;
+// Reach arrives here as a builder argument; only the tests name a
+// particular one.
+#[cfg(test)]
+use triblespace_core::collection::reach;
 use triblespace_core::prelude::entity;
 use std::error::Error;
 use std::fmt;
@@ -30,7 +33,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
-use triblespace_core::trible::{Trible, TribleSet, TRIBLE_LEN};
+use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 use crate::persistence::{automaton_fingerprint, path_automaton_fingerprint, PathSummaryV1, PATH_SUMMARY_RECIPE_V1};
 use crate::{Automaton, GraphEdge, PathError, PathSummary, PathSummaryBlob, PathSummaryBlobError};
@@ -239,7 +242,7 @@ impl Error for PathSummaryUnionValidationError {
 pub fn descriptor(
     source: triblespace_core::collection::records::CollectionHandle,
     automaton: &Automaton,
-    reach: Reach,
+    reach: Fragment,
 ) -> triblespace_core::trible::Fragment {
     let fingerprint = automaton_fingerprint(automaton);
     entity! { _ @
@@ -250,7 +253,7 @@ pub fn descriptor(
         triblespace_core::collection::records::collection_recipe*:
             <PathSummaryV1 as MetaDescribe>::describe(),
         path_automaton_fingerprint: fingerprint,
-        triblespace_core::collection::records::collection_reach?: reach.declared(),
+        triblespace_core::collection::records::collection_reach*: reach,
     }
 }
 
@@ -479,7 +482,7 @@ mod tests {
 
     /// The source collection these tests summarise.
     fn source_collection() -> Fragment {
-        simplearchive_union::descriptor(&name("edges"), team(), Reach::Private)
+        simplearchive_union::descriptor(&name("edges"), team(), reach::private())
     }
 
     /// These tests only need identities to bind claims to; nothing stores the
@@ -531,9 +534,9 @@ mod tests {
         let first_automaton = plus(label(7));
         let second_automaton = plus(label(8));
         let source = source_collection();
-        let first = descriptor(collection_of(&source), &first_automaton, Reach::Private);
-        let repeated = descriptor(collection_of(&source), &first_automaton, Reach::Private);
-        let second = descriptor(collection_of(&source), &second_automaton, Reach::Private);
+        let first = descriptor(collection_of(&source), &first_automaton, reach::private());
+        let repeated = descriptor(collection_of(&source), &first_automaton, reach::private());
+        let second = descriptor(collection_of(&source), &second_automaton, reach::private());
 
         assert_eq!(first, repeated);
         // A summary names the collection it summarises, and carries no anchor
@@ -551,9 +554,9 @@ mod tests {
         assert_ne!(
             collection_of(&first),
             collection_of(&descriptor(
-                collection_of(&simplearchive_union::descriptor(&name("other-edges"), team(), Reach::Private)),
+                collection_of(&simplearchive_union::descriptor(&name("other-edges"), team(), reach::private())),
                 &first_automaton,
-                Reach::Private,
+                reach::private(),
             ))
         );
         assert_eq!(
@@ -578,7 +581,7 @@ mod tests {
     fn canonical_empty_is_total_derived_bottom_and_join_identity() {
         let automaton = plus(label(7));
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, Reach::Private);
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
         let source_empty = archive(&TribleSet::new());
         let canonical_empty = empty(&automaton);
 
@@ -638,7 +641,7 @@ mod tests {
     fn derive_and_merge_commute_and_close_cross_fragment_paths() {
         let automaton = plus(metadata::tag.id().into());
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, Reach::Private);
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
 
@@ -701,7 +704,7 @@ mod tests {
     fn nullable_unmatched_domain_obeys_the_same_homomorphism() {
         let automaton = Automaton::new(1, [0], [0], []).unwrap();
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, Reach::Private);
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
         let source_union = simplearchive_union::join(&left, &right).unwrap();
@@ -757,7 +760,7 @@ mod tests {
     fn validators_reject_wrong_descriptors_endpoints_and_equations() {
         let automaton = plus(metadata::tag.id().into());
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, Reach::Private);
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
         let input = archive(&edge_facts(1, 2));
         let other_input = archive(&edge_facts(3, 4));
         let output = derive_element(&input, &automaton).unwrap();
@@ -801,7 +804,7 @@ mod tests {
         ));
 
         let foreign_automaton = plus(label(9));
-        let foreign_target = descriptor(collection_of(&source_collection()), &foreign_automaton, Reach::Private);
+        let foreign_target = descriptor(collection_of(&source_collection()), &foreign_automaton, reach::private());
         let foreign_claim = CollectionDerive::new(
             collection_of(&foreign_target),
             data_identity(&input),

@@ -18,7 +18,7 @@ use std::error::Error;
 use std::fmt;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use triblespace_core::collection::descriptor as collection_descriptor;
+use triblespace_core::collection::reach as collection_reach;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
@@ -437,7 +437,7 @@ pub fn relayable_commits(
             *travels.entry(collection.raw).or_insert_with(|| {
                 descriptor(collection)
                     .as_ref()
-                    .map(collection_descriptor::travels)
+                    .map(collection_reach::travels)
                     .unwrap_or(false)
             })
         })
@@ -531,7 +531,7 @@ pub async fn op_collection_evidence<C: Conn>(
 
 #[cfg(test)]
 mod tests {
-    use triblespace_core::collection::Reach;
+    use triblespace_core::collection::reach;
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -558,7 +558,7 @@ mod tests {
         simplearchive_union::descriptor(
             &CollectionName::new(name).unwrap(),
             test_team(),
-            Reach::Private,
+            reach::private(),
         )
     }
 
@@ -568,7 +568,7 @@ mod tests {
         simplearchive_union::descriptor(
             &CollectionName::new(name).unwrap(),
             test_team(),
-            Reach::Public,
+            reach::public(),
         )
     }
 

@@ -20,7 +20,7 @@ use ed25519_dalek::VerifyingKey;
 
 use itertools::Itertools;
 
-use crate::id::{id_hex, Id};
+use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::shortstring::ShortString;
 use crate::inline::{Inline, IntoInline, RawInline};
@@ -30,6 +30,10 @@ use crate::query::TriblePattern;
 use crate::temp;
 use crate::trible::{Fragment, TribleSet};
 
+// Reach arrives here as a builder argument; only the tests name a
+// particular one.
+#[cfg(test)]
+use super::reach;
 use super::records::{
     collection_name, collection_reach, collection_recipe, collection_representation,
     collection_source, collection_team, CollectionHandle, CollectionName, RecordDecodeError,
@@ -45,12 +49,22 @@ use super::records::{
 /// which additionally embeds both self-descriptions so a stranger holding the
 /// one blob can say what the collection is. This is the bare generic form,
 /// for callers holding only ids.
+///
+/// `reach` is a fragment rather than a flag, and it is required rather than
+/// defaulted. Required, because reach used to be a separate signed grant that
+/// production code never minted, so the normal outcome of publishing was that
+/// nothing replicated and nothing complained; an argument cannot be
+/// forgotten. A fragment, because what it exports is what gets declared and
+/// what it carries rides along into the same blob -- so
+/// [`reach::private`](crate::collection::reach::private) exports nothing and
+/// writes nothing, and a future law with arguments needs no change to this
+/// signature to state them.
 pub fn naming(
     name: &CollectionName,
     team: VerifyingKey,
     representation: Id,
     recipe: Id,
-    reach: Reach,
+    reach: Fragment,
 ) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
@@ -58,93 +72,8 @@ pub fn naming(
         collection_team: team,
         collection_representation: representation,
         collection_recipe: recipe,
-        collection_reach?: reach.declared(),
+        collection_reach*: reach,
     }
-}
-
-/// The reach law naming "any holder may relay this collection's strictly
-/// verified commits to any peer that asks".
-///
-/// One law is implemented, and it is the coarse one. What it forecloses is
-/// per-recipient scoping: this says *whether* a collection travels, not *to
-/// whom*, so it cannot express "these two teammates but not the third". That
-/// is deliberate for now rather than permanent -- a narrower law is a
-/// different id carrying its audience as further attributes on the same
-/// entity, and needs no change to [`collection_reach`] to exist. What is
-/// permanent is that reach is not per-*author*: a collection travels or it
-/// does not, and an author who wants different answers for different material
-/// writes it into different collections. That is the same mechanism at a finer
-/// grain rather than a second one.
-///
-/// Minted with `trible genid` on 2026-08-21.
-pub const REACH_PUBLIC: Id = id_hex!("A7ACA286FE5599D92DB87E8A84A7767E");
-
-/// How far a collection may travel, as stated when its identity is fixed.
-///
-/// Building a descriptor requires saying this, which is the point. Reach used
-/// to be a separate signed grant that production code never minted, so the
-/// normal outcome of publishing was that nothing replicated and nothing
-/// complained. A required argument cannot be forgotten: the silent failure is
-/// gone because there is no second act left to omit.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum Reach {
-    /// The collection does not travel. Nothing is written to the descriptor,
-    /// so a private descriptor is byte-identical to one built before reach
-    /// existed and keeps the identity it already had.
-    Private,
-    /// The collection travels under [`REACH_PUBLIC`].
-    Public,
-}
-
-impl Reach {
-    /// The law id to declare, or `None` for a collection that stays put.
-    pub fn declared(self) -> Option<Id> {
-        match self {
-            Self::Private => None,
-            Self::Public => Some(REACH_PUBLIC),
-        }
-    }
-}
-
-/// The reach law this descriptor declares, if it declares one readably.
-///
-/// Answers the raw law id rather than a verdict, because a reader that
-/// implements a law this binary does not should be able to see which one it
-/// met. A descriptor declaring nothing, declaring something unreadable, or
-/// declaring twice all answer `None`: each is a descriptor that has not
-/// stated a single reach, and [`travels`] treats them alike.
-pub fn reach(facts: &TribleSet) -> Option<Id> {
-    let mut rows = find!(
-        (v: Id?),
-        pattern!(facts, [{ _?e @ collection_reach: ?v }])
-    )
-    .map(|(v,)| v);
-    let first = rows.next()?.ok()?;
-    if rows.next().is_some() {
-        return None;
-    }
-    Some(first)
-}
-
-/// Whether this collection may be relayed to a peer.
-///
-/// **Read the collection's own descriptor and nothing else.** Unlike
-/// [`team_root`], which walks [`collection_source`] because a derivation
-/// genuinely inherits its owner, reach never walks: a derived collection
-/// declares its own or has none. Inheriting would be wrong in both
-/// directions. A derivation can expose what its source did not -- an index
-/// over private material still leaks the material's shape -- so publishing a
-/// source must not publish everything computed from it. And an aggregate
-/// deliberately published over private inputs is an ordinary thing to want,
-/// which inheritance would forbid. Locality also keeps the answer decidable
-/// from one blob, which is what lets a relay refuse without resolving a chain
-/// it may not hold.
-///
-/// Absence is a `false`, not a missing answer. Every descriptor written
-/// before this attribute existed says nothing, and every one of them stays
-/// put.
-pub fn travels(facts: &TribleSet) -> bool {
-    reach(facts) == Some(REACH_PUBLIC)
 }
 
 /// The entity the descriptor's own attributes hang off.
@@ -405,7 +334,7 @@ pub(crate) fn named_for_tests(name: &str, representation: Id, recipe: Id) -> Fra
         team,
         representation,
         recipe,
-        Reach::Private,
+        reach::private(),
     )
 }
 
@@ -459,7 +388,7 @@ mod tests {
             team,
             <SimpleArchive as crate::metadata::MetaDescribe>::id(),
             TRIBLE_SET_UNION_RECIPE_V1,
-            Reach::Private,
+            reach::private(),
         )
     }
 
@@ -579,14 +508,14 @@ mod tests {
             team,
             crate::id::id_hex!("11111111111111111111111111111111"),
             crate::id::id_hex!("22222222222222222222222222222222"),
-            Reach::Private,
+            reach::private(),
         );
         assert_eq!(
             hex::encode_upper(identity_for_tests(&bare).raw),
             "9D413F35934206B916104EE38F03E40E0D1F3AEE2332E00F61FB23B12B422F15"
         );
 
-        let root = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
+        let root = crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
         let root_handle = identity_for_tests(&root);
         assert_eq!(
             hex::encode_upper(root_handle.raw),
@@ -594,7 +523,7 @@ mod tests {
         );
 
         let succinct =
-            crate::collection::succinctarchive_union::descriptor(root_handle, Reach::Private);
+            crate::collection::succinctarchive_union::descriptor(root_handle, reach::private());
         assert_eq!(
             hex::encode_upper(identity_for_tests(&succinct).raw),
             "C1E12A2FB1CA64CC38D138039F13C9F99DC9AE1A9F73FC610D4201E0FBB84052"
@@ -603,7 +532,7 @@ mod tests {
         let observed = crate::collection::observed_union::descriptor(
             root_handle,
             crate::id::id_hex!("33333333333333333333333333333333"),
-            Reach::Private,
+            reach::private(),
         );
         assert_eq!(
             hex::encode_upper(identity_for_tests(&observed).raw),
@@ -612,15 +541,29 @@ mod tests {
     }
 
     /// Declaring reach is a rename, which is the entire point.
+    ///
+    /// The public handle is pinned for the same reason the absent one above
+    /// is, and against the same kind of witness: it was captured at commit
+    /// 5b32ca5d, when reach was a two-variant Rust enum whose `declared()`
+    /// fed an optional attribute. Stating reach as a fragment spread into the
+    /// same attribute has to write the same one row, and this is what says so
+    /// -- a builder that agreed with the old one only about *absence* would
+    /// still have quietly renamed every collection that travels.
     #[test]
     fn declaring_reach_makes_a_different_collection() {
         let team = team_key(9);
         let name = CollectionName::new("ledger").unwrap();
-        let private = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
-        let public = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Public);
+        let private =
+            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
+        let public =
+            crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
 
         assert_ne!(identity_for_tests(&private), identity_for_tests(&public));
         assert_eq!(private.facts().len() + 1, public.facts().len());
+        assert_eq!(
+            hex::encode_upper(identity_for_tests(&public).raw),
+            "719258222ECBADFF790DCC7EE1A1ABA1C7F7A4E35641C0D653D954E66ED78ED0"
+        );
     }
 
     /// A descriptor answers whether it travels, and silence is a refusal.
@@ -630,13 +573,13 @@ mod tests {
         let name = CollectionName::new("ledger").unwrap();
 
         let private =
-            crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
-        assert_eq!(reach(private.facts()), None);
-        assert!(!travels(private.facts()));
+            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
+        assert_eq!(reach::declared(private.facts()), None);
+        assert!(!reach::travels(private.facts()));
 
-        let public = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Public);
-        assert_eq!(reach(public.facts()), Some(REACH_PUBLIC));
-        assert!(travels(public.facts()));
+        let public = crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
+        assert_eq!(reach::declared(public.facts()), Some(reach::PUBLIC));
+        assert!(reach::travels(public.facts()));
     }
 
     /// A reach law this binary does not implement is a refusal, not a guess.
@@ -651,15 +594,15 @@ mod tests {
             collection_reach: crate::id::id_hex!("44444444444444444444444444444444"),
         };
         assert_eq!(
-            reach(unknown.facts()),
+            reach::declared(unknown.facts()),
             Some(crate::id::id_hex!("44444444444444444444444444444444"))
         );
-        assert!(!travels(unknown.facts()));
+        assert!(!reach::travels(unknown.facts()));
     }
 
     /// Two declarations are not a majority vote.
     ///
-    /// A descriptor asserting both `REACH_PUBLIC` and something else has not
+    /// A descriptor asserting both `reach::PUBLIC` and something else has not
     /// stated a reach, and the tie is broken closed rather than by picking the
     /// permissive row.
     #[test]
@@ -670,17 +613,17 @@ mod tests {
         let mut facts = TribleSet::new();
         facts += crate::prelude::entity! { &e @
             metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
-            collection_reach: REACH_PUBLIC,
+            collection_reach: reach::PUBLIC,
         }
         .into_facts();
-        assert!(travels(&facts));
+        assert!(reach::travels(&facts));
 
         facts += crate::prelude::entity! { &e @
             collection_reach: crate::id::id_hex!("44444444444444444444444444444444"),
         }
         .into_facts();
-        assert_eq!(reach(&facts), None);
-        assert!(!travels(&facts));
+        assert_eq!(reach::declared(&facts), None);
+        assert!(!reach::travels(&facts));
     }
 
     /// A derived collection declares its own reach and inherits nothing.
@@ -697,26 +640,26 @@ mod tests {
         let name = CollectionName::new("ledger").unwrap();
 
         let private_root =
-            crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
+            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
         let private_root_handle = identity_for_tests(&private_root);
 
         // A public derivation of a private source.
         let public_index =
-            crate::collection::succinctarchive_union::descriptor(private_root_handle, Reach::Public);
-        assert!(!travels(private_root.facts()));
-        assert!(travels(public_index.facts()));
+            crate::collection::succinctarchive_union::descriptor(private_root_handle, reach::public());
+        assert!(!reach::travels(private_root.facts()));
+        assert!(reach::travels(public_index.facts()));
 
         let public_root =
-            crate::collection::simplearchive_union::descriptor(&name, team, Reach::Public);
+            crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
         let public_root_handle = identity_for_tests(&public_root);
 
         // And a private derivation of a public source.
         let private_index = crate::collection::succinctarchive_union::descriptor(
             public_root_handle,
-            Reach::Private,
+            reach::private(),
         );
-        assert!(travels(public_root.facts()));
-        assert!(!travels(private_index.facts()));
+        assert!(reach::travels(public_root.facts()));
+        assert!(!reach::travels(private_index.facts()));
 
         // Reading reach never walks `collection_source`, so an absent source
         // descriptor cannot change the answer -- unlike `team_root`, which
@@ -725,6 +668,6 @@ mod tests {
             metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
             collection_source: identity_for_tests(&public_root),
         };
-        assert!(!travels(orphan.facts()));
+        assert!(!reach::travels(orphan.facts()));
     }
 }

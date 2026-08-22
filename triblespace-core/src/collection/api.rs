@@ -20,7 +20,10 @@ use crate::inline::encodings::hash::Handle;
 use crate::repo::{
     BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, StorageClose, StorageFlush,
 };
-use crate::collection::descriptor::Reach;
+// Reach arrives here as a builder argument; only the tests name a
+// particular one.
+#[cfg(test)]
+use crate::collection::reach;
 use crate::collection::records::CollectionName;
 use crate::trible::{Fragment, TribleSet};
 
@@ -441,7 +444,7 @@ impl<S> Collection<S> {
         name: &CollectionName,
         team: VerifyingKey,
         signing_key: SigningKey,
-        reach: Reach,
+        reach: Fragment,
     ) -> Self {
         Self {
             storage,
@@ -1287,9 +1290,9 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
         let collection_id =
-            identity_for_tests(&simplearchive_union::descriptor(&name, test_team(), Reach::Private));
+            identity_for_tests(&simplearchive_union::descriptor(&name, test_team(), reach::private()));
         let other_collection = identity_for_tests(
-            &simplearchive_union::descriptor(&other_name(), test_team(), Reach::Private),
+            &simplearchive_union::descriptor(&other_name(), test_team(), reach::private()),
         );
         let metadata = super::super::empty_metadata_handle();
         let first =
@@ -1323,7 +1326,7 @@ mod tests {
         ] {
             store.insert(record).unwrap();
         }
-        let mut collection = Collection::new(store, &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(store, &name, test_team(), signing_key, reach::private());
 
         let ticket = collection.ticket().unwrap();
         let mut expected = vec![first, second];
@@ -1336,7 +1339,7 @@ mod tests {
     #[test]
     fn ticket_for_an_empty_collection_is_empty_without_blob_access() {
         let mut collection = Collection::new(TicketStore::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
 
         assert!(collection.ticket().unwrap().is_empty());
@@ -1347,11 +1350,11 @@ mod tests {
     fn construction_is_pure_and_derives_the_scoped_descriptor() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut collection = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, reach::private());
 
         assert_eq!(
             collection.descriptor(),
-            &simplearchive_union::descriptor(&name, test_team(), Reach::Private)
+            &simplearchive_union::descriptor(&name, test_team(), reach::private())
         );
         assert!(collection.storage().blobs.is_empty());
         assert!(collection.storage_mut().records().unwrap().next().is_none());
@@ -1367,7 +1370,7 @@ mod tests {
         let mut storage = MemoryRepo::default();
 
         {
-            let mut collection = Collection::new(&mut storage, &name, test_team(), signing_key.clone(), Reach::Private);
+            let mut collection = Collection::new(&mut storage, &name, test_team(), signing_key.clone(), reach::private());
             collection.commit(expected.clone()).unwrap();
             assert_eq!(collection.materialize().unwrap(), expected.facts().clone());
         }
@@ -1375,7 +1378,7 @@ mod tests {
         let discovered = discover_collection_records(&mut storage).unwrap();
         assert_eq!(discovered.commits().len(), 1);
 
-        let mut collection = Collection::new(&mut storage, &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(&mut storage, &name, test_team(), signing_key, reach::private());
         assert_eq!(collection.materialize().unwrap(), expected.into_facts());
     }
 
@@ -1383,7 +1386,7 @@ mod tests {
     fn distinct_commits_coexist_and_repeated_commits_are_idempotent() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut collection = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, reach::private());
         let first_fragment = fragment(1, true);
         let second_fragment = fragment(2, false);
 
@@ -1436,7 +1439,7 @@ mod tests {
     #[test]
     fn empty_owned_collection_materializes_without_opening_a_blob_reader() {
         let mut collection =
-            Collection::new(EmptyWithoutReader, &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]), Reach::Private);
+            Collection::new(EmptyWithoutReader, &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]), reach::private());
 
         assert_eq!(collection.materialize().unwrap(), TribleSet::new());
     }
@@ -1444,7 +1447,7 @@ mod tests {
     #[test]
     fn empty_snapshot_still_carries_a_reader() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
 
         let snapshot = collection.snapshot().unwrap();
@@ -1462,7 +1465,7 @@ mod tests {
         let mut expected_all = first.facts().clone();
         expected_all += second.facts().clone();
 
-        let mut seeded = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key.clone(), Reach::Private);
+        let mut seeded = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key.clone(), reach::private());
         let first_commit = seeded.commit(first.clone()).unwrap();
         let second_commit = seeded.commit(second).unwrap();
         let storage = AppendAfterFirstDiscovery {
@@ -1470,7 +1473,7 @@ mod tests {
             initially_visible: BTreeSet::from([first_commit.id()]),
             records_calls: 0,
         };
-        let mut collection = Collection::new(storage, &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(storage, &name, test_team(), signing_key, reach::private());
 
         let snapshot = collection.snapshot().unwrap();
         assert_eq!(snapshot.facts(), first.facts());
@@ -1500,7 +1503,7 @@ mod tests {
     #[test]
     fn own_commits_materialize_completely_and_repeat_deterministically() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let first = fragment(1, false);
         let second = fragment(2, false);
@@ -1519,7 +1522,7 @@ mod tests {
     fn shared_commit_handles_are_validated_once_without_losing_provenance() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), Reach::Private);
+        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
         let first_data = archive(1);
         let second_data = archive(2);
         let first_metadata = archive(8);
@@ -1587,7 +1590,7 @@ mod tests {
         let mut expected = first_data.clone().try_from_blob::<TribleSet>().unwrap();
         expected += second_data.clone().try_from_blob::<TribleSet>().unwrap();
 
-        let mut collection = Collection::new(storage, &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(storage, &name, test_team(), signing_key, reach::private());
         let snapshot = collection.snapshot().unwrap();
         assert_eq!(snapshot.facts(), &expected);
         assert_eq!(
@@ -1604,7 +1607,7 @@ mod tests {
     #[test]
     fn parallel_dependency_fetches_keep_serial_stage_order() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let mut commits = [
             collection.commit(fragment(1, false)).unwrap(),
@@ -1667,7 +1670,7 @@ mod tests {
     fn owned_snapshot_remains_signer_scoped_after_shared_materializer_refactor() {
         let own_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
-        let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), own_key, Reach::Private);
+        let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), own_key, reach::private());
         let descriptor = collection.descriptor().clone();
         let expected = fragment(2, false);
         let own_commit = collection.commit(expected.clone()).unwrap();
@@ -1696,7 +1699,7 @@ mod tests {
     fn own_commit_without_its_descriptor_blob_fails_loud() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), Reach::Private);
+        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let commit = CollectionCommit::sign(
@@ -1709,7 +1712,7 @@ mod tests {
         storage.blobs.insert(data);
         storage.blobs.insert(metadata);
         storage.insert(CollectionRecord::Commit(commit)).unwrap();
-        let mut collection = Collection::new(storage, &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(storage, &name, test_team(), signing_key, reach::private());
 
         assert!(matches!(
             collection.materialize(),
@@ -1722,7 +1725,7 @@ mod tests {
     fn own_descriptor_bytes_must_match_the_collection_handle() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), Reach::Private);
+        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
         let descriptor_handle = identity_for_tests(&descriptor);
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
@@ -1734,7 +1737,7 @@ mod tests {
         );
         let wrong_descriptor =
             IntoBlob::<SimpleArchive>::to_blob(
-                simplearchive_union::descriptor(&other_name(), test_team(), Reach::Private).into_facts(),
+                simplearchive_union::descriptor(&other_name(), test_team(), reach::private()).into_facts(),
             );
         let actual = wrong_descriptor.get_handle();
         let mut storage = MemoryRepo::default();
@@ -1744,7 +1747,7 @@ mod tests {
             .blobs
             .insert(Blob::with_handle(wrong_descriptor.bytes, descriptor_handle));
         storage.insert(CollectionRecord::Commit(commit)).unwrap();
-        let mut collection = Collection::new(storage, &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(storage, &name, test_team(), signing_key, reach::private());
 
         assert!(matches!(
             collection.materialize(),
@@ -1760,7 +1763,7 @@ mod tests {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let expected = fragment(1, false);
-        let mut collection = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, Reach::Private);
+        let mut collection = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, reach::private());
         let valid = collection.commit(expected.clone()).unwrap();
         let invalid = invalid_signature(valid);
         collection
@@ -1775,7 +1778,7 @@ mod tests {
     fn missing_or_corrupt_owned_data_fails_loud() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut missing = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key.clone(), Reach::Private);
+        let mut missing = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key.clone(), reach::private());
         let missing_commit = missing.commit(fragment(1, false)).unwrap();
         let missing_descriptor = missing.collection();
         missing.storage_mut().blobs.keep([
@@ -1788,7 +1791,7 @@ mod tests {
                 if commit == missing_commit.id()
         ));
 
-        let mut corrupt = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, Reach::Private);
+        let mut corrupt = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, reach::private());
         let corrupt_commit = corrupt.commit(fragment(1, false)).unwrap();
         let corrupt_descriptor = corrupt.collection();
         corrupt.storage_mut().blobs.keep([
@@ -1811,7 +1814,7 @@ mod tests {
     fn missing_or_corrupt_owned_metadata_fails_loud() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut missing = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key.clone(), Reach::Private);
+        let mut missing = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key.clone(), reach::private());
         let missing_commit = missing.commit(fragment(1, false)).unwrap();
         let missing_descriptor = missing.collection();
         missing.storage_mut().blobs.keep([
@@ -1825,7 +1828,7 @@ mod tests {
                 if commit == missing_commit.id()
         ));
 
-        let mut corrupt = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, Reach::Private);
+        let mut corrupt = Collection::new(MemoryRepo::default(), &name, test_team(), signing_key, reach::private());
         let corrupt_commit = corrupt.commit(fragment(1, false)).unwrap();
         let corrupt_descriptor = corrupt.collection();
         corrupt.storage_mut().blobs.keep([
@@ -1847,7 +1850,7 @@ mod tests {
     #[test]
     fn canonical_owned_metadata_must_match_the_signed_handle() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let commit = collection.commit(fragment(1, false)).unwrap();
         let wrong_metadata = archive(9);
@@ -1874,7 +1877,7 @@ mod tests {
     #[test]
     fn valid_merge_cover_materializes_the_committed_union() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let left_fragment = fragment(1, false);
         let right_fragment = fragment(2, false);
@@ -1895,7 +1898,7 @@ mod tests {
     #[test]
     fn resident_top_cover_can_use_a_nonresident_intermediate() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let first = fragment(1, false);
         let second = fragment(2, false);
@@ -1942,7 +1945,7 @@ mod tests {
     #[test]
     fn shared_nonresident_intermediate_lives_through_all_consumers() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let fragments = [
             fragment(1, false),
@@ -2005,7 +2008,7 @@ mod tests {
     #[test]
     fn corrupt_optional_merge_result_falls_back_to_committed_leaves() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let left_fragment = fragment(1, false);
         let right_fragment = fragment(2, false);
@@ -2044,7 +2047,7 @@ mod tests {
     #[test]
     fn broken_unsigned_merge_falls_back_to_committed_leaves() {
         let mut collection = Collection::new(MemoryRepo::default(), &test_name(), test_team(), SigningKey::from_bytes(&[7; 32]),
-            Reach::Private,
+            reach::private(),
         );
         let left_fragment = fragment(1, false);
         let right_fragment = fragment(2, false);
