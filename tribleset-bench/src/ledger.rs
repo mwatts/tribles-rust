@@ -30,7 +30,9 @@ use triblespace::core::collection::{
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::prelude::blobencodings::UTF8String;
+// The deliberately pinned ledger revision predates the public type rename;
+// its encoding id and bytes are identical to the current `UTF8String`.
+use triblespace::prelude::blobencodings::LongString as UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, ShortString};
 use triblespace::prelude::*;
 
@@ -38,7 +40,7 @@ use triblespace::prelude::*;
 /// `triblespace::telemetry::schema` (read from
 /// `june-on-tip/src/telemetry.rs`).
 pub mod tele {
-    use triblespace::prelude::blobencodings::UTF8String;
+    use triblespace::prelude::blobencodings::LongString as UTF8String;
     use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
     use triblespace::prelude::*;
 
@@ -58,7 +60,7 @@ pub mod tele {
 /// guessed): session provenance (commit/engine/config) and per-measure
 /// outcome entities (of_run/workload/outcome/rows).
 pub mod bench {
-    use triblespace::prelude::blobencodings::UTF8String;
+    use triblespace::prelude::blobencodings::LongString as UTF8String;
     use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
     use triblespace::prelude::*;
 
@@ -153,9 +155,9 @@ fn ledger_metadata() -> Fragment {
     description
 }
 
-/// One open results collection. All facts and their attachments accumulate in
-/// a self-contained fragment; `finish` publishes one independent signed commit
-/// and closes the pile.
+/// One open results collection. Facts accumulate until a checkpoint publishes
+/// and flushes one self-contained fragment. `finish` alone adds the session end
+/// marker before publishing the final fragment and closing the pile.
 pub struct ResultsLedger {
     collection: Collection<Pile>,
     session: Id,
@@ -201,11 +203,18 @@ impl ResultsLedger {
             bench::config: config_handle,
         };
 
-        Ok(Self {
+        let mut ledger = Self {
             collection,
             session,
             pending,
-        })
+        };
+        // A session printed by the runner must already exist durably. Publishing
+        // the start here also means a run interrupted before its first measure
+        // remains queryable as incomplete rather than disappearing entirely.
+        ledger
+            .checkpoint()
+            .context("publish results session start")?;
+        Ok(ledger)
     }
 
     /// The session entity id (for logging).
@@ -243,23 +252,60 @@ impl ResultsLedger {
         }
     }
 
-    /// Close the session, publish one independent collection commit, and close
-    /// the pile. The fragment carries every long-string attachment referenced
-    /// by its facts and its full schema description in commit metadata.
+    /// Durably publish everything accumulated so far, keeping the session open.
+    ///
+    /// The complete schema description is attached to every collection commit,
+    /// and the pending fragment carries every long-string attachment referenced
+    /// by its facts. Collection publication deliberately has no implicit
+    /// durability barrier, so the commit is followed by an explicit flush
+    /// before the pending fragment is cleared or its result may be announced.
+    ///
+    /// The clone is intentional. If dependency publication, record insertion,
+    /// or the durability flush fails, `pending` remains byte-identical and can
+    /// be retried. Callers propagate that failure and do not print the normal
+    /// result line: continuing would make stdout claim more than the pile can
+    /// prove.
+    ///
+    /// Checkpoints never add [`tele::end_ns`]. Only [`finish`](Self::finish)
+    /// closes the session, so an interrupted run remains identifiable by the
+    /// durable session and measures without an end marker.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if self.pending.facts().is_empty() {
+            return Ok(());
+        }
+
+        let mut checkpoint = self.pending.clone();
+        checkpoint.describe_with(ledger_metadata());
+        self.collection
+            .commit(checkpoint)
+            .map_err(|e| anyhow!("publish results checkpoint: {e:?}"))?;
+        self.collection
+            .flush()
+            .map_err(|e| anyhow!("flush results checkpoint: {e:?}"))?;
+        self.pending = Fragment::empty();
+        Ok(())
+    }
+
+    /// Close the session, durably publish its end marker, and close the pile.
     pub fn finish(mut self, end_ns: u64) -> Result<()> {
         let session_ref = ExclusiveId::force_ref(&self.session);
         self.pending += entity! { session_ref @
             tele::end_ns: end_ns,
             tele::duration_ns: end_ns,
         };
-        self.pending.describe_with(ledger_metadata());
-        self.collection
-            .commit(std::mem::take(&mut self.pending))
-            .map_err(|e| anyhow!("publish results collection commit: {e:?}"))?;
+        self.checkpoint().context("publish results session end")?;
         self.collection
             .close()
             .map_err(|e| anyhow!("close results pile: {e:?}"))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn close_incomplete(self) -> Result<()> {
+        debug_assert!(self.pending.facts().is_empty());
+        self.collection
+            .close()
+            .map_err(|e| anyhow!("close incomplete results pile: {e:?}"))
     }
 }
 
@@ -420,6 +466,15 @@ pub fn verify(path: &Path) -> Result<()> {
     )
     .map(|(s,)| s)
     .collect();
+    let ended_sessions: BTreeSet<Id> = find!(
+        (s: Id, end: u64),
+        pattern!(&facts, [{ ?s @
+            metadata::tag: kind_session,
+            tele::end_ns: ?end
+        }])
+    )
+    .map(|(s, _)| s)
+    .collect();
 
     let span_count = find!(
         (s: Id),
@@ -451,7 +506,12 @@ pub fn verify(path: &Path) -> Result<()> {
             .map_err(|e| anyhow!("engine decode: {e:?}"))?;
         let config: anybytes::View<str> =
             reader.get(cfg).map_err(|e| anyhow!("config blob: {e:?}"))?;
-        println!("  {s:X}  commit={commit} engine={engine}");
+        let status = if ended_sessions.contains(&s) {
+            "complete"
+        } else {
+            "incomplete"
+        };
+        println!("  {s:X}  commit={commit} engine={engine} status={status}");
         println!("    config: {}", config.as_ref());
     }
 
@@ -608,7 +668,8 @@ mod tests {
             .iter()
             .filter(|commit| commit.collection() == collection)
             .collect();
-        assert_eq!(commits.len(), 2);
+        // Each run publishes a durable start checkpoint and a final checkpoint.
+        assert_eq!(commits.len(), 4);
 
         let mut facts = TribleSet::new();
         for commit in commits {
@@ -626,6 +687,17 @@ mod tests {
             .count(),
             2
         );
+        assert_eq!(
+            find!(
+                (session: Id, end: u64),
+                pattern!(&facts, [{ ?session @
+                    metadata::tag: *KIND_SESSION,
+                    tele::end_ns: ?end
+                }])
+            )
+            .count(),
+            2
+        );
         let configs: BTreeSet<String> = find!(
             cfg: Inline<Handle<UTF8String>>,
             pattern!(&facts, [{ bench::config: ?cfg }])
@@ -639,6 +711,97 @@ mod tests {
         assert!(configs
             .iter()
             .all(|config| config.contains("suite: tribleset-bench test")));
+
+        drop(reader);
+        pile.close().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn checkpointed_interruption_keeps_results_without_an_end_marker() {
+        let path =
+            std::env::temp_dir().join(format!("tribleset-bench-interrupted-{:X}.pile", *genid()));
+
+        let mut ledger = ResultsLedger::open(
+            &path,
+            "0123456789abcdef",
+            "interrupted-test",
+            "argv: interrupted | suite: tribleset-bench test",
+        )
+        .unwrap();
+        let session = ledger.session();
+        ledger.span("fixture/interrupted", 11, 13);
+        ledger.outcome("fixture/interrupted", "signal", Some(7));
+        ledger.checkpoint().unwrap();
+        ledger.close_incomplete().unwrap();
+
+        // The ordinary reader accepts an incomplete run: incompleteness is
+        // represented by the absent session end marker, not a corrupt pile.
+        verify(&path).unwrap();
+
+        let mut pile = Pile::open(&path).unwrap();
+        let discovered = discover_collection_records(&mut pile).unwrap();
+        let collection = results_collection().collection();
+        let reader = pile.reader().unwrap();
+        let commits: Vec<_> = discovered
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == collection)
+            .collect();
+        assert_eq!(commits.len(), 2);
+
+        let mut facts = TribleSet::new();
+        for commit in commits {
+            let metadata: TribleSet = reader.get(commit.metadata()).unwrap();
+            assert!(!metadata.is_empty());
+            let data_handle: Inline<Handle<SimpleArchive>> = commit.data().transmute();
+            let checkpoint: TribleSet = reader.get(data_handle).unwrap();
+            facts += checkpoint;
+        }
+
+        assert_eq!(
+            find!(
+                span: Id,
+                pattern!(&facts, [{ ?span @
+                    metadata::tag: *KIND_SPAN,
+                    tele::session: session
+                }])
+            )
+            .count(),
+            1
+        );
+        assert_eq!(
+            find!(
+                outcome: Id,
+                pattern!(&facts, [{ ?outcome @ bench::of_run: session }])
+            )
+            .count(),
+            1
+        );
+        assert_eq!(
+            find!(
+                end: u64,
+                pattern!(&facts, [{ session @ tele::end_ns: ?end }])
+            )
+            .count(),
+            0
+        );
+        assert_eq!(
+            find!(
+                duration: u64,
+                pattern!(&facts, [{ session @ tele::duration_ns: ?duration }])
+            )
+            .count(),
+            0
+        );
+        let configs: Vec<Inline<Handle<UTF8String>>> = find!(
+            config: Inline<Handle<UTF8String>>,
+            pattern!(&facts, [{ session @ bench::config: ?config }])
+        )
+        .collect();
+        assert_eq!(configs.len(), 1);
+        let config: anybytes::View<str> = reader.get(configs[0]).unwrap();
+        assert!(config.contains("suite: tribleset-bench test"));
 
         drop(reader);
         pile.close().unwrap();

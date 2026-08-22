@@ -399,17 +399,6 @@ where
         }
     }
 
-    /// The largest few region sizes with their multiplicities — the
-    /// console detail behind [`stats`](CountingArchive::stats).
-    pub fn top_regions(&self, k: usize) -> Vec<(u64, u64)> {
-        let hist = self.hist.lock().expect("region histogram");
-        hist.iter()
-            .rev()
-            .take(k)
-            .map(|(&value, &count)| (value, count))
-            .collect()
-    }
-
     /// Give the wrapped CPU archive back (the timed arms take it from
     /// here — the census builds the archive exactly once).
     pub fn into_archive(self) -> SuccinctArchive<U> {

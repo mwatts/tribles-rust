@@ -49,6 +49,7 @@
 
 use std::time::Instant;
 
+use anyhow::{Context, Result};
 use subject::core::prelude::TribleSet;
 
 mod archq;
@@ -307,8 +308,9 @@ impl Measure {
         }
     }
 
-    /// Write spans + the outcome entity; print one console line.
-    fn emit(self, led: &mut ledger::ResultsLedger, rows_meaningful: bool) {
+    /// Write spans + the outcome entity, durably publish them, then print one
+    /// console line. A publication failure leaves the line unannounced.
+    fn emit(self, led: &mut ledger::ResultsLedger, rows_meaningful: bool) -> Result<()> {
         for (begin_ns, duration_ns) in &self.spans {
             led.span(&self.name, *begin_ns, *duration_ns);
         }
@@ -325,10 +327,17 @@ impl Measure {
             ),
         };
         led.outcome(&self.name, &outcome, rows);
+        led.checkpoint()
+            .with_context(|| format!("publish {} before announcement", self.name))?;
         match rows {
-            Some(n) => println!("  {:<32} {outcome} ({} spans, {n} rows)", self.name, self.spans.len()),
+            Some(n) => println!(
+                "  {:<32} {outcome} ({} spans, {n} rows)",
+                self.name,
+                self.spans.len()
+            ),
             None => println!("  {:<32} {outcome} ({} spans)", self.name, self.spans.len()),
         }
+        Ok(())
     }
 }
 
@@ -357,14 +366,18 @@ fn run_r2(
     base: &Instant,
     build: impl FnOnce() -> TribleSet,
     measures: &[R2Measure],
-) {
+) -> Result<()> {
     let built = match fixtures::quiet_catch(build) {
         Err(msg) => {
             for m in measures {
                 led.outcome(m.name, &format!("panic:{msg}"), None);
+            }
+            led.checkpoint()
+                .context("publish R2 builder failure before announcement")?;
+            for m in measures {
                 println!("  {:<32} panic ({msg})", m.name);
             }
-            return;
+            return Ok(());
         }
         Ok(set) => set,
     };
@@ -379,8 +392,9 @@ fn run_r2(
         if let Some(expected) = spec.expect {
             state.expect_rows(expected);
         }
-        state.emit(led, spec.rows_meaningful);
+        state.emit(led, spec.rows_meaningful)?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -452,17 +466,15 @@ fn run_arch_queries(
     cfg: &Cfg,
     base: &Instant,
     set: &TribleSet,
-) -> bool {
+) -> Result<bool> {
     // Only the device arm can flip this; without the gpu capability
     // there is no second arm to disagree with.
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
     let mut cross_arm_failure = false;
-    let built = Instant::now();
     let archive = fixtures::build_archive(set);
     println!(
-        "arch     : query arm over a {}-trible archive (built in {:.2}s), routing threshold {}",
+        "arch     : query arm over a {}-trible archive, routing threshold {}",
         set.len(),
-        built.elapsed().as_secs_f64(),
         archq::CONFIRM_THRESHOLD
     );
 
@@ -485,9 +497,12 @@ fn run_arch_queries(
                             None,
                         );
                     }
+                    led.checkpoint().with_context(|| {
+                        format!("publish {} region panic before announcement", q.name)
+                    })?;
                     println!("  {:<34} panic ({msg})", q.name);
                 }
-                Ok(answer) => {
+                Ok(_answer) => {
                     let s = ds.facts.stats();
                     for (suffix, value) in [
                         ("confirms", s.confirms),
@@ -503,16 +518,6 @@ fn run_arch_queries(
                             Some(value),
                         );
                     }
-                    println!(
-                        "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}",
-                        q.name, s.confirms, s.max, s.p95, s.median, s.ge_threshold
-                    );
-                    println!(
-                        "      {} | answer {} | widest regions (size x count) {:?}",
-                        q.shape,
-                        answer.value,
-                        ds.facts.top_regions(4)
-                    );
                     // The claim under test is "wide regions at EVERY
                     // level", which the flat histogram above cannot
                     // distinguish from "one enormous root region".
@@ -520,18 +525,8 @@ fn run_arch_queries(
                     #[cfg(feature = "frontier")]
                     let widths: std::collections::BTreeMap<usize, u64> =
                         ds.facts.depth_widths().into_iter().collect();
-                    for (depth, d) in ds.facts.depth_rows() {
-                        #[cfg(feature = "frontier")]
-                        let width = format!(
-                            "{:>10}",
-                            widths.get(&depth).copied().unwrap_or(0)
-                        );
-                        #[cfg(not(feature = "frontier"))]
-                        let width = format!("{:>10}", "n/a");
-                        println!(
-                            "      depth {depth:<2}{:>26}{:>12}{:>11}{:>10}{:>10}{width}",
-                            d.confirms, d.max, d.p95, d.median, d.ge_threshold
-                        );
+                    let depth_rows = ds.facts.depth_rows();
+                    for (depth, d) in &depth_rows {
                         // The depth resolution is the whole claim ("wide
                         // regions at EVERY level", not one big root), so
                         // it belongs on the session axis in the pile and
@@ -554,27 +549,18 @@ fn run_arch_queries(
                         led.outcome(
                             &format!("arch_regions/{}/depth{depth}/width", q.name),
                             "signal",
-                            Some(widths.get(&depth).copied().unwrap_or(0)),
+                            Some(widths.get(depth).copied().unwrap_or(0)),
                         );
                     }
                     // The engine's own view of the same quantity.
                     #[cfg(feature = "frontier")]
-                    {
+                    let frontier = {
                         let f = archq::frontier_summary();
-                        println!(
-                            "      frontier: widest {} | expansions {} | mean width {:.1} \
-                             | proposals {} | descents {} in-place / {} copied",
-                            f.widest,
-                            f.expansions,
-                            f.mean_width(),
-                            f.proposals,
-                            f.inplace_descents,
-                            f.copied_descents
-                        );
                         for (suffix, value) in [
                             ("frontier_widest", f.widest),
                             ("frontier_expansions", f.expansions),
                             ("frontier_rows", f.rows),
+                            ("frontier_proposals", f.proposals),
                             ("frontier_inplace", f.inplace_descents),
                             ("frontier_copied", f.copied_descents),
                         ] {
@@ -584,7 +570,37 @@ fn run_arch_queries(
                                 Some(value),
                             );
                         }
+                        f
+                    };
+                    led.checkpoint().with_context(|| {
+                        format!("publish {} region census before announcement", q.name)
+                    })?;
+                    println!(
+                        "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}",
+                        q.name, s.confirms, s.max, s.p95, s.median, s.ge_threshold
+                    );
+                    println!("      {}", q.shape);
+                    for (depth, d) in depth_rows {
+                        #[cfg(feature = "frontier")]
+                        let width = format!("{:>10}", widths.get(&depth).copied().unwrap_or(0));
+                        #[cfg(not(feature = "frontier"))]
+                        let width = format!("{:>10}", "n/a");
+                        println!(
+                            "      depth {depth:<2}{:>26}{:>12}{:>11}{:>10}{:>10}{width}",
+                            d.confirms, d.max, d.p95, d.median, d.ge_threshold
+                        );
                     }
+                    #[cfg(feature = "frontier")]
+                    println!(
+                        "      frontier: widest {} | expansions {} | mean width {:.1} \
+                         | proposals {} | descents {} in-place / {} copied",
+                        frontier.widest,
+                        frontier.expansions,
+                        frontier.mean_width(),
+                        frontier.proposals,
+                        frontier.inplace_descents,
+                        frontier.copied_descents
+                    );
                 }
             }
         }
@@ -601,7 +617,12 @@ fn run_arch_queries(
                 );
             }
         }
-        println!("  {:<34} SKIP (protocol: no Candidates region)", "regions/live-count");
+        led.checkpoint()
+            .context("publish protocol skip census before announcement")?;
+        println!(
+            "  {:<34} SKIP (protocol: no Candidates region)",
+            "regions/live-count"
+        );
     }
 
     // -- phase 2a: the timed CPU arm ------------------------------------
@@ -615,7 +636,7 @@ fn run_arch_queries(
                 m.iterate(recording, base, || archq::answer_count(&(q.run)(&ds)));
             }
             cpu_counts.push(if m.panicked.is_some() { None } else { m.ident });
-            m.emit(led, true);
+            m.emit(led, true)?;
         }
         ds.facts
     };
@@ -633,7 +654,14 @@ fn run_arch_queries(
                     None,
                 );
             }
-            println!("  {:<32} SKIP (gpu: no triblespace-gpu on the subject)", format!("arch_gpu/{}/total", q.name));
+        }
+        led.checkpoint()
+            .context("publish GPU capability skips before announcement")?;
+        for q in archq::arch_queries::<TribleSet>() {
+            println!(
+                "  {:<32} SKIP (gpu: no triblespace-gpu on the subject)",
+                format!("arch_gpu/{}/total", q.name)
+            );
         }
     }
     #[cfg(feature = "gpu")]
@@ -646,23 +674,28 @@ fn run_arch_queries(
             Ok(Ok(gpu)) => {
                 led.span("arch_gpu/attach/total", attach_begin, attach_ns);
                 led.outcome("arch_gpu/attach/total", "signal", None);
+                led.checkpoint()
+                    .context("publish GPU attach measure before announcement")?;
                 println!(
-                    "  {:<32} signal (1 span, {:.0} ms, min_confirm_batch {})",
+                    "  {:<32} signal (1 span, {:.0} ms)",
                     "arch_gpu/attach/total",
-                    attach_ns as f64 / 1e6,
-                    gpu.min_confirm_batch()
+                    attach_ns as f64 / 1e6
                 );
                 Some(gpu)
             }
             Ok(Err(e)) => {
                 let reason = format!("gate_fail:attach {e:?}");
                 led.outcome("arch_gpu/attach/total", &reason, None);
+                led.checkpoint()
+                    .context("publish GPU attach gate before announcement")?;
                 println!("  {:<32} {reason}", "arch_gpu/attach/total");
                 None
             }
             Err(msg) => {
                 let reason = format!("panic:{msg}");
                 led.outcome("arch_gpu/attach/total", &reason, None);
+                led.checkpoint()
+                    .context("publish GPU attach panic before announcement")?;
                 println!("  {:<32} {reason}", "arch_gpu/attach/total");
                 None
             }
@@ -695,15 +728,19 @@ fn run_arch_queries(
                             archq::answer_count(&(q.run)(&ds))
                         });
                     }
-                    if let (Some(expected), Some(got)) = (cpu, m.ident) {
+                    let cross_arm_message = if let (Some(expected), Some(got)) = (cpu, m.ident) {
                         if *expected != got {
                             cross_arm_failure = true;
-                            eprintln!(
+                            Some(format!(
                                 "CROSS-ARM IDENTITY FAILURE: {} — cpu {expected} rows, gpu {got} rows",
                                 q.name
-                            );
+                            ))
+                        } else {
+                            None
                         }
-                    }
+                    } else {
+                        None
+                    };
                     if let Some(expected) = cpu {
                         m.cross_arm(*expected);
                     }
@@ -721,7 +758,10 @@ fn run_arch_queries(
                             Some(value),
                         );
                     }
-                    m.emit(led, true);
+                    m.emit(led, true)?;
+                    if let Some(message) = cross_arm_message {
+                        eprintln!("{message}");
+                    }
                     println!(
                         "      routing: {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
                         s.gpu_confirms,
@@ -735,10 +775,10 @@ fn run_arch_queries(
         }
     }
 
-    cross_arm_failure
+    Ok(cross_arm_failure)
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cfg = parse_cfg();
 
     if let Some(path) = &cfg.verify {
@@ -746,7 +786,7 @@ fn main() {
             eprintln!("verify failed: {e:?}");
             std::process::exit(1);
         }
-        return;
+        return Ok(());
     }
 
     let (Some(results), Some(label)) = (&cfg.results, &cfg.label) else {
@@ -779,24 +819,21 @@ fn main() {
 
     let suite_start = Instant::now();
     let base = Instant::now();
-    let mut led = match ledger::ResultsLedger::open(results, &commit, label, &config) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("cannot open results ledger: {e:?}");
-            std::process::exit(1);
-        }
-    };
+    let mut led = ledger::ResultsLedger::open(results, &commit, label, &config)
+        .context("open results ledger and publish session start")?;
     println!("session  : {:X}", led.session());
 
     // -- ladder + arch -----------------------------------------------------
     let dataset = match &cfg.data {
         None => {
-            println!("  {:<32} SKIP (no --data)", "ladder/checkout/total");
             led.outcome("ladder/checkout/total", "skip:no-data", None);
             led.outcome("ladder/checkout/digest", "skip:no-data", None);
-            println!("  {:<32} SKIP (no --data)", "arch/build_ram/total");
             led.outcome("arch/build_ram/total", "skip:no-data", None);
             skip_arch_queries(&mut led, "skip:no-data");
+            led.checkpoint()
+                .context("publish no-data skips before announcement")?;
+            println!("  {:<32} SKIP (no --data)", "ladder/checkout/total");
+            println!("  {:<32} SKIP (no --data)", "arch/build_ram/total");
             None
         }
         Some(path) => {
@@ -820,6 +857,8 @@ fn main() {
                     // only the digest tells two runs of the same rung
                     // apart (see fixtures::set_digest).
                     led.outcome("ladder/checkout/digest", "signal", Some(digest));
+                    led.checkpoint()
+                        .context("publish checkout measure before announcement")?;
                     println!(
                         "  {:<32} signal ({} spans, {tribles} tribles, digest {digest:016X})",
                         "ladder/checkout/total",
@@ -831,6 +870,8 @@ fn main() {
                     let reason = format!("gate_fail:{gate}");
                     led.outcome("ladder/checkout/total", &reason, None);
                     led.outcome("ladder/checkout/digest", &reason, None);
+                    led.checkpoint()
+                        .context("publish checkout gate before announcement")?;
                     println!("  {:<32} gate_fail ({gate})", "ladder/checkout/total");
                     None
                 }
@@ -838,6 +879,8 @@ fn main() {
                     let reason = format!("panic:{msg}");
                     led.outcome("ladder/checkout/total", &reason, None);
                     led.outcome("ladder/checkout/digest", &reason, None);
+                    led.checkpoint()
+                        .context("publish checkout panic before announcement")?;
                     println!("  {:<32} panic ({msg})", "ladder/checkout/total");
                     None
                 }
@@ -848,12 +891,14 @@ fn main() {
     if let Some(set) = &dataset {
         if set.len() > MAX_RAM {
             led.outcome("arch/build_ram/total", "skip:max-ram", None);
+            skip_arch_queries(&mut led, "skip:max-ram");
+            led.checkpoint()
+                .context("publish max-RAM skips before announcement")?;
             println!(
                 "  {:<32} SKIP ({} tribles > max-ram {MAX_RAM})",
                 "arch/build_ram/total",
                 set.len()
             );
-            skip_arch_queries(&mut led, "skip:max-ram");
         } else {
             let mut m = Measure::new("arch/build_ram/total");
             for i in 0..(cfg.build_warmup + cfg.build_iters) {
@@ -864,23 +909,30 @@ fn main() {
                     set.len()
                 });
             }
-            m.emit(&mut led, true);
-            cross_arm_failure = run_arch_queries(&mut led, &cfg, &base, set);
+            m.emit(&mut led, true)?;
+            cross_arm_failure = run_arch_queries(&mut led, &cfg, &base, set)?;
         }
     }
 
     // -- harkonnen ---------------------------------------------------------
     #[cfg(not(feature = "rpq"))]
-    for name in [
-        "harkonnen/F1/ttfr",
-        "harkonnen/F1/total",
-        "harkonnen/F2/ttfr",
-        "harkonnen/F2/total",
-        "harkonnen/F4/ttfr",
-        "harkonnen/F4/total",
-    ] {
-        led.outcome(name, "skip:rpq", None);
-        println!("  {name:<32} SKIP (rpq: no regular-path constraint)");
+    {
+        let names = [
+            "harkonnen/F1/ttfr",
+            "harkonnen/F1/total",
+            "harkonnen/F2/ttfr",
+            "harkonnen/F2/total",
+            "harkonnen/F4/ttfr",
+            "harkonnen/F4/total",
+        ];
+        for name in names {
+            led.outcome(name, "skip:rpq", None);
+        }
+        led.checkpoint()
+            .context("publish RPQ capability skips before announcement")?;
+        for name in names {
+            println!("  {name:<32} SKIP (rpq: no regular-path constraint)");
+        }
     }
 
     match fixtures::quiet_catch(|| {
@@ -890,13 +942,18 @@ fn main() {
         )
     }) {
         Err(msg) => {
-            for name in [
+            let names = [
                 "harkonnen/F3/ttfr",
                 "harkonnen/F3/total",
                 "harkonnen/F5/ttfr",
                 "harkonnen/F5/total",
-            ] {
+            ];
+            for name in names {
                 led.outcome(name, &format!("panic:{msg}"), None);
+            }
+            led.checkpoint()
+                .context("publish F3/F5 builder panic before announcement")?;
+            for name in names {
                 println!("  {name:<32} panic ({msg})");
             }
         }
@@ -914,10 +971,10 @@ fn main() {
             }
             f3_total.expect_rows(fixtures::F3_EXPECTED_ROWS);
             f5_total.expect_rows(fixtures::F5_EXPECTED_ROWS);
-            f3_ttfr.emit(&mut led, false);
-            f3_total.emit(&mut led, true);
-            f5_ttfr.emit(&mut led, false);
-            f5_total.emit(&mut led, true);
+            f3_ttfr.emit(&mut led, false)?;
+            f3_total.emit(&mut led, true)?;
+            f5_ttfr.emit(&mut led, false)?;
+            f5_total.emit(&mut led, true)?;
         }
     }
 
@@ -937,7 +994,7 @@ fn main() {
             expect: Some(fixtures::F6_EXPECTED_ROWS),
             run: fixtures::f6_total,
         }],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -950,7 +1007,7 @@ fn main() {
             expect: Some(fixtures::F7_EXPECTED_ROWS),
             run: fixtures::f7_total,
         }],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -971,7 +1028,7 @@ fn main() {
                 run: fixtures::f8_distinct,
             },
         ],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -984,7 +1041,7 @@ fn main() {
             expect: Some(fixtures::F9_SPARSE_EXPECTED_ROWS),
             run: fixtures::f9_total,
         }],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -997,12 +1054,19 @@ fn main() {
             expect: Some(fixtures::F9_DENSE_EXPECTED_ROWS),
             run: fixtures::f9_total,
         }],
-    );
+    )?;
 
     #[cfg(not(feature = "gpu"))]
-    for name in ["harkonnen/F10/below", "harkonnen/F10/above"] {
-        led.outcome(name, "skip:gpu", None);
-        println!("  {name:<32} SKIP (gpu: no triblespace-gpu on the subject)");
+    {
+        let names = ["harkonnen/F10/below", "harkonnen/F10/above"];
+        for name in names {
+            led.outcome(name, "skip:gpu", None);
+        }
+        led.checkpoint()
+            .context("publish F10 GPU capability skips before announcement")?;
+        for name in names {
+            println!("  {name:<32} SKIP (gpu: no triblespace-gpu on the subject)");
+        }
     }
     #[cfg(feature = "gpu")]
     {
@@ -1018,7 +1082,7 @@ fn main() {
                 expect: Some(fixtures::F10_BELOW),
                 run: |set| fixtures::f10_total(false, set),
             }],
-        );
+        )?;
         run_r2(
             &mut led,
             cfg.warmup,
@@ -1031,7 +1095,7 @@ fn main() {
                 expect: Some(fixtures::F10_ABOVE),
                 run: |set| fixtures::f10_total(true, set),
             }],
-        );
+        )?;
     }
 
     run_r2(
@@ -1062,7 +1126,7 @@ fn main() {
                 run: fixtures::f11_under,
             },
         ],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -1075,7 +1139,7 @@ fn main() {
             expect: Some(fixtures::F12_EXPECTED_ROWS),
             run: fixtures::f12_total,
         }],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -1096,7 +1160,7 @@ fn main() {
                 run: fixtures::f13_total,
             },
         ],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -1117,7 +1181,7 @@ fn main() {
                 run: fixtures::f14_total,
             },
         ],
-    );
+    )?;
     run_r2(
         &mut led,
         cfg.warmup,
@@ -1130,7 +1194,7 @@ fn main() {
             expect: Some(fixtures::F15_EXPECTED_ROWS),
             run: fixtures::f15_total,
         }],
-    );
+    )?;
 
     // -- sparqloscope ------------------------------------------------------
     // No wd Dataset loader is vendored (the pile manifest schema and
@@ -1153,6 +1217,8 @@ fn main() {
     for name in queries::SKIPPED_PATHS {
         led.outcome(&format!("sparqloscope/{name}/total"), "skip:rpq", None);
     }
+    led.checkpoint()
+        .context("publish SPARQLoscope census before announcement")?;
     println!(
         "  sparqloscope census              {} dataset-absent ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery) + {} rpq",
         queries::TRANSLATED.len(),
@@ -1161,10 +1227,8 @@ fn main() {
 
     // -- close -------------------------------------------------------------
     let end_ns = base.elapsed().as_nanos() as u64;
-    if let Err(e) = led.finish(end_ns) {
-        eprintln!("cannot finish results session: {e:?}");
-        std::process::exit(1);
-    }
+    led.finish(end_ns)
+        .context("publish and close results session")?;
     println!(
         "done     : suite ran {:.2}s, results in {}",
         suite_start.elapsed().as_secs_f64(),
@@ -1178,4 +1242,5 @@ fn main() {
         eprintln!("FAIL     : cross-arm identity failed (see gate_fail outcomes above)");
         std::process::exit(1);
     }
+    Ok(())
 }

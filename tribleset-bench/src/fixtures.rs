@@ -519,8 +519,9 @@ pub fn pile_checkout(
     // makes it exactly `n` no matter what came out of the checkout, so
     // a checkout that returned a different set would slide the cut
     // point and silently change the workload while the gate reported
-    // identity. All three are checked and printed, so the same rung is
-    // comparable across RUNS as well as across iterations.
+    // identity. All three gate cross-iteration identity; the caller durably
+    // publishes the carved size and content digest before announcing them, so
+    // the measured workload remains comparable across runs.
     let mut ident: Option<(usize, usize, u64)> = None;
     let mut gate: Option<String> = None;
     for i in 0..(warmup + iters) {
@@ -557,10 +558,7 @@ pub fn pile_checkout(
     if let Some(g) = gate {
         return Err(g);
     }
-    let (checked_out, carved, digest) = ident.unwrap_or((0, 0, 0));
-    println!(
-        "checkout : {checked_out} tribles from {k} commit(s) -> {carved} after carve, digest {digest:016X}"
-    );
+    let (_, carved, digest) = ident.unwrap_or((0, 0, 0));
     Ok((out.expect("at least one iteration"), spans, carved, digest))
 }
 

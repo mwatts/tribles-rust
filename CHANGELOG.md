@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make `tribleset-bench` result announcements interruption-safe. Session start
+  and each announced result batch are now committed through the native results
+  collection and explicitly flushed before stdout; failed publication retains
+  the pending fragment for retry, while only a successful final checkpoint
+  carries the session end marker and `--verify` labels interrupted sessions as
+  incomplete.
+
 - Rename the arbitrarily sized UTF-8 blob encoding from `LongString` to
   `UTF8String`, including its module and all current examples, tests, and
   documentation. The pinned encoding ID and payload bytes are unchanged, so
