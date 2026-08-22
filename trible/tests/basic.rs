@@ -1,6 +1,56 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+fn help(args: &[&str]) -> String {
+    let output = Command::cargo_bin("trible")
+        .unwrap()
+        .args(args)
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn has_command(help: &str, name: &str) -> bool {
+    help.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
+}
+
+#[test]
+fn legacy_mutation_commands_are_absent() {
+    let top = help(&[]);
+    assert!(!has_command(&top, "branch"));
+
+    let pile = help(&["pile"]);
+    for removed in ["branch", "pin", "merge", "squash", "extract", "reid"] {
+        assert!(
+            !has_command(&pile, removed),
+            "removed pile command {removed:?} remains in help:\n{pile}"
+        );
+    }
+    for retained in ["blob", "collection", "migrate", "net"] {
+        assert!(
+            has_command(&pile, retained),
+            "retained pile command {retained:?} is missing from help:\n{pile}"
+        );
+    }
+
+    let store = help(&["store"]);
+    assert!(!has_command(&store, "branch"));
+    assert!(has_command(&store, "blob"));
+
+    let migrate = help(&["pile", "migrate", "unused.pile"]);
+    assert!(has_command(&migrate, "branch-to-collection"));
+    assert!(has_command(&migrate, "reframe"));
+    let run = help(&["pile", "migrate", "unused.pile", "run"]);
+    assert!(!run.contains("branch-metadata-name"));
+    assert!(!run.contains("no-rename-duplicates"));
+}
+
 #[test]
 fn signing_key_init_is_explicit_and_idempotent() {
     let directory = tempfile::tempdir().unwrap();

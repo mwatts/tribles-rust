@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 pub enum Command {
-    /// Verify pile integrity (blob hash validation + branch commit-chain checks).
+    /// Verify pile integrity (blob hashes + legacy branch commit chains).
     Check {
         /// Path to the pile file to inspect
         pile: PathBuf,
@@ -96,14 +96,14 @@ fn scan_record_evidence(pile_path: &Path) -> Result<RecordEvidence> {
 
 fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace::prelude::blobencodings::{SimpleArchive, UTF8String};
-    use triblespace::prelude::{BlobStore, BlobStoreGet, PinStore};
+    use triblespace::prelude::{BlobStore, BlobStoreGet};
 
     use triblespace_core::id::id_hex;
     use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
     use triblespace_core::inline::Inline;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::repo::pile::{Pile, ReadError};
-    use triblespace_core::repo::{self, BlobStoreMeta};
+    use triblespace_core::repo::{self, BlobStoreMeta, PinSnapshotSource};
     use triblespace_core::trible::TribleSet;
 
     match Pile::open(pile_path) {
@@ -260,12 +260,14 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                     (count, None)
                 }
 
-                // Ensure in-memory indices are loaded before enumerating branches.
-                pile.refresh()?;
-                let iter = pile.pins()?;
-                for r in iter {
-                    let bid = r?;
-                    let meta_handle_opt = pile.head(bid)?;
+                // Legacy pins are migration evidence, not an operational
+                // mutable branch API. Diagnose them through the immutable
+                // snapshot surface retained for forensic reads.
+                let pins = pile.snapshot_pin_heads()?;
+                for raw in pins.iter_ordered() {
+                    let bid = triblespace_core::id::Id::new(*raw)
+                        .expect("pin snapshot cannot contain the nil id");
+                    let meta_handle_opt = pins.get(raw).copied();
                     let id_hex = format!("{bid:X}");
                     match meta_handle_opt {
                         None => {

@@ -1,20 +1,9 @@
 use assert_cmd::Command;
-use ed25519_dalek::SigningKey;
 use predicates::prelude::*;
 use tempfile::tempdir;
 use triblespace::prelude::BlobStore;
-use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStoreList;
-use triblespace::prelude::PinStore;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::Repository;
-use triblespace_core::trible::TribleSet;
-
-fn random_signing_key() -> SigningKey {
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).expect("getrandom");
-    SigningKey::from_bytes(&seed)
-}
 
 fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
     let mut record = vec![0u8; 256];
@@ -55,151 +44,6 @@ fn legacy_v3_definition_followed_by_blob() -> Vec<u8> {
 }
 
 #[test]
-fn list_branches_outputs_branch_id() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.pile");
-    std::fs::File::create(&path).unwrap();
-
-    {
-        let pile: Pile = Pile::open(&path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
-        repo.create_branch("main", None).expect("create branch");
-        repo.into_storage().close().unwrap();
-    }
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["pile", "branch", "list", path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::is_match("^[A-F0-9]{32}\\t-\\tmain\\n$").unwrap());
-}
-
-#[test]
-fn list_branches_crosses_opaque_envelopes() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("opaque-before-branch.pile");
-    std::fs::write(&path, opaque_envelope(None)).unwrap();
-
-    {
-        let pile = Pile::open(&path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
-        repo.create_branch("after-opaque", None)
-            .expect("create branch after opaque record");
-        repo.into_storage().close().unwrap();
-    }
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["pile", "branch", "list", path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::is_match("^[A-F0-9]{32}\\t-\\tafter-opaque\\n$").unwrap());
-}
-
-#[test]
-fn delete_branch_removes_branch_id_from_list() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("delete_test.pile");
-    std::fs::File::create(&path).unwrap();
-
-    let branch_id = {
-        let pile: Pile = Pile::open(&path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
-        let branch_id = repo.create_branch("main", None).expect("create branch");
-        let pile = repo.into_storage();
-        pile.close().unwrap();
-        *branch_id
-    };
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "branch",
-            "delete",
-            path.to_str().unwrap(),
-            &format!("{branch_id:X}"),
-        ])
-        .assert()
-        .success();
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["pile", "branch", "list", path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::is_empty());
-
-    let mut pile: Pile = Pile::open(&path).unwrap();
-    pile.refresh().unwrap();
-    assert_eq!(pile.head(branch_id).unwrap(), None);
-    pile.close().unwrap();
-}
-
-#[test]
-fn branch_stats_reports_fast_and_full_counts() {
-    use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::*;
-
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("stats_test.pile");
-    std::fs::File::create(&path).unwrap();
-
-    let branch_id = {
-        let pile: Pile = Pile::open(&path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
-        let branch_id = repo.create_branch("main", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull");
-
-        let entity_id = ufoid();
-        let mut content = TribleSet::new();
-        let label = ws.put::<UTF8String, _>("stats-test".to_string());
-        content += entity! { &entity_id @ triblespace_core::metadata::name: label };
-        ws.commit(content, "seed");
-
-        let push_res = repo.try_push(&mut ws).expect("push");
-        assert!(push_res.is_none(), "unexpected push conflict");
-
-        let pile = repo.into_storage();
-        pile.close().unwrap();
-        *branch_id
-    };
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "branch",
-            "stats",
-            path.to_str().unwrap(),
-            &format!("{branch_id:X}"),
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Commits: 1"))
-        .stdout(predicate::str::contains("Content blobs (accum): 1"))
-        .stdout(predicate::str::contains("Content bytes (accum): 64"))
-        .stdout(predicate::str::contains("Triples (accum): 1"));
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "branch",
-            "stats",
-            path.to_str().unwrap(),
-            &format!("{branch_id:X}"),
-            "--full",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Triples (unique): 1"))
-        .stdout(predicate::str::contains("Entities: 1"))
-        .stdout(predicate::str::contains("Attributes: 1"));
-}
-
-#[test]
 fn create_initializes_empty_pile() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("create_test.pile");
@@ -212,12 +56,9 @@ fn create_initializes_empty_pile() {
         .success()
         .stdout(predicate::str::is_empty());
 
-    let mut pile: Pile = Pile::open(&path).unwrap();
-    // Explicitly refresh after open to populate in-memory indices.
-    pile.refresh().unwrap();
-    let mut iter = pile.pins().unwrap();
-    assert!(iter.next().is_none());
+    let pile: Pile = Pile::open(&path).unwrap();
     pile.close().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 }
 
 #[test]
@@ -713,113 +554,8 @@ fn diagnose_locate_hash_reports_header_and_payload_refs() {
         .stdout(predicate::str::contains("Summary"));
 }
 
-#[test]
-fn pile_branch_create_outputs_id() {
-    let dir = tempdir().unwrap();
-    let pile_path = dir.path().join("create_branch.pile");
-    std::fs::File::create(&pile_path).unwrap();
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "branch",
-            "create",
-            pile_path.to_str().unwrap(),
-            "main",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::is_match("^[A-F0-9]{32}\\n$").unwrap());
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["pile", "branch", "list", pile_path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::is_match("^[A-F0-9]{32}\\t-\\tmain\\n$").unwrap());
-}
-
-#[test]
-fn reid_and_rename_preserve_unrelated_branch_annotations() {
-    use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::entity;
-    use triblespace::prelude::BlobStorePut;
-    use triblespace_core::metadata;
-    use triblespace_core::repo;
-
-    let dir = tempdir().unwrap();
-    let source_path = dir.path().join("annotation-source.pile");
-    let reid_path = dir.path().join("annotation-reid.pile");
-    std::fs::File::create(&source_path).unwrap();
-
-    let annotations: TribleSet = entity! {
-        metadata::tag*: [metadata::KIND_TAG, metadata::KIND_MULTI],
-    }
-    .into();
-    {
-        let mut pile = Pile::open(&source_path).unwrap();
-        let branch_id = triblespace_core::id::genid();
-        let name = pile.put::<UTF8String, _>("original".to_string()).unwrap();
-        let mut metadata =
-            repo::branch::branch_metadata(&random_signing_key(), *branch_id, name, None);
-        metadata += annotations.clone();
-        let metadata_handle = pile.put(metadata).unwrap();
-        pile.update(*branch_id, None, Some(metadata_handle))
-            .unwrap();
-        pile.close().unwrap();
-    }
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "reid",
-            source_path.to_str().unwrap(),
-            reid_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-
-    let reid_branch = {
-        let mut pile = Pile::open(&reid_path).unwrap();
-        pile.refresh().unwrap();
-        let branch = pile.pins().unwrap().next().unwrap().unwrap();
-        let metadata_handle = pile.head(branch).unwrap().unwrap();
-        let reader = pile.reader().unwrap();
-        let metadata: TribleSet = reader.get(metadata_handle).unwrap();
-        assert!(annotations.iter().all(|fact| metadata.contains(fact)));
-        drop(reader);
-        pile.close().unwrap();
-        branch
-    };
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "branch",
-            "rename",
-            reid_path.to_str().unwrap(),
-            &format!("{reid_branch:X}"),
-            "renamed",
-        ])
-        .assert()
-        .success();
-
-    let mut pile = Pile::open(&reid_path).unwrap();
-    pile.refresh().unwrap();
-    let metadata_handle = pile.head(reid_branch).unwrap().unwrap();
-    let reader = pile.reader().unwrap();
-    let metadata: TribleSet = reader.get(metadata_handle).unwrap();
-    assert!(annotations.iter().all(|fact| metadata.contains(fact)));
-    drop(reader);
-    pile.close().unwrap();
-}
-
-/// A malformed or incomplete source pile must make `reid`, `squash`, and
-/// `migrate` fail loud with a boundary-confirmed repair path, without
-/// truncating the source file.
+/// A malformed or incomplete source pile must make `migrate` fail loud with a
+/// boundary-confirmed repair path, without truncating the source file.
 #[test]
 fn corrupt_source_fails_loud_without_truncation() {
     use std::io::Write;
@@ -827,14 +563,6 @@ fn corrupt_source_fails_loud_without_truncation() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("corrupt_src.pile");
     std::fs::File::create(&src_path).unwrap();
-
-    // Seed a valid pile with one branch.
-    {
-        let pile: Pile = Pile::open(&src_path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
-        repo.create_branch("main", None).expect("create branch");
-        repo.into_storage().close().unwrap();
-    }
 
     // Tear the tail before even a complete record marker has landed.
     {
@@ -851,42 +579,6 @@ fn corrupt_source_fails_loud_without_truncation() {
         predicate::str::contains("cannot prove")
             .and(predicate::str::contains("--truncate-to <BYTE_OFFSET>"))
     };
-
-    // reid: fails loud, source untouched, destination never created.
-    let dest = dir.path().join("reid_dst.pile");
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "reid",
-            src_path.to_str().unwrap(),
-            dest.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(fail_loud());
-    assert!(
-        !dest.exists(),
-        "reid must not create dest on corrupt source"
-    );
-
-    // squash: same contract.
-    let dest = dir.path().join("squash_dst.pile");
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "squash",
-            src_path.to_str().unwrap(),
-            dest.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(fail_loud());
-    assert!(
-        !dest.exists(),
-        "squash must not create dest on corrupt source"
-    );
 
     // migrate (in-place rewrite): still refuses to open a corrupt pile.
     Command::cargo_bin("trible")

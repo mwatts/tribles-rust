@@ -6,44 +6,14 @@ use std::path::{Path, PathBuf};
 use triblespace_core::repo::pile::{Pile, ReadError};
 
 pub mod blob;
-pub mod branch;
 pub mod collection;
 mod diagnose;
-mod extract;
-mod merge;
 mod migrate;
 pub mod net;
-pub mod pin;
-mod reid;
 mod signing;
-mod squash;
 
 #[derive(Parser)]
 pub enum PileCommand {
-    /// Operations on the commit-chain branches stored in a pile file.
-    ///
-    /// A branch is a named pin holding one commit-chain head, and it is a
-    /// different thing from a collection: a branch has a head that moves and
-    /// a history to walk back, while a collection is a grow-only set named
-    /// within a team whose identity is its descriptor. Both live in a pile.
-    /// `branch list` shows the branches with commit-aware columns; for the
-    /// raw pin view underneath them see `pile pin`, and for collections see
-    /// `pile collection`.
-    Branch {
-        #[command(subcommand)]
-        cmd: branch::Command,
-    },
-    /// Operations on pins, the storage primitive a branch is made of.
-    ///
-    /// A pin is a mutable CAS cell in the pile; a branch is a pin that
-    /// carries a name and a commit head. Everything in the pile that pins
-    /// something shows up here regardless of role, which is why this is the
-    /// view for anonymous or stale cells. For the branch-specific view see
-    /// `pile branch`.
-    Pin {
-        #[command(subcommand)]
-        cmd: pin::Command,
-    },
     /// Operations on blobs stored in a pile file.
     Blob {
         #[command(subcommand)]
@@ -64,19 +34,6 @@ pub enum PileCommand {
     SigningKey {
         #[command(subcommand)]
         cmd: signing::Command,
-    },
-    /// Merge source branch heads into a target branch.
-    Merge {
-        /// Path to the pile file to modify
-        pile: PathBuf,
-        /// Target branch id (hex)
-        target: String,
-        /// Source branch id(s) (hex)
-        #[arg(num_args = 1..)]
-        sources: Vec<String>,
-        /// Optional signing key path. The file should contain a 64-char hex seed.
-        #[arg(long)]
-        signing_key: Option<PathBuf>,
     },
     /// Create a new empty pile file.
     ///
@@ -127,62 +84,6 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: net::Command,
     },
-    /// Squash all branch histories into single commits in a new pile.
-    ///
-    /// For each branch, the full accumulated content and metadata are
-    /// checked out and written as a single commit. Only blobs reachable
-    /// from the squashed content are copied. The result is a minimal
-    /// pile with clean commit timestamps and no orphaned data.
-    Squash {
-        /// Source pile file
-        source: PathBuf,
-        /// Destination pile file (will be created)
-        dest: PathBuf,
-        /// Only include these branches (by name or hex ID). If omitted, all branches are included.
-        #[arg(long)]
-        include: Vec<String>,
-        /// Exclude these branches (by name or hex ID).
-        #[arg(long)]
-        exclude: Vec<String>,
-        /// Optional signing key path
-        #[arg(long)]
-        signing_key: Option<PathBuf>,
-    },
-    /// Stream one branch's commit chain into a fresh pile.
-    ///
-    /// The scalable single-branch alternative to `squash`: the branch's
-    /// content is never materialized. Commits are walked oldest → newest
-    /// and each content delta blob is copied as raw bytes into the
-    /// destination, where a fresh commit is minted per original commit
-    /// (preserving messages and per-commit deltas). Peak memory stays
-    /// proportional to one commit's blob references, so this works on
-    /// piles far larger than RAM. Prints a per-commit ladder table with
-    /// running cumulative trible counts.
-    Extract {
-        /// Source pile file
-        source: PathBuf,
-        /// Destination pile file (will be created)
-        dest: PathBuf,
-        /// Branch to extract (name or hex id)
-        #[arg(long)]
-        branch: String,
-    },
-    /// Re-id every branch into a new pile, preserving names + full history.
-    ///
-    /// Each branch keeps its name and head commit, but receives a freshly
-    /// minted branch id; the full reachable blob graph is copied unchanged
-    /// (unlike `squash`, which collapses history). Use this to de-alias two
-    /// piles that share branch ids before `cat` + `branch consolidate
-    /// --by-name`.
-    Reid {
-        /// Source pile file
-        source: PathBuf,
-        /// Destination pile file (will be created)
-        dest: PathBuf,
-        /// Optional signing key path
-        #[arg(long)]
-        signing_key: Option<PathBuf>,
-    },
 }
 
 /// Turn a pile read failure into an operator-facing diagnostic without
@@ -225,17 +126,9 @@ pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
 
 pub fn run(cmd: PileCommand) -> Result<()> {
     match cmd {
-        PileCommand::Branch { cmd } => branch::run(cmd),
-        PileCommand::Pin { cmd } => pin::run(cmd),
         PileCommand::Blob { cmd } => blob::run(cmd),
         PileCommand::Collection { cmd } => collection::run(cmd),
         PileCommand::SigningKey { cmd } => signing::run(cmd),
-        PileCommand::Merge {
-            pile,
-            target,
-            sources,
-            signing_key,
-        } => merge::run(pile, target, sources, signing_key),
         PileCommand::Create { path } => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -287,22 +180,5 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             Ok(())
         }
         PileCommand::Migrate { pile, cmd } => migrate::run(pile, cmd),
-        PileCommand::Squash {
-            source,
-            dest,
-            include,
-            exclude,
-            signing_key,
-        } => squash::run(source, dest, signing_key, include, exclude),
-        PileCommand::Extract {
-            source,
-            dest,
-            branch,
-        } => extract::run(source, dest, branch),
-        PileCommand::Reid {
-            source,
-            dest,
-            signing_key,
-        } => reid::run(source, dest, signing_key),
     }
 }
