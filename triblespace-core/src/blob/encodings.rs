@@ -2,8 +2,6 @@
 
 /// Flat typed array blob encoding.
 pub mod array;
-/// Arbitrary-length UTF-8 text blob encoding.
-pub mod longstring;
 /// Opaque raw bytes blob encoding (positive choice, distinct from UnknownBlob).
 pub mod rawbytes;
 /// Canonical trible sequence blob encoding.
@@ -11,6 +9,8 @@ pub mod simplearchive;
 /// Succinct (Ring-based) compressed trible archive blob encoding.
 pub mod succinctarchive;
 pub mod tensor;
+/// Arbitrary-length UTF-8 text blob encoding.
+pub mod utf8string;
 /// WebAssembly bytecode blob encoding.
 pub mod wasmcode;
 
@@ -42,7 +42,7 @@ impl MetaDescribe for UnknownBlob {
         let id = id_hex!("EAB14005141181B0C10C4B5DD7985F8D");
         entity! { crate::id::ExclusiveId::force_ref(&id) @
             metadata::name:        "UnknownBlob",
-            metadata::description: "Fallback blob encoding for byte payloads with no known type. Discouraged in practice — use a specific blob encoding (e.g. `LongString`, `Array<T>`, `SimpleArchive`) instead.",
+            metadata::description: "Fallback blob encoding for byte payloads with no known type. Discouraged in practice — use a specific blob encoding (e.g. `UTF8String`, `Array<T>`, `SimpleArchive`) instead.",
             metadata::tag:         metadata::KIND_BLOB_ENCODING,
         }
     }

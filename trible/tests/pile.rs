@@ -139,7 +139,7 @@ fn delete_branch_removes_branch_id_from_list() {
 
 #[test]
 fn branch_stats_reports_fast_and_full_counts() {
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::*;
 
     let dir = tempdir().unwrap();
@@ -154,7 +154,7 @@ fn branch_stats_reports_fast_and_full_counts() {
 
         let entity_id = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<LongString, _>("stats-test".to_string());
+        let label = ws.put::<UTF8String, _>("stats-test".to_string());
         content += entity! { &entity_id @ triblespace_core::metadata::name: label };
         ws.commit(content, "seed");
 
@@ -742,7 +742,7 @@ fn pile_branch_create_outputs_id() {
 
 #[test]
 fn reid_and_rename_preserve_unrelated_branch_annotations() {
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::entity;
     use triblespace::prelude::BlobStorePut;
     use triblespace_core::metadata;
@@ -760,7 +760,7 @@ fn reid_and_rename_preserve_unrelated_branch_annotations() {
     {
         let mut pile = Pile::open(&source_path).unwrap();
         let branch_id = triblespace_core::id::genid();
-        let name = pile.put::<LongString, _>("original".to_string()).unwrap();
+        let name = pile.put::<UTF8String, _>("original".to_string()).unwrap();
         let mut metadata =
             repo::branch::branch_metadata(&random_signing_key(), *branch_id, name, None);
         metadata += annotations.clone();

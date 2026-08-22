@@ -100,11 +100,11 @@ fn classify(meta: &TribleSet, pin_id: Id) -> Role {
     // pin's role.
     if let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, pin_id) {
         let mut name_iter = find!(
-            h: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
+            h: Inline<Handle<triblespace_core::blob::encodings::utf8string::UTF8String>>,
             pattern!(meta, [{ branch_entity @ triblespace_core::metadata::name: ?h }])
         );
         if name_iter.next().is_some() {
-            // We don't dereference the LongString here (would require an
+            // We don't dereference the UTF8String here (would require an
             // extra blob fetch); the branch row shows the *id* with a
             // hint that it's named — `pile branch list` is the place to
             // get the resolved name.

@@ -201,7 +201,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
 
-    use crate::blob::encodings::longstring::LongString;
+    use crate::blob::encodings::utf8string::UTF8String;
     use crate::blob::{Blob, IntoBlob, MemoryBlobStore};
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
@@ -347,11 +347,11 @@ mod tests {
     fn authorized_commits_are_exact_strong_roots_and_keep_attachments() {
         let descriptor = test_root("source");
         let key = SigningKey::from_bytes(&[7; 32]);
-        let content_text: Blob<LongString> = "retained content".to_owned().to_blob();
+        let content_text: Blob<UTF8String> = "retained content".to_owned().to_blob();
         let content_text_handle = content_text.get_handle();
-        let metadata_text: Blob<LongString> = "retained metadata".to_owned().to_blob();
+        let metadata_text: Blob<UTF8String> = "retained metadata".to_owned().to_blob();
         let metadata_text_handle = metadata_text.get_handle();
-        let orphan: Blob<LongString> = "orphan".to_owned().to_blob();
+        let orphan: Blob<UTF8String> = "orphan".to_owned().to_blob();
         let orphan_handle = orphan.get_handle();
 
         let content = entity! { metadata::name: content_text_handle }
@@ -408,12 +408,12 @@ mod tests {
             .get::<Blob<SimpleArchive>, _>(commit.metadata())
             .is_ok());
         assert!(reader
-            .get::<Blob<LongString>, _>(content_text_handle)
+            .get::<Blob<UTF8String>, _>(content_text_handle)
             .is_ok());
         assert!(reader
-            .get::<Blob<LongString>, _>(metadata_text_handle)
+            .get::<Blob<UTF8String>, _>(metadata_text_handle)
             .is_ok());
-        assert!(reader.get::<Blob<LongString>, _>(orphan_handle).is_err());
+        assert!(reader.get::<Blob<UTF8String>, _>(orphan_handle).is_err());
     }
 
     #[test]

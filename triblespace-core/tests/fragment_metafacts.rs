@@ -2,20 +2,20 @@
 //! content-addressed blob store shared by both fact sets.
 
 use anybytes::View;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::inlineencodings::GenId;
 use triblespace_core::prelude::*;
 
 attributes! {
     /// Data-side text whose declaration documentation lives in metafacts.
-    fm_required: Handle<LongString>;
+    fm_required: Handle<UTF8String>;
     /// An optional data-side text field.
-    fm_optional: Handle<LongString>;
+    fm_optional: Handle<UTF8String>;
     /// A repeated data-side text field.
-    fm_repeated: Handle<LongString>;
+    fm_repeated: Handle<UTF8String>;
     /// Text carried by a child fragment spread into its parent.
-    fm_child_text: Handle<LongString>;
+    fm_child_text: Handle<UTF8String>;
     /// Links from a parent to the roots exported by a spread fragment.
     fm_children: GenId;
 }
@@ -82,8 +82,8 @@ fn fragment_merge_deduplicates_descriptions_and_unions_the_shared_store() {
         "metadata blobs common to both fragments should deduplicate"
     );
 
-    let handles: Vec<Inline<Handle<LongString>>> = find!(
-        (value: Inline<Handle<LongString>>),
+    let handles: Vec<Inline<Handle<UTF8String>>> = find!(
+        (value: Inline<Handle<UTF8String>>),
         pattern!(&left, [{ fm_required: ?value }])
     )
     .map(|(value,)| value)
@@ -96,7 +96,7 @@ fn fragment_merge_deduplicates_descriptions_and_unions_the_shared_store() {
         .into_iter()
         .map(|handle| {
             let value: View<str> = reader
-                .get::<View<str>, LongString>(handle)
+                .get::<View<str>, UTF8String>(handle)
                 .expect("each merged data handle resolves");
             value.to_string()
         })
@@ -115,8 +115,8 @@ fn spreading_a_fragment_preserves_the_child_metafacts() {
     assert!(describes(&parent, fm_children.id()));
     assert!(describes(&parent, fm_child_text.id()));
 
-    let nested: Vec<Inline<Handle<LongString>>> = find!(
-        (value: Inline<Handle<LongString>>),
+    let nested: Vec<Inline<Handle<UTF8String>>> = find!(
+        (value: Inline<Handle<UTF8String>>),
         pattern!(&parent, [{ child_id @ fm_child_text: ?value }])
     )
     .map(|(value,)| value)
@@ -126,7 +126,7 @@ fn spreading_a_fragment_preserves_the_child_metafacts() {
     let mut store = parent.blobs().clone();
     let reader = store.reader().expect("parent blob-store reader");
     let value: View<str> = reader
-        .get::<View<str>, LongString>(nested[0])
+        .get::<View<str>, UTF8String>(nested[0])
         .expect("the spread child blob resolves from the parent store");
     assert_eq!(&*value, "nested payload");
 }
@@ -156,7 +156,7 @@ fn declaration_description_does_not_participate_in_entity_identity() {
     // `Attribute::named` has the same identity core as the bare-name arm of
     // `attributes!`, but it does not carry this declaration site's usage and
     // documentation record.
-    let runtime_attribute = Attribute::<Handle<LongString>>::named("fm_required");
+    let runtime_attribute = Attribute::<Handle<UTF8String>>::named("fm_required");
     assert_eq!(runtime_attribute.id(), fm_required.id());
     let minimally_described = entity! { runtime_attribute: "identity payload" };
 
@@ -170,7 +170,7 @@ fn derived_attribute_identity_fragment_carries_its_name_blob() {
     let attribute = fm_required.id();
     let fragment = fm_required.fragment();
     let name_handle = find!(
-        (value: Inline<Handle<LongString>>),
+        (value: Inline<Handle<UTF8String>>),
         pattern!(fragment, [{ attribute @
             triblespace_core::metadata::name: ?value
         }])
@@ -182,7 +182,7 @@ fn derived_attribute_identity_fragment_carries_its_name_blob() {
     let mut store = fragment.blobs().clone();
     let reader = store.reader().expect("attribute blob-store reader");
     let name: View<str> = reader
-        .get::<View<str>, LongString>(name_handle)
+        .get::<View<str>, UTF8String>(name_handle)
         .expect("the identity fragment carries its own name bytes");
     assert_eq!(&*name, "fm_required");
 }
@@ -193,7 +193,7 @@ fn data_and_metadata_handles_resolve_from_the_same_blob_store() {
     let root = fragment.root().expect("entity is rooted");
 
     let data_handle = find!(
-        (value: Inline<Handle<LongString>>),
+        (value: Inline<Handle<UTF8String>>),
         pattern!(&fragment, [{ root @ fm_required: ?value }])
     )
     .map(|(value,)| value)
@@ -201,7 +201,7 @@ fn data_and_metadata_handles_resolve_from_the_same_blob_store() {
     .expect("data handle is present");
 
     let metadata_handle = find!(
-        (value: Inline<Handle<LongString>>),
+        (value: Inline<Handle<UTF8String>>),
         pattern!(
             fragment.metafacts(),
             [{ _?usage @
@@ -217,10 +217,10 @@ fn data_and_metadata_handles_resolve_from_the_same_blob_store() {
     let mut store = fragment.blobs().clone();
     let reader = store.reader().expect("shared blob-store reader");
     let data: View<str> = reader
-        .get::<View<str>, LongString>(data_handle)
+        .get::<View<str>, UTF8String>(data_handle)
         .expect("data handle resolves from the fragment store");
     let documentation: View<str> = reader
-        .get::<View<str>, LongString>(metadata_handle)
+        .get::<View<str>, UTF8String>(metadata_handle)
         .expect("metadata handle resolves from that same store");
 
     assert_eq!(&*data, "data-side payload");

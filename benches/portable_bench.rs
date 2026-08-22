@@ -96,9 +96,9 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
-use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::import::ntriples::uri_to_id_pure;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
@@ -298,7 +298,7 @@ impl DblpAttrs {
 //                            (publishedAsPartOf | publishedInStream) and
 //                            createdBy — or! under and!, branch pruning
 //            --   CANDIDATE  q3c see q3b with the small journal-volume
-//                            constraint (pile-only: Handle<LongString>
+//                            constraint (pile-only: Handle<UTF8String>
 //                            object space)
 // range      q4   WIRED      numberOfCreators >= --range-min via
 //                            value_range (selectivity dial: 2 = 50%,
@@ -816,8 +816,8 @@ fn pile_checkout(
         let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
             continue;
         };
-        let handles: Vec<Inline<Handle<LongString>>> = find!(
-            (n: Inline<Handle<LongString>>),
+        let handles: Vec<Inline<Handle<UTF8String>>> = find!(
+            (n: Inline<Handle<UTF8String>>),
             pattern!(&meta, [{ metadata::name: ?n }])
         )
         .map(|(n,)| n)

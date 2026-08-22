@@ -29,7 +29,7 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
 use triblespace::prelude::*;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
@@ -104,13 +104,13 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
             let branch_entity = repo::branch::branch_entity(&meta, bid).ok();
             let mut name_handles = branch_entity.into_iter().flat_map(|branch_entity| {
                 find!(
-                    handle: Inline<Handle<LongString>>,
+                    handle: Inline<Handle<UTF8String>>,
                     pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
                 )
             });
             let name = match (name_handles.next(), name_handles.next()) {
                 (Some(h), None) => src_reader
-                    .get::<View<str>, LongString>(h)
+                    .get::<View<str>, UTF8String>(h)
                     .ok()
                     .map(|v| v.to_string()),
                 (Some(_), Some(_)) => {
@@ -294,14 +294,14 @@ mod tests {
 
     /// Build a linear source branch of `commits` commits with
     /// `tribles_per` distinct tribles each; every 10th trible's value is
-    /// a real LongString literal blob stored alongside. Returns the union
+    /// a real UTF8String literal blob stored alongside. Returns the union
     /// of all content plus the literal handles for reachability checks.
     fn build_source(
         path: &Path,
         branch_name: &str,
         commits: usize,
         tribles_per: usize,
-    ) -> (TribleSet, Vec<Inline<Handle<LongString>>>) {
+    ) -> (TribleSet, Vec<Inline<Handle<UTF8String>>>) {
         std::fs::File::create(path).unwrap();
         let pile: Pile = Pile::open(path).unwrap();
         let mut repo_h = Repository::new(pile, test_key(), TribleSet::new()).unwrap();
@@ -310,7 +310,7 @@ mod tests {
 
         let attr = Id::new([0xAB; 16]).unwrap();
         let mut expected = TribleSet::new();
-        let mut literals: Vec<Inline<Handle<LongString>>> = Vec::new();
+        let mut literals: Vec<Inline<Handle<UTF8String>>> = Vec::new();
 
         for ci in 0..commits {
             let mut set = TribleSet::new();
@@ -318,8 +318,8 @@ mod tests {
                 let e = fucid();
                 if j % 10 == 0 {
                     let text = format!("literal commit={ci} trible={j}");
-                    let h: Inline<Handle<LongString>> =
-                        ws.put(IntoBlob::<LongString>::to_blob(text));
+                    let h: Inline<Handle<UTF8String>> =
+                        ws.put(IntoBlob::<UTF8String>::to_blob(text));
                     literals.push(h);
                     set.insert(&Trible::new(&e, &attr, &h));
                 } else {
@@ -468,8 +468,8 @@ mod tests {
         let commit_set = repo::commit::commit_metadata(&key, [], None, Some(content_blob), None);
         let _: CommitHandle = pile.put::<SimpleArchive, _>(commit_set.clone()).unwrap();
 
-        let name_handle: Inline<Handle<LongString>> = pile
-            .put(IntoBlob::<LongString>::to_blob("broken".to_string()))
+        let name_handle: Inline<Handle<UTF8String>> = pile
+            .put(IntoBlob::<UTF8String>::to_blob("broken".to_string()))
             .unwrap();
         let bid = genid();
         let bmeta =

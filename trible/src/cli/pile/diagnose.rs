@@ -95,7 +95,7 @@ fn scan_record_evidence(pile_path: &Path) -> Result<RecordEvidence> {
 }
 
 fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
-    use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
+    use triblespace::prelude::blobencodings::{SimpleArchive, UTF8String};
     use triblespace::prelude::{BlobStore, BlobStoreGet, PinStore};
 
     use triblespace_core::id::id_hex;
@@ -281,7 +281,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                     Ok(meta) => match repo::branch::branch_entity(&meta, bid) {
                                         Ok(branch_entity) => {
                                             let mut names = find!(
-                                                name: Inline<Handle<LongString>>,
+                                                name: Inline<Handle<UTF8String>>,
                                                 pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?name }])
                                             );
                                             if let (Some(name), None) = (names.next(), names.next())

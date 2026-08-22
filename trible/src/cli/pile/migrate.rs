@@ -12,7 +12,7 @@ use triblespace_core::trible::TribleSet;
 
 mod branch_to_collection;
 
-type NameHandle = Inline<Handle<blobencodings::LongString>>;
+type NameHandle = Inline<Handle<blobencodings::UTF8String>>;
 type BranchMetaHandle = Inline<Handle<blobencodings::SimpleArchive>>;
 
 mod legacy_branch_metadata {
@@ -311,7 +311,7 @@ fn migrate_branch_metadata_name(
             }
 
             let name_handle: NameHandle = pile
-                .put::<blobencodings::LongString, _>(legacy_name.clone())
+                .put::<blobencodings::UTF8String, _>(legacy_name.clone())
                 .context("store branch name blob")?;
 
             let new_meta = rewrite_branch_meta(&info.meta, info.meta_entity, name_handle);
@@ -499,7 +499,7 @@ fn rename_duplicate_branch_names(
             }
 
             let name_handle: NameHandle = pile
-                .put::<blobencodings::LongString, _>(new_name.clone())
+                .put::<blobencodings::UTF8String, _>(new_name.clone())
                 .context("store renamed branch name blob")?;
 
             let meta: TribleSet = reader

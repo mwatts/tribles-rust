@@ -100,7 +100,7 @@ pub type BlobReader = AnyBlobReader;
 ///
 /// The schema parameter matters: the importer splits one predicate IRI
 /// into one attribute *per value schema it observed* (e.g. a predicate
-/// used with both plain strings and IRIs yields a `Handle<LongString>`
+/// used with both plain strings and IRIs yields a `Handle<UTF8String>`
 /// attribute and a `GenId` attribute). Check `import --stats` output
 /// before trusting a schema choice in a translation.
 pub fn attr<S: InlineEncoding + MetaDescribe>(iri: &str) -> Attribute<S> {

@@ -4558,7 +4558,7 @@ mod tests {
                 .expect("every written record kind resolves in the pile that wrote it");
             let tag: Inline<GenId> = crate::inline::IntoInline::to_inline(KIND_PILE_RECORD);
             let named = find!(
-                (name: Inline<Handle<crate::blob::encodings::longstring::LongString>>),
+                (name: Inline<Handle<crate::blob::encodings::utf8string::UTF8String>>),
                 pattern!(&description, [{
                     metadata::tag: Inline::<GenId>::new(tag.raw),
                     metadata::name: ?name

@@ -39,7 +39,7 @@
 //!   a streamed `find!` plus a Rust fold. Matching stays in the
 //!   engine; only accumulation is Rust.
 //! - **String functions**: strings are content-addressed
-//!   `Handle<LongString>` blobs; the fold resolves each candidate
+//!   `Handle<UTF8String>` blobs; the fold resolves each candidate
 //!   handle through the dataset's blob reader and applies the SPARQL
 //!   string function to the decoded text.
 //! - **Property paths**: `path!` with `+` yields distinct endpoint
@@ -101,7 +101,7 @@ use std::collections::{HashMap, HashSet};
 use anybytes::View;
 use hifitime::Epoch;
 use regex::Regex;
-use subject::core::blob::encodings::longstring::LongString;
+use subject::core::blob::encodings::utf8string::UTF8String;
 use subject::core::import::{rdf_lang, rdf_text, rdf_uri};
 use subject::core::metadata::MetaDescribe;
 use subject::core::inline::encodings::time::NsTAIInterval;
@@ -434,10 +434,10 @@ pub struct Translated<B = TribleSet> {
 /// SELECT (COUNT(*) AS ?count) WHERE { ?s dblp:formerStreamTitle ?o1 . ?s rdf:type ?o2 }
 /// ```
 pub fn join_2_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
     let n = find!(
-        (s: Id, o1: Inline<Handle<LongString>>, o2: Id),
+        (s: Id, o1: Inline<Handle<UTF8String>>, o2: Id),
         pattern!(&ds.facts, [{ ?s @ former_stream_title: ?o1, rdf_type: ?o2 }])
     )
     .count() as u64;
@@ -455,9 +455,9 @@ pub fn join_2_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// the engine reorders by cardinality either way.
 pub fn join_2_large_small<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let n = find!(
-        (s: Id, o1: Id, o2: Inline<Handle<LongString>>),
+        (s: Id, o1: Id, o2: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ rdf_type: ?o1, former_stream_title: ?o2 }])
     )
     .count() as u64;
@@ -524,9 +524,9 @@ pub fn join_2_large_large_with_small_result<B: TriblePattern>(ds: &Dataset<B>) -
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     // DBLP's journal-volume objects are string literals (the volume
     // number), not IRIs — verified via `import --stats`.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let n = find!(
-        (s: Id, o1: Id, o2: Inline<Handle<LongString>>),
+        (s: Id, o1: Id, o2: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ published_as_part_of: ?o1, published_in_journal_volume: ?o2 }])
     )
     .count() as u64;
@@ -543,9 +543,9 @@ pub fn join_2_large_large_with_small_result<B: TriblePattern>(ds: &Dataset<B>) -
 pub fn join_3_star_largest_sum_of_join_sizes<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let n = find!(
-        (s: Id, o1: Inline<I256BE>, o2: Id, o3: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<I256BE>, o2: Id, o3: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ signature_ordinal: ?o1, rdf_type: ?o2, signature_dblp_name: ?o3 }])
     )
     .count() as u64;
@@ -594,7 +594,7 @@ pub fn join_3_chain_largest_sum_of_join_sizes<B: TriblePattern>(ds: &Dataset<B>)
 /// predicates, so the SPARQL result is 0 and the engine derives the
 /// same empty join.
 pub fn join_xlarge_star_on_small_predicates<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let award_webpage = attr::<GenId>(voc::DBLP_AWARD_WEBPAGE);
     let successor_stream = attr::<GenId>(voc::DBLP_SUCCESSOR_STREAM);
     let predeccessor_stream = attr::<GenId>(voc::DBLP_PREDECCESSOR_STREAM);
@@ -608,21 +608,21 @@ pub fn join_xlarge_star_on_small_predicates<B: TriblePattern>(ds: &Dataset<B>) -
     let rdfs_sub_class_of = attr::<GenId>(voc::RDFS_SUB_CLASS_OF);
     let owl_equivalent_class = attr::<GenId>(voc::OWL_EQUIVALENT_CLASS);
     let owl_inverse_of = attr::<GenId>(voc::OWL_INVERSE_OF);
-    let publishers_address = attr::<Handle<LongString>>(voc::DBLP_PUBLISHERS_ADDRESS);
-    let published_in_book_chapter = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_BOOK_CHAPTER);
+    let publishers_address = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHERS_ADDRESS);
+    let published_in_book_chapter = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_BOOK_CHAPTER);
     let terms_creator = attr::<GenId>(voc::TERMS_CREATOR);
-    let terms_abstract = attr::<Handle<LongString>>(voc::TERMS_ABSTRACT);
-    let terms_title = attr::<Handle<LongString>>(voc::TERMS_TITLE);
+    let terms_abstract = attr::<Handle<UTF8String>>(voc::TERMS_ABSTRACT);
+    let terms_title = attr::<Handle<UTF8String>>(voc::TERMS_TITLE);
     let owl_prior_version = attr::<GenId>(voc::OWL_PRIOR_VERSION);
-    let owl_version_info = attr::<Handle<LongString>>(voc::OWL_VERSION_INFO);
+    let owl_version_info = attr::<Handle<UTF8String>>(voc::OWL_VERSION_INFO);
     let owl_version_iri = attr::<GenId>(voc::OWL_VERSION_IRI);
     let terms_modified = attr::<NsTAIInterval>(voc::TERMS_MODIFIED);
     let terms_license = attr::<GenId>(voc::TERMS_LICENSE);
-    let terms_description = attr::<Handle<LongString>>(voc::TERMS_DESCRIPTION);
+    let terms_description = attr::<Handle<UTF8String>>(voc::TERMS_DESCRIPTION);
     let n = find!(
         (
             s: Id,
-            o0: Inline<Handle<LongString>>,
+            o0: Inline<Handle<UTF8String>>,
             o1: Id,
             o2: Id,
             o3: Id,
@@ -634,17 +634,17 @@ pub fn join_xlarge_star_on_small_predicates<B: TriblePattern>(ds: &Dataset<B>) -
             o9: Id,
             o10: Id,
             o11: Id,
-            o12: Inline<Handle<LongString>>,
-            o13: Inline<Handle<LongString>>,
+            o12: Inline<Handle<UTF8String>>,
+            o13: Inline<Handle<UTF8String>>,
             o14: Id,
-            o15: Inline<Handle<LongString>>,
-            o16: Inline<Handle<LongString>>,
+            o15: Inline<Handle<UTF8String>>,
+            o16: Inline<Handle<UTF8String>>,
             o17: Id,
-            o18: Inline<Handle<LongString>>,
+            o18: Inline<Handle<UTF8String>>,
             o19: Id,
             o20: Inline<NsTAIInterval>,
             o21: Id,
-            o22: Inline<Handle<LongString>>
+            o22: Inline<Handle<UTF8String>>
         ),
         pattern!(&ds.facts, [{ ?s @
             former_stream_title: ?o0,
@@ -778,7 +778,7 @@ pub fn join_xlarge_chain_on_small_predicates<B: TriblePattern>(ds: &Dataset<B>) 
 /// SELECT (COUNT(*) AS ?count) WHERE { ?s dblp:formerStreamTitle ?o1 FILTER EXISTS { ?s rdf:type ?o2 } }
 /// ```
 pub fn exists_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
     let typed: HashSet<Id> = find!(
         (s: Id),
@@ -787,7 +787,7 @@ pub fn exists_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     .map(|(s,)| s)
     .collect();
     let n = find!(
-        (s: Id, o1: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<Handle<UTF8String>>),
         and!(
             pattern!(&ds.facts, [{ ?s @ former_stream_title: ?o1 }]),
             typed.has(s)
@@ -806,7 +806,7 @@ pub fn exists_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// ```
 pub fn exists_join_large_small<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let titled: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ former_stream_title: _?o2 }])
@@ -887,7 +887,7 @@ pub fn exists_join_2_large_large_with_large_result<B: TriblePattern>(ds: &Datase
 pub fn exists_join_2_large_large_with_small_join_result_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     // String-literal objects — see join-2-large-large-with-small-result.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let in_volume: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ published_in_journal_volume: _?o2 }])
@@ -914,7 +914,7 @@ pub fn exists_join_2_large_large_with_small_join_result_1<B: TriblePattern>(ds: 
 /// ```
 pub fn exists_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     // String-literal objects — see join-2-large-large-with-small-result.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     let in_part: HashSet<Id> = find!(
         (s: Id),
@@ -923,7 +923,7 @@ pub fn exists_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds: 
     .map(|(s,)| s)
     .collect();
     let n = find!(
-        (s: Id, o1: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<Handle<UTF8String>>),
         and!(
             pattern!(&ds.facts, [{ ?s @ published_in_journal_volume: ?o1 }]),
             in_part.has(s)
@@ -943,7 +943,7 @@ pub fn exists_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds: 
 pub fn exists_join_3_star_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let named: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ signature_dblp_name: _?o3 }])
@@ -975,7 +975,7 @@ pub fn exists_join_3_star_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 pub fn exists_join_3_star_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let typed: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ rdf_type: _?o2 }])
@@ -1105,7 +1105,7 @@ pub fn exists_join_3_chain_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// SELECT (COUNT(*) AS ?count) WHERE { ?s dblp:formerStreamTitle ?o1 OPTIONAL { ?s rdf:type ?o2 } }
 /// ```
 pub fn optional_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
     let mut types: HashMap<Id, u64> = HashMap::new();
     for (s, _o2) in find!(
@@ -1116,7 +1116,7 @@ pub fn optional_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     }
     let mut n: u64 = 0;
     for (s, _o1) in find!(
-        (s: Id, o1: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ former_stream_title: ?o1 }])
     ) {
         n += types.get(&s).copied().unwrap_or(1);
@@ -1133,10 +1133,10 @@ pub fn optional_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// ```
 pub fn optional_join_large_small<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let mut titles: HashMap<Id, u64> = HashMap::new();
     for (s, _o2) in find!(
-        (s: Id, o2: Inline<Handle<LongString>>),
+        (s: Id, o2: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ former_stream_title: ?o2 }])
     ) {
         *titles.entry(s).or_insert(0) += 1;
@@ -1215,10 +1215,10 @@ pub fn optional_join_2_large_large_with_large_result<B: TriblePattern>(ds: &Data
 pub fn optional_join_2_large_large_with_small_join_result_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     // String-literal objects — see join-2-large-large-with-small-result.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let mut volumes: HashMap<Id, u64> = HashMap::new();
     for (s, _o2) in find!(
-        (s: Id, o2: Inline<Handle<LongString>>),
+        (s: Id, o2: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ published_in_journal_volume: ?o2 }])
     ) {
         *volumes.entry(s).or_insert(0) += 1;
@@ -1242,7 +1242,7 @@ pub fn optional_join_2_large_large_with_small_join_result_1<B: TriblePattern>(ds
 /// ```
 pub fn optional_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     // String-literal objects — see join-2-large-large-with-small-result.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     let mut parts: HashMap<Id, u64> = HashMap::new();
     for (s, _o2) in find!(
@@ -1253,7 +1253,7 @@ pub fn optional_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds
     }
     let mut n: u64 = 0;
     for (s, _o1) in find!(
-        (s: Id, o1: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ published_in_journal_volume: ?o1 }])
     ) {
         n += parts.get(&s).copied().unwrap_or(1);
@@ -1276,10 +1276,10 @@ pub fn optional_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds
 pub fn optional_join_3_star_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let mut names: HashMap<Id, u64> = HashMap::new();
     for (s, _o3) in find!(
-        (s: Id, o3: Inline<Handle<LongString>>),
+        (s: Id, o3: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ signature_dblp_name: ?o3 }])
     ) {
         *names.entry(s).or_insert(0) += 1;
@@ -1310,10 +1310,10 @@ pub fn optional_join_3_star_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 pub fn optional_join_3_star_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let mut branch: HashMap<Id, u64> = HashMap::new();
     for (s, _o2, _o3) in find!(
-        (s: Id, o2: Id, o3: Inline<Handle<LongString>>),
+        (s: Id, o2: Id, o3: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ rdf_type: ?o2, signature_dblp_name: ?o3 }])
     ) {
         *branch.entry(s).or_insert(0) += 1;
@@ -1424,7 +1424,7 @@ pub fn optional_join_3_chain_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// SELECT (COUNT(*) AS ?count) WHERE { ?s dblp:formerStreamTitle ?o1 MINUS { ?s rdf:type ?o2 } }
 /// ```
 pub fn minus_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
     let typed: HashSet<Id> = find!(
         (s: Id),
@@ -1433,7 +1433,7 @@ pub fn minus_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     .map(|(s,)| s)
     .collect();
     let n = find!(
-        (s: Id, o1: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ former_stream_title: ?o1 }])
     )
     .filter(|(s, _)| !typed.contains(s))
@@ -1450,7 +1450,7 @@ pub fn minus_join_small_large<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// ```
 pub fn minus_join_large_small<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let former_stream_title = attr::<Handle<LongString>>(voc::DBLP_FORMER_STREAM_TITLE);
+    let former_stream_title = attr::<Handle<UTF8String>>(voc::DBLP_FORMER_STREAM_TITLE);
     let titled: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ former_stream_title: _?o2 }])
@@ -1525,7 +1525,7 @@ pub fn minus_join_2_large_large_with_large_result<B: TriblePattern>(ds: &Dataset
 pub fn minus_join_2_large_large_with_small_join_result_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     // String-literal objects — see join-2-large-large-with-small-result.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let in_volume: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ published_in_journal_volume: _?o2 }])
@@ -1550,7 +1550,7 @@ pub fn minus_join_2_large_large_with_small_join_result_1<B: TriblePattern>(ds: &
 /// ```
 pub fn minus_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     // String-literal objects — see join-2-large-large-with-small-result.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     let in_part: HashSet<Id> = find!(
         (s: Id),
@@ -1559,7 +1559,7 @@ pub fn minus_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds: &
     .map(|(s,)| s)
     .collect();
     let n = find!(
-        (s: Id, o1: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ published_in_journal_volume: ?o1 }])
     )
     .filter(|(s, _)| !in_part.contains(s))
@@ -1577,7 +1577,7 @@ pub fn minus_join_2_large_large_with_small_join_result_2<B: TriblePattern>(ds: &
 pub fn minus_join_3_star_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let named: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ signature_dblp_name: _?o3 }])
@@ -1608,7 +1608,7 @@ pub fn minus_join_3_star_1<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 pub fn minus_join_3_star_2<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let witnesses: HashSet<Id> = find!(
         (s: Id),
         pattern!(&ds.facts, [{ ?s @ rdf_type: _?o2, signature_dblp_name: _?o3 }])
@@ -1737,14 +1737,14 @@ pub fn union_no_constraint<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 pub fn union_constraint_from_star<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let signature_ordinal = attr::<I256BE>(voc::DBLP_SIGNATURE_ORDINAL);
     let rdf_type = attr::<GenId>(voc::RDF_TYPE);
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let branch_ordinal = find!(
-        (s: Id, o1: Inline<I256BE>, o2: Inline<Handle<LongString>>),
+        (s: Id, o1: Inline<I256BE>, o2: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ signature_ordinal: ?o1, signature_dblp_name: ?o2 }])
     )
     .count() as u64;
     let branch_type = find!(
-        (s: Id, o1: Id, o2: Inline<Handle<LongString>>),
+        (s: Id, o1: Id, o2: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ rdf_type: ?o1, signature_dblp_name: ?o2 }])
     )
     .count() as u64;
@@ -1762,9 +1762,9 @@ pub fn union_constraint_small_join<B: TriblePattern>(ds: &Dataset<B>) -> Answer 
     let published_as_part_of = attr::<GenId>(voc::DBLP_PUBLISHED_AS_PART_OF);
     let published_in_stream = attr::<GenId>(voc::DBLP_PUBLISHED_IN_STREAM);
     // String-literal objects — see join-2-large-large-with-small-result.
-    let published_in_journal_volume = attr::<Handle<LongString>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
+    let published_in_journal_volume = attr::<Handle<UTF8String>>(voc::DBLP_PUBLISHED_IN_JOURNAL_VOLUME);
     let n = find!(
-        (s: Id, o1: Id, o2: Inline<Handle<LongString>>),
+        (s: Id, o1: Id, o2: Inline<Handle<UTF8String>>),
         and!(
             or!(
                 pattern!(&ds.facts, [{ ?s @ published_as_part_of: ?o1 }]),
@@ -1991,7 +1991,7 @@ pub fn group_by_complex_aggregate<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
     let needed: HashSet<Id> = members.iter().map(|&(s, _)| s).collect();
     let mut uris: HashMap<Id, String> = HashMap::new();
     for (e, h) in find!(
-        (e: Id, h: Inline<Handle<LongString>>),
+        (e: Id, h: Inline<Handle<UTF8String>>),
         and!(pattern!(&ds.meta, [{ ?e @ rdf_uri: ?h }]), needed.has(e))
     ) {
         let uri: View<str> = ds
@@ -2138,9 +2138,9 @@ pub fn group_by_implicit_numeric_avg<B: TriblePattern>(ds: &Dataset<B>) -> Answe
 /// SELECT (COUNT(?o) AS ?count) { ?s dblp:signatureDblpName ?o. }
 /// ```
 pub fn group_by_implicit_string_baseline<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let n = find!(
-        (s: Id, o: Inline<Handle<LongString>>),
+        (s: Id, o: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ signature_dblp_name: ?o }])
     )
     .count() as u64;
@@ -2150,9 +2150,9 @@ pub fn group_by_implicit_string_baseline<B: TriblePattern>(ds: &Dataset<B>) -> A
 /// Shared fold: stream every `signatureDblpName` string (resolving the
 /// content-addressed handle through the blob reader).
 fn fold_signature_names<B: TriblePattern>(ds: &Dataset<B>, mut f: impl FnMut(&str)) {
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     for (_s, h) in find!(
-        (s: Id, h: Inline<Handle<LongString>>),
+        (s: Id, h: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ signature_dblp_name: ?h }])
     ) {
         let text: View<str> = ds
@@ -2213,10 +2213,10 @@ pub fn group_by_implicit_string_max<B: TriblePattern>(ds: &Dataset<B>) -> Answer
 /// fold accumulates per-subject `(Σ len, n)` without materializing the
 /// concatenations.
 pub fn group_by_string_groupconcat<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let signature_dblp_name = attr::<Handle<LongString>>(voc::DBLP_SIGNATURE_DBLP_NAME);
+    let signature_dblp_name = attr::<Handle<UTF8String>>(voc::DBLP_SIGNATURE_DBLP_NAME);
     let mut groups: HashMap<Id, (u64, u64)> = HashMap::new();
     for (s, h) in find!(
-        (s: Id, h: Inline<Handle<LongString>>),
+        (s: Id, h: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ signature_dblp_name: ?h }])
     ) {
         let text: View<str> = ds
@@ -2417,15 +2417,15 @@ pub fn transitive_path_small_join_and_plus<B: TriblePattern>(ds: &Dataset<B>) ->
 /// Shared fold: stream every `rdfs:label` string.
 ///
 /// DBLP labels are overwhelmingly plain literals
-/// (`Handle<LongString>` attribute), but the embedded ontology has a
+/// (`Handle<UTF8String>` attribute), but the embedded ontology has a
 /// few language-tagged ones, which the importer reifies behind the
 /// `GenId`-schema attribute. SPARQL string functions operate on the
 /// lexical form of both, so the fold streams both attributes,
 /// resolving reified labels through their `rdf_text` handle.
 fn fold_labels<B: TriblePattern>(ds: &Dataset<B>, mut f: impl FnMut(&str)) {
-    let rdfs_label = attr::<Handle<LongString>>(voc::RDFS_LABEL);
+    let rdfs_label = attr::<Handle<UTF8String>>(voc::RDFS_LABEL);
     for (_s, h) in find!(
-        (s: Id, h: Inline<Handle<LongString>>),
+        (s: Id, h: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [{ ?s @ rdfs_label: ?h }])
     ) {
         let text: View<str> = ds.reader.get(h).expect("label blob present in import");
@@ -2433,7 +2433,7 @@ fn fold_labels<B: TriblePattern>(ds: &Dataset<B>, mut f: impl FnMut(&str)) {
     }
     let rdfs_label_lang = attr::<GenId>(voc::RDFS_LABEL);
     for (_s, _o, h) in find!(
-        (s: Id, o: Id, h: Inline<Handle<LongString>>),
+        (s: Id, o: Id, h: Inline<Handle<UTF8String>>),
         pattern!(&ds.facts, [
             { ?s @ rdfs_label_lang: ?o },
             { ?o @ rdf_text: ?h }
@@ -2853,7 +2853,7 @@ pub fn filter_many_results<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// carrying `rdf_lang`/`rdf_text`, referenced through the predicate's
 /// `GenId`-schema attribute. `LANG(?o) = "en"` is therefore a plain
 /// join against `rdf_lang: "en"` — plain-string rows live under the
-/// `LongString`-schema attribute and are excluded automatically
+/// `UTF8String`-schema attribute and are excluded automatically
 /// (`LANG` of a plain literal is `""`), so the counts agree in every
 /// case.
 pub fn filter_language_en<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
@@ -3020,8 +3020,8 @@ pub fn number_of_subjects<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// schemas shares one IRI handle — the `HashSet` fold dedupes across
 /// the describing entities).
 pub fn number_of_predicates<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
-    let distinct: HashSet<Inline<Handle<LongString>>> = find!(
-        (h: Inline<Handle<LongString>>),
+    let distinct: HashSet<Inline<Handle<UTF8String>>> = find!(
+        (h: Inline<Handle<UTF8String>>),
         pattern!(&ds.meta, [{ _?a @ metadata::iri: ?h }])
     )
     .map(|(h,)| h)
@@ -3053,7 +3053,7 @@ pub fn number_of_predicates<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 ///   different schemas (e.g. `"5"^^xsd:integer` as `I256BE` vs
 ///   `"5"^^xsd:nonNegativeInteger` as `U256BE`) stay distinct — as do
 ///   the RDF terms, whose datatypes differ.
-/// - `Handle<LongString>` / `Handle<RawBytes>`: distinct content
+/// - `Handle<UTF8String>` / `Handle<RawBytes>`: distinct content
 ///   hashes = distinct lexical forms.
 ///
 /// Known representational divergences (see LEDGER.md): (1) literals

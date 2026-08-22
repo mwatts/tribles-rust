@@ -377,11 +377,11 @@ mod tests {
     use super::*;
     use anybytes::Bytes;
 
-    use blobencodings::LongString;
+    use blobencodings::UTF8String;
     use inlineencodings::Handle;
 
     attributes! {
-        "5AD0FAFB1FECBC197A385EC20166899E" unsafe as description: Handle<LongString>;
+        "5AD0FAFB1FECBC197A385EC20166899E" unsafe as description: Handle<UTF8String>;
     }
 
     #[test]
@@ -392,10 +392,10 @@ mod tests {
         let mut kb = TribleSet::new();
         let mut blobs = MemoryBlobStore::new();
         let retained = blobs
-            .put::<LongString, _>(Bytes::from_source("retained".to_owned()).view().unwrap())
+            .put::<UTF8String, _>(Bytes::from_source("retained".to_owned()).view().unwrap())
             .unwrap();
         let discarded = blobs
-            .put::<LongString, _>(Bytes::from_source("discarded".to_owned()).view().unwrap())
+            .put::<UTF8String, _>(Bytes::from_source("discarded".to_owned()).view().unwrap())
             .unwrap();
         kb += entity! { description: retained };
 
@@ -404,8 +404,8 @@ mod tests {
 
         blobs.keep(candidates);
         let reader = blobs.reader().unwrap();
-        assert!(reader.get::<View<str>, LongString>(retained).is_ok());
-        assert!(reader.get::<View<str>, LongString>(discarded).is_err());
+        assert!(reader.get::<View<str>, UTF8String>(retained).is_ok());
+        assert!(reader.get::<View<str>, UTF8String>(discarded).is_err());
     }
 
     /// `MemoryBlobStoreReader` must be `Send + Sync` so it composes
@@ -421,19 +421,19 @@ mod tests {
     #[test]
     fn reader_is_a_pinned_snapshot() {
         let mut store = MemoryBlobStore::new();
-        let blob_a: Inline<Handle<LongString>> = store
+        let blob_a: Inline<Handle<UTF8String>> = store
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
         let snapshot = store.reader().unwrap();
         assert_eq!(snapshot.len(), 1);
 
-        let _blob_b: Inline<Handle<LongString>> = store
+        let _blob_b: Inline<Handle<UTF8String>> = store
             .put(Bytes::from_source("world".to_string()).view().unwrap())
             .unwrap();
         // The snapshot still has only the original blob.
         assert_eq!(snapshot.len(), 1);
         use anybytes::View;
-        let recovered: View<str> = snapshot.get::<View<str>, LongString>(blob_a).unwrap();
+        let recovered: View<str> = snapshot.get::<View<str>, UTF8String>(blob_a).unwrap();
         assert_eq!(&*recovered, "hello");
 
         // A fresh reader sees both.
@@ -445,7 +445,7 @@ mod tests {
     fn listing_reports_stored_lengths() {
         let mut store = MemoryBlobStore::new();
         let handle = store
-            .put::<LongString, _>(Bytes::from_source("hello".to_string()).view().unwrap())
+            .put::<UTF8String, _>(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
 
         let listed: Vec<_> = store
@@ -467,16 +467,16 @@ mod tests {
     #[test]
     fn union_merges_and_preserves_handles() {
         let mut a = MemoryBlobStore::new();
-        let h_hello: Inline<Handle<LongString>> = a
+        let h_hello: Inline<Handle<UTF8String>> = a
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
         let mut b = MemoryBlobStore::new();
-        let h_world: Inline<Handle<LongString>> = b
+        let h_world: Inline<Handle<UTF8String>> = b
             .put(Bytes::from_source("world".to_string()).view().unwrap())
             .unwrap();
         // Idempotent overlap: putting "hello" in b too — union should
         // collapse the duplicate, not double-count.
-        let _h_hello_b: Inline<Handle<LongString>> = b
+        let _h_hello_b: Inline<Handle<UTF8String>> = b
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
 
@@ -491,13 +491,13 @@ mod tests {
         let recovered_hello: View<str> = a
             .reader()
             .unwrap()
-            .get::<View<str>, LongString>(h_hello)
+            .get::<View<str>, UTF8String>(h_hello)
             .unwrap();
         assert_eq!(&*recovered_hello, "hello");
         let recovered_world: View<str> = a
             .reader()
             .unwrap()
-            .get::<View<str>, LongString>(h_world)
+            .get::<View<str>, UTF8String>(h_world)
             .unwrap();
         assert_eq!(&*recovered_world, "world");
     }

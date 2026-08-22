@@ -368,7 +368,7 @@ pub use crate::id::RawId as RawIdAlias;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::encodings::longstring::LongString;
+    use crate::blob::encodings::utf8string::UTF8String;
     use crate::blob::IntoBlob;
     use crate::id::Id;
     use crate::inline::encodings::hash::Handle;
@@ -384,7 +384,7 @@ mod tests {
         /// Anchored: same literal as `pinned_probe`, derived id.
         "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe: ShortString;
         /// Same anchor, different schema — must be a different attribute.
-        "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe_other: Handle<LongString>;
+        "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe_other: Handle<UTF8String>;
         /// Pinned: the id is the literal verbatim.
         "5F3C1A0E7B294D6685A0C1F2E3D40912" unsafe as pinned_probe: ShortString;
     }
@@ -460,7 +460,7 @@ mod tests {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
         let short = Attribute::<ShortString>::anchored(a);
         let handle =
-            Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::anchored(a);
+            Attribute::<Handle<crate::blob::encodings::utf8string::UTF8String>>::anchored(a);
         assert_ne!(short.raw(), handle.raw());
     }
 
@@ -488,7 +488,7 @@ mod tests {
     fn from_fragment_permits_a_lying_schema() {
         let lying = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::value_encoding:
-                <Handle<crate::blob::encodings::longstring::LongString> as MetaDescribe>::id(),
+                <Handle<crate::blob::encodings::utf8string::UTF8String> as MetaDescribe>::id(),
         });
         let honest = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
@@ -508,11 +508,11 @@ mod tests {
             crate::id::ExclusiveId::force_ref(&a) @
                 metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
-        let handle = Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::from_fragment_unchecked(
+        let handle = Attribute::<Handle<crate::blob::encodings::utf8string::UTF8String>>::from_fragment_unchecked(
             entity! {
                 crate::id::ExclusiveId::force_ref(&a) @
                     metadata::value_encoding:
-                        <Handle<crate::blob::encodings::longstring::LongString> as MetaDescribe>::id(),
+                        <Handle<crate::blob::encodings::utf8string::UTF8String> as MetaDescribe>::id(),
             },
         );
         // Both are just the anchor. A re-typed attribute keeps its id.
@@ -521,7 +521,7 @@ mod tests {
         // Whereas anchored separates them.
         assert_ne!(
             Attribute::<ShortString>::anchored(a).raw(),
-            Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::anchored(a).raw()
+            Attribute::<Handle<crate::blob::encodings::utf8string::UTF8String>>::anchored(a).raw()
         );
     }
 
@@ -565,9 +565,9 @@ mod tests {
             metadata::name:         h,
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
-        let handle = Attribute::<Handle<LongString>>::from_fragment_unchecked(entity! {
+        let handle = Attribute::<Handle<UTF8String>>::from_fragment_unchecked(entity! {
             metadata::name:         h,
-            metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+            metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
         });
 
         assert_ne!(short.raw(), handle.raw());
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn describe_preserves_identity_iri() {
         let iri = "http://example.org/foo".to_string();
-        let iri_handle: Inline<Handle<LongString>> = iri.to_blob().get_handle();
+        let iri_handle: Inline<Handle<UTF8String>> = iri.to_blob().get_handle();
         let attr = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::iri:          iri_handle,
             metadata::value_encoding: <ShortString as crate::metadata::MetaDescribe>::id(),

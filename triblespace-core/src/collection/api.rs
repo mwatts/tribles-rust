@@ -1115,7 +1115,7 @@ mod tests {
 
     use super::*;
 
-    use crate::blob::encodings::{longstring::LongString, UnknownBlob};
+    use crate::blob::encodings::{utf8string::UTF8String, UnknownBlob};
     use crate::blob::{BlobEncoding, Bytes, IntoBlob};
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::{discover_collection_records, CollectionMerge, CollectionRecord};
@@ -1262,7 +1262,7 @@ mod tests {
         facts.insert(&Trible::force_raw(row).unwrap());
         let mut fragment = Fragment::from(facts);
         if attachment {
-            let _: Inline<Handle<LongString>> = fragment.put("one attachment".to_owned());
+            let _: Inline<Handle<UTF8String>> = fragment.put("one attachment".to_owned());
         }
         fragment
     }

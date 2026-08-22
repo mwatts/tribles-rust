@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 use triblespace::prelude::*;
-use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo;
@@ -87,7 +87,7 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
         };
 
         let mut names = find!(
-            name: Inline<Handle<LongString>>,
+            name: Inline<Handle<UTF8String>>,
             pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?name }])
         );
         let name_handle = match (names.next(), names.next()) {
@@ -117,7 +117,7 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
 
         // Resolve human-readable name for logging.
         let name: String = src_reader
-            .get::<View<str>, LongString>(name_handle)
+            .get::<View<str>, UTF8String>(name_handle)
             .map(|v| v.to_string())
             .unwrap_or_else(|_| format!("{bid:x}"));
 

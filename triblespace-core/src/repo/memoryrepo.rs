@@ -384,12 +384,12 @@ mod tests {
     fn valid_collection_commits_and_owned_closure_survive_memory_keep() {
         use ed25519_dalek::SigningKey;
 
-        use crate::blob::encodings::longstring::LongString;
+        use crate::blob::encodings::utf8string::UTF8String;
         use crate::collection::Collection;
         use crate::repo::{BlobStoreGet, BlobStoreKeep};
 
         let mut repo = MemoryRepo::default();
-        let child = repo.put::<LongString, _>("owned child".to_owned()).unwrap();
+        let child = repo.put::<UTF8String, _>("owned child".to_owned()).unwrap();
         let fragment = entity! { crate::metadata::name: child };
         let name = crate::collection::records::CollectionName::new("owned").unwrap();
         let key = SigningKey::from_bytes(&[23; 32]);
@@ -398,7 +398,7 @@ mod tests {
         let commit = Collection::new(&mut repo, &name, team, key, reach::private())
             .commit(fragment)
             .unwrap();
-        let orphan = repo.put::<LongString, _>("orphan".to_owned()).unwrap();
+        let orphan = repo.put::<UTF8String, _>("orphan".to_owned()).unwrap();
 
         repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
 

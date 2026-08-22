@@ -331,13 +331,13 @@ proptest! {
         content in vec(any::<u8>(), 0..200),
     ) {
         use triblespace_core::blob::MemoryBlobStore;
-        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::repo::{BlobStorePut, BlobStore, BlobStoreGet};
         use anybytes::View;
 
         let text = String::from_utf8_lossy(&content).to_string();
         let mut store: MemoryBlobStore = MemoryBlobStore::default();
-        let handle = store.put::<LongString, _>(text.clone()).expect("put");
+        let handle = store.put::<UTF8String, _>(text.clone()).expect("put");
 
         let reader = store.reader().expect("reader");
         let retrieved: View<str> = reader.get(handle).expect("get");
@@ -386,8 +386,8 @@ proptest! {
 // outside core — a migration record, a downstream faculty's annotation.
 mod branch_head_carry {
     use super::*;
-    use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::inline::encodings::hash::Handle;
 
     mod ann {
@@ -412,9 +412,9 @@ mod branch_head_carry {
         // the pin identified by `branch_id`, and neither may be discarded.
         let marker = rngid();
         let unrelated_branch_id = *genid();
-        let annotation_name: Inline<Handle<LongString>> = repo
+        let annotation_name: Inline<Handle<UTF8String>> = repo
             .storage_mut()
-            .put::<LongString, _>("annotation".to_owned().to_blob())
+            .put::<UTF8String, _>("annotation".to_owned().to_blob())
             .expect("store annotation name");
         let decoy_head: Inline<Handle<SimpleArchive>> = repo
             .storage_mut()
@@ -480,8 +480,8 @@ mod branch_head_carry {
             1,
             "an annotation beside the branch head must survive a push that rebuilds it"
         );
-        let annotation_names: Vec<Inline<Handle<LongString>>> = find!(
-            name: Inline<Handle<LongString>>,
+        let annotation_names: Vec<Inline<Handle<UTF8String>>> = find!(
+            name: Inline<Handle<UTF8String>>,
             pattern!(&after, [{ &marker @ triblespace_core::metadata::name: ?name }])
         )
         .collect();

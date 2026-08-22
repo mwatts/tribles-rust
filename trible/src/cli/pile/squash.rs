@@ -76,7 +76,7 @@ pub fn run(
             let meta: TribleSet = reader.get(meta_handle).ok()?;
             let branch_entity = repo::branch::branch_entity(&meta, bid).ok()?;
             let mut names = find!(
-                handle: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
+                handle: Inline<Handle<triblespace_core::blob::encodings::utf8string::UTF8String>>,
                 pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
             );
             let (Some(handle), None) = (names.next(), names.next()) else {
@@ -181,7 +181,7 @@ pub fn run(
             } else {
                 format!("squashed {} ({}/{})", name, i + 1, num_chunks)
             };
-            let msg_blob: Blob<triblespace_core::blob::encodings::longstring::LongString> =
+            let msg_blob: Blob<triblespace_core::blob::encodings::utf8string::UTF8String> =
                 triblespace_core::blob::IntoBlob::to_blob(msg_text);
             let msg_handle = dst_pile
                 .put(msg_blob)
@@ -223,7 +223,7 @@ pub fn run(
 
         let name_handle = dst_pile
             .put(triblespace_core::blob::IntoBlob::<
-                triblespace_core::blob::encodings::longstring::LongString,
+                triblespace_core::blob::encodings::utf8string::UTF8String,
             >::to_blob(name.clone()))
             .map_err(|e| anyhow!("put name: {e:?}"))?;
 

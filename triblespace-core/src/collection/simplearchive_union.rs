@@ -1113,8 +1113,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hex_literal::hex;
 
-    use crate::blob::encodings::longstring::LongString;
     use crate::blob::encodings::rawbytes::RawBytes;
+    use crate::blob::encodings::utf8string::UTF8String;
     use crate::blob::{BlobEncoding, IntoBlob};
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::records::CollectionName;
@@ -1156,7 +1156,7 @@ mod tests {
 
         attributes! {
             // Test-only sentinel attributes; these are not protocol ids.
-            "DD00000000000000DD00000000000031" unsafe as pub text: inlineencodings::Handle<blobencodings::LongString>;
+            "DD00000000000000DD00000000000031" unsafe as pub text: inlineencodings::Handle<blobencodings::UTF8String>;
             "DD00000000000000DD00000000000032" unsafe as pub payload: inlineencodings::Handle<blobencodings::RawBytes>;
         }
     }
@@ -1330,10 +1330,10 @@ mod tests {
 
     fn fragment_fixture() -> (
         Fragment,
-        Inline<Handle<LongString>>,
+        Inline<Handle<UTF8String>>,
         Inline<Handle<RawBytes>>,
     ) {
-        let text: Blob<LongString> = String::from("a self-contained content blob").to_blob();
+        let text: Blob<UTF8String> = String::from("a self-contained content blob").to_blob();
         let text_handle = text.get_handle();
         let mut content = entity! { fragment_ns::text: text };
 
@@ -1482,7 +1482,7 @@ mod tests {
                 .get::<Blob<SimpleArchive>, SimpleArchive>(withheld.data().transmute())
                 .unwrap();
             let metadata: Blob<SimpleArchive> = reader.get(withheld.metadata()).unwrap();
-            let text: View<str> = reader.get::<View<str>, LongString>(text_handle).unwrap();
+            let text: View<str> = reader.get::<View<str>, UTF8String>(text_handle).unwrap();
             let payload: Bytes = reader.get::<Bytes, RawBytes>(payload_handle).unwrap();
             assert_eq!(content, expected_content);
             assert_eq!(metadata, expected_metadata);
@@ -1939,7 +1939,7 @@ mod tests {
         assert_eq!(fetched_metadata, expected_metadata);
         validate_commit(&descriptor, &commit, &fetched_content).unwrap();
 
-        let fetched_text: View<str> = reader.get::<View<str>, LongString>(text_handle).unwrap();
+        let fetched_text: View<str> = reader.get::<View<str>, UTF8String>(text_handle).unwrap();
         let fetched_payload: Bytes = reader.get::<Bytes, RawBytes>(payload_handle).unwrap();
         assert_eq!(&*fetched_text, "a self-contained content blob");
         assert_eq!(&*fetched_payload, &[0, 1, 2, 3, 0xFE, 0xFF]);

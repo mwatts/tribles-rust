@@ -4,12 +4,12 @@
 pub use crate::blob::encodings::array::elements;
 /// Re-export of [`Array`] and [`ArrayElement`].
 pub use crate::blob::encodings::array::{Array, ArrayElement};
-/// Re-export of [`LongString`].
-pub use crate::blob::encodings::longstring::LongString;
 /// Re-export of [`RawBytes`].
 pub use crate::blob::encodings::rawbytes::RawBytes;
 /// Re-export of [`SimpleArchive`].
 pub use crate::blob::encodings::simplearchive::SimpleArchive;
+/// Re-export of [`UTF8String`].
+pub use crate::blob::encodings::utf8string::UTF8String;
 
 /// Re-export of the succinct archive and its raw/index blob encodings.
 pub use crate::blob::encodings::succinctarchive::{

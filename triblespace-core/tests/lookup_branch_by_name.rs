@@ -11,7 +11,7 @@
 //! refuses to guess which one you meant.
 //!
 //! These tests also pin the equivalence that lets the scan skip a blob read
-//! per branch: a branch's name is stored as a content-addressed `LongString`
+//! per branch: a branch's name is stored as a content-addressed `UTF8String`
 //! blob and the metadata holds only its handle, so hashing the *sought* name
 //! and comparing handles is equivalent to fetching each name and comparing
 //! strings — handle equality IS content equality. The equivalence holds
@@ -22,7 +22,7 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -93,9 +93,9 @@ fn multiple_names_on_the_actual_branch_entity_fail_closed() {
     let reader = repo.storage_mut().reader().unwrap();
     let mut meta: TribleSet = reader.get(old).unwrap();
     let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, branch_id).unwrap();
-    let other_name: Inline<Handle<LongString>> = repo
+    let other_name: Inline<Handle<UTF8String>> = repo
         .storage_mut()
-        .put::<LongString, _>("other".to_owned().to_blob())
+        .put::<UTF8String, _>("other".to_owned().to_blob())
         .unwrap();
     meta += entity! { ExclusiveId::force_ref(&branch_entity) @
         triblespace_core::metadata::name: other_name

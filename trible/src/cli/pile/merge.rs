@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::path::PathBuf;
 
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::PinStore;
@@ -68,7 +68,7 @@ fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
         .map_err(|err| anyhow::anyhow!("branch {branch_id:X} metadata: {err:?}"))?;
 
     let mut names = find!(
-        handle: Inline<Handle<LongString>>,
+        handle: Inline<Handle<UTF8String>>,
         pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
     );
     let name = match (names.next(), names.next()) {

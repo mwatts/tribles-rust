@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::attribute::Attribute;
-use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::reach;
@@ -31,7 +31,7 @@ use triblespace_core::trible::TribleSet;
 use super::super::signing::load_signing_key;
 
 type ArchiveHandle = Inline<Handle<SimpleArchive>>;
-type NameHandle = Inline<Handle<LongString>>;
+type NameHandle = Inline<Handle<UTF8String>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MigrationReport {
@@ -175,7 +175,7 @@ fn resolve_branch(
             let mut current_names = facts
                 .iter()
                 .filter(|fact| fact.e() == &subject && fact.a() == &metadata::name.id())
-                .map(|fact| *fact.v::<Handle<LongString>>());
+                .map(|fact| *fact.v::<Handle<UTF8String>>());
             let current = current_names.next();
             if current_names.next().is_some() {
                 continue;
@@ -562,7 +562,7 @@ mod tests {
         pile.put::<SimpleArchive, _>(merge_blob.clone())?;
 
         let branch = Id::new([0xD8; 16]).unwrap();
-        let branch_name = pile.put::<LongString, _>("empty-and-merge".to_owned())?;
+        let branch_name = pile.put::<UTF8String, _>("empty-and-merge".to_owned())?;
         let branch_meta =
             repo::branch::branch_metadata(&author, branch, branch_name, Some(merge_blob));
         let branch_meta = pile.put::<SimpleArchive, _>(branch_meta)?;
@@ -727,7 +727,7 @@ mod tests {
         pile.put::<SimpleArchive, _>(wrapper_blob.clone())?;
 
         let branch = Id::new([0xC7; 16]).unwrap();
-        let name = pile.put::<LongString, _>("bad".to_owned())?;
+        let name = pile.put::<UTF8String, _>("bad".to_owned())?;
         let branch_meta = repo::branch::branch_metadata(&author, branch, name, Some(wrapper_blob));
         let branch_meta = pile.put::<SimpleArchive, _>(branch_meta)?;
         assert!(matches!(

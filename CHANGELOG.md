@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Rename the arbitrarily sized UTF-8 blob encoding from `LongString` to
+  `UTF8String`, including its module and all current examples, tests, and
+  documentation. The pinned encoding ID and payload bytes are unchanged, so
+  existing handles and encoding-derived attribute identities remain valid.
+
 - **Reach is a fragment, not an enum.** `Reach::{Private, Public}` and its
   `declared()` are gone. `collection::reach` states the same thing as data:
   `reach::private()` is an empty `Fragment`, `reach::public()` one that exports

@@ -43,7 +43,7 @@ mod instrumentation_attributes {
     /// Reuses `metadata::name`, `metadata::attribute`, and `metadata::tag` for
     /// fields that match their runtime `describe()` counterparts.
     pub(crate) mod attribute {
-        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::prelude::inlineencodings::{Handle, ShortString};
         use triblespace_core_macros::attributes;
 
@@ -51,20 +51,20 @@ mod instrumentation_attributes {
             // Instrumentation-specific: link back to the macro invocation entity.
             "19D4972B2DF977FA64541FC967C4B133" unsafe as invocation: ShortString;
             // Instrumentation-specific: the Rust type tokens for this attribute's inline encoding.
-            "D97A427FF782B0BF08B55AC84877B486" unsafe as attribute_type: Handle<LongString>;
+            "D97A427FF782B0BF08B55AC84877B486" unsafe as attribute_type: Handle<UTF8String>;
         }
     }
 
     pub(crate) mod invocation {
-        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::prelude::inlineencodings::{Handle, LineLocation, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {
             "1CED5213A71C9DD60AD9B3698E5548F4" unsafe as macro_kind: ShortString;
-            "E413CB09A4352D7B46B65FC635C18CCC" unsafe as manifest_dir: Handle<LongString>;
+            "E413CB09A4352D7B46B65FC635C18CCC" unsafe as manifest_dir: Handle<UTF8String>;
             "8ED33DA54C226ADEA0FFF7863563DF5F" unsafe as source_range: LineLocation;
-            "B981AEA9437561F8DB96E7EECBB94BFD" unsafe as source_tokens: Handle<LongString>;
+            "B981AEA9437561F8DB96E7EECBB94BFD" unsafe as source_tokens: Handle<UTF8String>;
             "92EF719DA3DD2405E89B953837E076A5" unsafe as crate_name: ShortString;
         }
     }
@@ -514,8 +514,8 @@ mod instrumentation_tests {
 
     use std::fs::File;
 
-    use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::blob::Blob;
     use triblespace_core::collection::{self, CollectionRecord, CollectionStore};
     use triblespace_core::trible::TribleSet;
@@ -577,14 +577,14 @@ mod instrumentation_tests {
                 fact.a() == &triblespace_core::metadata::name.id()
                     || fact.a() == &attribute::attribute_type.id()
             })
-            .map(|fact| *fact.v::<Handle<LongString>>())
+            .map(|fact| *fact.v::<Handle<UTF8String>>())
             .collect::<Vec<_>>();
         assert_eq!(handles.len(), 4);
 
         let mut blobs = context.fragment.blobs().clone();
         let reader = blobs.reader().unwrap();
         for handle in handles {
-            let _: Blob<LongString> = reader.get(handle).unwrap();
+            let _: Blob<UTF8String> = reader.get(handle).unwrap();
         }
     }
 
@@ -636,7 +636,7 @@ mod instrumentation_tests {
             "the commit names the descriptor the facade published"
         );
 
-        let _: Blob<LongString> = reader.get(attachment).unwrap();
+        let _: Blob<UTF8String> = reader.get(attachment).unwrap();
         StorageClose::close(pile).unwrap();
     }
 }

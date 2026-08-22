@@ -34,9 +34,9 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
-use subject::core::blob::encodings::longstring::LongString;
 use subject::core::blob::encodings::simplearchive::SimpleArchive;
 use subject::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use subject::core::blob::encodings::utf8string::UTF8String;
 use subject::core::inline::encodings::hash::Handle;
 use subject::core::metadata;
 use subject::core::prelude::inlineencodings::GenId;
@@ -433,8 +433,8 @@ pub fn pile_checkout(
     for id in branch_ids {
         let Ok(Some(meta_handle)) = pile.head(id) else { continue };
         let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue };
-        let handles: Vec<Inline<Handle<LongString>>> = find!(
-            (n: Inline<Handle<LongString>>),
+        let handles: Vec<Inline<Handle<UTF8String>>> = find!(
+            (n: Inline<Handle<UTF8String>>),
             pattern!(&meta, [{ metadata::name: ?n }])
         )
         .map(|(n,)| n)

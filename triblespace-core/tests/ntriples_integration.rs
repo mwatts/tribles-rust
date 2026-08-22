@@ -9,7 +9,7 @@ use anybytes::View;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::attribute::Attribute;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
 use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id_pure, IngestError};
@@ -67,7 +67,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     // `facts` is the faithful graph — no rdf_uri annotations mixed in.
     let uri_in_facts = find!(
-        (entity: Id, uri: Inline<Handle<LongString>>),
+        (entity: Id, uri: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
@@ -77,7 +77,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     // distinct subject URIs (frank, dune) each appear, and the
     // URI-valued object (dune) is also tagged.
     let uri_in_map = find!(
-        (entity: Id, uri: Inline<Handle<LongString>>),
+        (entity: Id, uri: Inline<Handle<UTF8String>>),
         pattern!(import.uri_map.facts(), [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
@@ -93,11 +93,11 @@ fn ingests_facts_and_roundtrips_via_query() {
     .expect("birthyear triple");
     assert_eq!(year, 1920);
 
-    // The string literal lands as Handle<LongString>; we don't pull the blob
+    // The string literal lands as Handle<UTF8String>; we don't pull the blob
     // (the test would need a reader), we just verify the trible exists.
-    let firstname_attr = Attribute::<Handle<LongString>>::iri("http://example.org/firstname");
+    let firstname_attr = Attribute::<Handle<UTF8String>>::iri("http://example.org/firstname");
     let firstname_count = find!(
-        (h: Inline<Handle<LongString>>),
+        (h: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ _?e @ firstname_attr: ?h }])
     )
     .count();
@@ -131,7 +131,7 @@ fn uri_to_id_is_deterministic_across_workspaces() {
         .facts
         .into_facts();
 
-    let frank_attr = Attribute::<Handle<LongString>>::iri("http://example.org/firstname");
+    let frank_attr = Attribute::<Handle<UTF8String>>::iri("http://example.org/firstname");
     let (frank_a,) = find!(
         (e: Id),
         pattern!(&facts_a, [{ ?e @ frank_attr: _?v }])
@@ -344,7 +344,7 @@ fn lang_tagged_literals_reify_into_entities() {
 
     // The label entity also carries an `rdf_text` handle.
     let text_count = find!(
-        (e: Id, h: Inline<Handle<LongString>>),
+        (e: Id, h: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ ?e @ rdf_text: ?h }])
     )
     .count();
@@ -433,7 +433,7 @@ _:b1 <http://ex/q> "x" .
     let facts = import.facts.into_facts();
 
     let p = Attribute::<inlineencodings::GenId>::iri("http://ex/p");
-    let q = Attribute::<Handle<LongString>>::iri("http://ex/q");
+    let q = Attribute::<Handle<UTF8String>>::iri("http://ex/q");
 
     let (target,) = find!(
         (id: Id),
@@ -444,7 +444,7 @@ _:b1 <http://ex/q> "x" .
 
     // The same id appears as the subject of the bnode's outgoing fact.
     let outgoing_count = find!(
-        (h: Inline<Handle<LongString>>),
+        (h: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ target @ q: ?h }])
     )
     .count();
@@ -466,8 +466,8 @@ _:child <http://ex/name> "leaf" .
         .into_facts();
 
     let child_attr = Attribute::<inlineencodings::GenId>::iri("http://ex/child");
-    let name_attr = Attribute::<Handle<LongString>>::iri("http://ex/name");
-    let leaf_handle: Inline<Handle<LongString>> = "leaf".to_blob().get_handle();
+    let name_attr = Attribute::<Handle<UTF8String>>::iri("http://ex/name");
+    let leaf_handle: Inline<Handle<UTF8String>> = "leaf".to_blob().get_handle();
     let expected_child = entity! { name_attr: leaf_handle }
         .root()
         .expect("child identity");
@@ -484,7 +484,7 @@ _:child <http://ex/name> "leaf" .
     assert_eq!(actual_child, expected_child);
     assert_eq!(
         find!(
-            (value: Inline<Handle<LongString>>),
+            (value: Inline<Handle<UTF8String>>),
             pattern!(&facts, [{ expected_child @ name_attr: ?value }])
         )
         .count(),
@@ -736,11 +736,11 @@ fn predicate_uris_recoverable_from_metafacts() {
     // then resolve the bytes from the fragment's one shared blob store.
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
 
-    let firstname_attr = Attribute::<Handle<LongString>>::iri("http://example.org/firstname");
+    let firstname_attr = Attribute::<Handle<UTF8String>>::iri("http://example.org/firstname");
     let attr_entity = firstname_attr.id();
 
     let (h,) = find!(
-        (h: Inline<Handle<LongString>>),
+        (h: Inline<Handle<UTF8String>>),
         pattern!(import.facts.metafacts(), [{ attr_entity @ metadata::iri: ?h }])
     )
     .next()
