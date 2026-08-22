@@ -1309,7 +1309,7 @@ mod collection_gossip_tests {
     #[test]
     fn a_peer_relays_only_what_its_own_store_says_may_travel() {
         use triblespace_core::collection::records::CollectionName;
-        use triblespace_core::collection::{Collection, reach, simplearchive_union};
+        use triblespace_core::collection::{Collection, reach};
         use triblespace_core::repo::memoryrepo::MemoryRepo;
         use triblespace_core::trible::{Fragment, TribleSet};
 

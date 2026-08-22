@@ -16,7 +16,6 @@ use triblespace_core::collection::{
     Collection, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
     CollectionRecord, CollectionStore, VerifyingKey, simplearchive_union,
 };
-use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::repo::WantRequest;
@@ -32,10 +31,6 @@ use common::{
     admin_cap, bring_up, bring_up_with_peers, key, pk, run_paused, self_cap_of, store_with_caps,
     vclock,
 };
-
-fn id(byte: u8) -> Id {
-    Id::new([byte; 16]).unwrap()
-}
 
 fn collection_name(name: &str) -> CollectionName {
     CollectionName::new(name).unwrap()

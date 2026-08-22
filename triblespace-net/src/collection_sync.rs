@@ -25,7 +25,7 @@
 //! 3. [`AuthorizedIncomingCollectionBatch::admit`] inserts the accepted
 //!    grow-only evidence and performs one durability flush.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use triblespace_core::collection::{
     CollectionCommit, CollectionRecord, CollectionStore, CommitVerificationError,
@@ -457,6 +457,6 @@ mod tests {
         // second signature to disagree with it, because permission is no
         // longer something a peer carries alongside a commit -- it is a
         // property of the collection the commit names.
-        prepare_incoming_collection_batch(vec![commit]).unwrap();
+        let _ = prepare_incoming_collection_batch(vec![commit]).unwrap();
     }
 }

@@ -22,7 +22,7 @@ use triblespace_core::collection::reach as collection_reach;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
-    CommitVerificationError, RecordDecodeError,
+    RecordDecodeError,
 };
 use triblespace_core::id::Id;
 use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest, WantRequestDecodeError};

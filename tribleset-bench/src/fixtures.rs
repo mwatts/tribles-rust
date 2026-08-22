@@ -29,6 +29,8 @@
 //!   rpq-gated; only F10 (which reads the GPU routing threshold out of
 //!   `triblespace-gpu`) is feature-gated.
 
+#![cfg_attr(feature = "legacy-repository", allow(deprecated))]
+
 use std::time::Instant;
 
 #[cfg(feature = "legacy-repository")]
@@ -46,9 +48,9 @@ use subject::core::prelude::*;
 // Raw engine protocol surface — needed only by the R2 fixtures: F11's
 // hand-written `Constraint` wrapper, F12's programmatic chain, and F13's
 // hand-rolled variable context.
-use subject::core::query::{
-    Binding, Constraint, ProposalBuffer, VariableContext, VariableId, VariableSet,
-};
+use subject::core::query::{Constraint, VariableContext};
+#[cfg(feature = "protocol-v2")]
+use subject::core::query::{Binding, ProposalBuffer, VariableId, VariableSet};
 // `ProposeCursor` is the resumable-narrowing cursor; it exists only on
 // subjects between the chunked-propose era and engine/batched-frontier.
 #[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
@@ -62,7 +64,7 @@ use subject::core::query::Candidates;
 #[cfg(feature = "frontier")]
 use subject::core::query::Frontier;
 use subject::core::repo::pile::Pile;
-use subject::core::repo::self;
+use subject::core::repo;
 #[cfg(feature = "legacy-repository")]
 use subject::core::repo::{PinStore, Repository};
 #[cfg(not(feature = "legacy-repository"))]
@@ -463,7 +465,7 @@ pub fn pile_checkout(
         let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else { continue };
         named.push((id, name.as_ref().to_owned(), meta));
     }
-    let (branch_id, branch_name, branch_meta) = match branch {
+    let (_branch_id, branch_name, branch_meta) = match branch {
         Some(want) => named
             .into_iter()
             .find(|(_, n, _)| n == want)
@@ -535,7 +537,7 @@ pub fn pile_checkout(
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .expect("create repository view");
     #[cfg(feature = "legacy-repository")]
-    let mut ws = repo.pull(branch_id).expect("pull branch");
+    let mut ws = repo.pull(_branch_id).expect("pull branch");
     let mut spans: Vec<(u64, u64)> = Vec::new();
     let mut out: Option<TribleSet> = None;
     // (checked-out size, carved size, carved content digest). The
@@ -1251,6 +1253,7 @@ pub const F11_SMALL: usize = 200;
 /// F11: candidates on the large side.
 pub const F11_LARGE: usize = 10_000;
 /// F11: how far the wrapper's estimate is off, in each direction.
+#[cfg(feature = "protocol-v2")]
 pub const F11_LIE_FACTOR: usize = 100;
 
 /// F11 expected rows (identical for all three plans): the small side's
