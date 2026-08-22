@@ -438,6 +438,15 @@ contribute one candidate, not two. That is a property of the candidate buffer
 for one level, and it does not extend to complete rows — the same alias
 witnessed by two different entities is still two rows.
 
+Candidate uniqueness is scoped to one proposal region and keyed by
+`(parent tag, value)`: equal values belonging to different parent bindings are
+different members of the relation. Exactness, uniqueness, and physical order
+are separate properties—knowing that a producer enumerated its complete input
+does not prove that its output is duplicate-free, and neither property promises
+an order. When regions over the same parent domain reconverge, as union arms do,
+uniqueness must therefore be re-established by deduplication unless their
+disjointness is proved.
+
 ## Constants live below the variable layer
 
 A pattern position is a [`Term`](triblespace::core::query::Term): either a

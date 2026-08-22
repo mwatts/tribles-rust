@@ -251,11 +251,67 @@ mod tests {
     use super::*;
     use crate::query::constantconstraint::ConstantConstraint;
 
+    #[derive(Clone, Copy)]
+    struct RepeatedValueSource {
+        value: RawInline,
+    }
+
+    impl<'a> Constraint<'a> for RepeatedValueSource {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+            (variable == 0).then_some(2)
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            frontier: &Frontier<'_>,
+            proposals: &mut ProposalBuffer,
+        ) {
+            assert_eq!(variable, 0);
+            for parent in 0..frontier.len() {
+                proposals.open(parent as u32);
+                proposals.extend([self.value, self.value]);
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _frontier: &Frontier<'_>,
+            _candidates: &mut Candidates<'_>,
+        ) {
+        }
+    }
+
     #[test]
     #[should_panic(expected = "UnionConstraint requires at least one variant")]
     fn empty_union_panics_at_construction() {
         // Without this assert, `variables()` would later panic on
         // `self.constraints[0]` with an unhelpful index-out-of-bounds.
         let _: UnionConstraint<ConstantConstraint> = UnionConstraint::new(vec![]);
+    }
+
+    #[test]
+    fn union_deduplicates_on_parent_and_value() {
+        let mut value = [0; 32];
+        value[31] = 7;
+        let source = RepeatedValueSource { value };
+        let union = UnionConstraint::new(vec![source, source]);
+
+        let root = Frontier::default();
+        let selected = [0, 0];
+        let frontier = root.with_select(&selected);
+        let mut proposals = ProposalBuffer::new();
+        union.propose(0, &frontier, &mut proposals);
+
+        assert_eq!(
+            proposals.tagged(0).collect::<Vec<_>>(),
+            vec![(0, value), (1, value)],
+            "equal values collapse within a parent but remain distinct across parents",
+        );
     }
 }

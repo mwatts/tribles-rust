@@ -4281,6 +4281,9 @@ mod tests {
     #[repr(C, align(16))]
     struct AlignedArchiveKey<const KEY_LEN: usize>([u8; KEY_LEN]);
 
+    crate::key_segmentation!(PermutedInfixSegments, 12, [4, 4, 4]);
+    crate::key_schema!(PermutedInfixSchema, PermutedInfixSegments, 12, [1, 2, 0]);
+
     struct PanicOnDrop(bool);
 
     impl Drop for PanicOnDrop {
@@ -4820,6 +4823,50 @@ mod tests {
         assert_eq!(
             tree.next_infix_after(&[], &[0x20; 16], &[0xff; 16]),
             Some([0xf0; 16]),
+        );
+    }
+
+    #[test]
+    fn ordered_infix_descent_honors_permuted_segments_in_local_leaves() {
+        fn physical_key(prefix: [u8; 4], infix: [u8; 4], suffix: [u8; 4]) -> [u8; 12] {
+            let mut key = [0; 12];
+            key[..4].copy_from_slice(&suffix);
+            key[4..8].copy_from_slice(&prefix);
+            key[8..].copy_from_slice(&infix);
+            key
+        }
+
+        let selected = [0x10; 4];
+        let other = [0x20; 4];
+        let first = [0x11; 4];
+        let second = [0x22; 4];
+        let storage = std::sync::Arc::new([
+            AlignedArchiveKey(physical_key(other, [0x33; 4], [0x44; 4])),
+            AlignedArchiveKey(physical_key(selected, second, [0x44; 4])),
+            AlignedArchiveKey(physical_key(selected, first, [0x55; 4])),
+            AlignedArchiveKey(physical_key(selected, first, [0x44; 4])),
+        ]);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let mut tree = PATCH::<12, PermutedInfixSchema, ()>::new();
+        for key in storage.iter() {
+            // SAFETY: every key is aligned and remains immutable and alive
+            // through `owner` for the lifetime of the archive-backed PATCH.
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            tree.insert_archive(&entry);
+        }
+
+        assert!(tree.node_stats().3 > 0, "fixture must contain a LocalLeaf");
+        assert_eq!(
+            tree.first_infix_range(&selected, &[u8::MIN; 4], &[u8::MAX; 4]),
+            Some(first),
+        );
+        assert_eq!(
+            tree.next_infix_after(&selected, &first, &[u8::MAX; 4]),
+            Some(second),
+        );
+        assert_eq!(
+            tree.next_infix_after(&selected, &second, &[u8::MAX; 4]),
+            None,
         );
     }
 
