@@ -24,9 +24,9 @@ artifacts. Each blob is tagged with a `BlobEncoding` so applications can decode 
 back into native types.
 
 ### Blob Store
-An abstraction that persists blobs. Implementations back local piles, in-memory
-workspaces, or remote object stores while presenting a common `BlobStore`
-interface that handles hashing, deduplication, and retrieval.
+An abstraction that persists immutable content-addressed blobs. Implementations
+back local piles, in-memory collections, or remote object stores while exposing
+small capability traits for insertion, retrieval, metadata, and enumeration.
 
 ### Capability
 A signed authorisation to act with a specific scope on a triblespace network.
@@ -39,28 +39,32 @@ back to the configured `team_root`. Holders present the sig blob's handle on
 connection (`OP_AUTH`); the relay enforces the verified scope on every
 subsequent op. See the [Capability Auth](capability-auth.md) chapter.
 
-### Checkout
-The result of `Workspace::checkout`. A `Checkout` pairs a `TribleSet` with the
-`CommitSet` that produced it. It derefs to `TribleSet` for querying and its
-`AddAssign` implementation merges both facts and commit sets, making it the
-natural accumulator for incremental query loops.
-
 ### Commit
-A signed snapshot of repository state. Commits archive a `TribleSet` describing
-the workspace contents and store metadata such as parent handles, timestamps,
-authors, signatures, and optional messages. The metadata itself lives in a
-`SimpleArchive` blob whose hash becomes the commit handle.
+A signed native collection membership assertion. A `CollectionCommit` names
+the exact collection descriptor, data element, mandatory metadata archive, and
+author. Its intrinsic record ID is derived from the canonical 192-byte payload.
+Commits are independent leaves rather than snapshots in a parent chain.
 
-### CommitSet
-A set of commit handles. `CommitSet` implements `CommitSelector` by returning
-itself, which is useful for incremental deltas (e.g.,
-`checkout(full.commits()..)`). Supports `union`, `intersection`, and
-`difference` operations.
+### Collection
+A self-describing grow-only join semilattice. Signed commits introduce members;
+validated merge records describe joins within the lattice; derivation records
+map elements into another collection through a canonical homomorphism. A
+collection has no distinguished head.
 
-### Commit Selector
-A query primitive that walks a repository’s commit graph to identify commits of
-interest. Selectors power history traversals such as `parents`,
-`nth_ancestors`, ranges like `a..b`, and helpers such as `history_of(entity)`.
+### Collection Descriptor
+A canonical `SimpleArchive` describing a collection's anchor, element
+representation, join recipe, and reach law. Its content handle is the
+`CollectionHandle`, so every native record which names a collection can resolve
+its meaning through the ordinary blob store.
+
+### Collection Store
+A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
+idempotent by intrinsic record ID; combining two stores is set union.
+
+### Collection Snapshot
+One coherent known-prefix observation containing materialized facts, the exact
+verified commit set which authorized them, and the blob reader which validated
+their dependencies.
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
@@ -100,6 +104,17 @@ mixing descriptions into ordinary queries. Use `Fragment::root()` to extract
 derived IDs, `Fragment::empty()` to start accumulation, and spread (`*`) to pass
 child fragments into parent entities, giving Merkle trees for free.
 
+### Derive
+An unsigned exact equation mapping one source element into a derived collection.
+The target descriptor names both source and recipe, so the record needs only
+the target, input, and output identities. Derivations are reproducible cache
+evidence, not authority.
+
+### Merge
+An unsigned exact equation `a ⊔ b = c` inside one collection. A validated merge
+result can replace its inputs in a physical cover without changing the logical
+value or creating new authority.
+
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.
 A single PATCH stores one ordering of a trible set in a 256-ary trie whose
@@ -111,15 +126,10 @@ segments relevant to their bindings, further described in
 [the deep-dive chapter](deep-dive/patch.md).
 
 ### Pile
-An append-only collection of blobs and branch records stored in a single file.
-Piles act as durable backing storage for repositories, providing a
-write-ahead-log style format that can be memory mapped, repaired after crashes,
-and safely shared between threads.
-
-### Repository
-The durable record that ties blob storage, branch metadata, and namespaces
-together. A repository coordinates synchronization, replication, and history
-traversal across commits while enforcing signatures and branch ownership.
+An append-only collection of blobs, native collection records, and WANT records
+stored in one file. Piles are memory mapped, recoverable after interrupted
+appends, and mergeable by byte concatenation. Legacy pin records remain
+decodable only for conservative retention and explicit migration.
 
 ### Encoding
 The byte-layout contract for a typed value. Encodings assign language-agnostic
@@ -134,11 +144,12 @@ referencing those blobs stay portable. The corresponding traits are
 The set of permissions a [Capability](#capability) grants. Output as tribles
 hung off the cap's `cap_scope_root` entity: one or more `metadata::tag: PERM_*`
 triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`) optionally combined with
-`scope_branch: <branch_id>` triples that restrict the permission to specific
-branches. An empty branch-restriction set means "every branch within the
-permission set." Sub-capabilities issued via delegation must have a scope that
-is a subset of the parent's; the verifier enforces this via `scope_subsumes`
-during chain walk.
+legacy `scope_branch: <branch_id>` triples that restrict blob reachability to
+the immutable heads visible in a `PinSnapshot`. An empty restriction set grants
+the permission without that legacy filter. Native collection enumeration
+currently requires unrestricted read authority. Sub-capabilities must have a
+scope no broader than their parent; `scope_subsumes` enforces this during the
+chain walk.
 
 ### Team Root
 The single immutable keypair that anchors a triblespace network's
@@ -154,17 +165,21 @@ layout. Tribles capture atomic facts, and query engines compose them into joins
 and higher-order results.
 
 ### TribleSpace
-The overall storage model that organises tribles across blobs, PATCHes, and
-repositories. It emphasises immutable, content-addressed data, monotonic set
-semantics, and familiar repository workflows.
+The storage model which organises tribles across blobs, PATCHes, and native
+collections. It emphasizes immutable content-addressed data, monotone set
+semantics, and reproducible derived representations.
 
 ### Inline
 The third position in a trible. Values store a fixed 32-byte payload interpreted
 through the attribute’s schema. They often embed identifiers for related
 entities or handles referencing larger blobs.
 
-### Workspace
-A mutable working area for preparing commits. Workspaces track staged trible
-sets and maintain a private blob store so large payloads can be uploaded before
-publishing. Once a commit is finalised it becomes immutable like the rest of
-TribleSpace.
+### Ticket
+The exact canonical set of signed commits selected as authority for one
+materialization or derivation. A ticket is explicit continuation state and can
+be diffed by intrinsic commit ID without walking a commit chain.
+
+### WANT
+A durable local request for a blob or for an existing merge/derive result.
+WANT is operational policy: it neither adds collection authority nor changes a
+collection's logical value.

@@ -498,7 +498,7 @@ variable as a plain [`Id`](triblespace::core::id::Id), and call
 
 ### Ownership and Eventual Consistency
 
-While a simple grow set (like the commit histories backing a branch)
+While a simple grow set (like the signed members of a native collection)
 already constitutes a conflict-free replicated data type (CRDT), it is
 also limited in expressiveness. To provide richer semantics while
 guaranteeing conflict-free mergeability we allow only "owned" IDs to be

@@ -81,11 +81,10 @@ kind byte and an eight-byte anti-deduplication nonce, for 201 bytes in total.
 The nonce changes transport identity for periodic replay but is not signed and
 has no semantic meaning.
 
-The receiver strictly verifies both signatures and their author/collection
-correspondence before admitting the pair to its two grow-only stores. The mesh
-carrier is only a relay; it is neither author nor authority. Duplicate delivery
-is reduced by intrinsic commit identity, and one drained batch crosses one
-storage flush barrier.
+The receiver strictly verifies each commit's embedded signature before unioning
+it into the local `CollectionStore`. The mesh carrier is only a relay; it is
+neither author nor authority. Duplicate delivery is reduced by intrinsic commit
+identity, and one drained batch crosses one storage flush barrier.
 
 ## Sparse discovery is deliberate
 
@@ -121,8 +120,8 @@ three variants:
   permits;
 - `Merge(collection, low, high)` asks whether a matching native `MERGE`
   receipt exists; and
-- `Derive(source, target, input)` asks whether a matching native `DERIVE`
-  receipt exists.
+- `Derive(target, input)` asks whether a matching native `DERIVE` receipt
+  exists; the target descriptor already names the source collection and recipe.
 
 The long-running `Reconciler` services these requests without deleting them.
 An unavailable answer is normal: the WANT remains durable and retries with
@@ -163,9 +162,10 @@ content.
 
 Collection-native enumeration currently requires unrestricted read authority;
 collection-scoped capabilities are future work. Blob reads may still be
-restricted to the graph reachable from named local pins. For that reason the
-read-only `PinSnapshotSource` remains part of capability evaluation even though
-pins are no longer a synchronization protocol or a remote source of truth.
+restricted to the graph reachable from an immutable legacy pin snapshot. For
+that reason the read-only `PinSnapshotSource` remains part of capability
+evaluation even though pins are no longer a synchronization protocol or a
+remote source of truth.
 
 Capability request, issuance, renewal, and delivery state lives in private
 signer-owned collections. Those collections declare no reach, so ordinary

@@ -1,245 +1,188 @@
 # Getting Started
 
-This chapter walks you through creating a brand-new repository, committing
-your first entity, and understanding the pieces involved. It assumes you have
-[Rust installed](https://www.rust-lang.org/tools/install) and are comfortable
-with running `cargo` commands from a terminal.
+This chapter publishes and queries a small native collection. It assumes Rust
+is installed and you are comfortable running `cargo` commands.
 
-## 1. Add the dependencies
-
-Create a new binary crate (for example with `cargo new tribles-demo`) and add
-the dependencies needed for the example. The `triblespace` crate provides the
-database, `ed25519-dalek` offers an implementation of the signing keys used for
-authentication, and `rand` supplies secure randomness.
+## 1. Add dependencies
 
 ```bash
+cargo new tribles-demo
+cd tribles-demo
 cargo add triblespace ed25519-dalek rand
 ```
 
-## 2. Build the example program
+`triblespace` supplies the data model, stores, collection facade, and query
+macros. `ed25519-dalek` and `rand` create the publishing identity used in this
+example.
 
-The walkthrough below mirrors the quick-start program featured in the
-README. It defines the attributes your application needs, stages and queries
-book data, publishes the first commit with automatic retries, and finally shows
-how to use `try_push` when you want to inspect and reconcile a conflict
-manually.
+## 2. Declare attributes
+
+Attributes carry the encoding of their value. Shared attributes should use a
+stable explicit anchor; the encoding participates in the resulting identity.
+Omit the anchor only for local prototypes whose identity may follow their name.
+
+```rust,ignore
+mod literature {
+    use triblespace::prelude::*;
+    use triblespace::prelude::blobencodings::UTF8String;
+    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
+
+    attributes! {
+        "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
+        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<UTF8String>;
+        "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
+        "0DBB530B37B966D137C50B943700EDB2" as pub firstname: ShortString;
+        "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: ShortString;
+        "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
+    }
+}
+```
+
+Use `trible genid` when minting a new published anchor. The literal-pinning
+`"HEX_ID" unsafe as ...` spelling is only for preserving an already-published
+attribute's exact historical bytes when its old identity cannot be re-derived.
+
+## 3. Open a collection
+
+A root collection is identified by the content handle of its descriptor. The
+descriptor names the collection within a team and states its representation,
+join recipe, and reach law. A single-user process is simply a team of one:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::collection::reach;
 use triblespace::prelude::*;
 
-mod literature {
-    use triblespace::prelude::*;
-    use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, R256, ShortString};
+let key = SigningKey::generate(&mut OsRng);
+let team = key.verifying_key();
+let name = CollectionName::new("library")?;
+let mut library = Collection::new(
+    MemoryRepo::default(),
+    &name,
+    team,
+    key,
+    reach::private(),
+);
+```
 
-    // Each shared attribute is declared with a stable 128-bit anchor. Its
-    // identity is derived from (anchor, value encoding), so `title` is only
-    // the human-readable Rust binding inside this module and changing the
-    // encoding truthfully creates a different attribute.
-    // Renaming the binding (or another codebase calling the same
-    // field `name`) doesn't break compatibility, because everyone derives
-    // the same underlying id from the shared anchor and encoding. See the
-    // [Identifiers chapter](./deep-dive/identifiers.md#abstract-vs-semantic-identifiers)
-    // for why abstract ids + local semantic names is the
-    // recommended split.
-    attributes! {
-        /// The title of a work.
-        ///
-        /// Small doc paragraph used in the book examples.
-        "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
+`reach::private()` means that network peers do not proactively gossip this
+collection. Use `reach::public()` only when the collection's identity should
+state that any holder may relay its verified commits.
 
-        /// A quote from a work.
-        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<UTF8String>;
+## 4. Build a self-contained fragment
 
-        /// The author of a work.
-        "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
+With no explicit subject prefix, `entity!` derives the entity ID from the
+canonical set of emitted fields. `Fragment::root()` returns that exported ID,
+which can be referenced by another entity. Long strings become blobs and remain
+attached to the fragment automatically.
 
-        /// The first name of an author.
-        "0DBB530B37B966D137C50B943700EDB2" as pub firstname: ShortString;
+```rust,ignore
+let author = entity! {
+    literature::firstname: "Frank",
+    literature::lastname: "Herbert",
+};
+let author_id = author.root().expect("intrinsic author id");
 
-        /// The last name of an author.
-        "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: ShortString;
+let book = entity! {
+    literature::title: "Dune",
+    literature::author: &author_id,
+    literature::quote: "I must not fear. Fear is the mind-killer.",
+};
 
-        /// The number of pages in the work.
-        "FCCE870BECA333D059D5CD68C43B98F0" as pub page_count: R256;
+let mut import = author;
+import += book;
+```
 
-        /// A pen name or alternate spelling for an author.
-        "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
+A fragment has four coordinated channels: facts, descriptive metafacts,
+exported IDs, and one shared attachment store. `+=` unions all four, so no
+parallel manifest or manual blob-staging step is needed.
 
-        /// A throwaway prototype field; omit the id to derive it from the name and encoding.
-        pub prototype_note: Handle<UTF8String>;
-    }
-}
+## 5. Publish independent commits
 
-// The examples anchor shared attributes independently of their Rust names. For
-// quick prototypes you can omit the hex literal and `attributes!` will derive
-// a deterministic id from the attribute name and encoding. The rare
-// `"HEX_ID" unsafe as ...` form pins the literal bytes themselves; use it only
-// to preserve an already-published attribute whose encoding cannot participate
-// in identity.
+```rust,ignore
+let first = library.commit(import)?;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Repositories manage shared history; MemoryRepo keeps everything in-memory
-    // for quick experiments. Swap in a `Pile` when you need durable storage.
-    let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
-    let branch_id = repo
-        .create_branch("main", None)
-        .expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull workspace");
+// A later fact about the same entity is another independent member.
+let second = library.commit(entity! {
+    &author_id @ literature::alias: "Francis",
+})?;
 
-    // The entity! macro returns a Fragment carrying facts, descriptions of
-    // the attributes actually used, and one blob store shared by both sets.
-    // Accumulate into another Fragment with `+=` so every channel composes.
-    let herbert = ufoid();
-    let dune = ufoid();
-    let mut library = Fragment::empty();
+assert_ne!(first.id(), second.id());
+```
 
-    library += entity! { &herbert @
-        literature::firstname: "Frank",
-        literature::lastname: "Herbert",
-    };
+Publication writes the descriptor, data archive, metadata archive, and fragment
+attachments before inserting the signed `COMMIT` record. The commit is the
+atomic assertion. There is no mutable head to advance: both records remain
+members and the collection value is their union.
 
-    library += entity! { &dune @
-        literature::title: "Dune",
-        literature::author: &herbert,
-        literature::quote: "I must not fear. Fear is the mind-killer.",
-    };
+Repeating byte-identical input produces the same record ID and is idempotent.
+Distinct input produces another coexisting member. Application-level
+supersession or versioning is represented in the facts when a domain needs it;
+append order is never an implicit winner.
 
-    // This introductory repository API is legacy: Workspace::commit archives
-    // the content facts and blobs but not Fragment::metafacts. New collection
-    // code passes the Fragment directly to publish_fragment_commit, which
-    // archives facts as data and metafacts as metadata.
-    ws.commit(library, "import dune");
+## 6. Read one coherent snapshot
 
-    // `checkout(..)` returns a Checkout — a TribleSet paired with the
-    // commits that produced it, usable for incremental delta queries.
-    let catalog = ws.checkout(..)?;
-    let title = "Dune";
+```rust,ignore
+let snapshot = library.snapshot()?;
+let title = "Dune";
 
-    // Multi-entity join: find quotes by authors of a given title.
-    // `_?author` is a pattern-local variable that joins without projecting.
-    for (f, l, quote) in find!(
-        (first: String, last: String, quote),
-        pattern!(&catalog, [
-            { _?author @
-                literature::firstname: ?first,
-                literature::lastname: ?last
-            },
-            { _?book @
-                literature::title: title,
-                literature::author: _?author,
-                literature::quote: ?quote
-            }
-        ])
-    ) {
-        let quote: View<str> = ws.get(quote)?;
-        let quote = quote.as_ref();
-        println!("'{quote}'\n - from {title} by {f} {l}.");
-    }
-
-    repo.push(&mut ws).expect("publish initial library");
-
-    // ── Conflict resolution ────────────────────────────────────────
-    // We rename the author; a collaborator independently records a
-    // different name. try_push detects the conflict.
-
-    ws.commit(
-        entity! { &herbert @ literature::firstname: "Francis" },
-        "use pen name",
-    );
-
-    let mut collaborator = repo.pull(*branch_id).expect("pull");
-    collaborator.commit(
-        entity! { &herbert @ literature::firstname: "Franklin" },
-        "record legal first name",
-    );
-    repo.push(&mut collaborator).expect("publish collaborator");
-
-    // try_push fails because the branch advanced. The returned
-    // workspace carries the collaborator's history.
-    if let Some(mut conflict_ws) = repo
-        .try_push(&mut ws)
-        .expect("attempt push")
-    {
-        // Inspect what the collaborator wrote.
-        let their_catalog = conflict_ws.checkout(..)?;
-        for first in find!(
-            first: String,
-            pattern!(&their_catalog, [{ &herbert @ literature::firstname: ?first }])
-        ) {
-            println!("Collaborator recorded: '{first}'.");
+for (first, last, quote) in find!(
+    (first: String, last: String, quote),
+    pattern!(snapshot.facts(), [
+        { _?author @
+            literature::firstname: ?first,
+            literature::lastname: ?last
+        },
+        { _?book @
+            literature::title: title,
+            literature::author: _?author,
+            literature::quote: ?quote
         }
-
-        // Accept their history — abandon our conflicting firstname
-        // commit and continue from the collaborator's state instead.
-        ws = conflict_ws;
-
-        // Record our preferred name as an alias rather than overwriting.
-        ws.commit(
-            entity! { &herbert @ literature::alias: "Francis" },
-            "keep pen-name as alias",
-        );
-
-        repo.push(&mut ws).expect("publish resolution");
-    }
-
-    Ok(())
+    ])
+) {
+    let quote: View<str> = snapshot.reader().get(quote)?;
+    println!("'{}'\n - from {title} by {first} {last}.", quote.as_ref());
 }
 ```
 
-## 3. Run the program
+`snapshot()` discovers one exact verified commit set, opens one blob-reader
+view, and materializes facts solely from those commits. The returned
+`CollectionSnapshot` keeps all three together. A concurrent commit may appear
+on this call or a later call, but physically visible blobs from an unobserved
+commit cannot leak into the snapshot's authority set.
 
-Compile and execute the example with `cargo run`. The example uses an in-memory
-repository (`MemoryRepo`) so no files are created on disk — everything lives in
-RAM for the duration of the run.
+Use `ticket()` when only the exact commit frontier is needed. It reads native
+records without opening a blob view or materializing facts, which is useful for
+feeding derived representations such as SuccinctArchive or path-index
+collections.
 
-```bash
-cargo run
+## 7. Choose durability explicitly
+
+`Collection::commit` performs no implicit flush. For a memory store that makes
+no difference. For a pile or remote backend, choose the durability boundary
+that matches the application:
+
+```rust,ignore
+library.commit(batch_a)?;
+library.commit(batch_b)?;
+library.flush()?;
 ```
 
-To persist data across runs, swap `MemoryRepo::default()` for
-`Pile::open(&path)?` backed by a file on disk.
+Amortizing one flush over several commits does not weaken their logical
+identity or change merge semantics. Consume the facade with `into_storage()`
+when another component needs the backend, or call `close()` where the backend
+supports explicit close.
 
-## Understanding the pieces
+## What to remember
 
-* **Branch setup.** `Repository::create_branch` registers the branch and returns
-  an `ExclusiveId` guard. Dereference the guard (or call `ExclusiveId::release`)
-  to obtain the `Id` that `Repository::pull` expects when creating a
-  `Workspace`.
-* **Minting attributes.** The `attributes!` macro names the fields that can be
-  stored in the repository. Attribute identifiers are global—if two crates use
-  the same identifier they will read each other's data—so give them meaningful
-  project-specific names.
-* **Committing data.** The `entity!` macro builds a set of attribute/value
-  assertions. When paired with the `ws.commit` call it records a transaction in
-  the workspace that becomes visible to others once pushed.
-* **Publishing changes.** `Repository::push` merges any concurrent history into
-  the workspace and retries automatically, making it ideal for monotonic
-  updates where you are happy to accept the merged result.
-* **Manual conflict resolution.** `Repository::try_push` performs a single
-  optimistic attempt and returns a conflict workspace when the branch has
-  advanced. Inspect that workspace to see the competing history, then decide
-  whether to merge your changes or abandon them — as the example does by
-  accepting the collaborator's name and recording ours as an alias.
-* **Closing repositories.** When working with pile-backed repositories it is
-  important to close them explicitly so buffered data is flushed and any errors
-  are reported while you can still decide how to handle them. Calling
-  `repo.close()?;` surfaces those errors; if the repository were only dropped,
-  failures would have to be logged or panic instead. Alternatively, you can
-  recover the underlying pile with `Repository::into_storage` and call
-  `Pile::close()` yourself.
+- `entity!` builds intrinsic entities and carries required blobs.
+- `Fragment` is the self-contained publication value.
+- `Collection::commit` publishes one signed, independent member.
+- `Collection::snapshot` returns a coherent known-prefix view.
+- Replicas converge by unioning records; they never elect a branch head.
+- Derived indexes are reproducible collection images, not alternate authority.
 
-See the [crate documentation](https://docs.rs/triblespace/latest/triblespace/) for
-additional modules and examples.
-
-## Switching signing identities
-
-The setup above generates a single signing key for brevity, but collaborating
-authors typically hold individual keys. Call `Repository::set_signing_key`
-before branching or pulling when you need a different default identity, or use
-`Repository::create_branch_with_key` and `Repository::pull_with_key` to choose a
-specific key per branch or workspace. The [Managing signing identities](repository-workflows.html#managing-signing-identities)
-section covers this workflow in more detail.
+Continue with [Collection Workflows](repository-workflows.md) for the native
+record algebra, exact tickets, migration from legacy piles, and derived
+collection maintenance.

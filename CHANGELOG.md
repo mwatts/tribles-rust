@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the current-facing Repository, Workspace, mutable branch, pin, and
+  compare-and-swap documentation with the native collection model. The book now
+  presents self-describing descriptors, signed `COMMIT` members, validated
+  `MERGE`/`DERIVE` equations, exact tickets, and orthogonal WANTs as one coherent
+  workflow; obsolete speculative chapters and their retired proof harnesses are
+  removed, while immutable legacy pin snapshots remain documented only for
+  authorization, retention, and explicit migration.
+
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.
 

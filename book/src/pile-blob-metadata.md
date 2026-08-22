@@ -29,7 +29,7 @@ callers can read when a blob was appended and how large the payload is.
 
 ## `BlobMetadata`
 
-[`BlobMetadata`][blobmetadata] is a lightweight struct shared by all repository
+[`BlobMetadata`][blobmetadata] is a lightweight struct shared by blob-store
 implementations. It mirrors the timestamp/length pair in the header and leaves
 validation to the reader:
 

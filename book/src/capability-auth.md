@@ -185,20 +185,21 @@ Capabilities encode their scope as tribles hung off `cap_scope_root`:
 
 - One or more `metadata::tag: PERM_*` triples granting permissions
   (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`).
-- Zero or more `scope_branch: <branch_id>` triples restricting the
-  permission to a specific branch. An empty branch-restriction set
-  means "all branches".
+- Zero or more legacy `scope_branch: <branch_id>` triples restricting raw blob
+  reachability to an immutable pin snapshot. An empty restriction set means
+  unrestricted scope for that permission.
 
-The relay applies branch restrictions only to blob reachability. There is no
-wire operation that lists or mutates branch state.
+The relay applies those legacy restrictions only to blob reachability. There is
+no wire operation that lists or mutates pin state, and new collection
+publication does not create pins.
 
 ### Blob level (`OP_GET_BLOB`, `OP_CHILDREN`)
 
-A peer with branch-X-only scope could otherwise circumvent the branch
-gate by guessing or probing raw blob hashes from branch Y. The
-blob-level gate closes that hole: a hash is in scope only if it's
-reachable (via 32-byte child chunks) from at least one branch head the
-cap grants read on. Out-of-scope blobs surface as `None` (length =
+A peer with a restricted legacy scope could otherwise circumvent the gate by
+guessing or probing raw blob hashes outside its retained graph. The blob-level
+gate closes that hole: a hash is in scope only if it is reachable (via 32-byte
+child chunks) from at least one granted head in the immutable `PinSnapshot`.
+Out-of-scope blobs surface as `None` (length =
 `u64::MAX`) on `OP_GET_BLOB`; `OP_CHILDREN` filters its returned list
 to in-scope hashes only.
 
@@ -263,10 +264,10 @@ Pending requests, decisions, renewal entries, and current team capabilities are
 facts in one private, signer-owned node-policy collection. “Private” is an
 authority decision, not a second storage primitive: policy code commits to the
 inner collection store, while `Peer` deliberately does not expose those records
-as repository branches, and the policy collection's descriptor declares no
-reach. Merely belonging to a collection therefore does not authorize proactive
-gossip — and since reach is part of the descriptor, nothing can grant it to
-that collection after the fact.
+through a second mutable namespace, and the policy collection's descriptor
+declares no reach. Merely belonging to a collection therefore does not authorize
+proactive gossip — and since reach is part of the descriptor, nothing can grant
+it to that collection after the fact.
 
 Policy history is immutable. A request has a stable intrinsic core, receipt is
 an observation event, and approval or rejection is an immutable decision DAG.

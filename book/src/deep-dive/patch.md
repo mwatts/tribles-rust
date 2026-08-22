@@ -153,5 +153,5 @@ Consumers can reorder or segment keys through the [`KeySchema`](../../src/patch.
 and [`KeySegmentation`](../../src/patch.rs) traits. Prefix queries reuse the
 schema’s tree ordering to walk just the matching segments. Because every update
 is implemented with copy-on-write semantics, cloning a tree is cheap and retains
-structural sharing: multiple workspaces can branch, mutate independently, and
-merge results without duplicating entire datasets.
+structural sharing: multiple owners can clone, mutate independently, and merge
+results without duplicating entire datasets.

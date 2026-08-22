@@ -22,15 +22,15 @@ TribleSpace closes those gaps with a single substrate that stores heavyweight
 assets and the relationships that explain them. Think of it as a library catalog
 for blobs and a lab notebook for the annotations, measurements, and discussions
 that give those blobs meaning. Because facts and payloads travel together,
-features like version control, verifiability, and provenance fall naturally out
-of the data model instead of bolting on as afterthoughts.
+features like reproducible versioning, verifiability, and provenance fall
+naturally out of the data model instead of bolting on as afterthoughts.
 
 That same structure also lets you support offline edits, reconcile concurrent
 changes safely, and ship datasets to partners with the evidence needed to trust
 them.
 
-To deliver those outcomes, TribleSpace blends ideas from databases, version
-control, and content-addressed storage. Information is encoded as fixed-width
+To deliver those outcomes, TribleSpace blends ideas from databases, join
+semilattices, and content-addressed storage. Information is encoded as fixed-width
 *tribles*: 64-byte entity–attribute–value facts. Each trible stores two 16-byte
 extrinsic identifiers plus a 32-byte typed value. When a value exceeds the
 inline slot it becomes a schema-qualified hash pointing to an immutable
@@ -44,9 +44,9 @@ verify when data is shared or synchronized.
 This design unlocks capabilities that are difficult to achieve together in
 traditional stacks:
 
-* **Trustworthy collaboration** – hashes and immutable histories provide the
-  audit trail needed to review changes, merge branches, and reproduce results
-  across teams.
+* **Trustworthy collaboration** – signed commits and immutable algebra records
+  provide the audit trail needed to review contributions, union independent
+  work, and reproduce results across teams.
 * **Content-addressed storage** – values are stored and looked up by their
   contents, making caches and replicas safe even when they live on untrusted
   infrastructure.
@@ -76,7 +76,7 @@ the previous ones:
    trible store, and issuing simple queries.
 2. **Architecture** and **Query Engine** explain how the runtime is structured
    so you can reason about performance and extensibility.
-3. Later sections explore schema design, incremental queries, repository
+3. Later sections explore schema design, incremental queries, collection
    workflows, and formal verification so you can grow from experiments to
    production systems.
 

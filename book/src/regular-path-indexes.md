@@ -180,9 +180,9 @@ let paths = path_collection.ensure_exact(&mut store, &ticket)?;
 let same_paths = path_collection.attach_exact(&mut store, &ticket)?;
 ```
 
-Both methods require only `BlobStore + CollectionStore`; there is no
-`Repository`, `PinStore`, branch head, commit chain, manifest, registered
-hook, or range planner.
+Both methods require only `BlobStore + CollectionStore`. The exact source
+ticket replaces ambient heads, commit-chain traversal, manifests, registered
+hooks, and range planning.
 
 The ticket is the authority boundary. Every commit must:
 

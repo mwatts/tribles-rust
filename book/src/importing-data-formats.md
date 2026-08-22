@@ -1,6 +1,6 @@
 # Importing Other Data Formats
 
-Import pipelines let you bring external datasets into a tribles repository without
+Import pipelines let you bring external datasets into a TribleSpace collection without
 hand-writing encodings or entity identifiers every time. This chapter introduces the
 `import` namespace, explains how the JSON importers map foreign fields onto
 attributes, and outlines how you can extend the same patterns to new formats.
@@ -15,7 +15,7 @@ deterministic JSON importers and an N-Triples (RDF) importer:
   `NIL || attribute || value` rows using the same protocol as `entity!`, so
   identical fact sets reproduce the same entities. It accepts a top-level JSON
   object (or a top-level array of objects). Construct it with a blob sink (e.g.,
-  a `Workspace`’s store or a `MemoryBlobStore`) and an optional 32-byte namespace
+  a collection's underlying store or a `MemoryBlobStore`) and an optional 32-byte namespace
   when independently imported corpora must not share identities. Each `import_*` call
   returns a [`Fragment`](../src/trible/fragment.rs) that exports the root entity
   id(s) and contains the emitted facts.
@@ -67,7 +67,7 @@ entity id(s) for the imported document and containing the emitted facts; call
 `metadata()` to retrieve a separate `Fragment` exporting the derived attribute
 ids and containing attribute descriptors plus multi-value hints (via
 `metadata::tag` pointing to `metadata::KIND_MULTI`). Merge those descriptors
-into your repository alongside the imported facts when you want queries to
+publish those descriptors as metadata alongside the imported facts when you want queries to
 discover the original JSON field names or project datasets by encoding without
 repeating the derivation logic. Field names are stored as `metadata::name`
 handles to
@@ -86,8 +86,8 @@ all += importer.import_str(doc2)?;
 // all.exports() yields the root ids; all.facts() yields the merged tribles.
 ```
 
-When exporting back to JSON, pass a blob reader (e.g., from a `Workspace` or
-`MemoryBlobStore`) to `export_to_json` so `UTF8String` blobs can be inlined. If a
+When exporting back to JSON, pass a blob reader (for example from a collection
+snapshot or `MemoryBlobStore`) to `export_to_json` so `UTF8String` blobs can be inlined. If a
 blob is missing or unreadable the exporter returns an error with the handle hash
 instead of silently emitting a placeholder, keeping roundtrips lossless when
 blobs are present. The exporter uses the same fixed mapping in reverse:

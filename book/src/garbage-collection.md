@@ -1,32 +1,18 @@
 # Garbage Collection and Forgetting
 
-Repositories grow over time as commits, branch metadata, and user blobs
+Stores grow as signed commits, reproducible derived artifacts, and user blobs
 accumulate. Because every blob is content addressed and immutable, nothing is
-ever overwritten and there is no automatic reclamation when branches move or
-objects become orphaned. To keep disk usage in check a repository can
-periodically _forget_ blobs that are no longer referenced.
+overwritten in place. A node periodically _forgets_ local bytes which its
+retention policy no longer owns.
 
 Forgetting is deliberately conservative. It only removes local copies, so
-re-synchronising from a peer or pushing a commit that references an "forgotten"
-blob will transparently restore it. Forgetting therefore complements the
-monotonic model: history never disappears globally, but any node can opt-out of
-retaining data it no longer needs.
+re-synchronising from a peer or satisfying a later WANT may restore them.
+Forgetting therefore complements the monotone model: an assertion is not
+semantically retracted merely because one node drops a physical copy.
 
-The main challenge is deciding which blobs are still reachable without
-reconstructing every `TribleSet`. The sections below outline how the repository
-module solves that problem and how you can compose the building blocks in your
-own tools.
-
-## Understanding the Roots
-
-The walk begins with a _root set_—the handles you know must stay alive. In a
-typical repository this includes the metadata blob for each branch (which in
-turn names the commit heads), tags, or any additional anchors your deployment
-requires. Roots are cheap to enumerate: walk the branch store via
-[`BranchStore::branches`](https://docs.rs/triblespace/latest/triblespace/core/repo/trait.BranchStore.html#tymethod.branches)
-and load each branch head, or read the subset of metadata relevant to the
-retention policy you are enforcing. Everything reachable from those handles
-will be retained by the traversal; everything else is eligible for forgetting.
+The main challenge is distinguishing authority from useful-but-reproducible
+cache work. A digest mentioned in a record is not automatically a lifetime
+edge.
 
 ## Direct and Recursive Policy Roots
 
@@ -43,11 +29,12 @@ has two sorts:
 Strong collection retention follows only signed ground truth. For every
 locally authorized, admitted `COMMIT`, the descriptor, signed data, and metadata
 handles are recursive roots, so all of their resident attachments remain
-owned. The descriptor is the canonical `(scope, representation, recipe)`
-`SimpleArchive`; its 32-byte content handle is the `CollectionHandle` carried by
-the commit. The native commit record is preserved by `CollectionStore` rather
-than represented as a blob root. Planning fails if any required descriptor,
-data, or metadata blob is absent.
+owned. The descriptor is the canonical collection anchor, representation,
+recipe, and reach description encoded as a `SimpleArchive`; its 32-byte content
+handle is the `CollectionHandle` carried by the commit. The native commit record
+is preserved by `CollectionStore` rather than represented as a blob root.
+Planning an explicitly selected authoritative view fails if any required
+descriptor, data, or metadata blob is absent.
 
 Unsigned `MERGE` and `DERIVE` records are reproducible cache work. They add no
 strong roots even when validation accepts them and their equations are active;
@@ -70,10 +57,10 @@ the surviving claim instead of duplicating it, and freshly verifies the exact
 raw/sidecar pair. No Rank9-specific retention record or hidden root is needed.
 
 The resulting roots compose with both storage paths. Yard's `collect` and
-`compact` require them as explicit policy roots; callers pass an empty
-`RetentionRoots` deliberately when legacy strong pins are the only strong
-roots. Both Yard collection and `Pile::rewrite_retained_into` strictly verify a
-native `COMMIT` signature before its fields can add implicit roots. They
+`compact` accept explicit policy roots in addition to the native collection
+roots they discover. Both Yard collection and `Pile::rewrite_retained_into`
+strictly verify a native `COMMIT` signature before its fields can add implicit
+roots. They
 preserve every immutable record, including invalid and partially synchronized
 records, but recursively retain only dependencies named by valid commits which
 are resident in the relevant Pile snapshot or live in the Yard. An absent
@@ -82,16 +69,18 @@ permanently poisoning local retention. Caller-supplied `RetentionRoots` keep
 their existing backend semantics; in particular, a retained Pile rewrite still
 fails loud when an explicitly selected blob is absent.
 
-The Pile rewrite also recursively retains and recreates every active branch
-pin. Legacy V3 collection records are different: their 16-byte definition
-identities predate descriptor handles, so they are preserved byte-for-byte as
+For migration safety, a retained Pile rewrite also recreates the exact immutable
+legacy pin snapshot it observed. That is physical preservation, not a current
+publication or retention API. Legacy V3 collection records are different: their
+16-byte definition identities predate descriptor handles, so they are
+preserved byte-for-byte as
 inert physical evidence but grant no current collection authority and own no
 blobs. Node policy needs no separate root primitive: its valid signer-owned
 collection commits retain the resident descriptor, fact archive, metadata, and
 referenced capability/signature closure under the ordinary collection rule.
-Weak wants are an explicit rewrite choice. Preserving
-them copies their demand markers but does not promote the requested blob to an
-ownership root; dropping them omits the markers entirely.
+Blob WANT records are an explicit rewrite choice. Preserving them copies their
+demand markers but does not promote the requested blob to an ownership root;
+dropping them omits the markers entirely.
 
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
 collection registry. Every later collection or rewrite must rediscover
@@ -113,107 +102,32 @@ retention.
 
 ## Conservative Reachability
 
-Every commit and branch metadata record is stored as a `SimpleArchive`. The
-archive encodes a canonical `TribleSet` as 64-byte tribles, each containing a
-32-byte value column. The blob store does not track which handles correspond to
-archives, so the collector treats every blob identically: it scans the raw bytes
-in 32-byte chunks and treats each chunk as a candidate handle. Chunks that are
-not value columns—for example the combined entity/attribute half of a trible or
-arbitrary attachment bytes—are discarded when the candidate lookup fails. If a
-chunk matches the hash of a blob in the store we assume it is a reference,
-regardless of the attribute type. With 32-byte hashes the odds of a random
-collision are negligible, so the scan may keep extra blobs but will not drop a
-referenced one.
+Canonical archives contain fixed 64-byte tribles whose value half is one
+32-byte inline value. The generic walker treats aligned 32-byte chunks as
+candidate handles and follows those which name resident blobs. This may keep an
+accidental extra blob, but with 256-bit handles it will not plausibly discard a
+real reference. Opaque attachments normally behave as leaves because their
+chunks do not name another resident object.
 
-Content blobs that are not `SimpleArchive` instances (for example large binary
-attachments) therefore behave as leaves: the traversal still scans them, but
-because no additional lookups succeed they contribute no further handles. They
-become reachable when some archive references their handle and are otherwise
-eligible for forgetting.
+The retention procedure is therefore:
 
-## Traversal Algorithm
+1. enumerate native collection records from one observed store view;
+2. strictly verify each admitted commit before its fields gain authority;
+3. add the resident descriptor, data, and metadata of valid commits as
+   recursive roots;
+4. add caller-selected direct or recursive policy roots;
+5. recursively mark resident candidate handles; and
+6. rewrite or evict everything outside that conservative live set while
+   preserving the immutable record ledger.
 
-1. Enumerate all branches and load their metadata blobs.
-2. Extract candidate handles from the metadata. This reveals the current commit
-   head along with any other referenced blobs.
-3. Recursively walk the discovered commits and content blobs. Each blob is
-   scanned in 32-byte steps; any chunk whose lookup succeeds is enqueued instead
-   of deserialising the archive.
-4. Stream the discovered handles into whatever operation you need. The
-   [`reachable`](https://docs.rs/triblespace/latest/triblespace/repo/fn.reachable.html)
-   helper returns an iterator of handles, so you can retain them, transfer
-   them into another store, or collect them into whichever structure your
-   workflow expects.
-
-Because the traversal is purely additive you can compose additional filters or
-instrumentation as needed—for example to track how many objects are held alive
-by a particular branch or to export a log of missing blobs for diagnostics.
-
-## Automating the Walk
-
-The repository module already provides most of the required plumbing. The
-[`reachable`](https://docs.rs/triblespace/latest/triblespace/repo/fn.reachable.html)
-helper exposes the traversal as a reusable iterator so you can compose other
-operations along the way, while
-[`transfer`](https://docs.rs/triblespace/latest/triblespace/repo/fn.transfer.html)
-duplicates whichever handles you feed it. The in-memory `MemoryBlobStore` can
-retain live blobs, duplicate them into a scratch store, and report how many
-handles were touched without writing bespoke walkers:
-
-```rust,ignore
-use triblespace::core::blob::memoryblobstore::MemoryBlobStore;
-use triblespace::core::repo::{self, BlobStoreKeep, BlobStoreList, BranchStore};
-use triblespace::core::inline::encodings::hash::Blake3;
-
-let mut store = MemoryBlobStore::default();
-// ... populate the store or import data ...
-
-let mut branch_store = /* your BranchStore implementation */;
-let reader = store.reader()?;
-
-// Collect the branch metadata handles we want to keep alive.
-let mut roots = Vec::new();
-for branch_id in branch_store.branches()? {
-    if let Some(meta) = branch_store.head(branch_id?)? {
-        roots.push(meta.transmute());
-    }
-}
-
-// Trim unreachable blobs in-place.
-store.keep(repo::reachable(&reader, roots.clone()));
-
-// Optionally copy the same reachable blobs into another store.
-let mut scratch = MemoryBlobStore::default();
-let visited = repo::reachable(&reader, roots.clone()).count();
-let mapping: Vec<_> = repo::transfer(
-    &reader,
-    &mut scratch,
-    repo::reachable(&reader, roots),
-)
-.collect::<Result<_, _>>()?;
-
-println!("visited {} blobs, copied {}", visited, mapping.len());
-println!("rewrote {} handles", mapping.len());
-```
-
-In practice you will seed the walker with the handles extracted from branch
-metadata or other root sets instead of iterating the entire store. The helper
-takes any `IntoIterator` of handles, so once branch heads (and other roots) have
-been identified, they can be fed directly into the traversal without writing
-custom queues or visitor logic. Passing the resulting iterator to
-`MemoryBlobStore::keep` or `repo::transfer` makes it easy to implement
-mark-and-sweep collectors or selective replication pipelines without duplicating
-traversal code.
-
-When you already have metadata represented as a `TribleSet`, the
-[`potential_handles`](https://docs.rs/triblespace/latest/triblespace/repo/fn.potential_handles.html)
-helper converts its value column into the conservative stream of
-`Handle<H, UnknownBlob>` instances expected by these operations.
+`MERGE` and `DERIVE` records remain useful even when their result bytes are
+absent: a later resolver can rediscover the equation, recompute or fetch the
+canonical result, and validate it again.
 
 ## Operational Tips
 
 - **Schedule forgetting deliberately.** Trigger it after large merges or
-  imports rather than on every commit so you amortise the walk over meaningful
+  imports rather than on every commit so you amortize the walk over meaningful
   changes.
 - **Watch available storage.** Because forgetting only affects the local node,
   replicating from a peer may temporarily reintroduce forgotten blobs. Consider
@@ -223,10 +137,6 @@ helper converts its value column into the conservative stream of
   effectively impossible, so cautious root selection simply preserves anything
   that might be referenced.
 
-## Future Work
-
-The public API for triggering garbage collection is still evolving. The
-composition-friendly walker introduced above is one building block; future work
-could layer additional convenience helpers or integrate with external retention
-policies. Conservative reachability by scanning `SimpleArchive` bytes remains
-the foundation for safe space reclamation.
+The essential safety rule is asymmetric: uncertainty keeps bytes. Collection
+can sacrifice space, never recoverability of an explicitly owned resident
+closure.

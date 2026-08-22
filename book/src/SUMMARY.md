@@ -20,16 +20,14 @@
 - [Deep Dive: Atreides Join](atreides-join.md)
 - [Deep Dive: Type Algebra](type-algebra.md)
 
-# Repositories & Workflows
+# Collections & Workflows
 
 - [Architecture](architecture.md)
 - [Patterns & Recipes](patterns-and-recipes.md)
-- [Repository Workflows](repository-workflows.md)
-- [Commit Selectors](commit-selectors.md)
+- [Collection Workflows](repository-workflows.md)
 - [Garbage Collection](garbage-collection.md)
 - [Distributed Sync](distributed-sync.md)
 - [Capability Auth](capability-auth.md)
-- [Deep Dive: Descriptive Typing & find! Idioms](descriptive_types.md)
 
 # Storage & Formats
 

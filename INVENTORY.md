@@ -170,23 +170,13 @@ its signature, because a commit asserts something no reader can recompute.
 - Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
   intended formatter toolchain): `cargo fmt --all` currently rewrites many
   unrelated files, obscuring focused query-engine diffs.
-- Provide additional examples showcasing advanced queries and repository usage.
+- Provide additional examples showcasing advanced queries and collection usage.
 - Helper to derive delta `TribleSet`s for `pattern_changes!` so callers don't
   have to compute them manually.
 - Add an exporter for the lossless JSON schema so archived JSON can be
   reconstructed (including field ordering).
 - Add a diagnosis tool that reports attributes missing `name`, `value_encoding`,
   or `value_formatter` metadata so strict renderers can explain omissions.
-- Explore replacing `CommitSelector` ranges with a set-based API
-  built on commit reachability. The goal is to mirror git's revision
-  selection semantics (similar to `rev-list` or `rev-parse`).
-  Combinators like `union`, `intersection` and `difference` should let
-  callers express queries such as "A minus B" or "ancestors of A
-  intersect B". Commit sets themselves would be formed by primitives
-  like `ancestors(<commit>)` and `descendants(<commit>)` so selectors
-  map directly to the commit graph.
-- Add tests that cover `CommitSelector` and `Workspace::checkout` behavior when
-  a branch has no head commit.
 - Generate `attributes!` modules from a `TribleSet` description so tooling can
   derive them programmatically. Rewriting `pattern!` as a procedural
   macro will be the first step toward this automation.
@@ -194,17 +184,15 @@ its signature, because a commit asserts something no reader can recompute.
 - Investigate the theoretical complexity of PATCH operations.
 - Measure practical space usage for PATCH with varying dataset sizes.
 - Explore hash-prefix-partitioned Pile bootstrap PATCH construction: keep all
-  duplicate candidates for a key in one ordered worker, retain serial pin LWW,
-  and merge only disjoint key ranges so value-insensitive PATCH union cannot
-  alter first-valid duplicate selection.
+  duplicate candidates for a key in one ordered worker, preserve the decoded
+  order of immutable legacy pin records separately, and merge only disjoint key
+  ranges so value-insensitive PATCH union cannot alter first-valid duplicate
+  selection.
 - Extend PATCH to associate values with keys, turning it into a map structure.
 - Expose value-aware PATCH iterators and lookup helpers so callers can access
   stored payloads.
 - Benchmark recursive `ByteTable` displacement planner versus the greedy random insert to measure fill rate and performance across intermediate table sizes.
 - Explore converting the recursive `ByteTable` planner into an iterative search to reduce stack usage.
-- Implement a garbage collection mechanism that scans branch and commit
-  archives without fully deserialising them to find reachable blob handles.
-  Anything not discovered this way can be forgotten by the underlying store.
 - Generalise the declarative key description utilities to other key types so
   segment layouts and orderings can be defined once and generated automatically.
 - Provide a macro to declare key layouts that emits segmentation and
@@ -218,7 +206,7 @@ its signature, because a commit asserts something no reader can recompute.
 ### Invariant Catalogue
 - Translate the `book/src/formal-verification.md` matrix into individual GitHub
   issues, each covering one subsystem (TribleSet, PATCH, values, queries,
-  repository, storage primitives).
+  collection algebra, storage primitives).
 - Document how each invariant maps to existing modules so new contributors can
   locate the relevant code without spelunking.
 
@@ -239,7 +227,8 @@ its signature, because a commit asserts something no reader can recompute.
   then bound symbolic transition tables without making private closure
   internals part of the verification surface.
 - Build shared bounded-data generators for Kani harnesses (tribles, PATCH
-  entries, commit DAGs) and publish them under `proofs/util.rs`.
+  entries, and native collection record sets) and publish them under
+  `proofs/util.rs`.
 - Add `proofs/tribleset_harness.rs` validating ordering-preserving union,
   intersection, difference, and iterator round-trips.
 - Add `proofs/patch_harness.rs` with ByteTable checks proving `plan_insert`
@@ -247,17 +236,17 @@ its signature, because a commit asserts something no reader can recompute.
   `Branch::modify_child`, and `table_grow` preserves every occupant.
 - Extend `proofs/value_harness.rs` with schema-aware helpers ensuring
   `TryFromInline` conversions reject truncated buffers.
-- Expand `proofs/commit_harness.rs` with bounded commit DAG generators that
-  assert append-only pile semantics.
+- Add a collection-algebra harness covering intrinsic record identity,
+  commutative merge inputs, and authority-preserving physical covers.
 
 ### Tooling & Execution
 - Integrate `cargo miri test` into `scripts/preflight.sh` with appropriate
   guards for unsupported harnesses.
 - Stand up a `cargo fuzz` workspace covering PATCH encoding/decoding, query
-  planning, and repository sync flows; publish nightly cadence expectations in
+  planning, and collection sync flows; publish nightly cadence expectations in
   the roadmap.
-- Record deterministic simulation scenarios (conflict resolution, garbage
-  collection, remote sync) that double as regression tests.
+- Record deterministic simulation scenarios (sparse evidence, garbage
+  collection, concurrent set union, and remote sync) that double as regression tests.
 
 ## Additional Built-in Schemas
 The existing collection of schemas covers the basics like strings, large
@@ -303,8 +292,8 @@ prioritized for efficient zero-copy access.
   dedicated chapter of the book.
 - Migrate the blob module introduction in `src/blob.rs` so the crate docs focus
   on API details.
-- Extract the repository design discussion and Git parallels from `src/repo.rs`
-  into the book.
+- Keep the collection algebra discussion in the book aligned with the narrow
+  API-level documentation in `src/collection`.
 - Split out the lengthy explanation of trible structure from `src/trible.rs`
   and consolidate it with the deep dive chapter.
 - Add a FAQ chapter to the book summarising common questions.
@@ -339,12 +328,6 @@ prioritized for efficient zero-copy access.
   while leaving the append-only Pile records in place. Add a future physical
   compaction/rewrite path when Yard needs to reclaim disk space, preserving
   live readers while replacing generation files.
-- Yard compact currently leaves a retained weak-pinned blob in the oldest
-  generation if the blob had already tenured before it was weak-pinned. Decide
-  whether weak-pinning old content should promote it back to young storage or
-  make collection evict it despite weak budget retention; see the ignored
-  `weak_pin_on_already_tenured_blob_stays_old_after_compact_bug` regression in
-  `repo::yard` tests.
 - The packed device confirm path assumes `UNIT_POS_PLANE` relates linearly to
   the cube-local invocation index — condition (c) on
   `membership_confirm_ballot_kernel`. It is true on Metal and CUDA and is what

@@ -1,11 +1,12 @@
 # Pile Format
 
-The on-disk pile keeps blobs, native collection records, pins, and wants in one
+The on-disk pile keeps blobs, native collection records, wants, and decodable
+legacy pin evidence in one
 append-only file. The write-ahead log *is*
 the database: all indices are
 reconstructed from the bytes already stored on disk. This design avoids
 background compaction, manifest management, or auxiliary metadata while still
-providing a durable content-addressed store for local repositories. The pile
+providing a durable content-addressed store for local collections. The pile
 file is memory mapped for fast, zero-copy reads and can be safely shared
 between threads because existing bytes are never mutated—once data is
 validated it remains stable.
@@ -106,16 +107,17 @@ record of the new kind. Such an extension—or any other extension whose absence
 cannot conservatively mean “no effect”—requires a new frame magic instead.
 
 Concatenation is associative ordered composition, not universally commutative:
-branches and wants are right-biased last-writer-wins logs. Opaque filtering is
-sound because it leaves the relative order of every known record unchanged;
-only collection records additionally collapse to order-independent set union.
+WANT assertions/retractions and decoded legacy pins are right-biased logs.
+Opaque filtering is sound because it leaves the relative order of every known
+record unchanged; native collection records additionally collapse to
+order-independent set union.
 
 ### Compatibility surface: v0.46.4, and a reframe for everything else
 
 The last released version is **v0.46.4** (tagged 2026-06-10). Its entire record
 vocabulary is three markers — the 64-byte-aligned V1 blob, branch, and
-tombstone records — and those are the only records anyone outside this
-workspace can be holding. They are read forever.
+tombstone records — and those are the only records external deployments may
+hold. They are read forever.
 
 Everything introduced between that release and the current framing never
 shipped: the V3 record family, the three generations of collection records, the
@@ -123,15 +125,16 @@ typed wants, the retired local cells, and the 36-byte legacy envelope. None of
 it is a compatibility commitment. It is read **once**, by
 `trible pile migrate <pile> reframe --into <dest>`, which re-encodes the whole
 pile into the current framing; a reframed pile never needs those decoders
-again, and they will be deleted once the workspace piles have been reframed.
+again, and they can be deleted once the local development piles have been
+reframed.
 
 The re-encode is semantic and in source order, which is what makes it faithful:
 
 - Blob payloads are content-addressed, so copying changes no identity, and
   their original insertion timestamps are carried across — the wall clock at
   the moment of a rewrite is not a fact about when a blob arrived.
-- Pins and wants are last-writer-wins logs, replayed in order, so the result's
-  projection equals the source's.
+- Legacy pins and WANT state are replayed in order, so the result's immutable
+  compatibility snapshot and operational request projection equal the source's.
 - Collection records are a grow-only set, so order is irrelevant and
   re-insertion is idempotent.
 - Records that never carried live state are dropped and counted: inert legacy
@@ -189,15 +192,16 @@ refreshing state.
    and `memmap2` mapping. It does not read any records yet (and it does not
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
-   `applied_length`, and rebuilds the blob, collection-record, and pin indices
+   `applied_length`, and rebuilds the blob, collection-record, WANT, and legacy
+   pin-snapshot indices
    in memory. It **fails loud** on a corrupt or torn record
    (`ReadError::CorruptPile { valid_length }`). It skips bounded unknown
    envelope kinds as opaque records and distinguishes an unknown legacy marker
    as `ReadError::UnsupportedRecord { offset, marker }`. It never mutates the
    file. Callers rarely need to invoke it directly:
-   `reader`, `records`, `pins`, `head`, and `update` call `refresh` internally
-   before they inspect or apply records, so external writers are visible
-   without a standalone scan.
+   blob readers and collection/WANT/pin-snapshot enumerations refresh internally
+   before observing records, so external writers are visible without a
+   standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
    path: it re-runs validation under an exclusive lock and truncates the file
    back to the last valid record, discarding a torn record left by a
@@ -212,11 +216,11 @@ refreshing state.
    exclusive file lock, so an intervening repair cannot move the boundary
    between validation and mutation.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
-   `CollectionStore::insert`, and pin update helpers extend the file. Each
+   `CollectionStore::insert`, and `WantStore` operations extend the file. Each
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
    Blob records use a single `write_vectored` call; fixed-width collection and
-   pin records use one append of their 256-byte envelope header.
+   WANT records use one append of their 256-byte envelope header.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
    macOS and `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes
@@ -231,7 +235,7 @@ refreshing state.
 This lifecycle keeps pile usage predictable: open → operate (operations
 refresh as they run) → hand out read-only readers. If a process wants to scan
 for new appends between operations (for example, a background monitor that is
-not issuing `reader` or pin calls), it can explicitly call `refresh` to pick up
+not issuing a reader or record enumeration), it can explicitly call `refresh` to pick up
 external writers without blocking them for long. If corruption is ever
 reported, surface it to the operator; truncating is a decision, not a default.
 
@@ -253,7 +257,7 @@ described above. The sections below illustrate each kind-specific body.
 
 ## Usage
 
-A pile typically lives as a `.pile` file on disk. Repositories open it through
+A pile typically lives as a `.pile` file on disk. Applications open it through
 `Pile::open` and load it with `refresh` (directly or via the first operation
 that refreshes internally). Multiple threads may share the same handle thanks
 to internal synchronisation, making a pile a convenient durable store for
@@ -262,9 +266,7 @@ remembers the last offset it processed and, after appending, scans any gap left
 by concurrent writes before advancing this `applied_length`. Writers may race
 and duplicate blobs, but content addressing keeps the data consistent. Each
 handle tracks hashes of pending appends separately so repeated writes are
-deduplicated until a `refresh`. Pin updates only record the referenced hash and
-do not verify that the corresponding blob exists in the pile, so a pile may act
-as a head-only store when blob data resides elsewhere.
+deduplicated until a `refresh`.
 
 ```rust,ignore
 use std::error::Error;
@@ -302,14 +304,10 @@ fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
 }
 ```
 
-This pattern illustrates the typical flow: open, load with `refresh`, rely on
-the built-in refreshes performed by `reader` and pin helpers, mutate via
-`put`, then hand the `PileReader` snapshot to read-only consumers. Updating
-pin heads requires a brief critical section—`flush → refresh → lock →
-refresh → append → unlock`—so a caller observes a consistent head even when
-multiple processes contend for the same file descriptor. `refresh` acquires a
-shared lock so it cannot race with an explicit `amputate`, which takes an
-exclusive lock before truncating a corrupted tail.
+This pattern illustrates the typical flow: open, load with `refresh`, append
+through the storage traits, then hand a `PileReader` snapshot to read-only
+consumers. `refresh` acquires a shared lock so it cannot race with an explicit
+`amputate`, which takes an exclusive lock before truncating a corrupted tail.
 
 Filesystems lacking atomic `write`/`vwrite` appends—such as some network or
 FUSE-based implementations—cannot safely host multiple writers for records
@@ -393,7 +391,7 @@ signed `COMMIT` assertions and unsigned `MERGE` and `DERIVE` equations. The
 pile stores these three kinds directly as fixed one-block enveloped records.
 Their pile record-kind markers retain the V4 values. They are
 **not blob records**, have no following payload, and carry no insertion
-timestamp. They are also distinct from mutable branch pins and wants:
+timestamp. They are also distinct from operational wants and historical pins:
 collection records have no head, tombstone, or
 last-writer-wins update. Their logical key is a content-derived 16-byte record
 ID; a collection record is not a trible entity.
@@ -453,7 +451,7 @@ commutative equation.
 
 The record ID is deliberately absent from these headers. On replay, the
 decoder reconstructs the record's exact dense typed payload: 192 bytes for a
-commit and 128 bytes for a merge or derive. It hashes a domain separator,
+commit, 128 bytes for a merge, and 96 bytes for a derive. It hashes a domain separator,
 record-ID version, stable semantic kind ID, and every payload byte with BLAKE3,
 then uses the digest's final 16 bytes as the record ID. For a commit the payload
 includes the public key and both signature components. Consequently the pile
@@ -465,8 +463,8 @@ record is an idempotent success; a different record reconstructing to the same
 ID is reported as a collision. Concatenating piles therefore gives set-union
 semantics for collection records: append order and duplicate copies do not
 change the discovered collection calculus. This order-independent behavior is
-specific to collection records; it does not turn the last-writer-wins pin log
-into a set.
+specific to collection records; it does not reinterpret historical pin or
+operational WANT logs as sets.
 
 ## Retired: Collection Publication Grants
 
@@ -521,18 +519,18 @@ they never enter `CollectionStore`, assert membership, or retain blobs.
 | Merge | `CC0108AC1DF4F335AFA856A529C42BE9` | `0..16` marker, `16..32` definition ID, `32..64` lower input digest, `64..96` higher input digest, `96..128` result digest, `128..256` reserved zeros |
 | Derive | `07ECF056F6F015D94389FFF21F851480` | `0..16` marker, `16..32` source definition ID, `32..48` target definition ID, `48..80` input digest, `80..112` output digest, `112..256` reserved zeros |
 
-## Pin Records (branch head / tombstone)
+## Legacy Pin Records (head / tombstone)
 
 | Kind | Record kind (rooted at) | Kind-specific body after the common prefix |
 |---|---|---|
 | Head | `2BC0B9FE0EFDB0BC53654E17BB9D06E01259F36AF93EEE54AD5D557B12DF706D` (`AC363D04AFE1AF17B39581B1E23021D7`) | `64..80` branch ID, `80..96` reserved zeros, `96..128` hash, `128..256` reserved zeros |
 | Tombstone | `8D9F27E76D3620EEC29B781F841E9EF77F2607B40DC702FE3DAED007E9228CA5` (`D0CBA0C8EAAB4C0C73121C3205671E4F`) | `64..80` branch ID, `80..256` reserved zeros |
 
-Pin-head records map a pin (branch) identifier to the hash of a blob; a
-tombstone retracts the mapping. Appends are intentionally lightweight: the
-pile does not check whether the referenced blob exists locally, allowing
-deployments that store heads on disk while serving blob contents from a remote
-store.
+These historical records map a pin identifier to a blob hash or tombstone that
+mapping. Current code decodes them into immutable snapshots for explicit
+migration, capability reachability, diagnostics, and byte-preserving retained
+rewrites. No current publication API appends, advances, or tombstones a pin.
+The legacy encoding never required the referenced blob to be resident locally.
 
 ## Retired Local Cell Records
 
@@ -552,7 +550,7 @@ assigned new meaning.
 
 Current readers recognize both the legacy enveloped form above and the
 fixed-width unenveloped V3 form solely to preserve migration evidence. They expose either
-form as `PileRecordContent::Opaque`, do not project a value into repository
+form as `PileRecordContent::Opaque`, do not project a value into current
 state, and do not treat its referenced archive as a retention root. Raw tooling
 through `PileRecords` can still copy or explicitly migrate the exact bytes.
 Because their former ownership semantics are no longer interpreted,

@@ -67,24 +67,18 @@ Run `trible <COMMAND>` to invoke a subcommand.
 - `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
 - `pile migrate <PILE> run [MIGRATION]` — run migrations (all by default). Pass `--dry-run` to preview changes.
 
-If branch names are missing in an older pile, run:
+Legacy piles can be migrated directly into native collections:
 
 ```bash
-trible pile migrate <PILE> run branch-metadata-name
+trible pile migrate <PILE> branch-to-collection \
+  --branch <LEGACY_BRANCH> \
+  --collection-name <NAME> \
+  --team-root <PUBLIC_KEY> \
+  --signing-key <KEY_PATH>
 ```
 
-#### Branches
-
-- `pile branch list <PILE>` — list branch ids, heads, and names.
-- `pile branch create <PILE> <NAME>` — create a new branch.
-- `pile branch delete <PILE> <BRANCH_ID>` — delete a branch (writes a tombstone record).
-- `pile branch stats <PILE> <BRANCH_ID>` — fast branch stats (commit count + accumulated content blob bytes + accumulated triple count via `bytes / 64`).
-- `pile branch stats <PILE> <BRANCH_ID> --full` — additionally materialize content to compute unique triples/entities/attributes (slower).
-- `pile branch consolidate <PILE> <BRANCH_ID...>` — consolidate multiple branches into a single new branch. The command creates a single merge commit whose parents are the selected branch heads and prints the new branch id.
-- `pile merge <PILE> <TARGET_ID> <SOURCE_ID...>` — merge source branch heads into a target branch by creating merge-only commits.
-
-Signing key format
-- Commands that create commits (e.g. `create`, `merge`, `merge-import`, `consolidate`) accept a signing key file path via the `--signing-key` flag. The file must contain a single 64-character hex string (32 bytes encoded as hex). You can also set TRIBLES_SIGNING_KEY to the path of such a file. Generated keys (when created by Codex tooling) are written as hex text to the configured path.
+This is an explicit compatibility operation over an immutable legacy pin
+snapshot. The current CLI does not create, advance, merge, or delete branches.
 
 #### Blobs
 
@@ -95,13 +89,15 @@ Signing key format
 
 #### Collections
 
-A collection is identified by the blake3 handle of its *descriptor blob* — a
-256-byte `SimpleArchive` naming the collection's scope, blob representation,
-and join recipe. `pile blob inspect` sees only "256 bytes, Binary"; these
-subcommands decode it.
+A collection is identified by the blake3 handle of its canonical descriptor
+blob — a `SimpleArchive` naming its anchor, representation, join recipe, and
+reach law, together with the representation and recipe descriptions.
+`pile blob inspect` sees only the encoded blob; these subcommands decode it.
 
 - `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded scope, representation, and recipe (known representation and recipe ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
-- `pile collection show <PILE> <HANDLE>` — full decode of one descriptor: the intrinsic entity id inside the archive, all four tribles, the decoded fields, and how many records in this pile reference it. The handle is accepted with or without the `blake3:` prefix.
+- `pile collection show <PILE> <HANDLE>` — decode one descriptor, its anchor,
+  representation, recipe, reach law, and referencing record counts. The handle
+  is accepted with or without the `blake3:` prefix.
 
 ### Distributed pile sync
 
@@ -125,7 +121,7 @@ off the founder's via delegation. See
 the full design.
 
 - `team create --pile PATH [--key KEY_PATH]` — mint a new team root keypair, sign the founder's self-cap with admin scope, and write both into the pile. Prints the team root pubkey (publish to peers), team root SECRET (archive offline), founder cap handles, and the cap's expiry timestamp.
-- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--branch HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--branch` (repeatable) restricts the cap to specific branches; without it the cap applies to every branch within the granted permission set.
+- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--branch HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--branch` is retained only to restrict reads through the immutable legacy pin-snapshot compatibility path; native collection-scoped capabilities are future work.
 - `team request-join --admin HEX --scope (read|write|admin) [--key PATH] [--pile PATH]` — send an `OP_REQUEST_CAP` to an admin asking to be issued a capability via the running auth-handshake daemon.
 - `team approve --pile PATH --entry HEX --team-root HEX --cap HEX [--key PATH]` — approve a pending join request, sign the cap, dispatch it via the auth-handshake ALPN, and add a renewal-policy entry so the cap stays renewed.
 - `team retract --pile PATH --entry HEX` — stop auto-renewing a (subject, scope) entry. The peer's cap chain dies at its next natural expiry. Pure local decision, takes effect on the next daemon tick. There is no team-root broadcast revocation primitive; eviction is per-issuer non-renewal.
@@ -144,17 +140,9 @@ the full design.
 - `store blob forget <URL> <HANDLE>` — remove an object from a remote store.
 - `store blob inspect <URL> <HANDLE>` — display metadata for a remote blob.
 
-#### Branches
-
-- `store branch list <URL>` — list branches at a remote store.
-- `branch push <URL> <PILE> <ID>` — push a branch to a remote store.
-- `branch pull <URL> <PILE> <ID>` — pull a branch from a remote store.
-
 See `INVENTORY.md` for notes on possible cleanup and future functionality.
 
 ## Development
 
-Command implementations live in `src/cli/` with modules for `branch`, `pile`,
-and `store`. The modules expose their subcommands and are re-exported from
-`main.rs` to preserve the existing CLI interface. Contributions are always
-welcome!
+Command implementations live in `src/cli/`, with pile, collection, migration,
+network, team, and remote-blob modules. Contributions are always welcome!

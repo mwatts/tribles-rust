@@ -569,7 +569,7 @@ The stable implementation lives in the standalone `triblespace-paths` crate.
 Its `PathExpr` builder compiles the normal regular-language operations into a
 fixed epsilon-free automaton; direct `Automaton` construction remains the
 low-level escape hatch. The crate persists unionable direct-product summaries
-per repository range, closes their global union, and exposes the resulting
+over exact source collection elements, closes their selected union, and exposes the resulting
 endpoint relation through the ordinary two-variable constraint protocol. See
 [Regular Path Indexes](regular-path-indexes.md) for the expression API,
 lifecycle, freshness boundary, and dense-output trade-off.

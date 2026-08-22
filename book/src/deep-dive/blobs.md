@@ -1,98 +1,95 @@
 # Blobs
 
-Blobs are immutable sequences of bytes used whenever data no longer fits into
-the fixed 256‑bit value slot of a trible. Instead of treating these payloads as
-untyped binary blobs, Tribles keeps track of their structure via `BlobEncoding`.
-Much like `InlineEncoding` drives how values are serialized into a trible, a
-`BlobEncoding` defines how to encode and decode rich data into a byte sequence.
+Blobs are immutable byte sequences used whenever data does not fit in a
+trible's fixed 256-bit value slot. `BlobEncoding` gives those bytes a portable
+meaning, just as `InlineEncoding` interprets the value slot.
 
-## When to reach for blobs
+## Handles, encodings, and stores
 
-Values and tribles capture compact facts – identifiers, timestamps, counters –
-in a fixed width. Whenever information grows beyond that footprint, blobs carry
-the payload while tribles continue to reference it. Common use cases include
-documents, media assets, serialized entity archives, or even domain specific
-binary formats. Because blobs are content addressed, the same payload stored
-twice automatically deduplicates to the same handle. In the in-memory
-implementation this falls straight out of the code: `MemoryBlobStore::insert`
-keeps a `BTreeMap` keyed by the handle and simply reuses the existing entry
-when the same digest shows up again.
+A blob's handle combines its content hash with a compile-time encoding. The
+same bytes have the same content identity, while the encoding tells a caller
+how to validate and decode them. Handles fit inline in tribles, so large values
+remain ordinary typed graph edges.
 
-## Handles, schemas, and stores
+Storage is split into small traits:
 
-Blobs live in a `BlobStore`. The store provides persistent storage and a
-content hash, determined by the selected `HashProtocol`, that acts as a stable
-handle. Handles can be embedded into tribles just like any other value so they
-benefit from the existing querying machinery. A handle couples the blob's hash
-with its `BlobEncoding` so consumers always know how to deserialize the
-referenced bytes.
+- `BlobStorePut` inserts encoded values and returns their handles;
+- `BlobStoreGet` resolves typed handles;
+- `BlobStoreMeta` reports residency metadata without fetching bytes; and
+- `BlobStoreList` enumerates stored objects where a backend supports it.
 
-Converting Rust types to blobs is infallible in practice, therefore the `ToBlob`
-and `TryFromBlob` traits are the most common helpers. The `TryToBlob` and
-`FromBlob` variants have been dropped to keep the API surface small without
-losing ergonomics.
+`MemoryRepo`, `Pile`, and remote object stores implement the relevant
+capabilities. Content addressing makes repeat insertion idempotent and allows
+caches to copy bytes without coordinating their names.
 
-## End‑to‑end example
+## Fragments carry their attachments
 
-The following example demonstrates creating blobs, archiving a `TribleSet` and
-signing its contents:
+The usual application path does not put each blob manually. `entity!` accepts a
+Rust value for a handle-valued attribute, encodes it, and puts the resulting
+bytes into the returned fragment's shared attachment store:
 
-```rust
+```rust,ignore
 use triblespace::prelude::*;
-use triblespace::examples::literature;
-use triblespace::core::{attestation, repo};
-use inlineencodings::{Handle, Blake3};
-use blobencodings::{SimpleArchive, UTF8String};
-use rand::rngs::OsRng;
-use ed25519_dalek::{Signature, Signer, SigningKey};
+use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::inlineencodings::Handle;
 
-// Build a BlobStore and fill it with some data.
-let mut memory_store: MemoryBlobStore = MemoryBlobStore::new();
+attributes! {
+    // Local prototype: derive the attribute from its name and encoding.
+    pub body: Handle<UTF8String>;
+}
 
-let book_author_id = fucid();
-let quote_a: Inline<Handle<UTF8String>> = memory_store
-    .put("Deep in the human unconscious is a pervasive need for a logical universe that makes sense. But the real universe is always one step beyond logic.")
-    .unwrap();
-let quote_b = memory_store
-    .put("I must not fear. Fear is the mind-killer. Fear is the little-death that brings total obliteration. I will face my fear. I will permit it to pass over me and through me. And when it has gone past I will turn the inner eye to see its path. Where the fear has gone there will be nothing. Only I will remain.")
-    .unwrap();
-
-let set = entity!{
-   literature::title: "Dune",
-   literature::author: &book_author_id,
-   literature::quote: quote_a,
-   literature::quote: quote_b
+let article = entity! {
+    body: "A long string which lives in a content-addressed blob.",
 };
 
-// Serialize the TribleSet and store it as another blob. The resulting
-// handle points to the archived bytes and keeps track of its schema.
-let archived_set_handle: Inline<Handle<SimpleArchive>> = memory_store.put(&set).unwrap();
-
-let mut csprng = OsRng;
-let commit_author_key: SigningKey = SigningKey::generate(&mut csprng);
-let signature: Signature = commit_author_key.sign(
-    &memory_store
-        .reader()
-        .unwrap()
-        .get::<Blob<SimpleArchive>, SimpleArchive>(archived_set_handle)
-        .unwrap()
-        .bytes,
-);
-
-// Store the handle in another TribleSet so the archived content can be
-// referenced alongside metadata and cryptographic proofs.
-let _meta_set = entity!{
-   repo::content: archived_set_handle,
-   repo::short_message: "Initial commit",
-   attestation::signed_by: commit_author_key.verifying_key(),
-   attestation::signature_r: signature,
-   attestation::signature_s: signature,
-};
+assert_eq!(article.facts().len(), 1);
 ```
 
-Blobs complement tribles and values by handling large payloads while keeping the
-core data structures compact. Embedding handles into entities ties together
-structured metadata and heavyweight data without breaking immutability or
-introducing duplication. This division of labor lets tribles focus on querying
-relationships while BlobStores take care of storage concerns such as hashing,
-deduplication, and retrieval.
+Composing fragments with `+=` unions their facts, metafacts, exported IDs, and
+attachments. `Collection::commit(fragment)` copies those attachments before it
+publishes the signed commit which refers to them. There is no separate staging
+manifest to keep in sync.
+
+## Put and get explicitly when needed
+
+Low-level code can still work directly with a store:
+
+```rust,ignore
+use triblespace::prelude::*;
+use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::inlineencodings::Handle;
+
+let mut store = MemoryBlobStore::new();
+let handle: Inline<Handle<UTF8String>> = store.put("Fear is the mind-killer.")?;
+let reader = store.reader()?;
+let value: View<str> = reader.get(handle)?;
+assert_eq!(value.as_ref(), "Fear is the mind-killer.");
+```
+
+Explicit insertion is useful for importers, representation builders, and code
+which must know a handle before constructing the referring entity.
+
+## Archives are blobs too
+
+Canonical `SimpleArchive` encodes a `TribleSet` as sorted, duplicate-free
+64-byte rows. Collection descriptors, commit data, and commit metadata use this
+representation. The handle of a descriptor archive is therefore the
+collection's identity; the handle of a data archive is one collection element.
+
+SuccinctArchive and other query-oriented formats are also typed blobs. Their
+collection recipes define canonical merge and derivation operations, so a
+validated derived artifact can be cached or forgotten without changing the
+authority of the signed source commits.
+
+## Conservative references
+
+The generic retention walker scans blob bytes in aligned 32-byte chunks and
+checks whether a chunk names a resident blob. This may retain an accidental
+extra object, but it does not omit a real inline handle. Signed collection
+commits recursively retain their resident descriptor, data, metadata, and
+attachment closure. Unsigned merge and derivation equations do not create
+strong ownership roots.
+
+This division keeps tribles compact, blobs verifiable, and publication
+self-contained while letting physical storage and cache policy evolve
+independently.

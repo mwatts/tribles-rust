@@ -102,7 +102,7 @@ for ancestor in find!(
 }
 ```
 
-For repository-backed maintenance and the cost of a potentially dense closure,
+For collection-backed maintenance and the cost of a potentially dense closure,
 see [Regular Path Indexes](regular-path-indexes.md). The core query engine stays
 non-recursive and stateless; the index turns the recursive result into a normal
 relation before the query begins.
@@ -131,21 +131,20 @@ systems.
 
 ## Working with blobs
 
-Values larger than 32 bytes live in blobs. The workspace manages their lifecycle:
+Values larger than 32 bytes live in blobs. `entity!` carries their bytes in the
+returned fragment:
 
 ```rust,ignore
-// Inline a blob payload — entity!{} auto-puts the bytes into the
-// workspace's blob store and stores the resulting handle in the trible.
+// Inline a blob payload — entity!{} stores the bytes in the fragment's
+// attachment store and puts the resulting handle in the trible.
 change += entity! { &doc @ article::body: "A very long string..." };
 
-// Read a blob back via the handle stored in the trible:
-let body: View<str> = ws.get(some_body_handle)?;
+// A collection snapshot carries the reader which validated its facts.
+let body: View<str> = snapshot.reader().get(some_body_handle)?;
 println!("{}", body.as_ref());
 
-// If you do want the handle in hand before the entity!{} call —
-// to reuse it across multiple entities, log it, ship it across
-// the wire — `ws.put` still does that:
-let text_handle = ws.put("A very long string...".to_owned());
+// Low-level producers may put explicitly when they need the handle first.
+let text_handle = store.put("A very long string...".to_owned())?;
 change += entity! { &doc @ article::body: text_handle };
 ```
 
