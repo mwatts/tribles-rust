@@ -54,10 +54,6 @@ mod book_doctests {
     pub struct PatternsAndRecipes;
     #[doc = include_str!("../book/src/encodings.md")]
     pub struct Schemas;
-    #[doc = include_str!("../book/src/commit-selectors.md")]
-    pub struct CommitSelectors;
-    #[doc = include_str!("../book/src/descriptive_types.md")]
-    pub struct DescriptiveTypes;
     #[doc = include_str!("../book/src/repository-workflows.md")]
     pub struct RepositoryWorkflows;
     #[doc = include_str!("../book/src/getting-started.md")]
