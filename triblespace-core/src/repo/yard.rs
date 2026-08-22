@@ -21,10 +21,7 @@ use anybytes::Bytes;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
-use crate::collection::{
-    CollectionRecord, CollectionRecordSelector,
-    CollectionStore,
-};
+use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::id::{Id, RawId};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
@@ -1644,16 +1641,10 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
         let target = Inline::new([42; 32]);
         let input = Inline::new([43; 32]);
-        let first = CollectionRecord::Derive(CollectionDerive::new(
-            target,
-            input,
-            Inline::new([44; 32]),
-        ));
-        let conflicting = CollectionRecord::Derive(CollectionDerive::new(
-            target,
-            input,
-            Inline::new([45; 32]),
-        ));
+        let first =
+            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([44; 32])));
+        let conflicting =
+            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([45; 32])));
         let unrelated = CollectionRecord::Derive(CollectionDerive::new(
             Inline::new([46; 32]),
             input,
@@ -1679,7 +1670,9 @@ mod tests {
             .pile_mut()
             .insert(unrelated)
             .unwrap();
-        let selectors = [CollectionRecordSelector::Operation(WantRequest::derive(target, input))]
+        let selectors = [CollectionRecordSelector::Operation(WantRequest::derive(
+            target, input,
+        ))]
         .into_iter()
         .collect();
         let mut expected = vec![first, conflicting];
@@ -1716,7 +1709,9 @@ mod tests {
 
         let descriptor = named_for_tests("retained", pin_id(32), pin_id(33));
         let collection = yard
-            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.into_facts(),
+            ))
             .unwrap();
         let key = SigningKey::from_bytes(&[34; 32]);
         let commit = CollectionCommit::sign(&key, collection, Inline::new(data.raw), metadata);
@@ -1775,7 +1770,9 @@ mod tests {
             .unwrap();
         let descriptor = named_for_tests("forged", pin_id(39), pin_id(40));
         let collection = yard
-            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.into_facts(),
+            ))
             .unwrap();
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
             &SigningKey::from_bytes(&[41; 32]),
@@ -1812,7 +1809,9 @@ mod tests {
         let (dir, mut yard) = yard_with(1, YardConfig::default());
         let descriptor = named_for_tests("dangling", pin_id(43), pin_id(44));
         let collection = yard
-            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.into_facts(),
+            ))
             .unwrap();
         let missing_data = Inline::new([45; 32]);
         let missing_metadata = Inline::<Handle<SimpleArchive>>::new([46; 32]);
@@ -2251,10 +2250,8 @@ mod tests {
         let (_dir, paths, yard) = yard_with_paths(2, YardConfig::default());
         drop(yard);
 
-        let request = WantRequest::derive(
-            Inline::new([62; INLINE_LEN]),
-            Inline::new([63; INLINE_LEN]),
-        );
+        let request =
+            WantRequest::derive(Inline::new([62; INLINE_LEN]), Inline::new([63; INLINE_LEN]));
         let mut old = Pile::open(&paths[1]).unwrap();
         old.want(request).unwrap();
         old.close().unwrap();

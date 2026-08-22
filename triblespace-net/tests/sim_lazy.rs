@@ -15,8 +15,8 @@
 
 mod common;
 
-use triblespace_core::collection::reach;
 use std::time::Duration;
+use triblespace_core::collection::reach;
 
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
@@ -119,8 +119,7 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
         let b = Inline::new([2; 32]);
         let result = Inline::new([3; 32]);
         let request = WantRequest::merge(descriptor, a, b);
-        let receipt =
-            CollectionRecord::Merge(CollectionMerge::new(descriptor, a, b, result));
+        let receipt = CollectionRecord::Merge(CollectionMerge::new(descriptor, a, b, result));
         server_store.insert(receipt).unwrap();
         client_store.want(request).unwrap();
 

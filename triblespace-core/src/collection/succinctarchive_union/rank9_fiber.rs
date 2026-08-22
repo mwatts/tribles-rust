@@ -19,15 +19,15 @@ use crate::blob::encodings::succinctarchive::{
     SuccinctArchiveRank9IndexBlob, UnionArchive,
 };
 use crate::blob::{Blob, BlobEncoding};
-use crate::trible::{Fragment, TribleSet};
 use crate::collection::exact_derived::ExactCover;
 use crate::collection::{
-    CollectionData, CollectionDerive, CollectionHandle, CollectionRecord,
-    CollectionRecordSelector, CollectionStore,
+    CollectionData, CollectionDerive, CollectionHandle, CollectionRecord, CollectionRecordSelector,
+    CollectionStore,
 };
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::trible::{Fragment, TribleSet};
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -345,11 +345,7 @@ impl Rank9Fiber {
 
             if let Some(candidate) = unique {
                 full_validation_attempted = true;
-                let claim = CollectionDerive::new(
-                    self.target_collection,
-                    raw_data,
-                    candidate,
-                );
+                let claim = CollectionDerive::new(self.target_collection, raw_data, candidate);
                 if let Some(attached) = self.try_attach(&reader, raw_data, &raw, claim)? {
                     output = Some(candidate);
                     claim_present = true;
@@ -390,11 +386,7 @@ impl Rank9Fiber {
                 claim_present = canonical_was_claimed;
                 output = Some(canonical);
                 if claim_present && !full_validation_attempted {
-                    let claim = CollectionDerive::new(
-                        self.target_collection,
-                        raw_data,
-                        canonical,
-                    );
+                    let claim = CollectionDerive::new(self.target_collection, raw_data, canonical);
                     runtime = self.try_attach(&reader, raw_data, &raw, claim)?;
                 }
                 if runtime.is_none() {
@@ -426,7 +418,9 @@ impl Rank9Fiber {
         ensure: bool,
     ) -> Result<BTreeMap<CollectionData, CandidateOutputs>, Rank9FiberError> {
         let mut candidates = BTreeMap::<CollectionData, CandidateOutputs>::new();
-        let selectors = [CollectionRecordSelector::DeriveTarget(self.target_collection)]
+        let selectors = [CollectionRecordSelector::DeriveTarget(
+            self.target_collection,
+        )]
         .into_iter()
         .collect();
         let records = store
@@ -559,11 +553,7 @@ impl Rank9Fiber {
                 let output = member
                     .output
                     .expect("every incomplete probe member is assigned before publication");
-                let claim = CollectionDerive::new(
-                    self.target_collection,
-                    member.raw_data,
-                    output,
-                );
+                let claim = CollectionDerive::new(self.target_collection, member.raw_data, output);
                 (claim.id(), claim)
             })
             .collect();
@@ -687,18 +677,18 @@ impl Rank9Fiber {
         collection: CollectionHandle,
         raw: CollectionData,
     ) -> Result<(), Rank9FiberError> {
-        let blob: Blob<SimpleArchive> = reader.get(collection).map_err(|error| {
-            Rank9FiberError::IncompletePublication {
-                raw,
-                rank9: None,
-                reason: format!("expected {role} descriptor is not readable: {error}"),
-            }
-        })?;
+        let blob: Blob<SimpleArchive> =
+            reader
+                .get(collection)
+                .map_err(|error| Rank9FiberError::IncompletePublication {
+                    raw,
+                    rank9: None,
+                    reason: format!("expected {role} descriptor is not readable: {error}"),
+                })?;
         let fresh = Blob::<SimpleArchive>::new(blob.bytes.clone());
-        let decoded = <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
-            fresh.clone(),
-        )
-        .ok();
+        let decoded =
+            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(fresh.clone())
+                .ok();
         if fresh.get_handle() != collection || decoded.as_ref() != Some(expected.facts()) {
             return Err(Rank9FiberError::IncompletePublication {
                 raw,

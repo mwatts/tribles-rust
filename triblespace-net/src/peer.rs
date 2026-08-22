@@ -51,9 +51,7 @@ use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use triblespace_core::collection::{
-    CollectionRecord, CollectionStore,
-};
+use triblespace_core::collection::{CollectionRecord, CollectionStore};
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -69,9 +67,9 @@ use crate::collection_sync::{
     IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_collection_batch,
 };
 use crate::collection_wire::relayable_commits;
-use triblespace_core::collection::CollectionCommit;
 use crate::host::{self, NetReceiver, NetSender};
 use crate::protocol::RawHash;
+use triblespace_core::collection::CollectionCommit;
 
 pub use crate::host::{PeerConfig, SyncDirection};
 
@@ -428,8 +426,9 @@ where
     ) -> Result<CollectionReconcileOutcome, CollectionReconcileError>
     where
         AuthorizationError: std::error::Error + Send + Sync + 'static,
-        Authorize:
-            FnMut(&triblespace_core::collection::CollectionCommit) -> Result<bool, AuthorizationError>,
+        Authorize: FnMut(
+            &triblespace_core::collection::CollectionCommit,
+        ) -> Result<bool, AuthorizationError>,
     {
         let evidence = self
             .fetch_collection_evidence_from(peer, collection)
@@ -628,10 +627,7 @@ where
                     }
                 }
             }
-            self.last_collection_commits = evidence
-                .into_iter()
-                .map(|item| item.id())
-                .collect();
+            self.last_collection_commits = evidence.into_iter().map(|item| item.id()).collect();
         }
 
         // Pin heads remain local storage state. Collection evidence above is
@@ -1313,7 +1309,7 @@ mod collection_gossip_tests {
     #[test]
     fn a_peer_relays_only_what_its_own_store_says_may_travel() {
         use triblespace_core::collection::records::CollectionName;
-        use triblespace_core::collection::{reach, Collection, simplearchive_union};
+        use triblespace_core::collection::{Collection, reach, simplearchive_union};
         use triblespace_core::repo::memoryrepo::MemoryRepo;
         use triblespace_core::trible::{Fragment, TribleSet};
 

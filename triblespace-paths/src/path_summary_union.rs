@@ -16,11 +16,11 @@
 
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
+use std::error::Error;
+use std::fmt;
 #[cfg(test)]
 use triblespace_core::collection::reach;
 use triblespace_core::prelude::entity;
-use std::error::Error;
-use std::fmt;
 
 use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
@@ -35,7 +35,9 @@ use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
-use crate::persistence::{automaton_fingerprint, path_automaton_fingerprint, PathSummaryV1, PATH_SUMMARY_RECIPE_V1};
+use crate::persistence::{
+    automaton_fingerprint, path_automaton_fingerprint, PathSummaryV1, PATH_SUMMARY_RECIPE_V1,
+};
 use crate::{Automaton, GraphEdge, PathError, PathSummary, PathSummaryBlob, PathSummaryBlobError};
 
 /// A collection descriptor participating in a validation failure.
@@ -458,11 +460,11 @@ mod tests {
     use ed25519_dalek::VerifyingKey;
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::collection::records::CollectionName;
-    use triblespace_core::trible::Fragment;
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::RawInline;
     use triblespace_core::metadata;
     use triblespace_core::prelude::entity;
+    use triblespace_core::trible::Fragment;
     use triblespace_core::trible::TribleSet;
 
     use crate::{PathIndex, Step, Transition};
@@ -541,7 +543,10 @@ mod tests {
         assert_eq!(first, repeated);
         // A summary names the collection it summarises, and carries no anchor
         // of its own.
-        assert_eq!(descriptor::source(first.facts()), Some(collection_of(&source)));
+        assert_eq!(
+            descriptor::source(first.facts()),
+            Some(collection_of(&source))
+        );
         assert!(
             descriptor::name(first.facts()).is_none(),
             "a derivation needs no anchor"
@@ -554,7 +559,11 @@ mod tests {
         assert_ne!(
             collection_of(&first),
             collection_of(&descriptor(
-                collection_of(&simplearchive_union::descriptor(&name("other-edges"), team(), reach::private())),
+                collection_of(&simplearchive_union::descriptor(
+                    &name("other-edges"),
+                    team(),
+                    reach::private()
+                )),
                 &first_automaton,
                 reach::private(),
             ))
@@ -563,13 +572,22 @@ mod tests {
             descriptor::representation(first.facts()).unwrap(),
             <PathSummaryBlob as MetaDescribe>::id()
         );
-        assert_ne!(descriptor::representation(first.facts()), descriptor::representation(source.facts()));
-        assert_ne!(descriptor::recipe(first.facts()), descriptor::recipe(source.facts()));
+        assert_ne!(
+            descriptor::representation(first.facts()),
+            descriptor::representation(source.facts())
+        );
+        assert_ne!(
+            descriptor::recipe(first.facts()),
+            descriptor::recipe(source.facts())
+        );
         // Two summaries over different automata share the law and are told
         // apart by its argument, so the recipe matches while the collections
         // differ. The automaton is readable from the descriptor rather than
         // hidden inside a derived recipe id.
-        assert_eq!(descriptor::recipe(first.facts()), descriptor::recipe(second.facts()));
+        assert_eq!(
+            descriptor::recipe(first.facts()),
+            descriptor::recipe(second.facts())
+        );
         assert_ne!(
             descriptor::argument(first.facts(), path_automaton_fingerprint.id()),
             descriptor::argument(second.facts(), path_automaton_fingerprint.id())
@@ -581,7 +599,11 @@ mod tests {
     fn canonical_empty_is_total_derived_bottom_and_join_identity() {
         let automaton = plus(label(7));
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
+        let target_descriptor = descriptor(
+            collection_of(&source_collection()),
+            &automaton,
+            reach::private(),
+        );
         let source_empty = archive(&TribleSet::new());
         let canonical_empty = empty(&automaton);
 
@@ -641,7 +663,11 @@ mod tests {
     fn derive_and_merge_commute_and_close_cross_fragment_paths() {
         let automaton = plus(metadata::tag.id().into());
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
+        let target_descriptor = descriptor(
+            collection_of(&source_collection()),
+            &automaton,
+            reach::private(),
+        );
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
 
@@ -704,7 +730,11 @@ mod tests {
     fn nullable_unmatched_domain_obeys_the_same_homomorphism() {
         let automaton = Automaton::new(1, [0], [0], []).unwrap();
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
+        let target_descriptor = descriptor(
+            collection_of(&source_collection()),
+            &automaton,
+            reach::private(),
+        );
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
         let source_union = simplearchive_union::join(&left, &right).unwrap();
@@ -760,7 +790,11 @@ mod tests {
     fn validators_reject_wrong_descriptors_endpoints_and_equations() {
         let automaton = plus(metadata::tag.id().into());
         let source_descriptor = source_collection();
-        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton, reach::private());
+        let target_descriptor = descriptor(
+            collection_of(&source_collection()),
+            &automaton,
+            reach::private(),
+        );
         let input = archive(&edge_facts(1, 2));
         let other_input = archive(&edge_facts(3, 4));
         let output = derive_element(&input, &automaton).unwrap();
@@ -804,7 +838,11 @@ mod tests {
         ));
 
         let foreign_automaton = plus(label(9));
-        let foreign_target = descriptor(collection_of(&source_collection()), &foreign_automaton, reach::private());
+        let foreign_target = descriptor(
+            collection_of(&source_collection()),
+            &foreign_automaton,
+            reach::private(),
+        );
         let foreign_claim = CollectionDerive::new(
             collection_of(&foreign_target),
             data_identity(&input),

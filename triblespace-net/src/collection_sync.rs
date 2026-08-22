@@ -200,10 +200,7 @@ pub enum IncomingValidationError {
 /// [`AuthorizedIncomingCollectionBatch::admit`].
 pub type IncomingBatchAdmissionResult<S> = Result<
     IncomingBatchCounts,
-    IncomingBatchAdmissionError<
-        <S as CollectionStore>::InsertError,
-        <S as StorageFlush>::Error,
-    >,
+    IncomingBatchAdmissionError<<S as CollectionStore>::InsertError, <S as StorageFlush>::Error>,
 >;
 
 /// Failure while durably publishing an already-authorized batch.
@@ -322,9 +319,7 @@ mod tests {
         let prepared = prepare_incoming_collection_batch(evidence).unwrap();
         assert_eq!(prepared.len(), 2);
         assert!(!prepared.is_empty());
-        let authorized = prepared
-            .authorize(|_| Ok::<_, Infallible>(true))
-            .unwrap();
+        let authorized = prepared.authorize(|_| Ok::<_, Infallible>(true)).unwrap();
         assert_eq!(
             authorized.counts(),
             IncomingBatchCounts {
@@ -393,9 +388,7 @@ mod tests {
     fn empty_batch_is_a_storage_noop() {
         let prepared = prepare_incoming_collection_batch(Vec::new()).unwrap();
         assert!(prepared.is_empty());
-        let authorized = prepared
-            .authorize(|_| Ok::<_, Infallible>(true))
-            .unwrap();
+        let authorized = prepared.authorize(|_| Ok::<_, Infallible>(true)).unwrap();
         let mut store = ProbeStore::default();
         assert_eq!(
             authorized.admit(&mut store).unwrap(),
@@ -466,5 +459,4 @@ mod tests {
         // property of the collection the commit names.
         prepare_incoming_collection_batch(vec![commit]).unwrap();
     }
-
 }

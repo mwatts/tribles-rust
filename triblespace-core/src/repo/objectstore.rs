@@ -34,8 +34,7 @@ use crate::prelude::blobencodings::SimpleArchive;
 
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
-    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionStore,
-    AsyncPinStore,
+    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionStore, AsyncPinStore,
 };
 use super::PushResult;
 use super::{BlobInfo, BlobMetadata};

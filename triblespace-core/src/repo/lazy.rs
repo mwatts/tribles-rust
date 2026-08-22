@@ -91,10 +91,7 @@ use anybytes::Bytes;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
-use crate::collection::{
-    CollectionRecord, CollectionRecordSelector,
-    CollectionStore,
-};
+use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
@@ -868,16 +865,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::reach;
     use super::*;
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
+    use crate::collection::reach;
     use crate::collection::records::CollectionName;
     use crate::collection::{CollectionHandle, CollectionMerge};
-    use ed25519_dalek::SigningKey;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
+    use ed25519_dalek::SigningKey;
     use futures::executor::block_on;
     use futures::task::{waker, ArcWake};
     use std::sync::atomic::AtomicUsize;

@@ -17,8 +17,8 @@
 //! that confer policy membership are not branch heads and are not announced as
 //! policy.
 
-use triblespace_core::collection::reach;
 use std::collections::{BTreeMap, BTreeSet};
+use triblespace_core::collection::reach;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -102,8 +102,7 @@ pub fn policy_collection_name() -> CollectionName {
 /// move.
 ///
 /// Minted with `trible genid` on 2026-08-12.
-const TEAM_ROOT_PLACEHOLDER: Id =
-    triblespace_core::id::id_hex!("8067402E88FE8DBBFA559F2212C2353D");
+const TEAM_ROOT_PLACEHOLDER: Id = triblespace_core::id::id_hex!("8067402E88FE8DBBFA559F2212C2353D");
 
 // Entity-kind ids, minted with `trible genid` on 2026-08-12.
 const KIND_REQUEST: Id = triblespace_core::id::id_hex!("35C96F095C003B7CDAE9602276C8D125");
@@ -167,7 +166,7 @@ where
         reach::private(),
     )
     .materialize()
-        .map_err(|error| storage_error("materializing policy collection", error))
+    .map_err(|error| storage_error("materializing policy collection", error))
 }
 
 fn commit<S>(store: &mut S, signing_key: &SigningKey, fragment: Fragment) -> Result<(), PolicyError>

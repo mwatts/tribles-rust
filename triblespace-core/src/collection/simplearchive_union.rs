@@ -27,8 +27,7 @@ use ed25519_dalek::VerifyingKey;
 
 use super::records::{
     collection_name, collection_reach, collection_recipe, collection_representation,
-    collection_team,
-    CollectionName, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+    collection_team, CollectionName, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -935,9 +934,7 @@ where
     Ok((merge, result))
 }
 
-fn validate_descriptor(
-    descriptor: &Fragment,
-) -> Result<(), SimpleArchiveUnionValidationError> {
+fn validate_descriptor(descriptor: &Fragment) -> Result<(), SimpleArchiveUnionValidationError> {
     let expected_representation = <SimpleArchive as MetaDescribe>::id();
     let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {
@@ -998,7 +995,6 @@ fn validate_handle(
 fn normalize_blob(blob: &Blob<SimpleArchive>) -> Blob<SimpleArchive> {
     Blob::new(blob.bytes.clone())
 }
-
 
 fn join_canonical_rows(
     left: &Blob<SimpleArchive>,
@@ -1135,7 +1131,11 @@ mod tests {
 
     /// One named root of this collection kind.
     fn root(name: &str) -> Fragment {
-        super::descriptor(&CollectionName::new(name).unwrap(), test_team(), reach::private())
+        super::descriptor(
+            &CollectionName::new(name).unwrap(),
+            test_team(),
+            reach::private(),
+        )
     }
 
     /// The same anchor as `root("first")`, but naming a different
@@ -1230,8 +1230,7 @@ mod tests {
 
     impl crate::repo::BlobStore for ProbeStore {
         type Reader = <crate::blob::MemoryBlobStore as crate::repo::BlobStore>::Reader;
-        type ReaderError =
-            <crate::blob::MemoryBlobStore as crate::repo::BlobStore>::ReaderError;
+        type ReaderError = <crate::blob::MemoryBlobStore as crate::repo::BlobStore>::ReaderError;
 
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
             self.blobs.reader()
@@ -1459,15 +1458,22 @@ mod tests {
             assert!(discovered.commits().is_empty());
             assert!(discovered.merges().is_empty());
             assert!(discovered.derives().is_empty());
-            let descriptor_blob: Blob<SimpleArchive> = reader.get(identity_for_tests(&descriptor)).unwrap();
+            let descriptor_blob: Blob<SimpleArchive> =
+                reader.get(identity_for_tests(&descriptor)).unwrap();
             assert_eq!(
-                <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(descriptor_blob).unwrap(),
+                <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
+                    descriptor_blob
+                )
+                .unwrap(),
                 *descriptor.facts()
             );
 
-            let resolution = resolve_collection_semantics(&discovered, &std::collections::BTreeMap::new(), &BTreeSet::new(), |_| {
-                Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending)
-            })
+            let resolution = resolve_collection_semantics(
+                &discovered,
+                &std::collections::BTreeMap::new(),
+                &BTreeSet::new(),
+                |_| Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending),
+            )
             .unwrap();
             assert!(resolution.admitted_claims().is_empty());
             assert!(resolution
@@ -1503,9 +1509,11 @@ mod tests {
             .commits()
             .iter()
             .any(|commit| commit.id() == withheld.id()));
-        let descriptor_blob: Blob<SimpleArchive> = reader.get(identity_for_tests(&descriptor)).unwrap();
+        let descriptor_blob: Blob<SimpleArchive> =
+            reader.get(identity_for_tests(&descriptor)).unwrap();
         assert_eq!(
-            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(descriptor_blob).unwrap(),
+            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(descriptor_blob)
+                .unwrap(),
             *descriptor.facts()
         );
         drop(reader);
@@ -1545,7 +1553,9 @@ mod tests {
         let forged_data = Blob::with_handle(data_blob.bytes.clone(), bogus.get_handle());
         let forged_metadata = Blob::with_handle(metadata.bytes.clone(), bogus.get_handle());
         let sequence = vec![
-            put_event(&IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())),
+            put_event(&IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.facts().clone(),
+            )),
             put_event(&data_blob),
             put_event(&metadata),
             insert_event(CollectionRecord::Commit(expected)),
@@ -1606,7 +1616,9 @@ mod tests {
             metadata_archive.get_handle(),
         );
         let sequence = [
-            vec![put_event(&IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()))],
+            vec![put_event(&IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.facts().clone(),
+            ))],
             embedded.clone(),
             vec![
                 put_event(&content_archive),
@@ -1677,7 +1689,9 @@ mod tests {
         // Three operations, not five. The inputs are already states of the
         // collection, so the merge writes only what it computed.
         let sequence = vec![
-            put_event(&IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())),
+            put_event(&IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.facts().clone(),
+            )),
             put_event(&expected_result),
             insert_event(CollectionRecord::Merge(expected_merge)),
         ];
@@ -1745,15 +1759,20 @@ mod tests {
         let right = archive([row(2, 1, 2), row(3, 1, 3)]);
         let (low, high) = ordered_inputs(&left, &right);
         let result = join(low, high).unwrap();
-        let expected =
-            CollectionMerge::new(identity_for_tests(&descriptor), data(low), data(high), data(&result));
+        let expected = CollectionMerge::new(
+            identity_for_tests(&descriptor),
+            data(low),
+            data(high),
+            data(&result),
+        );
         // Three operations now, not five: descriptor put, result put, record
         // insert. The inputs are read, not written.
         for fail_at in 1..=3 {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
             store.seed(&left);
             store.seed(&right);
-            let error = publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap_err();
+            let error =
+                publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap_err();
             match (fail_at, error) {
                 (1..=2, PublicationError::DependencyPut(ProbeFailure(at)))
                 | (3, PublicationError::RecordInsert(ProbeFailure(at))) => {
@@ -1770,7 +1789,8 @@ mod tests {
             store.recover();
             store.seed(&left);
             store.seed(&right);
-            let retried = publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap();
+            let retried =
+                publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap();
             assert_eq!(retried, (expected.clone(), result.clone()));
             assert!(store.records.contains_key(&expected.id()));
         }
@@ -1780,8 +1800,7 @@ mod tests {
     fn publication_rejects_every_invalid_input_before_writing() {
         let (descriptor, data_blob, metadata, signing_key, _) = commit_fixture();
         let mut store = ProbeStore::default();
-        let wrong_descriptor =
-            test_naming(id(8), TRIBLE_SET_UNION_RECIPE_V1);
+        let wrong_descriptor = test_naming(id(8), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             publish_commit(
                 &mut store,
@@ -1831,7 +1850,12 @@ mod tests {
         store.seed(&invalid_data);
         store.seed(&data_blob);
         assert!(matches!(
-            publish_merge(&mut store, &descriptor, Handle::<SimpleArchive>::to_hash(invalid_data.get_handle()), Handle::<SimpleArchive>::to_hash(data_blob.get_handle()),),
+            publish_merge(
+                &mut store,
+                &descriptor,
+                Handle::<SimpleArchive>::to_hash(invalid_data.get_handle()),
+                Handle::<SimpleArchive>::to_hash(data_blob.get_handle()),
+            ),
             Err(PublicationError::Validation(
                 SimpleArchiveUnionValidationError::InvalidElement { .. }
             ))
@@ -1878,13 +1902,17 @@ mod tests {
         assert!(discovered.derives().is_empty());
         assert!(discovered.diagnostics().is_empty());
 
-        let fetched_descriptor: Blob<SimpleArchive> = reader.get(identity_for_tests(&descriptor)).unwrap();
+        let fetched_descriptor: Blob<SimpleArchive> =
+            reader.get(identity_for_tests(&descriptor)).unwrap();
         let fetched_left: Blob<SimpleArchive> = reader.get(left.get_handle()).unwrap();
         let fetched_right: Blob<SimpleArchive> = reader.get(right.get_handle()).unwrap();
         let fetched_metadata: Blob<SimpleArchive> = reader.get(metadata.get_handle()).unwrap();
         let fetched_result: Blob<SimpleArchive> = reader.get(result.get_handle()).unwrap();
         assert_eq!(
-            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(fetched_descriptor).unwrap(),
+            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
+                fetched_descriptor
+            )
+            .unwrap(),
             *descriptor.facts()
         );
         assert_eq!(fetched_left, left);
@@ -1927,12 +1955,16 @@ mod tests {
         assert!(discovered.derives().is_empty());
         assert!(discovered.diagnostics().is_empty());
 
-        let fetched_descriptor: Blob<SimpleArchive> = reader.get(identity_for_tests(&descriptor)).unwrap();
+        let fetched_descriptor: Blob<SimpleArchive> =
+            reader.get(identity_for_tests(&descriptor)).unwrap();
         let content_handle: Inline<Handle<SimpleArchive>> = commit.data().transmute();
         let fetched_content: Blob<SimpleArchive> = reader.get(content_handle).unwrap();
         let fetched_metadata: Blob<SimpleArchive> = reader.get(commit.metadata()).unwrap();
         assert_eq!(
-            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(fetched_descriptor).unwrap(),
+            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
+                fetched_descriptor
+            )
+            .unwrap(),
             *descriptor.facts()
         );
         assert_eq!(fetched_content, expected_content);
@@ -1967,7 +1999,9 @@ mod tests {
             "first"
         );
         assert_eq!(
-            crate::collection::descriptor::team(descriptor.facts()).unwrap().unwrap(),
+            crate::collection::descriptor::team(descriptor.facts())
+                .unwrap()
+                .unwrap(),
             test_team()
         );
         // The descriptor entity is intrinsic in its own attributes, so the
@@ -2163,8 +2197,7 @@ mod tests {
         );
         validate_commit(&descriptor, &commit, &blob).unwrap();
 
-        let wrong_representation =
-            test_naming(id(9), TRIBLE_SET_UNION_RECIPE_V1);
+        let wrong_representation = test_naming(id(9), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             validate_commit(&wrong_representation, &commit, &blob),
             Err(SimpleArchiveUnionValidationError::WrongRepresentation { .. })

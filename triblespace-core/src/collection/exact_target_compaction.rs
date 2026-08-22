@@ -22,8 +22,8 @@ use super::exact_derived::{
     ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use super::{
-    CollectionCommit, CollectionData, CollectionHandle, CollectionMerge,
-    CollectionRecord, CollectionStore,
+    CollectionCommit, CollectionData, CollectionHandle, CollectionMerge, CollectionRecord,
+    CollectionStore,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;

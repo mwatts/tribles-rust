@@ -207,8 +207,8 @@ mod tests {
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-        CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge,
-        CollectionRecord, CollectionStore, CollectionValidationRequest,
+        CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
+        CollectionStore, CollectionValidationRequest,
     };
     use crate::inline::encodings::hash::{Blake3, Hash};
     use crate::macros::entity;
@@ -334,9 +334,9 @@ mod tests {
             self::data(&data),
             metadata.get_handle(),
         );
-        store
-            .blobs
-            .insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
+        store.blobs.insert(IntoBlob::<SimpleArchive>::to_blob(
+            descriptor.facts().clone(),
+        ));
         store.blobs.insert(data);
         store.blobs.insert(metadata);
         CollectionStore::insert(store, CollectionRecord::Commit(commit)).unwrap();
@@ -372,9 +372,12 @@ mod tests {
         let records = discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
         let authorized = BTreeSet::from([commit.id()]);
-        let resolution = resolve_collection_semantics(&records, &lineage_from_derives(&records), &authorized, |request| {
-            validate_union(&reader, &BTreeSet::new(), request)
-        })
+        let resolution = resolve_collection_semantics(
+            &records,
+            &lineage_from_derives(&records),
+            &authorized,
+            |request| validate_union(&reader, &BTreeSet::new(), request),
+        )
         .unwrap();
         let roots = plan_collection_retention(&records, &resolution, &reader).unwrap();
         assert_eq!(roots.direct().len(), 0);
@@ -393,7 +396,8 @@ mod tests {
         let retained_records = discover_collection_records(&mut store).unwrap();
         assert_eq!(retained_records.commits(), &[commit]);
         let reader = store.reader().unwrap();
-        let retained_descriptor: Blob<SimpleArchive> = reader.get(identity_for_tests(&descriptor)).unwrap();
+        let retained_descriptor: Blob<SimpleArchive> =
+            reader.get(identity_for_tests(&descriptor)).unwrap();
         assert_eq!(
             <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
                 retained_descriptor
@@ -440,7 +444,9 @@ mod tests {
             empty_metadata.clone(),
             &key,
         );
-        store.blobs.insert(IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()));
+        store
+            .blobs
+            .insert(IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()));
 
         let active_merge_result = simplearchive_union::join(&left, &right).unwrap();
         let active_merge = CollectionMerge::new(
@@ -492,9 +498,12 @@ mod tests {
         let records = discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
 
-        let unauthorized = resolve_collection_semantics(&records, &lineage_from_derives(&records), &BTreeSet::new(), |request| {
-            validate_union_and_derives(&reader, request)
-        })
+        let unauthorized = resolve_collection_semantics(
+            &records,
+            &lineage_from_derives(&records),
+            &BTreeSet::new(),
+            |request| validate_union_and_derives(&reader, request),
+        )
         .unwrap();
         assert!(unauthorized.admitted_claims().contains(&active_merge.id()));
         assert!(unauthorized.admitted_claims().contains(&active_derive.id()));
@@ -503,9 +512,12 @@ mod tests {
         assert_eq!(empty.recursive().len(), 0);
 
         let authorized = BTreeSet::from([first.id(), second.id()]);
-        let resolution = resolve_collection_semantics(&records, &lineage_from_derives(&records), &authorized, |request| {
-            validate_union_and_derives(&reader, request)
-        })
+        let resolution = resolve_collection_semantics(
+            &records,
+            &lineage_from_derives(&records),
+            &authorized,
+            |request| validate_union_and_derives(&reader, request),
+        )
         .unwrap();
         for active in [active_merge.id(), active_derive.id()] {
             assert!(resolution.admitted_claims().contains(&active));
@@ -557,18 +569,20 @@ mod tests {
 
         let mut complete = MemoryRepo::default();
         CollectionStore::insert(&mut complete, CollectionRecord::Commit(commit)).unwrap();
-        complete
-            .blobs
-            .insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
+        complete.blobs.insert(IntoBlob::<SimpleArchive>::to_blob(
+            descriptor.facts().clone(),
+        ));
         complete.blobs.insert(content.clone());
         complete.blobs.insert(metadata.clone());
         let records = discover_collection_records(&mut complete).unwrap();
         let complete_reader = complete.reader().unwrap();
-        let resolution =
-            resolve_collection_semantics(&records, &lineage_from_derives(&records), &BTreeSet::from([commit.id()]), |request| {
-                validate_union(&complete_reader, &BTreeSet::new(), request)
-            })
-            .unwrap();
+        let resolution = resolve_collection_semantics(
+            &records,
+            &lineage_from_derives(&records),
+            &BTreeSet::from([commit.id()]),
+            |request| validate_union(&complete_reader, &BTreeSet::new(), request),
+        )
+        .unwrap();
         plan_collection_retention(&records, &resolution, &complete_reader).unwrap();
 
         let mut missing_descriptor = MemoryBlobStore::new();
@@ -582,7 +596,9 @@ mod tests {
         ));
 
         let mut missing_data = MemoryBlobStore::new();
-        missing_data.insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
+        missing_data.insert(IntoBlob::<SimpleArchive>::to_blob(
+            descriptor.facts().clone(),
+        ));
         missing_data.insert(metadata.clone());
         let reader = missing_data.reader().unwrap();
         assert!(matches!(
@@ -592,7 +608,9 @@ mod tests {
         ));
 
         let mut missing_metadata = MemoryBlobStore::new();
-        missing_metadata.insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
+        missing_metadata.insert(IntoBlob::<SimpleArchive>::to_blob(
+            descriptor.facts().clone(),
+        ));
         missing_metadata.insert(content);
         let reader = missing_metadata.reader().unwrap();
         assert!(matches!(

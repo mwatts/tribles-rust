@@ -9,10 +9,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::collection::store::selectors_match_record;
-use crate::collection::{
-    CollectionRecord, CollectionRecordSelector,
-    CollectionStore,
-};
+use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::PinSnapshotSource;
@@ -237,8 +234,8 @@ impl crate::repo::StorageClose for MemoryRepo {
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::reach;
     use super::*;
+    use crate::collection::reach;
 
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{CollectionDerive, CollectionMerge};
@@ -336,32 +333,25 @@ mod tests {
             Inline::new([32; 32]),
             Inline::new([33; 32]),
         ));
-        let first = CollectionRecord::Derive(CollectionDerive::new(
-            target,
-            input,
-            Inline::new([34; 32]),
-        ));
-        let conflicting = CollectionRecord::Derive(CollectionDerive::new(
-            target,
-            input,
-            Inline::new([35; 32]),
-        ));
+        let first =
+            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([34; 32])));
+        let conflicting =
+            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([35; 32])));
         let sibling = CollectionRecord::Derive(CollectionDerive::new(
             target,
             Inline::new([36; 32]),
             Inline::new([37; 32]),
         ));
-        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
-            other,
-            input,
-            Inline::new([38; 32]),
-        ));
+        let unrelated =
+            CollectionRecord::Derive(CollectionDerive::new(other, input, Inline::new([38; 32])));
         let mut repo = MemoryRepo::default();
         for record in [unrelated, conflicting, merge, first, sibling, first] {
             repo.insert(record).unwrap();
         }
 
-        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(target, input))]
+        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
+            target, input,
+        ))]
         .into_iter()
         .collect();
         let mut expected = vec![first, conflicting];
@@ -394,7 +384,8 @@ mod tests {
         let name = crate::collection::records::CollectionName::new("owned").unwrap();
         let key = SigningKey::from_bytes(&[23; 32]);
         let team = key.verifying_key();
-        let collection = Collection::new(&mut repo, &name, team, key.clone(), reach::private()).collection();
+        let collection =
+            Collection::new(&mut repo, &name, team, key.clone(), reach::private()).collection();
         let commit = Collection::new(&mut repo, &name, team, key, reach::private())
             .commit(fragment)
             .unwrap();

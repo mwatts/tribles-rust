@@ -49,8 +49,9 @@ use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::collection::store::selectors_match_record;
 use crate::collection::{
-    CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionRecord, CollectionRecordSelector, CollectionStore, };
+    CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
+    CollectionRecordSelector, CollectionStore,
+};
 use crate::id::Id;
 use crate::id::RawId;
 use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED25519SComponent};
@@ -67,9 +68,7 @@ use crate::prelude::inlineencodings::Handle;
 use crate::repo::{WantRequest, WANT_REQUEST_BYTES_LEN};
 
 mod record_kind;
-pub use record_kind::{
-    described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD,
-};
+pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
 
 // ---------------------------------------------------------------------------
 // The supported legacy surface is exactly what shipped in **v0.46.4** (tagged
@@ -616,7 +615,12 @@ struct TypedWantHeaderEnvelopeV1 {
 
 impl TypedWantHeaderEnvelopeV1 {
     fn request(&self) -> Result<WantRequest, crate::repo::WantRequestDecodeError> {
-        decode_want_request(self.request_kind, &self.field_a, &self.field_b, &self.field_c)
+        decode_want_request(
+            self.request_kind,
+            &self.field_a,
+            &self.field_b,
+            &self.field_c,
+        )
     }
 }
 
@@ -838,7 +842,12 @@ impl WantRecordHeader {
     }
 
     fn request(&self) -> Result<WantRequest, crate::repo::WantRequestDecodeError> {
-        decode_want_request(self.request_kind, &self.field_a, &self.field_b, &self.field_c)
+        decode_want_request(
+            self.request_kind,
+            &self.field_a,
+            &self.field_b,
+            &self.field_c,
+        )
     }
 }
 
@@ -1232,8 +1241,8 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
         }
         record_kind::KIND_PIN_TOMBSTONE => {
             fixed_header()?;
-            let (header, _) = PinTombstoneRecordHeader::try_read_from_prefix(bytes)
-                .map_err(|_| corrupt())?;
+            let (header, _) =
+                PinTombstoneRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             if nonzero(&[&header.reserved[..]]) {
                 return Err(corrupt());
             }
@@ -1291,8 +1300,8 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
         }
         record_kind::KIND_COLLECTION_COMMIT => {
             fixed_header()?;
-            let (header, _) = CollectionCommitRecordHeader::try_read_from_prefix(bytes)
-                .map_err(|_| corrupt())?;
+            let (header, _) =
+                CollectionCommitRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             Ok(PileRecord {
                 offset,
                 len,
@@ -1310,8 +1319,8 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
         }
         record_kind::KIND_COLLECTION_MERGE => {
             fixed_header()?;
-            let (header, _) = CollectionMergeRecordHeader::try_read_from_prefix(bytes)
-                .map_err(|_| corrupt())?;
+            let (header, _) =
+                CollectionMergeRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             if nonzero(&[&header.reserved[..]]) || header.high < header.low {
                 return Err(corrupt());
             }
@@ -1330,8 +1339,8 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
         }
         record_kind::KIND_COLLECTION_DERIVE => {
             fixed_header()?;
-            let (header, _) = CollectionDeriveRecordHeader::try_read_from_prefix(bytes)
-                .map_err(|_| corrupt())?;
+            let (header, _) =
+                CollectionDeriveRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             if nonzero(&[&header.reserved[..]]) {
                 return Err(corrupt());
             }
@@ -1573,8 +1582,8 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
             offset,
             len,
             content: PileRecordContent::Opaque {
-                    kind: OpaqueKind::Legacy(kind),
-                },
+                kind: OpaqueKind::Legacy(kind),
+            },
         }),
     }
 }
@@ -3649,7 +3658,9 @@ impl std::fmt::Display for PileReframeError {
             Self::Destination(error) => write!(f, "failed to append to destination: {error}"),
             Self::Pin(error) => write!(f, "failed to replay a pin update: {error}"),
             Self::Want(error) => write!(f, "failed to replay a want: {error}"),
-            Self::Collection(error) => write!(f, "failed to re-encode a collection record: {error}"),
+            Self::Collection(error) => {
+                write!(f, "failed to re-encode a collection record: {error}")
+            }
             Self::DestinationNotEmpty { length } => write!(
                 f,
                 "destination already holds {length} byte(s); reframe requires an empty pile"
@@ -3782,9 +3793,7 @@ pub fn reframe_into(
                 stats.wants += 1;
             }
             PileRecordContent::WantAssert { request } => {
-                destination
-                    .want(request)
-                    .map_err(PileReframeError::Want)?;
+                destination.want(request).map_err(PileReframeError::Want)?;
                 stats.wants += 1;
             }
             PileRecordContent::WantRetract { request } => {
@@ -4060,8 +4069,7 @@ mod tests {
         assert!(physical_len >= FRAME_BODY_OFFSET);
         let mut bytes = vec![0xC3; physical_len];
         bytes[..FRAME_MAGIC_LEN].copy_from_slice(&FRAME_MAGIC);
-        bytes[FRAME_MAGIC_LEN..FRAME_MAGIC_LEN + 4]
-            .copy_from_slice(&span_blocks.to_le_bytes());
+        bytes[FRAME_MAGIC_LEN..FRAME_MAGIC_LEN + 4].copy_from_slice(&span_blocks.to_le_bytes());
         bytes[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET].copy_from_slice(&kind);
         bytes
     }
@@ -4448,7 +4456,11 @@ mod tests {
         assert_eq!(result.head(moved).unwrap(), Some(second));
         assert_eq!(result.head(cleared).unwrap(), None);
         assert_eq!(
-            result.wants().unwrap().collect::<Result<Vec<_>, _>>().unwrap(),
+            result
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
             vec![WantRequest::blob(kept_want)]
         );
         assert_eq!(
@@ -4537,8 +4549,10 @@ mod tests {
         let branch_id = Id::new([3; 16]).unwrap();
         pile.update(branch_id, None, Some(Inline::new([4; 32])))
             .unwrap();
-        pile.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([5; 32])))
-            .unwrap();
+        pile.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
+            [5; 32],
+        )))
+        .unwrap();
         for record in &collection_test_records() {
             pile.insert(*record).unwrap();
         }
@@ -5311,7 +5325,9 @@ mod tests {
             input,
             collection_test_hash(11),
         ));
-        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(target, input))]
+        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
+            target, input,
+        ))]
         .into_iter()
         .collect();
 
@@ -5483,13 +5499,11 @@ mod tests {
         let forged_metadata = source
             .put::<SimpleArchive, _>(metadata_facts.to_blob())
             .unwrap();
-        let descriptor = named_for_tests(
-            "forged",
-            collection_test_id(22),
-            collection_test_id(23),
-        );
+        let descriptor = named_for_tests("forged", collection_test_id(22), collection_test_id(23));
         let descriptor_handle = source
-            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.into_facts(),
+            ))
             .unwrap();
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
             &SigningKey::from_bytes(&[24; 32]),
@@ -5639,13 +5653,12 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
             .unwrap();
 
-        let descriptor = named_for_tests(
-            "retained",
-            collection_test_id(11),
-            collection_test_id(12),
-        );
+        let descriptor =
+            named_for_tests("retained", collection_test_id(11), collection_test_id(12));
         let descriptor_handle = source
-            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.into_facts(),
+            ))
             .unwrap();
         let key = SigningKey::from_bytes(&[13; 32]);
         let commit = CollectionCommit::sign(

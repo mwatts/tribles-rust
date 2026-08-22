@@ -50,8 +50,8 @@
 //! the same dataset but different edges are distinct collections, and cannot
 //! be confused for one another's cache.
 
-use ed25519_dalek::VerifyingKey;
 use crate::collection::records::CollectionName;
+use ed25519_dalek::VerifyingKey;
 
 use anybytes::Bytes;
 use std::error::Error;
@@ -78,8 +78,8 @@ use super::exact_derived::{
     ExactDerivedCollectionError,
 };
 use super::records::{
-    collection_recipe, collection_representation, collection_source, CollectionHandle,
-    collection_reach, KIND_COLLECTION_DESCRIPTOR,
+    collection_reach, collection_recipe, collection_representation, collection_source,
+    CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
 use super::{simplearchive_union, CollectionCommit, CollectionStore};
 use crate::repo::{BlobStore, BlobStoreMeta};
@@ -132,7 +132,10 @@ impl fmt::Display for ObservedSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadLength(len) => {
-                write!(formatter, "observed set of {len} bytes is not a whole number of {ID_LEN}-byte ids")
+                write!(
+                    formatter,
+                    "observed set of {len} bytes is not a whole number of {ID_LEN}-byte ids"
+                )
             }
             Self::NotStrictlyIncreasing => {
                 formatter.write_str("observed set ids are not strictly increasing")
@@ -529,9 +532,9 @@ impl ExactDerivedAlgebra<SimpleArchive, ObservedSetBlob> for ObservedSetCollecti
 mod tests {
     use super::*;
     use crate::prelude::*;
-    use std::collections::BTreeSet;
     use crate::query::register::{resolve, ObservationOrder};
     use crate::trible::TribleSet;
+    use std::collections::BTreeSet;
 
     fn archive(facts: &TribleSet) -> Blob<SimpleArchive> {
         facts.clone().to_blob()
@@ -559,7 +562,10 @@ mod tests {
         assert_eq!(index.len(), 1);
         assert_eq!(
             resolve(&index, candidates),
-            resolve(&ObservationOrder::new(&facts, metadata::supersedes.id()), candidates)
+            resolve(
+                &ObservationOrder::new(&facts, metadata::supersedes.id()),
+                candidates
+            )
         );
         assert_eq!(
             resolve(&index, candidates),

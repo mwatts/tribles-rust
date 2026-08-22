@@ -1,9 +1,6 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::collection::{
-    CollectionRecord, CollectionRecordSelector,
-    CollectionStore,
-};
+use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -223,8 +220,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::reach;
     use super::*;
+    use crate::collection::reach;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
@@ -242,9 +239,14 @@ mod tests {
     #[test]
     fn collection_records_delegate_only_to_the_record_side() {
         let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let facts =
-            descriptor::naming(&CollectionName::new("hybrid").unwrap(), team, id(2), id(3), reach::private())
-                .into_facts();
+        let facts = descriptor::naming(
+            &CollectionName::new("hybrid").unwrap(),
+            team,
+            id(2),
+            id(3),
+            reach::private(),
+        )
+        .into_facts();
         // Only the identity matters here; nothing resolves this descriptor.
         let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();
         let record = CollectionRecord::Merge(CollectionMerge::new(

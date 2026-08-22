@@ -23,10 +23,9 @@ use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::collection_wire::{
-    CollectionOperationReceiptResponse,
-    collection_operation_receipts, decode_collection_operation_request,
-    encode_collection_operation_receipts, op_collection_operation_receipts, relayable_commits,
-    relayable_commits_for,
+    CollectionOperationReceiptResponse, collection_operation_receipts,
+    decode_collection_operation_request, encode_collection_operation_receipts,
+    op_collection_operation_receipts, relayable_commits, relayable_commits_for,
 };
 use crate::identity::iroh_secret;
 use crate::protocol::*;
@@ -2235,9 +2234,9 @@ fn blob_in_scope(
 
 #[cfg(test)]
 mod collection_evidence_gossip_tests {
-    use triblespace_core::collection::reach;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
+    use triblespace_core::collection::reach;
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
@@ -2255,8 +2254,8 @@ mod collection_evidence_gossip_tests {
     use triblespace_core::collection::{COLLECTION_COMMIT_BYTES_LEN, CollectionCommit};
 
     fn evidence() -> CollectionCommit {
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::blob::IntoBlob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::collection::records::CollectionName;
 
         let author = SigningKey::from_bytes(&[0xA7; 32]);
@@ -2268,8 +2267,7 @@ mod collection_evidence_gossip_tests {
         // Gossip only ever carries the identity; nothing here stores the
         // descriptor it names -- these frame tests are about framing, and the
         // descriptor check lives in selection, one layer up.
-        let collection =
-            IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()).get_handle();
+        let collection = IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()).get_handle();
         CollectionCommit::sign(
             &author,
             collection,

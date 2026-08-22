@@ -182,7 +182,7 @@ impl SimpleArchiveCollection {
         let requested: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
         let discovered =
             discover_collection_records_for_collection_ticket(store, &requested, collection)
-        .map_err(CollectionMaterializationError::Discovery)?;
+                .map_err(CollectionMaterializationError::Discovery)?;
         validate_exact_ticket(&discovered, &commits)
             .map_err(CollectionMaterializationError::ExactTicket)?;
         Collection::<S>::snapshot_from_observation(store, &descriptor, discovered, commits)
@@ -579,10 +579,20 @@ mod tests {
         let (first, first_blob) = publish(&mut store, &descriptor, 7, 1);
         let (second, second_blob) = publish(&mut store, &descriptor, 8, 2);
         let (_extra, extra_blob) = publish(&mut store, &descriptor, 9, 3);
-        let (_, selected_cover) =
-            super::super::publish_merge(&mut store, &descriptor, Handle::<SimpleArchive>::to_hash(first_blob.get_handle()), Handle::<SimpleArchive>::to_hash(second_blob.get_handle()))
-                .unwrap();
-        super::super::publish_merge(&mut store, &descriptor, Handle::<SimpleArchive>::to_hash(selected_cover.get_handle()), Handle::<SimpleArchive>::to_hash(extra_blob.get_handle())).unwrap();
+        let (_, selected_cover) = super::super::publish_merge(
+            &mut store,
+            &descriptor,
+            Handle::<SimpleArchive>::to_hash(first_blob.get_handle()),
+            Handle::<SimpleArchive>::to_hash(second_blob.get_handle()),
+        )
+        .unwrap();
+        super::super::publish_merge(
+            &mut store,
+            &descriptor,
+            Handle::<SimpleArchive>::to_hash(selected_cover.get_handle()),
+            Handle::<SimpleArchive>::to_hash(extra_blob.get_handle()),
+        )
+        .unwrap();
 
         let attached = facade.attach_exact(&mut store, &[second, first]).unwrap();
         let mut expected = facts(1);

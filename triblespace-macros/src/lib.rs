@@ -6,9 +6,9 @@
 //! invocation is accumulated as one self-contained [`Fragment`] and published
 //! as one signed collection commit; partial configuration is inert.
 
-use triblespace_core::collection::reach;
 use proc_macro::Span;
 use proc_macro::TokenStream;
+use triblespace_core::collection::reach;
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, ToTokens};
@@ -105,7 +105,13 @@ fn publish_metadata(
         Ok(pile) => pile,
         Err(_) => return,
     };
-    let mut collection = Collection::new(pile, collection_name, collection_team, signing_key, reach::private());
+    let mut collection = Collection::new(
+        pile,
+        collection_name,
+        collection_team,
+        signing_key,
+        reach::private(),
+    );
     let _ = collection.commit(fragment);
     let _ = collection.close();
 }
@@ -518,9 +524,9 @@ mod instrumentation_tests {
     use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::blob::Blob;
     use triblespace_core::collection::{self, CollectionRecord, CollectionStore};
-    use triblespace_core::trible::TribleSet;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageClose};
+    use triblespace_core::trible::TribleSet;
 
     #[test]
     fn collection_name_accepts_only_legal_names() {

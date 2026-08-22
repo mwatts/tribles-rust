@@ -31,9 +31,7 @@ use std::future::Future;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use crate::collection::{
-    CollectionRecord, CollectionStore,
-};
+use crate::collection::{CollectionRecord, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};

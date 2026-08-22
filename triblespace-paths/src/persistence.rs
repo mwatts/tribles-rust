@@ -340,7 +340,8 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
 /// carried on the collection descriptor as `path_automaton_fingerprint`, not
 /// folded into this id: a digest of an automaton that is stored nowhere would
 /// leave the collection's meaning unrecoverable from the pile.
-pub const PATH_SUMMARY_RECIPE_V1: Id = triblespace_core::id_hex!("341216BFE738E2D82BFFF96F52E7FE06");
+pub const PATH_SUMMARY_RECIPE_V1: Id =
+    triblespace_core::id_hex!("341216BFE738E2D82BFFF96F52E7FE06");
 
 /// The path-summary law, as a describable type.
 pub struct PathSummaryV1;

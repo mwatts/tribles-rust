@@ -12,9 +12,7 @@ use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, TribleSet};
 
 use super::{join_many, validate_descriptor, SimpleArchiveUnionValidationError};
-use crate::collection::{
-    collection_physical_cover, CollectionData, CollectionSemantics,
-};
+use crate::collection::{collection_physical_cover, CollectionData, CollectionSemantics};
 
 /// Failure to materialize one resolved `SimpleArchive` union collection.
 #[derive(Debug)]
@@ -182,8 +180,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::reach;
     use super::*;
+    use crate::collection::reach;
 
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -452,9 +450,24 @@ mod tests {
         let bc = super::super::join(&b, &c).unwrap();
         let bcd = super::super::join(&bc, &d).unwrap();
         let merges = [
-            CollectionMerge::new(identity_for_tests(&descriptor), data(&a), data(&b), data(&ab)),
-            CollectionMerge::new(identity_for_tests(&descriptor), data(&b), data(&c), data(&bc)),
-            CollectionMerge::new(identity_for_tests(&descriptor), data(&bc), data(&d), data(&bcd)),
+            CollectionMerge::new(
+                identity_for_tests(&descriptor),
+                data(&a),
+                data(&b),
+                data(&ab),
+            ),
+            CollectionMerge::new(
+                identity_for_tests(&descriptor),
+                data(&b),
+                data(&c),
+                data(&bc),
+            ),
+            CollectionMerge::new(
+                identity_for_tests(&descriptor),
+                data(&bc),
+                data(&d),
+                data(&bcd),
+            ),
         ];
         let semantics = semantics(&descriptor, &[a.clone(), b, c, d], &merges);
         let mut reader = ProbeReader::default();

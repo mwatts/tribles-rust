@@ -774,7 +774,9 @@ mod pin_snapshot_source_tests {
 ///
 /// New code should use [`crate::collection::Collection`]. Anything still using
 /// this trait is either legacy-pile migration or has not been cut over yet.
-#[deprecated(note = "legacy pre-Collection storage; use crate::collection::Collection. Retained for reading and migrating existing piles.")]
+#[deprecated(
+    note = "legacy pre-Collection storage; use crate::collection::Collection. Retained for reading and migrating existing piles."
+)]
 pub trait PinStore {
     /// Error type for listing pins.
     type PinsError: Error + Debug + Send + Sync + 'static;
@@ -955,7 +957,11 @@ impl WantRequest {
     }
 
     /// Construct a merge request with its two inputs in canonical order.
-    pub fn merge(collection: CollectionHandle, first: CollectionData, second: CollectionData) -> Self {
+    pub fn merge(
+        collection: CollectionHandle,
+        first: CollectionData,
+        second: CollectionData,
+    ) -> Self {
         let (low, high) = if first <= second {
             (first, second)
         } else {
@@ -1503,7 +1509,9 @@ where
 /// readable and migratable. New work belongs in
 /// [`crate::collection::Collection`], which needs no mutable head — see the
 /// LEGACY note on [`PinStore`] for why that difference matters.
-#[deprecated(note = "legacy pre-Collection branch model; use crate::collection::Collection. Retained for reading and migrating existing piles.")]
+#[deprecated(
+    note = "legacy pre-Collection branch model; use crate::collection::Collection. Retained for reading and migrating existing piles."
+)]
 pub struct Repository<Storage: BlobStore + PinStore> {
     storage: Storage,
     signing_key: SigningKey,

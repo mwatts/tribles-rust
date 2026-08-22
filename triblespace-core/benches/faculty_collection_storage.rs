@@ -29,13 +29,13 @@
 //!   --cases 256/1,4096/16,4096/256,65536/256,65536/1024 --reps 21
 //! ```
 
-use triblespace_core::collection::reach;
 use std::env;
 use std::fs::{self, File};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
 use tempfile::{tempdir, TempDir};
@@ -587,7 +587,13 @@ fn build_fixture(case: Case) -> Fixture {
 
     let name = collection_name();
     let pile = open_refreshed(&collection);
-    let mut collection_facade = Collection::new(pile, &name, collection_team(), signing_key(), reach::private());
+    let mut collection_facade = Collection::new(
+        pile,
+        &name,
+        collection_team(),
+        signing_key(),
+        reach::private(),
+    );
     for fragment in fragments {
         collection_facade.commit(fragment).unwrap();
     }
@@ -631,7 +637,13 @@ fn legacy_materialize(path: &Path, branch: Id) -> TribleSet {
 
 fn collection_materialize(path: &Path, name: &CollectionName) -> TribleSet {
     let pile = open_refreshed(path);
-    let mut collection = Collection::new(pile, name, collection_team(), signing_key(), reach::private());
+    let mut collection = Collection::new(
+        pile,
+        name,
+        collection_team(),
+        signing_key(),
+        reach::private(),
+    );
     let facts = collection.materialize().unwrap();
     collection.close().unwrap();
     facts
@@ -683,7 +695,13 @@ fn hot_legacy_materialize(path: &Path, branch: Id, reps: usize) -> Summary {
 
 fn hot_collection_materialize(path: &Path, name: &CollectionName, reps: usize) -> Summary {
     let pile = open_refreshed(path);
-    let mut collection = Collection::new(pile, name, collection_team(), signing_key(), reach::private());
+    let mut collection = Collection::new(
+        pile,
+        name,
+        collection_team(),
+        signing_key(),
+        reach::private(),
+    );
     let summary = sample(reps, || collection.materialize().unwrap().len());
     collection.close().unwrap();
     summary
@@ -815,7 +833,13 @@ fn append_one_clone_collection(source: &Path, name: &CollectionName, ordinal: us
     let (_dir, path) = clone_fixture(source);
     let started = Instant::now();
     let pile = open_refreshed(&path);
-    let mut collection = Collection::new(pile, name, collection_team(), signing_key(), reach::private());
+    let mut collection = Collection::new(
+        pile,
+        name,
+        collection_team(),
+        signing_key(),
+        reach::private(),
+    );
     collection
         .commit(Fragment::from(fact_set(ordinal, 1)))
         .unwrap();
@@ -849,7 +873,13 @@ fn append_many_clone_collection(
     let (_dir, path) = clone_fixture(source);
     let started = Instant::now();
     let pile = open_refreshed(&path);
-    let mut collection = Collection::new(pile, name, collection_team(), signing_key(), reach::private());
+    let mut collection = Collection::new(
+        pile,
+        name,
+        collection_team(),
+        signing_key(),
+        reach::private(),
+    );
     for offset in 0..count {
         collection
             .commit(Fragment::from(fact_set(ordinal + offset, 1)))

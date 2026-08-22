@@ -69,9 +69,10 @@ pub(crate) fn selectors_match_record(
             ))
         }
         CollectionRecord::Derive(derive) => {
-            selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.target())) || selectors.contains(&CollectionRecordSelector::Operation(
-                collection_record_operation(record).expect("DERIVE has an operation key"),
-            ))
+            selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.target()))
+                || selectors.contains(&CollectionRecordSelector::Operation(
+                    collection_record_operation(record).expect("DERIVE has an operation key"),
+                ))
         }
     }
 }

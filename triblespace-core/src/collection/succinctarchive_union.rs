@@ -20,16 +20,16 @@ use super::simplearchive_union::TribleSetUnionV1;
 use crate::id::ExclusiveId;
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
+use super::descriptor as descriptor_facts;
+use super::records::{
+    collection_reach, collection_recipe, collection_representation, collection_source,
+    RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+};
 #[cfg(test)]
 use crate::collection::reach;
 use crate::metadata;
 use crate::prelude::entity;
 use crate::trible::Fragment;
-use super::descriptor as descriptor_facts;
-use super::records::{
-    collection_recipe, collection_representation, collection_source, RecordDecodeError,
-    collection_reach, KIND_COLLECTION_DESCRIPTOR,
-};
 use std::error::Error;
 use std::fmt;
 
@@ -264,7 +264,10 @@ impl fmt::Display for SuccinctArchiveUnionValidationError {
                     formatter,
                     "collection derives from {actual:?}, not {expected:?}"
                 ),
-                None => write!(formatter, "collection is a root, expected a derivation of {expected:?}"),
+                None => write!(
+                    formatter,
+                    "collection is a root, expected a derivation of {expected:?}"
+                ),
             },
             Self::Malformed(error) => {
                 write!(formatter, "malformed collection descriptor: {error}")
@@ -455,9 +458,7 @@ fn validate_source_descriptor(
     )
 }
 
-fn validate_descriptor(
-    descriptor: &Fragment,
-) -> Result<(), SuccinctArchiveUnionValidationError> {
+fn validate_descriptor(descriptor: &Fragment) -> Result<(), SuccinctArchiveUnionValidationError> {
     validate_descriptor_parts(
         DescriptorRole::Target,
         descriptor,
@@ -599,7 +600,10 @@ mod tests {
         // collection, because its source is.
         assert_ne!(
             identity_for_tests(&target),
-            identity_for_tests(&descriptor(identity_for_tests(&raw_root("second")), reach::private()))
+            identity_for_tests(&descriptor(
+                identity_for_tests(&raw_root("second")),
+                reach::private()
+            ))
         );
 
         assert_eq!(
@@ -624,7 +628,8 @@ mod tests {
     #[test]
     fn canonical_empty_is_the_derived_bottom_and_merge_identity() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor =
+            descriptor(identity_for_tests(&raw_root("first")), reach::private());
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let derived_empty = derive_element(&source_empty).unwrap();
         let canonical_empty = empty();
@@ -665,7 +670,8 @@ mod tests {
     #[test]
     fn derive_and_merge_commute_to_identical_canonical_bytes() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor =
+            descriptor(identity_for_tests(&raw_root("first")), reach::private());
         let shared = row(3, 10, 40);
         let left = archive([row(2, 10, 60), shared]);
         let right = archive([row(1, 10, 20), shared]);
@@ -715,7 +721,8 @@ mod tests {
     #[test]
     fn validators_reject_valid_but_wrong_canonical_outputs() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor =
+            descriptor(identity_for_tests(&raw_root("first")), reach::private());
         let input = archive([row(1, 9, 3)]);
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
@@ -757,7 +764,8 @@ mod tests {
     #[test]
     fn malformed_target_is_rejected_before_equation_admission() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor =
+            descriptor(identity_for_tests(&raw_root("first")), reach::private());
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
         let claim = CollectionDerive::new(

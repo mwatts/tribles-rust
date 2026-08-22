@@ -515,7 +515,8 @@ mod tests {
             "9D413F35934206B916104EE38F03E40E0D1F3AEE2332E00F61FB23B12B422F15"
         );
 
-        let root = crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
+        let root =
+            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
         let root_handle = identity_for_tests(&root);
         assert_eq!(
             hex::encode_upper(root_handle.raw),
@@ -577,7 +578,8 @@ mod tests {
         assert_eq!(reach::declared(private.facts()), None);
         assert!(!reach::travels(private.facts()));
 
-        let public = crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
+        let public =
+            crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
         assert_eq!(reach::declared(public.facts()), Some(reach::PUBLIC));
         assert!(reach::travels(public.facts()));
     }
@@ -607,9 +609,8 @@ mod tests {
     /// permissive row.
     #[test]
     fn a_descriptor_declaring_two_reaches_declares_none() {
-        let e = crate::id::ExclusiveId::force(crate::id::id_hex!(
-            "55555555555555555555555555555555"
-        ));
+        let e =
+            crate::id::ExclusiveId::force(crate::id::id_hex!("55555555555555555555555555555555"));
         let mut facts = TribleSet::new();
         facts += crate::prelude::entity! { &e @
             metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
@@ -644,8 +645,10 @@ mod tests {
         let private_root_handle = identity_for_tests(&private_root);
 
         // A public derivation of a private source.
-        let public_index =
-            crate::collection::succinctarchive_union::descriptor(private_root_handle, reach::public());
+        let public_index = crate::collection::succinctarchive_union::descriptor(
+            private_root_handle,
+            reach::public(),
+        );
         assert!(!reach::travels(private_root.facts()));
         assert!(reach::travels(public_index.facts()));
 

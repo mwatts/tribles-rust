@@ -4,8 +4,8 @@
 
 mod common;
 
-use triblespace_core::collection::reach;
 use std::time::Duration;
+use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::Blob;
@@ -13,11 +13,9 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
-    Collection, CollectionData, CollectionDerive,
-    CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore, VerifyingKey,
-    simplearchive_union,
+    Collection, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
+    CollectionRecord, CollectionStore, VerifyingKey, simplearchive_union,
 };
-use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::{Inline, TryToInline};
@@ -25,6 +23,7 @@ use triblespace_core::repo::WantRequest;
 use triblespace_core::repo::capability::{self, PERM_READ, scope_branch};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, WantStore};
+use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 use triblespace_net::peer::Peer;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
@@ -162,7 +161,8 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
         // Let both host tasks publish their capabilities before the direct op.
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
         let (client, fetched) =
-            fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor)).await;
+            fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor))
+                .await;
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0], commit);
@@ -226,11 +226,8 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
         ]);
 
         // Deliberately NOT `named_root`, which declares `reach::public()`.
-        let descriptor = simplearchive_union::descriptor(
-            &collection_name("c4"),
-            test_team(),
-            reach::private(),
-        );
+        let descriptor =
+            simplearchive_union::descriptor(&collection_name("c4"), test_team(), reach::private());
         let data: Blob<SimpleArchive> = TribleSet::new().to_blob();
         server_store
             .put::<SimpleArchive, _>(descriptor.clone().into_facts().to_blob())
@@ -243,8 +240,8 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
             server_key.clone(),
             reach::private(),
         )
-            .commit(Fragment::empty())
-            .unwrap();
+        .commit(Fragment::empty())
+        .unwrap();
 
         let net = SimNet::new(0xC011EC8, SimConfig::default());
         let _server = bring_up(
@@ -266,7 +263,8 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
 
         let (_client, fetched) =
-            fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor)).await;
+            fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor))
+                .await;
         assert!(fetched.is_empty());
     });
 }
@@ -423,8 +421,10 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
         let other = named_root("c22");
         let merge_request = WantRequest::merge(collection_of(&merged), data(1), data(2));
         let merge_first = CollectionMerge::new(collection_of(&merged), data(1), data(2), data(3));
-        let merge_conflict = CollectionMerge::new(collection_of(&merged), data(1), data(2), data(4));
-        let merge_unrelated = CollectionMerge::new(collection_of(&merged), data(1), data(9), data(5));
+        let merge_conflict =
+            CollectionMerge::new(collection_of(&merged), data(1), data(2), data(4));
+        let merge_unrelated =
+            CollectionMerge::new(collection_of(&merged), data(1), data(9), data(5));
         let merge_wrong_collection =
             CollectionMerge::new(collection_of(&other), data(1), data(2), data(6));
 
@@ -448,7 +448,6 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
         ] {
             server_store.insert(record).unwrap();
         }
-
 
         // A black-hole DHT makes the discovery choice observable: configured
         // operation probes still dial their named peers directly, while an

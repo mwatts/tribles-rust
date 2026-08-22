@@ -31,9 +31,9 @@ use super::discovery::{
 };
 use super::{
     collection_physical_cover, resolve_collection_semantics, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDerive, CollectionHandle,
-    CollectionMerge, CollectionRecord, CollectionSemantics, CollectionStore,
-    CollectionValidationRequest, DiscoveredCollectionRecords,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
+    CollectionRecord, CollectionSemantics, CollectionStore, CollectionValidationRequest,
+    DiscoveredCollectionRecords,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -550,8 +550,7 @@ where
             (&self.source, self.source_collection),
             (&self.target, self.target_collection),
         ] {
-            let blob =
-                crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone());
+            let blob = crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone());
             let actual = store
                 .put::<SimpleArchive, _>(blob)
                 .map_err(|error| ExactDerivedCollectionError::storage("store descriptor", error))?;
@@ -688,19 +687,19 @@ where
         let lineage = BTreeMap::from([(self.target_collection, self.source_collection)]);
         let resolution =
             resolve_collection_semantics(&discovered, &lineage, &authorized, |request| {
-            let claim = request.claim_id();
-            Ok::<CollectionClaimValidation<String>, std::convert::Infallible>(
-                if matches!(request, CollectionValidationRequest::Commit { .. }) {
-                    CollectionClaimValidation::Accepted
-                } else if accepted.contains(&claim) {
-                    CollectionClaimValidation::Accepted
-                } else if let Some(reason) = rejected.get(&claim) {
-                    CollectionClaimValidation::Rejected(reason.clone())
-                } else {
-                    CollectionClaimValidation::Pending
-                },
-            )
-        });
+                let claim = request.claim_id();
+                Ok::<CollectionClaimValidation<String>, std::convert::Infallible>(
+                    if matches!(request, CollectionValidationRequest::Commit { .. }) {
+                        CollectionClaimValidation::Accepted
+                    } else if accepted.contains(&claim) {
+                        CollectionClaimValidation::Accepted
+                    } else if let Some(reason) = rejected.get(&claim) {
+                        CollectionClaimValidation::Rejected(reason.clone())
+                    } else {
+                        CollectionClaimValidation::Pending
+                    },
+                )
+            });
         let resolution = match resolution {
             Ok(resolution) => resolution,
             Err(super::CollectionResolutionError::Validation { source, .. }) => match source {},
@@ -848,9 +847,7 @@ where
             discovered
                 .derives()
                 .iter()
-                .filter(|claim| {
-                    claim.target() == self.target_collection
-                })
+                .filter(|claim| claim.target() == self.target_collection)
                 .copied()
                 .map(Candidate::Derive),
         );

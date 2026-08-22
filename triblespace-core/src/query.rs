@@ -21,9 +21,6 @@ pub mod constantconstraint;
 pub mod equalityconstraint;
 /// [`latest`](frontier::latest) — the maximal states of an observation DAG.
 pub mod frontier;
-/// [`resolve`](register::resolve) — registers: states, an order, and the
-/// reader's choice of which are current.
-pub mod register;
 /// Shared finite continuation for immutable, ordered single-variable sources.
 #[doc(hidden)]
 /// [`KeysConstraint`](hashmapconstraint::KeysConstraint) — constrains a variable to HashMap keys.
@@ -40,6 +37,9 @@ pub mod patchconstraint;
 #[doc(hidden)]
 /// [`InlineRange`](rangeconstraint::InlineRange) — restricts a variable to a byte-lexicographic range.
 pub mod rangeconstraint;
+/// [`resolve`](register::resolve) — registers: states, an order, and the
+/// reader's choice of which are current.
+pub mod register;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
 pub mod sortedsliceconstraint;
 /// [`UnionConstraint`](unionconstraint::UnionConstraint) — logical OR.

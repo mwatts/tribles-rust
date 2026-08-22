@@ -16,8 +16,8 @@ use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::reach;
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::simplearchive_union::{self, PreparedCollectionCommit};
 use triblespace_core::collection::CollectionCommit;
 use triblespace_core::id::Id;
@@ -511,9 +511,10 @@ mod tests {
             .iter()
             .all(|(_, target)| target.metadata() == expected_metadata));
         drop(reader);
-        let materialized = Collection::new(&mut pile, &name, team, signer.clone(), reach::private())
-            .materialize()
-            .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
+        let materialized =
+            Collection::new(&mut pile, &name, team, signer.clone(), reach::private())
+                .materialize()
+                .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
         assert_eq!(materialized, expected_union);
 
         pile.flush()?;
@@ -601,9 +602,10 @@ mod tests {
         assert_eq!(data_target.data().raw, data.get_handle().raw);
         assert_eq!(data_target.metadata(), empty.get_handle());
 
-        let materialized = Collection::new(&mut pile, &collection_name, team, signer, reach::private())
-            .materialize()
-            .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
+        let materialized =
+            Collection::new(&mut pile, &collection_name, team, signer, reach::private())
+                .materialize()
+                .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
         assert_eq!(materialized, fact(9));
         pile.close()?;
         Ok(())

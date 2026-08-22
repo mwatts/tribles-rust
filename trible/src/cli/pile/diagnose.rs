@@ -602,11 +602,11 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
             .filter_map(|(field, value)| (value == *needle).then_some(field))
             .collect(),
             WantRequest::Derive { target, input } => {
-                [("target", target.raw), ("input", input.raw)]
+                { [("target", target.raw), ("input", input.raw)] }
+                    .into_iter()
+                    .filter_map(|(field, value)| (value == *needle).then_some(field))
+                    .collect()
             }
-            .into_iter()
-            .filter_map(|(field, value)| (value == *needle).then_some(field))
-            .collect(),
         }
     }
 

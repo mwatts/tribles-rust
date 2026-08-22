@@ -1,5 +1,5 @@
-use crate::collection::reach;
 use super::*;
+use crate::collection::reach;
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,10 +9,10 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{IntoBlob, TryFromBlob};
+use crate::collection::descriptor::{self, identity_for_tests};
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
-use crate::collection::descriptor::{self, identity_for_tests};
 use crate::collection::records::CollectionName;
 use crate::collection::simplearchive_union;
 use crate::inline::encodings::hash::Handle;
@@ -279,9 +279,7 @@ fn derived_inputs(store: &mut MemoryRepo) -> Vec<CollectionData> {
         .unwrap()
         .map(Result::unwrap)
         .filter_map(|record| match record {
-            CollectionRecord::Derive(claim)
-                if claim.target() == kernel().target_collection() =>
-            {
+            CollectionRecord::Derive(claim) if claim.target() == kernel().target_collection() => {
                 Some(claim.mapping().0)
             }
             _ => None,

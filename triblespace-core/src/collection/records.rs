@@ -304,7 +304,6 @@ impl fmt::Display for CommitVerificationError {
 
 impl Error for CommitVerificationError {}
 
-
 /// A collection name that is legal as part of an identity.
 ///
 /// Names are compared byte for byte, because that is what hashing a
@@ -403,7 +402,6 @@ impl fmt::Display for CollectionName {
         f.write_str(&self.0)
     }
 }
-
 
 /// Signed exogenous membership assertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -672,11 +670,7 @@ impl CollectionDerive {
     /// collection, and that descriptor already says which collection is the
     /// source and by what recipe. A derive therefore says *which instance* of
     /// a mapping was computed, never *which mapping*.
-    pub fn new(
-        target: CollectionHandle,
-        input: CollectionData,
-        output: CollectionData,
-    ) -> Self {
+    pub fn new(target: CollectionHandle, input: CollectionData, output: CollectionData) -> Self {
         let bytes = derive_bytes(target, input, output);
         let id = collection_record_id(KIND_COLLECTION_DERIVE, &bytes);
         Self {
@@ -792,7 +786,6 @@ pub const COLLECTION_RECORD_KIND_COMMIT_V1: u8 = 1;
 pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
 /// Dense generic-store tag for the version-1 [`CollectionRecord::Derive`] layout.
 pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
-
 
 fn commit_bytes(
     collection: CollectionHandle,
@@ -938,8 +931,8 @@ fn one_inline<S: InlineEncoding>(
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::reach;
     use super::*;
+    use crate::collection::reach;
 
     use hex_literal::hex;
 
@@ -975,10 +968,14 @@ mod tests {
         let other_name = CollectionName::new("second").unwrap();
 
         let a = descriptor::naming(&name, team, id(2), id(3), reach::private()).into_facts();
-        let renamed = descriptor::naming(&other_name, team, id(2), id(3), reach::private()).into_facts();
-        let reteamed = descriptor::naming(&name, other_team, id(2), id(3), reach::private()).into_facts();
-        let other_representation = descriptor::naming(&name, team, id(4), id(3), reach::private()).into_facts();
-        let other_recipe = descriptor::naming(&name, team, id(2), id(4), reach::private()).into_facts();
+        let renamed =
+            descriptor::naming(&other_name, team, id(2), id(3), reach::private()).into_facts();
+        let reteamed =
+            descriptor::naming(&name, other_team, id(2), id(3), reach::private()).into_facts();
+        let other_representation =
+            descriptor::naming(&name, team, id(4), id(3), reach::private()).into_facts();
+        let other_recipe =
+            descriptor::naming(&name, team, id(2), id(4), reach::private()).into_facts();
 
         let handle = |facts: &TribleSet| {
             <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
@@ -1300,7 +1297,10 @@ mod recipe_description_tests {
             crate::collection::observed_union::OBSERVED_UNION_RECIPE_V1,
             "observed-union-v1",
         );
-        check::<StatedOrderV1>(crate::query::register::STATED_ORDER_RECIPE_V1, "stated-order-v1");
+        check::<StatedOrderV1>(
+            crate::query::register::STATED_ORDER_RECIPE_V1,
+            "stated-order-v1",
+        );
         check::<Rank9LiftedUnionV1_32Le>(
             crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_32_LE,
             "rank9-32-le",

@@ -17,9 +17,9 @@ use anybytes::Bytes;
 use std::sync::mpsc;
 use triblespace_core::collection::CollectionHandle;
 
-use triblespace_core::collection::CollectionCommit;
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
+use triblespace_core::collection::CollectionCommit;
 
 /// A 32-byte public key identifying a publisher.
 pub type PublisherKey = [u8; 32];

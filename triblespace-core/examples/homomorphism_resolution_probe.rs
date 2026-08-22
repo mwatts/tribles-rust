@@ -1,8 +1,8 @@
-use triblespace_core::collection::reach;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::IntoBlob;
@@ -162,9 +162,7 @@ fn build(
     };
     let derives: Vec<_> = mapped_inputs
         .iter()
-        .map(|input| {
-            CollectionDerive::new(target_collection, *input, mapped(*input))
-        })
+        .map(|input| CollectionDerive::new(target_collection, *input, mapped(*input)))
         .collect();
 
     let mut store = MemoryRepo::default();
@@ -232,7 +230,13 @@ fn main() {
     let min_millis: u64 = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(500);
     let (records, authorized, target, members, maps) = build(leaves, shape, mapping);
 
-    let warm = resolve_collection_semantics(&records, &std::collections::BTreeMap::new(), &authorized, accepted).unwrap();
+    let warm = resolve_collection_semantics(
+        &records,
+        &std::collections::BTreeMap::new(),
+        &authorized,
+        accepted,
+    )
+    .unwrap();
     let target_frontier = warm.semantics().frontier(target).map_or(0, BTreeSet::len);
     black_box(warm);
 
@@ -240,7 +244,13 @@ fn main() {
     let started = Instant::now();
     let mut iterations = 0_u64;
     while iterations == 0 || started.elapsed() < deadline {
-        let result = resolve_collection_semantics(&records, &std::collections::BTreeMap::new(), &authorized, accepted).unwrap();
+        let result = resolve_collection_semantics(
+            &records,
+            &std::collections::BTreeMap::new(),
+            &authorized,
+            accepted,
+        )
+        .unwrap();
         black_box(result);
         iterations += 1;
     }

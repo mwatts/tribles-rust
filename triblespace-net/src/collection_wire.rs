@@ -24,9 +24,9 @@ use triblespace_core::collection::{
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
     CommitVerificationError, RecordDecodeError,
 };
-use triblespace_core::trible::TribleSet;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest, WantRequestDecodeError};
+use triblespace_core::trible::TribleSet;
 
 use crate::protocol::{
     COLLECTION_EVIDENCE_REJECTED, COLLECTION_OPERATION_RECEIPTS_REJECTED, OP_COLLECTION_EVIDENCE,
@@ -326,7 +326,9 @@ fn decode_operation_receipt(
             }
             let mut exact = [0u8; COLLECTION_DERIVE_BYTES_LEN];
             exact.copy_from_slice(&bytes[..COLLECTION_DERIVE_BYTES_LEN]);
-            Ok(CollectionRecord::Derive(CollectionDerive::from_bytes(exact)))
+            Ok(CollectionRecord::Derive(CollectionDerive::from_bytes(
+                exact,
+            )))
         }
         WantRequest::Blob { .. } => Err(CollectionOperationWireError::BlobRequest),
     }
@@ -518,10 +520,7 @@ pub async fn op_collection_evidence<C: Conn>(
             "collection evidence response contains trailing bytes"
         ));
     }
-    if !evidence
-        .windows(2)
-        .all(|pair| pair[0].id() < pair[1].id())
-    {
+    if !evidence.windows(2).all(|pair| pair[0].id() < pair[1].id()) {
         return Err(anyhow::anyhow!(
             "collection evidence response is not in canonical commit-id order"
         ));
@@ -531,18 +530,18 @@ pub async fn op_collection_evidence<C: Conn>(
 
 #[cfg(test)]
 mod tests {
-    use triblespace_core::collection::reach;
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_core::collection::reach;
     use triblespace_core::collection::records::CollectionName;
     use triblespace_core::collection::{
         CollectionData, CollectionHandle, empty_metadata_handle, simplearchive_union,
     };
-    use triblespace_core::trible::Fragment;
     use triblespace_core::inline::Inline;
     use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::trible::Fragment;
     use triblespace_core::trible::TribleSet;
 
     use super::*;
@@ -660,7 +659,8 @@ mod tests {
         let other_descriptor = root("c44");
         let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
         let first = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(3));
-        let conflicting = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(4));
+        let conflicting =
+            CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(4));
         let unrelated = CollectionMerge::new(collection_of(&descriptor), data(1), data(9), data(5));
         let wrong_collection =
             CollectionMerge::new(collection_of(&other_descriptor), data(1), data(2), data(6));

@@ -595,13 +595,7 @@ where
 {
     /// Whether `(challenger_key, challenger)` is strictly above
     /// `(key, state)` at this order's end.
-    fn beats(
-        &self,
-        challenger_key: [u8; 32],
-        challenger: Id,
-        key: [u8; 32],
-        state: Id,
-    ) -> bool {
+    fn beats(&self, challenger_key: [u8; 32], challenger: Id, key: [u8; 32], state: Id) -> bool {
         // Equal values are incomparable unless the reader asked for a total
         // order, and a state never dominates itself under either.
         if challenger_key == key {
@@ -811,7 +805,10 @@ mod tests {
         );
         // A fork is exactly where last-write-wins has no answer, and
         // reporting one would be inventing the order.
-        assert_eq!(sole(&observation(&facts), [*base, *left, *right]).sole(), None);
+        assert_eq!(
+            sole(&observation(&facts), [*base, *left, *right]).sole(),
+            None
+        );
     }
 
     #[test]
@@ -829,7 +826,10 @@ mod tests {
             resolve(&observation(&facts).first(), candidates),
             [*base].into_iter().collect::<BTreeSet<_>>()
         );
-        assert_eq!(sole(&observation(&facts).first(), candidates), Resolution::Sole(*base));
+        assert_eq!(
+            sole(&observation(&facts).first(), candidates),
+            Resolution::Sole(*base)
+        );
     }
 
     /// The edge is the identity claim, so an observer a reader thinks
@@ -996,11 +996,11 @@ mod tests {
     /// attributes a register was over.
     #[test]
     fn registers_share_a_law_and_differ_by_their_parameters() {
+        use crate::collection::descriptor;
         use crate::collection::records::{
             collection_name, collection_recipe, collection_representation, collection_team,
             CollectionName, KIND_COLLECTION_DESCRIPTOR,
         };
-        use crate::collection::descriptor;
         // The law is one minted name, identical for every stated-order register.
         assert_eq!(
             StatedOrder::<TribleSet, NsTAIInterval>::recipe(),
@@ -1386,6 +1386,9 @@ mod tests {
         )
         .collect();
         assert_eq!(queried, resolve(&order, [*base, *left, *right]));
-        assert_eq!(queried, [*left, *right].into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(
+            queried,
+            [*left, *right].into_iter().collect::<BTreeSet<_>>()
+        );
     }
 }

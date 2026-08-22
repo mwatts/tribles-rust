@@ -139,7 +139,9 @@ fn parse_collection_handle(handle: &str) -> Result<CollectionHandle> {
         owned.as_str()
     };
     let hash: Inline<Hash<Blake3>> = normalized.try_to_inline().map_err(|e| {
-        anyhow!("parse collection handle {handle:?}: {e:?} (expected `blake3:<64 hex>` or bare hex)")
+        anyhow!(
+            "parse collection handle {handle:?}: {e:?} (expected `blake3:<64 hex>` or bare hex)"
+        )
     })?;
     Ok(hash.into())
 }
@@ -203,9 +205,14 @@ fn named_id(id: Id, name: Option<&'static str>) -> String {
 /// The short column form: the schema's name if this binary implements it, and
 /// the bare id if it does not. An unknown id is not an error — a descriptor
 /// may name a recipe some other reader owns.
-fn short_named_id(id: Result<Id, impl std::fmt::Debug>, name: fn(Id) -> Option<&'static str>) -> String {
+fn short_named_id(
+    id: Result<Id, impl std::fmt::Debug>,
+    name: fn(Id) -> Option<&'static str>,
+) -> String {
     match id {
-        Ok(id) => name(id).map(str::to_owned).unwrap_or_else(|| format!("{id:X}")),
+        Ok(id) => name(id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{id:X}")),
         Err(_) => "<unreadable>".to_owned(),
     }
 }
@@ -340,7 +347,9 @@ fn anchor(fields: &Fields) -> Anchor {
     let facts = match fields {
         Fields::Decoded(facts) => facts,
         Fields::Missing => return Anchor::Unreadable("descriptor blob not in pile".to_owned()),
-        Fields::Undecodable(e) => return Anchor::Unreadable(format!("descriptor undecodable: {e}")),
+        Fields::Undecodable(e) => {
+            return Anchor::Unreadable(format!("descriptor undecodable: {e}"))
+        }
     };
     if let Some(source) = descriptor::source(facts) {
         return Anchor::Derived(source);
@@ -452,7 +461,10 @@ fn print_table(headers: &[&str], aligns: &[Align], rows: &[Vec<String>], indent:
     if rows.is_empty() {
         return;
     }
-    let mut widths: Vec<usize> = headers.iter().map(|header| header.chars().count()).collect();
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect();
     for row in rows {
         for (column, cell) in row.iter().enumerate() {
             widths[column] = widths[column].max(cell.chars().count());
@@ -513,7 +525,9 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
                 row.refs.total().to_string(),
                 abbrev(&handle_hex(row.handle), long),
                 match row.fields.facts() {
-                    Some(facts) => short_named_id(descriptor::representation(facts), representation_name),
+                    Some(facts) => {
+                        short_named_id(descriptor::representation(facts), representation_name)
+                    }
                     None => "-".to_owned(),
                 },
                 match row.fields.facts() {
@@ -621,14 +635,11 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         }
 
         if named_only {
-            let hidden: Vec<String> = [
-                (derived.len(), "derived"),
-                (anchorless.len(), "unnamed"),
-            ]
-            .into_iter()
-            .filter(|(count, _)| *count > 0)
-            .map(|(count, what)| format!("{count} {what}"))
-            .collect();
+            let hidden: Vec<String> = [(derived.len(), "derived"), (anchorless.len(), "unnamed")]
+                .into_iter()
+                .filter(|(count, _)| *count > 0)
+                .map(|(count, what)| format!("{count} {what}"))
+                .collect();
             if !hidden.is_empty() {
                 println!();
                 println!("  ({} hidden by --named)", hidden.join(", "));
@@ -924,11 +935,11 @@ fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<Co
 }
 #[cfg(test)]
 mod tests {
-    use triblespace_core::collection::reach;
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
     use triblespace_core::blob::{IntoBlob, MemoryBlobStore};
+    use triblespace_core::collection::reach;
     use triblespace_core::collection::records::CollectionName;
     use triblespace_core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use triblespace_core::id::fucid;
@@ -944,8 +955,13 @@ mod tests {
         let name = CollectionName::new("inspected").unwrap();
         let team = SigningKey::from_bytes(&[7; 32]).verifying_key();
         let representation = <SimpleArchive as MetaDescribe>::id();
-        let fragment =
-            descriptor::naming(&name, team, representation, TRIBLE_SET_UNION_RECIPE_V1, reach::private());
+        let fragment = descriptor::naming(
+            &name,
+            team,
+            representation,
+            TRIBLE_SET_UNION_RECIPE_V1,
+            reach::private(),
+        );
         let entity_id = fragment.root().expect("the descriptor has one root");
 
         let mut store = MemoryBlobStore::new();
@@ -966,8 +982,14 @@ mod tests {
             .expect("decode descriptor");
         assert_eq!(descriptor::name(&decoded).unwrap().unwrap(), name);
         assert_eq!(descriptor::team(&decoded).unwrap().unwrap(), team);
-        assert_eq!(descriptor::representation(&decoded).unwrap(), representation);
-        assert_eq!(descriptor::recipe(&decoded).unwrap(), TRIBLE_SET_UNION_RECIPE_V1);
+        assert_eq!(
+            descriptor::representation(&decoded).unwrap(),
+            representation
+        );
+        assert_eq!(
+            descriptor::recipe(&decoded).unwrap(),
+            TRIBLE_SET_UNION_RECIPE_V1
+        );
         assert_eq!(descriptor::entity(&decoded).unwrap(), entity_id);
 
         // The trible dump `show` prints comes from the same bytes.
@@ -1019,11 +1041,7 @@ mod tests {
                 data(11),
                 data(12),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(
-                collection(3),
-                data(20),
-                data(21),
-            )),
+            CollectionRecord::Derive(CollectionDerive::new(collection(3), data(20), data(21))),
         ];
 
         assert_eq!(
@@ -1046,8 +1064,11 @@ mod tests {
             Some("SimpleArchive")
         );
         assert_eq!(recipe_name(*fucid()), None);
-        assert!(named_id(TRIBLE_SET_UNION_RECIPE_V1, recipe_name(TRIBLE_SET_UNION_RECIPE_V1))
-            .contains("6D64C5F4B9E9B73F57C5F8702AB7FE45"));
+        assert!(named_id(
+            TRIBLE_SET_UNION_RECIPE_V1,
+            recipe_name(TRIBLE_SET_UNION_RECIPE_V1)
+        )
+        .contains("6D64C5F4B9E9B73F57C5F8702AB7FE45"));
     }
 
     /// Build one descriptor's decoded fields the way `list` sees them.
