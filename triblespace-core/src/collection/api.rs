@@ -31,10 +31,11 @@ use super::simplearchive_union::{
     self, MaterializationError, PublicationError, SimpleArchiveUnionValidationError,
 };
 use super::{
-    collection_physical_cover, discover_collection_records_scoped, resolve_collection_semantics,
-    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDiscoveryError,
-    CollectionFunctionalConflict, CollectionHandle, CollectionResolutionError, CollectionStore,
-    CollectionValidationRequest, DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError,
+    collection_physical_cover, discover_collection_records_authorized,
+    discover_collection_records_scoped, resolve_collection_semantics, CollectionClaimValidation,
+    CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionFunctionalConflict,
+    CollectionHandle, CollectionResolutionError, CollectionStore, CollectionValidationRequest,
+    DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError,
 };
 
 /// A scoped `SimpleArchive`-union collection and its signing authority.
@@ -508,6 +509,53 @@ where
         Ok(commits)
     }
 
+    /// Discover the exact strictly verified commits this facade will accept
+    /// from *any* signer `is_member` admits.
+    ///
+    /// [`ticket`](Self::ticket) answers "what did I write?"; this answers
+    /// "what did anyone I trust write?". A collection replicated between
+    /// machines is written by several keys -- a derived index computed on one
+    /// node is signed by that node -- so an own-key ticket is structurally
+    /// blind to it. The result feeds
+    /// [`snapshot_authorized`](Self::snapshot_authorized) or, unchanged,
+    /// [`SimpleArchiveCollection::snapshot_exact`], which already admits an
+    /// arbitrary commit set.
+    ///
+    /// Trust is the caller's to state and is deliberately not inferred here;
+    /// see [`discover_collection_records_authorized`] for why the predicate is
+    /// a scope rather than the decision, and for what replaces it once the
+    /// authority DAG is enumerable from a team root.
+    ///
+    /// Reads no blobs and opens no reader, exactly like [`ticket`](Self::ticket).
+    pub fn ticket_authorized<F>(
+        &mut self,
+        is_member: F,
+    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<S::RecordsError>>
+    where
+        F: Fn(&crate::inline::Inline<crate::inline::encodings::ed25519::ED25519PublicKey>) -> bool,
+    {
+        let (_, commits) = self.discover_authorized_commits(is_member)?;
+        Ok(commits)
+    }
+
+    fn discover_authorized_commits<F>(
+        &mut self,
+        is_member: F,
+    ) -> Result<
+        (DiscoveredCollectionRecords, Vec<CollectionCommit>),
+        CollectionDiscoveryError<S::RecordsError>,
+    >
+    where
+        F: Fn(&crate::inline::Inline<crate::inline::encodings::ed25519::ED25519PublicKey>) -> bool,
+    {
+        let collection = self.collection();
+        let discovered =
+            discover_collection_records_authorized(&mut self.storage, collection, is_member)?;
+        let commits = discovered.commits().to_vec();
+
+        Ok((discovered, commits))
+    }
+
     fn discover_owned_commits(
         &mut self,
     ) -> Result<
@@ -580,6 +628,44 @@ where
     > {
         let (discovered, commits) = self
             .discover_owned_commits()
+            .map_err(CollectionMaterializationError::Discovery)?;
+        Self::snapshot_from_observation(&mut self.storage, &self.descriptor, discovered, commits)
+    }
+
+    /// Capture one coherent known-prefix snapshot across every admitted signer.
+    ///
+    /// The multi-author counterpart of [`snapshot`](Self::snapshot). Both
+    /// enumerate records exactly once, then open one blob-reader snapshot, and
+    /// both materialize facts solely from the selected commit set through the
+    /// same validator -- only the selection differs, so a foreign commit is
+    /// admitted by the path own commits already take rather than a parallel
+    /// one.
+    ///
+    /// This is what makes a collection replicated across machines readable as
+    /// one collection: a derived index computed on another node is signed by
+    /// that node's key, which [`snapshot`](Self::snapshot) is structurally
+    /// blind to.
+    ///
+    /// Carries the same known-prefix caveat as [`snapshot`](Self::snapshot):
+    /// a commit first observed after this discovery pass appears on a later
+    /// call, and this is not a global-latest transaction.
+    pub fn snapshot_authorized<F>(
+        &mut self,
+        is_member: F,
+    ) -> Result<
+        CollectionSnapshot<S::Reader>,
+        CollectionMaterializationError<
+            S::RecordsError,
+            S::ReaderError,
+            <S::Reader as BlobStoreMeta>::MetaError,
+            <S::Reader as BlobStoreGet>::GetError<Infallible>,
+        >,
+    >
+    where
+        F: Fn(&crate::inline::Inline<crate::inline::encodings::ed25519::ED25519PublicKey>) -> bool,
+    {
+        let (discovered, commits) = self
+            .discover_authorized_commits(is_member)
             .map_err(CollectionMaterializationError::Discovery)?;
         Self::snapshot_from_observation(&mut self.storage, &self.descriptor, discovered, commits)
     }
@@ -1412,6 +1498,120 @@ mod tests {
             reach::private(),
         );
         assert_eq!(collection.materialize().unwrap(), expected.into_facts());
+    }
+
+    /// The replicated-collection case: two machines, one collection, one key
+    /// each. This is the exact scenario an own-key read is structurally blind
+    /// to -- a derived index computed on another node is signed by that node.
+    #[test]
+    fn snapshot_authorized_admits_foreign_signers_that_snapshot_cannot_see() {
+        let name = test_name();
+        let local_key = SigningKey::from_bytes(&[7; 32]);
+        let remote_key = SigningKey::from_bytes(&[9; 32]);
+        let local_pub = local_key.verifying_key();
+        let remote_pub = remote_key.verifying_key();
+        // A third key that never becomes a member, so "admits foreign commits"
+        // is distinguished from "admits every commit".
+        let stranger_key = SigningKey::from_bytes(&[11; 32]);
+
+        // Same name, same team, same reach on every facade, so all three sign
+        // into ONE collection rather than three same-named ones.
+        let mut remote = Collection::new(
+            MemoryRepo::default(),
+            &name,
+            test_team(),
+            remote_key,
+            reach::private(),
+        );
+        let remote_commit = remote.commit(fragment(2, false)).unwrap();
+
+        let mut stranger = Collection::new(
+            remote.into_storage(),
+            &name,
+            test_team(),
+            stranger_key,
+            reach::private(),
+        );
+        let stranger_commit = stranger.commit(fragment(3, false)).unwrap();
+
+        let mut local = Collection::new(
+            stranger.into_storage(),
+            &name,
+            test_team(),
+            local_key,
+            reach::private(),
+        );
+        let local_commit = local.commit(fragment(1, false)).unwrap();
+
+        let member = |key: &VerifyingKey| {
+            let bytes = key.to_bytes();
+            move |candidate: &Inline<crate::inline::encodings::ed25519::ED25519PublicKey>| {
+                candidate.raw == bytes
+            }
+        };
+        let is_member =
+            |candidate: &Inline<crate::inline::encodings::ed25519::ED25519PublicKey>| {
+                member(&local_pub)(candidate) || member(&remote_pub)(candidate)
+            };
+
+        // All three commits are physically present and identical bytes are
+        // visible to every reader; only authority differs.
+        assert_eq!(
+            discover_collection_records(local.storage_mut())
+                .unwrap()
+                .commits()
+                .iter()
+                .map(CollectionCommit::id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([local_commit.id(), remote_commit.id(), stranger_commit.id()])
+        );
+
+        // Own-key read sees exactly one of the three.
+        assert_eq!(
+            local
+                .ticket()
+                .unwrap()
+                .iter()
+                .map(CollectionCommit::id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([local_commit.id()])
+        );
+
+        // Authorized read sees both members and excludes the stranger, so the
+        // predicate is doing the selecting rather than being ignored.
+        assert_eq!(
+            local
+                .ticket_authorized(is_member)
+                .unwrap()
+                .iter()
+                .map(CollectionCommit::id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([local_commit.id(), remote_commit.id()])
+        );
+
+        let own = local.snapshot().unwrap();
+        let authorized = local.snapshot_authorized(is_member).unwrap();
+
+        // Facts, not just commit ids: the foreign element actually materializes.
+        assert_eq!(own.facts(), fragment(1, false).facts());
+        let mut expected = fragment(1, false).facts().clone();
+        expected += fragment(2, false).facts().clone();
+        assert_eq!(authorized.facts(), &expected);
+        assert!(!authorized
+            .facts()
+            .iter()
+            .any(|trible| fragment(3, false).facts().contains(trible)));
+
+        // An empty membership admits nothing, and does so without erroring --
+        // the boundary between "no authorized commits" and "failure" stays
+        // where `snapshot` already puts it.
+        let none = local
+            .snapshot_authorized(
+                |_: &Inline<crate::inline::encodings::ed25519::ED25519PublicKey>| false,
+            )
+            .unwrap();
+        assert_eq!(none.facts(), &TribleSet::new());
+        assert!(none.commits().is_empty());
     }
 
     #[test]

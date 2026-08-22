@@ -473,6 +473,88 @@ where
     Ok(discovered)
 }
 
+/// Discover records for one exact collection across *every* authorized signer.
+///
+/// This is the multi-author counterpart of
+/// [`discover_collection_records_scoped`]. That one answers "what did *I*
+/// write?" by fixing the signer to the reader's own key; this one answers
+/// "what did anyone I trust write?" by asking `is_member` per commit. Both
+/// narrow to one exact collection, and both hand the result to the same
+/// key-agnostic validator, so foreign commits are admitted through exactly the
+/// path own commits already take rather than a parallel one.
+///
+/// `is_member` sees a commit's *claimed* public key, which -- like the
+/// descriptor and public-key fields [`discover_collection_records_scoped`]
+/// filters on -- is structurally available before any signature is verified.
+/// Narrowing first means a nonmember costs no Ed25519 verification, and
+/// claiming membership falsely buys nothing: strict verification afterwards
+/// binds that key to the signed bytes, so a forged claim fails there. The
+/// predicate is therefore a *scope*, never the trust decision itself.
+///
+/// The predicate is supplied by the caller rather than derived from the
+/// collection's own [`collection_team`](super::collection_team) root, because
+/// walking capability chains from a root requires enumerating the authority
+/// DAG downward and issued capabilities are currently sealed inside
+/// content-addressed blobs, reachable only from a leaf already in hand. When
+/// that enumeration exists, it becomes one predicate passed here; the read
+/// path does not change.
+///
+/// `MERGE` and `DERIVE` records are retained in full, for the same reason
+/// [`discover_collection_records_scoped`] retains them: they are unsigned
+/// equations whose relevance can span collection boundaries.
+pub fn discover_collection_records_authorized<S, F>(
+    store: &mut S,
+    collection: CollectionHandle,
+    is_member: F,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+    F: Fn(&Inline<ED25519PublicKey>) -> bool,
+{
+    let mut discovered = DiscoveredCollectionRecords::default();
+    let mut matching_commits = Vec::new();
+    let records = store.records().map_err(CollectionDiscoveryError::Records)?;
+
+    for record in records {
+        let record = record.map_err(CollectionDiscoveryError::Records)?;
+        match record {
+            CollectionRecord::Commit(record)
+                if record.collection() == collection && is_member(&record.public_key()) =>
+            {
+                matching_commits.push(record)
+            }
+            CollectionRecord::Commit(_) => {}
+            CollectionRecord::Merge(record) => discovered.merges.push(record),
+            CollectionRecord::Derive(record) => discovered.derives.push(record),
+        }
+    }
+
+    // Each commit carries its own signer, so verification derives the key from
+    // the record rather than from a fixed scope key.
+    let mut verifications =
+        verify_matching_commits(&matching_commits, &CollectionCommit::verify_strict).into_iter();
+    matching_commits.retain(|record| {
+        match verifications
+            .next()
+            .expect("one verification result per matching commit")
+        {
+            Ok(()) => true,
+            Err(error) => {
+                discovered.diagnostics.push(CollectionRecordDiagnostic {
+                    id: record.id(),
+                    error: CollectionRecordDiagnosticError::InvalidCommit(error),
+                });
+                false
+            }
+        }
+    });
+    debug_assert!(verifications.next().is_none());
+    discovered.commits = matching_commits;
+
+    discovered.canonicalize();
+    Ok(discovered)
+}
+
 #[cfg(feature = "parallel")]
 fn verify_matching_commits<V>(
     commits: &[CollectionCommit],
