@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep telemetry session collections explicitly private now that collection
+  reach is a required, identity-bearing fragment.
+
 - Make frontier row order and depth plans implicit until the data proves they
   are not. Consecutive row selections now remain allocation-free views; a
   unanimous frontier records only its preferred variable; and a fragmented

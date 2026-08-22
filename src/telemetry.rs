@@ -394,7 +394,8 @@ impl Telemetry {
         // letting the facade assume it.
         let signing_key = SigningKey::generate(&mut OsRng);
         let team = signing_key.verifying_key();
-        let mut collection = Collection::new(pile, &collection_name, team, signing_key);
+        let mut collection =
+            Collection::new(pile, &collection_name, team, signing_key, reach::private());
 
         // Commit session start entity.
         let session_entity = ExclusiveId::force_ref(&session_id);
