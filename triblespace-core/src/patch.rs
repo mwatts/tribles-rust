@@ -477,8 +477,11 @@ mod parallel_union {
     }
     impl<T> Copy for ScatterPtr<T> {}
 
-    unsafe impl<T> Send for ScatterPtr<T> {}
-    unsafe impl<T> Sync for ScatterPtr<T> {}
+    // SAFETY: tasks only transfer owned `T` values into pairwise-disjoint
+    // output slots. The wrapper never exposes a reference to a stored `T`, so
+    // moving those values between threads requires `T: Send`, not `T: Sync`.
+    unsafe impl<T: Send> Send for ScatterPtr<T> {}
+    unsafe impl<T: Send> Sync for ScatterPtr<T> {}
 
     impl<T> ScatterPtr<T> {
         /// SAFETY: `i` must be in-bounds of the underlying buffer,
@@ -981,6 +984,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     ///   exists, which is the caller's responsibility to arrange — typically
     ///   by retaining its `Arc<dyn ArchiveOwner>` in the enclosing PATCH's
     ///   root owner set.
+    /// - The pointed-to bytes must remain fully initialized and immutable for
+    ///   that lifetime, including through concurrent aliases or interior
+    ///   mutability. LocalLeaf routing and fingerprints read them through
+    ///   shared references.
     /// - The pointer must be 16-byte aligned; this is debug-asserted.
     pub(crate) unsafe fn new_local_leaf(key: u8, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
         unsafe {
@@ -2674,6 +2681,9 @@ where
 
     /// Removes a key from the PATCH.
     ///
+    /// `key` is expressed in this PATCH's tree ordering. A key in the shared
+    /// key ordering must first be converted with [`KeySchema::tree_ordered`].
+    ///
     /// If the key is not present, this is a no-op.
     /// If a removed value or final archive owner's destructor panics, the
     /// removal is already fully committed when the panic is raised.
@@ -3117,6 +3127,10 @@ where
     /// Unions this PATCH with another PATCH.
     ///
     /// The other PATCH is consumed, and this PATCH is updated in place.
+    /// If both PATCHes contain the same key, one associated value survives,
+    /// but this operation does not specify which operand supplies it. Values
+    /// do not participate in PATCH key-set identity, and the merge may swap
+    /// operands internally.
     pub fn union(&mut self, mut other: Self)
     where
         O: Send + Sync,

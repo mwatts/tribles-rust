@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Tighten PATCH's archive and parallel-scatter safety contracts. Parallel
+  scatter pointers are `Send + Sync` only when their written value is `Send`;
+  archive-backed leaf constructors now state that retained bytes must remain
+  initialized and immutable; and the public API documents tree-ordered removal
+  keys and the intentionally unspecified value survivor for duplicate-key
+  union.
+
 - Document frontier width as a multiplicative proposal-memory budget:
   proposal residency grows as `Theta(width * fanout)` and is observable through
   `FrontierStats::peak_region()`, while `Query::with_frontier_width` bounds the
