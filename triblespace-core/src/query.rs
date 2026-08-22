@@ -1106,12 +1106,18 @@ impl Default for LevelValues {
 /// [`FRONTIER_RAMP_BASE`] until it reaches this ceiling. A conservative tail
 /// merge may consume the remainder early, but never exceeds the ceiling.
 ///
-/// The cost is frontier memory: one index row plus one estimate row per
-/// live row per depth, i.e. `O(width · variables · depth)` — the price of
-/// trading depth-first's `O(depth)` frontier for a wide one. Worst-case
-/// optimality is untouched: expanding N prefixes together is the same total
-/// work as expanding them one at a time, and the AGM bound is a statement
-/// about output size, not traversal order.
+/// The frontier matrices cost `O(width · variables · depth)`, but a level's
+/// proposal buffer can be larger: proposing `fanout` candidates for every row
+/// in one group materialises `O(width · fanout)` entries before that level is
+/// consumed. Each entry currently has 32 bytes of value, a four-byte parent
+/// tag, and one packed liveness bit — nominally 36.125 bytes, before allocator
+/// capacity slack. [`FrontierStats::peak_region`] observes this high-water mark
+/// in entries; [`Query::with_frontier_width`] is the direct way to reduce it
+/// when a query joins against a high-fanout source.
+///
+/// Worst-case optimality is untouched: expanding N prefixes together is the
+/// same total work as expanding them one at a time, and the AGM bound is a
+/// statement about output size, not traversal order.
 ///
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;

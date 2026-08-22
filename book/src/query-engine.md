@@ -83,8 +83,23 @@ per-binding setup is paid once per run instead of once per candidate.
 Nothing about the batch changes what the query means. Worst-case optimality is
 untouched — expanding *n* prefixes together is the same total work as expanding
 them one at a time, and the AGM bound is a statement about output size, not
-traversal order. The cost is frontier memory, `O(width × variables × depth)`:
-depth-first's `O(depth)` frontier traded for a wide one.
+traversal order.
+
+Batching has two different memory terms. The frontier matrices cost
+`O(width × variables × depth)`: depth-first's `O(depth)` frontier traded for a
+wide one. A proposal region can dominate that term. A source that proposes
+`fanout` candidates for each parent materialises `Θ(width × fanout)` entries
+before the level is consumed. Each entry currently carries a 32-byte value, a
+four-byte parent tag, and one packed liveness bit — nominally 36.125 bytes,
+excluding `Vec` capacity slack. Thus a width of 16,384 and a fanout of 10,000
+is nominally about 5.92 GB (5.51 GiB) at one level, even though no frontier ever
+contains more than 16,384 rows.
+
+[`FrontierStats::peak_region`](triblespace::core::query::FrontierStats::peak_region)
+reports that proposal high-water mark in entries. Choose a lower width with
+[`Query::with_frontier_width`](triblespace::core::query::Query::with_frontier_width)
+for queries that join against high-fanout sources; this bounds the number of
+parents expanded together, but it cannot bound one parent's own fanout.
 
 ## Statelessness is the load-bearing choice
 

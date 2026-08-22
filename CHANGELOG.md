@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Document frontier width as a multiplicative proposal-memory budget:
+  proposal residency grows as `Theta(width * fanout)` and is observable through
+  `FrontierStats::peak_region()`, while `Query::with_frontier_width` bounds the
+  number of parents expanded together.
+
 - Make `tribleset-bench` result announcements interruption-safe. Session start
   and each announced result batch are now committed through the native results
   collection and explicitly flushed before stdout; failed publication retains
