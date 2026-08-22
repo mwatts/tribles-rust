@@ -10,9 +10,9 @@ The project balances a few key goals:
 * **Performance** – we continually look for opportunities to improve.
 
 ## Repository Guidelines
-* Run `cargo fmt` on any Rust files you modify.
-* Run `cargo test` and ensure it passes before committing. If tests fail or cannot run, note that in your PR.
-* Before committing, execute `./scripts/preflight.sh` from the repository root. This script runs formatting checks and tests.
+* Run `cargo fmt --all` from the workspace root on any Rust files you modify.
+* Run `cargo test --workspace --features triblespace-net/sim` from the workspace root and ensure it passes before committing. If tests fail or cannot run, note that in your PR. `trible` is a workspace member, so a bare `cargo test` in this directory covers this crate alone.
+* Before committing, execute `./scripts/preflight.sh` from the workspace root (`triblespace-rs/`). That script checks the whole workspace and builds the book; `trible/scripts/preflight.sh` is the narrow crate-local variant.
 * Avoid committing files in `target/` or other build artifacts listed in `.gitignore`.
 * Use clear commit messages describing the change.
 * Add an entry to `CHANGELOG.md` summarizing your task using the Let's Changelog format.

@@ -1704,6 +1704,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Workspace preflight now runs `cargo fmt --all -- --check`; the repository
+  root is also the `triblespace` facade package, so the bare form silently
+  omitted other workspace members. Contributor instructions now state the
+  matching workspace-wide formatting and test commands.
+
 - **Unknown pile record markers can no longer arm destructive repair under
   version skew.** A complete unknown marker at a record boundary now returns
   `ReadError::UnsupportedRecord` with its offset and marker, while malformed or

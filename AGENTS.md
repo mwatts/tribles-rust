@@ -12,7 +12,7 @@ The project balances a few key goals:
 
 ## Repository Guidelines
 
-* Run `cargo fmt` on any Rust files you modify.
+* Run `cargo fmt --all` on any Rust files you modify. The repository root is also the `triblespace` facade package, so the bare command does not cover every workspace member.
 * Run `cargo test --workspace --features triblespace-net/sim` and ensure it passes before committing. The feature is REQUIRED: without it three integration binaries compile empty and report `ok` with 0 passed / 0 failed, silently skipping every collection-transfer test. It must be package-qualified — `sim` lives on `triblespace-net`, and a bare `--features sim` is rejected outright by the root package. If tests fail or cannot run, note that in your PR.
 * For quick iterations, run `./scripts/devtest.sh` to execute only the tests.
 * Before committing, execute `./scripts/preflight.sh` from the repository root. This script runs formatting checks and tests. Kani proofs run separately via `./scripts/verify.sh`, which normally shouldn't be executed locally.

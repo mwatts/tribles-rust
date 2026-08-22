@@ -32,8 +32,11 @@ builds in sync:
 - `./scripts/build_book.sh` regenerates the documentation after you modify
   Markdown chapters or code snippets.
 
-You can always fall back to the standard Cargo commands (`cargo fmt`,
-`cargo test`, etc.) if you prefer to run specific tools by hand.
+You can always fall back to the standard Cargo commands if you prefer to run
+specific tools by hand, but use `cargo fmt --all` and `cargo test --workspace`.
+The repository root is both the workspace root and its own package (the
+`triblespace` facade), so the bare forms select only that package and silently
+skip `triblespace-core` and the other workspace members.
 
 ## Rebuilding the book
 
