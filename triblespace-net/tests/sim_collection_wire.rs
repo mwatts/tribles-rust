@@ -22,7 +22,7 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::repo::WantRequest;
 use triblespace_core::repo::capability::{self, PERM_READ, scope_branch};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, WantStore};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, WantStore};
 use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 use triblespace_net::peer::Peer;
@@ -390,7 +390,6 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
                 .get::<TribleSet, SimpleArchive>(data.get_handle())
                 .is_err()
         );
-        assert!(store.pins().unwrap().next().is_none());
         assert!(store.wants().unwrap().next().is_none());
     });
 }

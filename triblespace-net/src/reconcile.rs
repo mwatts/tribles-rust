@@ -6,8 +6,8 @@
 //! to the shared pile out-of-band; a long-running sync daemon
 //! (`trible pile net sync`) services that queue.
 //!
-//! Wants are independent from named [`PinStore`](triblespace_core::repo::PinStore)
-//! branches. The reconciler never changes named pin state. Blob demand becomes
+//! Wants are independent from legacy named pins. The reconciler never changes
+//! legacy pin state. Blob demand becomes
 //! cache-retention interest after bytes land; operation wants are fulfilled by
 //! native collection records and never become blob roots.
 //! - **"Absent" is always "not obtained yet", never definitely-absent**

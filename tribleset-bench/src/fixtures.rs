@@ -17,9 +17,9 @@
 //!   so their builders compile only under `--features rpq` and the
 //!   runner records SKIP outcomes for their measures.
 //! - the F3 (oasis-last) and F5 (two-route diamond) fixture queries.
-//! - `commit_chain` + `pile_checkout` — the ladder phase: checkout of
-//!   the first k commits of a dataset pile's data branch, where k is
-//!   derived from a cumulative-trible rung target.
+//! - `commit_chain` + `pile_checkout` — the ladder phase: immutable
+//!   materialization of the first k commits of a dataset pile's legacy data
+//!   branch, where k is derived from a cumulative-trible rung target.
 //!
 //! Native to this crate (not vendored):
 //! - the Harkonnen R2 white-box fixtures F6..F15 (attribute ids minted
@@ -31,7 +31,9 @@
 
 use std::time::Instant;
 
+#[cfg(feature = "legacy-repository")]
 use ed25519_dalek::SigningKey;
+#[cfg(feature = "legacy-repository")]
 use rand::rngs::OsRng;
 
 use subject::core::blob::encodings::simplearchive::SimpleArchive;
@@ -60,7 +62,11 @@ use subject::core::query::Candidates;
 #[cfg(feature = "frontier")]
 use subject::core::query::Frontier;
 use subject::core::repo::pile::Pile;
-use subject::core::repo::{self, Repository};
+use subject::core::repo::self;
+#[cfg(feature = "legacy-repository")]
+use subject::core::repo::{PinStore, Repository};
+#[cfg(not(feature = "legacy-repository"))]
+use subject::core::repo::PinSnapshotSource;
 
 // ---------------------------------------------------------------------------
 // Crash isolation
@@ -333,7 +339,7 @@ pub fn build_archive(set: &TribleSet) -> SuccinctArchive<OrderedUniverse> {
 }
 
 // ---------------------------------------------------------------------------
-// Ladder phase: pile checkout (rung -> k mapping + Workspace::checkout).
+// Ladder phase: legacy pile materialization (rung -> k mapping + union).
 // ---------------------------------------------------------------------------
 
 type CommitHandle = Inline<Handle<SimpleArchive>>;
@@ -397,12 +403,10 @@ fn set_digest(set: &TribleSet) -> u64 {
 }
 
 /// Open the pile, resolve the data branch, map the rung to k commits,
-/// and measure `Workspace::checkout` of those commits — one span per
-/// warmed iteration, timestamps against `base`.
-///
-/// !!! `Repository::new` appends one commit-metadata blob record to
-/// the pile file on open — always point the runner at a clonefile copy
-/// (`cp -c` on APFS, free) of the dataset pile, never at the original.
+/// and measure materialization of those commits — one span per warmed
+/// iteration, timestamps against `base`. Current subjects use a strictly
+/// observational pin snapshot; the `legacy-repository` adapter exists only
+/// so the history sweep can compile subjects from before that API existed.
 ///
 /// Returns the checked-out set (prefix-carved for sub-first-chunk
 /// rungs), the per-iteration spans as `(begin_ns, duration_ns)`, the
@@ -420,18 +424,34 @@ pub fn pile_checkout(
 ) -> Result<(TribleSet, Vec<(u64, u64)>, usize, u64), String> {
     let mut pile = Pile::open(path).expect("open pile");
     pile.refresh().expect("load pile records");
+    #[cfg(not(feature = "legacy-repository"))]
+    let pins = pile
+        .snapshot_pin_heads()
+        .expect("snapshot legacy branch pins");
     let reader = pile.reader().expect("pile reader");
 
     // Resolve branches by metadata::name. With `branch`, exact match;
     // else auto-pick the single branch not named "manifest".
-    let branch_ids: Vec<Id> = pile
+    let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
+    #[cfg(feature = "legacy-repository")]
+    let legacy_heads: Vec<(Id, Inline<Handle<SimpleArchive>>)> = pile
         .pins()
         .expect("list branches")
         .collect::<Result<Vec<_>, _>>()
-        .expect("list branches");
-    let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
-    for id in branch_ids {
-        let Ok(Some(meta_handle)) = pile.head(id) else { continue };
+        .expect("list branches")
+        .into_iter()
+        .filter_map(|id| pile.head(id).ok().flatten().map(|head| (id, head)))
+        .collect();
+    #[cfg(not(feature = "legacy-repository"))]
+    let legacy_heads: Vec<(Id, Inline<Handle<SimpleArchive>>)> = pins
+        .iter_ordered()
+        .map(|raw| {
+            let id = Id::new(*raw).expect("legacy pin snapshot contains a nil id");
+            let head = *pins.get(raw).expect("iterated legacy pin has a head");
+            (id, head)
+        })
+        .collect();
+    for (id, meta_handle) in legacy_heads {
         let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue };
         let handles: Vec<Inline<Handle<UTF8String>>> = find!(
             (n: Inline<Handle<UTF8String>>),
@@ -508,9 +528,13 @@ pub fn pile_checkout(
         carve.map(|n| format!(", carving a {n}-trible sorted prefix")).unwrap_or_default()
     );
 
-    // Workspace::checkout, one span per warmed iteration.
+    // Immutable prefix materialization, one span per warmed iteration. The
+    // old-subject adapter retains Workspace::checkout solely for historical
+    // compilation; current subjects never author or advance a pin here.
+    #[cfg(feature = "legacy-repository")]
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .expect("create repository view");
+    #[cfg(feature = "legacy-repository")]
     let mut ws = repo.pull(branch_id).expect("pull branch");
     let mut spans: Vec<(u64, u64)> = Vec::new();
     let mut out: Option<TribleSet> = None;
@@ -528,8 +552,29 @@ pub fn pile_checkout(
         let recording = i >= warmup;
         let begin_ns = base.elapsed().as_nanos() as u64;
         let t = Instant::now();
-        let co = ws.checkout(&handles[..k]).expect("checkout");
-        let mut set = co.into_facts();
+        #[cfg(feature = "legacy-repository")]
+        let mut set = ws.checkout(&handles[..k]).expect("checkout").into_facts();
+        #[cfg(not(feature = "legacy-repository"))]
+        let mut set = {
+            let mut set = TribleSet::new();
+            for handle in &handles[..k] {
+                let meta: TribleSet = reader
+                    .get(*handle)
+                    .expect("read legacy commit metadata");
+                let contents: Vec<CommitHandle> = find!(
+                    (c: Inline<Handle<SimpleArchive>>),
+                    pattern!(&meta, [{ repo::content: ?c }])
+                )
+                .map(|(c,)| c)
+                .collect();
+                let [content] = contents[..] else { continue };
+                let content: TribleSet = reader
+                    .get(content)
+                    .expect("read legacy commit content");
+                set += content;
+            }
+            set
+        };
         let checked_out = set.len();
         if let Some(n) = carve {
             let mut prefix = TribleSet::new();
@@ -553,8 +598,12 @@ pub fn pile_checkout(
         }
         out = Some(set);
     }
+    #[cfg(feature = "legacy-repository")]
     drop(ws);
+    #[cfg(feature = "legacy-repository")]
     repo.close().expect("close pile");
+    #[cfg(not(feature = "legacy-repository"))]
+    pile.close().expect("close pile");
     if let Some(g) = gate {
         return Err(g);
     }

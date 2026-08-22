@@ -32,7 +32,7 @@ use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, PinStore, WantRequest, WantStore,
+    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, WantRequest, WantStore,
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
@@ -253,9 +253,8 @@ fn fetch_blob_pulls_from_the_holder() {
 /// blob fetches it from the swarm and lands it in its store under a
 /// **want** — the demand-born retention marker — after which the
 /// `PeerReader` serves it locally. This is "lazy replication" in one
-/// test: B reads content it never eagerly replicated, retains it as an
-/// evictable wanted resident, and a strong pin (the durability
-/// promise) would be a separate decision.
+/// test: B reads content it never eagerly replicated and retains it as
+/// a wanted resident.
 #[test]
 fn lazy_read_lands_wanted_in_store() {
     let _g = sim_guard();
@@ -289,7 +288,6 @@ fn lazy_read_lands_wanted_in_store() {
             "precondition: B lacks the blob"
         );
         assert_eq!(want_count(&peer_b), 0, "precondition: no wants");
-        let strong_before = peer_b.store().pins().unwrap().count();
 
         // The lazy read: record the demand-born want, fetch from
         // the swarm, land the verified bytes in the store.
@@ -324,12 +322,6 @@ fn lazy_read_lands_wanted_in_store() {
             wanted,
             vec![WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash))],
             "fetched blob is wanted"
-        );
-        // 3. ...and NOT strong-pinned (no eager durability promise).
-        assert_eq!(
-            peer_b.store().pins().unwrap().count(),
-            strong_before,
-            "lazy read must not create a strong pin"
         );
     });
 }
@@ -1271,12 +1263,10 @@ fn lazy_fetch_succeeds_across_many_seeds() {
 /// durable want-marker". A faculty (another process) appends a want
 /// record for a blob the node doesn't hold; the sync daemon's reconcile
 /// tick notices the want, fetches the blob from whoever holds it, and
-/// lands it under the existing want. Strong pins are never touched,
-/// on either side. B runs WITHOUT gossip, keeping the test focused on the
+/// lands it under the existing want. B runs WITHOUT gossip, keeping the test focused on the
 /// reconcile-driven content fetch rather than collection-evidence exchange.
 #[test]
 fn reconcile_tick_services_out_of_band_want() {
-    use triblespace_core::id::Id;
     use triblespace_net::reconcile::Reconciler;
 
     let _g = sim_guard();
@@ -1289,15 +1279,11 @@ fn reconcile_tick_services_out_of_band_want() {
         let cap_a = admin_cap(&root, &ka);
         let cap_b = admin_cap(&root, &kb);
 
-        // A holds the blob under a local strong pin — independent retention
-        // state which B's reconciliation must not touch.
+        // A holds the blob locally; B's reconciliation must not alter A's
+        // independent want state.
         let (blob, hash) = content_blob(0x21);
         let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let pin_id = Id::new([0xAD; 16]).unwrap();
-        store_a
-            .update(pin_id, None, Some(blob.get_handle()))
-            .unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
@@ -1322,9 +1308,7 @@ fn reconcile_tick_services_out_of_band_want() {
             "precondition: B lacks the blob"
         );
 
-        let a_pins_before: Vec<_> = peer_a.store().pins().unwrap().map(Result::unwrap).collect();
         let a_wants_before = want_count(&peer_a);
-        let b_pins_before = peer_b.store().pins().unwrap().count();
 
         // The reconcile pass: notice the want, fetch, land.
         let mut rec = Reconciler::new();
@@ -1342,7 +1326,7 @@ fn reconcile_tick_services_out_of_band_want() {
             "want serviced: blob now resident at B"
         );
         // ...still wanted — the want-marker became the retention
-        // marker (the reconciler records no pin state of its own)...
+        // marker...
         let wanted: Vec<_> = peer_b
             .store()
             .wants()
@@ -1354,15 +1338,7 @@ fn reconcile_tick_services_out_of_band_want() {
             vec![WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash))],
             "the want stays on record as the want"
         );
-        // ...B grew no strong pin...
-        assert_eq!(
-            peer_b.store().pins().unwrap().count(),
-            b_pins_before,
-            "reconcile must not create strong pins"
-        );
-        // ...and A's retention is untouched.
-        let a_pins_after: Vec<_> = peer_a.store().pins().unwrap().map(Result::unwrap).collect();
-        assert_eq!(a_pins_after, a_pins_before, "A's strong pins untouched");
+        // ...and A's independent retention policy is untouched.
         assert_eq!(want_count(&peer_a), a_wants_before, "A's wants untouched");
     });
 }

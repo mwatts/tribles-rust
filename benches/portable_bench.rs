@@ -6,8 +6,8 @@
 //! CONSTRAINTS, each paid for by a real failure on 2026-07-25:
 //!
 //! * *Stable core API only.* `prelude::*`, `find!`, `pattern!`, `path!`,
-//!   `or!`, `and!`, `temp!`, `value_range`, `Pile`, `Repository`,
-//!   `Workspace::checkout`, `SuccinctArchive` — every item verified present
+//!   `or!`, `and!`, `temp!`, `value_range`, `Pile`, and
+//!   `SuccinctArchive` — every item verified present
 //!   at both 739fd05c (2026-07-03) and 6a6a94f1 (2026-07-24). Everything
 //!   that drifted this month lives outside this surface. The native exact-
 //!   Succinct collection arm is deliberately NOT here — it lives in
@@ -34,8 +34,8 @@
 //!   it. Exit code stays 0 while at least one measure has SIGNAL.
 //!
 //! PHASES (each with its own measure keys, each SKIP-able):
-//!   checkout   — `Workspace::checkout` of the first k commits of a dataset
-//!                pile's data branch, where k is derived from a cumulative-
+//!   checkout   — immutable materialization of the first k legacy commits of
+//!                a dataset pile's data branch, where k is derived from a cumulative-
 //!                trible rung target by walking the commit chain once
 //!                (per-commit tribles = SimpleArchive blob length / 64).
 //!                Sub-first-chunk rungs checkout commit 1 and carve a sorted
@@ -55,12 +55,9 @@
 //!
 //! DATASET MODES:
 //!   --pile <path>  a v2 dataset pile (e.g. sparqloscope's dblp-ladder): a
-//!                  named data branch whose linear commit chain carries
-//!                  SimpleArchive content blobs. !!! `Repository::new`
-//!                  appends ONE small commit-metadata blob record to the
-//!                  pile file on open — always point --pile at a clonefile
-//!                  copy (`cp -c` on APFS, free) of the dataset pile, never
-//!                  at the original.
+//!                  named legacy data branch whose linear commit chain carries
+//!                  SimpleArchive content blobs. The pile is only observed;
+//!                  benchmark setup does not append or advance mutable state.
 //!   (no --pile)    DBLP-shaped synthetic data minted in-process from a
 //!                  seeded splitmix64 — the harness runs at any commit with
 //!                  zero setup, and the SAME query matrix applies because
@@ -93,9 +90,6 @@
 
 use std::time::Instant;
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::blob::encodings::utf8string::UTF8String;
@@ -105,7 +99,7 @@ use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{self, PinStore, Repository};
+use triblespace_core::repo::{self, PinSnapshotSource};
 
 // GPU comparison arm. The whole arm is behind `feature = "gpu"` so it
 // VANISHES when the feature is off (early commits predate the crate, and the
@@ -753,7 +747,7 @@ fn build_dblp_shaped(target: usize, qa: &DblpAttrs) -> (TribleSet, Id) {
 }
 
 // ---------------------------------------------------------------------------
-// Pile checkout (rung -> k mapping + Workspace::checkout).
+// Legacy pile materialization (rung -> k mapping + immutable union).
 // ---------------------------------------------------------------------------
 
 type CommitHandle = Inline<Handle<SimpleArchive>>;
@@ -786,7 +780,7 @@ fn commit_chain(
 }
 
 /// Open the pile, resolve the data branch, map the rung to k commits, and
-/// measure `Workspace::checkout` of those commits. Returns the checked-out
+/// measure immutable materialization of those commits. Returns the materialized
 /// set (prefix-carved for sub-first-chunk rungs; chunk-boundary-snapped when
 /// `chunk_aligned`), the checkout samples, and the identity count.
 fn pile_checkout(
@@ -799,20 +793,17 @@ fn pile_checkout(
 ) -> (TribleSet, Vec<f64>, usize) {
     let mut pile = Pile::open(path).expect("open pile");
     pile.refresh().expect("load pile records");
+    let pins = pile
+        .snapshot_pin_heads()
+        .expect("snapshot legacy branch pins");
     let reader = pile.reader().expect("pile reader");
 
-    // Resolve branches by metadata::name. With --branch, exact match; else
+    // Resolve legacy branches by metadata::name. With --branch, exact match; else
     // auto-pick the single branch not named "manifest".
-    let branch_ids: Vec<Id> = pile
-        .pins()
-        .expect("list branches")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("list branches");
     let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
-    for id in branch_ids {
-        let Ok(Some(meta_handle)) = pile.head(id) else {
-            continue;
-        };
+    for raw in pins.iter_ordered() {
+        let id = Id::new(*raw).expect("legacy pin snapshot contains a nil id");
+        let meta_handle = *pins.get(raw).expect("iterated legacy pin has a head");
         let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
             continue;
         };
@@ -828,7 +819,7 @@ fn pile_checkout(
         };
         named.push((id, name.as_ref().to_owned(), meta));
     }
-    let (branch_id, branch_name, branch_meta) = match branch {
+    let (_branch_id, branch_name, branch_meta) = match branch {
         Some(want) => named
             .into_iter()
             .find(|(_, n, _)| n == want)
@@ -910,20 +901,30 @@ fn pile_checkout(
         );
     }
 
-    // Workspace::checkout, min-statistic over warmed iterations. NOTE:
-    // Repository::new appends one commit-metadata blob record to the pile —
-    // run against a clonefile copy (see module docs).
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .expect("create repository view");
-    let mut ws = repo.pull(branch_id).expect("pull branch");
+    // Immutable legacy-prefix materialization, min-statistic over warmed
+    // iterations. The metric key remains `checkout` so history-sweep output
+    // stays comparable; no Repository facade or pile write participates.
     let mut samples = Vec::new();
     let mut out: Option<TribleSet> = None;
     let mut ident: Option<usize> = None;
     for i in 0..(warmup + iters) {
         let recording = i >= warmup;
         let t = Instant::now();
-        let co = ws.checkout(&handles[..k]).expect("checkout");
-        let mut set = co.into_facts();
+        let mut set = TribleSet::new();
+        for handle in &handles[..k] {
+            let meta: TribleSet = reader.get(*handle).expect("read legacy commit metadata");
+            let contents: Vec<CommitHandle> = find!(
+                (c: Inline<Handle<SimpleArchive>>),
+                pattern!(&meta, [{ repo::content: ?c }])
+            )
+            .map(|(c,)| c)
+            .collect();
+            let [content] = contents[..] else {
+                continue;
+            };
+            let content: TribleSet = reader.get(content).expect("read legacy commit content");
+            set += content;
+        }
         if let Some(n) = carve {
             let mut prefix = TribleSet::new();
             for t in set.iter().take(n) {
@@ -947,8 +948,7 @@ fn pile_checkout(
         }
         out = Some(set);
     }
-    drop(ws);
-    repo.close().expect("close pile");
+    pile.close().expect("close pile");
     (
         out.expect("at least one iteration"),
         samples,

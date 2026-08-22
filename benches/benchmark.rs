@@ -15,9 +15,9 @@ use triblespace::core::blob::encodings::succinctarchive::CachedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::CompressedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::collection::{reach, Collection, CollectionName};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::BlobStorePut;
-use triblespace::core::repo::Repository;
 
 use triblespace::prelude::blobencodings::*;
 use triblespace::prelude::*;
@@ -946,21 +946,25 @@ fn pile_benchmark(c: &mut Criterion) {
     */
 }
 
-fn checkout_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("checkout");
+fn collection_materialize_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("collection_materialize");
     group.sample_size(10);
 
-    // Build a repo with N commits, each carrying ~1000 entities-worth
-    // of tribles. Each commit lives in storage as a separate
-    // SimpleArchive blob, so `checkout(..)` does N independent
-    // fetch+unarchive+union operations — the parallel target.
+    // Build one native collection with N independent signed commits. Each
+    // commit carries its own SimpleArchive element, so materialization must
+    // validate and union the complete authority frontier.
     for &n_commits in &[10usize, 100, 1000] {
         let entities_per_commit = 100;
         let storage = MemoryRepo::default();
-        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())
-            .expect("repo");
-        let branch_id = repo.create_branch("bench", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let name = CollectionName::new("materialize-bench").expect("valid collection name");
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            signing_key.verifying_key(),
+            signing_key,
+            reach::private(),
+        );
 
         let mut total_tribles: u64 = 0;
         for _ in 0..n_commits {
@@ -980,16 +984,14 @@ fn checkout_benchmark(c: &mut Criterion) {
                 };
             }
             total_tribles += commit_data.len() as u64;
-            ws.commit(commit_data, "bench commit");
+            collection
+                .commit(commit_data.into())
+                .expect("publish collection commit");
         }
-        repo.push(&mut ws).expect("push");
 
         group.throughput(Throughput::Elements(total_tribles));
-        group.bench_function(BenchmarkId::new("checkout", n_commits), |b| {
-            b.iter(|| {
-                let mut ws = repo.pull(*branch_id).expect("pull");
-                ws.checkout(..).expect("checkout")
-            });
+        group.bench_function(BenchmarkId::new("materialize", n_commits), |b| {
+            b.iter(|| collection.materialize().expect("materialize collection"));
         });
     }
 
@@ -1006,7 +1008,7 @@ criterion_group!(
     entities_benchmark,
     query_benchmark,
     pile_benchmark,
-    checkout_benchmark,
+    collection_materialize_benchmark,
 );
 
 criterion_main!(benches);

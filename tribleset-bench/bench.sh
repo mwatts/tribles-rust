@@ -62,6 +62,12 @@ echo "bench.sh : subject -> $target" >&2
 # which is exactly how the era-portability property gets lost.
 SUBJECT="$(cd subjects/current && pwd -P)"
 FEATURES=""
+# legacy-repository: old subjects expose only mutable pin/Repository access to
+# their dataset ladder. Current subjects use the immutable PinSnapshotSource
+# path, so the compatibility adapter is selected only for history.
+if ! grep -q 'trait PinSnapshotSource' "$SUBJECT/triblespace-core/src/repo.rs" 2>/dev/null; then
+  FEATURES="$FEATURES legacy-repository"
+fi
 # gpu: the subject must actually ship the triblespace-gpu crate (F10 reads
 # DEFAULT_MIN_CONFIRM_BATCH out of it rather than copying the number).
 if [ -d "$SUBJECT/triblespace-gpu" ] && grep -q '^gpu = ' "$SUBJECT/Cargo.toml" 2>/dev/null; then

@@ -10,6 +10,10 @@ description = "Engine-version-agnostic benchmark suite for triblespace. The SUBJ
 # purpose (benchmarking any rev). bench.sh probes the subject and enables
 # exactly the ones it supports.
 default = []
+# The benchmark normally reads legacy pile heads through the current immutable
+# snapshot API. History subjects predating that API can still be swept by
+# enabling this adapter; it is never part of a current production surface.
+legacy-repository = []
 # The performance fingerprint is a reader for benchmark receipts, not part of
 # the measured process. Keeping it behind a feature means ordinary subject
 # builds never compile an eframe/wgpu UI into the benchmark runner.
@@ -89,8 +93,8 @@ anyhow = "1"
 anybytes = "0.20.2"
 regex = "1"
 hifitime = "4.1.2"
-# Collection/repository signing (the ledger writer and the subject's legacy
-# checkout phase create throwaway signing keys). 2.1 unifies with both graphs.
+# Collection signing, plus throwaway legacy Repository signing only when the
+# history-sweep adapter is selected. 2.1 unifies with both graphs.
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
 rand = "0.8"
 # GORBIE 0.18.1's CardCtx calls its markdown helper unconditionally, so this

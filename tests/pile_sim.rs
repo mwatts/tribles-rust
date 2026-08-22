@@ -1,10 +1,8 @@
 use anybytes::Bytes;
 use proptest::prelude::*;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::repo::PushResult;
-use triblespace::prelude::blobencodings::SimpleArchive;
+use triblespace::core::collection::{CollectionMerge, CollectionRecord, CollectionStore};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
@@ -15,9 +13,13 @@ enum Op {
     Refresh,
     Amputate,
     Get(usize),
-    BranchUpdate { branch: usize, handle: usize },
-    BranchHead(usize),
-    BranchList,
+    MergeRecord {
+        collection: usize,
+        left: usize,
+        right: usize,
+        result: usize,
+    },
+    CollectionList,
 }
 
 #[derive(Debug, Clone)]
@@ -32,98 +34,107 @@ struct Scenario {
     ops: Vec<ActorOp>,
 }
 
-fn actor_op_strategy(actors: usize, branches: usize) -> impl Strategy<Value = ActorOp> {
+fn actor_op_strategy(actors: usize) -> impl Strategy<Value = ActorOp> {
     let data = prop::collection::vec(any::<u8>(), 0..32);
     let idx = 0usize..20;
     prop_oneof![
-        (0..actors, data.clone()).prop_map(|(actor, data)| ActorOp::Run {
+        (0..actors, data).prop_map(|(actor, data)| ActorOp::Run {
             actor,
-            op: Op::Put(data)
+            op: Op::Put(data),
         }),
         (0..actors).prop_map(|actor| ActorOp::Run {
             actor,
-            op: Op::Flush
+            op: Op::Flush,
         }),
         (0..actors).prop_map(|actor| ActorOp::Run {
             actor,
-            op: Op::Refresh
+            op: Op::Refresh,
         }),
         (0..actors).prop_map(|actor| ActorOp::Run {
             actor,
-            op: Op::Amputate
+            op: Op::Amputate,
         }),
-        (0..actors, idx.clone()).prop_map(|(actor, i)| ActorOp::Run {
+        (0..actors, idx.clone()).prop_map(|(actor, index)| ActorOp::Run {
             actor,
-            op: Op::Get(i)
+            op: Op::Get(index),
         }),
-        (0..actors, 0..branches, idx.clone()).prop_map(|(actor, branch, i)| ActorOp::Run {
-            actor,
-            op: Op::BranchUpdate { branch, handle: i }
-        }),
-        (0..actors, 0..branches).prop_map(|(actor, branch)| ActorOp::Run {
-            actor,
-            op: Op::BranchHead(branch)
-        }),
+        (0..actors, idx.clone(), idx.clone(), idx.clone(), idx,).prop_map(
+            |(actor, collection, left, right, result)| ActorOp::Run {
+                actor,
+                op: Op::MergeRecord {
+                    collection,
+                    left,
+                    right,
+                    result,
+                },
+            }
+        ),
         (0..actors).prop_map(|actor| ActorOp::Run {
             actor,
-            op: Op::BranchList
+            op: Op::CollectionList,
         }),
         Just(ActorOp::Check),
     ]
 }
 
 fn scenario_strategy(max_actors: usize) -> impl Strategy<Value = Scenario> {
-    (1..=max_actors, 1usize..=4).prop_flat_map(move |(actors, branches)| {
-        let op = actor_op_strategy(actors, branches);
-        prop::collection::vec(op, 1..20).prop_map(move |ops| Scenario { actors, ops })
+    (1..=max_actors).prop_flat_map(move |actors| {
+        prop::collection::vec(actor_op_strategy(actors), 1..20)
+            .prop_map(move |ops| Scenario { actors, ops })
     })
 }
 
-fn branch_id(idx: usize) -> Id {
-    let mut raw = [0u8; 16];
-    raw[0] = (idx as u8).saturating_add(1);
-    Id::new(raw).unwrap()
+fn observed_records(pile: &mut Pile) -> Vec<CollectionRecord> {
+    pile.refresh().unwrap();
+    pile.records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn assert_known_records(
+    pile: &mut Pile,
+    expected: &HashMap<Id, CollectionRecord>,
+) -> Result<(), TestCaseError> {
+    let found = observed_records(pile);
+    prop_assert_eq!(found.len(), expected.len());
+    for record in found {
+        prop_assert_eq!(expected.get(&record.id()), Some(&record));
+    }
+    Ok(())
 }
 
 proptest! {
     #[test]
-    fn pile_operation_sequences_are_consistent(
-        scenario in scenario_strategy(4)
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sim.pile");
+    fn pile_operation_sequences_are_consistent(scenario in scenario_strategy(4)) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sim.pile");
         std::fs::File::create(&path).unwrap();
         let mut piles: Vec<Pile> =
             (0..scenario.actors).map(|_| Pile::open(&path).unwrap()).collect();
-        let mut expected: HashMap<Inline<Handle<UnknownBlob>>, Vec<u8>> = HashMap::new();
+        let mut expected_blobs: HashMap<Inline<Handle<UnknownBlob>>, Vec<u8>> = HashMap::new();
         let mut handles: Vec<Inline<Handle<UnknownBlob>>> = Vec::new();
-        let mut branches: HashMap<Id, Inline<Handle<SimpleArchive>>> = HashMap::new();
+        let mut expected_records: HashMap<Id, CollectionRecord> = HashMap::new();
 
-        for op in scenario.ops {
-            match op {
+        for actor_op in scenario.ops {
+            match actor_op {
                 ActorOp::Run { actor, op } => match op {
                     Op::Put(data) => {
-                        let blob: Blob<UnknownBlob> =
-                            Blob::new(Bytes::from_source(data.clone()));
+                        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
                         let handle = piles[actor].put::<UnknownBlob, _>(blob).unwrap();
-                        expected.insert(handle, data);
+                        expected_blobs.insert(handle, data);
                         handles.push(handle);
                     }
-                    Op::Flush => {
-                        piles[actor].flush().unwrap();
-                    }
+                    Op::Flush => piles[actor].flush().unwrap(),
                     Op::Refresh => {
                         let _ = piles[actor].refresh();
                     }
                     Op::Amputate => {
-                        // Simulate crash recovery: close and reopen with amputate
-                        let path = dir.path().join("sim.pile");
                         piles[actor] = Pile::open(&path).unwrap();
                         piles[actor].amputate().unwrap();
                     }
-                    Op::Get(i) => {
-                        if !handles.is_empty() {
-                            let handle = handles[i % handles.len()];
+                    Op::Get(index) => {
+                        if let Some(handle) = handles.get(index % handles.len().max(1)).copied() {
                             piles[actor].refresh().unwrap();
                             if let Ok(blob) = piles[actor]
                                 .reader()
@@ -132,61 +143,38 @@ proptest! {
                             {
                                 prop_assert_eq!(
                                     blob.bytes.as_ref(),
-                                    expected.get(&handle).unwrap().as_slice()
+                                    expected_blobs.get(&handle).unwrap().as_slice(),
                                 );
                             }
                         }
                     }
-                    Op::BranchUpdate { branch, handle } => {
+                    Op::MergeRecord { collection, left, right, result } => {
                         if !handles.is_empty() {
-                            let id = branch_id(branch);
-                            let h = handles[handle % handles.len()].transmute();
-                            let old = branches.get(&id).copied();
-                            let res = piles[actor].update(id, old, Some(h)).unwrap();
-                            match res {
-                                PushResult::Success() => {
-                                    branches.insert(id, h);
-                                }
-                                PushResult::Conflict(c) => {
-                                    prop_assert_eq!(c, old);
-                                    branches.insert(id, h);
-                                }
-                            }
+                            let at = |index: usize| handles[index % handles.len()].transmute();
+                            let record = CollectionRecord::Merge(CollectionMerge::new(
+                                at(collection),
+                                at(left).into(),
+                                at(right).into(),
+                                at(result).into(),
+                            ));
+                            piles[actor].insert(record).unwrap();
+                            expected_records.insert(record.id(), record);
                         }
                     }
-                    Op::BranchHead(branch) => {
-                        let id = branch_id(branch);
-                        piles[actor].refresh().unwrap();
-                        let head = piles[actor].head(id).unwrap();
-                        prop_assert_eq!(head, branches.get(&id).copied());
-                    }
-                    Op::BranchList => {
-                        piles[actor].refresh().unwrap();
-                        let iter = piles[actor].pins().unwrap();
-                        let found: HashSet<Id> = iter.map(|r| r.unwrap()).collect();
-                        let expected_ids: HashSet<Id> = branches.keys().copied().collect();
-                        prop_assert_eq!(found, expected_ids);
+                    Op::CollectionList => {
+                        assert_known_records(&mut piles[actor], &expected_records)?;
                     }
                 },
                 ActorOp::Check => {
                     for pile in &mut piles {
                         pile.refresh().unwrap();
-                    }
-                    for pile in &mut piles {
                         let reader = pile.reader().unwrap();
-                        for (handle, data) in &expected {
+                        for (handle, data) in &expected_blobs {
                             if let Ok(blob) = reader.get::<Blob<UnknownBlob>, _>(*handle) {
                                 prop_assert_eq!(blob.bytes.as_ref(), data.as_slice());
                             }
                         }
-                        let iter = pile.pins().unwrap();
-                        let found: HashSet<Id> = iter.map(|r| r.unwrap()).collect();
-                        let expected_ids: HashSet<Id> = branches.keys().copied().collect();
-                        prop_assert_eq!(found, expected_ids);
-                        for (id, head) in &branches {
-                            let h = pile.head(*id).unwrap();
-                            prop_assert_eq!(h, Some(*head));
-                        }
+                        assert_known_records(pile, &expected_records)?;
                     }
                 }
             }
@@ -199,21 +187,16 @@ proptest! {
         for pile in piles {
             pile.close().unwrap();
         }
-        let mut pile_final: Pile = Pile::open(&path).unwrap();
-        pile_final.amputate().unwrap();
-        let reader = pile_final.reader().unwrap();
-        for (handle, data) in &expected {
+
+        let mut final_pile = Pile::open(&path).unwrap();
+        final_pile.amputate().unwrap();
+        let reader = final_pile.reader().unwrap();
+        for (handle, data) in &expected_blobs {
             let blob = reader.get::<Blob<UnknownBlob>, _>(*handle).unwrap();
-            assert_eq!(blob.bytes.as_ref(), data.as_slice());
+            prop_assert_eq!(blob.bytes.as_ref(), data.as_slice());
         }
-        let iter = pile_final.pins().unwrap();
-        let found: HashSet<Id> = iter.map(|r| r.unwrap()).collect();
-        let expected_ids: HashSet<Id> = branches.keys().copied().collect();
-        assert_eq!(found, expected_ids);
-        for (id, head) in &branches {
-            let h = pile_final.head(*id).unwrap();
-            assert_eq!(h, Some(*head));
-        }
-        pile_final.close().unwrap();
+        drop(reader);
+        assert_known_records(&mut final_pile, &expected_records)?;
+        final_pile.close().unwrap();
     }
 }

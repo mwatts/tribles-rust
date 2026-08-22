@@ -78,7 +78,7 @@ use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{self, PinStore};
+use triblespace_core::repo::{self, PinSnapshotSource};
 
 // ---------------------------------------------------------------------------
 // DBLP vocabulary + content-derived attributes (identical derivation to the
@@ -456,18 +456,15 @@ struct Chunk {
 fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec<Chunk> {
     let mut pile = Pile::open(path).expect("open pile");
     pile.refresh().expect("load pile records");
+    let pins = pile
+        .snapshot_pin_heads()
+        .expect("snapshot legacy branch pins");
     let reader = pile.reader().expect("pile reader");
 
-    let branch_ids: Vec<Id> = pile
-        .pins()
-        .expect("list branches")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("list branches");
     let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
-    for id in branch_ids {
-        let Ok(Some(meta_handle)) = pile.head(id) else {
-            continue;
-        };
+    for raw in pins.iter_ordered() {
+        let id = Id::new(*raw).expect("legacy pin snapshot contains a nil id");
+        let meta_handle = *pins.get(raw).expect("iterated legacy pin has a head");
         let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
             continue;
         };

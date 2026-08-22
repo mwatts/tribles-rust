@@ -110,39 +110,36 @@ mod readme_example {
             /// The number of pages in the work.
             "FCCE870BECA333D059D5CD68C43B98F0" unsafe as pub page_count: R256;
 
-            /// A pen name or alternate spelling for an author.
-            "D2D1B857AC92CEAA45C0737147CA417E" unsafe as pub alias: ShortString;
         }
     }
 
     #[test]
     fn readme_example() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::collection::reach;
+
         let storage = MemoryRepo::default();
-        let mut repo =
-            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-        let branch_id = repo.create_branch("main", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull workspace");
+        let key = SigningKey::generate(&mut OsRng);
+        let name = CollectionName::new("library")?;
+        let mut library =
+            Collection::new(storage, &name, key.verifying_key(), key, reach::private());
 
-        let herbert = ufoid();
-        let dune = ufoid();
-        let mut library = TribleSet::new();
-
-        library += entity! { &herbert @
+        let mut initial = entity! {
             literature::firstname: "Frank",
             literature::lastname: "Herbert",
         };
+        let herbert = initial.root().expect("intrinsic author identity");
 
-        library += entity! { &dune @
+        let quote = initial.put("I must not fear. Fear is the mind-killer.");
+        initial += entity! {
             literature::title: "Dune",
             literature::author: &herbert,
-            literature::quote: ws.put(
-                "I must not fear. Fear is the mind-killer."
-            ),
+            literature::quote: quote,
         };
 
-        ws.commit(library, "import dune");
+        library.commit(initial)?;
 
-        let catalog = ws.checkout(..)?;
+        let snapshot = library.snapshot()?;
+        let catalog = snapshot.facts();
         let title = "Dune";
 
         for (f, l, quote) in find!(
@@ -159,44 +156,30 @@ mod readme_example {
                 }
             ])
         ) {
-            let quote: View<str> = ws.get(quote)?;
+            let quote: View<str> = snapshot.reader().get(quote)?;
             let quote = quote.as_ref();
             println!("'{quote}'\n - from {title} by {f} {l}.");
         }
 
-        repo.push(&mut ws).expect("publish initial library");
+        // Independent commits coexist and materialize by set union. There is
+        // no mutable head to race and no conflict-resolution loop to write.
+        library.commit(entity! {
+            literature::firstname: "Francis",
+            literature::lastname: "Bacon",
+        })?;
+        library.commit(entity! {
+            literature::firstname: "Franklin",
+            literature::lastname: "Roosevelt",
+        })?;
 
-        ws.commit(
-            entity! { &herbert @ literature::firstname: "Francis" },
-            "use pen name",
-        );
-
-        let mut collaborator = repo.pull(*branch_id).expect("pull");
-        collaborator.commit(
-            entity! { &herbert @ literature::firstname: "Franklin" },
-            "record legal first name",
-        );
-        repo.push(&mut collaborator).expect("publish collaborator");
-
-        if let Some(mut conflict_ws) = repo.try_push(&mut ws).expect("attempt push") {
-            let their_catalog = conflict_ws.checkout(..)?;
-            for first in find!(
-                first: String,
-                pattern!(&their_catalog, [{ &herbert @ literature::firstname: ?first }])
-            ) {
-                println!("Collaborator recorded: '{first}'.");
-            }
-
-            // Accept their history — abandon our conflicting commit.
-            ws = conflict_ws;
-
-            ws.commit(
-                entity! { &herbert @ literature::alias: "Francis" },
-                "keep pen-name as alias",
-            );
-
-            repo.push(&mut ws).expect("publish resolution");
-        }
+        let catalog = library.materialize()?;
+        let mut names: Vec<String> = find!(
+            first: String,
+            pattern!(&catalog, [{ _?author @ literature::firstname: ?first }])
+        )
+        .collect();
+        names.sort();
+        assert_eq!(names, ["Francis", "Frank", "Franklin"]);
 
         Ok(())
     }

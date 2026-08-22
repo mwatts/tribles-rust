@@ -2408,9 +2408,7 @@ mod serving_snapshot_tests {
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::{Inline, InlineEncoding};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{
-        BlobStore, BlobStorePut, PinSnapshot, PinSnapshotSource, PinStore,
-    };
+    use triblespace_core::repo::{BlobStore, BlobStorePut, PinSnapshot, PinSnapshotSource};
 
     use super::wire;
 
@@ -2426,10 +2424,11 @@ mod serving_snapshot_tests {
     impl std::error::Error for SnapshotUnavailable {}
 
     /// A normal in-memory store behind a deliberately fallible observational
-    /// pin-snapshot boundary. It does not implement PinStore itself, proving
-    /// the host needs only the narrow source capability.
+    /// legacy-pin snapshot. The snapshot is immutable fixture evidence rather
+    /// than state authored through a mutable pin API.
     struct FallibleSnapshotStore {
         inner: MemoryRepo,
+        pins: PinSnapshot,
         fail_snapshot: bool,
     }
 
@@ -2476,10 +2475,7 @@ mod serving_snapshot_tests {
             if self.fail_snapshot {
                 Err(SnapshotUnavailable)
             } else {
-                Ok(self
-                    .inner
-                    .snapshot_pin_heads()
-                    .expect("MemoryRepo pin snapshots are infallible"))
+                Ok(self.pins.clone())
             }
         }
     }
@@ -2488,13 +2484,12 @@ mod serving_snapshot_tests {
     fn failed_refresh_clears_a_previously_authorizing_snapshot() {
         let branch = Id::new([0x31; 16]).unwrap();
         let head = Inline::new([0x42; 32]);
-        let mut inner = MemoryRepo::default();
-        assert!(matches!(
-            inner.update(branch, None, Some(head)).unwrap(),
-            triblespace_core::repo::PushResult::Success()
-        ));
+        let mut pins = PinSnapshot::new();
+        let raw: [u8; 16] = branch.into();
+        pins.insert(&triblespace_core::patch::Entry::with_value(&raw, head));
         let mut store = FallibleSnapshotStore {
-            inner,
+            inner: MemoryRepo::default(),
+            pins,
             fail_snapshot: false,
         };
 

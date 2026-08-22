@@ -1,9 +1,5 @@
 use crate::entity;
 use crate::pattern_changes;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
 
 pub mod literature {
@@ -19,32 +15,16 @@ pub mod literature {
 
 fn main() {
     // ANCHOR: pattern_changes_example
-    let storage = MemoryRepo::default();
-    let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("branch");
+    // `pattern_changes!` needs only the complete known set and the newly
+    // observed delta. How those sets arrived is deliberately orthogonal.
+    let mut initial = entity! { literature::firstname: "Frank", literature::lastname: "Herbert" };
+    let herbert = initial.root().expect("intrinsic author identity");
+    initial += entity! { literature::title: "Dune", literature::author: &herbert };
 
-    // ── commit initial data ──────────────────────────────────────────
-    let herbert = ufoid();
-    let dune = ufoid();
-    let mut ws = repo.pull(*branch_id).expect("pull");
-    let mut initial = TribleSet::new();
-    initial +=
-        entity! { &herbert @ literature::firstname: "Frank", literature::lastname: "Herbert" };
-    initial += entity! { &dune @ literature::title: "Dune", literature::author: &herbert };
-    ws.commit(initial, "initial");
-    repo.push(&mut ws).unwrap();
-
-    // ── first checkout: load everything ──────────────────────────────
-    // `full` starts as a clone of the first checkout.
-    let mut changed = repo
-        .pull(*branch_id)
-        .expect("pull")
-        .checkout(..)
-        .expect("checkout");
+    // On first observation, the whole set is new.
+    let mut changed = initial.into_facts();
     let mut full = changed.clone();
 
-    // On the first iteration, everything is "new".
     let all_titles: Vec<String> = find!(
         title: String,
         pattern_changes!(&full, &changed, [
@@ -55,25 +35,15 @@ fn main() {
     .collect();
     assert_eq!(all_titles, vec!["Dune".to_string()]);
 
-    // ── simulate an external update ──────────────────────────────────
-    let messiah = ufoid();
-    let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(
-        entity! { &messiah @ literature::title: "Dune Messiah", literature::author: &herbert },
-        "add Dune Messiah",
-    );
-    repo.push(&mut ws).unwrap();
+    // A later collection observation contributes one monotonic delta.
+    changed = entity! {
+        literature::title: "Dune Messiah",
+        literature::author: &herbert,
+    }
+    .into_facts();
+    full += changed.clone();
 
-    // ── incremental update ───────────────────────────────────────────
-    // Pull fresh, exclude all commits we've already processed.
-    changed = repo
-        .pull(*branch_id)
-        .expect("pull")
-        .checkout(full.commits()..)
-        .expect("delta");
-    full += &changed;
-
-    // Only Dune Messiah shows up — Dune was in the previous checkout.
+    // Only Dune Messiah shows up — Dune was in the previous observation.
     let new_titles: Vec<String> = find!(
         title: String,
         pattern_changes!(&full, &changed, [

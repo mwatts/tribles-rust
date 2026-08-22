@@ -9,8 +9,8 @@
 //! runner — raw observations only; statistics are the viewer's job.
 //!
 //! Groups:
-//! - `ladder/checkout/total` — `Workspace::checkout` of the first k
-//!   commits of the `--data` pile's branch at the `--rung` target.
+//! - `ladder/checkout/total` — immutable materialization of the first k
+//!   legacy commits of the `--data` pile's branch at the `--rung` target.
 //! - `arch/build_ram/total` — `SuccinctArchive<OrderedUniverse>` build
 //!   over the checked-out set.
 //! - `arch_regions/<query>/{confirms,max,p95,median,ge_threshold,
@@ -38,9 +38,8 @@
 //! Panics in any measure are caught (`quiet_catch`) and recorded as
 //! `panic:<reason>` outcomes; the run continues.
 //!
-//! !!! Always point `--data` at a clonefile copy (`cp -c`) of a
-//! dataset pile — the checkout phase's `Repository::new` appends a
-//! commit-metadata record to the pile file on open.
+//! Dataset pile acquisition is observational on current subjects. The metric
+//! name remains `checkout` so existing result series retain one stable key.
 //!
 //! A run is reproducible from its own results: the session records
 //! the subject rev, the full argv, and the machine's load at start,

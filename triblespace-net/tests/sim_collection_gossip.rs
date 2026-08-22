@@ -27,7 +27,7 @@ use triblespace_core::collection::{
     Collection, CollectionHandle, CollectionRecord, CollectionStore, VerifyingKey,
     simplearchive_union,
 };
-use triblespace_core::repo::{BlobStore, BlobStoreGet, PinStore, WantStore};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, WantStore};
 use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
@@ -151,7 +151,6 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
                     .is_err()
             );
             assert!(store.wants().unwrap().next().is_none());
-            assert!(store.pins().unwrap().next().is_none());
         }
 
         // Hosts periodically replay their live collection snapshot with a
@@ -270,6 +269,5 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
                 .is_err()
         );
         assert!(store.wants().unwrap().next().is_none());
-        assert!(store.pins().unwrap().next().is_none());
     });
 }

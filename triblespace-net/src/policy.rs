@@ -1559,9 +1559,9 @@ mod tests {
     use triblespace_core::blob::{Blob, IntoBlob};
     use triblespace_core::collection::CollectionStore;
     use triblespace_core::inline::TryToInline;
+    use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::pile::Pile;
-    use triblespace_core::repo::{BlobStorePut, PinStore};
 
     fn point_now() -> Inline<NsTAIInterval> {
         let now = hifitime::Epoch::now().expect("system time");
@@ -1608,7 +1608,6 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, first);
         assert_eq!(listed[0].status, STATUS_PENDING);
-        assert!(store.pins().unwrap().next().is_none());
         assert!(store.records().unwrap().next().is_some());
     }
 
