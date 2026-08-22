@@ -1,6 +1,4 @@
-use std::array::TryFromSliceError;
 use std::convert::Infallible;
-use std::convert::TryInto;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -13,12 +11,16 @@ use object_store::parse_url;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use object_store::PutMode;
-use object_store::UpdateVersion;
 use object_store::{self};
 use url::Url;
 
 use hex::FromHex;
 
+use super::async_store::{
+    AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
+    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionStore,
+};
+use super::{BlobInfo, BlobMetadata};
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
@@ -30,20 +32,11 @@ use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
-use crate::prelude::blobencodings::SimpleArchive;
 
-use super::async_store::{
-    AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
-    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionStore, AsyncPinStore,
-};
-use super::PushResult;
-use super::{BlobInfo, BlobMetadata};
-
-const BRANCH_INFIX: &str = "branches";
 const BLOB_INFIX: &str = "blobs";
 const COLLECTION_RECORD_INFIX: &str = "collection-records";
 
-/// Repository backed by an [`object_store`] compatible storage backend.
+/// Storage backed by an [`object_store`] compatible backend.
 ///
 /// All data is stored in an external service (e.g. S3, local filesystem)
 /// via the `object_store` crate, which is async at its core — so this
@@ -104,7 +97,7 @@ impl PartialEq for ObjectStoreReader {
 impl Eq for ObjectStoreReader {}
 
 impl ObjectStoreRemote {
-    /// Creates a repository pointing at the object store described by
+    /// Creates storage pointing at the object store described by
     /// `url`. The returned value is async-native — wrap it in
     /// [`Blocking`](super::async_store::Blocking) for synchronous use.
     pub fn with_url(url: &Url) -> Result<ObjectStoreRemote, object_store::Error> {
@@ -261,186 +254,6 @@ impl AsyncCollectionStore for ObjectStoreRemote {
                     }
                 }
                 Err(error) => Err(InsertCollectionRecordErr::Store(error)),
-            }
-        }
-    }
-}
-
-impl AsyncPinStore for ObjectStoreRemote {
-    type PinsError = ListBranchesErr;
-    type HeadError = PullBranchErr;
-    type UpdateError = PushBranchErr;
-
-    fn pins(
-        &mut self,
-    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
-    {
-        async move {
-            let prefix = self.prefix.child(BRANCH_INFIX);
-            let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
-                match r {
-                    Ok(meta) if meta.size == 0 => None, // tombstoned branch (0-byte object)
-                    Ok(meta) => {
-                        let name = match meta.location.filename() {
-                            Some(name) => name,
-                            None => return Some(Err(ListBranchesErr::NotAFile("no filename"))),
-                        };
-                        let digest = match RawId::from_hex(name) {
-                            Ok(digest) => digest,
-                            Err(e) => return Some(Err(ListBranchesErr::BadNameHex(e))),
-                        };
-                        let Some(id) = Id::new(digest) else {
-                            return Some(Err(ListBranchesErr::BadId));
-                        };
-                        Some(Ok(id))
-                    }
-                    Err(e) => Some(Err(ListBranchesErr::List(e))),
-                }
-            });
-            Ok(stream.collect().await)
-        }
-    }
-
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send
-    {
-        async move {
-            let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
-            match self.store.get(&path).await {
-                Ok(object) => {
-                    let bytes = object.bytes().await?;
-                    if bytes.is_empty() {
-                        return Ok(None);
-                    }
-                    let value = (&bytes[..]).try_into()?;
-                    Ok(Some(Inline::new(value)))
-                }
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(PullBranchErr::StoreErr(e)),
-            }
-        }
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
-        async move {
-            let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
-            // We encode "deleted branch" as an empty object. This lets us
-            // preserve CAS semantics for delete via conditional PUT
-            // (PutMode::Update), since `object_store` does not currently
-            // expose conditional delete.
-            //
-            // TODO: Once `object_store` supports conditional delete,
-            // migrate away from 0-byte tombstones and treat empty objects
-            // as corruption.
-            let new_bytes = match new {
-                Some(new) => bytes::Bytes::copy_from_slice(&new.raw),
-                None => bytes::Bytes::new(),
-            };
-
-            let parse_branch = |bytes: &bytes::Bytes| -> Result<
-                Option<Inline<Handle<SimpleArchive>>>,
-                TryFromSliceError,
-            > {
-                if bytes.is_empty() {
-                    return Ok(None);
-                }
-                let value = (&bytes[..]).try_into()?;
-                Ok(Some(Inline::new(value)))
-            };
-
-            if let Some(old_hash) = old {
-                let mut result = self.store.get(&path).await;
-                loop {
-                    match result {
-                        Ok(obj) => {
-                            let version = UpdateVersion {
-                                e_tag: obj.meta.e_tag.clone(),
-                                version: obj.meta.version.clone(),
-                            };
-                            let stored_bytes = obj.bytes().await?;
-                            let stored_hash = parse_branch(&stored_bytes)?;
-                            if stored_hash != Some(old_hash) {
-                                return Ok(PushResult::Conflict(stored_hash));
-                            }
-                            match self
-                                .store
-                                .put_opts(
-                                    &path,
-                                    new_bytes.clone().into(),
-                                    PutMode::Update(version).into(),
-                                )
-                                .await
-                            {
-                                Ok(_) => return Ok(PushResult::Success()),
-                                Err(object_store::Error::Precondition { .. }) => {
-                                    result = self.store.get(&path).await;
-                                    continue;
-                                }
-                                Err(e) => return Err(PushBranchErr::StoreErr(e)),
-                            }
-                        }
-                        Err(object_store::Error::NotFound { .. }) => {
-                            return Ok(PushResult::Conflict(None));
-                        }
-                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
-                    }
-                }
-            } else {
-                loop {
-                    match self
-                        .store
-                        .put_opts(&path, new_bytes.clone().into(), PutMode::Create.into())
-                        .await
-                    {
-                        Ok(_) => return Ok(PushResult::Success()),
-                        Err(object_store::Error::AlreadyExists { .. }) => {
-                            let mut result = self.store.get(&path).await;
-                            loop {
-                                match result {
-                                    Ok(obj) => {
-                                        let version = UpdateVersion {
-                                            e_tag: obj.meta.e_tag.clone(),
-                                            version: obj.meta.version.clone(),
-                                        };
-                                        let stored_bytes = obj.bytes().await?;
-                                        let stored_hash = parse_branch(&stored_bytes)?;
-                                        if stored_hash.is_some() {
-                                            return Ok(PushResult::Conflict(stored_hash));
-                                        }
-                                        match self
-                                            .store
-                                            .put_opts(
-                                                &path,
-                                                new_bytes.clone().into(),
-                                                PutMode::Update(version).into(),
-                                            )
-                                            .await
-                                        {
-                                            Ok(_) => return Ok(PushResult::Success()),
-                                            Err(object_store::Error::Precondition { .. }) => {
-                                                result = self.store.get(&path).await;
-                                                continue;
-                                            }
-                                            Err(e) => return Err(PushBranchErr::StoreErr(e)),
-                                        }
-                                    }
-                                    // raced with delete; retry create
-                                    Err(object_store::Error::NotFound { .. }) => break,
-                                    Err(e) => return Err(PushBranchErr::StoreErr(e)),
-                                }
-                            }
-                            continue;
-                        }
-                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
-                    }
-                }
             }
         }
     }
@@ -808,96 +621,6 @@ impl fmt::Display for ListBlobsErr {
 }
 impl Error for ListBlobsErr {}
 
-/// Error returned when listing branches from the object store.
-#[derive(Debug)]
-pub enum ListBranchesErr {
-    /// The underlying list operation failed.
-    List(object_store::Error),
-    /// A listed object had no filename component.
-    NotAFile(&'static str),
-    /// A listed object's filename was not valid hexadecimal.
-    BadNameHex(<RawId as FromHex>::Error),
-    /// The decoded bytes represent the nil identifier.
-    BadId,
-}
-
-impl fmt::Display for ListBranchesErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::List(e) => write!(f, "list failed: {e}"),
-            Self::NotAFile(e) => write!(f, "list failed: {e}"),
-            Self::BadNameHex(e) => write!(f, "list failed: {e}"),
-            Self::BadId => write!(f, "list failed: bad id"),
-        }
-    }
-}
-impl Error for ListBranchesErr {}
-
-/// Error returned when reading a branch head from the object store.
-#[derive(Debug)]
-pub enum PullBranchErr {
-    /// The stored bytes could not be parsed as a valid handle.
-    ValidationErr(TryFromSliceError),
-    /// The underlying object store operation failed.
-    StoreErr(object_store::Error),
-}
-
-impl fmt::Display for PullBranchErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::StoreErr(e) => write!(f, "pull failed: {e}"),
-            Self::ValidationErr(e) => write!(f, "pull failed: {e}"),
-        }
-    }
-}
-
-impl Error for PullBranchErr {}
-
-impl From<object_store::Error> for PullBranchErr {
-    fn from(err: object_store::Error) -> Self {
-        Self::StoreErr(err)
-    }
-}
-
-impl From<TryFromSliceError> for PullBranchErr {
-    fn from(err: TryFromSliceError) -> Self {
-        Self::ValidationErr(err)
-    }
-}
-
-/// Error returned when updating a branch head in the object store.
-#[derive(Debug)]
-pub enum PushBranchErr {
-    /// The stored bytes could not be parsed as a valid handle during a
-    /// compare-and-swap.
-    ValidationErr(TryFromSliceError),
-    /// The underlying object store operation failed.
-    StoreErr(object_store::Error),
-}
-
-impl fmt::Display for PushBranchErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::ValidationErr(e) => write!(f, "commit failed: {e}"),
-            Self::StoreErr(e) => write!(f, "commit failed: {e}"),
-        }
-    }
-}
-
-impl Error for PushBranchErr {}
-
-impl From<object_store::Error> for PushBranchErr {
-    fn from(err: object_store::Error) -> Self {
-        Self::StoreErr(err)
-    }
-}
-
-impl From<TryFromSliceError> for PushBranchErr {
-    fn from(err: TryFromSliceError) -> Self {
-        Self::ValidationErr(err)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,8 +629,6 @@ mod tests {
     use object_store::memory::InMemory;
 
     use crate::blob::encodings::rawbytes::RawBytes;
-    use ed25519_dalek::SigningKey;
-
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
         CollectionMerge, CollectionStore, COLLECTION_MERGE_BYTES_LEN,

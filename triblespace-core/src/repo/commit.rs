@@ -1,20 +1,13 @@
-use crate::inline::TryToInline;
-use crate::macros::entity;
 use crate::macros::pattern;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
-use ed25519_dalek::SigningKey;
 use ed25519_dalek::Verifier;
 use ed25519_dalek::VerifyingKey;
 use itertools::Itertools;
 
-use ed25519::signature::Signer;
-
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::Blob;
 use crate::inline::Inline;
-use crate::prelude::inlineencodings::Handle;
 use crate::query::find;
 use crate::trible::TribleSet;
 
@@ -33,66 +26,6 @@ impl From<SignatureError> for ValidationError {
     fn from(_: SignatureError) -> Self {
         ValidationError::FailedValidation
     }
-}
-
-/// Constructs commit metadata describing `content`, optional `metadata`, and its parent commits.
-///
-/// The resulting [`TribleSet`] is signed using `signing_key` when content is
-/// present, so that its authenticity can later be verified. If `msg` is
-/// provided it is stored as a long commit message via a UTF8String blob
-/// handle. If `metadata` is provided it is stored as a SimpleArchive handle.
-///
-/// The commit's entity id is derived intrinsically from the metadata's sorted,
-/// deduplicated `NIL || attribute || value` rows — so two commits with
-/// identical content, parents, and signatures collide on entity id and blob
-/// hash alike. This matters especially for **merge commits**
-/// (`content = None`): merges carry no author-specific bits (no signature,
-/// no timestamp, no random entity id), so two peers merging the same parent
-/// set produce bit-identical merge commits, and parallel-merge scenarios
-/// converge in zero extra rounds.
-pub fn commit_metadata(
-    signing_key: &SigningKey,
-    parents: impl IntoIterator<Item = Inline<Handle<SimpleArchive>>>,
-    msg: Option<Inline<Handle<UTF8String>>>,
-    content: Option<Blob<SimpleArchive>>,
-    metadata: Option<Inline<Handle<SimpleArchive>>>,
-) -> TribleSet {
-    // Authored commits carry a timestamp and a signature. Merge commits
-    // (content = None) carry neither, so they stay content-deterministic.
-    let (content_handle, signed_by, signature, created_at) = match content.as_ref() {
-        Some(blob) => {
-            // Through the clock seam (not Epoch::now directly) so
-            // simulated executions mint deterministic, virtual-time
-            // commit timestamps — bit-identical commits per seed.
-            let now = crate::clock::epoch_now();
-            let timestamp: Inline<_> = (now, now).try_to_inline().expect("point interval");
-            (
-                Some(blob.get_handle()),
-                Some(signing_key.verifying_key()),
-                Some(signing_key.sign(&blob.bytes)),
-                Some(timestamp),
-            )
-        }
-        None => (None, None, None, None),
-    };
-    let parents: Vec<_> = parents.into_iter().collect();
-
-    // `entity!` without an explicit `id @` prefix derives the entity id by
-    // hashing the sorted/deduped NIL || attr_id || value rows. The resulting
-    // commit is content-addressed at both the blob level (via
-    // SimpleArchive) and the entity-id level.
-    let fragment = entity! {
-        crate::metadata::created_at?: created_at,
-        super::content?: content_handle,
-        crate::attestation::signed_by?: signed_by,
-        crate::attestation::signature_r?: signature,
-        crate::attestation::signature_s?: signature,
-        super::message?: msg,
-        crate::metadata::archive?: metadata,
-        super::parent*: parents,
-    };
-
-    fragment.into()
 }
 
 /// Validates that the `metadata` blob genuinely signs the supplied commit

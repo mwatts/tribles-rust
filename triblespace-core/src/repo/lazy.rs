@@ -88,11 +88,9 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 
-use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
-use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
 
@@ -100,8 +98,8 @@ use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
 };
 use super::{
-    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinSnapshotSource, PinStore,
-    PushResult, StorageFlush, WantRequest, WantStore,
+    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinSnapshotSource,
+    StorageFlush, WantRequest, WantStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -411,40 +409,6 @@ where
             store: self.store.clone(),
             signal: self.signal.clone(),
         })
-    }
-}
-
-impl<S> PinStore for Lazy<S>
-where
-    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
-{
-    type PinsError = S::PinsError;
-    type HeadError = S::HeadError;
-    type UpdateError = S::UpdateError;
-    // Collected eagerly: the inner store's iterator would borrow the
-    // mutex guard, which cannot leave this call.
-    type ListIter<'a>
-        = std::vec::IntoIter<Result<Id, S::PinsError>>
-    where
-        S: 'a;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        let mut store = self.store.lock().expect("store mutex");
-        let ids: Vec<Result<Id, S::PinsError>> = store.pins()?.collect();
-        Ok(ids.into_iter())
-    }
-
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        self.store.lock().expect("store mutex").head(id)
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        self.store.lock().expect("store mutex").update(id, old, new)
     }
 }
 
@@ -872,6 +836,7 @@ mod tests {
     use crate::collection::reach;
     use crate::collection::records::CollectionName;
     use crate::collection::{CollectionHandle, CollectionMerge};
+    use crate::id::Id;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
     use ed25519_dalek::SigningKey;

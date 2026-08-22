@@ -29,15 +29,13 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
 
-use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{CollectionRecord, CollectionStore};
-use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
     BlobInfo, BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
-    BlobStorePut, PinStore, PushResult,
+    BlobStorePut,
 };
 // Only used by the `object-store`-gated `Blocking` impls below.
 #[cfg(feature = "object-store")]
@@ -157,37 +155,6 @@ pub trait AsyncCollectionStore {
         &mut self,
         record: CollectionRecord,
     ) -> impl Future<Output = Result<(), Self::InsertError>> + Send;
-}
-
-/// Async counterpart of [`PinStore`]: named,
-/// atomically-updatable handles to `SimpleArchive` blobs.
-pub trait AsyncPinStore {
-    /// Error type for listing pins.
-    type PinsError: Error + Debug + Send + Sync + 'static;
-    /// Error type for head lookups.
-    type HeadError: Error + Debug + Send + Sync + 'static;
-    /// Error type for CAS updates.
-    type UpdateError: Error + Debug + Send + Sync + 'static;
-
-    /// List every pin id (eagerly collected — see [`AsyncBlobStoreList`]
-    /// for why `Vec` over `Stream`).
-    fn pins(
-        &mut self,
-    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send;
-
-    /// Current head of a pin: `Some(head)`, `None` if tombstoned.
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send;
-
-    /// Compare-and-swap update of a pin's head.
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send;
 }
 
 /// Async counterpart of [`BlobStoreMeta`].
@@ -346,39 +313,6 @@ where
         record: CollectionRecord,
     ) -> impl Future<Output = Result<(), Self::InsertError>> + Send {
         async move { self.0.insert(record) }
-    }
-}
-
-impl<S> AsyncPinStore for SyncAsAsync<S>
-where
-    S: PinStore + Send,
-{
-    type PinsError = S::PinsError;
-    type HeadError = S::HeadError;
-    type UpdateError = S::UpdateError;
-
-    fn pins(
-        &mut self,
-    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
-    {
-        async move { self.0.pins().map(|it| it.collect()) }
-    }
-
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send
-    {
-        async move { self.0.head(id) }
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
-        async move { self.0.update(id, old, new) }
     }
 }
 
@@ -579,34 +513,6 @@ impl<A: AsyncCollectionStore> CollectionStore for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
-impl<A: AsyncPinStore> PinStore for Blocking<A> {
-    type PinsError = A::PinsError;
-    type HeadError = A::HeadError;
-    type UpdateError = A::UpdateError;
-    type ListIter<'a>
-        = std::vec::IntoIter<Result<Id, A::PinsError>>
-    where
-        A: 'a;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        self.rt.block_on(self.inner.pins()).map(|v| v.into_iter())
-    }
-
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        self.rt.block_on(self.inner.head(id))
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        self.rt.block_on(self.inner.update(id, old, new))
-    }
-}
-
-#[cfg(feature = "object-store")]
 impl<A: AsyncBlobStoreMeta> BlobStoreMeta for Blocking<A> {
     type MetaError = A::MetaError;
 
@@ -735,15 +641,6 @@ mod tests {
             .map(|info| info.handle.raw)
             .collect();
         assert!(listed.contains(&h1.raw) && listed.contains(&h2.raw));
-    }
-
-    #[test]
-    fn async_pins_on_fresh_repo_are_empty() {
-        let mut repo = SyncAsAsync::new(MemoryRepo::default());
-        let pins = block_on(repo.pins()).unwrap();
-        assert!(pins.is_empty(), "fresh repo has no pins");
-        let head = block_on(repo.head(Id::new([7u8; 16]).unwrap())).unwrap();
-        assert!(head.is_none(), "unknown pin has no head");
     }
 
     #[test]

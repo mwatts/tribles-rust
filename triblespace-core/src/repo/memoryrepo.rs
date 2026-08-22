@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
 
@@ -10,11 +9,8 @@ use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::collection::store::selectors_match_record;
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
-use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
-use crate::repo::PinSnapshotSource;
-use crate::repo::PinStore;
-use crate::repo::PushResult;
+use crate::repo::{PinSnapshot, PinSnapshotSource};
 use crate::repo::{WantRequest, WantStore};
 
 use crate::inline::encodings::hash::Handle;
@@ -28,8 +24,8 @@ use crate::inline::InlineEncoding;
 pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
-    /// Map from pin id to the handle of its current head (a commit for content branches; arbitrary SimpleArchive blob for other pin roles).
-    pub branches: HashMap<Id, Inline<Handle<SimpleArchive>>>,
+    /// Read-only legacy pin state, retained only for snapshot composition.
+    legacy_pins: PinSnapshot,
     /// LWW-resolved typed requests (see [`WantStore`]). In memory the
     /// last-writer-wins resolution is just insert/remove. Wants here are
     /// exactly as ephemeral as the blobs themselves — the trait is a
@@ -125,66 +121,11 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
     }
 }
 
-impl PinStore for MemoryRepo {
-    type PinsError = Infallible;
-    type HeadError = Infallible;
-    type UpdateError = Infallible;
-
-    type ListIter<'a> = std::vec::IntoIter<Result<Id, Self::PinsError>>;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        // Sorted (not HashMap order): pin iteration order feeds
-        // gossip-publish order and snapshot construction; HashMap's
-        // per-instance seed would make every run reorder them, which
-        // breaks deterministic simulation replay. Pile's PATCH-backed
-        // pins() is already byte-ordered for the same reason.
-        let mut ids: Vec<Id> = self.branches.keys().cloned().collect();
-        ids.sort();
-        Ok(ids.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
-    }
-
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        Ok(self.branches.get(&id).cloned())
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        let current = self.branches.get(&id);
-        if current != old.as_ref() {
-            return Ok(PushResult::Conflict(current.cloned()));
-        }
-        match new {
-            Some(new) => {
-                self.branches.insert(id, new);
-            }
-            None => {
-                self.branches.remove(&id);
-            }
-        }
-        Ok(PushResult::Success())
-    }
-}
-
 impl PinSnapshotSource for MemoryRepo {
     type PinSnapshotError = Infallible;
 
-    fn snapshot_pin_heads(&mut self) -> Result<crate::repo::PinSnapshot, Self::PinSnapshotError> {
-        let mut snapshot = crate::repo::PinSnapshot::new();
-        let mut ids: Vec<Id> = self.branches.keys().copied().collect();
-        ids.sort();
-        for id in ids {
-            let raw: [u8; 16] = id.into();
-            let head = *self
-                .branches
-                .get(&id)
-                .expect("pin disappeared while MemoryRepo was exclusively borrowed");
-            snapshot.insert(&crate::patch::Entry::with_value(&raw, head));
-        }
-        Ok(snapshot)
+    fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
+        Ok(self.legacy_pins.clone())
     }
 }
 
@@ -204,9 +145,8 @@ impl WantStore for MemoryRepo {
     }
 
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
-        // Sorted for the same reason as `pins()`: want enumeration
-        // feeds sync-daemon fetch order, and HashSet's per-instance seed
-        // would break deterministic simulation replay.
+        // Want enumeration feeds sync-daemon fetch order, and HashSet's
+        // per-instance seed would break deterministic simulation replay.
         let mut requests: Vec<WantRequest> = self.wants.iter().copied().collect();
         requests.sort();
         Ok(requests.into_iter().map(Ok).collect::<Vec<_>>().into_iter())

@@ -9,7 +9,7 @@
 //! also be physically removed from disk.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -22,24 +22,20 @@ use anybytes::Bytes;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
-use crate::id::{Id, RawId};
+use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, PATCH};
-
-use crate::prelude::blobencodings::SimpleArchive;
 
 use super::pile::{
     CollectionInsertError, GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError,
 };
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    PinSnapshotSource, PinStore, PushResult, RetentionRoots, StorageClose, TransferError,
-    WantRequest, WantStore,
+    PinSnapshotSource, RetentionRoots, StorageClose, TransferError, WantRequest, WantStore,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
-type StrongPins = PATCH<16, IdentitySchema, Inline<Handle<UnknownBlob>>>;
 type WantIndex = PATCH<INLINE_LEN, IdentitySchema, WantEntry>;
 
 #[derive(Debug, Clone, Copy)]
@@ -188,7 +184,6 @@ impl Generation {
 pub struct Yard {
     generations: Vec<Generation>,
     config: YardConfig,
-    strong_pins: StrongPins,
     want_state: Arc<Mutex<WantState>>,
 }
 
@@ -233,7 +228,6 @@ impl Yard {
         Ok(Self {
             generations,
             config,
-            strong_pins: StrongPins::new(),
             want_state: Arc::new(Mutex::new(WantState::default())),
         })
     }
@@ -340,7 +334,6 @@ impl Yard {
         Ok(Self {
             generations,
             config,
-            strong_pins: StrongPins::new(),
             want_state: Arc::new(Mutex::new(want_state)),
         })
     }
@@ -365,23 +358,6 @@ impl Yard {
         self.generations
             .get(level)
             .is_some_and(|g| g.segments.iter().any(|s| s.live.get(&handle.raw).is_some()))
-    }
-
-    /// Strongly pin a blob as the current head for `pin`.
-    pub fn pin_strong<S>(&mut self, pin: Id, handle: Inline<Handle<S>>)
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        let raw: RawId = pin.into();
-        self.strong_pins.replace(&Entry::with_value(&raw, handle));
-    }
-
-    /// Remove a strong pin.
-    pub fn unpin_strong(&mut self, pin: Id) {
-        let raw: RawId = pin.into();
-        self.strong_pins.remove(&raw);
     }
 
     /// Re-append the surviving want markers to the young generation's
@@ -417,8 +393,8 @@ impl Yard {
     /// commits add their resident data and metadata as recursive roots;
     /// invalid commits authenticate nothing, dangling dependencies remain for
     /// later synchronization, and unsigned equations add no roots. Pass an
-    /// empty [`RetentionRoots`] explicitly when those commits and legacy strong
-    /// pins are the only desired strong roots.
+    /// empty [`RetentionRoots`] explicitly when verified commits are the only
+    /// desired strong roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
         let opaque_records = self
             .opaque_record_count()
@@ -455,7 +431,7 @@ impl Yard {
     /// Strong survivors descend when a level exceeds its strong budget. The
     /// whole surviving tier moves together; wanted survivors remain evictable
     /// under the want budget after they descend. Pass an empty
-    /// [`RetentionRoots`] explicitly when legacy strong pins are the only
+    /// [`RetentionRoots`] explicitly when verified commits are the only
     /// desired strong roots.
     pub fn compact(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
         self.collect(retention)?;
@@ -657,32 +633,9 @@ impl Yard {
     }
 
     fn strong_keep_set(&self, reader: &YardReader, retention: &RetentionRoots) -> HandleSet {
-        let wants = self
-            .want_state
-            .lock()
-            .expect("want mutex poisoned")
-            .wants
-            .clone();
-        let roots: Vec<_> = (&self.strong_pins)
-            .into_iter()
-            .filter_map(|pin| self.strong_pins.get(pin).copied())
-            .collect();
-
         let mut keep = HandleSet::new();
-        let mut queue = VecDeque::from(roots);
-        while let Some(handle) = queue.pop_front() {
-            // Wants veto legacy strong-pin ownership and prune that whole
-            // subtree. This policy belongs to the collector, not to the
-            // structural BlobChildren view used by explicit retention.
-            if wants.get(&handle.raw).is_some() || keep.get(&handle.raw).is_some() {
-                continue;
-            }
-            keep.insert(&Entry::new(&handle.raw));
-            queue.extend(reader.children(handle));
-        }
-        // Explicit policy roots are not cache wants. They remain strong
-        // even if the same handle or an owned descendant also has a stale want
-        // marker.
+        // Explicit policy roots remain strong even if the same handle or an
+        // owned descendant also has a stale want marker.
         for handle in retention.expanded(reader) {
             keep.insert(&Entry::new(&handle.raw));
         }
@@ -826,63 +779,89 @@ impl CollectionStore for Yard {
     }
 }
 
-impl PinStore for Yard {
-    type PinsError = Infallible;
-    type HeadError = Infallible;
-    type UpdateError = Infallible;
+/// Failure to produce one unambiguous legacy pin snapshot from a yard.
+#[derive(Debug)]
+pub enum YardPinSnapshotError {
+    /// A generation pile could not refresh its legacy record projection.
+    Read {
+        /// Young-to-old generation index.
+        level: usize,
+        /// Segment index within the generation.
+        segment: usize,
+        /// Underlying pile read failure.
+        source: ReadError,
+    },
+    /// Legacy pin heads appeared outside the active young segment.
+    ///
+    /// Per-pile snapshots intentionally omit tombstones, so combining final
+    /// projections from multiple logs could resurrect an older head. Refuse
+    /// that ambiguous shape rather than inventing cross-file LWW order.
+    OutsideActiveSegment {
+        /// Young-to-old generation index.
+        level: usize,
+        /// Segment index within the generation.
+        segment: usize,
+    },
+}
 
-    type ListIter<'a> = std::vec::IntoIter<Result<Id, Infallible>>;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        // Byte-ordered (PATCH tree order) for deterministic iteration,
-        // mirroring Pile's PATCH-backed `pins`.
-        let ids: Vec<Result<Id, Infallible>> = self
-            .strong_pins
-            .clone()
-            .into_iter_ordered()
-            .map(|raw| Ok(Id::new(raw).expect("nil pin id in yard strong pins")))
-            .collect();
-        Ok(ids.into_iter())
-    }
-
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        let raw: RawId = id.into();
-        Ok(self.strong_pins.get(&raw).copied().map(Inline::transmute))
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        let raw: RawId = id.into();
-        let current: Option<Inline<Handle<SimpleArchive>>> =
-            self.strong_pins.get(&raw).copied().map(Inline::transmute);
-        if current != old {
-            return Ok(PushResult::Conflict(current));
+impl fmt::Display for YardPinSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read {
+                level,
+                segment,
+                source,
+            } => write!(
+                formatter,
+                "failed to read legacy pins from yard generation {level} segment {segment}: {source}"
+            ),
+            Self::OutsideActiveSegment { level, segment } => write!(
+                formatter,
+                "legacy pins outside active yard segment at generation {level} segment {segment}"
+            ),
         }
-        match new {
-            Some(new) => self.pin_strong(id, new),
-            None => self.unpin_strong(id),
+    }
+}
+
+impl Error for YardPinSnapshotError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::OutsideActiveSegment { .. } => None,
         }
-        Ok(PushResult::Success())
     }
 }
 
 impl PinSnapshotSource for Yard {
-    type PinSnapshotError = Infallible;
+    type PinSnapshotError = YardPinSnapshotError;
 
     fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
-        let mut snapshot = super::PinSnapshot::new();
-        for raw in self.strong_pins.iter_ordered() {
-            let head: Inline<Handle<SimpleArchive>> = self
-                .strong_pins
-                .get(raw)
-                .copied()
-                .expect("yard strong-pin snapshot key has no value")
-                .transmute();
-            snapshot.insert(&Entry::with_value(raw, head));
+        let active_segment = self.generations[0].segments.len() - 1;
+        let snapshot = self.generations[0].segments[active_segment]
+            .pile_mut()
+            .snapshot_pin_heads()
+            .map_err(|source| YardPinSnapshotError::Read {
+                level: 0,
+                segment: active_segment,
+                source,
+            })?;
+
+        for (level, generation) in self.generations.iter_mut().enumerate() {
+            for (segment, storage) in generation.segments.iter_mut().enumerate() {
+                if level == 0 && segment == active_segment {
+                    continue;
+                }
+                let pins = storage.pile_mut().snapshot_pin_heads().map_err(|source| {
+                    YardPinSnapshotError::Read {
+                        level,
+                        segment,
+                        source,
+                    }
+                })?;
+                if !pins.is_empty() {
+                    return Err(YardPinSnapshotError::OutsideActiveSegment { level, segment });
+                }
+            }
         }
         Ok(snapshot)
     }
@@ -1479,13 +1458,14 @@ impl Error for YardReclaimError {}
 mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
+    use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
         empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionMerge,
     };
     use crate::trible::TribleSet;
     use ed25519_dalek::SigningKey;
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::collections::BTreeSet;
 
     fn yard_with_paths(
         generations: usize,
@@ -1842,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn strong_keep_and_want_evict_gc() {
+    fn explicit_keep_and_want_evict_gc() {
         let (_dir, mut yard) = yard_with(
             1,
             YardConfig {
@@ -1858,44 +1838,14 @@ mod tests {
         yard.want(WantRequest::blob(wanted)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"wanted")).unwrap();
 
-        yard.pin_strong(pin_id(1), strong);
-        yard.collect(&RetentionRoots::new()).unwrap();
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(strong);
+        yard.collect(&roots).unwrap();
         let reader = yard.reader().unwrap();
 
         assert_eq!(get_raw(&reader, strong).unwrap(), raw_blob(b"strong"));
         assert!(matches!(
             get_raw(&reader, wanted),
-            Err(YardGetError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn want_veto_overrides_strong_reachability() {
-        let (_dir, mut yard) = yard_with(
-            1,
-            YardConfig {
-                want_budget: 0,
-                ..YardConfig::default()
-            },
-        );
-        // `child` enters the cache the demand-born way: wanted while
-        // absent (the want), then fetched. It is reachable from a strong
-        // parent, yet the wanted veto still makes it evictable.
-        let child = Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
-        yard.want(WantRequest::blob(child)).unwrap();
-        yard.put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
-            .unwrap();
-        let parent = yard
-            .put::<UnknownBlob, _>(Bytes::from_source(child.raw.to_vec()))
-            .unwrap();
-
-        yard.pin_strong(pin_id(2), parent);
-        yard.collect(&RetentionRoots::new()).unwrap();
-        let reader = yard.reader().unwrap();
-
-        assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
-        assert!(matches!(
-            reader.get::<Blob<UnknownBlob>, UnknownBlob>(child),
             Err(YardGetError::NotFound)
         ));
     }
@@ -1956,10 +1906,11 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(absent.raw.to_vec()))
             .unwrap();
 
-        yard.pin_strong(pin_id(3), parent);
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(parent);
         yard.want(WantRequest::blob(absent)).unwrap();
 
-        yard.collect(&RetentionRoots::new()).unwrap();
+        yard.collect(&roots).unwrap();
         let reader = yard.reader().unwrap();
 
         assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
@@ -1970,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_tenures_strong_and_lets_wants_descend() {
+    fn compaction_tenures_retained_and_lets_wants_descend() {
         let (_dir, mut yard) = yard_with(
             3,
             YardConfig {
@@ -1985,9 +1936,10 @@ mod tests {
         let wanted = Blob::<RawBytes>::new(raw_blob(b"cache")).get_handle();
         yard.want(WantRequest::blob(wanted)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
-        yard.pin_strong(pin_id(4), strong);
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(strong);
 
-        yard.compact(&RetentionRoots::new()).unwrap();
+        yard.compact(&roots).unwrap();
 
         // With a zero strong budget everything overflows downward; wanted now
         // rides the flow to the bottom alongside strong (it is not pinned to
@@ -2016,7 +1968,8 @@ mod tests {
         let strong = yard
             .put::<RawBytes, _>(Bytes::from_source(vec![b'S'; 512]))
             .unwrap();
-        yard.pin_strong(pin_id(7), strong);
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(strong);
         // Dead bytes physically present in gen 0, so there is genuinely
         // something for the merge to reclaim.
         let _dead = yard
@@ -2028,7 +1981,7 @@ mod tests {
             get_raw(&reader, strong).unwrap()
         };
 
-        yard.compact(&RetentionRoots::new()).unwrap();
+        yard.compact(&roots).unwrap();
 
         // No separate reclaim(): the merge itself recycled gen 0's pile, so it
         // is physically empty, while the live blob moved down to gen 1 and
@@ -2040,28 +1993,6 @@ mod tests {
     }
 
     #[test]
-    fn superseded_strong_head_becomes_droppable() {
-        let (_dir, mut yard) = yard_with(1, YardConfig::default());
-        let old = yard.put::<RawBytes, _>(raw_blob(b"old")).unwrap();
-        let pin = pin_id(5);
-
-        yard.pin_strong(pin, old);
-        yard.collect(&RetentionRoots::new()).unwrap();
-        assert_eq!(
-            get_raw(&yard.reader().unwrap(), old).unwrap(),
-            raw_blob(b"old")
-        );
-
-        let new = yard.put::<RawBytes, _>(raw_blob(b"new")).unwrap();
-        yard.pin_strong(pin, new);
-        yard.collect(&RetentionRoots::new()).unwrap();
-        let reader = yard.reader().unwrap();
-
-        assert!(matches!(get_raw(&reader, old), Err(YardGetError::NotFound)));
-        assert_eq!(get_raw(&reader, new).unwrap(), raw_blob(b"new"));
-    }
-
-    #[test]
     fn reclaim_rewrites_generation_to_live_blobs_only() {
         let (_dir, paths, mut yard) = yard_with_paths(
             1,
@@ -2070,6 +2001,7 @@ mod tests {
                 ..YardConfig::default()
             },
         );
+
         let live = yard
             .put::<RawBytes, _>(Bytes::from_source(vec![b'L'; 512]))
             .unwrap();
@@ -2077,8 +2009,9 @@ mod tests {
             .put::<RawBytes, _>(Bytes::from_source(vec![b'E'; 4096]))
             .unwrap();
 
-        yard.pin_strong(pin_id(6), live);
-        yard.collect(&RetentionRoots::new()).unwrap();
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(live);
+        yard.collect(&roots).unwrap();
         let before_size = fs::metadata(&paths[0]).unwrap().len();
         let before_count = pile_blob_count(&paths[0]);
         let before_reader = yard.reader().unwrap();
@@ -2173,7 +2106,7 @@ mod tests {
     }
 
     /// A young-pile rewrite (reclaim) must not drop the durable wanted set:
-    /// surviving pins are re-recorded into the rewritten pile.
+    /// surviving want markers are re-recorded into the rewritten pile.
     #[test]
     fn want_markers_survive_reclaim() {
         let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
@@ -2305,594 +2238,5 @@ mod tests {
         assert!(fs::metadata(&paths[0]).unwrap().len() < corrupt_len);
         let reader = repaired.reader().unwrap();
         assert_eq!(get_raw(&reader, live).unwrap(), raw_blob(b"survivor"));
-    }
-
-    /// Yard's PinStore impl: CAS semantics over the in-memory strong pins.
-    #[test]
-    fn yard_pinstore_cas_update() {
-        let (_dir, mut yard) = yard_with(1, YardConfig::default());
-        let h1 = yard.put::<RawBytes, _>(raw_blob(b"one")).unwrap();
-        let h2 = yard.put::<RawBytes, _>(raw_blob(b"two")).unwrap();
-        let pin = pin_id(9);
-
-        assert!(matches!(
-            yard.update(pin, None, Some(h1.transmute())).unwrap(),
-            PushResult::Success()
-        ));
-        assert_eq!(yard.head(pin).unwrap(), Some(h1.transmute()));
-        match yard
-            .update(pin, Some(h2.transmute()), Some(h2.transmute()))
-            .unwrap()
-        {
-            PushResult::Conflict(current) => assert_eq!(current, Some(h1.transmute())),
-            other => panic!("expected conflict, got {other:?}"),
-        }
-        let ids: Vec<_> = yard.pins().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(ids, vec![pin]);
-        assert!(matches!(
-            yard.update(pin, Some(h1.transmute()), None).unwrap(),
-            PushResult::Success()
-        ));
-        assert_eq!(yard.head(pin).unwrap(), None);
-    }
-
-    mod dst {
-        use super::*;
-
-        const GENERATIONS: usize = 4;
-        const SEEDS: u64 = 50;
-        const STEPS: usize = 64;
-        const PIN_COUNT: usize = 8;
-
-        type RawHandle = [u8; INLINE_LEN];
-
-        #[derive(Debug, Clone)]
-        struct Model {
-            handles: Vec<RawHandle>,
-            bytes: BTreeMap<RawHandle, Vec<u8>>,
-            absent: Vec<RawHandle>,
-        }
-
-        impl Model {
-            fn new() -> Self {
-                Self {
-                    handles: Vec::new(),
-                    bytes: BTreeMap::new(),
-                    absent: Vec::new(),
-                }
-            }
-        }
-
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        struct FinalState {
-            live_by_generation: Vec<Vec<RawHandle>>,
-            readable: Vec<RawHandle>,
-        }
-
-        #[derive(Clone, Copy, Debug)]
-        enum WantMode {
-            YoungOnly,
-            AnyKnownHandle,
-        }
-
-        #[derive(Clone, Copy, Debug)]
-        struct SplitMix64 {
-            state: u64,
-        }
-
-        impl SplitMix64 {
-            fn new(seed: u64) -> Self {
-                Self { state: seed }
-            }
-
-            fn next_u64(&mut self) -> u64 {
-                self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                let mut z = self.state;
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                z ^ (z >> 31)
-            }
-
-            fn index(&mut self, len: usize) -> usize {
-                (self.next_u64() as usize) % len
-            }
-
-            fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
-                self.next_u64() % denominator < numerator
-            }
-
-            fn fill(&mut self, bytes: &mut [u8]) {
-                for chunk in bytes.chunks_mut(8) {
-                    let random = self.next_u64().to_le_bytes();
-                    chunk.copy_from_slice(&random[..chunk.len()]);
-                }
-            }
-        }
-
-        fn unknown(raw: RawHandle) -> Inline<Handle<UnknownBlob>> {
-            Inline::<Handle<UnknownBlob>>::new(raw)
-        }
-
-        fn pin_id(index: usize) -> Id {
-            Id::new([(index as u8).wrapping_add(1); 16]).unwrap()
-        }
-
-        fn live_sets(yard: &Yard) -> Vec<BTreeSet<RawHandle>> {
-            yard.generations
-                .iter()
-                .map(|generation| {
-                    generation
-                        .segments
-                        .iter()
-                        .flat_map(|s| s.live.clone().into_iter())
-                        .collect()
-                })
-                .collect()
-        }
-
-        fn live_union(yard: &Yard) -> BTreeSet<RawHandle> {
-            live_sets(yard).into_iter().flatten().collect()
-        }
-
-        fn wants(yard: &Yard) -> BTreeMap<RawHandle, u64> {
-            let want_state = yard.want_state.lock().expect("want mutex poisoned");
-            want_state
-                .wants
-                .clone()
-                .into_iter()
-                .map(|raw| {
-                    let entry = want_state
-                        .wants
-                        .get(&raw)
-                        .expect("want key resolves")
-                        .last_used;
-                    (raw, entry)
-                })
-                .collect()
-        }
-
-        fn strong_roots(yard: &Yard) -> Vec<RawHandle> {
-            (&yard.strong_pins)
-                .into_iter()
-                .filter_map(|pin| yard.strong_pins.get(pin).copied())
-                .map(|handle| handle.raw)
-                .collect()
-        }
-
-        fn budgeted_wants(
-            wanted: &BTreeMap<RawHandle, u64>,
-            present: &BTreeSet<RawHandle>,
-            budget: usize,
-        ) -> BTreeSet<RawHandle> {
-            let mut candidates = wanted
-                .iter()
-                .filter(|(raw, _)| present.contains(*raw))
-                .map(|(raw, last_used)| (*raw, *last_used))
-                .collect::<Vec<_>>();
-            candidates.sort_by_key(|(_, last_used)| Reverse(*last_used));
-            candidates
-                .into_iter()
-                .take(budget)
-                .map(|(raw, _)| raw)
-                .collect()
-        }
-
-        fn child_chunks(bytes: &[u8]) -> impl Iterator<Item = RawHandle> + '_ {
-            bytes.chunks_exact(INLINE_LEN).map(|chunk| {
-                let mut raw = [0u8; INLINE_LEN];
-                raw.copy_from_slice(chunk);
-                raw
-            })
-        }
-
-        fn model_strong_keep(
-            roots: &[RawHandle],
-            present: &BTreeSet<RawHandle>,
-            wanted: &BTreeSet<RawHandle>,
-            model: &Model,
-        ) -> BTreeSet<RawHandle> {
-            let mut queue = VecDeque::new();
-            for root in roots {
-                if !wanted.contains(root) {
-                    queue.push_back(*root);
-                }
-            }
-
-            let mut keep = BTreeSet::new();
-            while let Some(raw) = queue.pop_front() {
-                if !keep.insert(raw) || !present.contains(&raw) {
-                    continue;
-                }
-
-                let Some(bytes) = model.bytes.get(&raw) else {
-                    continue;
-                };
-
-                for child in child_chunks(bytes) {
-                    if !wanted.contains(&child)
-                        && present.contains(&child)
-                        && model.bytes.contains_key(&child)
-                        && !keep.contains(&child)
-                    {
-                        queue.push_back(child);
-                    }
-                }
-            }
-
-            keep
-        }
-
-        fn expected_live_after_collect(yard: &Yard, model: &Model) -> BTreeSet<RawHandle> {
-            let present = live_union(yard);
-            let wants_with_lru = wants(yard);
-            let wanted = wants_with_lru.keys().copied().collect::<BTreeSet<_>>();
-            let strong_keep = model_strong_keep(&strong_roots(yard), &present, &wanted, model);
-            let want_keep = budgeted_wants(&wants_with_lru, &present, yard.config.want_budget);
-
-            present
-                .into_iter()
-                .filter(|raw| strong_keep.contains(raw) || want_keep.contains(raw))
-                .collect()
-        }
-
-        fn assert_readable_bytes(
-            reader: &YardReader,
-            raw: RawHandle,
-            expected: &[u8],
-            seed: u64,
-            step: usize,
-        ) {
-            let actual = reader
-                .get_local::<Bytes, UnknownBlob>(unknown(raw))
-                .unwrap_or_else(|| {
-                    panic!("seed {seed} step {step}: live handle {raw:02X?} was not readable")
-                })
-                .unwrap_or_else(|err| {
-                    panic!("seed {seed} step {step}: live handle {raw:02X?} errored: {err}")
-                });
-            assert_eq!(
-                actual.as_ref(),
-                expected,
-                "seed {seed} step {step}: readable bytes changed for {raw:02X?}"
-            );
-        }
-
-        fn assert_general_invariants(yard: &mut Yard, model: &Model, seed: u64, step: usize) {
-            let reader = yard.reader().unwrap();
-            let live = live_union(yard);
-            let wanted = wants(yard).keys().copied().collect::<BTreeSet<_>>();
-            let strong_keep = model_strong_keep(&strong_roots(yard), &live, &wanted, model);
-
-            for raw in strong_keep.intersection(&live) {
-                let expected = model
-                    .bytes
-                    .get(raw)
-                    .unwrap_or_else(|| panic!("seed {seed} step {step}: unknown live handle"));
-                assert_readable_bytes(&reader, *raw, expected, seed, step);
-            }
-
-            if let Some(raw) = wanted.intersection(&strong_keep).next() {
-                panic!("seed {seed} step {step}: want {raw:02X?} leaked into strong keep");
-            }
-
-            for raw in &live {
-                let expected = model.bytes.get(raw).unwrap_or_else(|| {
-                    panic!("seed {seed} step {step}: live set has unknown blob")
-                });
-                assert_readable_bytes(&reader, *raw, expected, seed, step);
-                let _ = reader.children(unknown(*raw));
-            }
-
-            for raw in model.bytes.keys().filter(|raw| !live.contains(*raw)) {
-                assert!(
-                    reader
-                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
-                        .is_none(),
-                    "seed {seed} step {step}: non-live handle {raw:02X?} was readable"
-                );
-            }
-
-            for raw in &model.absent {
-                assert!(
-                    reader
-                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
-                        .is_none(),
-                    "seed {seed} step {step}: absent handle {raw:02X?} became readable"
-                );
-                assert!(
-                    reader.children(unknown(*raw)).is_empty(),
-                    "seed {seed} step {step}: absent handle {raw:02X?} had children"
-                );
-            }
-        }
-
-        fn assert_exact_collect_result(
-            yard: &mut Yard,
-            expected: &BTreeSet<RawHandle>,
-            model: &Model,
-            seed: u64,
-            step: usize,
-        ) {
-            let actual = live_union(yard);
-            assert_eq!(
-                &actual, expected,
-                "seed {seed} step {step}: live union after collection did not equal keep set"
-            );
-            assert_general_invariants(yard, model, seed, step);
-        }
-
-        fn snapshot_readable(yard: &mut Yard) -> BTreeMap<RawHandle, Vec<u8>> {
-            let reader = yard.reader().unwrap();
-            live_union(yard)
-                .into_iter()
-                .filter_map(|raw| {
-                    reader
-                        .get_local::<Bytes, UnknownBlob>(unknown(raw))
-                        .map(|result| (raw, result.unwrap().as_ref().to_vec()))
-                })
-                .collect()
-        }
-
-        fn assert_reclaim_preserved(
-            yard: &mut Yard,
-            before: &BTreeMap<RawHandle, Vec<u8>>,
-            model: &Model,
-            seed: u64,
-            step: usize,
-        ) {
-            let reader = yard.reader().unwrap();
-            let live = live_union(yard);
-            for (raw, bytes) in before {
-                assert!(
-                    live.contains(raw),
-                    "seed {seed} step {step}: reclaim removed live handle {raw:02X?}"
-                );
-                assert_readable_bytes(&reader, *raw, bytes, seed, step);
-            }
-            for raw in model.bytes.keys().filter(|raw| !live.contains(*raw)) {
-                assert!(
-                    reader
-                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
-                        .is_none(),
-                    "seed {seed} step {step}: reclaim exposed non-live handle {raw:02X?}"
-                );
-            }
-        }
-
-        fn fresh_absent_handle(rng: &mut SplitMix64, model: &mut Model) -> RawHandle {
-            let mut bytes = vec![0u8; 48];
-            rng.fill(&mut bytes);
-            let handle = Blob::<UnknownBlob>::new(Bytes::from_source(bytes)).get_handle();
-            model.absent.push(handle.raw);
-            handle.raw
-        }
-
-        fn choose_known_or_absent(rng: &mut SplitMix64, model: &mut Model) -> RawHandle {
-            if !model.handles.is_empty() && rng.chance(3, 4) {
-                model.handles[rng.index(model.handles.len())]
-            } else {
-                fresh_absent_handle(rng, model)
-            }
-        }
-
-        fn choose_want_target(
-            yard: &Yard,
-            rng: &mut SplitMix64,
-            model: &mut Model,
-            mode: WantMode,
-        ) -> RawHandle {
-            match mode {
-                WantMode::AnyKnownHandle => choose_known_or_absent(rng, model),
-                WantMode::YoungOnly => {
-                    let young = live_sets(yard)
-                        .first()
-                        .into_iter()
-                        .flat_map(|set| set.iter())
-                        .copied()
-                        .collect::<Vec<_>>();
-                    if !young.is_empty() && rng.chance(3, 4) {
-                        young[rng.index(young.len())]
-                    } else {
-                        fresh_absent_handle(rng, model)
-                    }
-                }
-            }
-        }
-
-        fn put_fresh_blob(
-            yard: &mut Yard,
-            model: &mut Model,
-            rng: &mut SplitMix64,
-            seed: u64,
-            step: usize,
-        ) {
-            let mut bytes = Vec::new();
-            let mut unique = [0u8; INLINE_LEN];
-            unique[..8].copy_from_slice(&seed.to_le_bytes());
-            unique[8..16].copy_from_slice(&(step as u64).to_le_bytes());
-            unique[16..24].copy_from_slice(&rng.next_u64().to_le_bytes());
-            unique[24..32].copy_from_slice(&rng.next_u64().to_le_bytes());
-            bytes.extend_from_slice(&unique);
-
-            let child_count = if model.handles.is_empty() {
-                0
-            } else {
-                rng.index(4)
-            };
-            for _ in 0..child_count {
-                let child = choose_known_or_absent(rng, model);
-                bytes.extend_from_slice(&child);
-            }
-
-            let noise_len = rng.index(17);
-            let mut noise = vec![0u8; noise_len];
-            rng.fill(&mut noise);
-            bytes.extend_from_slice(&noise);
-
-            let blob = Blob::<UnknownBlob>::new(Bytes::from_source(bytes.clone()));
-            let expected = blob.get_handle();
-            let handle = if rng.chance(2, 3) {
-                yard.put::<UnknownBlob, _>(blob).unwrap()
-            } else {
-                let level = rng.index(GENERATIONS);
-                yard.put_in_generation::<UnknownBlob, _>(level, blob)
-                    .unwrap()
-            };
-            assert_eq!(handle.raw, expected.raw);
-
-            model.bytes.entry(handle.raw).or_insert(bytes);
-            if !model.handles.contains(&handle.raw) {
-                model.handles.push(handle.raw);
-            }
-        }
-
-        fn run_one(seed: u64, want_mode: WantMode) -> FinalState {
-            let (_dir, mut yard) = yard_with(
-                GENERATIONS,
-                YardConfig {
-                    want_budget: 3,
-                    strong_level_budget: 2,
-                    fanout: 2,
-                },
-            );
-            let mut rng = SplitMix64::new(seed);
-            let mut model = Model::new();
-
-            for step in 0..STEPS {
-                match rng.index(9) {
-                    0 | 1 => put_fresh_blob(&mut yard, &mut model, &mut rng, seed, step),
-                    2 => {
-                        if !model.handles.is_empty() {
-                            let pin = pin_id(rng.index(PIN_COUNT));
-                            let raw = model.handles[rng.index(model.handles.len())];
-                            yard.pin_strong(pin, unknown(raw));
-                        }
-                    }
-                    3 => yard.unpin_strong(pin_id(rng.index(PIN_COUNT))),
-                    4 => {
-                        let raw = choose_want_target(&yard, &mut rng, &mut model, want_mode);
-                        yard.want(WantRequest::blob(unknown(raw))).unwrap();
-                    }
-                    5 => {
-                        let raw = choose_known_or_absent(&mut rng, &mut model);
-                        let reader = yard.reader().unwrap();
-                        let result = reader.get::<Bytes, UnknownBlob>(unknown(raw));
-                        if !live_union(&yard).contains(&raw) {
-                            assert!(
-                                matches!(result, Err(YardGetError::NotFound)),
-                                "seed {seed} step {step}: absent get did not miss cleanly"
-                            );
-                        }
-                    }
-                    6 => {
-                        let expected = expected_live_after_collect(&yard, &model);
-                        yard.collect(&RetentionRoots::new()).unwrap();
-                        assert_exact_collect_result(&mut yard, &expected, &model, seed, step);
-                    }
-                    7 => {
-                        let expected = expected_live_after_collect(&yard, &model);
-                        yard.compact(&RetentionRoots::new()).unwrap();
-                        assert_exact_collect_result(&mut yard, &expected, &model, seed, step);
-                    }
-                    8 => {
-                        let before = snapshot_readable(&mut yard);
-                        yard.reclaim().unwrap();
-                        assert_reclaim_preserved(&mut yard, &before, &model, seed, step);
-                    }
-                    _ => unreachable!(),
-                }
-
-                assert_general_invariants(&mut yard, &model, seed, step);
-            }
-
-            let reader = yard.reader().unwrap();
-            let mut live_by_generation = live_sets(&yard)
-                .into_iter()
-                .map(|set| set.into_iter().collect::<Vec<_>>())
-                .collect::<Vec<_>>();
-            for generation in &mut live_by_generation {
-                generation.sort();
-            }
-            let mut readable = live_union(&yard)
-                .into_iter()
-                .filter(|raw| {
-                    reader
-                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
-                        .is_some()
-                })
-                .collect::<Vec<_>>();
-            readable.sort();
-
-            FinalState {
-                live_by_generation,
-                readable,
-            }
-        }
-
-        #[test]
-        fn seeded_yard_property_sequences() {
-            for seed in 0..SEEDS {
-                run_one(0xC0DE_0000_0000_0000 ^ seed, WantMode::YoungOnly);
-            }
-        }
-
-        #[test]
-        fn seeded_yard_property_sequences_are_deterministic() {
-            for seed in [0, 13, 49] {
-                let seed = 0xD57D_0000_0000_0000 ^ seed;
-                assert_eq!(
-                    run_one(seed, WantMode::YoungOnly),
-                    run_one(seed, WantMode::YoungOnly),
-                    "seed {seed} diverged"
-                );
-            }
-        }
-
-        #[test]
-        fn seeded_yard_property_sequences_include_resident_wants() {
-            // Exercise explicit wants for absent, young, and already-tenured
-            // blobs. The model treats every assertion uniformly and verifies
-            // the same bounded cache policy after collection.
-            for seed in [0, 2, 7, 13, 31, 49] {
-                run_one(0xC0DE_0000_0000_0000 ^ seed, WantMode::AnyKnownHandle);
-            }
-        }
-
-        #[test]
-        fn explicit_want_on_resident_blob_is_recorded_and_budgeted() {
-            let (_dir, mut yard) = yard_with(
-                3,
-                YardConfig {
-                    want_budget: 0,
-                    strong_level_budget: 0,
-                    fanout: 1,
-                },
-            );
-            let tenured = yard
-                .put::<UnknownBlob, _>(Bytes::from_source(b"tenured then wanted".to_vec()))
-                .unwrap();
-
-            yard.pin_strong(pin_id(0), tenured);
-            yard.compact(&RetentionRoots::new()).unwrap();
-            assert!(yard.contains_in_generation(2, tenured));
-
-            // Explicit interest is recorded even though the bytes are already
-            // present. With a zero want budget, that makes the previously
-            // strong resident eligible for eviction on the next collection.
-            yard.want(WantRequest::blob(tenured)).unwrap();
-            assert_eq!(
-                yard.wants()
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap(),
-                vec![WantRequest::blob(tenured)]
-            );
-            yard.collect(&RetentionRoots::new()).unwrap();
-
-            assert!(
-                !yard.contains_in_generation(2, tenured),
-                "zero want budget must evict explicitly wanted resident content"
-            );
-        }
     }
 }

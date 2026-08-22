@@ -437,7 +437,7 @@ mod tests {
         ));
     }
 
-    /// Compile-time proof that the native API has no PinStore requirement.
+    /// Compile-time proof that the native API has no legacy pin requirement.
     #[derive(Default)]
     struct CollectionOnly {
         repo: MemoryRepo,

@@ -2867,8 +2867,6 @@ use super::BlobStore;
 use super::BlobStoreGet;
 use super::BlobStoreList;
 use super::BlobStorePut;
-use super::PinStore;
-use super::PushResult;
 use super::WantStore;
 
 /// Iterator returned by [`PileReader::iter`].
@@ -2964,27 +2962,6 @@ impl BlobStoreList for PileReader {
             reader: self.clone(),
             inner: self.blobs.difference(&old.blobs).into_iter(),
         }
-    }
-}
-
-/// Iterator over pin ids stored in the pile's PATCH, using the PATCH's
-/// built-in key iterator to avoid allocating a full Vec of ids.
-pub struct PileBranchStoreIter {
-    inner:
-        crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-}
-
-impl Iterator for PileBranchStoreIter {
-    type Item = Result<Id, ReadError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // The owned ordered iterator yields key arrays ([u8; 16]) by value.
-        // The `apply_next` path guarantees that a nil (all-zero) pin id
-        // is never inserted into the PATCH; therefore we can safely `expect`
-        // a valid `Id` here and treat a nil id as an invariant violation.
-        let key = self.inner.next()?;
-        let id = Id::new(key).expect("nil pin id inserted into patch");
-        Some(Ok(id))
     }
 }
 
@@ -3316,115 +3293,83 @@ impl Pile {
     }
 }
 
-impl PinStore for Pile {
-    type PinsError = ReadError;
-    // Pulling a head may require refreshing the pile which can fail; expose
-    // the underlying `ReadError` so callers can surface refresh failures.
-    type HeadError = ReadError;
-    type UpdateError = PileWriteError;
-
-    type ListIter<'a> = PileBranchStoreIter;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        // Ensure newly appended records are applied before enumerating
-        // branches so external writers are visible to callers.
-        self.refresh()?;
-        // Create an owned ordered iterator from the PATCH clone so the
-        // returned iterator does not borrow from `self.branches`. This avoids
-        // allocating a temporary Vec of ids while preserving tree-order.
-        let cloned = self.branches.clone();
-        let inner = cloned.into_iter_ordered();
-        Ok(PileBranchStoreIter { inner })
-    }
-
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        // Ensure newly appended records are applied before returning the head.
-        // This keeps callers up-to-date with any external writers that appended
-        // to the pile file.
-        self.refresh()?;
-        Ok(self.branches.get(&id.into()).copied())
-    }
-
-    /// Updates the head of `id` to `new` if it matches `old`.
+impl Pile {
+    /// Append one legacy pin occurrence while rewriting an existing pile.
     ///
-    /// This method does not verify that `new` refers to a blob stored in the pile,
-    /// allowing piles to reference external data and serve as head-only stores.
-    ///
-    /// The update is written to the pile but is **not durable** until
-    /// [`Pile::flush`] is called. Callers must explicitly flush to ensure
-    /// pin updates survive crashes.
-    ///
-    /// After the header is written, the record is read back with `apply_next`
-    /// while still holding the lock, ensuring the update is applied without an
-    /// additional refresh pass.
-    fn update(
+    /// This is deliberately private and unconditional: reframe must replay
+    /// head and tombstone occurrences in source order so concatenating the
+    /// rewritten log preserves the old LWW semantics. It is not a CAS surface
+    /// and must never be used to publish new mutable application state.
+    fn append_legacy_pin_record(
         &mut self,
         id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<super::PushResult, Self::UpdateError> {
+        head: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Result<(), PileWriteError> {
         self.file.lock()?;
-        let res = (|| {
+        let result = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
-            let current_hash = self.branches.get(&id.into()).copied();
-            if current_hash != old {
-                return Ok(PushResult::Conflict(current_hash));
-            }
-
-            // No-op short-circuit: if the requested head is already
-            // what we have, return success without appending a record.
-            // The pin table is logically a (id → head) map; a write
-            // where new == current carries no information and would
-            // just churn the append-only file. Steady-state gossip
-            // rebroadcasts of unchanged heads (e.g. tracking-pin
-            // re-publication at 30s ticks) hit this path heavily.
-            if current_hash == new {
-                return Ok(PushResult::Success());
-            }
-
-            // Enveloped branch/tombstone records: fixed 256-byte header, no data, so the
-            // record is exactly one 256-byte unit — keeping a current pile
-            // 256-aligned throughout (branches write under the exclusive lock).
             self.dirty = true;
-            let (expected, write_res) = match new {
-                Some(new) => {
-                    let header = PinHeadRecordHeader::new(id, new);
-                    (ENVELOPE_HEADER_LEN, self.file.write(header.as_bytes()))
-                }
-                None => {
-                    let header = PinTombstoneRecordHeader::new(id);
-                    (ENVELOPE_HEADER_LEN, self.file.write(header.as_bytes()))
-                }
-            };
-            let written = match write_res {
-                Ok(n) => n,
-                Err(e) => return Err(PileWriteError::IoError(e)),
-            };
-            if written != expected {
+            let written = match head {
+                Some(head) => self
+                    .file
+                    .write(PinHeadRecordHeader::new(id, head).as_bytes()),
+                None => self
+                    .file
+                    .write(PinTombstoneRecordHeader::new(id).as_bytes()),
+            }
+            .map_err(PileWriteError::IoError)?;
+            if written != ENVELOPE_HEADER_LEN {
                 return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
-                    "failed to write branch header",
+                    "failed to write legacy pin header",
                 )));
             }
             match self.apply_next().map_err(PileWriteError::from)? {
-                Some(Applied::Branch { id: bid, hash }) if matches!(new, Some(new) if bid == id && hash == new.into()) => {
-                    Ok(PushResult::Success())
+                Some(Applied::Branch {
+                    id: actual_id,
+                    hash,
+                }) if matches!(head, Some(expected) if actual_id == id && hash == expected.into()) => {
+                    Ok(())
                 }
-                Some(Applied::BranchTombstone { id: bid }) if new.is_none() && bid == id => {
-                    Ok(PushResult::Success())
+                Some(Applied::BranchTombstone { id: actual_id })
+                    if head.is_none() && actual_id == id =>
+                {
+                    Ok(())
                 }
                 Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
-                    "unexpected record after branch write",
+                    "unexpected record after legacy pin restoration",
                 ))),
                 None => Err(PileWriteError::IoError(std::io::Error::other(
-                    "branch missing after write",
+                    "legacy pin record missing after restoration",
                 ))),
             }
         })();
-        let unlock_res = self.file.unlock();
-        let out = res?;
-        unlock_res?;
-        Ok(out)
+        let unlock_result = self.file.unlock();
+        result?;
+        unlock_result?;
+        Ok(())
+    }
+
+    /// Private legacy-record constructor for tests that exercise decoding,
+    /// reframe, or physical retention. `previous` documents fixture order but
+    /// grants no compare-and-swap behavior.
+    #[cfg(test)]
+    fn append_legacy_pin_for_test(
+        &mut self,
+        id: Id,
+        _previous: Option<Inline<Handle<SimpleArchive>>>,
+        head: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Result<(), PileWriteError> {
+        self.append_legacy_pin_record(id, head)
+    }
+
+    #[cfg(test)]
+    fn legacy_pin_head_for_test(
+        &mut self,
+        id: Id,
+    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, ReadError> {
+        self.refresh()?;
+        Ok(self.branches.get(&id.into()).copied())
     }
 }
 
@@ -3447,11 +3392,10 @@ impl Iterator for PileWantIter {
 
 impl Pile {
     /// Append an enveloped typed want assertion or retraction.
-    /// Mirrors [`PinStore::update`]'s write path:
-    /// exclusive lock, refresh, no-op short-circuit when the LWW state already
+    /// Uses an exclusive lock, refresh, and no-op short-circuit when the LWW state already
     /// matches, a single fixed 256-byte header write (keeping a current pile
     /// 256-aligned), and an `apply_next` read-back while still holding the
-    /// lock. Like branch updates, the record is **not durable** until
+    /// lock. Like other header appends, the record is **not durable** until
     /// [`Pile::flush`] is called.
     fn write_want_marker(
         &mut self,
@@ -3730,11 +3674,6 @@ pub fn reframe_into(
 
     let mut records = PileRecords::open(source).map_err(PileReframeError::Source)?;
     let mut stats = PileReframeStats::default();
-    // Pins are last-writer-wins, and `update` is a compare-and-set, so the
-    // replay has to carry the head it just wrote forward as the expectation
-    // for the next write to the same pin.
-    let mut heads: HashMap<RawId, Option<Inline<Handle<SimpleArchive>>>> = HashMap::new();
-
     loop {
         let record = match records.next() {
             None => break,
@@ -3763,21 +3702,15 @@ pub fn reframe_into(
                 stats.blobs += 1;
             }
             PileRecordContent::Branch { branch_id, head } => {
-                let key: RawId = branch_id.into();
-                let previous = heads.get(&key).copied().flatten();
                 destination
-                    .update(branch_id, previous, Some(head))
+                    .append_legacy_pin_record(branch_id, Some(head))
                     .map_err(PileReframeError::Pin)?;
-                heads.insert(key, Some(head));
                 stats.pin_updates += 1;
             }
             PileRecordContent::BranchTombstone { branch_id } => {
-                let key: RawId = branch_id.into();
-                let previous = heads.get(&key).copied().flatten();
                 destination
-                    .update(branch_id, previous, None)
+                    .append_legacy_pin_record(branch_id, None)
                     .map_err(PileReframeError::Pin)?;
-                heads.insert(key, None);
                 stats.pin_updates += 1;
             }
             PileRecordContent::WeakPin { handle } => {
@@ -3982,20 +3915,26 @@ impl Pile {
             copied.map_err(PileRewriteError::Transfer)?;
         }
 
+        destination
+            .refresh()
+            .map_err(PileWriteError::from)
+            .map_err(PileRewriteError::StrongPin)?;
         for raw in &strong_pins {
             let id = Id::new(*raw).expect("Pile never stores a nil strong-pin id");
             let head = *strong_pins
                 .get(raw)
                 .expect("pin key from snapshot must retain its value");
-            match destination
-                .update(id, None, Some(head))
-                .map_err(PileRewriteError::StrongPin)?
-            {
-                PushResult::Success() => {}
-                PushResult::Conflict(Some(current)) if current == head => {}
-                PushResult::Conflict(current) => {
-                    return Err(PileRewriteError::StrongPinConflict { id, current });
+            match destination.branches.get(raw).copied() {
+                Some(current) if current == head => {}
+                Some(current) => {
+                    return Err(PileRewriteError::StrongPinConflict {
+                        id,
+                        current: Some(current),
+                    });
                 }
+                None => destination
+                    .append_legacy_pin_record(id, Some(head))
+                    .map_err(PileRewriteError::StrongPin)?,
             }
         }
 
@@ -4052,7 +3991,7 @@ mod tests {
     use crate::macros::entity;
     use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
-    use crate::repo::{BlobStoreMeta, PushResult, RetentionRoots, StorageClose};
+    use crate::repo::{BlobStoreMeta, RetentionRoots, StorageClose};
     use crate::trible::TribleSet;
 
     fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
@@ -4296,14 +4235,10 @@ mod tests {
 
         let branch_id = Id::new([1; 16]).unwrap();
         let branch_head = Inline::<Handle<SimpleArchive>>::new([2; 32]);
-        assert!(matches!(
-            pile.update(branch_id, None, Some(branch_head)).unwrap(),
-            PushResult::Success()
-        ));
-        assert!(matches!(
-            pile.update(branch_id, Some(branch_head), None).unwrap(),
-            PushResult::Success()
-        ));
+        pile.append_legacy_pin_for_test(branch_id, None, Some(branch_head))
+            .unwrap();
+        pile.append_legacy_pin_for_test(branch_id, Some(branch_head), None)
+            .unwrap();
 
         let wanted = Inline::<Handle<UnknownBlob>>::new([5; 32]);
         pile.want(WantRequest::blob(wanted)).unwrap();
@@ -4355,7 +4290,7 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         let fetched: Blob<UnknownBlob> = reopened.reader().unwrap().get(blob).unwrap();
         assert_eq!(fetched.bytes.as_ref(), blob_data);
-        assert_eq!(reopened.head(branch_id).unwrap(), None);
+        assert_eq!(reopened.legacy_pin_head_for_test(branch_id).unwrap(), None);
         assert!(reopened.wants().unwrap().next().is_none());
         assert_eq!(
             reopened
@@ -4407,10 +4342,18 @@ mod tests {
         let cleared = Id::new([22; 16]).unwrap();
         let first = Inline::<Handle<SimpleArchive>>::new([31; 32]);
         let second = Inline::<Handle<SimpleArchive>>::new([32; 32]);
-        source.update(moved, None, Some(first)).unwrap();
-        source.update(moved, Some(first), Some(second)).unwrap();
-        source.update(cleared, None, Some(first)).unwrap();
-        source.update(cleared, Some(first), None).unwrap();
+        source
+            .append_legacy_pin_for_test(moved, None, Some(first))
+            .unwrap();
+        source
+            .append_legacy_pin_for_test(moved, Some(first), Some(second))
+            .unwrap();
+        source
+            .append_legacy_pin_for_test(cleared, None, Some(first))
+            .unwrap();
+        source
+            .append_legacy_pin_for_test(cleared, Some(first), None)
+            .unwrap();
 
         let kept_want = Inline::<Handle<UnknownBlob>>::new([41; 32]);
         let dropped_want = Inline::<Handle<UnknownBlob>>::new([42; 32]);
@@ -4453,8 +4396,11 @@ mod tests {
         let mut result = Pile::open(&dest_path).unwrap();
         result.refresh().unwrap();
         assert_eq!(result.opaque_record_count().unwrap(), 0);
-        assert_eq!(result.head(moved).unwrap(), Some(second));
-        assert_eq!(result.head(cleared).unwrap(), None);
+        assert_eq!(
+            result.legacy_pin_head_for_test(moved).unwrap(),
+            Some(second)
+        );
+        assert_eq!(result.legacy_pin_head_for_test(cleared).unwrap(), None);
         assert_eq!(
             result
                 .wants()
@@ -4547,7 +4493,7 @@ mod tests {
         assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 37);
 
         let branch_id = Id::new([3; 16]).unwrap();
-        pile.update(branch_id, None, Some(Inline::new([4; 32])))
+        pile.append_legacy_pin_for_test(branch_id, None, Some(Inline::new([4; 32])))
             .unwrap();
         pile.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
             [5; 32],
@@ -4698,7 +4644,7 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(known_payload.clone()))
             .unwrap();
         let branch_id = Id::new([9; 16]).unwrap();
-        pile.update(branch_id, None, Some(known.transmute()))
+        pile.append_legacy_pin_for_test(branch_id, None, Some(known.transmute()))
             .unwrap();
         pile.close().unwrap();
 
@@ -4741,7 +4687,10 @@ mod tests {
         assert_eq!(reopened.opaque_records, 2);
         let fetched: Blob<UnknownBlob> = reopened.reader().unwrap().get(known).unwrap();
         assert_eq!(fetched.bytes.as_ref(), known_payload);
-        assert_eq!(reopened.head(branch_id).unwrap(), Some(known.transmute()));
+        assert_eq!(
+            reopened.legacy_pin_head_for_test(branch_id).unwrap(),
+            Some(known.transmute())
+        );
         reopened.close().unwrap();
     }
 
@@ -4824,17 +4773,17 @@ mod tests {
         let branch_cleared = Id::new([11; 16]).unwrap();
         let branch_restored = Id::new([12; 16]).unwrap();
         let branch_head = Inline::<Handle<SimpleArchive>>::new([13; 32]);
-        pile.update(branch_cleared, None, Some(branch_head))
+        pile.append_legacy_pin_for_test(branch_cleared, None, Some(branch_head))
             .unwrap();
         append_test_bytes(&path, &opaque);
-        pile.update(branch_cleared, Some(branch_head), None)
+        pile.append_legacy_pin_for_test(branch_cleared, Some(branch_head), None)
             .unwrap();
         append_test_bytes(
             &path,
             PinTombstoneRecordHeader::new(branch_restored).as_bytes(),
         );
         append_test_bytes(&path, &opaque);
-        pile.update(branch_restored, None, Some(branch_head))
+        pile.append_legacy_pin_for_test(branch_restored, None, Some(branch_head))
             .unwrap();
 
         let want_retracted = Inline::<Handle<UnknownBlob>>::new([17; 32]);
@@ -4853,8 +4802,14 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         reopened.refresh().unwrap();
         assert_eq!(reopened.opaque_record_count().unwrap(), 4);
-        assert_eq!(reopened.head(branch_cleared).unwrap(), None);
-        assert_eq!(reopened.head(branch_restored).unwrap(), Some(branch_head));
+        assert_eq!(
+            reopened.legacy_pin_head_for_test(branch_cleared).unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened.legacy_pin_head_for_test(branch_restored).unwrap(),
+            Some(branch_head)
+        );
         let wants = reopened
             .wants()
             .unwrap()
@@ -5408,10 +5363,9 @@ mod tests {
             )))
             .unwrap();
         let pin_id = Id::new([9; 16]).unwrap();
-        assert!(matches!(
-            source.update(pin_id, None, Some(legacy_head)).unwrap(),
-            PushResult::Success()
-        ));
+        source
+            .append_legacy_pin_for_test(pin_id, None, Some(legacy_head))
+            .unwrap();
 
         let collection_attachment = source
             .put::<UnknownBlob, _>(Bytes::from_source(b"collection attachment".to_vec()))
@@ -5466,7 +5420,10 @@ mod tests {
         for collected in [obsolete_input, want_target, orphan] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(collected).is_err());
         }
-        assert_eq!(destination.head(pin_id).unwrap(), Some(legacy_head));
+        assert_eq!(
+            destination.legacy_pin_head_for_test(pin_id).unwrap(),
+            Some(legacy_head)
+        );
         assert_eq!(
             destination
                 .wants()
@@ -6438,68 +6395,6 @@ mod tests {
     }
 
     #[test]
-    fn close_flushes_only_mutations_by_this_handle() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-        let mut observer = Pile::open(&path).unwrap();
-        let mut writer = Pile::open(&path).unwrap();
-
-        assert!(!observer.dirty);
-        assert!(!writer.dirty);
-
-        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![4u8; 32]));
-        let handle = writer.put::<UnknownBlob, _>(blob).unwrap();
-        assert!(writer.dirty);
-
-        // Replaying an append made through another descriptor must not make a
-        // read-only observer responsible for a whole-file sync.
-        observer.refresh().unwrap();
-        assert!(!observer.dirty);
-        observer.flush_if_dirty().unwrap();
-        assert!(!observer.dirty);
-
-        writer.flush().unwrap();
-        assert!(!writer.dirty);
-        writer.flush().unwrap();
-        assert!(!writer.dirty);
-
-        let branch = Id::new([9u8; 16]).unwrap();
-        writer
-            .update(branch, None, Some(handle.transmute()))
-            .unwrap();
-        assert!(writer.dirty);
-        writer.flush().unwrap();
-        assert!(!writer.dirty);
-
-        // Conflicts and logical no-ops append nothing.
-        assert!(matches!(
-            writer
-                .update(branch, None, Some(handle.transmute()))
-                .unwrap(),
-            PushResult::Conflict(_)
-        ));
-        assert!(!writer.dirty);
-        writer
-            .update(branch, Some(handle.transmute()), Some(handle.transmute()))
-            .unwrap();
-        assert!(!writer.dirty);
-
-        writer.want(WantRequest::blob(handle)).unwrap();
-        assert!(writer.dirty);
-        writer.flush().unwrap();
-        assert!(!writer.dirty);
-        writer.want(WantRequest::blob(handle)).unwrap();
-        assert!(!writer.dirty);
-        writer.unwant(WantRequest::blob(handle)).unwrap();
-        assert!(writer.dirty);
-        writer.flush().unwrap();
-        assert!(!writer.dirty);
-
-        observer.close().unwrap();
-        writer.close().unwrap();
-    }
-
-    #[test]
     fn iter_lists_all_blobs_handles() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
@@ -6676,7 +6571,8 @@ mod tests {
 
         let branch_id = Id::new([1; 16]).unwrap();
         let head = Inline::<Handle<SimpleArchive>>::new([2; 32]);
-        pile.update(branch_id, None, Some(head)).unwrap();
+        pile.append_legacy_pin_for_test(branch_id, None, Some(head))
+            .unwrap();
 
         let data = vec![3u8; 8];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
@@ -6698,7 +6594,7 @@ mod tests {
         let handle1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
 
         let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(handle1.transmute()))
+        pile.append_legacy_pin_for_test(branch_id, None, Some(handle1.transmute()))
             .unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
@@ -6707,7 +6603,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
-        let head = pile.head(branch_id).unwrap();
+        let head = pile.legacy_pin_head_for_test(branch_id).unwrap();
         assert_eq!(head, Some(handle1.transmute()));
         pile.close().unwrap();
     }
@@ -6723,7 +6619,7 @@ mod tests {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![3u8; 5]));
             let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
-            pile.update(branch_id, None, Some(handle.transmute()))
+            pile.append_legacy_pin_for_test(branch_id, None, Some(handle.transmute()))
                 .unwrap();
             pile.flush().unwrap();
             std::mem::forget(pile);
@@ -6732,7 +6628,10 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
-        assert_eq!(pile.head(branch_id).unwrap(), Some(handle.transmute()));
+        assert_eq!(
+            pile.legacy_pin_head_for_test(branch_id).unwrap(),
+            Some(handle.transmute())
+        );
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
         pile.close().unwrap();
     }
@@ -6746,83 +6645,27 @@ mod tests {
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
         let h = pile.put::<UnknownBlob, _>(blob).unwrap();
         let branch_id = Id::new([7u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(h.transmute())).unwrap();
+        pile.append_legacy_pin_for_test(branch_id, None, Some(h.transmute()))
+            .unwrap();
         pile.flush().unwrap();
 
-        assert_eq!(pile.head(branch_id).unwrap(), Some(h.transmute()));
+        assert_eq!(
+            pile.legacy_pin_head_for_test(branch_id).unwrap(),
+            Some(h.transmute())
+        );
 
-        pile.update(branch_id, Some(h.transmute()), None).unwrap();
+        pile.append_legacy_pin_for_test(branch_id, Some(h.transmute()), None)
+            .unwrap();
         pile.flush().unwrap();
 
-        assert_eq!(pile.head(branch_id).unwrap(), None);
-        let branches: HashSet<Id> = pile.pins().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(pile.legacy_pin_head_for_test(branch_id).unwrap(), None);
+        pile.refresh().unwrap();
+        let branches: HashSet<Id> = pile
+            .branches
+            .iter_ordered()
+            .map(|raw| Id::new(*raw).expect("legacy pin ids are non-nil"))
+            .collect();
         assert!(!branches.contains(&branch_id));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn branch_update_detects_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let handle1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
-
-        let branch_id = Id::new([2u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(handle1.transmute()))
-            .unwrap();
-
-        let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
-        let handle2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
-        pile.flush().unwrap();
-
-        match pile
-            .update(
-                branch_id,
-                Some(handle2.transmute()),
-                Some(handle2.transmute()),
-            )
-            .unwrap()
-        {
-            PushResult::Conflict(current) => {
-                assert_eq!(current, Some(handle1.transmute()));
-            }
-            other => panic!("unexpected result: {other:?}"),
-        }
-        assert_eq!(pile.head(branch_id).unwrap(), Some(handle1.transmute()));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn branch_update_conflict_returns_current_head() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let handle1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
-
-        let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(handle1.transmute()))
-            .unwrap();
-        pile.flush().unwrap();
-
-        let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
-        let handle2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
-
-        let result = pile
-            .update(
-                branch_id,
-                Some(handle2.transmute()),
-                Some(handle2.transmute()),
-            )
-            .unwrap();
-        match result {
-            PushResult::Conflict(current) => assert_eq!(current, Some(handle1.transmute())),
-            other => panic!("unexpected result: {other:?}"),
-        }
-        assert_eq!(pile.head(branch_id).unwrap(), Some(handle1.transmute()));
         pile.close().unwrap();
     }
 
@@ -6865,32 +6708,6 @@ mod tests {
         assert!(handles.contains(&h1));
         assert!(handles.contains(&h2));
         assert_eq!(handles.len(), 2);
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn update_conflict_returns_current_head() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let h1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
-        let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(h1.transmute())).unwrap();
-        pile.flush().unwrap();
-
-        let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
-        let h2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
-        pile.flush().unwrap();
-
-        match pile.update(branch_id, Some(h2.transmute()), Some(h1.transmute())) {
-            Ok(PushResult::Conflict(existing)) => {
-                assert_eq!(existing, Some(h1.transmute()))
-            }
-            other => panic!("unexpected result: {other:?}"),
-        }
-        assert_eq!(pile.head(branch_id).unwrap(), Some(h1.transmute()));
         pile.close().unwrap();
     }
 
@@ -7010,61 +6827,6 @@ mod tests {
 
         assert_eq!(handle1, handle2);
         assert_eq!(len_after_first, len_after_second);
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn branch_update_conflict_returns_existing_head() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 8]));
-        let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 8]));
-        let h1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
-        let h2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
-        pile.flush().unwrap();
-
-        let branch_id = Id::new([3u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(h1.transmute())).unwrap();
-
-        match pile.update(branch_id, Some(h2.transmute()), Some(h2.transmute())) {
-            Ok(PushResult::Conflict(existing)) => {
-                assert_eq!(existing, Some(h1.transmute()))
-            }
-            other => panic!("expected conflict, got {other:?}"),
-        }
-        assert_eq!(pile.head(branch_id).unwrap(), Some(h1.transmute()));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn branch_update_noop_does_not_grow_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![7u8; 8]));
-        let h = pile.put::<UnknownBlob, _>(blob).unwrap();
-        pile.flush().unwrap();
-
-        let branch_id = Id::new([4u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(h.transmute())).unwrap();
-        pile.flush().unwrap();
-        let len_after_first = std::fs::metadata(&path).unwrap().len();
-
-        match pile.update(branch_id, Some(h.transmute()), Some(h.transmute())) {
-            Ok(PushResult::Success()) => {}
-            other => panic!("expected no-op success, got {other:?}"),
-        }
-        pile.flush().unwrap();
-        let len_after_noop = std::fs::metadata(&path).unwrap().len();
-
-        assert_eq!(
-            len_after_first, len_after_noop,
-            "no-op branch update must not append a new record"
-        );
-        assert_eq!(pile.head(branch_id).unwrap(), Some(h.transmute()));
         pile.close().unwrap();
     }
 
@@ -7381,7 +7143,8 @@ mod tests {
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
-        pile.update(branch_id, None, Some(h1.transmute())).unwrap();
+        pile.append_legacy_pin_for_test(branch_id, None, Some(h1.transmute()))
+            .unwrap();
         pile.want(WantRequest::blob(retracted)).unwrap();
         pile.unwant(WantRequest::blob(retracted)).unwrap();
         let d2 = vec![2u8; 77];
@@ -7402,7 +7165,10 @@ mod tests {
         assert_eq!(got2.bytes.as_ref(), d2.as_slice());
         drop(reader);
 
-        assert_eq!(pile.head(branch_id).unwrap(), Some(h1.transmute()));
+        assert_eq!(
+            pile.legacy_pin_head_for_test(branch_id).unwrap(),
+            Some(h1.transmute())
+        );
 
         let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
@@ -7448,10 +7214,12 @@ mod tests {
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
-        pile.update(branch_id, None, Some(h1.transmute())).unwrap();
+        pile.append_legacy_pin_for_test(branch_id, None, Some(h1.transmute()))
+            .unwrap();
         pile.want(WantRequest::blob(want)).unwrap();
         pile.unwant(WantRequest::blob(want)).unwrap();
-        pile.update(branch_id, Some(h1.transmute()), None).unwrap();
+        pile.append_legacy_pin_for_test(branch_id, Some(h1.transmute()), None)
+            .unwrap();
         pile.close().unwrap();
 
         let mut records = PileRecords::open(&path).unwrap();

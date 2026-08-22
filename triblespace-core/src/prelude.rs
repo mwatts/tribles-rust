@@ -78,33 +78,14 @@ pub use crate::query::ContainsConstraint;
 pub use crate::query::Term;
 pub use crate::query::TriblePattern;
 pub use crate::query::Variable;
-pub use crate::repo::ancestors;
-pub use crate::repo::difference;
-pub use crate::repo::filter;
-pub use crate::repo::history_of;
-pub use crate::repo::intersect;
 pub use crate::repo::lazy::Lazy;
 pub use crate::repo::memoryrepo::MemoryRepo;
-pub use crate::repo::nth_ancestors;
-pub use crate::repo::parents;
 pub use crate::repo::pile::Pile;
-pub use crate::repo::symmetric_diff;
-pub use crate::repo::time_range;
-pub use crate::repo::union;
 pub use crate::repo::BlobChildren;
 pub use crate::repo::BlobStore;
 pub use crate::repo::BlobStoreGet;
 pub use crate::repo::BlobStorePut;
-pub use crate::repo::Checkout;
 pub use crate::repo::CommitHandle;
-pub use crate::repo::CommitSet;
-// Legacy, and still in the prelude so existing consumers keep compiling. Both
-// should leave the prelude once the remaining migration paths are gone --
-// re-exporting a deprecated surface by default is why nobody notices it.
-#[allow(deprecated)]
-pub use crate::repo::PinStore;
-#[allow(deprecated)]
-pub use crate::repo::Repository;
 pub use crate::repo::StorageFlush;
 pub use crate::repo::WantRequest;
 pub use crate::repo::WantRequestDecodeError;

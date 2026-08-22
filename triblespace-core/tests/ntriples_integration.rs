@@ -1,13 +1,11 @@
 //! End-to-end N-Triples importer coverage: URI → stable entity id,
 //! predicate URI → IRI-rooted attribute, XSD datatypes → native value
-//! schemas, all round-tripping through a `Workspace` and queryable via
-//! the normal `find!`/`pattern!` macros.
+//! schemas, all queryable via the normal `find!`/`pattern!` macros.
 
 use std::io::Cursor;
 
 use anybytes::View;
 
-use ed25519_dalek::SigningKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::IntoBlob;
@@ -20,15 +18,7 @@ use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{self, Handle};
 use triblespace_core::prelude::BlobStore as _;
 use triblespace_core::prelude::BlobStoreGet as _;
-use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::Repository;
 use triblespace_core::trible::{Fragment, TribleSet};
-
-fn new_repo() -> Repository<MemoryRepo> {
-    let signing_key = SigningKey::from_bytes(&[0x11; 32]);
-    let store = MemoryRepo::default();
-    Repository::new(store, signing_key, TribleSet::new()).expect("fresh repo")
-}
 
 const NT_SAMPLE: &[u8] = br#"
 <http://example.org/frank> <http://example.org/firstname> "Frank" .
@@ -57,10 +47,6 @@ fn undescribed_attributes(fragment: &Fragment) -> Vec<Id> {
 
 #[test]
 fn ingests_facts_and_roundtrips_via_query() {
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).expect("branch");
-    let mut ws = repo.pull(branch_id).expect("workspace");
-
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     assert_eq!(import.triples, 4, "four non-empty triples in the sample");
     let facts = import.facts.facts().clone();
@@ -111,10 +97,6 @@ fn ingests_facts_and_roundtrips_via_query() {
     )
     .count();
     assert_eq!(link_count, 1, "one wrote edge");
-
-    // Actually commit, to prove the facts are a valid commit payload.
-    ws.commit(import.facts, "ntriples import");
-    repo.push(&mut ws).expect("push succeeds");
 }
 
 #[test]
