@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Fix the telemetry facade's explicit private-reach construction after the
+  collection reach API became fragment-based.
+
 - Advance the pinned CubeCL zero-copy fork to the clean canonical line with
   stricter CUDA alias eligibility and ownership-preserving slice uploads.
 

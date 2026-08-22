@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::core::collection::Collection;
+use crate::core::collection::{reach, Collection};
 use crate::core::metadata;
 use crate::core::repo::pile::{Pile, ReadError};
 use crate::prelude::blobencodings::UTF8String;
