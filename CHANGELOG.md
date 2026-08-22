@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Expose `FrontierStats::peak_region()` as the largest proposal region one
+  query level materialised at once. This is the proposal-memory high-water
+  mark that cumulative proposal count and widest frontier rows cannot recover;
+  it is observational only and does not change scheduling.
+
 - Add `trible pile migrate <pile> branch-to-collection` as the generic,
   same-pile bridge from one legacy `Repository` branch to a native
   `SimpleArchive` union collection. The command requires the target collection

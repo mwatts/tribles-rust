@@ -1307,6 +1307,7 @@ pub struct FrontierStats {
     rows: AtomicU64,
     variable_groups: AtomicU64,
     proposals: AtomicU64,
+    peak_region: AtomicU64,
     widest: AtomicU64,
     inplace_descents: AtomicU64,
     copied_descents: AtomicU64,
@@ -1332,6 +1333,18 @@ impl FrontierStats {
     /// Total candidates proposed across all levels.
     pub fn proposals(&self) -> u64 {
         self.proposals.load(Ordering::Relaxed)
+    }
+
+    /// Largest number of proposals materialised by one level at once.
+    ///
+    /// A refill proposes for every parent row in one preferred-variable
+    /// group before the level is consumed in geometrically widening chunks.
+    /// The resident proposal region can therefore be much larger than the
+    /// frontier itself. Cumulative [`proposals`](Self::proposals) and row
+    /// width [`widest`](Self::widest) measure different quantities; neither
+    /// can be used to recover this proposal-memory high-water mark.
+    pub fn peak_region(&self) -> u64 {
+        self.peak_region.load(Ordering::Relaxed)
     }
 
     /// Rows in the widest single expansion — the widest frontier the
@@ -1769,6 +1782,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         self.stats
             .proposals
             .fetch_add(proposed as u64, Ordering::Relaxed);
+        self.stats
+            .peak_region
+            .fetch_max(proposed as u64, Ordering::Relaxed);
         self.mode = Search::NextChunk;
     }
 
