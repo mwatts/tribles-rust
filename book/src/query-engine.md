@@ -66,9 +66,11 @@ once at the root and never again. Batching the *parents* is what makes a
 level's region large at every depth.
 
 A frontier is cheap because bindings are indexes, not values (see below): it is
-an index matrix over the shared level buffers plus a `select` list of row
-numbers, so restricting one to a subset costs four bytes per row and never
-copies a row. Correspondingly, the
+an index matrix over the shared level buffers plus an exact row selection.
+Consecutive selections and their slices are implicit; a genuine permutation
+borrows a dense list of row ordinals, so restricting a frontier never copies
+an index row and pays four bytes per row only when the order must be explicit.
+Correspondingly, the
 [`ProposalBuffer`](triblespace::core::query::ProposalBuffer) is *segmented*: a
 proposer calls `open(row)` before appending a row's candidates, and every entry
 carries that **parent tag**. `Candidates` exposes the tags, so one region can
@@ -221,6 +223,15 @@ lives in the bucketing described next — which is exactly why agreement, and so
 an unsplit batch, is the common case.
 [`FrontierStats`](triblespace::core::query::FrontierStats) counts expansions,
 rows and groups, so fragmentation is observed rather than assumed.
+
+The plan is represented with the same economy. Until planning runs there is
+no plan allocation. If every row chooses the same variable, the depth stores
+only that variable and the rows remain an implicit consecutive selection. If
+rows disagree but their stable variable groups are already consecutive, only
+the group boundaries are stored. An explicit row-ordinal permutation exists
+only when grouping actually changes visitation order. These are different
+representations of the same exact row selection, not separate execution
+strategies.
 
 Specificity is deliberately coarse. The sort key is the *bit length* of the
 estimate (`ilog2(n) + 1`), so counts inside the same power-of-two bucket are

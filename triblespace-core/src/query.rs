@@ -32,6 +32,8 @@ pub mod intersectionconstraint;
 /// [`ProposalBuffer`] and [`Candidates`] — candidate storage and bit-packed
 /// liveness for one search level.
 mod liveness;
+/// Exact consecutive or explicit row selections.
+mod ordinal;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
 #[doc(hidden)]
@@ -54,6 +56,7 @@ use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use constantconstraint::*;
+use ordinal::RowSelection;
 
 use crate::inline::encodings::genid::GenId;
 use crate::inline::Inline;
@@ -375,8 +378,6 @@ impl<'a> Binding<'a> {
 /// resolves through them, but a view needs something to point at.
 static NO_LEVELS: [LevelValues; 128] = [const { LevelValues::empty() }; 128];
 static NO_INDEXES: [u32; 128] = [0; 128];
-/// The one-row selection a width-1 [`Frontier`] uses.
-static SINGLE_ROW: [u32; 1] = [0];
 
 impl Default for Binding<'_> {
     /// The empty binding — no variable is bound.
@@ -395,10 +396,9 @@ impl Default for Binding<'_> {
 /// Because bindings are indexes rather than values, a frontier is an
 /// *index matrix*, not a pile of copied assignments: one row of `stride`
 /// `u32`s per parent binding, over the level buffers those indexes point
-/// into. A sub-batch is expressed by a `select` array of row numbers, so
-/// narrowing a frontier (the engine splitting it by preferred variable,
-/// an intersection splitting it by preferred proposer) costs one `u32`
-/// per row and never copies a row.
+/// into. Identity selections and their offset slices remain consecutive and
+/// allocation-free, while a genuine permutation borrows explicit row
+/// numbers. Narrowing never copies an index row.
 ///
 /// Every row of a frontier has the *same* [`bound`](Frontier::bound) set —
 /// they are all at the same point in the search, differing only in which
@@ -409,7 +409,7 @@ pub struct Frontier<'a> {
     bound: VariableSet,
     block: &'a [u32],
     stride: usize,
-    select: &'a [u32],
+    select: RowSelection<'a>,
     levels: &'a [LevelValues],
     /// Whether this frontier is being driven by `QueryParIter`.
     ///
@@ -434,7 +434,7 @@ impl Default for Frontier<'_> {
             bound: VariableSet::new_empty(),
             block: &NO_INDEXES,
             stride: NO_INDEXES.len(),
-            select: &SINGLE_ROW,
+            select: RowSelection::identity(1),
             levels: &NO_LEVELS,
             parallel: false,
         }
@@ -449,7 +449,7 @@ impl<'a> Frontier<'a> {
 
     /// True when the batch is empty.
     pub fn is_empty(&self) -> bool {
-        self.select.is_empty()
+        self.select.len() == 0
     }
 
     /// The variables bound in *every* row of this batch.
@@ -479,7 +479,7 @@ impl<'a> Frontier<'a> {
     }
 
     fn row_indexes(&self, i: usize) -> &'a [u32] {
-        let row = self.select[i] as usize;
+        let row = self.select.get(i).expect("frontier row index is in bounds") as usize;
         &self.block[row * self.stride..(row + 1) * self.stride]
     }
 
@@ -490,7 +490,11 @@ impl<'a> Frontier<'a> {
     /// [`with_select`](Frontier::with_select) to hand a subset of this
     /// frontier to a child constraint without copying any row.
     pub fn compose(&self, positions: impl IntoIterator<Item = u32>, out: &mut Vec<u32>) {
-        out.extend(positions.into_iter().map(|p| self.select[p as usize]));
+        out.extend(positions.into_iter().map(|position| {
+            self.select
+                .get(position as usize)
+                .expect("frontier composition index is in bounds")
+        }));
     }
 
     /// This frontier restricted to `select` — row numbers of the
@@ -503,7 +507,7 @@ impl<'a> Frontier<'a> {
             bound: self.bound,
             block: self.block,
             stride: self.stride,
-            select,
+            select: RowSelection::explicit(select),
             levels: self.levels,
             parallel: self.parallel,
         }
@@ -570,7 +574,7 @@ impl BindingStore {
             bound: self.bound,
             block: &self.indexes,
             stride: self.indexes.len(),
-            select: &SINGLE_ROW,
+            select: RowSelection::identity(1),
             levels: &self.levels,
             parallel: false,
         }
@@ -633,7 +637,7 @@ impl BindingStore {
         &mut self,
         variable: VariableId,
         block: &[u32],
-        select: &[u32],
+        select: RowSelection<'_>,
         stride: usize,
         parallel: bool,
         propose: impl FnOnce(&Frontier<'_>, &mut ProposalBuffer),
@@ -681,7 +685,7 @@ impl BindingStore {
     pub(crate) fn batch<'s>(
         &'s self,
         block: &'s [u32],
-        select: &'s [u32],
+        select: RowSelection<'s>,
         stride: usize,
         parallel: bool,
     ) -> Frontier<'s> {
@@ -719,7 +723,7 @@ impl BindingStore {
         variable: VariableId,
         width: usize,
         parent_block: &[u32],
-        parent_select: &[u32],
+        parent_select: RowSelection<'_>,
         stride: usize,
         out: &mut Vec<u32>,
         parents_out: &mut Vec<u32>,
@@ -738,7 +742,9 @@ impl BindingStore {
                 break;
             };
             *pos = i + 1;
-            let parent = parent_select[buffer.parent_of(i) as usize] as usize;
+            let parent = parent_select
+                .get(buffer.parent_of(i) as usize)
+                .expect("candidate parent tag is in bounds") as usize;
             out.extend_from_slice(&parent_block[parent * stride..(parent + 1) * stride]);
             let base = out.len() - stride;
             out[base + variable] = i as u32;
@@ -763,7 +769,7 @@ impl BindingStore {
         &mut self,
         variable: VariableId,
         width: usize,
-        parent_select: &[u32],
+        parent_select: RowSelection<'_>,
         drawn_out: &mut Vec<u32>,
         parents_out: &mut Vec<u32>,
     ) {
@@ -781,7 +787,11 @@ impl BindingStore {
             };
             *pos = i + 1;
             drawn_out.push(i as u32);
-            parents_out.push(parent_select[buffer.parent_of(i) as usize]);
+            parents_out.push(
+                parent_select
+                    .get(buffer.parent_of(i) as usize)
+                    .expect("candidate parent tag is in bounds"),
+            );
         }
         self.bound.set_value(variable, !drawn_out.is_empty());
     }
@@ -1206,7 +1216,8 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     /// retired but keep their allocations for the next descent.
     depths: Vec<Depth>,
     depth: usize,
-    /// Per-row preferred variable, rebuilt on every expansion.
+    /// Scratch for per-row preferred variables, materialized only after the
+    /// first disagreement in an expansion.
     choice: Vec<u32>,
     /// Scratch: the level-buffer entry index of each freshly-drawn child row.
     drawn: Vec<u32>,
@@ -1257,9 +1268,72 @@ fn reset_shared<T: Clone>(slot: &mut Arc<Vec<T>>, capacity: usize) -> &mut Vec<T
     buffer
 }
 
+/// The variable choice shared by every row, or the first exact partition
+/// observed when rows disagree.
+///
+/// `Unplanned` and `Universal` carry no allocation. A split plan owns the
+/// stable variable groups and stores an order override only when stable
+/// grouping genuinely permutes row ordinals.
+#[derive(Clone, Debug, Default)]
+enum DepthPlan {
+    #[default]
+    Unplanned,
+    Universal(VariableId),
+    Split(Arc<SplitPlan>),
+}
+
+/// Explicit metadata for a frontier whose rows choose different variables.
+#[derive(Debug, Default)]
+struct SplitPlan {
+    /// Stable grouped row order. Empty exactly when that order is the
+    /// consecutive identity `0..rows`.
+    order_override: Vec<u32>,
+    /// `(variable, end offset into the grouped order)`, in variable order.
+    groups: Vec<(VariableId, usize)>,
+}
+
+impl DepthPlan {
+    /// Row visitation order denoted by this plan.
+    fn selection(&self, rows: usize) -> RowSelection<'_> {
+        match self {
+            Self::Split(plan) if !plan.order_override.is_empty() => {
+                debug_assert_eq!(plan.order_override.len(), rows);
+                RowSelection::explicit(&plan.order_override)
+            }
+            Self::Unplanned | Self::Universal(_) | Self::Split(_) => RowSelection::identity(rows),
+        }
+    }
+
+    fn group_count(&self) -> usize {
+        match self {
+            Self::Unplanned => 0,
+            Self::Universal(_) => 1,
+            Self::Split(plan) => plan.groups.len(),
+        }
+    }
+
+    fn group(&self, group: usize, rows: usize) -> (VariableId, std::ops::Range<usize>) {
+        match self {
+            Self::Unplanned => panic!("an unplanned frontier has no variable groups"),
+            Self::Universal(variable) => {
+                assert_eq!(group, 0, "universal plan has exactly one group");
+                (*variable, 0..rows)
+            }
+            Self::Split(plan) => {
+                let start = if group == 0 {
+                    0
+                } else {
+                    plan.groups[group - 1].1
+                };
+                let (variable, end) = plan.groups[group];
+                (variable, start..end)
+            }
+        }
+    }
+}
+
 /// One frontier: the index matrix of the rows sitting at one point of the
-/// search, their per-row estimates, and the partition into groups that
-/// agree on which variable to bind next.
+/// search, their per-row estimates, and an exact generated-or-split plan.
 #[derive(Clone, Debug, Default)]
 struct Depth {
     /// Row-major index matrix, `rows * slots` entries.
@@ -1267,29 +1341,28 @@ struct Depth {
     rows: usize,
     /// Row-major estimate matrix, `rows * slots` entries.
     estimates: Arc<Vec<usize>>,
-    /// Row numbers, grouped by preferred variable.
-    order: Arc<Vec<u32>>,
-    /// `(variable, end offset into order)`, one per group.
-    groups: Arc<Vec<(VariableId, usize)>>,
+    plan: DepthPlan,
     /// Next group to expand.
     group: usize,
     /// Exclusive end of the group range this query owns.
     ///
-    /// Normally this is `groups.len()`. A rayon sibling is fenced to one
+    /// Normally this is `plan.group_count()`. A rayon sibling is fenced to one
     /// shared-plan group by setting `group_limit = group + 1`; the original
     /// advances `group` and retains everything after it. Keeping ownership as
-    /// a cursor interval lets both halves share `order` and `groups` without
-    /// copying or truncating either plan.
+    /// a cursor interval lets both halves share a fragmented [`SplitPlan`]
+    /// without copying or truncating it.
     group_limit: usize,
     /// Emission cursor, used only when every variable is bound.
     emit: usize,
 }
 
 impl Depth {
-    /// The half-open slice of `order` belonging to group `g`.
-    fn group_range(&self, g: usize) -> std::ops::Range<usize> {
-        let start = if g == 0 { 0 } else { self.groups[g - 1].1 };
-        start..self.groups[g].1
+    fn selection(&self) -> RowSelection<'_> {
+        self.plan.selection(self.rows)
+    }
+
+    fn group(&self, group: usize) -> (VariableId, std::ops::Range<usize>) {
+        self.plan.group(group, self.rows)
     }
 }
 
@@ -1589,8 +1662,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             block: Arc::new(vec![0u32; slots]),
             rows: 1,
             estimates: Arc::new(estimates),
-            order: Arc::new(vec![0u32]),
-            groups: Arc::new(Vec::new()),
+            plan: DepthPlan::Unplanned,
             group: 0,
             group_limit: 0,
             emit: 0,
@@ -1644,12 +1716,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     /// The frontier currently at the top of the stack, unrestricted.
     fn frontier(&self) -> Frontier<'_> {
         let depth = &self.depths[self.depth];
-        self.bindings.batch(
-            &depth.block,
-            &depth.order[..depth.rows],
-            self.slots,
-            self.parallel,
-        )
+        self.bindings
+            .batch(&depth.block, depth.selection(), self.slots, self.parallel)
     }
 
     /// Partitions the top frontier by each row's preferred variable.
@@ -1677,13 +1745,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let depth = &mut self.depths[self.depth];
         let rows = depth.rows;
 
-        self.choice.clear();
-        self.choice.reserve(rows);
-        let mut single = true;
-        let mut first = u32::MAX;
-        for row in 0..rows {
+        assert!(rows != 0, "the engine never plans an empty frontier");
+        u32::try_from(rows - 1).expect("frontier row ordinal exceeds u32");
+
+        let preferred = |row: usize| {
             let row_estimates = &depth.estimates[row * slots..(row + 1) * slots];
-            let variable = unbound
+            unbound
                 .into_iter()
                 .max_by_key(|&v| {
                     (
@@ -1696,52 +1763,71 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                         influences[v].count(),
                     )
                 })
-                .expect("non-empty unbound") as u32;
-            if row == 0 {
-                first = variable;
-            } else if variable != first {
-                single = false;
-            }
-            self.choice.push(variable);
-        }
+                .expect("non-empty unbound")
+        };
 
-        let order = reset_shared(&mut depth.order, 0);
-        let groups = reset_shared(&mut depth.groups, 0);
-        if single {
-            // The whole block travels as one batch: only row numbers are
-            // written, never a row.
-            order.extend(0..rows as u32);
-            groups.push((first as VariableId, rows));
-        } else {
-            // Stable counting sort by preferred variable, so a group's rows
-            // keep their frontier order.
-            let mut counts = vec![0usize; slots];
+        self.choice.clear();
+        let first = preferred(0);
+        let disagreement = (1..rows).find_map(|row| {
+            let variable = preferred(row);
+            (variable != first).then_some((row, variable))
+        });
+
+        if let Some((row, variable)) = disagreement {
+            // Only an observed distinction earns storage. Materialise the
+            // implied unanimous prefix at the first counterexample, then the
+            // counterexample and remaining exact choices.
+            self.choice.resize(
+                row,
+                u32::try_from(first).expect("query variables fit in u32"),
+            );
+            self.choice
+                .push(u32::try_from(variable).expect("query variables fit in u32"));
+            for row in row + 1..rows {
+                self.choice
+                    .push(u32::try_from(preferred(row)).expect("query variables fit in u32"));
+            }
+
+            let mut counts = [0usize; 128];
             for &variable in &self.choice {
                 counts[variable as usize] += 1;
             }
+            let mut starts = [0usize; 128];
+            let mut split = SplitPlan::default();
             let mut offset = 0;
-            let mut starts = vec![0usize; slots];
             for variable in 0..slots {
                 starts[variable] = offset;
                 if counts[variable] != 0 {
                     offset += counts[variable];
-                    groups.push((variable, offset));
+                    split.groups.push((variable, offset));
                 }
             }
-            order.resize(rows, 0);
-            for (row, &variable) in self.choice.iter().enumerate() {
-                order[starts[variable as usize]] = row as u32;
-                starts[variable as usize] += 1;
+            debug_assert_eq!(offset, rows);
+            debug_assert!(split.groups.len() > 1);
+
+            // Stable counting sort is the identity exactly when the input
+            // choices are already in nondecreasing variable order.
+            let identity = self.choice.windows(2).all(|pair| pair[0] <= pair[1]);
+            if !identity {
+                split.order_override.resize(rows, 0);
+                for (row, &variable) in self.choice.iter().enumerate() {
+                    split.order_override[starts[variable as usize]] =
+                        u32::try_from(row).expect("frontier row ordinal exceeds u32");
+                    starts[variable as usize] += 1;
+                }
             }
+            depth.plan = DepthPlan::Split(Arc::new(split));
+        } else {
+            depth.plan = DepthPlan::Universal(first);
         }
         depth.group = 0;
-        depth.group_limit = depth.groups.len();
+        depth.group_limit = depth.plan.group_count();
 
         self.stats.expansions.fetch_add(1, Ordering::Relaxed);
         self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
         self.stats.widest.fetch_max(rows as u64, Ordering::Relaxed);
         self.stats.variable_groups.fetch_add(
-            self.depths[self.depth].groups.len() as u64,
+            self.depths[self.depth].group_limit as u64,
             Ordering::Relaxed,
         );
         self.mode = Search::NextGroup;
@@ -1762,8 +1848,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             return;
         }
         let group = depth.group;
-        let range = depth.group_range(group);
-        let variable = depth.groups[group].0;
+        let (variable, range) = depth.group(group);
         self.depths[self.depth].group += 1;
 
         self.unbound.unset(variable);
@@ -1771,11 +1856,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let constraint = &self.constraint;
         let depth = &self.depths[self.depth];
         let block = Arc::clone(&depth.block);
-        let order = Arc::clone(&depth.order);
+        let selection = depth.selection().slice(range);
         let proposed = self.bindings.refill(
             variable,
             &block,
-            &order[range],
+            selection,
             self.slots,
             self.parallel,
             |frontier, proposals| constraint.propose(variable, frontier, proposals),
@@ -1841,7 +1926,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let variable = level.variable;
         let parent = self.depth;
         let group = self.depths[parent].group - 1;
-        let range = self.depths[parent].group_range(group);
+        let (_, range) = self.depths[parent].group(group);
         let slots = self.slots;
 
         if self.depths.len() <= parent + 1 {
@@ -1858,21 +1943,23 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             && self.depths[parent].group >= self.depths[parent].group_limit;
 
         let rows = if speculate {
+            let selection = self.depths[parent].selection().slice(range.clone());
             self.bindings.draw(
                 variable,
                 level.width,
-                &self.depths[parent].order[range],
+                selection,
                 &mut self.drawn,
                 &mut self.parents,
             );
             self.drawn.len()
         } else {
             let (head, tail) = self.depths.split_at_mut(parent + 1);
+            let selection = head[parent].selection().slice(range);
             self.bindings.take_chunk(
                 variable,
                 level.width,
                 &head[parent].block,
-                &head[parent].order[range],
+                selection,
                 slots,
                 Arc::make_mut(&mut tail[0].block),
                 &mut self.parents,
@@ -1981,21 +2068,19 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.stats.copied_descents.fetch_add(1, Ordering::Relaxed);
         }
         child.rows = rows;
+        child.plan = DepthPlan::Unplanned;
         child.group = 0;
         child.group_limit = 0;
         child.emit = 0;
-
-        let order = Arc::make_mut(&mut child.order);
-        order.clear();
-        order.extend(0..rows as u32);
 
         let stale = self.influences[variable].intersect(self.unbound);
         if !stale.is_empty() {
             let child = &mut self.depths[parent + 1];
             let block = Arc::clone(&child.block);
-            let order = Arc::clone(&child.order);
             let estimates = Arc::make_mut(&mut child.estimates);
-            let batch = self.bindings.batch(&block, &order, slots, self.parallel);
+            let batch =
+                self.bindings
+                    .batch(&block, RowSelection::identity(rows), slots, self.parallel);
             for row in 0..rows {
                 let binding = batch.row(row);
                 for v in stale {
@@ -2443,11 +2528,18 @@ mod tests {
         }
 
         fn refill(store: &mut BindingStore, values: &[RawInline]) {
-            store.refill(0, &[0], &[0], 1, false, |frontier, proposals| {
-                assert_eq!(frontier.len(), 1);
-                proposals.open(0);
-                proposals.extend(values.iter().copied());
-            });
+            store.refill(
+                0,
+                &[0],
+                RowSelection::identity(1),
+                1,
+                false,
+                |frontier, proposals| {
+                    assert_eq!(frontier.len(), 1);
+                    proposals.open(0);
+                    proposals.extend(values.iter().copied());
+                },
+            );
         }
 
         #[test]
@@ -2463,7 +2555,7 @@ mod tests {
 
             let mut drawn = Vec::new();
             let mut parents = Vec::new();
-            left.draw(0, 1, &[0], &mut drawn, &mut parents);
+            left.draw(0, 1, RowSelection::identity(1), &mut drawn, &mut parents);
             assert_eq!(left.levels[0].pos, 1);
             assert_eq!(right.levels[0].pos, 0);
             assert_eq!(right.levels[0].buffer()[0], value(1));
@@ -2708,7 +2800,10 @@ mod tests {
         use std::sync::atomic::{AtomicU8, Ordering};
 
         #[derive(Clone)]
-        struct Fixture(u32);
+        struct Fixture {
+            fanout: u32,
+            anchors: [u8; 4],
+        }
 
         /// One proposal per level and no alternate continuation anywhere.
         /// This is the shape on which speculative splitting is most harmful:
@@ -2792,6 +2887,25 @@ mod tests {
         }
 
         impl Fixture {
+            fn identity_split(fanout: u32) -> Self {
+                Self {
+                    fanout,
+                    // Anchor 3 is consumed by the scalar latency page. The
+                    // remaining choices are 1, 2, 3, so stable grouping is
+                    // already consecutive identity.
+                    anchors: [3, 0, 1, 2],
+                }
+            }
+
+            fn nonidentity_split(fanout: u32) -> Self {
+                Self {
+                    fanout,
+                    // After anchor 3, choices are 2, 1, 3 and stable grouping
+                    // must visit rows 1, 0, 2.
+                    anchors: [3, 1, 0, 2],
+                }
+            }
+
             fn value(tag: u8, index: u32) -> RawInline {
                 let mut value = [0; 32];
                 value[0] = tag;
@@ -2802,7 +2916,7 @@ mod tests {
             fn count(&self, group: u8, variable: VariableId) -> u32 {
                 match (group, variable) {
                     (3 | 0, 1) => 0,
-                    (1, 2) => self.0,
+                    (1, 2) => self.fanout,
                     _ => 1,
                 }
             }
@@ -2841,7 +2955,11 @@ mod tests {
                 for row in 0..frontier.len() {
                     proposals.open(row as u32);
                     if variable == 0 {
-                        proposals.extend([3, 0, 1, 2].map(|group| Self::value(0, group)));
+                        proposals.extend(
+                            self.anchors
+                                .into_iter()
+                                .map(|group| Self::value(0, group as u32)),
+                        );
                     } else {
                         let group = frontier.row(row).get(0).expect("anchor bound")[31];
                         proposals.extend(
@@ -2868,11 +2986,16 @@ mod tests {
         }
 
         fn query(fanout: u32) -> TestQuery {
-            Query::new(
-                Fixture(fanout),
-                project as fn(&Binding<'_>) -> Option<RawInline>,
-            )
-            .with_frontier_width(4)
+            fixture_query(Fixture::identity_split(fanout))
+        }
+
+        fn nonidentity_query(fanout: u32) -> TestQuery {
+            fixture_query(Fixture::nonidentity_split(fanout))
+        }
+
+        fn fixture_query(fixture: Fixture) -> TestQuery {
+            Query::new(fixture, project as fn(&Binding<'_>) -> Option<RawInline>)
+                .with_frontier_width(4)
         }
 
         #[test]
@@ -2916,9 +3039,75 @@ mod tests {
             query.next_group();
             query.next_chunk();
             query.plan();
-            assert_eq!(query.depths[query.depth].groups.len(), 3);
+            assert_eq!(query.depths[query.depth].plan.group_count(), 3);
             assert_eq!(query.depths[query.depth].group, 0);
             assert_eq!(query.depths[query.depth].group_limit, 3);
+        }
+
+        fn split_plan(query: &TestQuery) -> &SplitPlan {
+            match &query.depths[query.depth].plan {
+                DepthPlan::Split(plan) => plan,
+                plan => panic!("expected split plan, got {plan:?}"),
+            }
+        }
+
+        #[test]
+        fn universal_plan_stays_generated_without_choice_storage() {
+            let mut representation = query(16);
+            assert_eq!(representation.choice.capacity(), 0);
+
+            representation.plan();
+
+            assert!(matches!(
+                representation.depths[0].plan,
+                DepthPlan::Universal(0)
+            ));
+            assert_eq!(
+                representation.depths[0].selection(),
+                RowSelection::identity(1)
+            );
+            assert_eq!(
+                representation.choice.capacity(),
+                0,
+                "unanimity must not allocate planner choice storage"
+            );
+        }
+
+        #[test]
+        fn identity_partition_omits_the_row_order_override() {
+            let mut representation = query(16);
+            advance_to_three_groups(&mut representation);
+
+            let plan = split_plan(&representation);
+            assert_eq!(plan.groups, [(1, 1), (2, 2), (3, 3)]);
+            assert!(plan.order_override.is_empty());
+            assert_eq!(
+                representation.depths[representation.depth].selection(),
+                RowSelection::identity(3)
+            );
+        }
+
+        #[test]
+        fn nonidentity_partition_stores_only_the_row_order_override() {
+            let mut representation = nonidentity_query(16);
+            advance_to_three_groups(&mut representation);
+
+            let plan = split_plan(&representation);
+            assert_eq!(plan.groups, [(1, 1), (2, 2), (3, 3)]);
+            assert_eq!(plan.order_override, [1, 0, 2]);
+            assert_eq!(
+                representation.depths[representation.depth].selection(),
+                RowSelection::explicit(&[1, 0, 2])
+            );
+
+            let mut expected: Vec<_> = query(16).collect();
+            let mut actual: Vec<_> = nonidentity_query(16).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(
+                actual, expected,
+                "row permutation must preserve the exact bag"
+            );
         }
 
         #[test]
@@ -2942,13 +3131,18 @@ mod tests {
                 (
                     right.depths[0].group,
                     right.depths[0].group_limit,
-                    right.depths[0].groups.len(),
+                    right.depths[0].plan.group_count(),
                 ),
                 (0, 1, 3)
             );
             assert!(Arc::ptr_eq(&left.depths[1].block, &right.depths[0].block));
-            assert!(Arc::ptr_eq(&left.depths[1].order, &right.depths[0].order));
-            assert!(Arc::ptr_eq(&left.depths[1].groups, &right.depths[0].groups));
+            assert_eq!(left.depths[1].selection(), right.depths[0].selection());
+            match (&left.depths[1].plan, &right.depths[0].plan) {
+                (DepthPlan::Split(left), DepthPlan::Split(right)) => {
+                    assert!(Arc::ptr_eq(left, right), "fencing must not clone the plan");
+                }
+                plans => panic!("expected shared split plans, got {plans:?}"),
+            }
             assert_eq!(left.depths[1].group, 1, "left skips the owned group");
 
             // The ancestor source was cloned intact, not bisected. Both
@@ -2996,6 +3190,7 @@ mod tests {
             assert!(left.depth > 0);
             let terminal_rows = left.depths[left.depth].rows;
             let terminal_block = Arc::clone(&left.depths[left.depth].block);
+            let terminal_plan = left.depths[left.depth].plan.clone();
             let mut expected = left.clone().collect::<Vec<_>>();
 
             let right = left
@@ -3006,6 +3201,22 @@ mod tests {
             assert_eq!(right.mode, Search::Emit);
             assert_eq!(right.depths[0].rows, terminal_rows);
             assert!(Arc::ptr_eq(&terminal_block, &right.depths[0].block));
+            assert_eq!(
+                terminal_plan.selection(terminal_rows),
+                right.depths[0].selection()
+            );
+            for variable in left.bindings.bound {
+                assert!(Arc::ptr_eq(
+                    left.bindings.levels[variable]
+                        .buffer
+                        .as_ref()
+                        .expect("bound level has a published buffer"),
+                    right.bindings.levels[variable]
+                        .buffer
+                        .as_ref()
+                        .expect("bound level has a published buffer"),
+                ));
+            }
 
             let mut actual: Vec<_> = left.chain(right).collect();
             expected.sort_unstable();
@@ -3041,40 +3252,44 @@ mod tests {
         }
 
         #[test]
-        fn repeated_manual_producer_splits_preserve_dead_groups_and_bag() {
-            let mut expected: Vec<_> = query(96).collect();
-            expected.sort_unstable();
-
-            let mut queue = vec![query(96).into_par_iter()];
-            let mut leaves = Vec::new();
-            for _ in 0..64 {
-                let Some(producer) = queue.pop() else {
-                    break;
-                };
-                let (left, right) = producer.split();
-                if let Some(right) = right {
-                    queue.push(left);
-                    queue.push(right);
-                } else {
-                    leaves.push(left);
-                }
-            }
-
-            let mut actual = Vec::new();
-            for producer in queue.into_iter().chain(leaves) {
-                actual.extend(producer.collect::<Vec<_>>());
-            }
-            actual.sort_unstable();
-            assert_eq!(actual, expected);
-
+        fn repeated_manual_producer_splits_preserve_explicit_order_and_bag() {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(4)
                 .build()
                 .unwrap();
-            for _ in 0..8 {
-                let mut scheduled = pool.install(|| query(96).into_par_iter().collect::<Vec<_>>());
-                scheduled.sort_unstable();
-                assert_eq!(scheduled, expected);
+
+            for fixture in [query as fn(u32) -> TestQuery, nonidentity_query] {
+                let mut expected: Vec<_> = fixture(96).collect();
+                expected.sort_unstable();
+
+                let mut queue = vec![fixture(96).into_par_iter()];
+                let mut leaves = Vec::new();
+                for _ in 0..64 {
+                    let Some(producer) = queue.pop() else {
+                        break;
+                    };
+                    let (left, right) = producer.split();
+                    if let Some(right) = right {
+                        queue.push(left);
+                        queue.push(right);
+                    } else {
+                        leaves.push(left);
+                    }
+                }
+
+                let mut actual = Vec::new();
+                for producer in queue.into_iter().chain(leaves) {
+                    actual.extend(producer.collect::<Vec<_>>());
+                }
+                actual.sort_unstable();
+                assert_eq!(actual, expected);
+
+                for _ in 0..8 {
+                    let mut scheduled =
+                        pool.install(|| fixture(96).into_par_iter().collect::<Vec<_>>());
+                    scheduled.sort_unstable();
+                    assert_eq!(scheduled, expected);
+                }
             }
         }
     }

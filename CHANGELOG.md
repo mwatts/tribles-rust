@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make frontier row order and depth plans implicit until the data proves they
+  are not. Consecutive row selections now remain allocation-free views; a
+  unanimous frontier records only its preferred variable; and a fragmented
+  frontier stores explicit row ordinals only when stable grouping genuinely
+  permutes them. Query results and scheduling semantics are unchanged. In the
+  frozen four-arm gate this cut allocation calls by 21% to the first result,
+  17% over a full unanimous traversal, and 9% over a fragmented traversal;
+  process CPU time remained effectively neutral overall (0.990x geometric
+  mean, 1.014x when weighted by measured work).
+
 - Tighten PATCH's archive and parallel-scatter safety contracts. Parallel
   scatter pointers are `Send + Sync` only when their written value is `Send`;
   archive-backed leaf constructors now state that retained bytes must remain
