@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Move pile sync to ALPN `/triblespace/pile-sync/6` and replace
+  handle-addressed capability authentication with one bounded, claim-directed
+  positive authority proof carried inline by the first `OP_AUTH` stream. The
+  verified leaf must invoke the exact `ACTION_CONNECT` atom for the transport
+  peer on the configured team's public authority collection. CONNECT admits
+  direct authenticated RPC only; it grants no WRITE, generic READ, gossip,
+  collection reach, custody, retention, or semantic author trust.
+
+### Removed
+
+- Remove the old expiry, renewal, retraction, permission-scope, private-policy,
+  pending-approval, capability-delivery, and auth-handshake machinery,
+  including the pre-auth capability-proof fetch operation and its separate
+  handshake ALPN. Proofs are now self-contained; there is no ambient
+  environment fallback, sentinel credential, remote proof bootstrap, or
+  per-operation expiry refresh.
+
 ## [0.41.4] - 2026-05-17
 
 ### Added

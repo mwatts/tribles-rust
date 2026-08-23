@@ -24,7 +24,7 @@ categories = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.5.57", features = ["derive", "env"] }
+clap = { version = "4.5.57", features = ["derive"] }
 clap_complete = "4.5.65"
 anyhow = "1.0.101"
 getrandom = "0.4.1"
@@ -35,11 +35,8 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 file_type = "0.8"
 chrono = "0.4"
 object_store = { version = "0.13.1", default-features = false, features = ["aws", "fs"] }
-futures = "0.3"
 url = "2"
 ed25519-dalek = "2.2.0"
-hifitime = "4"
-anybytes = { version = "0.20.2", features = ["zerocopy"] }
 iroh-base = "1.0"
 iroh-tickets = "1.0"
 triblespace-net = { version = "0.47.0", path = "../triblespace-net" }

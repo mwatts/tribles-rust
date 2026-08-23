@@ -34,18 +34,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed, while immutable legacy pin snapshots remain documented only for
   diagnosis, retention, and explicit migration.
 
-- Remove branch-scoped authorization from the current team protocol. Team
-  capabilities now contain only validated `PERM_READ`/`PERM_WRITE`/`PERM_ADMIN`
-  tags; historical capabilities carrying resource facts fail closed. Network
-  serving snapshots no longer contain pin heads, and `Peer`/`Reconciler` no
-  longer require a legacy pin-snapshot capability. The CLI no longer issues
-  `team invite --branch` credentials. Legacy pin decoding remains available to
-  explicit pile diagnosis and branch-to-collection migration. Capability
-  verification now binds every delegation issuer to its parent subject,
-  recomputes fetched content handles, and rechecks the earliest chain expiry on
-  every operation. A bounded one-shot proof operation bootstraps sibling peers
-  whose private stores contain only their own credential chains, without
-  opening ordinary blob reads before authentication.
+- Replace the expiring descriptive-capability protocol with positive,
+  enumerable authority. Each team root now identifies one public grow-only
+  `SimpleArchive`-union authority collection whose signed grant occurrences
+  name one exact subject, resource, action, invoke/delegate mode, and optional
+  exact parent. Resolution computes the grounded positive fixed point, while
+  claim-directed portable root-to-leaf proofs carry every signed commit and
+  canonical grant archive needed for standalone verification. Pile-sync moves
+  to ALPN v6 and authenticates direct RPC by carrying an exact CONNECT proof
+  inline on the first `OP_AUTH` stream. CONNECT grants no WRITE, generic READ,
+  gossip, reach, custody, or retention authority. The `trible team` surface is
+  now only `create`, `invite`, `join`, `list`, and `show`; `pile net status` and
+  `sync` require explicit `--team-root` and `--grant` plus an existing key.
+  Expiry, renewal, retraction, admin-scope hierarchy, pending approval, ambient
+  environment fallback, sentinels, pre-auth proof fetch, and the associated
+  private policy/handshake machinery are removed. Durable removal is a
+  successor team, collection, or key epoch outside this monotone kernel.
 
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.

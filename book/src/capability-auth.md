@@ -1,315 +1,260 @@
-# Capability Auth
+# Positive Authority and CONNECT
 
-The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
-crate ships a chain-of-trust capability system on top of iroh's
-TLS-verified peer identities. Every ordinary data connection on the
-`/triblespace/pile-sync/5` ALPN must present a capability before data ops are
-served; a bounded one-shot proof connection bootstraps that authentication.
-This chapter explains the team model, the CLI lifecycle, and the team
-permission gate the relay enforces.
+TribleSpace authority is a public, grow-only set of positive grant
+occurrences. Each occurrence is an ordinary signed collection commit: the
+commit signer is the issuer, the commit's intrinsic ID is the grant occurrence
+ID, and the committed `SimpleArchive` contains one exact grant atom.
 
-For the design rationale (single team root vs multi-root web-of-trust,
-sign-the-bytes convention, embedded parent sig optimisation), see the
-companion design notes in
-[`triblespace-core/src/repo/capability.rs`](https://github.com/triblespace/triblespace-rs/blob/main/triblespace-core/src/repo/capability.rs)'s
-module-level docs.
+The kernel has no mutable membership record, negative grant, permission
+hierarchy, expiry, renewal, or retraction. Independent valid grants combine by
+set union. Delegation follows exact parent occurrences, so portable evidence is
+a concrete root-to-leaf chain rather than a lookup into ambient policy.
 
-## Model
+## One public authority collection per team
 
-A team has **one immutable root keypair**, generated once at team
-creation and used to sign exactly one capability — the founder's.
-After that the root keypair is archived; it never operates online. Like
-a CA: bootstrapping authority, not runtime authority.
+A team is rooted in one Ed25519 public key. That key determines a canonical
+collection descriptor named `authority` with:
 
-All other capabilities **chain off the founder's** via delegation. Any
-holder of a capability can sign a sub-capability for someone else, as
-long as the sub-cap's scope is a subset of their own. Verification
-walks the chain back to the team root.
+- `SimpleArchive` elements;
+- set union as its join law; and
+- public reach, so signed grant evidence may be relayed.
 
-Each capability is two blobs stored in the pile:
+The descriptor's content handle is
+`authority::collection(team_root)`. There is exactly one such authority
+collection for a team root. It is an ordinary native collection, not a new
+storage primitive or a mutable policy table.
 
-- A **cap blob** — a `TribleSet` carrying `cap_subject` (the pubkey
-  this cap authorises), `cap_issuer` (the pubkey that signed it),
-  `cap_scope_root` (the entity id anchoring the scope facts inside
-  the same blob), and `metadata::expires_at`.
-- A **sig blob** — a `TribleSet` with `sig_signs` (handle of the cap
-  blob) plus `attestation::signed_by`, `attestation::signature_r`, and
-  `attestation::signature_s`,
-  reusing the shared structural attestation attributes.
+Every accepted authority record is a `CollectionCommit` in that collection.
+Its data must be exactly one canonical grant entity and its metadata must be
+the canonical empty archive. A grant names:
 
-Signatures attest to the cap blob's canonical bytes, not to a hash of those
-bytes, keeping them hash-agnostic across any future change to the handle
-scheme.
+| Field | Meaning |
+|---|---|
+| subject | one direct Ed25519 public-key principal |
+| resource | one exact collection descriptor handle |
+| action | one exact, uninterpreted action ID |
+| parent | zero or one exact grant occurrence ID |
+| invoke | whether the subject may perform the action |
+| delegate | whether the subject may issue a child for the same action and resource |
 
-For a delegated chain, the leaf sig blob carries the recursive parent proof:
-`sig_parent_cap` names the parent cap and `sig_embedded_parent_proof` links to
-the embedded parent signature entity. This halves cold-cache verification
-fetch counts: at chain depth N, the verifier needs N+1 blobs instead of 2N+1.
+Invocation and delegation are independent uses. A grant may carry invocation,
+delegation, or both, but never neither. Actions do not imply one another: a
+grant for one action is not a weaker or stronger spelling of another action.
+Resources are equally exact; there is no ambient resource namespace or
+wildcard.
 
-## Team Lifecycle (CLI)
+`triblespace-core` defines `ACTION_WRITE` for authorizing a subject to
+contribute signed commits to one exact collection. `triblespace-net` defines a
+separate `ACTION_CONNECT`. A grant for either one says nothing about the
+other.
 
-The `trible team` subcommands cover the full lifecycle. All four
-operations work directly against a pile file — they don't require the
-network thread.
+## Positive fixed-point resolution
 
+Authority resolution observes one known prefix of the team's authority
+collection and computes its least positive fixed point.
+
+A no-parent occurrence is accepted only when its collection commit is signed
+by the team root. A child occurrence is accepted only when all of the
+following hold:
+
+1. its exact named parent occurrence is already accepted;
+2. the child commit signer is the parent grant's subject;
+3. the child preserves the parent's exact action and resource; and
+4. the parent grants delegation.
+
+The child's direct subject and invoke/delegate mode are its own explicit
+fields. Several independently grounded grants are alternatives: any one exact
+accepted occurrence can establish the requested authority.
+
+Malformed or incomplete candidates remain inert instead of poisoning the
+whole observation. Resolution reports diagnostics for invalid signatures,
+non-canonical metadata or grant data, unavailable data blobs, wrong root
+issuers, signer/subject mismatches, changed actions or resources,
+non-delegating parents, and unresolved parents. Adding a previously missing
+parent or data blob can ground more grants on a later observation; an already
+accepted grant is never removed by set growth.
+
+## Claim-directed portable proofs
+
+An `AuthorityProof` carries the exact accepted ancestry needed for one claim.
+Its steps are ordered root to leaf. Each step contains:
+
+- the complete 192-byte signed authority `CollectionCommit`; and
+- the canonical grant archive whose content identity that commit names.
+
+Verification is standalone. It strictly verifies every commit, recomputes and
+checks every adjacent data identity, requires the canonical team authority
+collection and empty metadata, and enforces the exact parent, issuer, action,
+resource, and delegation rules at every step.
+
+Verification is also claim-directed. After validating the chain, the verifier
+compares its leaf with the caller's required subject, action, resource, and
+minimum invoke/delegate mode. A valid prefix proves its own leaf; it cannot be
+mistaken for proof of a descendant that the caller expected. A grant carrying
+both uses satisfies a claim requiring invocation alone or delegation alone.
+
+The portable wire codec is versioned and bounded. Version 1 encodes:
+
+```text
+version:u8
+step_count:u8
+repeat step_count times:
+    commit:192
+    grant_data_length:u16
+    grant_data:bytes
 ```
+
+The one-byte count bounds a transport proof to 255 steps. Each grant archive
+is bounded by the seven tribles in the canonical delegated shape. Decoding
+checks the complete framing before allocating step payloads. These are
+transport bounds, not an expiry or a depth limit in the authority algebra.
+
+Invite bundles prepend the 32-byte team-root public key to the same proof
+bytes. They are public, self-contained evidence. Possessing a bundle does not
+let another key use it because verification binds the leaf subject to the
+claim, and CONNECT authentication binds that claim to the transport peer's
+Ed25519 key.
+
+## CONNECT authenticates direct RPC only
+
+`ACTION_CONNECT` authorizes one exact subject to establish an authenticated
+direct-RPC connection for one team. Its required resource is always that
+team's authority collection:
+
+```text
+subject = transport peer's Ed25519 key
+action = ACTION_CONNECT
+resource = authority::collection(team_root)
+required mode = Invoke
+```
+
+That atom grants no `WRITE`, generic `READ`, gossip membership, collection
+reach, blob custody, retention, or semantic trust. Collection reach still
+decides which signed commits a holder may proactively relay. Author admission
+still belongs to the resolver selecting a collection view. Gossip remains a
+sparse evidence transport, and local WANT/retention policy remains local.
+After CONNECT admits a session, the endpoint may answer its configured
+read-only RPC surface; that disclosure is a property of the host's serving
+snapshot, not a READ grant carried by CONNECT.
+
+The direct protocol uses ALPN `/triblespace/pile-sync/6`. The first stream on
+every connection must be `OP_AUTH` (`0x05`) carrying the complete bounded proof
+inline. The server verifies an exact CONNECT claim for the TLS peer and replies
+with `AUTH_OK` or `AUTH_REJECTED`. Only after success are the read-only direct
+RPC operations served on later streams.
+
+There is no pre-auth proof-fetch operation and no ambient proof lookup. A
+caller must already possess the complete proof it presents. `OP_AUTH` cannot
+appear again later on the connection.
+
+## Team CLI
+
+The `trible team` surface has five commands. All authority evidence lives in
+the supplied pile.
+
+```text
 trible team create --pile PATH [--key KEY_PATH]
-    Mint a new team root keypair, sign the founder's capability with
-    it, and write both into the pile. Prints the team root pubkey
-    (publish this to peers), the team root SECRET (archive offline),
-    and the founder's cap-sig handle (the founder's "credential" for
-    OP_AUTH).
-
-trible team invite --pile PATH --team-root HEX --cap HEX --key ISSUER
-                   --invitee HEX --scope (read|write|admin)
-    Issue a sub-capability to another peer. ISSUER must hold a cap
-    that subsumes the requested scope. The invitee's pubkey appears
-    on its own (use `trible pile net identity` on the invitee's
-    machine to print it). Prints the invitee's cap-sig handle.
-
-trible team request-join --admin HEX --scope (read|write|admin)
-                         [--key PATH] [--pile PATH]
-    Send an OP_REQUEST_CAP to an admin's running daemon asking to
-    be issued a capability. The admin sees the request in their private
-    node-policy collection (`team list-pending`); after `team approve`
-    the freshly-signed cap arrives via the auth-handshake ALPN.
-
-trible team approve --pile PATH --entry HEX --team-root HEX
-                    --cap HEX [--key PATH]
-    Approve a pending request, sign the cap, dispatch it back to
-    the requester, and add a renewal-policy entry so the local
-    daemon keeps the cap renewed.
-
-trible team retract --pile PATH --entry HEX
-    Stop auto-renewing one (subject, scope) entry. The peer's
-    chain dies at its next natural expiry. Pure local decision —
-    no broadcast, no transitive cascade. This is the eviction
-    primitive: there is no team-root-signed revocation blob in
-    the descriptive-caps model.
-
-trible team list --pile PATH
-    Audit summary: per-cap detail line (issuer → subject, scope,
-    expiry — sorted soonest-expiry-first).
-
-trible team list-pending --pile PATH
-    Incoming join requests awaiting approval.
-
-trible team list-issued --pile PATH
-    Renewal-policy entries this node is keeping renewed.
-
-trible team show --pile PATH --cap HEX [--verify TEAM_ROOT_HEX]
-    Walk one chain end-to-end. Prints each level with subject,
-    issuer, scope, expiry, sig blob handle, cap blob handle, and
-    a signer-matches-issuer (`✓` / `✗ MISMATCH`) check. Bounded
-    by MAX_DEPTH=32; chains beyond root render the embedded
-    parent sig as `(embedded in level above)`. Use when `list`
-    shows a cap is present but a connection still fails — `show`
-    surfaces structural mismatches (signer ≠ issuer, missing
-    parent sig fields) that the summary view hides.
-
-    `--verify <TEAM_ROOT_HEX>` (or env `TRIBLE_TEAM_ROOT`)
-    additionally runs `verify_chain` against the given team root
-    and reports `✓ VERIFIED` or `✗ FAILED — <VerifyError>` —
-    the same code path the relay's `OP_AUTH` uses, so the
-    result is the local-side rehearsal of what a real connection
-    attempt would produce. Add `--expected-subject HEX` to
-    override the default subject check (the leaf cap's declared
-    `cap_subject`) for subject-substitution-attack detection.
 ```
 
-A typical bootstrap flow:
+Creates a fresh team-root key, initializes the founder key at its conventional
+path if needed, and publishes a root-signed founder CONNECT grant with both
+invocation and delegation. It prints the team-root public key, the team-root
+secret, and the founder grant ID. The root secret is not a mutable membership
+database and is not written to the pile or a key file; capture it from the
+command output and store it offline because anyone holding it can publish
+independent root grants for that team.
+
+```text
+trible team invite --pile PATH --team-root HEX --parent ID \
+    --key ISSUER_KEY --invitee HEX [--delegate] --out FILE
+```
+
+Loads an existing issuer key and requires `--parent` to be an accepted exact
+CONNECT grant whose subject is that issuer and whose mode permits delegation.
+It publishes a child occurrence and writes a self-contained invite bundle.
+Without `--delegate`, the child invokes CONNECT only. With `--delegate`, it
+both invokes and may issue another child.
+
+```text
+trible team join --pile PATH --key INVITEE_KEY --invite FILE
+```
+
+Loads the invitee's existing key, verifies the bundle against an exact CONNECT
+claim for that key, and idempotently imports the authority descriptor, empty
+metadata archive, grant data archives, and signed commits.
+
+```text
+trible team list --pile PATH --team-root HEX
+```
+
+Prints accepted occurrences in intrinsic commit-ID order and the diagnostics
+for inert candidates.
+
+```text
+trible team show --pile PATH --team-root HEX --grant ID
+```
+
+Prints one accepted occurrence's exact ancestry from the root grant to the
+selected leaf. An inert or absent occurrence is an error rather than a partial
+chain.
+
+A complete bootstrap is explicit:
 
 ```bash
-# Founder, on machine A:
-$ trible team create --pile team.pile --key founder.key
-team root pubkey: 1a8a6a9d8ca1da67facab373de21233b...
-team root SECRET: <archive offline>
-founder cap (sig): 4e6e02d51c3676ece1eea9094f8e9d76...
+# Founder
+trible pile create founder.pile
+trible team create --pile founder.pile --key founder.key
+# Save the printed team root and founder grant ID.
 
-# Invitee, on machine B:
-$ trible pile net identity --key invitee.key
-node: e825b3a8d387b4dae1720b0edcbfaa9e...
+# Invitee creates only its local transport key.
+trible pile create member.pile
+trible pile net identity --key member.key
 
-# Founder, on machine A:
-$ trible team invite --pile team.pile \
-    --team-root 1a8a6a9d... \
-    --cap       4e6e02d5... \
-    --key       founder.key \
-    --invitee   e825b3a8... \
-    --scope     read
-issued cap (sig): 7afe59e7f895b23f05452ff7919e12e4...
+# Founder publishes the child and writes a portable bundle.
+trible team invite \
+  --pile founder.pile \
+  --team-root <TEAM_ROOT> \
+  --parent <FOUNDER_GRANT_ID> \
+  --key founder.key \
+  --invitee <MEMBER_PUBLIC_KEY> \
+  --out member.invite
+
+# Transfer member.invite by any ordinary file channel, then import it.
+trible team join \
+  --pile member.pile \
+  --key member.key \
+  --invite member.invite
 ```
 
-The invitee then runs the relay (or any pile-net peer) with
-`TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` set:
+`pile net status` and `pile net sync` then require the pile, team root, and
+exact accepted grant explicitly:
 
 ```bash
-$ TRIBLE_TEAM_ROOT=1a8a6a9d... \
-  TRIBLE_TEAM_CAP=7afe59e7... \
-  trible pile net sync /path/to/their.pile --peers <founder-id>
+trible pile net status member.pile \
+  --key member.key --team-root <TEAM_ROOT> --grant <MEMBER_GRANT_ID>
+
+trible pile net sync member.pile \
+  --key member.key --team-root <TEAM_ROOT> --grant <MEMBER_GRANT_ID> \
+  --peers <FOUNDER_ENDPOINT>
 ```
 
-Without those env vars the peer falls back to a single-user
-team-of-one (`team_root = signing_key.verifying_key()`), which means
-only their own caps will pass — useful for solo workflows but rejects
-every other peer's cap.
+Both commands load an existing key, resolve that exact local occurrence,
+confirm it invokes CONNECT for the key, reconstruct its ancestry, and reject a
+proof that exceeds the transport bounds. There is no environment-variable
+fallback, all-zero sentinel, implicit team-of-one credential, or automatic key
+creation on these paths. `pile net identity` is the explicit key-initialization
+command.
 
-## Wire Protocol
+## Deliberate boundary: no removal inside an epoch
 
-Protocol v5 (`/triblespace/pile-sync/5`) makes auth mandatory:
+Positive authority is monotone. A valid occurrence does not expire and cannot
+be retracted, renewed, denied by an admin hierarchy, or hidden behind a pending
+approval workflow. The kernel also has no distinguished "current membership"
+head whose replacement could invalidate earlier proofs.
 
-| Op | Byte | Meaning |
-|---|---:|---|
-| retired | 0x01 | former branch-list operation |
-| `OP_GET_BLOB` | 0x02 | Fetch one blob by hash |
-| `OP_CHILDREN` | 0x03 | List present child handles |
-| retired | 0x04 | former branch-head operation |
-| `OP_AUTH` | 0x05 | Present a capability sig handle |
-| `OP_COLLECTION_EVIDENCE` | 0x06 | Fetch relayable commits for one collection |
-| `OP_COLLECTION_OPERATION_RECEIPTS` | 0x07 | Fetch exact merge/derive receipts |
-| `OP_CAPABILITY_PROOF` | 0x08 | One-shot bounded retrieval of one complete validated credential proof |
-
-The first stream on an ordinary connection must be `OP_AUTH`. The server
-fetches the referenced sig blob, walks back to the team root through embedded
-parent proofs and `sig_parent_cap` handles, and either accepts
-(`AUTH_OK = 0x00`) or rejects (`AUTH_REJECTED = 0x01`). Subsequent
-streams on the same connection reuse that verified capability without a
-second handshake, but the server rechecks the earliest expiry in the chain on
-every operation. Expired cached authority is cleared immediately.
-
-`OP_CAPABILITY_PROOF` is the only pre-auth exception. It returns only the
-bounded artifacts reached by a full locally verified chain, then closes the
-connection. A requester may supply already received, hash-checked leaf
-artifacts (notably during capability delivery); these are merely untrusted
-lookup input to the same full verifier. This breaks circular first contact
-between sibling members without opening ordinary blob reads before
-authentication. Other streams sent before OP_AUTH or after AUTH_REJECTED are
-silently closed.
-
-## Scope Gate
-
-Capabilities encode their scope as tribles hung off `cap_scope_root`:
-
-- One or more `metadata::tag: PERM_*` triples granting permissions
-  (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`).
-
-Permission semantics mirror `scope_subsumes` and form an attenuating order:
-read may delegate read, write may delegate write or read, and admin may
-delegate any supported permission. `PERM_WRITE` and `PERM_ADMIN` imply
-`PERM_READ`. All read protocol operations require a read-equivalent team
-permission. A scope with unknown permission tags or non-permission facts is
-rejected, so a capability from the retired branch-scoped model fails closed
-rather than silently widening to team-wide access.
-
-## Eviction
-
-There is no team-root-signed revocation blob. The descriptive-caps
-model evicts peers via **per-issuer non-renewal**: every cap carries
-a short natural expiry (default 30 days), the issuer's running
-daemon refreshes the cap before that expiry as long as a
-**renewal-policy entry** says it should, and `team retract` appends a
-terminal successor version. The peer's chain dies at the next natural expiry. The
-decision is local to the issuer — nothing propagates, nothing
-cascades, nothing has to be signed by the team root.
-
-This trades the "instant network-wide revocation" property for
-several real wins:
-
-- **No revocation rescan on every snapshot refresh.** Previously
-  `update_snapshot` walked every blob looking for `(rev, sig)` pairs
-  signed by the team root; that was a CPU hotspot on quiescent peers.
-  The refresh path is now a near-no-op snapshot swap.
-- **No `HashSet<VerifyingKey>` shared state.** The old model needed
-  a process-wide revocation set, written from the snapshot scanner
-  and read from every chain verification. Removing it dropped a
-  cross-thread synchronisation point.
-- **No team-root keypair in normal operation.** Issuing a revocation
-  required the team root SECRET to sign. Now the root SECRET lives
-  in cold storage; every day-to-day operation (invite, approve,
-  retract) uses a regular admin cap.
-- **Monotonic gossip.** The wire protocol no longer has to gossip
-  revocation blobs as a special category that has to land *before*
-  the affected cap is verified. Caps and renewals are first-class
-  blobs; everything else is local issuer policy.
-
-The trade-off: there's no way to immediately invalidate a
-compromised key network-wide. The mitigation is to keep natural
-expiries short (the 30-day default is a starting point, not a
-hard rule) and to ensure issuers stop renewing the moment they
-notice. For acutely sensitive teams the natural-expiry window can
-be tightened to hours.
-
-Renewal happens via the same `OP_DELIVER_CAP` path that `team
-approve` uses: the issuer's daemon signs a fresh cap with a
-later expiry, dispatches it to the subject's daemon over the
-auth-handshake ALPN, and the subject records it in its private node-policy
-collection.
-`team list-issued` shows the renewal-policy entries this node is
-keeping renewed; `team retract --entry HEX` marks one as non-renewing.
-
-Pending requests, decisions, renewal entries, and current team capabilities are
-facts in one private, signer-owned node-policy collection. “Private” is an
-authority decision, not a second storage primitive: policy code commits to the
-inner collection store, while `Peer` deliberately does not expose those records
-through a second mutable namespace, and the policy collection's descriptor
-declares no reach. Merely belonging to a collection therefore does not authorize
-proactive gossip — and since reach is part of the descriptor, nothing can grant
-it to that collection after the fact.
-
-Policy history is immutable. A request has a stable intrinsic core, receipt is
-an observation event, and approval or rejection is an immutable decision DAG.
-Approving a request commits the decision and the first issued-cap policy version
-together. Renewal-policy and team-cap changes form explicit version DAGs with
-`metadata::supersedes`; a stable terminal renewal version is paired with a
-separate immutable observation carrying the local retraction time, and delivery
-acknowledgements name the exact version they confirm. The current value is
-derived only when a track has one unambiguous terminal version. Concurrent
-descendants survive pile concatenation as a visible fork and fail closed
-instead of letting append order silently choose a winner. An explicit successor
-can supersede every current head to resolve a fork. Exact retries are
-idempotent, while stale updates are rejected.
-
-The collection is owned by the node signing key. CLI readers and writers must
-load that existing key; silently initializing a replacement key would select a
-different policy collection. Its admitted commits recursively retain their
-descriptor, fact archive, metadata, and referenced capability/signature blobs.
-
-An upgraded binary does not automatically import policy written through the
-former local-policy-pin or experimental local-cell representations. Retired
-records remain opaque migration evidence; operators must explicitly migrate or
-re-establish their renewal, request, and team-cap facts.
-
-## `PeerConfig` Surface
-
-```rust,ignore
-use triblespace::net::peer::{Peer, PeerConfig};
-use triblespace::net::peer::SyncDirection;
-
-let pile = triblespace::core::repo::pile::Pile::open(path)?;
-let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
-    peers: vec![bootstrap_endpoint_id],
-    gossip: true,                           // false = pull/serve-only
-    team_root: team_root_pubkey,            // 32 bytes — the team's CA AND
-                                            // the gossip mesh id when gossip=true
-    self_cap: my_own_cap_sig_handle,        // what we present on OP_AUTH
-    direction: SyncDirection::Bidirectional,
-});
-```
-
-There's no `Default` impl: every peer construction site must specify
-a team root because auth is mandatory. The CLI's single-user
-team-of-one fallback sets `team_root = signing_key.verifying_key()`
-and `self_cap = [0u8; 32]` (which the remote rejects, signalling that
-multi-user operation needs the env vars).
-
-For a hosted relay running for a team, the operator only needs:
-
-- 32 bytes: the team root pubkey
-- 32 bytes: the relay's own cap-sig handle (the team grants it a
-  read-or-better cap and the operator pastes that handle into the
-  config)
-
-That's it. No per-user accounts, no shared secrets, no team configuration
-database. Capabilities remain private collection data and move through the
-authenticated delivery protocol; collection membership alone never grants
-permission to gossip them.
+Durable removal is therefore an epoch change outside this kernel: move to a
+successor team, collection, or key epoch and enforce the cutoff at that new
+epoch's external admission boundary. Merely issuing a new subject key under
+the same still-served team root does not invalidate an old CONNECT proof. That
+cost is explicit. It is what keeps authority proof verification local,
+portable, and invariant under pile concatenation.

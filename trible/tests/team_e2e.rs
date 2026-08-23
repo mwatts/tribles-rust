@@ -1,499 +1,418 @@
-//! End-to-end test of the `trible team` CLI flow.
-//!
-//! Exercises create → invite → list against the real binary, validating
-//! that the three subcommands compose correctly and produce the
-//! expected on-pile artefacts. The actual network protocol (auth
-//! handshake on connection establishment) is exercised by the
-//! capability lib tests in `triblespace-core::repo::capability`; this
-//! test covers the CLI surface that callers actually use. Eviction
-//! is per-issuer non-renewal (`team retract` / not auto-renewing) and
-//! is exercised by the daemon-side tests.
+//! End-to-end tests for the positive authority team CLI.
 
 use assert_cmd::Command;
 use tempfile::tempdir;
 
-fn parse_create_output(stdout: &str) -> (String, String, String) {
-    let mut team_root = None;
-    let mut team_root_secret = None;
-    let mut cap_sig = None;
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("team root pubkey:") {
-            team_root = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("team root SECRET:") {
-            team_root_secret = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("founder cap (sig):") {
-            cap_sig = Some(rest.trim().to_string());
-        }
-    }
-    (
-        team_root.expect("team root pubkey in output"),
-        team_root_secret.expect("team root SECRET in output"),
-        cap_sig.expect("founder cap (sig) in output"),
-    )
+struct CreatedTeam {
+    root: String,
+    root_secret: String,
+    founder_grant: String,
 }
 
-fn parse_invite_output(stdout: &str) -> String {
-    for line in stdout.lines() {
-        if let Some(rest) = line.trim().strip_prefix("issued cap (sig):") {
-            return rest.trim().to_string();
-        }
-    }
-    panic!("no `issued cap (sig):` line in output");
+fn output_field(stdout: &[u8], label: &str) -> String {
+    std::str::from_utf8(stdout)
+        .expect("utf8 output")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(label).map(str::trim))
+        .unwrap_or_else(|| panic!("missing {label:?} in {}", String::from_utf8_lossy(stdout)))
+        .to_owned()
 }
 
-#[test]
-fn team_full_lifecycle() {
-    let dir = tempdir().expect("tempdir");
-    let pile_path = dir.path().join("team.pile");
-    std::fs::File::create(&pile_path).expect("create pile file");
-
-    let founder_key_path = dir.path().join("founder.key");
-    let invitee_key_path = dir.path().join("invitee.key");
-
-    let create = Command::cargo_bin("trible")
+fn create_team(pile: &std::path::Path, key: &std::path::Path) -> CreatedTeam {
+    let output = Command::cargo_bin("trible")
         .expect("trible binary")
         .args([
             "team",
             "create",
             "--pile",
-            pile_path.to_str().unwrap(),
+            pile.to_str().unwrap(),
             "--key",
-            founder_key_path.to_str().unwrap(),
+            key.to_str().unwrap(),
         ])
         .assert()
-        .success();
-    let create_stdout = String::from_utf8(create.get_output().stdout.clone()).expect("utf8 stdout");
-    let (team_root_pubkey, team_root_secret, founder_cap_sig) = parse_create_output(&create_stdout);
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    CreatedTeam {
+        root: output_field(&output, "team root pubkey:"),
+        root_secret: output_field(&output, "team root SECRET:"),
+        founder_grant: output_field(&output, "founder grant:"),
+    }
+}
 
-    assert_eq!(team_root_pubkey.len(), 64, "team root pubkey is 32 bytes");
-    assert_eq!(team_root_secret.len(), 64, "team root SECRET is 32 bytes");
-    assert_eq!(
-        founder_cap_sig.len(),
-        64,
-        "founder cap-sig handle is 32 bytes"
-    );
-
-    let list1 = Command::cargo_bin("trible")
+fn identity(key: &std::path::Path) -> String {
+    let output = Command::cargo_bin("trible")
         .unwrap()
-        .args(["team", "list", "--pile", pile_path.to_str().unwrap()])
+        .args(["pile", "net", "identity", "--key", key.to_str().unwrap()])
         .assert()
-        .success();
-    let list1_out = String::from_utf8(list1.get_output().stdout.clone()).unwrap();
-    assert!(
-        list1_out.contains("capabilities in pile:  1"),
-        "post-create has one cap; got:\n{list1_out}"
-    );
-    // The capability detail line lists the founder cap with
-    // PERM_ADMIN scope. Format: `<short-hex> → <short-hex> (PERM_ADMIN, expires …)`.
-    assert!(
-        list1_out.contains("capabilities:")
-            && list1_out.contains("PERM_ADMIN")
-            && list1_out.contains("expires"),
-        "post-create lists the founder cap with PERM_ADMIN + expiry; got:\n{list1_out}"
-    );
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    output_field(&output, "node:")
+}
 
-    let identity = Command::cargo_bin("trible")
+#[test]
+fn create_invite_join_and_delegate_compose() {
+    let dir = tempdir().unwrap();
+    let founder_pile = dir.path().join("founder.pile");
+    let invitee_pile = dir.path().join("invitee.pile");
+    let third_pile = dir.path().join("third.pile");
+    for pile in [&founder_pile, &invitee_pile, &third_pile] {
+        std::fs::File::create(pile).unwrap();
+    }
+    let founder_key = dir.path().join("founder.key");
+    let invitee_key = dir.path().join("invitee.key");
+    let third_key = dir.path().join("third.key");
+    let invitee_bundle = dir.path().join("invitee.team");
+    let third_bundle = dir.path().join("third.team");
+
+    let team = create_team(&founder_pile, &founder_key);
+    assert_eq!(team.root.len(), 64);
+    assert_eq!(team.root_secret.len(), 64);
+    assert_eq!(team.founder_grant.len(), 32);
+
+    let founder_list = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "pile",
-            "net",
-            "identity",
-            "--key",
-            invitee_key_path.to_str().unwrap(),
+            "team",
+            "list",
+            "--pile",
+            founder_pile.to_str().unwrap(),
+            "--team-root",
+            &team.root,
         ])
         .assert()
-        .success();
-    let identity_out = String::from_utf8(identity.get_output().stdout.clone()).unwrap();
-    let invitee_pubkey = identity_out
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("node:")
-                .map(|s| s.trim().to_string())
-        })
-        .expect("identity prints `node:`");
-    assert_eq!(invitee_pubkey.len(), 64, "invitee pubkey is 32 bytes");
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let founder_list = String::from_utf8(founder_list).unwrap();
+    assert!(founder_list.contains("accepted grants: 1"));
+    assert!(founder_list.contains("action:   CONNECT"));
+    assert!(founder_list.contains("delegate: true"));
+    assert!(founder_list.contains("diagnostics:     0"));
 
-    let invite = Command::cargo_bin("trible")
+    let invitee = identity(&invitee_key);
+    let invite_output = Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
             "invite",
             "--pile",
-            pile_path.to_str().unwrap(),
+            founder_pile.to_str().unwrap(),
             "--team-root",
-            &team_root_pubkey,
-            "--cap",
-            &founder_cap_sig,
+            &team.root,
+            "--parent",
+            &team.founder_grant,
             "--key",
-            founder_key_path.to_str().unwrap(),
+            founder_key.to_str().unwrap(),
             "--invitee",
-            &invitee_pubkey,
-            "--scope",
-            "read",
+            &invitee,
+            "--delegate",
+            "--out",
+            invitee_bundle.to_str().unwrap(),
         ])
         .assert()
-        .success();
-    let invite_out = String::from_utf8(invite.get_output().stdout.clone()).unwrap();
-    let invitee_cap_sig = parse_invite_output(&invite_out);
-    assert_eq!(invitee_cap_sig.len(), 64);
-    assert_ne!(
-        invitee_cap_sig, founder_cap_sig,
-        "invitee cap distinct from founder cap"
-    );
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let invitee_grant = output_field(&invite_output, "issued grant:");
+    assert_eq!(invitee_grant.len(), 32);
+    assert_eq!(output_field(&invite_output, "proof steps:"), "2");
 
-    let list2 = Command::cargo_bin("trible")
-        .unwrap()
-        .args(["team", "list", "--pile", pile_path.to_str().unwrap()])
-        .assert()
-        .success();
-    let list2_out = String::from_utf8(list2.get_output().stdout.clone()).unwrap();
-    assert!(
-        list2_out.contains("capabilities in pile:  2"),
-        "post-invite has two caps; got:\n{list2_out}"
-    );
-    // The invitee was issued a PERM_READ scope cap; both that and
-    // the founder's PERM_ADMIN cap should appear in the detail.
-    assert!(
-        list2_out.contains("PERM_ADMIN") && list2_out.contains("PERM_READ"),
-        "post-invite lists both PERM_ADMIN (founder) and PERM_READ (invitee); got:\n{list2_out}"
-    );
-
-    // No revoke step — eviction in the descriptive-caps model is
-    // per-issuer non-renewal (`team retract`), not a broadcast
-    // revocation blob. The retraction daemon path is exercised in
-    // the capability lib tests.
-    let _ = &team_root_secret;
-    let _ = &invitee_pubkey;
-}
-
-#[test]
-fn invite_rejects_invalid_issuer_cap() {
-    let dir = tempdir().expect("tempdir");
-    let pile_path = dir.path().join("team.pile");
-    std::fs::File::create(&pile_path).expect("create pile file");
-    let founder_key_path = dir.path().join("founder.key");
-    let invitee_key_path = dir.path().join("invitee.key");
-
-    let create = Command::cargo_bin("trible")
+    let join_output = Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
-            "create",
+            "join",
             "--pile",
-            pile_path.to_str().unwrap(),
+            invitee_pile.to_str().unwrap(),
             "--key",
-            founder_key_path.to_str().unwrap(),
+            invitee_key.to_str().unwrap(),
+            "--invite",
+            invitee_bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(output_field(&join_output, "team root:"), team.root);
+    assert_eq!(output_field(&join_output, "accepted grant:"), invitee_grant);
+    assert_eq!(output_field(&join_output, "proof steps:"), "2");
+
+    // Import is a set insertion, so replaying the same portable evidence is
+    // an idempotent success rather than a second logical membership event.
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "join",
+            "--pile",
+            invitee_pile.to_str().unwrap(),
+            "--key",
+            invitee_key.to_str().unwrap(),
+            "--invite",
+            invitee_bundle.to_str().unwrap(),
         ])
         .assert()
         .success();
-    let (_real_root, _real_secret, real_cap_sig) =
-        parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
 
-    let identity = Command::cargo_bin("trible")
+    let status = Command::cargo_bin("trible")
         .unwrap()
         .args([
             "pile",
             "net",
-            "identity",
+            "status",
+            invitee_pile.to_str().unwrap(),
             "--key",
-            invitee_key_path.to_str().unwrap(),
+            invitee_key.to_str().unwrap(),
+            "--team-root",
+            &team.root,
+            "--grant",
+            &invitee_grant,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status = String::from_utf8(status).unwrap();
+    assert!(status.contains("proof_steps: 2"));
+    assert!(status.contains("authorization: CONNECT accepted"));
+
+    let third = identity(&third_key);
+    let third_invite = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "invite",
+            "--pile",
+            invitee_pile.to_str().unwrap(),
+            "--team-root",
+            &team.root,
+            "--parent",
+            &invitee_grant,
+            "--key",
+            invitee_key.to_str().unwrap(),
+            "--invitee",
+            &third,
+            "--out",
+            third_bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let third_grant = output_field(&third_invite, "issued grant:");
+    assert_eq!(output_field(&third_invite, "proof steps:"), "3");
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "join",
+            "--pile",
+            third_pile.to_str().unwrap(),
+            "--key",
+            third_key.to_str().unwrap(),
+            "--invite",
+            third_bundle.to_str().unwrap(),
         ])
         .assert()
         .success();
-    let invitee_pubkey = String::from_utf8(identity.get_output().stdout.clone())
-        .unwrap()
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("node:")
-                .map(|s| s.trim().to_string())
-        })
-        .expect("identity prints `node:`");
 
-    let fake_team_root = "00".repeat(32);
+    let show = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "show",
+            "--pile",
+            third_pile.to_str().unwrap(),
+            "--team-root",
+            &team.root,
+            "--grant",
+            &third_grant,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let show = String::from_utf8(show).unwrap();
+    assert!(show.contains("ancestry: 3 step(s), root to leaf"));
+    assert!(show.contains("level 0:"));
+    assert!(show.contains("level 1:"));
+    assert!(show.contains("level 2:"));
+    assert!(show.contains("delegate: false"));
+}
+
+#[test]
+fn join_rejects_a_bundle_for_another_key() {
+    let dir = tempdir().unwrap();
+    let founder_pile = dir.path().join("founder.pile");
+    let receiver_pile = dir.path().join("receiver.pile");
+    std::fs::File::create(&founder_pile).unwrap();
+    std::fs::File::create(&receiver_pile).unwrap();
+    let founder_key = dir.path().join("founder.key");
+    let intended_key = dir.path().join("intended.key");
+    let wrong_key = dir.path().join("wrong.key");
+    let bundle = dir.path().join("invite.team");
+    let team = create_team(&founder_pile, &founder_key);
+    let intended = identity(&intended_key);
+    let _ = identity(&wrong_key);
+
     Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
             "invite",
             "--pile",
-            pile_path.to_str().unwrap(),
+            founder_pile.to_str().unwrap(),
             "--team-root",
-            &fake_team_root,
-            "--cap",
-            &real_cap_sig,
+            &team.root,
+            "--parent",
+            &team.founder_grant,
             "--key",
-            founder_key_path.to_str().unwrap(),
+            founder_key.to_str().unwrap(),
             "--invitee",
-            &invitee_pubkey,
-            "--scope",
-            "read",
+            &intended,
+            "--out",
+            bundle.to_str().unwrap(),
         ])
         .assert()
-        .failure();
+        .success();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "join",
+            "--pile",
+            receiver_pile.to_str().unwrap(),
+            "--key",
+            wrong_key.to_str().unwrap(),
+            "--invite",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invite proof rejected"));
+
+    let list = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "list",
+            "--pile",
+            receiver_pile.to_str().unwrap(),
+            "--team-root",
+            &team.root,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(String::from_utf8(list)
+        .unwrap()
+        .contains("accepted grants: 0"));
 }
 
 #[test]
-fn show_walks_chain_end_to_end() {
-    // Build a length-2 chain (founder + invitee), then run
-    // `team show` on the leaf invitee cap. The walk should
-    // produce two `level N:` blocks — depth 0 with the leaf
-    // sig blob and PERM_READ scope, depth 1 with PERM_ADMIN
-    // and the "(embedded in level above)" sig label.
-    let dir = tempdir().expect("tempdir");
-    let pile_path = dir.path().join("team.pile");
-    std::fs::File::create(&pile_path).expect("create pile file");
-    let founder_key_path = dir.path().join("founder.key");
-    let invitee_key_path = dir.path().join("invitee.key");
+fn invite_requires_the_exact_accepted_delegating_parent() {
+    let dir = tempdir().unwrap();
+    let pile = dir.path().join("team.pile");
+    std::fs::File::create(&pile).unwrap();
+    let founder_key = dir.path().join("founder.key");
+    let invitee_key = dir.path().join("invitee.key");
+    let out = dir.path().join("invite.team");
+    let team = create_team(&pile, &founder_key);
+    let invitee = identity(&invitee_key);
 
-    let create = Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "team",
-            "create",
-            "--pile",
-            pile_path.to_str().unwrap(),
-            "--key",
-            founder_key_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-    let (team_root_pubkey, _, founder_cap_sig) =
-        parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
-
-    // Run show on the founder cap — should be length-1 (root).
-    let show_root = Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "team",
-            "show",
-            "--pile",
-            pile_path.to_str().unwrap(),
-            "--cap",
-            &founder_cap_sig,
-        ])
-        .assert()
-        .success();
-    let root_out = String::from_utf8(show_root.get_output().stdout.clone()).unwrap();
-    assert!(
-        root_out.contains("level 0:") && root_out.contains("PERM_ADMIN"),
-        "founder show emits level 0 with PERM_ADMIN; got:\n{root_out}"
-    );
-    assert!(
-        root_out.contains("root link"),
-        "founder show identifies the link as root (no cap_parent); got:\n{root_out}"
-    );
-    assert!(
-        !root_out.contains("level 1:"),
-        "founder show is length-1 — no level 1 expected; got:\n{root_out}"
-    );
-
-    // Issue an invitee cap and walk that chain.
-    let identity = Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "net",
-            "identity",
-            "--key",
-            invitee_key_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-    let invitee_pubkey = String::from_utf8(identity.get_output().stdout.clone())
-        .unwrap()
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("node:").map(|s| s.trim().to_string()))
-        .expect("identity prints `node:`");
-
-    let invite = Command::cargo_bin("trible")
+    Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
             "invite",
             "--pile",
-            pile_path.to_str().unwrap(),
+            pile.to_str().unwrap(),
             "--team-root",
-            &team_root_pubkey,
-            "--cap",
-            &founder_cap_sig,
+            &team.root,
+            "--parent",
+            "11111111111111111111111111111111",
             "--key",
-            founder_key_path.to_str().unwrap(),
+            founder_key.to_str().unwrap(),
             "--invitee",
-            &invitee_pubkey,
-            "--scope",
-            "read",
+            &invitee,
+            "--out",
+            out.to_str().unwrap(),
         ])
         .assert()
-        .success();
-    let invitee_cap_sig =
-        parse_invite_output(std::str::from_utf8(&invite.get_output().stdout).unwrap());
-
-    let show_chain = Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "team",
-            "show",
-            "--pile",
-            pile_path.to_str().unwrap(),
-            "--cap",
-            &invitee_cap_sig,
-        ])
-        .assert()
-        .success();
-    let chain_out = String::from_utf8(show_chain.get_output().stdout.clone()).unwrap();
-    // Both levels.
-    assert!(
-        chain_out.contains("level 0:") && chain_out.contains("level 1:"),
-        "invitee show walks two levels; got:\n{chain_out}"
-    );
-    // Level 0 is the invitee cap (PERM_READ), level 1 is the
-    // founder cap (PERM_ADMIN).
-    assert!(
-        chain_out.contains("PERM_READ") && chain_out.contains("PERM_ADMIN"),
-        "invitee show shows both PERM_READ and PERM_ADMIN; got:\n{chain_out}"
-    );
-    // Level 1's sig is embedded in the leaf sig blob now (sig-blob
-    // chain proof), and the chain still bottoms out at root.
-    assert!(
-        chain_out.contains("embedded proof") || chain_out.contains("chained from parent"),
-        "level 1 marks its sig as embedded; got:\n{chain_out}"
-    );
-    // Level 1 should also be flagged as root.
-    assert!(
-        chain_out.contains("root link"),
-        "chain bottoms out at root link; got:\n{chain_out}"
-    );
-    // signer-matches-issuer ✓ should appear at every level —
-    // 2 occurrences for the length-2 chain.
-    let check_count = chain_out.matches("signer matches cap_issuer: ✓").count();
-    assert_eq!(
-        check_count, 2,
-        "signer ✓ appears at each level (length-2 → 2 ticks); got:\n{chain_out}"
-    );
+        .failure()
+        .stderr(predicates::str::contains("is not accepted"));
+    assert!(!out.exists());
 }
 
 #[test]
-fn show_verify_pass_and_fail() {
-    // Build a team and an invitee cap, then run `team show
-    // --verify <team-root>` for both the correct team-root
-    // (should print ✓ VERIFIED) and a deliberately-wrong
-    // all-zeros pubkey (should print ✗ FAILED with the
-    // VerifyError variant straight from the library).
-    let dir = tempdir().expect("tempdir");
-    let pile_path = dir.path().join("team.pile");
-    std::fs::File::create(&pile_path).expect("create pile file");
-    let founder_key_path = dir.path().join("founder.key");
-    let invitee_key_path = dir.path().join("invitee.key");
+fn join_rejects_an_oversized_bundle_before_decoding() {
+    let dir = tempdir().unwrap();
+    let pile = dir.path().join("receiver.pile");
+    let key = dir.path().join("receiver.key");
+    let bundle = dir.path().join("oversized.team");
+    std::fs::File::create(&pile).unwrap();
+    let _ = identity(&key);
+    std::fs::write(
+        &bundle,
+        vec![0; 32 + triblespace_net::protocol::MAX_AUTHORITY_PROOF_BYTES + 1],
+    )
+    .unwrap();
 
-    let create = Command::cargo_bin("trible")
+    Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
-            "create",
+            "join",
             "--pile",
-            pile_path.to_str().unwrap(),
+            pile.to_str().unwrap(),
             "--key",
-            founder_key_path.to_str().unwrap(),
+            key.to_str().unwrap(),
+            "--invite",
+            bundle.to_str().unwrap(),
         ])
         .assert()
-        .success();
-    let (team_root_pubkey, _, founder_cap_sig) =
-        parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
+        .failure()
+        .stderr(predicates::str::contains("invite bundle exceeds"));
+}
 
-    let identity = Command::cargo_bin("trible")
+#[test]
+fn retired_capability_commands_are_absent() {
+    let help = Command::cargo_bin("trible")
         .unwrap()
-        .args([
-            "pile",
-            "net",
-            "identity",
-            "--key",
-            invitee_key_path.to_str().unwrap(),
-        ])
+        .args(["team", "--help"])
         .assert()
-        .success();
-    let invitee_pubkey = String::from_utf8(identity.get_output().stdout.clone())
-        .unwrap()
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("node:").map(|s| s.trim().to_string()))
-        .expect("identity prints `node:`");
-
-    let invite = Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "team",
-            "invite",
-            "--pile",
-            pile_path.to_str().unwrap(),
-            "--team-root",
-            &team_root_pubkey,
-            "--cap",
-            &founder_cap_sig,
-            "--key",
-            founder_key_path.to_str().unwrap(),
-            "--invitee",
-            &invitee_pubkey,
-            "--scope",
-            "read",
-        ])
-        .assert()
-        .success();
-    let invitee_cap_sig =
-        parse_invite_output(std::str::from_utf8(&invite.get_output().stdout).unwrap());
-
-    // PASS: real team root.
-    let pass = Command::cargo_bin("trible")
-        .unwrap()
-        .env_remove("TRIBLE_TEAM_ROOT")
-        .args([
-            "team",
-            "show",
-            "--pile",
-            pile_path.to_str().unwrap(),
-            "--cap",
-            &invitee_cap_sig,
-            "--verify",
-            &team_root_pubkey,
-        ])
-        .assert()
-        .success();
-    let pass_out = String::from_utf8(pass.get_output().stdout.clone()).unwrap();
-    assert!(
-        pass_out.contains("== Verification ==") && pass_out.contains("✓ VERIFIED"),
-        "verify against the real team root prints ✓ VERIFIED; got:\n{pass_out}"
-    );
-    assert!(
-        pass_out.contains("WOULD pass `OP_AUTH`"),
-        "VERIFIED block names the parity with relay OP_AUTH; got:\n{pass_out}"
-    );
-
-    // FAIL: all-zeros team root — chain doesn't terminate at it,
-    // verify_chain bottoms out with NonRootMissingParent.
-    let zero_root = "0".repeat(64);
-    let fail = Command::cargo_bin("trible")
-        .unwrap()
-        .env_remove("TRIBLE_TEAM_ROOT")
-        .args([
-            "team",
-            "show",
-            "--pile",
-            pile_path.to_str().unwrap(),
-            "--cap",
-            &invitee_cap_sig,
-            "--verify",
-            &zero_root,
-        ])
-        .assert()
-        .success();
-    let fail_out = String::from_utf8(fail.get_output().stdout.clone()).unwrap();
-    assert!(
-        fail_out.contains("== Verification ==") && fail_out.contains("✗ FAILED"),
-        "verify against all-zeros team root prints ✗ FAILED; got:\n{fail_out}"
-    );
-    assert!(
-        fail_out.contains("SAME error the relay would raise"),
-        "FAILED block names the relay-parity message; got:\n{fail_out}"
-    );
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(help).unwrap();
+    for retired in [
+        "list-pending",
+        "list-issued",
+        "retract",
+        "request-join",
+        "approve",
+    ] {
+        assert!(!help.contains(retired), "retired command {retired} remains");
+    }
+    for current in ["create", "invite", "join", "list", "show"] {
+        assert!(
+            help.contains(current),
+            "current command {current} is missing"
+        );
+    }
 }

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Replaced the expiring scoped-capability team workflow with one positive
+  authority ledger. `team create`, `invite`, `join`, `list`, and `show` now
+  publish, carry, resolve, and inspect exact CONNECT grant occurrences.
+  Pending requests, approval, renewal, retraction, permission scopes, ambient
+  `TRIBLE_TEAM_*` configuration, and zero sentinels were removed.
+- `pile net status` and `pile net sync` now require an explicit team root and
+  local accepted grant id, reconstruct the bounded authority proof from the
+  pile, and pass that proof directly to transport authentication.
+
 ## [0.41.4] - 2026-05-17
 
 ### Fixed

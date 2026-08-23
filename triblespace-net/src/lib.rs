@@ -4,9 +4,9 @@
 //! iroh network thread internally and exposes the standard storage traits.
 //! Reads auto-drain immutable collection evidence; writes announce blobs to
 //! the DHT and publish commits whose collection descriptor declares that the
-//! collection travels. Team capabilities authorize reads; collection
-//! descriptors and WANTs govern what evidence travels and which content a
-//! node retains.
+//! collection travels. A positive CONNECT authority proof admits direct RPC;
+//! collection descriptors and WANTs govern what evidence travels and which
+//! content a node retains.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
@@ -24,11 +24,9 @@ pub mod clock;
 pub mod collection_sync;
 pub mod collection_wire;
 pub mod dht;
-pub mod handshake;
 pub mod host;
 pub mod identity;
 pub mod peer;
-pub mod policy;
 pub mod protocol;
 pub mod reconcile;
 pub mod transport;

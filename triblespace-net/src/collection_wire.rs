@@ -29,8 +29,7 @@ use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest, WantRequestDec
 use triblespace_core::trible::TribleSet;
 
 use crate::protocol::{
-    COLLECTION_EVIDENCE_REJECTED, COLLECTION_OPERATION_RECEIPTS_REJECTED, OP_COLLECTION_EVIDENCE,
-    OP_COLLECTION_OPERATION_RECEIPTS, recv_u32_be, send_hash, send_u8,
+    OP_COLLECTION_EVIDENCE, OP_COLLECTION_OPERATION_RECEIPTS, recv_u32_be, send_hash, send_u8,
 };
 use crate::transport::Conn;
 
@@ -46,18 +45,8 @@ pub const MAX_COLLECTION_EVIDENCE_ITEMS: u32 = 1 << 20;
 /// every item.
 pub const COLLECTION_OPERATION_RECEIPT_BYTES_LEN: usize = COLLECTION_MERGE_BYTES_LEN;
 
-/// Rejection sentinel in the collection-operation receipt response count.
 /// Defensive upper bound on operation receipts accepted in one response.
 pub const MAX_COLLECTION_OPERATION_RECEIPTS: u32 = 1 << 20;
-
-/// A decoded collection-operation response.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CollectionOperationReceiptResponse {
-    /// The peer declined the request, normally because authorization failed.
-    Rejected,
-    /// Canonically ordered, distinct exact receipts answering the request.
-    Receipts(Vec<CollectionRecord>),
-}
 
 /// Encode one exact collection-operation request.
 ///
@@ -140,18 +129,13 @@ pub fn encode_collection_operation_receipts(
     Ok(bytes)
 }
 
-/// Encode the reserved rejection response.
-pub const fn encode_collection_operation_rejection() -> [u8; 4] {
-    COLLECTION_OPERATION_RECEIPTS_REJECTED.to_be_bytes()
-}
-
 /// Ask one already-authenticated peer for every exact receipt answering an
 /// operation request. The RPC remains read-only: callers decide whether and
 /// where to admit the returned evidence.
 pub async fn op_collection_operation_receipts<C: Conn>(
     conn: &C,
     request: WantRequest,
-) -> anyhow::Result<CollectionOperationReceiptResponse> {
+) -> anyhow::Result<Vec<CollectionRecord>> {
     let request_bytes = encode_collection_operation_request(request)?;
     let (mut send, mut recv) = conn
         .open_bi()
@@ -166,18 +150,6 @@ pub async fn op_collection_operation_receipts<C: Conn>(
         .map_err(|error| anyhow::anyhow!("finish collection receipt request: {error}"))?;
 
     let count = recv_u32_be(&mut recv).await?;
-    if count == COLLECTION_OPERATION_RECEIPTS_REJECTED {
-        let mut trailing = [0u8; 1];
-        if recv.read(&mut trailing).await.map_err(|error| {
-            anyhow::anyhow!("finish rejected collection receipt response: {error}")
-        })? != 0
-        {
-            return Err(anyhow::anyhow!(
-                "rejected collection receipt response contains trailing bytes"
-            ));
-        }
-        return Ok(CollectionOperationReceiptResponse::Rejected);
-    }
     if count > MAX_COLLECTION_OPERATION_RECEIPTS {
         return Err(CollectionOperationWireError::ReceiptCountExceedsLimit {
             count,
@@ -217,7 +189,7 @@ pub async fn op_collection_operation_receipts<C: Conn>(
 pub fn decode_collection_operation_receipts(
     request: WantRequest,
     bytes: &[u8],
-) -> Result<CollectionOperationReceiptResponse, CollectionOperationWireError> {
+) -> Result<Vec<CollectionRecord>, CollectionOperationWireError> {
     ensure_operation_request(request)?;
     if bytes.len() < 4 {
         return Err(CollectionOperationWireError::WrongResponseLength {
@@ -227,15 +199,6 @@ pub fn decode_collection_operation_receipts(
     }
 
     let count = u32::from_be_bytes(bytes[..4].try_into().expect("checked count width"));
-    if count == COLLECTION_OPERATION_RECEIPTS_REJECTED {
-        if bytes.len() != 4 {
-            return Err(CollectionOperationWireError::WrongResponseLength {
-                expected: 4,
-                actual: bytes.len(),
-            });
-        }
-        return Ok(CollectionOperationReceiptResponse::Rejected);
-    }
     if count > MAX_COLLECTION_OPERATION_RECEIPTS {
         return Err(CollectionOperationWireError::ReceiptCountExceedsLimit {
             count,
@@ -279,7 +242,7 @@ pub fn decode_collection_operation_receipts(
         previous = Some(receipt.id());
         receipts.push(receipt);
     }
-    Ok(CollectionOperationReceiptResponse::Receipts(receipts))
+    Ok(receipts)
 }
 
 fn ensure_operation_request(request: WantRequest) -> Result<(), CollectionOperationWireError> {
@@ -343,8 +306,7 @@ pub enum CollectionOperationWireError {
     BlobRequest,
     /// A successful response was too short, truncated, or had trailing bytes.
     WrongResponseLength { expected: usize, actual: usize },
-    /// A local response could not be represented without colliding with the
-    /// reserved rejection sentinel.
+    /// A local response exceeds the transport's explicit receipt-count bound.
     TooManyReceipts { count: usize, limit: u32 },
     /// The peer claimed more receipts than this implementation will allocate.
     ReceiptCountExceedsLimit { count: u32, limit: u32 },
@@ -479,11 +441,6 @@ pub async fn op_collection_evidence<C: Conn>(
         .map_err(|error| anyhow::anyhow!("finish collection evidence request: {error}"))?;
 
     let count = recv_u32_be(&mut recv).await?;
-    if count == COLLECTION_EVIDENCE_REJECTED {
-        return Err(anyhow::anyhow!(
-            "server rejected collection evidence request: team read capability required"
-        ));
-    }
     if count > MAX_COLLECTION_EVIDENCE_ITEMS {
         return Err(anyhow::anyhow!(
             "collection evidence count {count} exceeds limit {MAX_COLLECTION_EVIDENCE_ITEMS}"
@@ -699,7 +656,7 @@ mod tests {
         }
         assert_eq!(
             decode_collection_operation_receipts(request, &encoded),
-            Ok(CollectionOperationReceiptResponse::Receipts(expected))
+            Ok(expected)
         );
     }
 
@@ -720,11 +677,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let CollectionOperationReceiptResponse::Receipts(receipts) =
-            decode_collection_operation_receipts(request, &encoded).unwrap()
-        else {
-            panic!("successful response decoded as rejection")
-        };
+        let receipts = decode_collection_operation_receipts(request, &encoded).unwrap();
         assert_eq!(receipts.len(), 2);
         assert!(receipts.contains(&CollectionRecord::Derive(first)));
         assert!(receipts.contains(&CollectionRecord::Derive(conflicting)));
@@ -741,28 +694,13 @@ mod tests {
     }
 
     #[test]
-    fn receipt_response_decoder_enforces_count_framing_order_and_rejection() {
+    fn receipt_response_decoder_enforces_count_framing_and_order() {
         let descriptor = root("c48");
         let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
         let first = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(3));
         let second = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(4));
         let mut ordered = [first, second];
         ordered.sort_by_key(CollectionMerge::id);
-
-        assert_eq!(
-            decode_collection_operation_receipts(request, &encode_collection_operation_rejection()),
-            Ok(CollectionOperationReceiptResponse::Rejected)
-        );
-
-        let mut rejected_with_trailing = Vec::from(encode_collection_operation_rejection());
-        rejected_with_trailing.push(0);
-        assert_eq!(
-            decode_collection_operation_receipts(request, &rejected_with_trailing),
-            Err(CollectionOperationWireError::WrongResponseLength {
-                expected: 4,
-                actual: 5,
-            })
-        );
 
         let mut reversed = Vec::from(2u32.to_be_bytes());
         reversed.extend_from_slice(&ordered[1].to_bytes());

@@ -2,8 +2,8 @@
 //! network, as traits.
 //!
 //! This module exists so the *entire* protocol stack above it — the
-//! host loop, authenticated blob/collection reads, cap verification,
-//! collection-evidence gossip, and the renewal daemon's redispatch — can run
+//! host loop, authenticated blob/collection reads, CONNECT verification, and
+//! collection-evidence gossip — can run
 //! unmodified against either:
 //!
 //! - [`crate::transport::iroh`]: the production adapter (iroh QUIC,
@@ -12,13 +12,13 @@
 //!   seeded delays, drops, partitions, and crashes) for
 //!   FoundationDB/TigerBeetle-style simulation testing.
 //!
-//! Design rule: the seam carries *capabilities*, not protocol. Anything
+//! Design rule: the seam carries network capabilities, not protocol. Anything
 //! that decides what bytes mean (ALPN dispatch targets, frame layouts,
 //! auth semantics, scope checks) lives above; anything that decides how
 //! bytes move (QUIC, relays, NAT traversal, mesh membership, DHT
 //! routing) lives below. The week-of-2026-06-04 bug hunt found every
 //! protocol bug *above* this line (snapshot/gossip ordering,
-//! dialer-equals-issuer, sig-vs-cap handle confusion), which is why the
+//! authentication subject binding), which is why the
 //! host loop must run inside the simulator rather than being mocked
 //! out at the `NetCommand`/`NetEvent` channel boundary.
 //!
@@ -32,13 +32,12 @@ use tokio::sync::mpsc;
 
 /// A 32-byte node identity — the ed25519 pubkey bytes that double as
 /// the iroh endpoint id in production and as the node address in the
-/// simulator. Same value as `crate::channel::PublisherKey`.
+/// simulator.
 pub type PeerId = [u8; 32];
 
-/// Application-layer protocol identifier for a connection. Both of the
-/// protocol's ALPNs are `'static` consts ([`crate::protocol::PILE_SYNC_ALPN`],
-/// [`crate::handshake::AUTH_HANDSHAKE_ALPN`]), so a borrowed static slice
-/// suffices and keeps dispatch alloc-free.
+/// Application-layer protocol identifier for a connection. The protocol's
+/// ALPN is a `'static` const ([`crate::protocol::PILE_SYNC_ALPN`]), so a
+/// borrowed static slice suffices and keeps dispatch alloc-free.
 pub type Alpn = &'static [u8];
 
 /// A bidirectional connection to one remote peer on one ALPN.
@@ -54,7 +53,7 @@ pub trait Conn: Clone + Send + Sync + 'static {
 
     /// The remote peer's verified identity. In production this is
     /// iroh's TLS-level `remote_id` — the value the
-    /// dialer-equals-issuer check and OP_AUTH subject binding trust.
+    /// CONNECT proof's subject binding trusts.
     /// The simulator forges nothing: it returns the actual id of the
     /// node that dialed, so identity-dependent protocol logic is
     /// exercised honestly.

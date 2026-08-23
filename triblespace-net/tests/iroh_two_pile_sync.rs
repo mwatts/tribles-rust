@@ -6,8 +6,8 @@
 //! *transport*: two
 //! `Peer<Pile>`s — real pile files on disk — run the full production
 //! stack (`transport::iroh::bind_with_endpoint`: embedded DHT node,
-//! protocol router, iroh-gossip topic mesh, OP_AUTH with cap-chain
-//! verification) over real iroh QUIC endpoints wired through
+//! protocol router, iroh-gossip topic mesh, OP_AUTH with an inline CONNECT
+//! proof) over real iroh QUIC endpoints wired through
 //! `iroh::test_utils` `TestNetwork` (an in-memory packet transport —
 //! no relays, no DNS, no OS sockets — everything above the packet
 //! layer is the production code path).
@@ -15,7 +15,7 @@
 //! A content blob lives only in pile A. B durably records a want for its hash;
 //! a `Reconciler::tick` services the want over B's explicitly configured route
 //! to A and lands the verified bytes in pile B under the still-recorded want.
-//! This preserves real-transport, pile persistence, capability authentication,
+//! This preserves real-transport, pile persistence, CONNECT authentication,
 //! content verification, and durable-want coverage without depending on the
 //! retired mutable-HEAD/tracking protocol.
 //!
@@ -32,75 +32,56 @@ use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::TestNetwork;
 use iroh_base::{EndpointAddr, EndpointId, SecretKey};
+use triblespace_core::authority::{
+    AuthorityGrant, AuthorityMode, AuthorityProof, AuthorityProofStep,
+};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::collection::{CollectionCommit, empty_metadata_handle};
+use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::encodings::time::NsTAIInterval;
-use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::prelude::BlobStore;
-use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
-use triblespace_net::clock;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::protocol::ACTION_CONNECT;
 use triblespace_net::reconcile::Reconciler;
 
 fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
 }
 
-/// Sign a PERM_ADMIN root cap for `subject` — the out-of-band
-/// provisioning a team admin would do. Same as the sim suite's helper.
-fn admin_cap(
-    root: &SigningKey,
-    subject: &SigningKey,
-) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::{ExclusiveId, ufoid};
-    use triblespace_core::macros::entity;
-
-    let scope_root = *ufoid();
-    let scope_facts = TribleSet::from(entity! {
-        ExclusiveId::force_ref(&scope_root) @
-        triblespace_core::metadata::tag: PERM_ADMIN,
-    });
-    let now = clock::epoch_now();
-    let expiry: Inline<NsTAIInterval> = (now, now + hifitime::Duration::from_days(30.0))
-        .try_to_inline()
-        .expect("interval");
-    capability::build_capability(
-        root,
+fn connect_proof(root: &SigningKey, subject: &SigningKey) -> AuthorityProof {
+    let collection = triblespace_core::authority::collection(root.verifying_key());
+    let grant = AuthorityGrant::root(
         subject.verifying_key(),
-        None,
-        scope_root,
-        scope_facts,
-        expiry,
-    )
-    .expect("build cap")
+        collection,
+        ACTION_CONNECT,
+        AuthorityMode::Invoke,
+    );
+    let data: Blob<SimpleArchive> = grant.fragment().into_facts().to_blob();
+    let commit = CollectionCommit::sign(
+        root,
+        collection,
+        Handle::<SimpleArchive>::to_hash(data.get_handle()),
+        empty_metadata_handle(),
+    );
+    AuthorityProof::new(vec![AuthorityProofStep::new(commit, data)])
 }
 
-/// A fresh pile file in a temp dir, seeded with the given cap+sig
-/// blobs so OP_AUTH verifies locally on both ends.
-fn fresh_pile(
-    dir: &std::path::Path,
-    name: &str,
-    caps: &[(Blob<SimpleArchive>, Blob<SimpleArchive>)],
-) -> Pile {
+/// A fresh pile file. CONNECT proof bytes travel inline and are deliberately
+/// absent from the pile.
+fn fresh_pile(dir: &std::path::Path, name: &str) -> Pile {
     let path = dir.join(name);
     std::fs::File::create(&path).expect("create pile file");
-    let mut pile = Pile::open(&path).expect("open pile");
-    for (cap, sig) in caps {
-        pile.put::<SimpleArchive, _>(cap.clone()).expect("seed cap");
-        pile.put::<SimpleArchive, _>(sig.clone()).expect("seed sig");
-    }
-    pile.flush().expect("flush seeded pile");
-    pile
+    Pile::open(&path).expect("open pile")
 }
 
 /// Bind a real iroh endpoint whose only packet path is the shared
-/// `TestNetwork` (mirrors `auth_handshake_e2e::test_endpoint`), with
+/// `TestNetwork`, with
 /// the network's address-lookup service replacing the N0 discovery
 /// stack so bare-`EndpointId` dials resolve without DNS/pkarr.
 async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
@@ -129,7 +110,7 @@ async fn bring_up(
     signing_key: &SigningKey,
     store: Pile,
     team_root: ed25519_dalek::VerifyingKey,
-    self_cap: [u8; 32],
+    connect_proof: AuthorityProof,
     bootstrap: Vec<EndpointAddr>,
 ) -> Peer<Pile> {
     let secret = triblespace_net::identity::iroh_secret(signing_key);
@@ -139,20 +120,13 @@ async fn bring_up(
         peers: bootstrap,
         gossip: true,
         team_root,
-        self_cap,
+        connect_proof,
         direction: SyncDirection::Bidirectional,
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(ep, &config).await;
     let (sender, receiver, wiring) = host::wire(id);
     tokio::spawn(host::run_host(harness, config, wiring));
-    Peer::with_wiring(
-        store,
-        signing_key.clone(),
-        SyncDirection::Bidirectional,
-        team_root,
-        sender,
-        receiver,
-    )
+    Peer::with_wiring(store, SyncDirection::Bidirectional, sender, receiver)
 }
 
 fn init_tracing() {
@@ -165,9 +139,8 @@ fn init_tracing() {
         .try_init();
 }
 
-/// The shared two-node bring-up: team root + two admin caps, two piles
-/// (both seeded with both chains), A up first with no bootstrap, B up
-/// second with an explicit route to A.
+/// The shared two-node bring-up: one team root, two inline CONNECT proofs, and
+/// two piles that contain no authentication state.
 struct TwoNodes {
     peer_a: Peer<Pile>,
     peer_b: Peer<Pile>,
@@ -182,20 +155,17 @@ async fn two_nodes(
 ) -> TwoNodes {
     let root = key(0xF0);
     let team_root = root.verifying_key();
-    let cap_a = admin_cap(&root, ka);
-    let cap_b = admin_cap(&root, kb);
-    let self_cap_a = (&cap_a.1).get_handle().raw;
-    let self_cap_b = (&cap_b.1).get_handle().raw;
-    let caps = [cap_a, cap_b];
+    let proof_a = connect_proof(&root, ka);
+    let proof_b = connect_proof(&root, kb);
 
     let dir = tempfile::tempdir().expect("temp dir for piles");
-    let mut pile_a = fresh_pile(dir.path(), "a.pile", &caps);
+    let mut pile_a = fresh_pile(dir.path(), "a.pile");
     seed_a(&mut pile_a);
-    let pile_b = fresh_pile(dir.path(), "b.pile", &caps);
+    let pile_b = fresh_pile(dir.path(), "b.pile");
 
-    let peer_a = bring_up(network, ka, pile_a, team_root, self_cap_a, Vec::new()).await;
+    let peer_a = bring_up(network, ka, pile_a, team_root, proof_a, Vec::new()).await;
     let a_id: EndpointAddr = peer_a.id().into();
-    let peer_b = bring_up(network, kb, pile_b, team_root, self_cap_b, vec![a_id]).await;
+    let peer_b = bring_up(network, kb, pile_b, team_root, proof_b, vec![a_id]).await;
 
     TwoNodes {
         peer_a,

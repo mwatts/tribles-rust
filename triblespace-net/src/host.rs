@@ -14,18 +14,18 @@ use std::thread;
 use ed25519_dalek::SigningKey;
 use futures::stream::{FuturesUnordered, StreamExt};
 use iroh_base::{EndpointAddr, EndpointId};
-use tracing::{Instrument, debug, debug_span, error, info, info_span, instrument, trace, warn};
+use tracing::{Instrument, debug, debug_span, info, info_span, instrument, trace, warn};
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, CollectionCommit, CollectionHandle, CollectionRecord,
     CollectionStore,
 };
 use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest};
 
-use crate::channel::{NetCommand, NetEvent, PublisherKey};
+use crate::channel::{NetCommand, NetEvent};
 use crate::collection_wire::{
-    CollectionOperationReceiptResponse, collection_operation_receipts,
-    decode_collection_operation_request, encode_collection_operation_receipts,
-    op_collection_operation_receipts, relayable_commits, relayable_commits_for,
+    collection_operation_receipts, decode_collection_operation_request,
+    encode_collection_operation_receipts, op_collection_operation_receipts, relayable_commits,
+    relayable_commits_for,
 };
 use crate::identity::iroh_secret;
 use crate::protocol::*;
@@ -71,7 +71,6 @@ fn decode_collection_evidence_gossip_frame(bytes: &[u8]) -> Option<CollectionCom
 fn op_name(op: u8) -> &'static str {
     match op {
         OP_AUTH => "AUTH",
-        OP_CAPABILITY_PROOF => "CAPABILITY_PROOF",
         OP_GET_BLOB => "GET_BLOB",
         OP_CHILDREN => "CHILDREN",
         OP_COLLECTION_EVIDENCE => "COLLECTION_EVIDENCE",
@@ -129,7 +128,7 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
 }
 
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
-/// `Default` impl — auth is mandatory in protocol v5 so every peer
+/// `Default` impl — auth is mandatory in protocol v6 so every peer
 /// construction site must explicitly choose a team root. For solo
 /// workflows the convention is `team_root = signing_key.verifying_key()`
 /// (the user is the team root and the founder of a team-of-one);
@@ -148,17 +147,15 @@ pub struct PeerConfig {
     /// mesh, derived from its identity. `false` = serve-/pull-only (no
     /// subscription, no broadcasts).
     pub gossip: bool,
-    /// The team root public key — verifies all incoming capability
-    /// chains. Every ordinary data connection's first stream must present a
-    /// cap that chains back to this key; bounded one-shot proof retrieval is
-    /// the sole pre-auth exception. See `triblespace_core::repo::capability`.
-    /// When `gossip = true`, also serves as the gossip topic id.
+    /// The team root public key. Every connection's first stream must carry a
+    /// complete CONNECT authority proof rooted here. When `gossip = true`, it
+    /// also serves as the gossip topic id.
     pub team_root: ed25519_dalek::VerifyingKey,
-    /// This node's own capability sig handle. Presented to remote peers
-    /// as the first stream on every outgoing connection so they can
-    /// authorise us. Required — protocol v5 has mandatory auth on both
-    /// directions of a connection.
-    pub self_cap: RawHash,
+    /// Complete, prebuilt root-to-leaf proof authorizing this node's TLS key
+    /// to invoke [`crate::protocol::ACTION_CONNECT`] on the team's authority
+    /// collection. Outgoing dials send these bytes inline; the transport never
+    /// selects a grant or fetches proof state implicitly.
+    pub connect_proof: triblespace_core::authority::AuthorityProof,
     /// Direction of participation in the team swarm. Controls whether this
     /// node publishes collection evidence (write side) and/or admits incoming
     /// collection evidence (read side). Default is `Bidirectional`. Use
@@ -400,7 +397,7 @@ fn collection_evidence_for_rebroadcast(
 struct NetCap<T: Transport> {
     transport: T,
     pool: SharedPool<T::Conn>,
-    self_cap: RawHash,
+    connect_proof: triblespace_core::authority::AuthorityProof,
     my_id: PeerId,
     /// Configured peers and live gossip neighbors — consulted before the DHT
     /// on every on-demand fetch. Membership is only a routing hint; callers
@@ -415,7 +412,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> {
         let t = self.transport.clone();
         let pool = self.pool.clone();
-        let self_cap = self.self_cap;
+        let connect_proof = self.connect_proof.clone();
         let my_id = self.my_id;
         // Snapshot the routing list now (sync lock, most-recent-first, self
         // excluded) so the future is self-contained.
@@ -433,11 +430,11 @@ impl<T: Transport> NetCapability for NetCap<T> {
             let mut data = if known.is_empty() {
                 None
             } else {
-                fetch_from_providers(&t, &hash, &pool, &known, &self_cap).await
+                fetch_from_providers(&t, &hash, &pool, &known, &connect_proof).await
             };
             // DHT fallback: no publisher known, or none of them held it.
             if data.is_none() {
-                data = fetch_one(&t, &hash, &pool, my_id, &self_cap).await;
+                data = fetch_one(&t, &hash, &pool, my_id, &connect_proof).await;
             }
             data.filter(|data| blake3::hash(data).as_bytes() == &hash)
         })
@@ -449,15 +446,16 @@ impl<T: Transport> NetCapability for NetCap<T> {
     ) -> FuturesUnordered<futures::future::BoxFuture<'static, CollectionOperationPeerProbe>> {
         let transport = self.transport.clone();
         let pool = self.pool.clone();
-        let self_cap = self.self_cap;
+        let connect_proof = self.connect_proof.clone();
         let peers = self.configured_peers.clone();
         peers
             .into_iter()
             .map(|peer| {
                 let transport = transport.clone();
                 let pool = pool.clone();
+                let connect_proof = connect_proof.clone();
                 Box::pin(async move {
-                    let Some(connection) = pool_get(&transport, &pool, peer, &self_cap).await
+                    let Some(connection) = pool_get(&transport, &pool, peer, &connect_proof).await
                     else {
                         return CollectionOperationPeerProbe::Incomplete;
                     };
@@ -467,15 +465,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
                     )
                     .await
                     {
-                        Ok(Ok(CollectionOperationReceiptResponse::Receipts(receipts))) => {
-                            CollectionOperationPeerProbe::Complete(receipts)
-                        }
-                        // Authorization refusal is not a broken pooled
-                        // connection, but it also cannot establish that this
-                        // peer has no receipt. The sweep remains incomplete.
-                        Ok(Ok(CollectionOperationReceiptResponse::Rejected)) => {
-                            CollectionOperationPeerProbe::Incomplete
-                        }
+                        Ok(Ok(receipts)) => CollectionOperationPeerProbe::Complete(receipts),
                         Ok(Err(error)) => {
                             debug!(
                                 peer = %hex::encode(&peer[..4]),
@@ -544,23 +534,6 @@ impl NetSender {
         let _ = self
             .cmd_tx
             .send(NetCommand::GossipCollectionEvidence { evidence });
-    }
-
-    /// Dispatch a freshly-signed (cap, sig) blob pair to `subject`.
-    /// Fire-and-forget — the network thread handles the dial,
-    /// `OP_DELIVER_CAP`, and connection teardown. Used by the
-    /// renewal daemon and `team approve`.
-    pub fn deliver_cap(
-        &self,
-        subject: PublisherKey,
-        cap_bytes: anybytes::Bytes,
-        sig_bytes: anybytes::Bytes,
-    ) {
-        let _ = self.cmd_tx.send(NetCommand::DeliverCap {
-            subject,
-            cap_bytes,
-            sig_bytes,
-        });
     }
 
     pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
@@ -819,12 +792,12 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 
 // ── Network thread event loop ────────────────────────────────────────
 
-/// Deadline for establishing + authenticating a connection (the
-/// `pool_get` init future: dial + OP_AUTH round trip). A connection
+/// Deadline for establishing + authenticating a connection (the `pool_get`
+/// init future: dial + inline CONNECT proof round trip). A connection
 /// attempt that exceeds this counts as failed: the pool's
 /// singleflight cell resets so the next walk re-dials, instead of
 /// every later fetch to that peer queueing forever behind one
-/// stalled handshake. Generous relative to real-world QUIC + relay
+/// stalled authentication exchange. Generous relative to real-world QUIC + relay
 /// setup times; deterministic under simulated virtual time.
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -835,27 +808,24 @@ const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// warrant an idle deadline instead.
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Whole-operation budget for obtaining the bounded proof behind an unknown
-/// capability handle. This path runs before the incoming peer is authorized.
-const AUTH_PROOF_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Connect to a peer over the pile-sync ALPN and immediately present
-/// our capability so subsequent ops are authorised. Protocol v5 makes
-/// this mandatory — the server rejects any op until the connection
-/// completes auth.
-#[instrument(level = "info", skip(t, self_cap), fields(peer = %hex::encode(&peer[..4])))]
+/// our complete CONNECT proof so subsequent direct RPCs are admitted.
+#[instrument(level = "info", skip(t, connect_proof), fields(peer = %hex::encode(&peer[..4])))]
 async fn connect_authed<T: Transport>(
     t: &T,
     peer: PeerId,
-    self_cap: &RawHash,
+    connect_proof: &triblespace_core::authority::AuthorityProof,
 ) -> anyhow::Result<T::Conn> {
     let conn = t.dial(peer, PILE_SYNC_ALPN).await.map_err(|e| {
         warn!(error = %e, "connect failed");
         anyhow::anyhow!("connect: {e}")
     })?;
-    debug!(self_cap = %hex::encode(&self_cap[..4]), "connected; sending OP_AUTH");
-    op_auth(&conn, self_cap).await.map_err(|e| {
-        warn!(error = %e, "auth handshake failed");
+    debug!(
+        steps = connect_proof.steps().len(),
+        "connected; sending OP_AUTH"
+    );
+    op_auth(&conn, connect_proof).await.map_err(|e| {
+        warn!(error = %e, "CONNECT authentication failed");
         anyhow::anyhow!("auth: {e}")
     })?;
     info!("auth ok");
@@ -877,7 +847,7 @@ async fn host_loop<T: Transport>(
     } = harness;
 
     let my_id: PeerId = transport.local_id();
-    let self_cap: RawHash = config.self_cap;
+    let connect_proof = config.connect_proof.clone();
     let publishes_collection_evidence = config.direction != SyncDirection::ReadOnly;
     let mut configured_peers: Vec<PeerId> = config
         .peers
@@ -889,7 +859,7 @@ async fn host_loop<T: Transport>(
     configured_peers.dedup();
 
     // Host-wide singleflight connection pool — one authed connection per
-    // remote peer, reused across direct blob and capability-chain fetches. See
+    // remote peer, reused across direct blob and collection fetches. See
     // `SharedPool` docs for the OnceCell-based dial deduplication.
     let conn_pool: SharedPool<T::Conn> = new_shared_pool();
 
@@ -907,42 +877,24 @@ async fn host_loop<T: Transport>(
     let _ = cap_tx.send(Some(Arc::new(NetCap {
         transport: transport.clone(),
         pool: conn_pool.clone(),
-        self_cap,
+        connect_proof: connect_proof.clone(),
         my_id,
         candidates: routing_candidates.clone(),
         configured_peers,
     }) as Arc<dyn NetCapability>));
 
-    // Our own pubkey — the expected `cap_subject` of any cap
-    // delivered to us via OP_DELIVER_CAP.
-    let our_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&my_id)
-        .expect("transport local id is an ed25519 pubkey");
-
-    // ── Inbound connections: dispatch by ALPN to the protocol
-    // handlers. Each connection gets its own task; each handler
+    // ── Inbound connections. Each connection gets its own task and
     // accepts sequential bi-streams until the peer closes.
     let snapshot_handler = SnapshotHandler {
         snapshot: snapshot.clone(),
         team_root: config.team_root,
-        transport: transport.clone(),
-        events: events.clone(),
-    };
-    let handshake_handler = HandshakeHandler {
-        events: events.clone(),
-        team_root: config.team_root,
-        our_pubkey,
-        snapshot: snapshot.clone(),
-        transport: transport.clone(),
     };
     let mut incoming = incoming;
     tokio::spawn(async move {
         while let Some(inc) = incoming.recv().await {
             if inc.alpn == PILE_SYNC_ALPN {
                 let h = snapshot_handler.clone();
-                tokio::spawn(async move { h.handle(inc.conn).await });
-            } else if inc.alpn == crate::handshake::AUTH_HANDSHAKE_ALPN {
-                let h = handshake_handler.clone();
-                tokio::spawn(async move { h.handle(inc.conn).await });
+                tokio::spawn(async move { h.handle::<T>(inc.conn).await });
             } else {
                 debug!(alpn = %String::from_utf8_lossy(inc.alpn), "incoming conn on unknown alpn; dropping");
             }
@@ -1022,65 +974,6 @@ async fn host_loop<T: Transport>(
                         });
                     }
                 }
-                NetCommand::DeliverCap {
-                    subject,
-                    cap_bytes,
-                    sig_bytes,
-                } => {
-                    // Open a fresh connection on the auth-handshake
-                    // ALPN, send OP_DELIVER_CAP, close. On STATUS_OK
-                    // ack we emit `NetEvent::CapDeliveryConfirmed`
-                    // so the Peer can mark the matching
-                    // renewal-policy entry as delivered; on any
-                    // failure (connect/send/non-OK) the entry stays
-                    // in the undelivered set and the next renewal
-                    // tick attempts redispatch.
-                    let t_for_deliver = transport.clone();
-                    tokio::spawn(async move {
-                        let conn = match t_for_deliver
-                            .dial(subject, crate::handshake::AUTH_HANDSHAKE_ALPN)
-                            .await
-                        {
-                            Ok(c) => c,
-                            Err(e) => {
-                                debug!(
-                                    subject = %hex::encode(&subject[..4]),
-                                    error = %e,
-                                    "DeliverCap: connect failed"
-                                );
-                                return;
-                            }
-                        };
-                        match crate::handshake::send_deliver_cap(&conn, &cap_bytes, &sig_bytes)
-                            .await
-                        {
-                            Ok(status) if status == crate::handshake::STATUS_OK => {
-                                debug!(
-                                    subject = %hex::encode(&subject[..4]),
-                                    "DeliverCap: recipient ack OK (wire-level — absorb \
-                                     happens asynchronously on recipient; \
-                                     CapDeliveryConfirmed is emitted later from the OP_AUTH \
-                                     path when the subject actually authenticates with the cap)"
-                                );
-                            }
-                            Ok(status) => {
-                                debug!(
-                                    subject = %hex::encode(&subject[..4]),
-                                    status,
-                                    "DeliverCap: recipient returned non-OK status"
-                                );
-                            }
-                            Err(e) => {
-                                debug!(
-                                    subject = %hex::encode(&subject[..4]),
-                                    error = %e,
-                                    "DeliverCap: send failed"
-                                );
-                            }
-                        }
-                        conn.close(0, b"ok");
-                    });
-                }
                 NetCommand::FetchCollectionEvidence {
                     peer,
                     collection,
@@ -1088,13 +981,14 @@ async fn host_loop<T: Transport>(
                 } => {
                     let transport = transport.clone();
                     let pool = conn_pool.clone();
+                    let connect_proof = connect_proof.clone();
                     tokio::spawn(async move {
                         let result = async {
                             if peer == my_id {
                                 anyhow::bail!("collection reconciliation peer is the local node");
                             }
                             let Some(connection) =
-                                pool_get(&transport, &pool, peer, &self_cap).await
+                                pool_get(&transport, &pool, peer, &connect_proof).await
                             else {
                                 anyhow::bail!(
                                     "could not establish an authenticated collection connection to {}",
@@ -1148,8 +1042,7 @@ async fn host_loop<T: Transport>(
 }
 
 /// Resolve providers for a hash. When `preferred_peer` is not self, use it as
-/// the exact first candidate (cap-chain transfer knows the requesting peer is
-/// the source). Otherwise query the DHT.
+/// the exact first candidate. Otherwise query the DHT.
 ///
 /// Self is filtered out — `find_providers` will list us as a
 /// provider for any blob we've announced, and trying to dial
@@ -1179,7 +1072,7 @@ async fn providers_for<T: Transport>(t: &T, hash: &RawHash, preferred_peer: Peer
 }
 
 /// Host-wide connection pool: one authed `iroh::endpoint::Connection`
-/// per remote peer, shared across all direct blob and capability-chain fetches.
+/// per remote peer, shared across all direct blob and collection fetches.
 ///
 /// `OnceCell` per peer provides automatic singleflight: the first
 /// task to encounter a missing entry runs the dial; concurrent tasks
@@ -1188,8 +1081,8 @@ async fn providers_for<T: Transport>(t: &T, hash: &RawHash, preferred_peer: Peer
 ///
 /// iroh QUIC multiplexes streams cheaply on a single connection; our
 /// `serve_stream` accepts unbounded sequential bi-streams per
-/// connection (auth state set on the first OP_AUTH stream, reused on
-/// every subsequent stream). So one connection per peer is enough.
+/// connection. The handler admits request streams only after the first
+/// OP_AUTH stream succeeds. So one connection per peer is enough.
 pub(crate) type SharedPool<C> =
     Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::OnceCell<C>>>>>;
 
@@ -1206,7 +1099,7 @@ async fn pool_get<T: Transport>(
     t: &T,
     pool: &SharedPool<T::Conn>,
     provider: PeerId,
-    self_cap: &RawHash,
+    connect_proof: &triblespace_core::authority::AuthorityProof,
 ) -> Option<T::Conn> {
     let cell = {
         let mut guard = pool.lock().await;
@@ -1216,7 +1109,8 @@ async fn pool_get<T: Transport>(
             .clone()
     };
     let init = || async {
-        match tokio::time::timeout(DIAL_DEADLINE, connect_authed(t, provider, self_cap)).await {
+        match tokio::time::timeout(DIAL_DEADLINE, connect_authed(t, provider, connect_proof)).await
+        {
             Ok(r) => r,
             Err(_) => Err(anyhow::anyhow!(
                 "connection setup deadline ({DIAL_DEADLINE:?}) exceeded"
@@ -1265,10 +1159,10 @@ async fn fetch_one<T: Transport>(
     hash: &RawHash,
     pool: &SharedPool<T::Conn>,
     publisher_id: PeerId,
-    self_cap: &RawHash,
+    connect_proof: &triblespace_core::authority::AuthorityProof,
 ) -> Option<Vec<u8>> {
     let providers = providers_for(t, hash, publisher_id).await;
-    fetch_from_providers(t, hash, pool, &providers, self_cap).await
+    fetch_from_providers(t, hash, pool, &providers, connect_proof).await
 }
 
 /// Try `providers` in order for a single blob: pooled authed connection,
@@ -1282,10 +1176,10 @@ async fn fetch_from_providers<T: Transport>(
     hash: &RawHash,
     pool: &SharedPool<T::Conn>,
     providers: &[PeerId],
-    self_cap: &RawHash,
+    connect_proof: &triblespace_core::authority::AuthorityProof,
 ) -> Option<Vec<u8>> {
     for &provider in providers {
-        let Some(conn) = pool_get(t, pool, provider, self_cap).await else {
+        let Some(conn) = pool_get(t, pool, provider, connect_proof).await else {
             continue;
         };
         let op = tokio::time::timeout(OP_DEADLINE, op_get_blob(&conn, hash))
@@ -1313,439 +1207,19 @@ async fn fetch_from_providers<T: Transport>(
     None
 }
 
-/// Fetch one complete capability proof over the one-shot unauthenticated proof
-/// operation. This breaks the circular bootstrap in which A cannot authenticate
-/// to B until B has fetched A's credential, but fetching from A would otherwise
-/// require B to authenticate first.
-async fn fetch_capability_proof<T: Transport>(
-    t: &T,
-    publisher: PeerId,
-    head: &RawHash,
-    known: &std::collections::BTreeMap<RawHash, Vec<u8>>,
-) -> std::collections::BTreeMap<RawHash, Vec<u8>> {
-    if known.iter().any(|(hash, bytes)| {
-        bytes.len() > MAX_CAPABILITY_PROOF_BLOB_BYTES || blake3::hash(bytes).as_bytes() != hash
-    }) {
-        return std::collections::BTreeMap::new();
-    }
-
-    let providers = providers_for(t, head, publisher).await;
-    for provider in providers {
-        let connection = match tokio::time::timeout(DIAL_DEADLINE, t.dial(provider, PILE_SYNC_ALPN))
-            .await
-        {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(error)) => {
-                debug!(%error, provider = %hex::encode(&provider[..4]), "capability proof dial failed");
-                continue;
-            }
-            Err(_) => continue,
-        };
-        let response = tokio::time::timeout(
-            AUTH_PROOF_FETCH_DEADLINE,
-            op_capability_proof(&connection, head, known),
-        )
-        .await;
-        connection.close(0, b"capability proof complete");
-        match response {
-            Ok(Ok(Some(mut proof))) if proof.contains_key(head) => {
-                proof.retain(|hash, _| !known.contains_key(hash));
-                return proof;
-            }
-            Ok(Ok(_)) => continue,
-            Ok(Err(error)) => {
-                debug!(%error, provider = %hex::encode(&provider[..4]), "capability proof request failed");
-            }
-            Err(_) => {
-                debug!(provider = %hex::encode(&provider[..4]), "capability proof request timed out");
-            }
-        }
-    }
-    std::collections::BTreeMap::new()
-}
-
-/// Materialize exactly the artifacts requested while verifying one local
-/// capability chain. The recursive sig blob's linkage facts are not themselves
-/// signed, so enumerating every apparent parent handle would be unsafe; using
-/// the verifier as the traversal oracle records only the unique reachable path.
-fn local_capability_proof(
-    snapshot: &dyn AnySnapshot,
-    team_root: ed25519_dalek::VerifyingKey,
-    head: RawHash,
-    known: &std::collections::BTreeMap<RawHash, Vec<u8>>,
-) -> Option<std::collections::BTreeMap<RawHash, Vec<u8>>> {
-    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::blob::{Blob, TryFromBlob};
-    use triblespace_core::inline::Inline;
-    use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::macros::{find, pattern};
-    use triblespace_core::trible::TribleSet;
-
-    let bounded_blob = |hash: RawHash| {
-        let bytes = known
-            .get(&hash)
-            .cloned()
-            .or_else(|| snapshot.get_blob(&hash))?;
-        if bytes.len() > MAX_CAPABILITY_PROOF_BLOB_BYTES || blake3::hash(&bytes).as_bytes() != &hash
-        {
-            return None;
-        }
-        Some(bytes)
-    };
-
-    // Derive the expected subject from the uniquely referenced leaf cap. It is
-    // intentionally not constrained to the requesting peer: cap delivery may
-    // ask an issuer for the recipient's freshly issued proof.
-    let head_bytes = bounded_blob(head)?;
-    let sig_set: TribleSet = TryFromBlob::try_from_blob(Blob::<SimpleArchive>::new(
-        anybytes::Bytes::from_source(head_bytes),
-    ))
-    .ok()?;
-    let mut leaf_caps = find!(
-        (handle: Inline<Handle<SimpleArchive>>),
-        pattern!(&sig_set, [{ _?sig @
-            triblespace_core::repo::capability::sig_signs: ?handle
-        }])
-    );
-    let leaf_cap = match (leaf_caps.next(), leaf_caps.next()) {
-        (Some((handle,)), None) => handle,
-        _ => return None,
-    };
-    let leaf_cap_bytes = bounded_blob(leaf_cap.raw)?;
-    let leaf_cap_set: TribleSet = TryFromBlob::try_from_blob(Blob::<SimpleArchive>::new(
-        anybytes::Bytes::from_source(leaf_cap_bytes),
-    ))
-    .ok()?;
-    let mut subjects = find!(
-        (subject: ed25519_dalek::VerifyingKey),
-        pattern!(&leaf_cap_set, [{ _?cap @
-            triblespace_core::repo::capability::cap_subject: ?subject
-        }])
-    );
-    let expected_subject = match (subjects.next(), subjects.next()) {
-        (Some((subject,)), None) => subject,
-        _ => return None,
-    };
-
-    let mut proof = std::collections::BTreeMap::new();
-    let result = triblespace_core::repo::capability::verify_chain(
-        team_root,
-        Inline::new(head),
-        expected_subject,
-        |handle: Inline<Handle<SimpleArchive>>| {
-            if !proof.contains_key(&handle.raw) && proof.len() >= MAX_CAPABILITY_PROOF_ITEMS {
-                return None;
-            }
-            let bytes = bounded_blob(handle.raw)?;
-            proof.insert(handle.raw, bytes.clone());
-            Some(Blob::new(anybytes::Bytes::from_source(bytes)))
-        },
-    );
-    result.ok()?;
-    proof.contains_key(&head).then_some(proof)
-}
-
 // ── Protocol handler ─────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct SnapshotHandler<T: Transport> {
+struct SnapshotHandler {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    /// Verifies all incoming capability chains. Required — protocol v5
-    /// has mandatory auth.
     team_root: ed25519_dalek::VerifyingKey,
-    /// Transport for bounded, exact capability-proof fetches during OP_AUTH
-    /// when an incoming chain references blobs we do not have locally.
-    transport: T,
-    /// Channel back to the Peer for caching fetched cap blobs. After a
-    /// successful bounded proof retrieval + verify_chain, we emit NetEvent::Blob
-    /// for each fetched cap so the Peer puts them in the local store —
-    /// next OP_AUTH involving the same chain hits local instead of
-    /// re-walking the swarm.
-    events: mpsc::Sender<NetEvent>,
 }
 
-/// Protocol handler for `/triblespace/auth-handshake/1`. Accepts
-/// incoming `OP_REQUEST_CAP` and `OP_DELIVER_CAP` streams and
-/// forwards their payloads to the Peer's event channel. All policy
-/// (approve / queue / reject; verify / record / drop) lives in the
-/// receiving Peer, not here — this handler just bridges the wire to
-/// the local event queue.
-#[derive(Clone)]
-struct HandshakeHandler<T: Transport> {
-    events: mpsc::Sender<NetEvent>,
-    /// Team root pubkey — verifies the delivered cap's chain at
-    /// `OP_DELIVER_CAP` time so STATUS_OK means "we'd accept this".
-    team_root: ed25519_dalek::VerifyingKey,
-    /// Our own pubkey — the expected `cap_subject` of any cap
-    /// delivered to us.
-    our_pubkey: ed25519_dalek::VerifyingKey,
-    /// Snapshot for local-pile blob lookup during verify.
-    snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    /// Transport for one-shot, bounded proof retrieval when local verification
-    /// lacks an ancestor of the just-delivered chain.
-    transport: T,
-}
-
-impl<T: Transport> HandshakeHandler<T> {
-    async fn handle(&self, connection: T::Conn) {
-        // PublisherKey is just the 32-byte pubkey representation;
-        // the transport's remote id is the TLS-verified ed25519
-        // pubkey of the dialer (matched against the type alias in
-        // channel.rs).
-        let peer_pubkey_bytes: PublisherKey = connection.remote_id();
-        let events = self.events.clone();
-        let team_root = self.team_root;
-        let our_pubkey = self.our_pubkey;
+impl SnapshotHandler {
+    async fn handle<T: Transport>(&self, connection: T::Conn) {
         let snapshot = self.snapshot.clone();
-        let transport = self.transport.clone();
-        let span = info_span!(
-            "auth-handshake",
-            peer = %hex::encode(&peer_pubkey_bytes[..4]),
-        );
-        async move {
-            // Each connection can carry multiple bi-streams (e.g. a
-            // request followed by a deliver). Loop until the peer
-            // closes the connection.
-            loop {
-                let Some((mut send, mut recv)) = connection.accept_bi().await else {
-                    debug!("accept_bi ended; handshake connection closing");
-                    break;
-                };
-                match crate::handshake::read_incoming(&mut recv).await {
-                    Ok(Some(crate::handshake::IncomingOp::Request {
-                        partial_cap_bytes,
-                    })) => {
-                        let _ = events.send(NetEvent::CapRequest {
-                            requester: peer_pubkey_bytes,
-                            partial_cap_bytes,
-                        });
-                        let _ = crate::handshake::respond(
-                            &mut send,
-                            crate::handshake::STATUS_OK,
-                        )
-                        .await;
-                    }
-                    Ok(Some(crate::handshake::IncomingOp::Deliver {
-                        cap_bytes,
-                        sig_bytes,
-                    })) => {
-                        use triblespace_core::blob::{Blob, TryFromBlob};
-                        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-                        use triblespace_core::inline::Inline;
-                        use triblespace_core::inline::encodings::hash::Handle;
-                        use triblespace_core::trible::TribleSet;
-                        use triblespace_core::macros::{find, pattern};
-
-                        let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes.clone());
-                        let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes.clone());
-                        let cap_hash: RawHash = *blake3::hash(&cap_bytes).as_bytes();
-                        let sig_hash: RawHash = *blake3::hash(&sig_bytes).as_bytes();
-                        let sig_handle: Inline<Handle<SimpleArchive>> =
-                            Inline::new(sig_hash);
-
-                        // Cheap DoS guard before any proof retrieval: the
-                        // cap's declared `cap_issuer` must equal the
-                        // TLS-verified pubkey of whoever just dialed
-                        // us. The auth-handshake ALPN is open to
-                        // unauthenticated peers, so without this gate
-                        // a stranger could ship a cap with our subject and a
-                        // sig proof pointing at arbitrary parent hashes. The
-                        // check prevents us from asking an unrelated peer for
-                        // that malformed chain. The check
-                        // costs one `find!` against the leaf cap
-                        // blob.
-                        let declared_issuer = if let Ok(cap_set) =
-                            TribleSet::try_from_blob(cap_blob.clone())
-                        {
-                            find!(
-                                (issuer: ed25519_dalek::VerifyingKey),
-                                pattern!(&cap_set, [{
-                                    triblespace_core::repo::capability::cap_issuer: ?issuer,
-                                }])
-                            )
-                            .next()
-                            .map(|(k,)| k)
-                        } else {
-                            None
-                        };
-                        match declared_issuer {
-                            Some(issuer) if issuer.to_bytes() == peer_pubkey_bytes => {}
-                            Some(issuer) => {
-                                warn!(
-                                    declared_issuer = %hex::encode(&issuer.to_bytes()[..4]),
-                                    dialer = %hex::encode(&peer_pubkey_bytes[..4]),
-                                    "OP_DELIVER_CAP: cap_issuer doesn't match TLS dialer; rejecting",
-                                );
-                                let _ = crate::handshake::respond(
-                                    &mut send,
-                                    crate::handshake::STATUS_REJECTED,
-                                )
-                                .await;
-                                continue;
-                            }
-                            None => {
-                                warn!("OP_DELIVER_CAP: cap blob malformed or missing cap_issuer; rejecting");
-                                let _ = crate::handshake::respond(
-                                    &mut send,
-                                    crate::handshake::STATUS_MALFORMED,
-                                )
-                                .await;
-                                continue;
-                            }
-                        }
-
-                        // Verify with an exact, bounded fallback: try local
-                        // first, then fetch only the cap handles named by the
-                        // in-band recursive signature proof.
-                        let verify_once = |fetched: &std::collections::BTreeMap<RawHash, Vec<u8>>| {
-                            let snap_for_fetch = snapshot.clone();
-                            let fetched_for_lookup = fetched.clone();
-                            let cap_blob_for_fetch = cap_blob.clone();
-                            let sig_blob_for_fetch = sig_blob.clone();
-                            triblespace_core::repo::capability::verify_chain(
-                                team_root,
-                                sig_handle,
-                                our_pubkey,
-                                move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-                                    if h.raw == cap_hash {
-                                        return Some(cap_blob_for_fetch.clone());
-                                    }
-                                    if h.raw == sig_hash {
-                                        return Some(sig_blob_for_fetch.clone());
-                                    }
-                                    if let Some(bytes) = snap_for_fetch
-                                        .lock()
-                                        .unwrap()
-                                        .as_ref()
-                                        .and_then(|s| s.get_blob(&h.raw))
-                                    {
-                                        return Some(Blob::new(anybytes::Bytes::from_source(bytes)));
-                                    }
-                                    let bytes = fetched_for_lookup.get(&h.raw)?.clone();
-                                    Some(Blob::new(anybytes::Bytes::from_source(bytes)))
-                                },
-                            )
-                        };
-
-                        let mut fetched: std::collections::BTreeMap<RawHash, Vec<u8>> =
-                            std::collections::BTreeMap::new();
-                        let mut result = verify_once(&fetched);
-
-                        if matches!(
-                            result,
-                            Err(
-                                triblespace_core::repo::capability::VerifyError::Fetch
-                                    | triblespace_core::repo::capability::VerifyError::LeafCapMissing
-                            ),
-                        ) {
-                            debug!(sig = %hex::encode(&sig_hash[..4]), "OP_DELIVER_CAP: chain incomplete locally, fetching proof");
-
-                            // Ask the TLS-verified issuer for the exact
-                            // just-received `sig_hash` proof over the bounded,
-                            // one-shot pre-auth operation. The response still
-                            // passes our own full verifier below.
-                            let known = std::collections::BTreeMap::from([
-                                (cap_hash, cap_bytes.as_ref().to_vec()),
-                                (sig_hash, sig_bytes.as_ref().to_vec()),
-                            ]);
-                            fetched = match tokio::time::timeout(
-                                AUTH_PROOF_FETCH_DEADLINE,
-                                fetch_capability_proof(
-                                    &transport,
-                                    peer_pubkey_bytes,
-                                    &sig_hash,
-                                    &known,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(fetched) => fetched,
-                                Err(_) => {
-                                    warn!(sig = %hex::encode(&sig_hash[..4]), "OP_DELIVER_CAP: proof fetch deadline exceeded");
-                                    std::collections::BTreeMap::new()
-                                }
-                            };
-                            debug!(blobs = fetched.len(), "fetched capability proof blobs");
-                            result = verify_once(&fetched);
-                        }
-
-                        match result {
-                            Ok(_verified) => {
-                                debug!(
-                                    sig = %hex::encode(&sig_hash[..4]),
-                                    issuer = %hex::encode(&peer_pubkey_bytes[..4]),
-                                    "OP_DELIVER_CAP: chain verified; absorbing",
-                                );
-                                // Emit Blob events for everything the
-                                // verify needed — the in-band leaf
-                                // pair + every proof-fetched parent.
-                                // mpsc preserves order so the Peer
-                                // thread sees these before the
-                                // CapDelivered marker that records the policy
-                                // version.
-                                let _ = events.send(NetEvent::Blob(cap_bytes.clone()));
-                                let _ = events.send(NetEvent::Blob(sig_bytes.clone()));
-                                for (_, bytes) in std::mem::take(&mut fetched) {
-                                    let _ = events.send(NetEvent::Blob(
-                                        anybytes::Bytes::from_source(bytes),
-                                    ));
-                                }
-                                let _ = events.send(NetEvent::CapDelivered {
-                                    issuer: peer_pubkey_bytes,
-                                    cap_bytes,
-                                    sig_bytes,
-                                });
-                                let _ = crate::handshake::respond(
-                                    &mut send,
-                                    crate::handshake::STATUS_OK,
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    error = ?e,
-                                    sig = %hex::encode(&sig_hash[..4]),
-                                    "OP_DELIVER_CAP: chain verify failed; rejecting",
-                                );
-                                let _ = crate::handshake::respond(
-                                    &mut send,
-                                    crate::handshake::STATUS_REJECTED,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        let _ = crate::handshake::respond(
-                            &mut send,
-                            crate::handshake::STATUS_MALFORMED,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "handshake decode error; rejecting");
-                        let _ = crate::handshake::respond(
-                            &mut send,
-                            crate::handshake::STATUS_MALFORMED,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        .instrument(span)
-        .await;
-    }
-}
-
-impl<T: Transport> SnapshotHandler<T> {
-    async fn handle(&self, connection: T::Conn) {
-        let snap = self.snapshot.clone();
         let team_root = self.team_root;
-        let transport = self.transport.clone();
-        let events = self.events.clone();
-
-        let peer_id: PeerId = connection.remote_id();
+        let peer_id = connection.remote_id();
         let span = info_span!(
             "connection",
             peer = %hex::encode(&peer_id[..4]),
@@ -1754,50 +1228,36 @@ impl<T: Transport> SnapshotHandler<T> {
 
         async move {
             info!("connection accepted");
-
-            // The connecting peer's verified ed25519 identity from
-            // the transport's TLS layer.
-            let peer_pubkey = match ed25519_dalek::VerifyingKey::from_bytes(&peer_id) {
-                Ok(k) => k,
-                Err(e) => {
-                    warn!(error = %e, "peer pubkey parse failed; closing");
+            let peer = match ed25519_dalek::VerifyingKey::from_bytes(&peer_id) {
+                Ok(peer) => peer,
+                Err(error) => {
+                    warn!(%error, "peer public key is malformed; closing");
+                    connection.close(1, b"invalid peer identity");
                     return;
                 }
             };
 
-            // Per-connection auth state. Set by the first `OP_AUTH`
-            // stream; read by every subsequent stream to gate access.
-            let auth_state: Arc<
-                tokio::sync::RwLock<Option<triblespace_core::repo::capability::VerifiedCapability>>,
-            > = Arc::new(tokio::sync::RwLock::new(None));
-
-            // Authenticate exactly once, synchronously, before admitting any
-            // concurrent data streams. Besides matching the wire contract,
-            // this bounds pre-auth proof discovery to one operation per
-            // connection and avoids a race where stream #2 observes an empty
-            // auth state while stream #1 is still fetching the chain.
+            // Authentication is deliberately structural control flow rather
+            // than mutable per-connection state: the first stream proves the
+            // exact CONNECT claim, then and only then can request streams run.
             let Some((mut send, mut recv)) = connection.accept_bi().await else {
                 debug!("connection ended before OP_AUTH");
                 return;
             };
-            if let Err(e) = serve_stream(
-                &snap,
-                team_root,
-                peer_pubkey,
-                auth_state.clone(),
-                &transport,
-                &events,
-                &mut send,
-                &mut recv,
-            )
-            .await
-            {
-                error!(error = %e, "authentication stream error");
-            }
+            let authenticated =
+                authenticate_connection::<T::Conn>(team_root, peer, &mut send, &mut recv).await;
             let _ = send.shutdown().await;
-            if auth_state.read().await.is_none() {
-                connection.close(1, b"authentication required");
-                return;
+            match authenticated {
+                Ok(true) => {}
+                Ok(false) => {
+                    connection.close(1, b"CONNECT authority required");
+                    return;
+                }
+                Err(error) => {
+                    warn!(%error, "authentication stream failed");
+                    connection.close(1, b"malformed authentication");
+                    return;
+                }
             }
 
             loop {
@@ -1805,25 +1265,13 @@ impl<T: Transport> SnapshotHandler<T> {
                     debug!("accept_bi ended; connection closing");
                     break;
                 };
-                let snap = snap.clone();
-                let auth_state = auth_state.clone();
-                let transport = transport.clone();
-                let events = events.clone();
+                let snapshot = snapshot.clone();
                 tokio::spawn(
                     async move {
-                        if let Err(e) = serve_stream(
-                            &snap,
-                            team_root,
-                            peer_pubkey,
-                            auth_state,
-                            &transport,
-                            &events,
-                            &mut send,
-                            &mut recv,
-                        )
-                        .await
+                        if let Err(error) =
+                            serve_stream::<T::Conn>(&snapshot, &mut send, &mut recv).await
                         {
-                            error!(error = %e, "stream handler error");
+                            debug!(%error, "direct RPC stream failed");
                         }
                         let _ = send.shutdown().await;
                     }
@@ -1836,223 +1284,93 @@ impl<T: Transport> SnapshotHandler<T> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn serve_stream<T: Transport>(
-    snap_arc: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+async fn authenticate_connection<C: Conn>(
     team_root: ed25519_dalek::VerifyingKey,
-    peer_pubkey: ed25519_dalek::VerifyingKey,
-    auth_state: Arc<
-        tokio::sync::RwLock<Option<triblespace_core::repo::capability::VerifiedCapability>>,
-    >,
-    t: &T,
-    events: &mpsc::Sender<NetEvent>,
-    send: &mut <T::Conn as Conn>::SendHalf,
-    recv: &mut <T::Conn as Conn>::RecvHalf,
-) -> anyhow::Result<()> {
-    use triblespace_core::blob::Blob;
-    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::inline::Inline;
-    use triblespace_core::inline::encodings::hash::Handle;
+    peer: ed25519_dalek::VerifyingKey,
+    send: &mut C::SendHalf,
+    recv: &mut C::RecvHalf,
+) -> anyhow::Result<bool> {
+    use triblespace_core::authority::{AuthorityClaim, AuthorityMode};
 
+    let verdict = async {
+        let op = recv_u8(recv).await?;
+        if op != OP_AUTH {
+            anyhow::bail!(
+                "first stream operation is {}, expected OP_AUTH",
+                op_name(op)
+            );
+        }
+        let proof = recv_authority_proof(recv).await?;
+        let mut trailing = [0u8; 1];
+        if recv.read(&mut trailing).await? != 0 {
+            anyhow::bail!("OP_AUTH contains trailing bytes");
+        }
+        proof.verify_claim(
+            team_root,
+            AuthorityClaim::new(
+                peer,
+                ACTION_CONNECT,
+                triblespace_core::authority::collection(team_root),
+                AuthorityMode::Invoke,
+            ),
+        )?;
+        anyhow::Ok(())
+    }
+    .await;
+
+    match verdict {
+        Ok(()) => {
+            info!("CONNECT authority verified");
+            send_u8(send, AUTH_OK).await?;
+            Ok(true)
+        }
+        Err(error) => {
+            warn!(%error, "CONNECT authority rejected");
+            send_u8(send, AUTH_REJECTED).await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn serve_stream<C: Conn>(
+    snapshot: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    send: &mut C::SendHalf,
+    recv: &mut C::RecvHalf,
+) -> anyhow::Result<()> {
     let op = recv_u8(recv).await?;
     let span = debug_span!("stream", op = op_name(op));
     let _enter = span.enter();
 
-    if op == OP_CAPABILITY_PROOF {
-        if auth_state.read().await.is_some() {
-            send_u32_be(send, CAPABILITY_PROOF_REJECTED).await?;
-            return Ok(());
-        }
-        let head = recv_hash(recv).await?;
-        let known = recv_capability_proof_request(recv).await?;
-        let proof = {
-            let snapshot = snap_arc.lock().unwrap();
-            snapshot
-                .as_deref()
-                .and_then(|snapshot| local_capability_proof(snapshot, team_root, head, &known))
-        };
-        let Some(proof) = proof else {
-            send_u32_be(send, CAPABILITY_PROOF_REJECTED).await?;
-            return Ok(());
-        };
-        let count = u32::try_from(proof.len()).expect("proof count is statically bounded");
-        send_u32_be(send, count).await?;
-        for (hash, bytes) in proof {
-            send_hash(send, &hash).await?;
-            send_u32_be(
-                send,
-                u32::try_from(bytes.len()).expect("proof blob is statically bounded"),
-            )
-            .await?;
-            send.write_all(&bytes)
-                .await
-                .map_err(|error| anyhow::anyhow!("send capability proof: {error}"))?;
-        }
-        return Ok(());
-    }
-
-    if op == OP_AUTH {
-        if auth_state.read().await.is_some() {
-            warn!("repeated OP_AUTH on authenticated connection; rejecting");
-            send_u8(send, AUTH_REJECTED).await?;
-            return Ok(());
-        }
-        let cap_handle_raw = recv_hash(recv).await?;
-        debug!(cap_handle = %hex::encode(&cap_handle_raw[..4]), "auth: cap handle received");
-        let cap_handle: Inline<Handle<SimpleArchive>> = Inline::new(cap_handle_raw);
-
-        // Brief sync read inside async — guard is dropped before any
-        // .await runs so this never blocks an async worker.
-        // First-pass verify with local-only lookup. The common case is
-        // "we already have the whole chain"; only retry with a swarm
-        // fetch on the specific "missing blob" failure mode.
-        let verify_once = |fetched: &std::collections::BTreeMap<RawHash, Vec<u8>>| {
-            let snap_for_fetch = snap_arc.clone();
-            let fetched_for_lookup = fetched.clone();
-            triblespace_core::repo::capability::verify_chain(
-                team_root,
-                cap_handle,
-                peer_pubkey,
-                move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-                    if let Some(bytes) = snap_for_fetch
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|s| s.get_blob(&h.raw))
-                    {
-                        return Some(Blob::new(anybytes::Bytes::from_source(bytes)));
-                    }
-                    let bytes = fetched_for_lookup.get(&h.raw)?.clone();
-                    Some(Blob::new(anybytes::Bytes::from_source(bytes)))
-                },
-            )
-        };
-
-        let mut fetched: std::collections::BTreeMap<RawHash, Vec<u8>> =
-            std::collections::BTreeMap::new();
-        let mut result = verify_once(&fetched);
-
-        // Exact bounded fetch + retry on a missing blob. Capability blobs are
-        // not collection evidence, so the first auth from a peer may need the
-        // cap handles named by its recursive signature proof.
-        if matches!(
-            result,
-            Err(triblespace_core::repo::capability::VerifyError::Fetch
-                | triblespace_core::repo::capability::VerifyError::LeafCapMissing),
-        ) {
-            debug!(
-                cap_handle = %hex::encode(&cap_handle_raw[..4]),
-                "auth: chain incomplete locally, fetching proof",
-            );
-            let publisher: PeerId = peer_pubkey.to_bytes();
-            let known = std::collections::BTreeMap::new();
-            fetched = match tokio::time::timeout(
-                AUTH_PROOF_FETCH_DEADLINE,
-                fetch_capability_proof(t, publisher, &cap_handle_raw, &known),
-            )
-            .await
-            {
-                Ok(fetched) => fetched,
-                Err(_) => {
-                    warn!(cap_handle = %hex::encode(&cap_handle_raw[..4]), "auth proof fetch deadline exceeded");
-                    std::collections::BTreeMap::new()
-                }
-            };
-            debug!(blobs = fetched.len(), "fetched capability proof blobs");
-            result = verify_once(&fetched);
-        }
-
-        match result {
-            Ok(verified) => {
-                info!(permissions = ?verified.permissions(), "auth ok");
-                // Cache the proof-fetched blobs into the local store so
-                // the next AUTH involving the same chain finds them
-                // locally. mpsc preserves order; child-before-parent
-                // ordering doesn't matter here because the chain is
-                // already self-consistent (every parent referenced by
-                // every fetched cap is also in `fetched`).
-                for (_, bytes) in std::mem::take(&mut fetched) {
-                    let _ = events.send(NetEvent::Blob(anybytes::Bytes::from_source(bytes)));
-                }
-                // Tell the Peer thread that this remote authed with
-                // `cap_handle_raw`. If the Peer issued a cap to this
-                // subject and `cap_handle_raw` matches the policy
-                // entry's `latest_sig`, the Peer marks the entry as
-                // delivered (the subject has the cap and can use it).
-                let _ = events.send(NetEvent::CapDeliveryConfirmed {
-                    subject: peer_pubkey.to_bytes(),
-                    sig_handle: cap_handle_raw,
-                });
-                *auth_state.write().await = Some(verified);
-                send_u8(send, AUTH_OK).await?;
-            }
-            Err(e) => {
-                warn!(error = ?e, "auth rejected");
-                send_u8(send, AUTH_REJECTED).await?;
-            }
-        }
-        return Ok(());
-    }
-
-    // All other ops require a verified cap on the connection. Snapshot the
-    // auth state once so the permission gate sees a stable view for the rest
-    // of this stream's lifetime.
-    let verified = {
-        let mut state = auth_state.write().await;
-        match state.as_ref() {
-            Some(verified) if verified.is_current() => verified.clone(),
-            Some(_) => {
-                // A pooled connection may outlive the credential presented on
-                // its OP_AUTH stream. Clear the cached authorization so
-                // non-renewal takes effect at the earliest chain expiry.
-                *state = None;
-                debug!("operation after capability expiry; closing stream");
-                return Ok(());
-            }
-            None => {
-                // Not authenticated. Close the stream silently — the client
-                // should have presented OP_AUTH first.
-                debug!("op without prior OP_AUTH on connection; closing stream");
-                return Ok(());
-            }
-        }
-    };
     match op {
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
-            let data = if verified.grants_read() {
-                let guard = snap_arc.lock().unwrap();
-                guard.as_ref().and_then(|snap| snap.get_blob(&hash))
-            } else {
-                None
-            };
+            let data = snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|snapshot| snapshot.get_blob(&hash));
             match data {
                 Some(data) => {
                     debug!(hash = %hex::encode(&hash[..4]), bytes = data.len(), "OP_GET_BLOB served");
                     send_u64_be(send, data.len() as u64).await?;
                     send.write_all(&data)
                         .await
-                        .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+                        .map_err(|error| anyhow::anyhow!("send blob: {error}"))?;
                 }
                 None => {
-                    if !verified.grants_read() {
-                        warn!(hash = %hex::encode(&hash[..4]), "OP_GET_BLOB denied: read permission required");
-                    } else {
-                        debug!(hash = %hex::encode(&hash[..4]), "OP_GET_BLOB miss: blob not present");
-                    }
+                    debug!(hash = %hex::encode(&hash[..4]), "OP_GET_BLOB miss");
                     send_u64_be(send, u64::MAX).await?;
                 }
             }
         }
-
         OP_CHILDREN => {
             let parent_hash = recv_hash(recv).await?;
             let mut total_chunks = 0usize;
-            let children: Vec<RawHash> = if verified.grants_read() {
-                let guard = snap_arc.lock().unwrap();
+            let children: Vec<RawHash> = {
+                let guard = snapshot.lock().unwrap();
                 match guard.as_ref() {
                     None => Vec::new(),
-                    Some(snap) => match snap.get_blob(&parent_hash) {
+                    Some(snapshot) => match snapshot.get_blob(&parent_hash) {
                         None => Vec::new(),
                         Some(parent_data) => {
                             let mut result = Vec::new();
@@ -2061,7 +1379,7 @@ async fn serve_stream<T: Transport>(
                                     total_chunks += 1;
                                     let mut candidate = [0u8; 32];
                                     candidate.copy_from_slice(chunk);
-                                    if snap.has_blob(&candidate) {
+                                    if snapshot.has_blob(&candidate) {
                                         result.push(candidate);
                                     }
                                 }
@@ -2070,116 +1388,72 @@ async fn serve_stream<T: Transport>(
                         }
                     },
                 }
-            } else {
-                Vec::new()
             };
-            if !verified.grants_read() {
-                warn!(parent = %hex::encode(&parent_hash[..4]), "OP_CHILDREN denied: read permission required");
-            } else {
-                debug!(
-                    parent = %hex::encode(&parent_hash[..4]),
-                    candidates = total_chunks,
-                    in_scope = children.len(),
-                    "OP_CHILDREN served"
-                );
-            }
-            for hash in &children {
-                send_hash(send, hash).await?;
+            debug!(
+                parent = %hex::encode(&parent_hash[..4]),
+                candidates = total_chunks,
+                in_scope = children.len(),
+                "OP_CHILDREN served"
+            );
+            for hash in children {
+                send_hash(send, &hash).await?;
             }
             send_hash(send, &NIL_HASH).await?;
         }
-
         OP_COLLECTION_EVIDENCE => {
             let collection = CollectionHandle::new(recv_hash(recv).await?);
-            if !verified.grants_read() {
-                warn!(
-                    collection = %hex::encode(&collection.raw[..4]),
-                    "OP_COLLECTION_EVIDENCE denied: read permission required"
-                );
-                send_u32_be(send, COLLECTION_EVIDENCE_REJECTED).await?;
-            } else {
-                let evidence = {
-                    let guard = snap_arc.lock().unwrap();
-                    guard
-                        .as_ref()
-                        .map(|snapshot| snapshot.collection_evidence(collection))
-                        .unwrap_or_default()
-                };
-                let count = u32::try_from(evidence.len())
-                    .map_err(|_| anyhow::anyhow!("too many collection evidence records"))?;
-                // `u32::MAX` is reserved for the authorization sentinel.
-                if count == COLLECTION_EVIDENCE_REJECTED {
-                    return Err(anyhow::anyhow!("too many collection evidence records"));
-                }
-                send_u32_be(send, count).await?;
-                for item in evidence {
-                    send.write_all(&item.to_bytes())
-                        .await
-                        .map_err(|error| anyhow::anyhow!("send collection evidence: {error}"))?;
-                }
-                debug!(
-                    collection = %hex::encode(&collection.raw[..4]),
-                    count,
-                    "OP_COLLECTION_EVIDENCE served"
-                );
+            let evidence = snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|snapshot| snapshot.collection_evidence(collection))
+                .unwrap_or_default();
+            let count = u32::try_from(evidence.len())
+                .map_err(|_| anyhow::anyhow!("too many collection evidence records"))?;
+            send_u32_be(send, count).await?;
+            for item in evidence {
+                send.write_all(&item.to_bytes())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("send collection evidence: {error}"))?;
             }
+            debug!(
+                collection = %hex::encode(&collection.raw[..4]),
+                count,
+                "OP_COLLECTION_EVIDENCE served"
+            );
         }
-
         OP_COLLECTION_OPERATION_RECEIPTS => {
             let mut request_bytes = [0u8; WANT_REQUEST_BYTES_LEN];
-            let request = match recv.read_exact(&mut request_bytes).await {
-                Ok(_) => {
-                    let mut trailing = [0u8; 1];
-                    match recv.read(&mut trailing).await {
-                        Ok(0) => decode_collection_operation_request(request_bytes).ok(),
-                        Ok(_) => {
-                            debug!("collection operation request contains trailing bytes");
-                            None
-                        }
-                        Err(error) => {
-                            debug!(%error, "failed to finish collection operation request");
-                            None
-                        }
-                    }
-                }
-                Err(error) => {
-                    debug!(%error, "truncated collection operation request");
-                    None
-                }
-            };
-            if !verified.grants_read() || request.is_none() {
-                warn!(
-                    valid_request = request.is_some(),
-                    "OP_COLLECTION_OPERATION_RECEIPTS denied or malformed"
-                );
-                send_u32_be(send, COLLECTION_OPERATION_RECEIPTS_REJECTED).await?;
-            } else {
-                let request = request.expect("checked operation request");
-                let receipts = {
-                    let guard = snap_arc.lock().unwrap();
-                    guard
-                        .as_ref()
-                        .map(|snapshot| snapshot.collection_operation_receipts(request))
-                        .unwrap_or_default()
-                };
-                let response = encode_collection_operation_receipts(request, receipts)?;
-                send.write_all(&response).await.map_err(|error| {
-                    anyhow::anyhow!("send collection operation receipts: {error}")
-                })?;
-                debug!(
-                    ?request,
-                    count = (response.len() - 4)
-                        / crate::collection_wire::COLLECTION_OPERATION_RECEIPT_BYTES_LEN,
-                    "OP_COLLECTION_OPERATION_RECEIPTS served"
-                );
+            recv.read_exact(&mut request_bytes).await.map_err(|error| {
+                anyhow::anyhow!("truncated collection operation request: {error}")
+            })?;
+            let mut trailing = [0u8; 1];
+            if recv.read(&mut trailing).await? != 0 {
+                anyhow::bail!("collection operation request contains trailing bytes");
             }
+            let request = decode_collection_operation_request(request_bytes)?;
+            let receipts = snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|snapshot| snapshot.collection_operation_receipts(request))
+                .unwrap_or_default();
+            let response = encode_collection_operation_receipts(request, receipts)?;
+            send.write_all(&response)
+                .await
+                .map_err(|error| anyhow::anyhow!("send collection operation receipts: {error}"))?;
+            debug!(
+                ?request,
+                count = (response.len() - 4)
+                    / crate::collection_wire::COLLECTION_OPERATION_RECEIPT_BYTES_LEN,
+                "OP_COLLECTION_OPERATION_RECEIPTS served"
+            );
         }
-
-        _ => {}
+        OP_AUTH => anyhow::bail!("OP_AUTH may only appear on the first stream"),
+        _ => anyhow::bail!("unknown direct RPC operation {op:#x}"),
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod collection_evidence_gossip_tests {
     use std::collections::HashSet;
@@ -2332,216 +1606,5 @@ mod collection_evidence_gossip_tests {
         remove_transient_routing_candidate(&candidates, &configured, transient_peer);
         remove_transient_routing_candidate(&candidates, &configured, configured_peer);
         assert_eq!(*candidates.lock().unwrap(), vec![configured_peer]);
-    }
-}
-
-#[cfg(test)]
-mod capability_proof_tests {
-    use std::collections::BTreeMap;
-
-    use ed25519_dalek::SigningKey;
-    use triblespace_core::collection::{CollectionCommit, CollectionHandle, CollectionRecord};
-    use triblespace_core::id::{ExclusiveId, ufoid};
-    use triblespace_core::inline::encodings::time::NsTAIInterval;
-    use triblespace_core::inline::{Inline, TryToInline};
-    use triblespace_core::macros::entity;
-    use triblespace_core::repo::WantRequest;
-    use triblespace_core::repo::capability::{PERM_ADMIN, build_capability};
-    use triblespace_core::trible::TribleSet;
-
-    use super::{AnySnapshot, RawHash, local_capability_proof};
-
-    struct BlobSnapshot(BTreeMap<RawHash, Vec<u8>>);
-
-    impl AnySnapshot for BlobSnapshot {
-        fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
-            self.0.get(hash).cloned()
-        }
-
-        fn has_blob(&self, hash: &RawHash) -> bool {
-            self.0.contains_key(hash)
-        }
-
-        fn collection_evidence(&self, _: CollectionHandle) -> Vec<CollectionCommit> {
-            Vec::new()
-        }
-
-        fn all_collection_evidence(&self) -> Vec<CollectionCommit> {
-            Vec::new()
-        }
-
-        fn collection_operation_receipts(&self, _: WantRequest) -> Vec<CollectionRecord> {
-            Vec::new()
-        }
-    }
-
-    fn admin_scope() -> (triblespace_core::id::Id, TribleSet) {
-        let root = *ufoid();
-        let facts = TribleSet::from(entity! {
-            ExclusiveId::force_ref(&root) @
-            triblespace_core::metadata::tag: PERM_ADMIN,
-        });
-        (root, facts)
-    }
-
-    fn expiry() -> Inline<NsTAIInterval> {
-        let now = triblespace_core::clock::epoch_now();
-        (now, now + hifitime::Duration::from_days(1.0))
-            .try_to_inline()
-            .unwrap()
-    }
-
-    #[test]
-    fn supplied_leaf_completes_proof_against_stale_issuer_snapshot() {
-        let root = SigningKey::from_bytes(&[0xD1; 32]);
-        let issuer = SigningKey::from_bytes(&[0xD2; 32]);
-        let recipient = SigningKey::from_bytes(&[0xD3; 32]);
-        let (parent_scope, parent_facts) = admin_scope();
-        let parent = build_capability(
-            &root,
-            issuer.verifying_key(),
-            None,
-            parent_scope,
-            parent_facts,
-            expiry(),
-        )
-        .unwrap();
-        let (leaf_scope, leaf_facts) = admin_scope();
-        let leaf = build_capability(
-            &issuer,
-            recipient.verifying_key(),
-            Some(parent.clone()),
-            leaf_scope,
-            leaf_facts,
-            expiry(),
-        )
-        .unwrap();
-
-        // The issuer persisted the ancestor long ago, but its serving snapshot
-        // predates the newly issued leaf pair being delivered.
-        let snapshot = BlobSnapshot(BTreeMap::from([
-            (parent.0.get_handle().raw, parent.0.bytes.as_ref().to_vec()),
-            (parent.1.get_handle().raw, parent.1.bytes.as_ref().to_vec()),
-        ]));
-        let known = BTreeMap::from([
-            (leaf.0.get_handle().raw, leaf.0.bytes.as_ref().to_vec()),
-            (leaf.1.get_handle().raw, leaf.1.bytes.as_ref().to_vec()),
-        ]);
-
-        let proof = local_capability_proof(
-            &snapshot,
-            root.verifying_key(),
-            leaf.1.get_handle().raw,
-            &known,
-        )
-        .expect("in-band leaf plus local ancestor forms a complete proof");
-        assert_eq!(proof.len(), 3, "leaf sig, leaf cap, and parent cap");
-        assert!(proof.contains_key(&leaf.1.get_handle().raw));
-        assert!(proof.contains_key(&leaf.0.get_handle().raw));
-        assert!(proof.contains_key(&parent.0.get_handle().raw));
-        assert!(!proof.contains_key(&parent.1.get_handle().raw));
-    }
-}
-
-#[cfg(test)]
-mod serving_snapshot_tests {
-    use std::convert::Infallible;
-    use std::fmt;
-
-    use ed25519_dalek::SigningKey;
-    use iroh_base::EndpointId;
-    use triblespace_core::blob::{BlobEncoding, IntoBlob};
-    use triblespace_core::collection::{CollectionRecord, CollectionStore};
-    use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::inline::{Inline, InlineEncoding};
-    use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStore, BlobStorePut};
-
-    use super::wire;
-
-    #[derive(Debug)]
-    struct SnapshotUnavailable;
-
-    impl fmt::Display for SnapshotUnavailable {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("snapshot unavailable")
-        }
-    }
-
-    impl std::error::Error for SnapshotUnavailable {}
-
-    /// A normal in-memory store behind a deliberately fallible blob reader.
-    struct FallibleSnapshotStore {
-        inner: MemoryRepo,
-        fail_reader: bool,
-    }
-
-    impl BlobStorePut for FallibleSnapshotStore {
-        type PutError = <MemoryRepo as BlobStorePut>::PutError;
-
-        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
-        where
-            S: BlobEncoding + 'static,
-            T: IntoBlob<S>,
-            Handle<S>: InlineEncoding,
-        {
-            self.inner.put(item)
-        }
-    }
-
-    impl BlobStore for FallibleSnapshotStore {
-        type Reader = <MemoryRepo as BlobStore>::Reader;
-        type ReaderError = SnapshotUnavailable;
-
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            if self.fail_reader {
-                Err(SnapshotUnavailable)
-            } else {
-                Ok(self.inner.reader().expect("memory reader is infallible"))
-            }
-        }
-    }
-
-    impl CollectionStore for FallibleSnapshotStore {
-        type RecordsError = Infallible;
-        type InsertError = Infallible;
-        type RecordIter<'a> = <MemoryRepo as CollectionStore>::RecordIter<'a>;
-
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            self.inner.records()
-        }
-
-        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-            self.inner.insert(record)
-        }
-    }
-
-    #[test]
-    fn failed_refresh_clears_a_previous_serving_snapshot() {
-        let mut store = FallibleSnapshotStore {
-            inner: MemoryRepo::default(),
-            fail_reader: false,
-        };
-
-        let key = SigningKey::from_bytes(&[0x71; 32]);
-        let endpoint = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
-        let (sender, _receiver, wiring) = wire(endpoint);
-
-        assert!(sender.refresh_store_snapshot(&mut store));
-        assert!(wiring.snapshot.lock().unwrap().is_some());
-
-        store.fail_reader = true;
-        assert!(!sender.refresh_store_snapshot(&mut store));
-        assert!(
-            wiring.snapshot.lock().unwrap().is_none(),
-            "construction failure must clear the prior view; request handlers deny when no snapshot is installed"
-        );
-
-        store.fail_reader = false;
-        assert!(sender.refresh_store_snapshot(&mut store));
-        assert!(
-            wiring.snapshot.lock().unwrap().is_some(),
-            "a later successful refresh restores service"
-        );
     }
 }

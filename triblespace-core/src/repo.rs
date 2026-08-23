@@ -8,8 +8,6 @@
 pub mod async_store;
 
 pub mod branch;
-/// Capability-based authorization for triblespace networks.
-pub mod capability;
 /// Commit metadata construction and signature verification.
 pub mod commit;
 /// Storage adapter that delegates blobs and collection records to separate backends.

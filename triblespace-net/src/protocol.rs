@@ -4,46 +4,52 @@
 //! followed by the request payload. The response follows on the same stream.
 //! Stream FIN signals completion — no explicit DONE framing needed.
 //!
-//! Auth: the first stream on an ordinary connection must be
-//! `OP_AUTH(cap_handle)`. The only pre-auth exception is the one-shot,
-//! bounded `OP_CAPABILITY_PROOF(head)` bootstrap operation; that connection is
-//! closed after its response. The server walks an auth chain back to the
-//! configured team root and caches the verified permissions for later streams,
-//! rechecking expiry on every operation.
+//! Auth: the first stream on every connection must be `OP_AUTH(proof)`. The
+//! proof is a complete, bounded, root-to-leaf [`AuthorityProof`] for
+//! [`ACTION_CONNECT`] on the team's authority collection. It is verified
+//! entirely from the bytes on that stream; authentication never fetches or
+//! persists ambient state.
 //!
 //! Nil sentinels: nil id ([0u8; 16]) and nil hash ([0u8; 32]) terminate
 //! sequences. P(collision) = 2^(-128) / 2^(-256). Content-addressed systems
 //! already assume hash uniqueness — nil sentinels are the same assumption.
 //!
 //! Operations:
-//!   AUTH       cap_handle:32 → resp:u8                (0x00 = OK, 0x01 = REJECTED)
+//!   AUTH       proof_len:u32 proof:bytes → resp:u8    (0x00 = OK, 0x01 = REJECTED)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   CHILDREN   parent:32 → hash* nil                  (nil = end)
 //!   COLLECTION_EVIDENCE collection:32 → count:u32 evidence[count]
-//!                  (`u32::MAX` = read capability required)
 //!   COLLECTION_OPERATION_RECEIPTS request:97 → count:u32 receipt[count]
-//!                  (`u32::MAX` = rejected; each receipt is 128 bytes)
-//!   CAPABILITY_PROOF head:32 known_count:u32 (hash:32 len:u32 data)*
-//!                  → count:u32 (hash:32 len:u32 data)*
-//!                  (`u32::MAX` = rejected; bounded, pre-auth, one-shot)
+//!                  (each receipt is 128 bytes)
 //!   (protocol is read-only — no remote writes)
 //!
-//! Branch-state operations are retired. Immutable grant-backed collection
+//! Branch-state operations are retired. Immutable signed collection
 //! commits are discovered through the team gossip mesh; content and exact
 //! receipts remain explicitly fetched through this read-only protocol.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/5";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/6";
+
+use triblespace_core::id::{Id, id_hex};
+
+/// Permission to establish an authenticated direct-RPC connection.
+///
+/// Minted on 2026-08-23 CEST with the exact command `trible genid`, whose
+/// output was `9685583C6ADD2A5F5309F9504F46ABC3`.
+///
+/// This action is meaningful only on [`triblespace_core::authority::collection`]
+/// for the configured team root. It grants no collection write admission,
+/// disclosure, gossip, custody, or retention authority.
+pub const ACTION_CONNECT: Id = id_hex!("9685583C6ADD2A5F5309F9504F46ABC3");
 
 // Operation types — first byte on each stream.
 // 0x01 was the retired branch-list operation.
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_CHILDREN: u8 = 0x03;
 // 0x04 was the retired branch-head operation.
-/// First stream on every ordinary connection. Body: cap_handle:32. Response:
-/// u8 status (`AUTH_OK` or `AUTH_REJECTED`). Connection state caches the
-/// verified permissions; subsequent ops on the same connection inherit them.
+/// First stream on every connection. Body: one length-prefixed canonical
+/// authority proof. Response: u8 status (`AUTH_OK` or `AUTH_REJECTED`).
 pub const OP_AUTH: u8 = 0x05;
-/// Enumerate grant-backed signed commits for one exact 32-byte collection
+/// Enumerate signed commits for one exact 32-byte collection
 /// descriptor handle. The response framing and strict evidence codec live in
 /// [`crate::collection_wire`].
 pub const OP_COLLECTION_EVIDENCE: u8 = 0x06;
@@ -51,45 +57,206 @@ pub const OP_COLLECTION_EVIDENCE: u8 = 0x06;
 /// canonical 97-byte [`triblespace_core::repo::WantRequest`]. Responses carry
 /// full untagged 128-byte records; the request kind supplies their type.
 pub const OP_COLLECTION_OPERATION_RECEIPTS: u8 = 0x07;
-/// Obtain the complete, bounded capability proof rooted at one exact sig
-/// handle. This is the sole operation permitted before authentication besides
-/// `OP_AUTH` itself, breaking the otherwise-circular bootstrap between two
-/// members that each hold only their own private credential chain.
-pub const OP_CAPABILITY_PROOF: u8 = 0x08;
 // CAS_PUSH removed: the data model is monotonic (set union), and immutable
 // collection records travel as evidence rather than remote mutable-head
 // writes. The request/response protocol is read-only.
 
-/// Auth response: capability verified, all subsequent ops on this
-/// connection are scope-gated by the verified cap.
+/// Auth response: CONNECT authority verified. Subsequent direct RPCs on this
+/// connection may proceed.
 pub const AUTH_OK: u8 = 0x00;
-/// Auth response: capability did not verify (chain malformed, signature
-/// failed, expired, scope-not-subset, fetch failed for any link, etc.).
-/// The connection should be closed by the client.
+/// Auth response: the inline proof was malformed or did not authorize the TLS
+/// peer to CONNECT. The connection should be closed by the client.
 pub const AUTH_REJECTED: u8 = 0x01;
 
-/// `OP_COLLECTION_EVIDENCE` response sentinel: the authenticated capability
-/// lacks read permission.
-pub const COLLECTION_EVIDENCE_REJECTED: u32 = u32::MAX;
-/// `OP_COLLECTION_OPERATION_RECEIPTS` response sentinel. This covers both
-/// authorization rejection and structurally invalid requests; callers learn
-/// no collection evidence from either case.
-pub const COLLECTION_OPERATION_RECEIPTS_REJECTED: u32 = u32::MAX;
-/// `OP_CAPABILITY_PROOF` response sentinel: the requested handle is not a
-/// complete, currently valid capability proof rooted in this team.
-pub const CAPABILITY_PROOF_REJECTED: u32 = u32::MAX;
-
-/// Capability proof blobs are canonical SimpleArchives produced by the team
-/// machinery. This bound applies only to pre-auth proof transfer, never to
-/// ordinary content blobs.
-pub const MAX_CAPABILITY_PROOF_BLOB_BYTES: usize = 16 * 1024;
-/// One leaf sig blob plus at most one cap per verifier depth.
-pub const MAX_CAPABILITY_PROOF_ITEMS: usize =
-    triblespace_core::repo::capability::MAX_CHAIN_DEPTH + 2;
+/// Version of the standalone authority-proof byte codec.
+pub const AUTHORITY_PROOF_WIRE_VERSION: u8 = 1;
+/// Transport-local bound on delegation depth, derived directly from the
+/// one-byte step count in this protocol version. The authority algebra itself
+/// remains unbounded.
+pub const MAX_AUTHORITY_PROOF_STEPS: usize = u8::MAX as usize;
+/// Exact largest canonical grant archive: a delegated grant has seven tribles
+/// (tag, subject, resource, action, parent, invoke, delegate).
+pub const MAX_AUTHORITY_PROOF_DATA_BYTES: usize = 7 * triblespace_core::trible::TRIBLE_LEN;
+const AUTHORITY_PROOF_HEADER_BYTES: usize = 2;
+const AUTHORITY_PROOF_STEP_HEADER_BYTES: usize =
+    triblespace_core::collection::COLLECTION_COMMIT_BYTES_LEN + 2;
+/// Largest complete proof frame accepted by this transport.
+pub const MAX_AUTHORITY_PROOF_BYTES: usize = AUTHORITY_PROOF_HEADER_BYTES
+    + MAX_AUTHORITY_PROOF_STEPS
+        * (AUTHORITY_PROOF_STEP_HEADER_BYTES + MAX_AUTHORITY_PROOF_DATA_BYTES);
 
 pub const NIL_HASH: RawHash = [0u8; 32];
 
 pub type RawHash = [u8; 32];
+
+use triblespace_core::authority::{AuthorityProof, AuthorityProofStep};
+use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::collection::COLLECTION_COMMIT_BYTES_LEN;
+
+/// Structural failure in the canonical bounded authority-proof codec.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum AuthorityProofWireError {
+    #[error("authority proof uses wire version {actual}, expected {expected}")]
+    WrongVersion { expected: u8, actual: u8 },
+    #[error("authority proof must contain at least one step")]
+    Empty,
+    #[error("authority proof has {count} steps; limit is {limit}")]
+    TooManySteps { count: usize, limit: usize },
+    #[error("authority proof step {step} data is {bytes} bytes; limit is {limit}")]
+    StepDataTooLarge {
+        step: usize,
+        bytes: usize,
+        limit: usize,
+    },
+    #[error("authority proof frame is {bytes} bytes; limit is {limit}")]
+    FrameTooLarge { bytes: usize, limit: usize },
+    #[error("authority proof is truncated at byte {offset}")]
+    Truncated { offset: usize },
+    #[error("authority proof contains {bytes} trailing bytes")]
+    TrailingBytes { bytes: usize },
+    #[error("authority proof length arithmetic overflowed")]
+    LengthOverflow,
+}
+
+/// Encode one authority proof into the canonical standalone byte format.
+///
+/// The format is `version:u8, count:u8, (commit:192, data_len:u16,
+/// data[data_len])*`. It is independent of QUIC and can be embedded unchanged
+/// in invite bundles. Semantic trust remains exclusively in
+/// [`AuthorityProof::verify_claim`].
+pub fn encode_authority_proof(proof: &AuthorityProof) -> Result<Vec<u8>, AuthorityProofWireError> {
+    let count = proof.steps().len();
+    validate_proof_count(count)?;
+
+    let mut encoded_len = AUTHORITY_PROOF_HEADER_BYTES;
+    for (step, item) in proof.steps().iter().enumerate() {
+        let data_len = item.data().bytes.len();
+        validate_step_data_len(step, data_len)?;
+        encoded_len = encoded_len
+            .checked_add(AUTHORITY_PROOF_STEP_HEADER_BYTES)
+            .and_then(|len| len.checked_add(data_len))
+            .ok_or(AuthorityProofWireError::LengthOverflow)?;
+    }
+    validate_frame_len(encoded_len)?;
+
+    let mut bytes = Vec::with_capacity(encoded_len);
+    bytes.push(AUTHORITY_PROOF_WIRE_VERSION);
+    bytes.push(count as u8);
+    for item in proof.steps() {
+        bytes.extend_from_slice(&item.commit().to_bytes());
+        let data = item.data().bytes.as_ref();
+        bytes.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(data);
+    }
+    debug_assert_eq!(bytes.len(), encoded_len);
+    Ok(bytes)
+}
+
+/// Decode one complete canonical bounded authority-proof byte string.
+///
+/// Framing is validated in a full first pass before the step vector or any
+/// per-step blob is allocated. Cryptographic and authority semantics are
+/// deliberately left to [`AuthorityProof::verify_claim`].
+pub fn decode_authority_proof(bytes: &[u8]) -> Result<AuthorityProof, AuthorityProofWireError> {
+    validate_frame_len(bytes.len())?;
+    if bytes.len() < AUTHORITY_PROOF_HEADER_BYTES {
+        return Err(AuthorityProofWireError::Truncated {
+            offset: bytes.len(),
+        });
+    }
+    if bytes[0] != AUTHORITY_PROOF_WIRE_VERSION {
+        return Err(AuthorityProofWireError::WrongVersion {
+            expected: AUTHORITY_PROOF_WIRE_VERSION,
+            actual: bytes[0],
+        });
+    }
+    let count = bytes[1] as usize;
+    validate_proof_count(count)?;
+
+    // First pass: validate every declared boundary before allocating output.
+    let mut offset = AUTHORITY_PROOF_HEADER_BYTES;
+    for step in 0..count {
+        let header_end = offset
+            .checked_add(AUTHORITY_PROOF_STEP_HEADER_BYTES)
+            .ok_or(AuthorityProofWireError::LengthOverflow)?;
+        if header_end > bytes.len() {
+            return Err(AuthorityProofWireError::Truncated { offset });
+        }
+        let len_offset = offset + COLLECTION_COMMIT_BYTES_LEN;
+        let data_len = u16::from_be_bytes([bytes[len_offset], bytes[len_offset + 1]]) as usize;
+        validate_step_data_len(step, data_len)?;
+        let data_end = header_end
+            .checked_add(data_len)
+            .ok_or(AuthorityProofWireError::LengthOverflow)?;
+        if data_end > bytes.len() {
+            return Err(AuthorityProofWireError::Truncated { offset: header_end });
+        }
+        offset = data_end;
+    }
+    if offset != bytes.len() {
+        return Err(AuthorityProofWireError::TrailingBytes {
+            bytes: bytes.len() - offset,
+        });
+    }
+
+    // Second pass: exact framing has been proven bounded and complete.
+    let mut steps = Vec::with_capacity(count);
+    let mut offset = AUTHORITY_PROOF_HEADER_BYTES;
+    for _ in 0..count {
+        let commit_end = offset + COLLECTION_COMMIT_BYTES_LEN;
+        let commit_bytes: [u8; COLLECTION_COMMIT_BYTES_LEN] = bytes[offset..commit_end]
+            .try_into()
+            .expect("first pass proved the fixed commit boundary");
+        offset = commit_end;
+        let data_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        offset += 2;
+        let data_end = offset + data_len;
+        let data = Blob::<SimpleArchive>::new(anybytes::Bytes::from_source(
+            bytes[offset..data_end].to_vec(),
+        ));
+        offset = data_end;
+        steps.push(AuthorityProofStep::new(
+            triblespace_core::collection::CollectionCommit::from_bytes(commit_bytes),
+            data,
+        ));
+    }
+    Ok(AuthorityProof::new(steps))
+}
+
+fn validate_proof_count(count: usize) -> Result<(), AuthorityProofWireError> {
+    if count == 0 {
+        return Err(AuthorityProofWireError::Empty);
+    }
+    if count > MAX_AUTHORITY_PROOF_STEPS {
+        return Err(AuthorityProofWireError::TooManySteps {
+            count,
+            limit: MAX_AUTHORITY_PROOF_STEPS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_step_data_len(step: usize, bytes: usize) -> Result<(), AuthorityProofWireError> {
+    if bytes > MAX_AUTHORITY_PROOF_DATA_BYTES {
+        return Err(AuthorityProofWireError::StepDataTooLarge {
+            step,
+            bytes,
+            limit: MAX_AUTHORITY_PROOF_DATA_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_frame_len(bytes: usize) -> Result<(), AuthorityProofWireError> {
+    if bytes > MAX_AUTHORITY_PROOF_BYTES {
+        return Err(AuthorityProofWireError::FrameTooLarge {
+            bytes,
+            limit: MAX_AUTHORITY_PROOF_BYTES,
+        });
+    }
+    Ok(())
+}
 
 // ── Send/Recv helpers ────────────────────────────────────────────────
 //
@@ -158,18 +325,83 @@ pub async fn recv_u64_be<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u64> {
 
 // ── Single-stream operations (client side) ───────────────────────────
 
-/// AUTH: present a capability handle. Must be the first stream opened
-/// on every new connection. Returns `Ok(())` if the server accepted the
-/// capability and the connection is authorised for subsequent ops.
-pub async fn op_auth<C: Conn>(conn: &C, cap_handle: &RawHash) -> Result<()> {
+/// Write one length-prefixed authority proof.
+pub async fn send_authority_proof<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    proof: &AuthorityProof,
+) -> Result<()> {
+    let bytes = encode_authority_proof(proof)?;
+    send_u32_be(
+        send,
+        u32::try_from(bytes.len()).expect("proof frame has a static usize bound below u32::MAX"),
+    )
+    .await?;
+    send.write_all(&bytes)
+        .await
+        .map_err(|error| anyhow!("send authority proof: {error}"))
+}
+
+/// Read one length-prefixed authority proof with count and byte bounds checked
+/// before allocating its frame buffer.
+pub async fn recv_authority_proof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<AuthorityProof> {
+    let frame_len = recv_u32_be(recv).await? as usize;
+    validate_frame_len(frame_len)?;
+    if frame_len < AUTHORITY_PROOF_HEADER_BYTES {
+        return Err(AuthorityProofWireError::Truncated { offset: frame_len }.into());
+    }
+
+    let mut header = [0u8; AUTHORITY_PROOF_HEADER_BYTES];
+    recv.read_exact(&mut header)
+        .await
+        .map_err(|error| anyhow!("recv authority proof header: {error}"))?;
+    if header[0] != AUTHORITY_PROOF_WIRE_VERSION {
+        return Err(AuthorityProofWireError::WrongVersion {
+            expected: AUTHORITY_PROOF_WIRE_VERSION,
+            actual: header[0],
+        }
+        .into());
+    }
+    let count = header[1] as usize;
+    validate_proof_count(count)?;
+    let minimum = AUTHORITY_PROOF_HEADER_BYTES
+        + count
+            .checked_mul(AUTHORITY_PROOF_STEP_HEADER_BYTES)
+            .ok_or(AuthorityProofWireError::LengthOverflow)?;
+    let maximum = AUTHORITY_PROOF_HEADER_BYTES
+        + count
+            .checked_mul(AUTHORITY_PROOF_STEP_HEADER_BYTES + MAX_AUTHORITY_PROOF_DATA_BYTES)
+            .ok_or(AuthorityProofWireError::LengthOverflow)?;
+    if frame_len < minimum {
+        return Err(AuthorityProofWireError::Truncated { offset: frame_len }.into());
+    }
+    if frame_len > maximum {
+        return Err(AuthorityProofWireError::FrameTooLarge {
+            bytes: frame_len,
+            limit: maximum,
+        }
+        .into());
+    }
+
+    let mut bytes = Vec::with_capacity(frame_len);
+    bytes.extend_from_slice(&header);
+    bytes.resize(frame_len, 0);
+    recv.read_exact(&mut bytes[AUTHORITY_PROOF_HEADER_BYTES..])
+        .await
+        .map_err(|error| anyhow!("recv authority proof body: {error}"))?;
+    Ok(decode_authority_proof(&bytes)?)
+}
+
+/// AUTH: present a complete CONNECT proof. Must be the first stream opened on
+/// every new connection.
+pub async fn op_auth<C: Conn>(conn: &C, proof: &AuthorityProof) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_AUTH).await?;
-    send_hash(&mut send, cap_handle).await?;
+    send_authority_proof(&mut send, proof).await?;
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
     let resp = recv_u8(&mut recv).await?;
     match resp {
         AUTH_OK => Ok(()),
-        AUTH_REJECTED => Err(anyhow!("server rejected capability")),
+        AUTH_REJECTED => Err(anyhow!("server rejected CONNECT proof")),
         other => Err(anyhow!("unknown auth response: {other:#x}")),
     }
 }
@@ -239,125 +471,119 @@ async fn recv_children_response<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Ve
     Ok(children)
 }
 
-/// CAPABILITY_PROOF: fetch one complete, bounded credential proof without
-/// first authenticating this connection.
-///
-/// The server validates the full chain before releasing it and closes the
-/// one-shot connection afterwards. The client independently checks framing,
-/// ordering, content hashes, and ultimately the chain itself in `verify_chain`.
-pub async fn op_capability_proof<C: Conn>(
-    conn: &C,
-    head: &RawHash,
-    known: &std::collections::BTreeMap<RawHash, Vec<u8>>,
-) -> Result<Option<std::collections::BTreeMap<RawHash, Vec<u8>>>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_CAPABILITY_PROOF).await?;
-    send_hash(&mut send, head).await?;
-    send_capability_proof_items(&mut send, known).await?;
-    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
-
-    recv_capability_proof_response(&mut recv).await
-}
-
-async fn send_capability_proof_items<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    items: &std::collections::BTreeMap<RawHash, Vec<u8>>,
-) -> Result<()> {
-    if items.len() > MAX_CAPABILITY_PROOF_ITEMS {
-        return Err(anyhow!("too many capability proof items"));
-    }
-    if items.iter().any(|(hash, bytes)| {
-        bytes.len() > MAX_CAPABILITY_PROOF_BLOB_BYTES || *blake3::hash(bytes).as_bytes() != *hash
-    }) {
-        return Err(anyhow!("invalid locally supplied capability proof item"));
-    }
-    send_u32_be(
-        send,
-        u32::try_from(items.len()).expect("proof item count is statically bounded"),
-    )
-    .await?;
-    for (hash, bytes) in items {
-        send_hash(send, hash).await?;
-        send_u32_be(
-            send,
-            u32::try_from(bytes.len()).expect("proof blob length is statically bounded"),
-        )
-        .await?;
-        send.write_all(bytes)
-            .await
-            .map_err(|error| anyhow!("send capability proof item: {error}"))?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn recv_capability_proof_request<R: AsyncRead + Unpin>(
-    recv: &mut R,
-) -> Result<std::collections::BTreeMap<RawHash, Vec<u8>>> {
-    let count = recv_u32_be(recv).await?;
-    recv_capability_proof_items(recv, count as usize, true).await
-}
-
-async fn recv_capability_proof_response<R: AsyncRead + Unpin>(
-    recv: &mut R,
-) -> Result<Option<std::collections::BTreeMap<RawHash, Vec<u8>>>> {
-    let count = recv_u32_be(recv).await?;
-    if count == CAPABILITY_PROOF_REJECTED {
-        return Ok(None);
-    }
-    let count = usize::try_from(count).map_err(|_| anyhow!("proof count does not fit usize"))?;
-    Ok(Some(recv_capability_proof_items(recv, count, false).await?))
-}
-
-async fn recv_capability_proof_items<R: AsyncRead + Unpin>(
-    recv: &mut R,
-    count: usize,
-    allow_empty: bool,
-) -> Result<std::collections::BTreeMap<RawHash, Vec<u8>>> {
-    if (!allow_empty && count == 0) || count > MAX_CAPABILITY_PROOF_ITEMS {
-        return Err(anyhow!(
-            "capability proof item count {count} is outside the valid bound"
-        ));
-    }
-
-    let mut proof = std::collections::BTreeMap::new();
-    let mut previous = None;
-    for _ in 0..count {
-        let hash = recv_hash(recv).await?;
-        if previous.is_some_and(|previous| hash <= previous) {
-            return Err(anyhow!("capability proof handles are not strictly ordered"));
-        }
-        previous = Some(hash);
-
-        let len = recv_u32_be(recv).await? as usize;
-        if len > MAX_CAPABILITY_PROOF_BLOB_BYTES {
-            return Err(anyhow!(
-                "capability proof blob length {len} exceeds {MAX_CAPABILITY_PROOF_BLOB_BYTES}"
-            ));
-        }
-        let mut bytes = vec![0u8; len];
-        recv.read_exact(&mut bytes)
-            .await
-            .map_err(|e| anyhow!("recv: {e}"))?;
-        if blake3::hash(&bytes).as_bytes() != &hash {
-            return Err(anyhow!("capability proof blob content hash mismatch"));
-        }
-        proof.insert(hash, bytes);
-    }
-    Ok(proof)
-}
-
 #[cfg(test)]
 mod bounds_tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use triblespace_core::authority::{AuthorityClaim, AuthorityGrant, AuthorityMode};
+    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::collection::{CollectionCommit, empty_metadata_handle};
+
+    fn connect_proof() -> (SigningKey, SigningKey, AuthorityProof) {
+        let root = SigningKey::from_bytes(&[0xA1; 32]);
+        let delegate = SigningKey::from_bytes(&[0xA2; 32]);
+        let peer = SigningKey::from_bytes(&[0xA3; 32]);
+        let resource = triblespace_core::authority::collection(root.verifying_key());
+
+        let parent_grant = AuthorityGrant::root(
+            delegate.verifying_key(),
+            resource,
+            ACTION_CONNECT,
+            AuthorityMode::Delegate,
+        );
+        let parent_data = parent_grant.fragment().into_facts().to_blob();
+        let parent_commit = CollectionCommit::sign(
+            &root,
+            resource,
+            triblespace_core::inline::encodings::hash::Handle::<SimpleArchive>::to_hash(
+                parent_data.get_handle(),
+            ),
+            empty_metadata_handle(),
+        );
+
+        let leaf_grant = AuthorityGrant::delegated(
+            parent_commit.id(),
+            peer.verifying_key(),
+            resource,
+            ACTION_CONNECT,
+            AuthorityMode::Invoke,
+        );
+        let leaf_data = leaf_grant.fragment().into_facts().to_blob();
+        let leaf_commit = CollectionCommit::sign(
+            &delegate,
+            resource,
+            triblespace_core::inline::encodings::hash::Handle::<SimpleArchive>::to_hash(
+                leaf_data.get_handle(),
+            ),
+            empty_metadata_handle(),
+        );
+
+        (
+            root,
+            peer,
+            AuthorityProof::new(vec![
+                AuthorityProofStep::new(parent_commit, parent_data),
+                AuthorityProofStep::new(leaf_commit, leaf_data),
+            ]),
+        )
+    }
+
+    #[test]
+    fn authority_proof_codec_roundtrips_a_verified_delegation() {
+        let (root, peer, proof) = connect_proof();
+        let bytes = encode_authority_proof(&proof).unwrap();
+        let decoded = decode_authority_proof(&bytes).unwrap();
+
+        assert_eq!(decoded, proof);
+        let leaf = decoded
+            .verify_claim(
+                root.verifying_key(),
+                AuthorityClaim::new(
+                    peer.verifying_key(),
+                    ACTION_CONNECT,
+                    triblespace_core::authority::collection(root.verifying_key()),
+                    AuthorityMode::Invoke,
+                ),
+            )
+            .unwrap();
+        assert_eq!(leaf.grant().subject().raw, peer.verifying_key().to_bytes());
+        assert_eq!(leaf.grant().action(), ACTION_CONNECT);
+        assert!(leaf.grant().invoke());
+    }
 
     #[tokio::test]
-    async fn capability_proof_rejects_oversized_item_before_allocation() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1u32.to_be_bytes());
-        bytes.extend_from_slice(&[7u8; 32]);
-        bytes.extend_from_slice(&((MAX_CAPABILITY_PROOF_BLOB_BYTES + 1) as u32).to_be_bytes());
+    async fn authority_proof_rejects_oversized_frame_before_reading_a_body() {
+        let bytes = ((MAX_AUTHORITY_PROOF_BYTES + 1) as u32).to_be_bytes();
         let mut input = bytes.as_slice();
-        assert!(recv_capability_proof_response(&mut input).await.is_err());
+        assert!(recv_authority_proof(&mut input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn authority_proof_rejects_invalid_count_before_reading_a_body() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(AUTHORITY_PROOF_HEADER_BYTES as u32).to_be_bytes());
+        bytes.extend_from_slice(&[AUTHORITY_PROOF_WIRE_VERSION, 0]);
+        let mut input = bytes.as_slice();
+        assert!(recv_authority_proof(&mut input).await.is_err());
+    }
+
+    #[test]
+    fn authority_proof_rejects_noncanonical_step_width_and_trailing_bytes() {
+        let (_, _, proof) = connect_proof();
+        let mut bytes = encode_authority_proof(&proof).unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            decode_authority_proof(&bytes),
+            Err(AuthorityProofWireError::TrailingBytes { bytes: 1 })
+        ));
+
+        let mut oversized = vec![AUTHORITY_PROOF_WIRE_VERSION, 1];
+        oversized.extend_from_slice(&[0; COLLECTION_COMMIT_BYTES_LEN]);
+        oversized.extend_from_slice(&((MAX_AUTHORITY_PROOF_DATA_BYTES + 1) as u16).to_be_bytes());
+        assert!(matches!(
+            decode_authority_proof(&oversized),
+            Err(AuthorityProofWireError::StepDataTooLarge { step: 0, .. })
+        ));
     }
 
     #[tokio::test]
@@ -375,48 +601,5 @@ mod bounds_tests {
         let bytes = (u64::MAX - 1).to_be_bytes();
         let mut input = bytes.as_slice();
         assert!(recv_blob_response(&mut input).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn capability_proof_response_checks_content_hash() {
-        let payload = b"not the named content";
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1u32.to_be_bytes());
-        bytes.extend_from_slice(&[7u8; 32]);
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(payload);
-        let mut input = bytes.as_slice();
-        assert!(recv_capability_proof_response(&mut input).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn capability_proof_request_rejects_oversized_known_item() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1u32.to_be_bytes());
-        bytes.extend_from_slice(&[7u8; 32]);
-        bytes.extend_from_slice(&((MAX_CAPABILITY_PROOF_BLOB_BYTES + 1) as u32).to_be_bytes());
-        let mut input = bytes.as_slice();
-        assert!(recv_capability_proof_request(&mut input).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn capability_proof_request_rejects_unordered_known_items() {
-        let first = b"first";
-        let second = b"second";
-        let mut items = [
-            (*blake3::hash(first).as_bytes(), first.as_slice()),
-            (*blake3::hash(second).as_bytes(), second.as_slice()),
-        ];
-        items.sort_by_key(|(hash, _)| std::cmp::Reverse(*hash));
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&2u32.to_be_bytes());
-        for (hash, payload) in items {
-            bytes.extend_from_slice(&hash);
-            bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(payload);
-        }
-        let mut input = bytes.as_slice();
-        assert!(recv_capability_proof_request(&mut input).await.is_err());
     }
 }

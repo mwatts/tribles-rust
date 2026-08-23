@@ -4,6 +4,12 @@ This chapter collects the core terms that appear throughout the book. Skim it
 when you encounter unfamiliar terminology or need a refresher on how concepts
 relate to one another in TribleSpace.
 
+### Action
+An uninterpreted 128-bit identifier naming one exact operation in the positive
+authority kernel. Actions do not form a hierarchy and never imply one another.
+For example, `ACTION_WRITE` and `ACTION_CONNECT` are separate atoms even when
+they concern collections associated with the same team.
+
 ### Attribute
 A property that describes some aspect of an entity. Attributes occupy the
 middle position in a trible and carry the `InlineEncoding` (or blob-handle
@@ -16,6 +22,29 @@ omit the literal to derive a deterministic id from the attribute name and
 encoding (the macro wraps the name + encoding id in an `entity!{}` fragment and
 takes the root for you), which is handy for short-lived or internal attributes.
 
+### Authority Collection
+The canonical public `SimpleArchive`-union collection named `authority` for one
+team root. Its content handle is `authority::collection(team_root)`. Signed
+grant occurrences are ordinary commits in this grow-only collection, with
+canonical empty metadata; there is no separate mutable membership store.
+
+### Authority Grant
+One atomic positive authority statement carried by one signed authority
+collection commit. The outer commit signer is the issuer and its intrinsic
+commit ID is the grant occurrence ID. The canonical grant names one direct
+subject key, one exact resource collection handle, one exact action, optional
+exact parent occurrence, and explicit invoke/delegate uses. Independent
+accepted grants are alternatives under set union.
+
+### Authority Proof
+A self-contained, root-to-leaf sequence of authority commits paired with their
+exact canonical grant archives. Verification checks the team-root anchor,
+signatures, data identities, exact parent links, issuer/subject binding,
+unchanged action and resource, and delegation at every step, then checks the
+leaf against the caller's exact subject/action/resource/mode claim. This
+claim-directed final check prevents a valid truncated prefix from authorizing
+the intended descendant.
+
 ### Blob
 An immutable chunk of binary data addressed by the hash of its contents. Blobs
 store payloads that do not fit in the fixed 32-byte value slot—long strings,
@@ -27,17 +56,6 @@ back into native types.
 An abstraction that persists immutable content-addressed blobs. Implementations
 back local piles, in-memory collections, or remote object stores while exposing
 small capability traits for insertion, retrieval, metadata, and enumeration.
-
-### Capability
-A signed authorisation to act with a specific scope on a triblespace network.
-Each capability is two `SimpleArchive` blobs: a `cap` blob carrying
-`cap_subject` (the pubkey it authorises), `cap_issuer`, `cap_scope_root`, and
-`metadata::expires_at`; and a `sig` blob whose `sig_signs` points at the cap
-blob's handle and carries the issuer's `signed_by` + `signature_r/s`. Caps chain
-off the team root (or off another cap while attenuating its permission) and
-verify by walking back to the configured `team_root`. Holders present the sig
-blob's handle on connection (`OP_AUTH`); the relay enforces the verified scope
-on every subsequent op. See the [Capability Auth](capability-auth.md) chapter.
 
 ### Commit
 A signed native collection membership assertion. A `CollectionCommit` names
@@ -65,6 +83,15 @@ idempotent by intrinsic record ID; combining two stores is set union.
 One coherent known-prefix observation containing materialized facts, the exact
 verified commit set which authorized them, and the blob reader which validated
 their dependencies.
+
+### CONNECT
+The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
+direct-RPC session. Its resource is the team's
+`authority::collection(team_root)`, and its claimed subject must equal the
+transport peer key. CONNECT grants no WRITE, generic READ, gossip, collection
+reach, semantic trust, custody, or retention authority. Protocol v6 carries
+the complete claim-directed proof inline on the connection's first `OP_AUTH`
+stream.
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
@@ -140,21 +167,14 @@ native types; **blob encodings** describe arbitrarily long payloads so tribles
 referencing those blobs stay portable. The corresponding traits are
 `InlineEncoding` and `BlobEncoding`.
 
-### Scope
-The set of permissions a [Capability](#capability) grants. Output as tribles
-hung off the cap's `cap_scope_root` entity: one or more `metadata::tag: PERM_*`
-triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`). Sub-capabilities must have a
-scope no broader than their parent; `scope_subsumes` enforces this during the
-chain walk. Unknown tags or non-permission facts make a scope invalid rather
-than introducing an ambient resource namespace.
-
 ### Team Root
-The single immutable keypair that anchors a triblespace network's
-[capability](#capability) chain. Generated once at team creation, used to sign
-exactly one capability (the founder's), and then archived offline — the team
-root never operates online. Like a CA: bootstrapping authority, not runtime
-authority. The relay hard-codes the team root pubkey via
-`PeerConfig.team_root` and rejects any cap chain that doesn't terminate at it.
+The Ed25519 key whose public half identifies a team and its one canonical
+[authority collection](#authority-collection). A no-parent authority grant is
+grounded only when its collection commit is signed by this root. Keeping the
+secret offline after bootstrap is operational practice, not a one-use rule in
+the algebra: anyone holding it can publish another independent root grant.
+`PeerConfig.team_root` fixes both the CONNECT proof anchor and, when gossip is
+enabled, the team topic ID.
 
 ### Trible
 A three-part tuple of entity, attribute, and value stored in a fixed 64-byte

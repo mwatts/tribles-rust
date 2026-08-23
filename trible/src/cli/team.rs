@@ -1,1382 +1,484 @@
-//! `trible team` — capability-based team membership management.
+//! `trible team` -- positive team authority management.
 //!
-//! Issues, lists, retracts, and renews capabilities for a triblespace
-//! team. Capabilities are signed delegations chained from a single
-//! team root keypair; possessing a leaf capability handle authorises
-//! a peer to connect to the team's mesh under the cap's scope.
-//! Eviction is per-issuer non-renewal — there is no team-root
-//! broadcast revocation primitive in the descriptive-caps model.
-//!
-//! All commands accept the relevant team artefacts via CLI flags or
-//! environment variables (`TRIBLE_TEAM_ROOT`, `TRIBLE_TEAM_CAP`).
-//! The local pile stores the issued cap blobs so they're retrievable
-//! for verification when peers connect.
+//! A team is rooted in one Ed25519 key and has one public, grow-only
+//! authority collection. Each grant is a signed collection commit naming one
+//! direct subject, one exact resource, one action, and optionally one exact
+//! delegating parent occurrence. Invites carry a bounded, self-contained
+//! root-to-leaf proof; joining validates it before importing its public
+//! evidence into the local pile.
+
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use std::path::PathBuf;
 
+use triblespace_core::authority::{
+    self, AcceptedAuthorityGrant, AuthorityClaim, AuthorityGrant, AuthorityMode, AuthorityProof,
+};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::Blob;
+use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::collection::{CollectionRecord, CollectionStore};
 use triblespace_core::id::Id;
-use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::capability;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::BlobStore;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
 
-type PileBlake3 = Pile;
+use triblespace_net::protocol::{
+    decode_authority_proof, encode_authority_proof, ACTION_CONNECT, MAX_AUTHORITY_PROOF_BYTES,
+    MAX_AUTHORITY_PROOF_STEPS,
+};
+
+const TEAM_ROOT_BYTES: usize = 32;
+const MAX_INVITE_BYTES: usize = TEAM_ROOT_BYTES + MAX_AUTHORITY_PROOF_BYTES;
 
 #[derive(Parser)]
 pub enum Command {
-    /// Create a new team. Generates a fresh team root keypair, signs
-    /// the founder's self-cap with admin scope, and stores it in the
-    /// pile. Prints the team root pubkey, the team root SECRET (which
-    /// you MUST store offline), and the founder's cap handle.
+    /// Create a team and grant the founder CONNECT authority with delegation.
     Create {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
-        /// Path to the founder's signing key (defaults to a key
-        /// alongside the pile, generated if missing).
+        /// Founder's signing key (generated at the conventional path if absent).
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Issue a capability for a teammate, delegating from the running
-    /// node's own cap.
+    /// Issue one portable CONNECT invite from an exact delegating grant.
     Invite {
-        /// Path to the local pile file.
+        /// Path to the issuer's pile file.
         #[arg(long)]
         pile: PathBuf,
-        /// Team root pubkey (hex). Used to verify the issuer's cap
-        /// chain before signing the new cap.
-        #[arg(long, env = "TRIBLE_TEAM_ROOT")]
+        /// Team root public key (32-byte hex).
+        #[arg(long)]
         team_root: String,
-        /// The issuer's own cap handle (hex). The cap blob must be in
-        /// the pile already (e.g. from a prior `team create` or
-        /// `team invite` issued to this node).
-        #[arg(long, env = "TRIBLE_TEAM_CAP")]
-        cap: String,
-        /// Issuer's signing key path (defaults to the conventional
-        /// location next to the pile).
+        /// Exact parent grant occurrence (16-byte hex commit id).
+        #[arg(long)]
+        parent: String,
+        /// Issuer's existing signing key.
         #[arg(long)]
         key: Option<PathBuf>,
-        /// Invitee's pubkey (hex).
+        /// Invitee's Ed25519 public key (32-byte hex).
         #[arg(long)]
         invitee: String,
-        /// Scope to grant. Must be a subset of the issuer's own scope.
-        #[arg(long, value_enum, default_value = "read")]
-        scope: ScopeArg,
+        /// Let the invitee issue child CONNECT grants too.
+        #[arg(long)]
+        delegate: bool,
+        /// Portable public invite bundle to write.
+        #[arg(long)]
+        out: PathBuf,
     },
-    /// List capabilities stored in the local pile.
+    /// Validate and import a portable invite into a local pile.
+    Join {
+        /// Path to the receiving pile file.
+        #[arg(long)]
+        pile: PathBuf,
+        /// Invitee's existing signing key.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Portable invite bundle produced by `team invite`.
+        #[arg(long)]
+        invite: PathBuf,
+    },
+    /// List accepted grants and inert candidate diagnostics for one team.
     List {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
-    },
-    /// List incoming join requests awaiting approval. These are
-    /// peers that sent `OP_REQUEST_CAP` to this node while
-    /// `pile net sync` was running.
-    ListPending {
-        /// Path to the local pile file.
+        /// Team root public key (32-byte hex).
         #[arg(long)]
-        pile: PathBuf,
-        /// Node signing key that owns the private policy collection.
-        #[arg(long)]
-        key: Option<PathBuf>,
-    },
-    /// List the renewal-policy entries on the local pile: caps this
-    /// node has issued (or auto-approved) that the daemon is
-    /// keeping renewed. Retracted entries are included with a
-    /// retraction marker.
-    ListIssued {
-        /// Path to the local pile file.
-        #[arg(long)]
-        pile: PathBuf,
-        /// Node signing key that owns the private policy collection.
-        #[arg(long)]
-        key: Option<PathBuf>,
-    },
-    /// Stop auto-renewing a specific (subject, scope) entry. The
-    /// corresponding peer's cap chain dies at its next natural
-    /// expiry — no revocation blob propagates anywhere. Pure local
-    /// decision, takes effect on the next daemon tick.
-    Retract {
-        /// Path to the local pile file.
-        #[arg(long)]
-        pile: PathBuf,
-        /// Node signing key that owns the private policy collection.
-        #[arg(long)]
-        key: Option<PathBuf>,
-        /// The renewal-policy entry id to retract (hex, from
-        /// `team list-issued`).
-        #[arg(long)]
-        entry: String,
-    },
-    /// Send an `OP_REQUEST_CAP` to a team admin asking to be issued
-    /// a capability. The admin's running daemon records the request
-    /// in its private policy collection (visible via `team list-pending`);
-    /// once they approve via `team approve`, the freshly-signed cap
-    /// arrives via the auth-handshake ALPN and the daemon stores it
-    /// in its private policy collection.
-    RequestJoin {
-        /// Admin's pubkey (hex).
-        #[arg(long)]
-        admin: String,
-        /// Scope to request. The admin may grant a subset.
-        #[arg(long, value_enum, default_value = "read")]
-        scope: ScopeArg,
-        /// Path to the requester's signing key. Defaults to a key
-        /// next to the pile if `--pile` is given; required
-        /// otherwise.
-        #[arg(long)]
-        key: Option<PathBuf>,
-        /// Optional pile path for storing the key alongside (or
-        /// loading it from). Not used for state — request-join
-        /// doesn't write to the pile.
-        #[arg(long)]
-        pile: Option<PathBuf>,
-    },
-    /// Approve a pending join request by signing a cap for the
-    /// requester and dispatching it via the auth-handshake ALPN.
-    /// Also creates a renewal-policy entry so the running daemon
-    /// keeps the cap renewed.
-    Approve {
-        /// Path to the local pile file.
-        #[arg(long)]
-        pile: PathBuf,
-        /// Pending-request entity id to approve (hex, from
-        /// `team list-pending`).
-        #[arg(long)]
-        entry: String,
-        /// Team root pubkey (hex). Used to verify the issuer's cap
-        /// chain before signing the new cap.
-        #[arg(long, env = "TRIBLE_TEAM_ROOT")]
         team_root: String,
-        /// The issuer's own cap handle (hex). The parent of the new
-        /// cap; must already be in the pile (e.g. from
-        /// `team create` / `team invite`).
-        #[arg(long, env = "TRIBLE_TEAM_CAP")]
-        cap: String,
-        /// Issuer's signing key path (defaults to the conventional
-        /// location next to the pile).
-        #[arg(long)]
-        key: Option<PathBuf>,
     },
-    /// Walk the chain of one capability and print each level
-    /// (subject, issuer, scope, expiry). Diagnostic deep-dive
-    /// for "why is this cap rejected" — `team list` gives
-    /// summaries, `team show` gives a single chain's full
-    /// vertical slice. The structural walk verifies that each
-    /// link's `signed_by` matches the cap's `cap_issuer`; pass
-    /// `--verify` with the team root pubkey to additionally
-    /// run `verify_chain` for the full cryptographic check.
+    /// Show the accepted root-to-leaf ancestry of one exact grant occurrence.
     Show {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
-        /// Capability sig handle (hex, 32 bytes / 64 chars).
-        /// The leaf to start the walk from.
+        /// Team root public key (32-byte hex).
         #[arg(long)]
-        cap: String,
-        /// Run `verify_chain` against the given team root pubkey
-        /// (hex). Reports the same Ok/Err the relay would see
-        /// at OP_AUTH time. Falls back to env `TRIBLE_TEAM_ROOT`
-        /// when the flag is omitted (matching `pile net sync`'s
-        /// configuration).
-        #[arg(long, env = "TRIBLE_TEAM_ROOT")]
-        verify: Option<String>,
-        /// Subject pubkey the cap is supposed to authorise (hex).
-        /// `verify_chain` checks that the leaf cap's
-        /// `cap_subject` equals this. Defaults to the cap's own
-        /// declared subject — pass explicitly if you want to
-        /// detect a subject-substitution attack.
+        team_root: String,
+        /// Exact grant occurrence (16-byte hex commit id).
         #[arg(long)]
-        expected_subject: Option<String>,
+        grant: String,
     },
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub enum ScopeArg {
-    Read,
-    Write,
-    Admin,
-}
-
-impl ScopeArg {
-    fn perm_id(self) -> Id {
-        match self {
-            ScopeArg::Read => capability::PERM_READ,
-            ScopeArg::Write => capability::PERM_WRITE,
-            ScopeArg::Admin => capability::PERM_ADMIN,
-        }
-    }
-}
-
-pub fn run(cmd: Command) -> Result<()> {
-    match cmd {
+pub fn run(command: Command) -> Result<()> {
+    match command {
         Command::Create { pile, key } => run_create(pile, key),
         Command::Invite {
             pile,
             team_root,
-            cap,
+            parent,
             key,
             invitee,
-            scope,
-        } => run_invite(pile, team_root, cap, key, invitee, scope),
-        Command::List { pile } => run_list(pile),
-        Command::ListPending { pile, key } => run_list_pending(pile, key),
-        Command::ListIssued { pile, key } => run_list_issued(pile, key),
-        Command::Retract { pile, key, entry } => run_retract(pile, key, entry),
-        Command::RequestJoin {
-            admin,
-            scope,
-            key,
-            pile,
-        } => run_request_join(admin, scope, key, pile),
-        Command::Approve {
-            pile,
-            entry,
-            team_root,
-            cap,
-            key,
-        } => run_approve(pile, entry, team_root, cap, key),
+            delegate,
+            out,
+        } => run_invite(pile, team_root, parent, key, invitee, delegate, out),
+        Command::Join { pile, key, invite } => run_join(pile, key, invite),
+        Command::List { pile, team_root } => run_list(pile, team_root),
         Command::Show {
             pile,
-            cap,
-            verify,
-            expected_subject,
-        } => run_show(pile, cap, verify, expected_subject),
+            team_root,
+            grant,
+        } => run_show(pile, team_root, grant),
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-fn open_pile(path: &PathBuf) -> Result<PileBlake3> {
-    let mut pile =
-        PileBlake3::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(crate::cli::pile::pile_read_error(path, err));
-    }
-    Ok(pile)
+fn open_pile(path: &Path) -> Result<Pile> {
+    crate::cli::pile::open_refreshed(path)
 }
 
-/// Open + refresh the pile at `path`, run `f`, close the pile, propagate.
-///
-/// Calls `pile.close()` unconditionally on the way out — both happy
-/// path and any `Err` returned by `f`. `Pile`'s `Drop` impl warns
-/// (loudly, on stderr) when the pile is dropped without `close()`, so
-/// every `?` or `bail!` between `open_pile` and the final `close` in
-/// a CLI subcommand was a latent warning waiting to surface. Routing
-/// through this helper makes the "every successful subcommand closes
-/// its pile" invariant load-bearing on the type system instead of
-/// on hand-discipline.
-///
-/// If both `f` returns Err AND `close` fails, the user-facing error
-/// (f's) wins — close errors are appended to the message so they're
-/// still visible but don't shadow the original cause.
-fn with_pile<T>(path: &PathBuf, f: impl FnOnce(&mut PileBlake3) -> Result<T>) -> Result<T> {
+fn with_pile<T>(path: &Path, operation: impl FnOnce(&mut Pile) -> Result<T>) -> Result<T> {
     let mut pile = open_pile(path)?;
-    let result = f(&mut pile);
-    let close_err = pile.close().err();
-    match (result, close_err) {
-        (Ok(t), None) => Ok(t),
-        (Ok(_), Some(e)) => Err(anyhow!("pile close: {e:?}")),
-        (Err(e), None) => Err(e),
-        (Err(e), Some(close_e)) => Err(anyhow!(
-            "{e:#}; additionally pile close failed: {close_e:?}"
+    let result = operation(&mut pile);
+    let close_error = pile.close().err();
+    match (result, close_error) {
+        (Ok(value), None) => Ok(value),
+        (Ok(_), Some(error)) => Err(anyhow!("pile close: {error:?}")),
+        (Err(error), None) => Err(error),
+        (Err(error), Some(close_error)) => Err(anyhow!(
+            "{error:#}; additionally pile close failed: {close_error:?}"
         )),
     }
 }
 
-fn load_or_generate_signing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
-    let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
+fn load_or_generate_signing_key(path: Option<PathBuf>, pile: &Path) -> Result<SigningKey> {
+    let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile);
     triblespace_core::signing_key_file::init(&path).map_err(Into::into)
 }
 
-fn load_existing_signing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
-    let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
+fn load_existing_signing_key(path: Option<PathBuf>, pile: &Path) -> Result<SigningKey> {
+    let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile);
     triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
 }
 
 fn fresh_signing_key() -> Result<SigningKey> {
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).map_err(|e| anyhow!("generate key: {e}"))?;
+    let mut seed = [0; 32];
+    getrandom::fill(&mut seed).map_err(|error| anyhow!("generate key: {error}"))?;
     Ok(SigningKey::from_bytes(&seed))
 }
 
-fn parse_pubkey_hex(s: &str) -> Result<VerifyingKey> {
-    let bytes = hex::decode(s).map_err(|e| anyhow!("decode pubkey hex: {e}"))?;
+pub(crate) fn parse_team_root(text: &str) -> Result<VerifyingKey> {
+    let bytes = hex::decode(text).map_err(|error| anyhow!("decode team root hex: {error}"))?;
     let raw: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow!("pubkey must be 32 bytes"))?;
-    VerifyingKey::from_bytes(&raw).map_err(|e| anyhow!("bad pubkey: {e}"))
+        .map_err(|_| anyhow!("team root must be 32 bytes"))?;
+    VerifyingKey::from_bytes(&raw).map_err(|error| anyhow!("invalid team root: {error}"))
 }
 
-fn parse_handle_hex(s: &str) -> Result<Inline<Handle<SimpleArchive>>> {
-    let bytes = hex::decode(s).map_err(|e| anyhow!("decode handle hex: {e}"))?;
+fn parse_public_key(text: &str, label: &str) -> Result<VerifyingKey> {
+    let bytes = hex::decode(text).map_err(|error| anyhow!("decode {label} hex: {error}"))?;
     let raw: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow!("handle must be 32 bytes"))?;
-    Ok(Inline::new(raw))
+        .map_err(|_| anyhow!("{label} must be 32 bytes"))?;
+    VerifyingKey::from_bytes(&raw).map_err(|error| anyhow!("invalid {label}: {error}"))
 }
 
-fn now_plus_30_days() -> Inline<triblespace_core::inline::encodings::time::NsTAIInterval> {
-    use triblespace_core::inline::TryToInline;
-    let now = hifitime::Epoch::now().expect("system time");
-    let later = now + hifitime::Duration::from_seconds(30.0 * 86400.0);
-    (now, later).try_to_inline().expect("valid interval")
+pub(crate) fn parse_grant_id(text: &str) -> Result<Id> {
+    Id::from_hex(text).ok_or_else(|| anyhow!("grant must be a nonzero 16-byte hex id"))
 }
 
-/// Format the upper bound of an `NsTAIInterval` value as a
-/// human-readable UTC timestamp for diagnostic output. Used by
-/// `team create` / `team invite` to surface when the freshly-issued
-/// cap expires — operators rotate caps before that point.
-fn format_expiry(
-    interval: &Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-) -> String {
-    use triblespace_core::inline::TryFromInline;
-    match <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(interval) {
-        Ok((_lower, upper)) => {
-            let (y, mo, d, h, mi, s, _ns) = upper.to_gregorian_utc();
-            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+fn subject_inline(key: VerifyingKey) -> Inline<ED25519PublicKey> {
+    Inline::new(key.to_bytes())
+}
+
+fn connect_grant_is_exact(grant: AuthorityGrant, team_root: VerifyingKey) -> bool {
+    grant.action() == ACTION_CONNECT && grant.resource() == authority::collection(team_root)
+}
+
+/// Resolve and build the exact CONNECT proof used by `pile net`.
+pub(crate) fn resolve_connect_proof(
+    pile: &mut Pile,
+    team_root: VerifyingKey,
+    grant_id: Id,
+    expected_subject: VerifyingKey,
+) -> Result<AuthorityProof> {
+    let resolution = authority::resolve_authority(pile, team_root)
+        .map_err(|error| anyhow!("resolve team authority: {error}"))?;
+    let accepted = resolution.grant(grant_id).ok_or_else(|| {
+        let diagnostic = resolution
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.commit() == grant_id);
+        match diagnostic {
+            Some(diagnostic) => anyhow!("grant {grant_id:X} is inert: {diagnostic:?}"),
+            None => anyhow!("grant {grant_id:X} is not present in this team authority collection"),
         }
-        Err(_) => "<malformed>".to_string(),
+    })?;
+    let grant = accepted.grant();
+    if grant.subject() != subject_inline(expected_subject) {
+        bail!("grant {grant_id:X} belongs to a different subject key");
     }
+    if !connect_grant_is_exact(grant, team_root) || !grant.invoke() {
+        bail!("grant {grant_id:X} does not invoke CONNECT on this team's authority collection");
+    }
+    let proof = resolution.proof(grant_id).ok_or_else(|| {
+        anyhow!("accepted grant {grant_id:X} has no reconstructible ancestry proof")
+    })?;
+    encode_authority_proof(&proof)
+        .map_err(|error| anyhow!("CONNECT proof is not transport-portable: {error}"))?;
+    Ok(proof)
 }
 
-fn store_blob(pile: &mut PileBlake3, blob: Blob<SimpleArchive>) -> Result<()> {
-    pile.put::<SimpleArchive, _>(blob)
-        .map_err(|e| anyhow!("put blob: {e:?}"))?;
+fn write_invite(path: &Path, team_root: VerifyingKey, proof: &AuthorityProof) -> Result<()> {
+    let encoded = encode_authority_proof(proof)
+        .map_err(|error| anyhow!("encode authority proof: {error}"))?;
+    let mut bundle = Vec::with_capacity(TEAM_ROOT_BYTES + encoded.len());
+    bundle.extend_from_slice(&team_root.to_bytes());
+    bundle.extend_from_slice(&encoded);
+    fs::write(path, bundle).map_err(|error| anyhow!("write invite {}: {error}", path.display()))
+}
+
+fn read_invite(path: &Path) -> Result<(VerifyingKey, AuthorityProof)> {
+    let file =
+        fs::File::open(path).map_err(|error| anyhow!("open invite {}: {error}", path.display()))?;
+    let mut bundle = Vec::with_capacity(MAX_INVITE_BYTES + 1);
+    file.take((MAX_INVITE_BYTES + 1) as u64)
+        .read_to_end(&mut bundle)
+        .map_err(|error| anyhow!("read invite {}: {error}", path.display()))?;
+    if bundle.len() > MAX_INVITE_BYTES {
+        bail!("invite bundle exceeds the {MAX_INVITE_BYTES}-byte limit");
+    }
+    if bundle.len() <= TEAM_ROOT_BYTES {
+        bail!("invite bundle is truncated");
+    }
+    let root_bytes: [u8; 32] = bundle[..TEAM_ROOT_BYTES]
+        .try_into()
+        .expect("a 32-byte prefix has a 32-byte array shape");
+    let team_root = VerifyingKey::from_bytes(&root_bytes)
+        .map_err(|error| anyhow!("invite has an invalid team root: {error}"))?;
+    let proof = decode_authority_proof(&bundle[TEAM_ROOT_BYTES..])
+        .map_err(|error| anyhow!("decode authority proof: {error}"))?;
+    Ok((team_root, proof))
+}
+
+fn print_root_secret_warning() {
+    eprintln!("TEAM ROOT SECRET -- STORE OFFLINE");
+    eprintln!("Anyone holding it can create independent root grants for this team.");
+}
+
+fn run_create(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
+    let founder = load_or_generate_signing_key(key_path, &pile_path)?;
+    let team_root_key = fresh_signing_key()?;
+    let team_root = team_root_key.verifying_key();
+    let founder_grant = AuthorityGrant::root(
+        founder.verifying_key(),
+        authority::collection(team_root),
+        ACTION_CONNECT,
+        AuthorityMode::InvokeAndDelegate,
+    );
+    let commit = with_pile(&pile_path, |pile| {
+        authority::publish_grant(pile, team_root, &team_root_key, founder_grant)
+            .map_err(|error| anyhow!("publish founder grant: {error:?}"))
+    })?;
+
+    println!("team root pubkey:  {}", hex::encode(team_root.to_bytes()));
+    print_root_secret_warning();
+    println!(
+        "team root SECRET:  {}",
+        hex::encode(team_root_key.to_bytes())
+    );
+    println!("founder grant:     {:X}", commit.id());
     Ok(())
 }
 
-fn fetch_cap_blob_pair(
-    pile: &mut PileBlake3,
-    sig_handle: Inline<Handle<SimpleArchive>>,
-) -> Result<(Blob<SimpleArchive>, Blob<SimpleArchive>)> {
-    use triblespace_core::blob::TryFromBlob;
-    use triblespace_core::repo::BlobStore;
-    use triblespace_core::repo::BlobStoreGet;
+#[allow(clippy::too_many_arguments)]
+fn run_invite(
+    pile_path: PathBuf,
+    team_root_text: String,
+    parent_text: String,
+    key_path: Option<PathBuf>,
+    invitee_text: String,
+    delegate: bool,
+    out: PathBuf,
+) -> Result<()> {
+    let team_root = parse_team_root(&team_root_text)?;
+    let parent_id = parse_grant_id(&parent_text)?;
+    let issuer_key = load_existing_signing_key(key_path, &pile_path)?;
+    let issuer = issuer_key.verifying_key();
+    let invitee = parse_public_key(&invitee_text, "invitee public key")?;
 
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let (commit, proof) = with_pile(&pile_path, |pile| {
+        let resolution = authority::resolve_authority(pile, team_root)
+            .map_err(|error| anyhow!("resolve team authority: {error}"))?;
+        let parent = resolution
+            .grant(parent_id)
+            .ok_or_else(|| anyhow!("parent grant {parent_id:X} is not accepted"))?;
+        let parent_grant = parent.grant();
+        if parent_grant.subject() != subject_inline(issuer) {
+            bail!("parent grant {parent_id:X} belongs to a different issuer key");
+        }
+        if !connect_grant_is_exact(parent_grant, team_root) {
+            bail!("parent grant {parent_id:X} does not govern CONNECT for this team");
+        }
+        if !parent_grant.delegate() {
+            bail!("parent grant {parent_id:X} does not permit delegation");
+        }
+        let parent_proof = resolution
+            .proof(parent_id)
+            .ok_or_else(|| anyhow!("accepted parent grant has no reconstructible proof"))?;
+        encode_authority_proof(&parent_proof)
+            .map_err(|error| anyhow!("parent authority proof is not portable: {error}"))?;
+        if parent_proof.steps().len() >= MAX_AUTHORITY_PROOF_STEPS {
+            bail!(
+                "parent proof already has the transport maximum of {MAX_AUTHORITY_PROOF_STEPS} steps"
+            );
+        }
 
-    // Fetch the sig blob, locate the cap handle it signs.
-    let sig_blob: Blob<SimpleArchive> = reader
-        .get::<Blob<SimpleArchive>, SimpleArchive>(sig_handle)
-        .map_err(|e| anyhow!("fetch sig blob: {e:?}"))?;
-    let sig_set: TribleSet = TryFromBlob::try_from_blob(sig_blob.clone())
-        .map_err(|e| anyhow!("parse sig blob: {e:?}"))?;
+        let mode = if delegate {
+            AuthorityMode::InvokeAndDelegate
+        } else {
+            AuthorityMode::Invoke
+        };
+        let child = AuthorityGrant::delegated(
+            parent_id,
+            invitee,
+            authority::collection(team_root),
+            ACTION_CONNECT,
+            mode,
+        );
+        let commit = authority::publish_grant(pile, team_root, &issuer_key, child)
+            .map_err(|error| anyhow!("publish invite grant: {error:?}"))?;
 
-    use triblespace_core::macros::pattern;
-    use triblespace_core::query::find;
-    let cap_handle: Inline<Handle<SimpleArchive>> = find!(
-        (sig: Id, h: Inline<Handle<SimpleArchive>>),
-        pattern!(&sig_set, [{ ?sig @ capability::sig_signs: ?h }])
-    )
-    .map(|(_, h)| h)
-    .next()
-    .ok_or_else(|| anyhow!("sig blob has no sig_signs trible"))?;
+        let updated = authority::resolve_authority(pile, team_root)
+            .map_err(|error| anyhow!("resolve published invite: {error}"))?;
+        let proof = updated
+            .proof(commit.id())
+            .ok_or_else(|| anyhow!("published invite grant was not accepted"))?;
+        Ok((commit, proof))
+    })?;
 
-    let cap_blob: Blob<SimpleArchive> = reader
-        .get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle)
-        .map_err(|e| anyhow!("fetch cap blob: {e:?}"))?;
-
-    Ok((cap_blob, sig_blob))
+    write_invite(&out, team_root, &proof)?;
+    println!("issued grant:      {:X}", commit.id());
+    println!("invite bundle:     {}", out.display());
+    println!("proof steps:       {}", proof.steps().len());
+    Ok(())
 }
 
-fn print_warning_box(lines: &[&str]) {
-    let max = lines.iter().map(|l| l.len()).max().unwrap_or(0);
-    let bar = "═".repeat(max + 2);
-    eprintln!("╔{bar}╗");
-    for line in lines {
-        eprintln!("║ {line:<max$} ║");
+fn run_join(pile_path: PathBuf, key_path: Option<PathBuf>, invite_path: PathBuf) -> Result<()> {
+    let local_key = load_existing_signing_key(key_path, &pile_path)?;
+    let (team_root, proof) = read_invite(&invite_path)?;
+    let claim = AuthorityClaim::new(
+        local_key.verifying_key(),
+        ACTION_CONNECT,
+        authority::collection(team_root),
+        AuthorityMode::Invoke,
+    );
+    let leaf = proof
+        .verify_claim(team_root, claim)
+        .map_err(|error| anyhow!("invite proof rejected: {error}"))?;
+    let grant = leaf.grant();
+    if grant.subject() != subject_inline(local_key.verifying_key()) {
+        bail!("invite belongs to a different local signing key");
     }
-    eprintln!("╚{bar}╝");
-}
-
-// ── Subcommands ─────────────────────────────────────────────────────
-
-fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
-    let founder_key = load_or_generate_signing_key(key, &pile_path)?;
-
-    // Generate the team root keypair. Used exactly once, here, to sign
-    // the founder's self-cap, then never again.
-    let team_root = fresh_signing_key()?;
-    let team_root_pubkey = team_root.verifying_key();
-
-    // Build the founder's scope: full admin authority.
-    let scope_root = *triblespace_core::id::ufoid();
-    use triblespace_core::id::ExclusiveId;
-    use triblespace_core::macros::entity;
-    let scope_facts = TribleSet::from(entity! {
-        ExclusiveId::force_ref(&scope_root) @
-        triblespace_core::metadata::tag: capability::PERM_ADMIN,
-    });
-
-    let expiry = now_plus_30_days();
-    let (cap_blob, sig_blob) = capability::build_capability(
-        &team_root,
-        founder_key.verifying_key(),
-        None,
-        scope_root,
-        scope_facts,
-        expiry,
-    )
-    .map_err(|e| anyhow!("build founder cap: {e:?}"))?;
-
-    let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-    let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+    if !connect_grant_is_exact(grant, team_root) || !grant.invoke() {
+        bail!("invite does not invoke CONNECT on this team's authority collection");
+    }
 
     with_pile(&pile_path, |pile| {
-        store_blob(pile, cap_blob)?;
-        store_blob(pile, sig_blob)?;
+        let descriptor: Blob<SimpleArchive> =
+            authority::descriptor(team_root).into_facts().to_blob();
+        pile.put::<SimpleArchive, _>(descriptor)
+            .map_err(|error| anyhow!("store authority descriptor: {error:?}"))?;
+        let empty_metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        pile.put::<SimpleArchive, _>(empty_metadata)
+            .map_err(|error| anyhow!("store empty metadata: {error:?}"))?;
+        for step in proof.steps() {
+            pile.put::<SimpleArchive, _>(step.data().clone())
+                .map_err(|error| anyhow!("store grant data: {error:?}"))?;
+            CollectionStore::insert(pile, CollectionRecord::Commit(step.commit()))
+                .map_err(|error| anyhow!("store grant commit: {error:?}"))?;
+        }
         Ok(())
     })?;
 
-    println!(
-        "team root pubkey:  {}",
-        hex::encode(team_root_pubkey.to_bytes())
-    );
-    print_warning_box(&[
-        "TEAM ROOT SECRET — STORE OFFLINE NOW",
-        "Loss of this key means losing team admin authority forever.",
-        "Anyone with this key can issue founder-equivalent capabilities.",
-    ]);
-    println!("team root SECRET:  {}", hex::encode(team_root.to_bytes()));
-    println!("founder cap blob:  {}", hex::encode(cap_handle.raw));
-    println!("founder cap (sig): {}", hex::encode(sig_handle.raw));
-    println!("expires:           {}", format_expiry(&expiry));
-    println!();
-    println!("Set these in your environment to use the team:");
-    println!(
-        "  export TRIBLE_TEAM_ROOT={}",
-        hex::encode(team_root_pubkey.to_bytes())
-    );
-    println!("  export TRIBLE_TEAM_CAP={}", hex::encode(sig_handle.raw));
-
+    println!("team root:         {}", hex::encode(team_root.to_bytes()));
+    println!("accepted grant:    {:X}", leaf.commit().id());
+    println!("proof steps:       {}", proof.steps().len());
     Ok(())
 }
 
-fn run_invite(
-    pile_path: PathBuf,
-    team_root_hex: String,
-    cap_hex: String,
-    key: Option<PathBuf>,
-    invitee_hex: String,
-    scope: ScopeArg,
-) -> Result<()> {
-    let issuer_key = load_existing_signing_key(key, &pile_path)?;
-    let team_root = parse_pubkey_hex(&team_root_hex)?;
-    let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
-    let invitee = parse_pubkey_hex(&invitee_hex)?;
-    let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
-        // Verify the issuer's cap chain first — we don't sign
-        // delegations off invalid/expired caps. This also confirms
-        // the cap blobs are present locally so `fetch_cap_blob_pair`
-        // will succeed below.
-        let issuer_pubkey = issuer_key.verifying_key();
-        let snap_reader = {
-            use triblespace_core::repo::BlobStore;
-            pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?
-        };
-        let _ = capability::verify_chain(
-            team_root,
-            issuer_cap_sig_handle,
-            issuer_pubkey,
-            |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-                use triblespace_core::repo::BlobStoreGet;
-                snap_reader
-                    .get::<Blob<SimpleArchive>, SimpleArchive>(h)
-                    .ok()
-            },
-        )
-        .map_err(|e| anyhow!("issuer's cap does not verify: {e:?}"))?;
-        drop(snap_reader);
-
-        let (parent_cap_blob, parent_sig_blob) = fetch_cap_blob_pair(pile, issuer_cap_sig_handle)?;
-
-        // Build the invitee's team permission scope. `verify_chain` rejects
-        // the issued cap at use time if it exceeds the issuer's permission.
-        let scope_root = *triblespace_core::id::ufoid();
-        use triblespace_core::id::ExclusiveId;
-        use triblespace_core::macros::entity;
-        let scope_facts = TribleSet::from(entity! {
-            ExclusiveId::force_ref(&scope_root) @
-            triblespace_core::metadata::tag: scope.perm_id(),
-        });
-
-        let expiry = now_plus_30_days();
-        let (cap_blob, sig_blob) = capability::build_capability(
-            &issuer_key,
-            invitee,
-            Some((parent_cap_blob, parent_sig_blob)),
-            scope_root,
-            scope_facts,
-            expiry,
-        )
-        .map_err(|e| anyhow!("build invitee cap: {e:?}"))?;
-
-        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-
-        store_blob(pile, cap_blob)?;
-        store_blob(pile, sig_blob)?;
-
-        // Record in the signer-owned policy collection so the running
-        // `pile net sync` daemon's renewal_tick takes over from here: once
-        // this cap nears expiry, the daemon signs a successor and
-        // dispatches via OP_DELIVER_CAP. The invitee experiences the
-        // issuance and every subsequent renewal as the same
-        // OP_DELIVER_CAP event — the first delivery and the daemon's
-        // later renewals are indistinguishable on B's side.
-        let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile,
-            &issuer_key,
-            team_root,
-            invitee,
-            scope_root,
-            expiry,
-            cap_handle,
-            sig_handle,
-        )
-        .map_err(|error| anyhow!("record renewal policy: {error}"))?;
-
-        Ok((sig_handle, expiry, policy_entry))
-    })?;
-
-    println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
-    println!("expires:           {}", format_expiry(&expiry));
-    let entry_bytes: [u8; 16] = policy_entry.into();
-    println!("renewal entry:     {}", hex::encode(entry_bytes));
-    println!(
-        "  the running sync daemon will auto-renew this cap until you `team retract --entry {}`",
-        hex::encode(entry_bytes)
-    );
-    println!();
-    println!("Share with the invitee:");
-    println!("  TRIBLE_TEAM_ROOT={}", hex::encode(team_root.to_bytes()));
-    println!("  TRIBLE_TEAM_CAP={}", hex::encode(sig_handle.raw));
-
-    Ok(())
-}
-
-/// Describe a single capability for the `team list` audit view.
-struct CapSummary {
-    subject: VerifyingKey,
-    issuer: VerifyingKey,
-    perms: Vec<Id>,
-    expires_at: Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
-}
-
-/// Extract the upper-bound `Epoch` of an expiry interval. Used to
-/// sort caps by "expires soonest first" — caps without an expiry
-/// (none should currently exist; defensive) sort to the end.
-fn expiry_upper(
-    interval: &Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
-) -> Option<hifitime::Epoch> {
-    use triblespace_core::inline::TryFromInline;
-    let v = interval.as_ref()?;
-    <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(v)
-        .ok()
-        .map(|(_lower, upper)| upper)
-}
-
-/// Format a permission tag as a short label (`PERM_READ`/`PERM_WRITE`/
-/// `PERM_ADMIN` or `"unknown(<hex>)"` for caller-defined tags).
-fn perm_label(perm: &Id) -> String {
-    if *perm == capability::PERM_READ {
-        "PERM_READ".to_string()
-    } else if *perm == capability::PERM_WRITE {
-        "PERM_WRITE".to_string()
-    } else if *perm == capability::PERM_ADMIN {
-        "PERM_ADMIN".to_string()
+fn action_label(action: Id) -> String {
+    if action == ACTION_CONNECT {
+        "CONNECT".to_owned()
+    } else if action == authority::ACTION_WRITE {
+        "WRITE".to_owned()
     } else {
-        format!("unknown({})", hex::encode(<[u8; 16]>::from(*perm)))
+        format!("{action:X}")
     }
 }
 
-fn run_list(pile_path: PathBuf) -> Result<()> {
-    use triblespace_core::macros::pattern;
-    use triblespace_core::query::find;
-    use triblespace_core::repo::BlobStore;
-    use triblespace_core::repo::BlobStoreGet;
-    use triblespace_core::repo::BlobStoreList;
-
-    let mut caps: Vec<CapSummary> = with_pile(&pile_path, |pile| {
-        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-
-        let mut caps: Vec<CapSummary> = Vec::new();
-
-        use triblespace_core::blob::TryFromBlob;
-        for handle_result in reader.blobs() {
-            let handle = match handle_result {
-                Ok(info) => info.handle,
-                Err(_) => continue,
-            };
-            let typed_handle: Inline<Handle<SimpleArchive>> = Inline::new(handle.raw);
-            let blob: Blob<SimpleArchive> =
-                match reader.get::<Blob<SimpleArchive>, SimpleArchive>(typed_handle) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-            let set: TribleSet = match TryFromBlob::try_from_blob(blob) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            // Each cap blob has exactly one entity carrying these attributes;
-            // recursive parent proofs live in the separate sig blob.
-            for (_e, subject, issuer, scope_root, expires_at) in find!(
-                (
-                    e: Id,
-                    subject: VerifyingKey,
-                    issuer: VerifyingKey,
-                    root: Id,
-                    exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-                ),
-                pattern!(&set, [{
-                    ?e @
-                    capability::cap_subject: ?subject,
-                    capability::cap_issuer: ?issuer,
-                    capability::cap_scope_root: ?root,
-                    triblespace_core::metadata::expires_at: ?exp,
-                }])
-            ) {
-                // Walk the scope sub-graph for permission tags. A malformed
-                // cap with no permission surfaces as an empty list rather
-                // than breaking the whole audit listing.
-                let perms: Vec<Id> = find!(
-                    (perm: Id),
-                    pattern!(&set, [{
-                        scope_root @ triblespace_core::metadata::tag: ?perm
-                    }])
-                )
-                .map(|(p,)| p)
-                .collect();
-                caps.push(CapSummary {
-                    subject,
-                    issuer,
-                    perms,
-                    expires_at: Some(expires_at),
-                });
-            }
-        }
-
-        Ok(caps)
-    })?;
-
-    println!("capabilities in pile:  {}", caps.len());
-
-    if !caps.is_empty() {
-        // Sort by expiry ascending (soonest-to-expire first), so
-        // operators scanning the list see what needs rotation up
-        // top. Caps without a parseable expiry sort to the end.
-        caps.sort_by_key(|c| {
-            expiry_upper(&c.expires_at).map(|e| {
-                // hifitime::Epoch is comparable but not Ord-clean
-                // across constructors; use the nanosecond TAI
-                // duration since J2000 as a stable sort key.
-                e.to_tai_duration().to_parts()
-            })
-        });
-        println!("  capabilities:");
-        for cap in &caps {
-            let perm_str = if cap.perms.is_empty() {
-                "no perms".to_string()
-            } else {
-                cap.perms
-                    .iter()
-                    .map(perm_label)
-                    .collect::<Vec<_>>()
-                    .join("|")
-            };
-            let expiry_str = cap
-                .expires_at
-                .as_ref()
-                .map(format_expiry)
-                .unwrap_or_else(|| "<no expiry>".to_string());
-            println!("    issuer:  {}", hex::encode(cap.issuer.to_bytes()),);
-            println!("    subject: {}", hex::encode(cap.subject.to_bytes()),);
-            println!("    scope:   {perm_str}");
-            println!("    expires: {expiry_str}");
-            println!();
-        }
+fn print_grant(accepted: &AcceptedAuthorityGrant, indent: &str) {
+    let commit = accepted.commit();
+    let grant = accepted.grant();
+    println!("{indent}grant:    {:X}", commit.id());
+    println!("{indent}issuer:   {}", hex::encode(commit.public_key().raw));
+    println!("{indent}subject:  {}", hex::encode(grant.subject().raw));
+    println!("{indent}action:   {}", action_label(grant.action()));
+    println!("{indent}resource: {}", hex::encode(grant.resource().raw));
+    match grant.parent() {
+        Some(parent) => println!("{indent}parent:   {parent:X}"),
+        None => println!("{indent}parent:   root"),
     }
-
-    Ok(())
+    println!("{indent}invoke:   {}", grant.invoke());
+    println!("{indent}delegate: {}", grant.delegate());
 }
 
-fn run_show(
-    pile_path: PathBuf,
-    cap_hex: String,
-    verify_team_root: Option<String>,
-    expected_subject_hex: Option<String>,
-) -> Result<()> {
-    use triblespace_core::blob::TryFromBlob;
-    use triblespace_core::macros::pattern;
-    use triblespace_core::query::find;
-    use triblespace_core::repo::BlobStore;
-    use triblespace_core::repo::BlobStoreGet;
-
-    let leaf_sig = parse_handle_hex(&cap_hex)?;
-
+fn run_list(pile_path: PathBuf, team_root_text: String) -> Result<()> {
+    let team_root = parse_team_root(&team_root_text)?;
     with_pile(&pile_path, |pile| {
-        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-
-        // Walk the chain via the leaf sig blob's recursive embedded
-        // proofs. In the new (descriptive-caps) model, all chain
-        // references live in the sig blob — cap blobs are pure
-        // declarations. State carried between iterations:
-        //   current_outer_id: the entity in `sig_set` whose attached
-        //     signature attests to the cap we're about to print. Starts
-        //     at the leaf-outer entity (the one carrying `sig_signs`);
-        //     advances to embedded sub-entities via
-        //     `sig_embedded_parent_proof` as we walk upward.
-        //   current_cap_handle: cap blob to decode + print this iter.
-        let leaf_sig_blob: Blob<SimpleArchive> = reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
-            .map_err(|e| anyhow!("fetch sig blob {}: {e:?}", hex::encode(leaf_sig.raw)))?;
-        let sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
-            .map_err(|e| anyhow!("parse sig blob: {e:?}"))?;
-        let mut leaf_iter = find!(
-            (
-                sig: Id,
-                signed: Inline<Handle<SimpleArchive>>,
-                signer: VerifyingKey
-            ),
-            pattern!(&sig_set, [{
-                ?sig @
-                capability::sig_signs: ?signed,
-                triblespace_core::attestation::signed_by: ?signer,
-            }])
-        );
-        let (mut current_outer_id, mut current_cap_handle, mut current_signer) =
-            match (leaf_iter.next(), leaf_iter.next()) {
-                (Some(row), None) => row,
-                _ => {
-                    return Err(anyhow!(
-                "malformed sig blob — expected exactly one outer entity with (sig_signs, signed_by)"
-            ))
-                }
-            };
-        let mut depth = 0usize;
-        const MAX_DEPTH: usize = 32;
-
-        loop {
-            if depth > MAX_DEPTH {
-                return Err(anyhow!(
-                    "chain exceeds MAX_DEPTH={MAX_DEPTH} — refusing to walk further"
-                ));
-            }
-            let cap_handle = current_cap_handle;
-            let signer = current_signer;
-
-            let cap_blob: Blob<SimpleArchive> = reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle)
-                .map_err(|e| anyhow!("fetch cap blob {}: {e:?}", hex::encode(cap_handle.raw)))?;
-            let cap_set: TribleSet = TryFromBlob::try_from_blob(cap_blob)
-                .map_err(|e| anyhow!("parse cap blob: {e:?}"))?;
-            let mut cap_iter = find!(
-                (
-                    e: Id,
-                    subject: VerifyingKey,
-                    issuer: VerifyingKey,
-                    root: Id,
-                    exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>
-                ),
-                pattern!(&cap_set, [{
-                    ?e @
-                    capability::cap_subject: ?subject,
-                    capability::cap_issuer: ?issuer,
-                    capability::cap_scope_root: ?root,
-                    triblespace_core::metadata::expires_at: ?exp,
-                }])
-            );
-            let (_, subject, issuer, scope_root, expiry) = match (cap_iter.next(), cap_iter.next()) {
-            (Some(row), None) => row,
-            _ => return Err(anyhow!("malformed cap blob — expected exactly one (subject, issuer, scope_root, expires_at) tuple")),
-        };
-
-            // Permissions hung off the scope root.
-            let perms: Vec<Id> = find!(
-                (perm: Id),
-                pattern!(&cap_set, [{
-                    scope_root @ triblespace_core::metadata::tag: ?perm
-                }])
-            )
-            .map(|(p,)| p)
-            .collect();
-            let perm_str = if perms.is_empty() {
-                "no perms".to_string()
-            } else {
-                perms.iter().map(perm_label).collect::<Vec<_>>().join("|")
-            };
-            let signer_matches_issuer = if signer == issuer {
-                "✓"
-            } else {
-                "✗ MISMATCH"
-            };
-
-            println!("level {depth}:");
-            println!("  issuer:   {}", hex::encode(issuer.to_bytes()));
-            println!("  subject:  {}", hex::encode(subject.to_bytes()));
-            println!("  scope:    {perm_str}");
-            println!("  expires:  {}", format_expiry(&expiry));
-            println!("  cap blob: {}", hex::encode(cap_handle.raw));
-            println!("  signer matches cap_issuer: {signer_matches_issuer}");
-
-            // Look for sig_parent_cap + sig_embedded_parent_proof on the
-            // CURRENT outer entity inside the SIG blob's tribleset (these
-            // live in the sig blob, not the cap blob, in the new model).
-            let parent_pair = find!(
-                (
-                    parent_cap: Inline<Handle<SimpleArchive>>,
-                    parent_proof_id: Id,
-                ),
-                pattern!(&sig_set, [{
-                    current_outer_id @
-                    capability::sig_parent_cap: ?parent_cap,
-                    capability::sig_embedded_parent_proof: ?parent_proof_id,
-                }])
-            )
-            .next();
-
-            match parent_pair {
-                None => {
-                    println!("  ↳ root link (no sig_parent_cap — signer should be team root)");
-                    println!();
-                    break;
-                }
-                Some((parent_cap, parent_proof_id)) => {
-                    // Pull the next-level signer out of the embedded
-                    // parent proof sub-entity.
-                    let mut iter = find!(
-                        (next_signer: VerifyingKey),
-                        pattern!(&sig_set, [{
-                            parent_proof_id @
-                            triblespace_core::attestation::signed_by: ?next_signer
-                        }])
-                    );
-                    let next_signer = match iter.next() {
-                        Some((s,)) => s,
-                        None => {
-                            println!("  ⚠ embedded parent proof missing signed_by — chain broken");
-                            println!();
-                            break;
-                        }
-                    };
-                    println!("  ↳ chained from parent (embedded proof)");
-                    println!();
-                    current_outer_id = parent_proof_id;
-                    current_cap_handle = parent_cap;
-                    current_signer = next_signer;
-                    depth += 1;
-                }
-            }
+        let resolution = authority::resolve_authority(pile, team_root)
+            .map_err(|error| anyhow!("resolve team authority: {error}"))?;
+        println!("team root:       {}", hex::encode(team_root.to_bytes()));
+        println!("accepted grants: {}", resolution.grants().count());
+        for accepted in resolution.grants() {
+            println!();
+            print_grant(accepted, "  ");
         }
-
-        // Optional: full cryptographic verification via verify_chain.
-        if let Some(root_hex) = verify_team_root {
-            println!("== Verification ==");
-            let team_root = parse_pubkey_hex(&root_hex)
-                .map_err(|e| anyhow!("--verify (or TRIBLE_TEAM_ROOT): {e}"))?;
-
-            // Determine which subject to verify against. Default to
-            // the leaf cap's own cap_subject (re-decode it) — matches
-            // what the relay would check against the connecting peer.
-            let leaf_subject: VerifyingKey = match expected_subject_hex {
-                Some(s) => parse_pubkey_hex(&s).map_err(|e| anyhow!("--expected-subject: {e}"))?,
-                None => {
-                    // Re-fetch the leaf sig blob to find what cap it
-                    // signs, then extract that cap's subject. Yes,
-                    // this is a redundant fetch — verify_chain will
-                    // also do it — but it keeps the diagnostic
-                    // self-contained and the cost is one blob read.
-                    use triblespace_core::blob::TryFromBlob;
-                    use triblespace_core::macros::pattern;
-                    use triblespace_core::query::find;
-                    let leaf_sig_blob: Blob<SimpleArchive> = reader
-                        .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
-                        .map_err(|e| anyhow!("re-fetch leaf sig: {e:?}"))?;
-                    let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
-                        .map_err(|e| anyhow!("parse leaf sig: {e:?}"))?;
-                    let raw_iter = find!(
-                        (sig: Id, h: Inline<Handle<SimpleArchive>>),
-                        pattern!(&leaf_sig_set, [{
-                            ?sig @ capability::sig_signs: ?h
-                        }])
-                    );
-                    let mut iter = raw_iter.map(|(_sig, h)| (h,));
-                    let cap_h: Inline<Handle<SimpleArchive>> = match iter.next() {
-                        Some((h,)) => h,
-                        None => return Err(anyhow!("leaf sig blob malformed")),
-                    };
-                    let cap_b: Blob<SimpleArchive> = reader
-                        .get::<Blob<SimpleArchive>, SimpleArchive>(cap_h)
-                        .map_err(|e| anyhow!("re-fetch leaf cap: {e:?}"))?;
-                    let cap_s: TribleSet = TryFromBlob::try_from_blob(cap_b)
-                        .map_err(|e| anyhow!("parse leaf cap: {e:?}"))?;
-                    let mut subj_iter = find!(
-                        (e: Id, s: VerifyingKey),
-                        pattern!(&cap_s, [{
-                            ?e @ capability::cap_subject: ?s
-                        }])
-                    );
-                    match subj_iter.next() {
-                        Some((_e, s)) => s,
-                        None => return Err(anyhow!("leaf cap missing cap_subject")),
-                    }
-                }
-            };
-
-            // Build the fetch_blob closure verify_chain expects, backed
-            // by the same pile reader the structural walk used.
-            let fetch = |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-                use triblespace_core::repo::BlobStoreGet;
-                reader.get::<Blob<SimpleArchive>, SimpleArchive>(h).ok()
-            };
-
-            match capability::verify_chain(team_root, leaf_sig, leaf_subject, fetch) {
-                Ok(verified) => {
-                    println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
-                    println!(
-                        "  expected_subject: {}",
-                        hex::encode(leaf_subject.to_bytes())
-                    );
-                    println!("  scope_root:       {:?}", verified.scope_root);
-                    println!("  result:           ✓ VERIFIED");
-                    println!();
-                    println!(
-                        "  This chain WOULD pass `OP_AUTH` against a relay configured \
-                     with the given team root."
-                    );
-                }
-                Err(e) => {
-                    println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
-                    println!(
-                        "  expected_subject: {}",
-                        hex::encode(leaf_subject.to_bytes())
-                    );
-                    println!("  result:           ✗ FAILED — {e:?}");
-                    println!();
-                    println!(
-                        "  This is the SAME error the relay would raise on \
-                     `OP_AUTH`. Check that the team root matches what the \
-                     relay was configured with, and that no link in the \
-                     chain has expired."
-                    );
-                }
-            }
+        println!();
+        println!("diagnostics:     {}", resolution.diagnostics().len());
+        for diagnostic in resolution.diagnostics() {
+            println!("  {:X}: {diagnostic:?}", diagnostic.commit());
         }
-
         Ok(())
     })
 }
 
-// ── Descriptive-caps subcommands (decide#4b59ce27) ─────────────────────
-
-/// Print the pending join requests recorded in the local policy
-/// collection. Each line shows the entry id (for `team approve`),
-/// requester pubkey, partial-cap handle, received-at instant, and
-/// status tag.
-fn run_list_pending(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
-    let signing_key = load_existing_signing_key(key, &pile_path)?;
-    let pending = with_pile(&pile_path, |pile| {
-        triblespace_net::policy::list_pending_requests(pile, &signing_key)
-            .map_err(|error| anyhow!("read policy collection: {error}"))
-    })?;
-
-    if pending.is_empty() {
-        println!("(no pending requests)");
-        return Ok(());
-    }
-    println!("pending requests:  {}", pending.len());
-    for p in &pending {
-        let id_bytes: [u8; 16] = p.id.into();
-        let status_label = if p.status == triblespace_net::policy::STATUS_PENDING {
-            "PENDING"
-        } else if p.status == triblespace_net::policy::STATUS_APPROVED {
-            "APPROVED"
-        } else if p.status == triblespace_net::policy::STATUS_REJECTED {
-            "REJECTED"
-        } else {
-            "unknown"
-        };
-        println!("  entry:        {}", hex::encode(id_bytes));
-        println!("    requester:  {}", hex::encode(p.requester.to_bytes()));
-        println!("    partial:    {}", hex::encode(p.partial_cap.raw));
-        println!("    received:   {}", format_expiry(&p.received_at));
-        println!("    status:     {status_label}");
-        println!();
-    }
-    Ok(())
-}
-
-/// Print the renewal-policy entries on the local pile: caps this node
-/// is currently auto-renewing, plus any that have been retracted.
-fn run_list_issued(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
-    let signing_key = load_existing_signing_key(key, &pile_path)?;
-    let entries = with_pile(&pile_path, |pile| {
-        triblespace_net::policy::list_renewal_policy(pile, &signing_key)
-            .map_err(|error| anyhow!("read policy collection: {error}"))
-    })?;
-
-    if entries.is_empty() {
-        println!("(no renewal-policy entries)");
-        return Ok(());
-    }
-    println!("renewal-policy entries:  {}", entries.len());
-    for e in &entries {
-        let id_bytes: [u8; 16] = e.id.into();
-        let scope_bytes: [u8; 16] = e.scope.into();
-        let status = if e.retracted_at.is_some() {
-            "RETRACTED"
-        } else {
-            "ACTIVE"
-        };
-        println!("  entry:      {}  [{status}]", hex::encode(id_bytes));
-        println!("    subject:  {}", hex::encode(e.subject.to_bytes()));
-        println!("    scope:    {}", hex::encode(scope_bytes));
-        println!("    issued:   {}", format_expiry(&e.issued_at));
-        println!("    cap:      {}", hex::encode(e.latest_cap.raw));
-        println!("    sig:      {}", hex::encode(e.latest_sig.raw));
-        if let Some(r) = &e.retracted_at {
-            println!("    retracted: {}", format_expiry(r));
-        }
-        match &e.delivered_at {
-            Some(d) => println!("    delivered: {}", format_expiry(d)),
-            None => println!("    delivered: (not yet)"),
-        }
-        println!();
-    }
-    Ok(())
-}
-
-/// Mark a renewal-policy entry as retracted. The next daemon tick
-/// will skip it; the corresponding subject's chain dies at its
-/// current cap's natural expiry.
-fn run_retract(pile_path: PathBuf, key: Option<PathBuf>, entry_hex: String) -> Result<()> {
-    let entry_bytes: [u8; 16] = hex::decode(entry_hex.trim())
-        .map_err(|e| anyhow!("decode entry hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("entry id must be 16 bytes (32 hex chars)"))?;
-    let entry_id =
-        Id::new(entry_bytes).ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
-
-    let signing_key = load_existing_signing_key(key, &pile_path)?;
-    let terminal = with_pile(&pile_path, |pile| {
-        triblespace_net::policy::retract_policy_entry(pile, &signing_key, entry_id)
-            .map_err(|error| anyhow!("retract policy entry: {error}"))
-    })?;
-
-    println!(
-        "retracted entry {} with terminal version {}",
-        hex::encode(<[u8; 16]>::from(entry_id)),
-        hex::encode(<[u8; 16]>::from(terminal)),
-    );
-    println!(
-        "(the subject's cap chain will die at its current cap's expiry; no revocation propagates)"
-    );
-    Ok(())
-}
-
-// ── Approve / Request-Join (one-shot iroh-endpoint subcommands) ───────
-
-/// Open a tokio runtime, run `fut` to completion, drop the runtime.
-/// The CLI subcommands that need async (auth-handshake dispatch) use
-/// this rather than making the whole CLI async — keeps the existing
-/// sync surface intact.
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio current-thread runtime");
-    rt.block_on(fut)
-}
-
-fn run_request_join(
-    admin_hex: String,
-    scope: ScopeArg,
-    key: Option<PathBuf>,
-    pile_for_key: Option<PathBuf>,
-) -> Result<()> {
-    use triblespace_core::blob::IntoBlob;
-    use triblespace_core::id::ExclusiveId;
-    use triblespace_core::macros::entity;
-
-    let admin_pubkey = parse_pubkey_hex(&admin_hex)?;
-
-    // Load (or generate) the requester's signing key. If `--pile` is
-    // given, reuse the conventional sibling-of-pile location; else
-    // require `--key` explicitly so the keypair is intentional.
-    let signing_key = match (key, pile_for_key) {
-        (None, None) => bail!(
-            "team request-join needs either --key <path> or --pile <path> \
-             (for the conventional alongside-the-pile location)"
-        ),
-        (k, pile_opt) => {
-            let pile_path = pile_opt.unwrap_or_else(|| PathBuf::from("."));
-            load_or_generate_signing_key(k, &pile_path)?
-        }
-    };
-    let requester_pubkey = signing_key.verifying_key();
-
-    // Build the partial cap blob (declares: who we are, what we want,
-    // how long we want it for). The admin fills in chain linkage
-    // when signing — we leave cap_issuer set to admin's pubkey so the
-    // admin-side build_capability call uses our declared scope and
-    // expiry verbatim.
-    let scope_root = *triblespace_core::id::ufoid();
-    let scope_facts = TribleSet::from(entity! {
-        ExclusiveId::force_ref(&scope_root) @
-        triblespace_core::metadata::tag: scope.perm_id(),
-    });
-    let expiry = now_plus_30_days();
-
-    let cap_fragment = entity! {
-        capability::cap_subject: requester_pubkey,
-        capability::cap_issuer: admin_pubkey,
-        capability::cap_scope_root: scope_root,
-        triblespace_core::metadata::expires_at: expiry,
-    };
-    let mut cap_set = TribleSet::from(cap_fragment);
-    cap_set += scope_facts;
-    let partial_cap: Blob<SimpleArchive> = cap_set.to_blob();
-
-    println!(
-        "sending OP_REQUEST_CAP to admin {} (scope={:?})…",
-        hex::encode(admin_pubkey.to_bytes()),
-        scope,
-    );
-
-    // partial_cap.bytes is already an anybytes::Bytes; pass it
-    // through as &[u8] (Deref) without re-allocating.
-    let status = block_on(async {
-        triblespace_net::handshake::one_shot_request_cap(
-            signing_key.clone(),
-            admin_pubkey,
-            &partial_cap.bytes,
-        )
-        .await
-    })?;
-
-    match status {
-        triblespace_net::handshake::STATUS_OK => {
-            println!("ACK — admin received your request and queued it.");
-            println!("They'll see it under `team list-pending`.");
-            println!("Once approved, your cap arrives via the auth-handshake ALPN;");
-            println!(
-                "a running `pile net sync` daemon will store it in its private policy collection."
-            );
-            Ok(())
-        }
-        triblespace_net::handshake::STATUS_REJECTED => bail!("admin rejected the request"),
-        triblespace_net::handshake::STATUS_MALFORMED => {
-            bail!("admin rejected the request as malformed (version mismatch or bad payload)")
-        }
-        other => bail!("admin returned unknown status code {other:#x}"),
-    }
-}
-
-fn run_approve(
-    pile_path: PathBuf,
-    entry_hex: String,
-    team_root_hex: String,
-    cap_hex: String,
-    key: Option<PathBuf>,
-) -> Result<()> {
-    use triblespace_core::blob::TryFromBlob;
-    use triblespace_core::macros::pattern;
-    use triblespace_core::query::find;
-    use triblespace_core::repo::BlobStoreGet;
-
-    let entry_bytes: [u8; 16] = hex::decode(entry_hex.trim())
-        .map_err(|e| anyhow!("decode entry hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("entry id must be 16 bytes (32 hex chars)"))?;
-    let entry_id =
-        Id::new(entry_bytes).ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
-
-    let team_root = parse_pubkey_hex(&team_root_hex)?;
-    let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
-
-    let issuer_key = load_existing_signing_key(key, &pile_path)?;
-
-    let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
-        // Look up the pending request entry. Read the partial cap
-        // blob, its subject pubkey, scope_root, and expiry — those
-        // are what the requester proposed. We pass them through to
-        // build_capability (along with our parent cap+sig and
-        // signing key).
-        let pending = triblespace_net::policy::list_pending_requests(pile, &issuer_key)
-            .map_err(|error| anyhow!("read policy collection: {error}"))?;
-        let request = pending
-            .iter()
-            .find(|p| p.id == entry_id)
-            .ok_or_else(|| anyhow!("pending request {entry_hex} not found"))?;
-
-        if request.status != triblespace_net::policy::STATUS_PENDING {
-            bail!("request {entry_hex} is not PENDING (current status: another state)");
-        }
-
-        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-        let partial_cap_blob: Blob<SimpleArchive> = reader
-            .get(request.partial_cap)
-            .map_err(|e| anyhow!("fetch partial cap blob: {e:?}"))?;
-        let partial_set: TribleSet = TryFromBlob::try_from_blob(partial_cap_blob)
-            .map_err(|e| anyhow!("parse partial cap blob: {e:?}"))?;
-
-        let mut iter = find!(
-            (
-                e: Id,
-                subject: VerifyingKey,
-                scope_root: Id,
-                expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-            ),
-            pattern!(&partial_set, [{
-                ?e @
-                capability::cap_subject: ?subject,
-                capability::cap_scope_root: ?scope_root,
-                triblespace_core::metadata::expires_at: ?expiry,
-            }])
-        );
-        let (_cap_id, subject, scope_root, expiry) = match (iter.next(), iter.next()) {
-            (Some(row), None) => row,
-            _ => bail!("partial cap blob malformed (no unique subject/scope/expiry)"),
-        };
-
-        if subject != request.requester {
-            bail!(
-                "partial cap subject {} doesn't match requester {} — refusing to sign",
-                hex::encode(subject.to_bytes()),
-                hex::encode(request.requester.to_bytes()),
-            );
-        }
-
-        // Extract scope_facts (all tribles hanging off scope_root in the
-        // partial cap). build_capability takes scope_facts so we preserve
-        // whatever the requester wrote there.
-        let mut scope_facts = TribleSet::new();
-        for t in partial_set.iter() {
-            if *t.e() == scope_root {
-                scope_facts.insert(t);
+fn run_show(pile_path: PathBuf, team_root_text: String, grant_text: String) -> Result<()> {
+    let team_root = parse_team_root(&team_root_text)?;
+    let grant_id = parse_grant_id(&grant_text)?;
+    with_pile(&pile_path, |pile| {
+        let resolution = authority::resolve_authority(pile, team_root)
+            .map_err(|error| anyhow!("resolve team authority: {error}"))?;
+        if resolution.grant(grant_id).is_none() {
+            if let Some(diagnostic) = resolution
+                .diagnostics()
+                .iter()
+                .find(|diagnostic| diagnostic.commit() == grant_id)
+            {
+                bail!("grant {grant_id:X} is inert: {diagnostic:?}");
             }
+            bail!("grant {grant_id:X} is not present in this team authority collection");
         }
-
-        // Fetch our issuer cap+sig (the parent for the new cap). The
-        // sig blob carries `sig_signs: <cap_handle>` pointing at the cap,
-        // so one read gives us both via the reader we already have.
-        let parent_sig_blob: Blob<SimpleArchive> = reader
-            .get(issuer_cap_sig_handle)
-            .map_err(|e| anyhow!("fetch issuer sig blob: {e:?}"))?;
-        let parent_sig_set: TribleSet = TryFromBlob::try_from_blob(parent_sig_blob.clone())
-            .map_err(|e| anyhow!("parse issuer sig blob: {e:?}"))?;
-        let mut sig_signs_iter = find!(
-            (e: Id, h: Inline<Handle<SimpleArchive>>),
-            pattern!(&parent_sig_set, [{ ?e @ capability::sig_signs: ?h }])
-        );
-        let (_e, parent_cap_handle) = match (sig_signs_iter.next(), sig_signs_iter.next()) {
-            (Some(row), None) => row,
-            _ => bail!("issuer sig blob malformed (no unique sig_signs)"),
-        };
-        let parent_cap_blob: Blob<SimpleArchive> = reader
-            .get(parent_cap_handle)
-            .map_err(|e| anyhow!("fetch issuer cap blob: {e:?}"))?;
-        // Verify the issuer's chain before signing — refuse to delegate
-        // off an invalid chain.
-        let snap_reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-        let _ = capability::verify_chain(
-            team_root,
-            issuer_cap_sig_handle,
-            issuer_key.verifying_key(),
-            |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-                snap_reader
-                    .get::<Blob<SimpleArchive>, SimpleArchive>(h)
-                    .ok()
-            },
-        )
-        .map_err(|e| anyhow!("issuer's cap chain does not verify: {e:?}"))?;
-
-        // Sign the cap. Note: build_capability sets cap_issuer to the
-        // issuer's verifying key automatically (overrides whatever the
-        // partial cap declared); that's correct — the requester's
-        // declared cap_issuer was just a placeholder telling us "this is
-        // for the K_A path".
-        let (cap_blob, sig_blob) = capability::build_capability(
-            &issuer_key,
-            subject,
-            Some((parent_cap_blob, parent_sig_blob)),
-            scope_root,
-            scope_facts,
-            expiry,
-        )
-        .map_err(|e| anyhow!("build cap: {e:?}"))?;
-
-        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-        let request_id = request.id;
-
-        // Persist cap+sig blobs, then atomically record the approval and
-        // issued renewal version in one private collection commit. These are
-        // purely local writes, with no policy gossip. The running `pile net sync` daemon's
-        // `redispatch_undelivered` loop picks the new policy entry up
-        // on its next tick (every 100ms) and dispatches
-        // OP_DELIVER_CAP over its already-up iroh endpoint. We don't
-        // dispatch from the CLI for three reasons:
-        //
-        // 1. The subject is commonly offline at approve-time — the
-        //    whole point of an async request/approve flow is that
-        //    the requester and admin needn't be online
-        //    simultaneously. The daemon's re-dispatch loop has to
-        //    exist for that case to work; once it exists, an extra
-        //    "try once and hope" from the CLI is redundant.
-        // 2. The CLI's dispatcher (`one_shot_deliver_cap`) used to
-        //    spin up a fresh iroh endpoint with the issuer's signing
-        //    key — *same* pubkey as the daemon's long-lived endpoint.
-        //    N0's relay server treats that as "another endpoint
-        //    connected with the same id" and the duplicate-identity
-        //    warns spam the log.
-        // 3. The block-on dispatch had no timeout: a 30-day-fresh
-        //    cap to an offline subject hung the CLI forever instead
-        //    of returning with "daemon will retry."
-        drop(reader);
-        drop(snap_reader);
-        store_blob(pile, cap_blob)?;
-        store_blob(pile, sig_blob)?;
-
-        let policy_entry = triblespace_net::policy::approve_request_and_record_policy(
-            pile,
-            &issuer_key,
-            request_id,
-            team_root,
-            subject,
-            scope_root,
-            expiry,
-            cap_handle,
-            sig_handle,
-        )
-        .map_err(|error| anyhow!("record approval and renewal policy: {error}"))?;
-
-        Ok((sig_handle, expiry, policy_entry))
-    })?;
-
-    println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
-    println!("expires:           {}", format_expiry(&expiry));
-    let eid_bytes: [u8; 16] = policy_entry.into();
-    println!("renewal entry:     {}", hex::encode(eid_bytes));
-    println!(
-        "  request marked APPROVED; the running sync daemon will deliver via \
-         OP_DELIVER_CAP on its next tick (visible in `team list-issued` when \
-         the subject's daemon auths back with the new cap)"
-    );
-    Ok(())
+        let proof = resolution
+            .proof(grant_id)
+            .ok_or_else(|| anyhow!("accepted grant {grant_id:X} has no ancestry proof"))?;
+        println!("team root: {}", hex::encode(team_root.to_bytes()));
+        println!("ancestry: {} step(s), root to leaf", proof.steps().len());
+        for (level, step) in proof.steps().iter().enumerate() {
+            let accepted = resolution
+                .grant(step.commit().id())
+                .expect("proof steps came from this resolution");
+            println!();
+            println!("level {level}:");
+            print_grant(accepted, "  ");
+        }
+        Ok(())
+    })
 }

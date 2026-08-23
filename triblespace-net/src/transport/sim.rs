@@ -2,7 +2,7 @@
 //!
 //! [`SimNet`] is a process-local network: nodes join it, get a
 //! [`Harness<SimTransport>`] back, and from there the *entire*
-//! production protocol stack — host loop, authenticated reads, cap delivery,
+//! production protocol stack — host loop, CONNECT-authenticated reads and
 //! collection-evidence gossip — runs unmodified over in-memory pipes instead
 //! of iroh QUIC.
 //!
@@ -34,8 +34,7 @@
 //! [`SimNet::revive`]. Per-frame gossip drops happen with
 //! [`SimConfig::gossip_drop_prob`]. Faults affect *delivery*, never
 //! identity — `Conn::remote_id` always reports the true dialer, so
-//! identity-dependent protocol logic (dialer-equals-issuer, OP_AUTH
-//! subject binding) is exercised honestly.
+//! identity-dependent OP_AUTH subject binding is exercised honestly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -132,7 +131,7 @@ struct SimNetInner {
     /// Symmetric partition set; (a, b) stored with a <= b.
     partitions: BTreeSet<(PeerId, PeerId)>,
     /// Dial targets whose connection setup stalls forever (the
-    /// handshake neither completes nor errors). Models a peer that
+    /// connection setup neither completes nor errors). Models a peer that
     /// is routable enough to start a dial but never finishes it —
     /// the failure shape connection deadlines exist to catch. Unlike
     /// `crash` (dials error fast), this keeps the dial future
@@ -284,7 +283,7 @@ impl SimNet {
     }
 
     /// Lift a [`SimNet::stall_dials`] fault. Dials already pending
-    /// stay pending — like production, where a wedged handshake
+    /// stay pending — like production, where a wedged connection setup
     /// doesn't retroactively complete; recovery comes from the
     /// caller's deadline + retry.
     pub fn unstall_dials(&self, id: PeerId) {
@@ -359,7 +358,7 @@ async fn bridge<T: Send + 'static>(mut rx: mpsc::UnboundedReceiver<T>, tx: mpsc:
     }
 }
 
-/// One node's capability handle onto the [`SimNet`].
+/// One node's transport handle onto the [`SimNet`].
 #[derive(Clone)]
 pub struct SimTransport {
     net: SimNet,
@@ -415,11 +414,11 @@ impl Transport for SimTransport {
         {
             let mut inner = self.net.inner.lock().unwrap();
             // Re-check liveness after the dial latency: a crash that
-            // landed mid-handshake kills the connection attempt.
+            // landed mid-connection-setup kills the attempt.
             let target_up = inner.nodes.get(&peer).map(|n| n.up).unwrap_or(false);
             if !target_up || inner.partitioned(&self.id, &peer) {
                 anyhow::bail!(
-                    "simnet: dial {}: peer lost during handshake",
+                    "simnet: dial {}: peer lost during connection setup",
                     hex_prefix(&peer)
                 );
             }

@@ -21,13 +21,10 @@ use crate::host::PeerConfig;
 /// the desired failure mode (better than unbounded buffering).
 const CHANNEL_CAP: usize = 64;
 
-/// The two protocol ALPNs forwarded into the host loop. The DHT and
+/// The protocol ALPN forwarded into the host loop. The DHT and
 /// gossip ALPNs are *not* forwarded — their handlers are registered
 /// directly with the router here and never surface above the seam.
-const FORWARDED_ALPNS: [Alpn; 2] = [
-    crate::protocol::PILE_SYNC_ALPN,
-    crate::handshake::AUTH_HANDSHAKE_ALPN,
-];
+const FORWARDED_ALPNS: [Alpn; 1] = [crate::protocol::PILE_SYNC_ALPN];
 
 #[derive(Clone)]
 pub struct IrohTransport {
@@ -241,7 +238,7 @@ pub async fn bind(
 /// Factored out of [`bind`] so a caller can supply its own endpoint —
 /// notably an `iroh::test_utils` `TestNetwork` endpoint for integration
 /// tests that wire two real `Peer`s over a virtual transport (no relays,
-/// no DNS), the way `auth_handshake_e2e` does for raw endpoints.
+/// no DNS), the way the real-transport integration tests do.
 pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harness<IrohTransport> {
     use iroh::address_lookup::{EndpointInfo, MemoryLookup};
     use iroh::protocol::Router;

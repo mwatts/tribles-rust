@@ -26,8 +26,7 @@ use triblespace_net::peer::Peer;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
 
 use common::{
-    admin_cap, bring_up, bring_up_with_peers, key, pk, run_paused, self_cap_of, store_with_caps,
-    vclock,
+    bring_up, bring_up_with_peers, connect_proof, empty_store, key, pk, run_paused, vclock,
 };
 
 fn collection_name(name: &str) -> CollectionName {
@@ -68,17 +67,11 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
         let root = key(0xF0);
         let server_key = key(0xA0);
         let client_key = key(0xB0);
-        let (server_cap, server_sig) = admin_cap(&root, &server_key);
-        let (client_cap, client_sig) = admin_cap(&root, &client_key);
+        let server_proof = connect_proof(&root, &server_key);
+        let client_proof = connect_proof(&root, &client_key);
 
-        let mut server_store = store_with_caps(&[
-            (server_cap.clone(), server_sig.clone()),
-            (client_cap.clone(), client_sig.clone()),
-        ]);
-        let client_store = store_with_caps(&[
-            (server_cap, server_sig.clone()),
-            (client_cap, client_sig.clone()),
-        ]);
+        let mut server_store = empty_store();
+        let client_store = empty_store();
 
         let descriptor = named_root("c1");
         let data = archive(2);
@@ -107,7 +100,7 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_sig),
+            server_proof.clone(),
             false,
         );
         let client = bring_up(
@@ -115,11 +108,11 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             &client_key,
             client_store,
             root.verifying_key(),
-            self_cap_of(&client_sig),
+            client_proof.clone(),
             false,
         );
 
-        // Let both host tasks publish their capabilities before the direct op.
+        // Let both host tasks bind before the direct op.
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
         let (client, fetched) =
             fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor))
@@ -160,22 +153,20 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
     });
 }
 
-/// Two siblings provisioned with only their own private credential chains can
-/// still establish the first authenticated connection. The server obtains the
-/// client's exact proof over the one-shot pre-auth operation; no shared cap
-/// cache, gossip, or DHT fallback masks the bootstrap.
+/// Two siblings can establish their first authenticated connection while
+/// neither store contains authority state: the complete proof travels inline.
 #[test]
-fn sibling_members_bootstrap_with_disjoint_private_cap_stores() {
+fn sibling_members_bootstrap_without_resident_authority_state() {
     let _guard = common::sim_guard();
     run_paused(0xC011EC9, async {
         let root = key(0xF9);
         let server_key = key(0xA9);
         let client_key = key(0xB9);
-        let (server_cap, server_sig) = admin_cap(&root, &server_key);
-        let (client_cap, client_sig) = admin_cap(&root, &client_key);
+        let server_proof = connect_proof(&root, &server_key);
+        let client_proof = connect_proof(&root, &client_key);
 
-        let mut server_store = store_with_caps(&[(server_cap.clone(), server_sig.clone())]);
-        let client_store = store_with_caps(&[(client_cap, client_sig.clone())]);
+        let mut server_store = empty_store();
+        let client_store = empty_store();
         let descriptor = named_root("sibling-bootstrap");
         let mut collection = Collection::new(
             &mut server_store,
@@ -198,7 +189,7 @@ fn sibling_members_bootstrap_with_disjoint_private_cap_stores() {
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_sig),
+            server_proof.clone(),
             false,
         );
         let client = bring_up(
@@ -206,7 +197,7 @@ fn sibling_members_bootstrap_with_disjoint_private_cap_stores() {
             &client_key,
             client_store,
             root.verifying_key(),
-            self_cap_of(&client_sig),
+            client_proof.clone(),
             false,
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
@@ -215,6 +206,45 @@ fn sibling_members_bootstrap_with_disjoint_private_cap_stores() {
             fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor))
                 .await;
         assert_eq!(fetched, vec![commit]);
+    });
+}
+
+#[test]
+fn connect_proof_subject_must_equal_the_tls_peer() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ED0, async {
+        let root = key(0xE0);
+        let server_key = key(0xA0);
+        let client_key = key(0xB0);
+        let different_subject = key(0xC0);
+
+        let net = SimNet::new(0xC011ED0, SimConfig::default());
+        let _server = bring_up(
+            &net,
+            &server_key,
+            empty_store(),
+            root.verifying_key(),
+            connect_proof(&root, &server_key),
+            false,
+        );
+        let client = bring_up(
+            &net,
+            &client_key,
+            empty_store(),
+            root.verifying_key(),
+            connect_proof(&root, &different_subject),
+            false,
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let descriptor = named_root("wrong-connect-subject");
+        let (_client, result) = fetch_evidence_result_while_stepping(
+            client,
+            pk(&server_key),
+            collection_of(&descriptor),
+        )
+        .await;
+        assert!(result.is_err(), "a proof for another TLS peer was admitted");
     });
 }
 
@@ -233,16 +263,10 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
         let root = key(0xF1);
         let server_key = SigningKey::from_bytes(&[0xA1; 32]);
         let client_key = SigningKey::from_bytes(&[0xB1; 32]);
-        let (server_cap, server_sig) = admin_cap(&root, &server_key);
-        let (client_cap, client_sig) = admin_cap(&root, &client_key);
-        let mut server_store = store_with_caps(&[
-            (server_cap.clone(), server_sig.clone()),
-            (client_cap.clone(), client_sig.clone()),
-        ]);
-        let client_store = store_with_caps(&[
-            (server_cap, server_sig.clone()),
-            (client_cap, client_sig.clone()),
-        ]);
+        let server_proof = connect_proof(&root, &server_key);
+        let client_proof = connect_proof(&root, &client_key);
+        let mut server_store = empty_store();
+        let client_store = empty_store();
 
         // Deliberately NOT `named_root`, which declares `reach::public()`.
         let descriptor =
@@ -268,7 +292,7 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_sig),
+            server_proof.clone(),
             false,
         );
         let client = bring_up(
@@ -276,7 +300,7 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
             &client_key,
             client_store,
             root.verifying_key(),
-            self_cap_of(&client_sig),
+            client_proof.clone(),
             false,
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
@@ -295,16 +319,10 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
         let root = key(0xF3);
         let server_key = key(0xA3);
         let client_key = key(0xB3);
-        let (server_cap, server_sig) = admin_cap(&root, &server_key);
-        let (client_cap, client_sig) = admin_cap(&root, &client_key);
-        let mut server_store = store_with_caps(&[
-            (server_cap.clone(), server_sig.clone()),
-            (client_cap.clone(), client_sig.clone()),
-        ]);
-        let client_store = store_with_caps(&[
-            (server_cap, server_sig.clone()),
-            (client_cap, client_sig.clone()),
-        ]);
+        let server_proof = connect_proof(&root, &server_key);
+        let client_proof = connect_proof(&root, &client_key);
+        let mut server_store = empty_store();
+        let client_store = empty_store();
 
         let descriptor = named_root("c6");
         let data = archive(7);
@@ -324,7 +342,7 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_sig),
+            server_proof.clone(),
             false,
         );
         let client = bring_up(
@@ -332,7 +350,7 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
             &client_key,
             client_store,
             root.verifying_key(),
-            self_cap_of(&client_sig),
+            client_proof.clone(),
             false,
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
@@ -376,18 +394,13 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
         let server_key = key(0xA4);
         let configured_key = key(0xB4);
         let unconfigured_key = key(0xC4);
-        let server_cap = admin_cap(&root, &server_key);
-        let configured_cap = admin_cap(&root, &configured_key);
-        let unconfigured_cap = admin_cap(&root, &unconfigured_key);
+        let server_proof = connect_proof(&root, &server_key);
+        let configured_proof = connect_proof(&root, &configured_key);
+        let unconfigured_proof = connect_proof(&root, &unconfigured_key);
 
-        let all_caps = [
-            server_cap.clone(),
-            configured_cap.clone(),
-            unconfigured_cap.clone(),
-        ];
-        let mut server_store = store_with_caps(&all_caps);
-        let configured_store = store_with_caps(&all_caps);
-        let unconfigured_store = store_with_caps(&all_caps);
+        let mut server_store = empty_store();
+        let configured_store = empty_store();
+        let unconfigured_store = empty_store();
 
         let merged = named_root("c20");
         let derived = named_root("c21");
@@ -437,7 +450,7 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            server_proof.clone(),
             false,
         );
         let configured = bring_up_with_peers(
@@ -445,7 +458,7 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
             &configured_key,
             configured_store,
             root.verifying_key(),
-            self_cap_of(&configured_cap.1),
+            configured_proof.clone(),
             false,
             vec![pk(&server_key)],
         );
@@ -454,7 +467,7 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
             &unconfigured_key,
             unconfigured_store,
             root.verifying_key(),
-            self_cap_of(&unconfigured_cap.1),
+            unconfigured_proof.clone(),
             false,
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
@@ -497,17 +510,12 @@ fn configured_peer_probe_unions_conflicting_receipts_split_across_peers() {
         let first_server_key = key(0xA6);
         let second_server_key = key(0xA7);
         let client_key = key(0xB6);
-        let first_server_cap = admin_cap(&root, &first_server_key);
-        let second_server_cap = admin_cap(&root, &second_server_key);
-        let client_cap = admin_cap(&root, &client_key);
-        let all_caps = [
-            first_server_cap.clone(),
-            second_server_cap.clone(),
-            client_cap.clone(),
-        ];
-        let mut first_store = store_with_caps(&all_caps);
-        let mut second_store = store_with_caps(&all_caps);
-        let client_store = store_with_caps(&all_caps);
+        let first_server_proof = connect_proof(&root, &first_server_key);
+        let second_server_proof = connect_proof(&root, &second_server_key);
+        let client_proof = connect_proof(&root, &client_key);
+        let mut first_store = empty_store();
+        let mut second_store = empty_store();
+        let client_store = empty_store();
 
         let descriptor = named_root("c24");
         let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
@@ -538,7 +546,7 @@ fn configured_peer_probe_unions_conflicting_receipts_split_across_peers() {
             &first_server_key,
             first_store,
             root.verifying_key(),
-            self_cap_of(&first_server_cap.1),
+            first_server_proof.clone(),
             false,
         );
         let _second_server = bring_up(
@@ -546,7 +554,7 @@ fn configured_peer_probe_unions_conflicting_receipts_split_across_peers() {
             &second_server_key,
             second_store,
             root.verifying_key(),
-            self_cap_of(&second_server_cap.1),
+            second_server_proof.clone(),
             false,
         );
         let client = bring_up_with_peers(
@@ -554,7 +562,7 @@ fn configured_peer_probe_unions_conflicting_receipts_split_across_peers() {
             &client_key,
             client_store,
             root.verifying_key(),
-            self_cap_of(&client_cap.1),
+            client_proof.clone(),
             false,
             vec![pk(&second_server_key), pk(&first_server_key)],
         );
@@ -580,13 +588,12 @@ fn configured_peer_probe_keeps_partial_evidence_and_recovers_conflict_after_stal
         let healthy_key = key(0xA8);
         let stalled_key = key(0xA9);
         let client_key = key(0xB7);
-        let healthy_cap = admin_cap(&root, &healthy_key);
-        let stalled_cap = admin_cap(&root, &stalled_key);
-        let client_cap = admin_cap(&root, &client_key);
-        let all_caps = [healthy_cap.clone(), stalled_cap.clone(), client_cap.clone()];
-        let mut healthy_store = store_with_caps(&all_caps);
-        let mut stalled_store = store_with_caps(&all_caps);
-        let client_store = store_with_caps(&all_caps);
+        let healthy_proof = connect_proof(&root, &healthy_key);
+        let stalled_proof = connect_proof(&root, &stalled_key);
+        let client_proof = connect_proof(&root, &client_key);
+        let mut healthy_store = empty_store();
+        let mut stalled_store = empty_store();
+        let client_store = empty_store();
 
         let descriptor = named_root("c25");
         let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
@@ -617,7 +624,7 @@ fn configured_peer_probe_keeps_partial_evidence_and_recovers_conflict_after_stal
             &healthy_key,
             healthy_store,
             root.verifying_key(),
-            self_cap_of(&healthy_cap.1),
+            healthy_proof.clone(),
             false,
         );
         let _stalled = bring_up(
@@ -625,7 +632,7 @@ fn configured_peer_probe_keeps_partial_evidence_and_recovers_conflict_after_stal
             &stalled_key,
             stalled_store,
             root.verifying_key(),
-            self_cap_of(&stalled_cap.1),
+            stalled_proof.clone(),
             false,
         );
         let client = bring_up_with_peers(
@@ -633,7 +640,7 @@ fn configured_peer_probe_keeps_partial_evidence_and_recovers_conflict_after_stal
             &client_key,
             client_store,
             root.verifying_key(),
-            self_cap_of(&client_cap.1),
+            client_proof.clone(),
             false,
             vec![pk(&stalled_key), pk(&healthy_key)],
         );

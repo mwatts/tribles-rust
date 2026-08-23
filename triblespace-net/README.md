@@ -29,7 +29,7 @@ let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint],
     gossip: true,
     team_root,
-    self_cap,
+    connect_proof,
     direction: SyncDirection::Bidirectional,
 });
 
@@ -37,8 +37,8 @@ let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
 peer.refresh();
 ```
 
-Gossip transports only a strictly verified publication grant plus its matching
-signed `COMMIT`. It does **not** fetch the collection descriptor, data,
+Gossip transports only a strictly verified signed `COMMIT`. It does **not**
+fetch the collection descriptor, data,
 metadata, or attachments and does not manufacture a WANT. Those resources
 remain independently content-addressed and are fetched only when local policy
 asks for them.
@@ -54,7 +54,6 @@ and CLI surface live in the book's
 - `collection_wire` — canonical dense codecs and exact collection RPCs
 - `reconcile` — fulfillment of durable blob, merge, and derive WANTs
 - `protocol` — authenticated read-only QUIC protocol
-- `policy` — private capability lifecycle collections
 - `transport` — production iroh and deterministic simulation transports
 - `identity` — persistent network signing-key handling
 

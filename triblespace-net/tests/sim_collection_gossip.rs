@@ -33,7 +33,7 @@ use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
-use common::{admin_cap, bring_up, key, run_paused, self_cap_of, store_with_caps, vclock};
+use common::{bring_up, connect_proof, empty_store, key, run_paused, vclock};
 
 fn collection_name(name: &str) -> CollectionName {
     CollectionName::new(name).unwrap()
@@ -85,11 +85,10 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
         let root = key(0xF0);
         let author = key(0xA0);
         let receiver = key(0xB0);
-        let author_cap = admin_cap(&root, &author);
-        let receiver_cap = admin_cap(&root, &receiver);
-        let caps = [author_cap.clone(), receiver_cap.clone()];
-        let mut author_store = store_with_caps(&caps);
-        let receiver_store = store_with_caps(&caps);
+        let author_proof = connect_proof(&root, &author);
+        let receiver_proof = connect_proof(&root, &receiver);
+        let mut author_store = empty_store();
+        let receiver_store = empty_store();
 
         let descriptor = named_root("c31");
         let data = archive(0x41);
@@ -117,7 +116,7 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
             &receiver,
             receiver_store,
             root.verifying_key(),
-            self_cap_of(&receiver_cap.1),
+            receiver_proof.clone(),
             true,
         );
         let mut author_peer = bring_up(
@@ -125,7 +124,7 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
             &author,
             author_store,
             root.verifying_key(),
-            self_cap_of(&author_cap.1),
+            author_proof.clone(),
             true,
         );
 
@@ -191,11 +190,10 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
         let root = key(0xE0);
         let author = key(0xA1);
         let receiver = key(0xB1);
-        let author_cap = admin_cap(&root, &author);
-        let receiver_cap = admin_cap(&root, &receiver);
-        let caps = [author_cap.clone(), receiver_cap.clone()];
-        let mut author_store = store_with_caps(&caps);
-        let receiver_store = store_with_caps(&caps);
+        let author_proof = connect_proof(&root, &author);
+        let receiver_proof = connect_proof(&root, &receiver);
+        let mut author_store = empty_store();
+        let receiver_store = empty_store();
 
         let descriptor = named_root("c32");
         let data = archive(0x42);
@@ -218,7 +216,7 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
             &author,
             author_store,
             root.verifying_key(),
-            self_cap_of(&author_cap.1),
+            author_proof.clone(),
             true,
         );
 
@@ -233,7 +231,7 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
             &receiver,
             receiver_store,
             root.verifying_key(),
-            self_cap_of(&receiver_cap.1),
+            receiver_proof.clone(),
             true,
         );
         SimNet::step(&vclock(), Duration::from_millis(100)).await;
@@ -298,14 +296,13 @@ fn sparse_gossip_retains_all_commits_but_authority_admits_only_the_writer() {
         let writer = key(0xA2);
         let stranger = key(0xC2);
         let receiver = key(0xB2);
-        // Legacy capabilities only authenticate the two simulated transport
-        // endpoints. Target-data admission below comes solely from the new
-        // positive authority ledger.
-        let writer_cap = admin_cap(&root, &writer);
-        let receiver_cap = admin_cap(&root, &receiver);
-        let caps = [writer_cap.clone(), receiver_cap.clone()];
-        let mut source_store = store_with_caps(&caps);
-        let receiver_store = store_with_caps(&caps);
+        // CONNECT proofs authenticate only the simulated transport endpoints.
+        // Target-data admission below comes solely from the positive authority
+        // ledger.
+        let writer_proof = connect_proof(&root, &writer);
+        let receiver_proof = connect_proof(&root, &receiver);
+        let mut source_store = empty_store();
+        let receiver_store = empty_store();
 
         let name = collection_name("authority-boundary");
         let target_descriptor = named_root(name.as_str());
@@ -346,7 +343,7 @@ fn sparse_gossip_retains_all_commits_but_authority_admits_only_the_writer() {
             &receiver,
             receiver_store,
             root.verifying_key(),
-            self_cap_of(&receiver_cap.1),
+            receiver_proof.clone(),
             true,
         );
         let mut source_peer = bring_up(
@@ -354,7 +351,7 @@ fn sparse_gossip_retains_all_commits_but_authority_admits_only_the_writer() {
             &writer,
             source_store,
             root.verifying_key(),
-            self_cap_of(&writer_cap.1),
+            writer_proof.clone(),
             true,
         );
 

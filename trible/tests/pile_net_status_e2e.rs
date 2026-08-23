@@ -1,70 +1,82 @@
-//! End-to-end tests for the `trible pile net status` diagnostic.
-//!
-//! Status reports the auth configuration the running peer would
-//! present on `OP_AUTH`: node id, team root, self_cap, and the
-//! source of each value (env var vs fallback). The format is what
-//! ops people will eyeball when debugging a stuck connection, so
-//! lock the contract here.
+//! End-to-end tests for explicit `pile net status` authority resolution.
 
 use assert_cmd::Command;
 use tempfile::tempdir;
 
-#[test]
-fn status_without_env_vars_reports_fallbacks() {
-    let dir = tempdir().expect("tempdir");
-    let key_path = dir.path().join("node.key");
-
-    let out = Command::cargo_bin("trible")
-        .expect("trible binary")
-        .args(["pile", "net", "status", "--key", key_path.to_str().unwrap()])
-        // Make sure no test-environment leak: explicitly clear
-        // both env vars so the fallback branches are exercised
-        // even if the CI inherits them.
-        .env_remove("TRIBLE_TEAM_ROOT")
-        .env_remove("TRIBLE_TEAM_CAP")
-        .assert()
-        .success();
-    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf8 stdout");
-
-    assert!(
-        stdout.contains("node:"),
-        "status prints node id; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("team_root:") && stdout.contains("single-user fallback"),
-        "status notes single-user fallback when TRIBLE_TEAM_ROOT unset; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("self_cap:") && stdout.contains("NOT SET"),
-        "status flags self_cap NOT SET when TRIBLE_TEAM_CAP unset; got:\n{stdout}"
-    );
+fn field(stdout: &[u8], label: &str) -> String {
+    std::str::from_utf8(stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(label).map(str::trim))
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
-fn status_with_env_vars_reports_from_env() {
-    let dir = tempdir().expect("tempdir");
-    let key_path = dir.path().join("node.key");
+fn status_resolves_the_exact_local_connect_grant() {
+    let dir = tempdir().unwrap();
+    let pile = dir.path().join("team.pile");
+    let key = dir.path().join("node.key");
+    std::fs::File::create(&pile).unwrap();
 
-    // Hand-picked deterministic test values; the status command
-    // does no validation, just echoes what the env var contains.
-    let team_root_hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-    let self_cap_hex = "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe";
-
-    let out = Command::cargo_bin("trible")
-        .expect("trible binary")
-        .args(["pile", "net", "status", "--key", key_path.to_str().unwrap()])
-        .env("TRIBLE_TEAM_ROOT", team_root_hex)
-        .env("TRIBLE_TEAM_CAP", self_cap_hex)
+    let create = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "create",
+            "--pile",
+            pile.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+        ])
         .assert()
-        .success();
-    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf8 stdout");
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let root = field(&create, "team root pubkey:");
+    let grant = field(&create, "founder grant:");
 
-    assert!(
-        stdout.contains(team_root_hex) && stdout.contains("from TRIBLE_TEAM_ROOT"),
-        "status surfaces TRIBLE_TEAM_ROOT value + source; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains(self_cap_hex) && stdout.contains("from TRIBLE_TEAM_CAP"),
-        "status surfaces TRIBLE_TEAM_CAP value + source; got:\n{stdout}"
-    );
+    let status = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "net",
+            "status",
+            pile.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--team-root",
+            &root,
+            "--grant",
+            &grant,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status = String::from_utf8(status).unwrap();
+    assert!(status.contains(&format!("team_root:   {root}")));
+    assert!(status.contains(&format!("grant:       {grant}")));
+    assert!(status.contains("proof_steps: 1"));
+    assert!(status.contains("authorization: CONNECT accepted"));
+}
+
+#[test]
+fn status_has_no_ambient_or_sentinel_configuration() {
+    let help = Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "net", "status", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(help).unwrap();
+    assert!(help.contains("--team-root"));
+    assert!(help.contains("--grant"));
+    assert!(!help.contains("TRIBLE_TEAM_ROOT"));
+    assert!(!help.contains("TRIBLE_TEAM_CAP"));
+    assert!(!help.contains("self_cap"));
 }

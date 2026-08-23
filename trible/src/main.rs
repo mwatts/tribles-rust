@@ -32,7 +32,7 @@ enum TribleCli {
         #[command(subcommand)]
         cmd: StoreCommand,
     },
-    /// Capability-based team membership management.
+    /// Positive, proof-carrying team authority management.
     Team {
         #[command(subcommand)]
         cmd: TeamCommand,

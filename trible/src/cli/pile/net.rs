@@ -4,17 +4,16 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 
-use triblespace_net::identity::load_or_create_key;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 
 use triblespace_core::repo::pile::Pile;
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
-    Pile::open(path).map_err(|e| anyhow!("open pile: {e:?}"))
+    crate::cli::pile::open_refreshed(path)
 }
 
 /// Parse `--peers` as canonical iroh endpoint tickets or bare endpoint ids.
@@ -39,47 +38,9 @@ fn parse_peers(strs: &[String]) -> Result<Vec<EndpointAddr>> {
         .collect()
 }
 
-fn key_dir(pile_path: &PathBuf) -> &std::path::Path {
-    pile_path.parent().unwrap_or(pile_path.as_ref())
-}
-
-/// Read the team root pubkey from the `TRIBLE_TEAM_ROOT` env var, or
-/// fall back to the user's own pubkey for the single-user team-of-one
-/// convention. Multi-user teams MUST set the env var; if they don't,
-/// the relay will accept caps signed by their own key (treating them
-/// as the team root) and reject everyone else's caps.
-fn team_root_from_env(key: &SigningKey) -> Result<VerifyingKey> {
-    match std::env::var("TRIBLE_TEAM_ROOT") {
-        Ok(hex_str) => {
-            let bytes =
-                hex::decode(hex_str.trim()).map_err(|e| anyhow!("TRIBLE_TEAM_ROOT decode: {e}"))?;
-            let raw: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("TRIBLE_TEAM_ROOT must be 32 bytes"))?;
-            VerifyingKey::from_bytes(&raw).map_err(|e| anyhow!("TRIBLE_TEAM_ROOT bad pubkey: {e}"))
-        }
-        Err(_) => Ok(key.verifying_key()),
-    }
-}
-
-/// Read this node's own capability sig handle from the
-/// `TRIBLE_TEAM_CAP` env var. Falls back to all-zeros (which the
-/// remote will reject — that's the right signal that the env var
-/// needs to be set for this node to participate in a team mesh).
-fn self_cap_from_env() -> Result<[u8; 32]> {
-    match std::env::var("TRIBLE_TEAM_CAP") {
-        Ok(hex_str) => {
-            let bytes =
-                hex::decode(hex_str.trim()).map_err(|e| anyhow!("TRIBLE_TEAM_CAP decode: {e}"))?;
-            let raw: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("TRIBLE_TEAM_CAP must be 32 bytes"))?;
-            Ok(raw)
-        }
-        Err(_) => Ok([0u8; 32]),
-    }
+fn load_existing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
+    let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
+    triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -92,24 +53,33 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Show the auth configuration this node would use for sync /
-    /// pull operations: node id, team root, and self_cap (if any).
-    /// Useful for debugging why a remote peer rejects auth.
+    /// Resolve and show the exact CONNECT proof this node would present.
     Status {
+        /// Pile containing the accepted authority chain.
+        pile: PathBuf,
         /// Path to the node's signing key.
         #[arg(long)]
         key: Option<PathBuf>,
+        /// Team root public key (32-byte hex).
+        #[arg(long)]
+        team_root: String,
+        /// Exact accepted CONNECT grant occurrence (16-byte hex id).
+        #[arg(long)]
+        grant: String,
     },
-    /// Sync with peers — live bidirectional gossip on the team's
-    /// gossip mesh (topic = team root pubkey). The team root is read
-    /// from `TRIBLE_TEAM_ROOT`, falling back to this node's own
-    /// pubkey for single-user / team-of-one workflows.
+    /// Sync with peers on one explicitly authorized team's gossip mesh.
     Sync {
         pile: PathBuf,
         #[arg(long, value_delimiter = ',')]
         peers: Vec<String>,
         #[arg(long)]
         key: Option<PathBuf>,
+        /// Team root public key (32-byte hex).
+        #[arg(long)]
+        team_root: String,
+        /// Exact accepted CONNECT grant occurrence (16-byte hex id).
+        #[arg(long)]
+        grant: String,
         /// Don't publish our own collection evidence — receive only. Useful
         /// for follower / leecher workflows where we're catching up.
         #[arg(long, conflicts_with = "write_only")]
@@ -150,11 +120,18 @@ pub enum Command {
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Identity { key } => run_identity(key),
-        Command::Status { key } => run_status(key),
+        Command::Status {
+            pile,
+            key,
+            team_root,
+            grant,
+        } => run_status(pile, key, team_root, grant),
         Command::Sync {
             pile,
             peers,
             key,
+            team_root,
+            grant,
             read_only,
             write_only,
             duration,
@@ -173,6 +150,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 pile,
                 peers,
                 key,
+                team_root,
+                grant,
                 direction,
                 duration,
                 quiescent_for,
@@ -187,7 +166,9 @@ pub fn run(cmd: Command) -> Result<()> {
 
 fn run_identity(sk: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let key = load_or_create_key(&sk, &cwd)?;
+    let default_anchor = cwd.join("identity.pile");
+    let path = triblespace_core::signing_key_file::resolve_path(sk.as_deref(), &default_anchor);
+    let key = triblespace_core::signing_key_file::init(&path)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
     println!("node: {public}");
     Ok(())
@@ -195,39 +176,37 @@ fn run_identity(sk: Option<PathBuf>) -> Result<()> {
 
 // ── Status ───────────────────────────────────────────────────────────
 
-fn run_status(sk: Option<PathBuf>) -> Result<()> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let key = load_or_create_key(&sk, &cwd)?;
+fn run_status(
+    pile_path: PathBuf,
+    key_path: Option<PathBuf>,
+    team_root_text: String,
+    grant_text: String,
+) -> Result<()> {
+    let key = load_existing_key(key_path, &pile_path)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
-    println!("node:      {public}");
+    let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
+    let grant = crate::cli::team::parse_grant_id(&grant_text)?;
+    let mut pile = open_pile(&pile_path)?;
+    let proof = match crate::cli::team::resolve_connect_proof(
+        &mut pile,
+        team_root,
+        grant,
+        key.verifying_key(),
+    ) {
+        Ok(proof) => proof,
+        Err(error) => {
+            let _ = pile.close();
+            return Err(error);
+        }
+    };
+    pile.close()
+        .map_err(|error| anyhow!("close pile: {error:?}"))?;
 
-    // team_root: explicit env var or single-user fallback to own pubkey.
-    match std::env::var("TRIBLE_TEAM_ROOT") {
-        Ok(s) => {
-            let trimmed = s.trim();
-            println!("team_root: {trimmed}  (from TRIBLE_TEAM_ROOT)");
-        }
-        Err(_) => {
-            println!(
-                "team_root: {}  (single-user fallback — own pubkey)",
-                hex::encode(key.verifying_key().to_bytes()),
-            );
-        }
-    }
-
-    // self_cap: explicit env var or all-zeros sentinel.
-    match std::env::var("TRIBLE_TEAM_CAP") {
-        Ok(s) => {
-            let trimmed = s.trim();
-            println!("self_cap:  {trimmed}  (from TRIBLE_TEAM_CAP)");
-        }
-        Err(_) => {
-            println!(
-                "self_cap:  {}  (NOT SET — remote will reject OP_AUTH)",
-                "0".repeat(64),
-            );
-        }
-    }
+    println!("node:        {public}");
+    println!("team_root:   {}", hex::encode(team_root.to_bytes()));
+    println!("grant:       {grant:X}");
+    println!("proof_steps: {}", proof.steps().len());
+    println!("authorization: CONNECT accepted");
     Ok(())
 }
 
@@ -238,13 +217,15 @@ fn run_sync(
     pile_path: PathBuf,
     peer_strs: Vec<String>,
     key_path: Option<PathBuf>,
+    team_root_text: String,
+    grant_text: String,
     direction: SyncDirection,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
     no_lazy: bool,
     reconcile_interval: u64,
 ) -> Result<()> {
-    let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
+    let key = load_existing_key(key_path, &pile_path)?;
     // Endpoint tickets retain caller-selected direct/fabric routes; bare
     // endpoint ids intentionally use iroh's discovery layer.
     let peers = parse_peers(&peer_strs)?;
@@ -252,9 +233,21 @@ fn run_sync(
     // One pile handle wrapped directly in a Peer. Collection synchronization
     // is a union of immutable signed evidence, so the daemon needs neither a
     // Repository workspace nor mutable branch mirrors.
-    let pile = open_pile(&pile_path)?;
-    let team_root = team_root_from_env(&key)?;
-    let self_cap = self_cap_from_env()?;
+    let mut pile = open_pile(&pile_path)?;
+    let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
+    let grant = crate::cli::team::parse_grant_id(&grant_text)?;
+    let connect_proof = match crate::cli::team::resolve_connect_proof(
+        &mut pile,
+        team_root,
+        grant,
+        key.verifying_key(),
+    ) {
+        Ok(proof) => proof,
+        Err(error) => {
+            let _ = pile.close();
+            return Err(error);
+        }
+    };
     let mut peer = Peer::new(
         pile,
         key.clone(),
@@ -262,7 +255,7 @@ fn run_sync(
             peers,
             gossip: true,
             team_root,
-            self_cap,
+            connect_proof,
             direction,
         },
     );
@@ -353,21 +346,6 @@ fn run_sync(
         // Drain immutable collection evidence and publish any records appended
         // by another process. Direction policy lives inside Peer::refresh.
         peer.refresh();
-
-        // Renewal-daemon tick: scan the renewal-policy branch for
-        // entries whose current cap is within the renewal window of
-        // expiry, sign a successor, and dispatch via OP_DELIVER_CAP.
-        // Quiet by default (returns 0 when nothing is due) so the
-        // overhead is dominated by the policy-branch read.
-        //
-        // The window is intentionally large relative to the tick
-        // cadence (1 hour vs 100 ms) so missed ticks don't break
-        // chains — entries become due well before the cap actually
-        // expires, giving the daemon multiple chances to land the
-        // successor.
-        if direction != SyncDirection::ReadOnly {
-            let _renewed = peer.renewal_tick(hifitime::Duration::from_seconds(3600.0));
-        }
 
         // Want-reconcile tick: a want IS a durable want-marker —
         // "I would like this blob; fetch it if absent; evictable."

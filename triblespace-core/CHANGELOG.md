@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add `authority.rs`, a positive enumerable authority kernel backed by one
+  public grow-only `SimpleArchive`-union collection per team root. Signed grant
+  occurrences bind one exact subject, resource, action, invoke/delegate mode,
+  and optional exact parent; resolution computes their grounded least fixed
+  point without letting malformed or unavailable candidates poison independent
+  authority. Add claim-directed portable root-to-leaf proofs carrying each
+  signed collection commit beside its canonical grant archive, with standalone
+  verification of the exact leaf subject, action, resource, and required mode.
+
+### Removed
+
+- Remove `repo::capability` and its expiring capability blobs, permission-scope
+  hierarchy, revocation/renewal model, and ambient chain lookup. Durable removal
+  now requires a successor team, collection, or key epoch outside the monotone
+  authority kernel.
+
 ## [0.41.4] - 2026-05-17
 
 Lock-step bump alongside the trailing-dot-leak +

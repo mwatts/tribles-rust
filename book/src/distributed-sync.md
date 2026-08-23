@@ -7,13 +7,13 @@ separate jobs:
 
 - a team gossip mesh discovers immutable signed collection evidence;
 - a DHT discovers providers for content-addressed blobs; and
-- authenticated QUIC answers exact blob, collection, and operation-receipt
-  questions.
+- CONNECT-authenticated QUIC answers exact blob, collection, and
+  operation-receipt questions.
 
 The user-visible surface is `Peer<S>`. It wraps a local store, owns the async
 network host, and continues to expose synchronous storage traits. Network
-activity does not introduce a remote mutable head or a distributed
-compare-and-swap operation.
+activity does not introduce a remote mutable head, a distributed
+compare-and-swap operation, or a second authorization database.
 
 Enable it through the facade crate's `net` feature:
 
@@ -30,12 +30,18 @@ let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint],
     gossip: true,
     team_root,
-    self_cap,
+    connect_proof,
     direction: SyncDirection::Bidirectional,
 });
 
 peer.refresh();
 ```
+
+`connect_proof` is a complete root-to-leaf positive authority proof whose leaf
+invokes `ACTION_CONNECT` for `signing_key` on
+`authority::collection(team_root)`. The caller selects and builds that proof;
+the transport sends exactly those bytes and never searches for authority
+implicitly.
 
 ## The synchronized object is evidence
 
@@ -54,173 +60,214 @@ One `COMMIT` is a 192-byte signed assertion containing:
 
 The signature proves who authored the assertion. It does not force a receiver
 to treat that author as ground truth. Author trust belongs to the resolver that
-selects a collection view, where all relevant local policy is available.
+selects a collection view, where the relevant application policy and positive
+authority observation are available.
 
-Publication permission is a property of the collection, not a second record.
-The descriptor's optional `collection_reach` attribute names a reach law, and
-because a collection handle is the hash of its descriptor, a collection that
-travels and one that stays put are *different collections*. There is nothing to
-sign after the fact and nothing to forget: an author who commits into a
-collection whose identity declares it public has published, and one who commits
-into a collection that declares nothing has not.
+Publication permission is part of the collection descriptor. Its optional
+`collection_reach` attribute names a reach law, and because a collection
+handle is the hash of its descriptor, a collection that travels and one that
+stays put are different collections. An author who commits into a collection
+whose identity declares public reach has published that occurrence; a commit
+into a descriptor with no declared reach remains local unless some other
+explicit law says otherwise.
 
-A peer may relay a commit exactly when it can resolve that commit's collection
-descriptor and that descriptor declares a reach law it implements. A descriptor
-it cannot resolve is a refusal — permission it cannot read is permission it does
-not have — and so is a law it does not recognise, which is why reach names a law
-rather than carrying a boolean. `Collection::commit` writes its descriptor as a
-commit dependency, so a publisher's own store always holds its own permission.
+A peer may relay a commit only when it can resolve that commit's exact
+descriptor and the descriptor declares a reach law the peer implements. A
+missing descriptor is a refusal, as is an unrecognized law. `Collection::commit`
+writes the descriptor before the commit, so a publisher's own store contains
+the permission it needs to interpret.
 
-The receiving side does not consult descriptors. Admitting evidence a peer
-handed you leaks nothing, and requiring residency there would contradict the
-sparse-admission rule above. The guarantee holds transitively: a receiver that
-later serves is a relay, and answers the question then.
+The receiving side does not require the descriptor before admitting sparse
+evidence. Admission leaks no local data and requiring descriptor residency
+would defeat sparse discovery. If that receiver later wants to relay the
+commit, it must resolve and apply reach at that later boundary.
 
-The canonical evidence frame is the 192-byte commit. The mesh frame adds one
-kind byte and an eight-byte anti-deduplication nonce, for 201 bytes in total.
-The nonce changes transport identity for periodic replay but is not signed and
-has no semantic meaning.
+The gossip frame contains one strictly verified signed `CollectionCommit`, one
+kind byte, and an eight-byte anti-deduplication nonce. The nonce gives periodic
+replays a fresh transport identity but is not signed and has no semantic
+meaning. Duplicate semantic delivery collapses by intrinsic commit ID, and one
+drained batch crosses one storage flush barrier.
 
-The receiver strictly verifies each commit's embedded signature before unioning
-it into the local `CollectionStore`. The mesh carrier is only a relay; it is
-neither author nor authority. Duplicate delivery is reduced by intrinsic commit
-identity, and one drained batch crosses one storage flush barrier.
+## Gossip is sparse and untrusted
 
-## Sparse discovery is deliberate
+Gossiping a `COMMIT` does not transfer any referenced blob. The receiver may
+learn exact handles for the descriptor, data, metadata, and attachments while
+possessing none of their bytes. Admission also does not manufacture a WANT.
 
-Gossiping a `COMMIT` does not transfer any referenced blob. In
-particular, the receiver may know the exact handles of the descriptor, data,
-metadata, and attachments while possessing none of their bytes. Admission also
-does not create a WANT for any of them.
+This applies to the team's public authority collection too. Gossip may carry a
+signed grant commit as sparse evidence, but its grant archive remains an
+independent content-addressed blob. A portable invite or CONNECT proof carries
+the exact grant archives it needs inline; authentication never relies on a
+pre-auth network fetch.
 
-This separation is what lets a node cheaply learn a large global frontier and
-then apply its own cache, trust, and derivation policy. Evidence answers “what
-has been asserted?” A WANT answers “what work or content should this node
-obtain?” Conflating them would make every observation an involuntary full
-replica.
+Sparse discovery lets a node learn a large global frontier and then apply its
+own cache, trust, authority, and derivation policy. Evidence answers “what has
+been asserted?” A WANT answers “what content or computation should this node
+obtain?” Treating the first as the second would turn observation into
+involuntary full replication.
 
-`Peer::refresh` performs both directions of the sparse exchange:
+The team root's public bytes identify the gossip topic. Knowing or joining
+that topic is not authority. In particular, a CONNECT grant does not grant
+gossip membership or make a gossip carrier trusted. Safety comes from strict
+verification of each signed commit plus reach checks at relay time, not from
+trusting the mesh participant that forwarded it.
 
-1. drain pending evidence frames, canonicalize and admit them;
-2. update the host's immutable serving snapshot;
+`Peer::refresh` performs both sides of local sparse synchronization:
+
+1. drain pending gossip frames, strictly verify, canonicalize, and admit them;
+2. refresh the immutable snapshot served by direct RPC;
 3. announce newly added blobs to the DHT; and
-4. gossip newly visible relayable commits.
+4. gossip newly visible commits whose descriptors permit relay.
 
-Construction drives one initial refresh, so existing evidence is published
-without a separate startup ritual. The host later reads the current durable
-snapshot every 30 seconds and replays the exact publication frontier with fresh
-nonces. It does not maintain a second unbounded ledger mirror.
+Construction drives one initial refresh, so resident blobs and existing
+evidence are published without a separate startup ritual. The host later
+reads the current durable snapshot every 30 seconds and replays the relayable
+commit frontier with fresh nonces. It does not retain a second unbounded ledger
+mirror.
 
 ## Durable WANTs
 
 `WantStore` records local operational interest. Its canonical request key has
 three variants:
 
-- `Blob(handle)` asks to obtain content and retain it while cache policy
-  permits;
+- `Blob(handle)` asks to obtain exact content;
 - `Merge(collection, low, high)` asks whether a matching native `MERGE`
   receipt exists; and
 - `Derive(target, input)` asks whether a matching native `DERIVE` receipt
-  exists; the target descriptor already names the source collection and recipe.
+  exists. The target descriptor already names the source collection and
+  recipe.
 
-The long-running `Reconciler` services these requests without deleting them.
+The long-running `Reconciler` services these questions without deleting them.
 An unavailable answer is normal: the WANT remains durable and retries with
 bounded exponential backoff.
 
-Blob fulfillment first tries configured or currently live team peers as
-routing candidates, then falls back to DHT providers. A routing candidate is
-not presumed to hold the blob; every returned payload must still match the
+Blob fulfillment first tries configured or recently live team peers as routing
+candidates, then falls back to DHT provider discovery. A candidate is not
+presumed to hold the blob, and every returned payload must still hash to the
 requested BLAKE3 handle.
 
 Merge and derive questions have no result hash to feed into the DHT. They are
-therefore probed against the explicitly configured authenticated peers. Every
-exact native receipt returned before the deadline is unioned into the local
-`CollectionStore`. A sweep only becomes complete when every configured peer
-answered; partial answers remain useful evidence but do not turn temporary
-unreachability into a proof of absence. Obtaining the result bytes is a
+therefore probed against explicitly configured authenticated peers. Every exact
+native receipt returned before the deadline is unioned into the local
+`CollectionStore`. A sweep is complete only when every configured peer
+answered; partial answers remain useful evidence but temporary unreachability
+never becomes proof of absence. Obtaining a receipt's result bytes is a
 separate `Blob(result)` WANT.
 
-## Authenticated read protocol
+## Positive CONNECT authentication
 
-All point-to-point operations use `PILE_SYNC_ALPN =
-"/triblespace/pile-sync/5"`. An ordinary connection starts with `OP_AUTH`,
-which proves a capability chain back to the configured team root. The sole
-pre-auth exception is a bounded, one-shot `CAPABILITY_PROOF` connection used
-to obtain that exact chain when sibling members hold only their own private
-credentials. Already held leaf artifacts may accompany the request, but the
-server still verifies the complete chain before returning its exact closure.
-The remaining protocol is read-only:
+All direct point-to-point operations use
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/6"`. The first stream on every
+connection must be `OP_AUTH`. Its request carries a length-prefixed canonical
+authority proof inline:
 
-| Operation | Question | Response |
-|---|---|---|
-| `GET_BLOB` | exact 32-byte content handle | bytes or missing |
-| `CHILDREN` | exact parent handle | referenced present handles |
-| `CAPABILITY_PROOF` | exact capability sig handle | complete validated proof bundle, then close |
-| `COLLECTION_EVIDENCE` | exact collection descriptor handle | canonical commits the descriptor permits |
-| `COLLECTION_OPERATION_RECEIPTS` | exact merge/derive WANT key | canonical matching receipts |
+```text
+OP_AUTH
+proof_length:u32
+proof: version:u8, count:u8, (commit:192, data_length:u16, data:bytes)*
+```
+
+The server obtains the caller's Ed25519 public key from the authenticated
+transport and verifies this exact claim:
+
+```text
+subject  = transport peer key
+action   = ACTION_CONNECT
+resource = authority::collection(configured team root)
+mode     = Invoke
+```
+
+The proof must start with a team-root-signed occurrence, follow each exact
+parent in order, preserve action and resource, and end at the claimed peer.
+Every signed commit and adjacent canonical grant archive is verified directly
+from the stream. Empty, truncated, oversized, reordered, malformed, or
+claim-mismatched proofs are rejected. The response is `AUTH_OK` (`0x00`) or
+`AUTH_REJECTED` (`0x01`); a rejected connection is closed.
+
+There is no pre-auth exception, remote proof-fetch operation, ambient store
+lookup, expiry check, or renewal exchange. After a successful first stream,
+later streams on that connection may use the read-only direct RPC surface:
+
+| Operation | Byte | Question | Response |
+|---|---:|---|---|
+| `GET_BLOB` | `0x02` | exact 32-byte content handle | bytes or missing |
+| `CHILDREN` | `0x03` | exact parent blob handle | resident referenced handles |
+| `OP_AUTH` | `0x05` | inline exact CONNECT proof | accept or reject; first stream only |
+| `COLLECTION_EVIDENCE` | `0x06` | exact collection descriptor handle | relayable signed commits |
+| `COLLECTION_OPERATION_RECEIPTS` | `0x07` | exact merge/derive WANT key | matching native receipts |
+
+The direct protocol has no remote write operation.
+
+CONNECT is transport admission, not a permission hierarchy. It grants no
+`ACTION_WRITE`, generic `READ`, gossip, collection reach, semantic author
+trust, custody, or retention. The host's current serving snapshot determines
+which read-only answers exist; content hashes, commit signatures, collection
+reach, application author selection, and local retention policy retain their
+own independent boundaries.
 
 `fetch_collection_evidence_from` returns strictly verified but inert sparse
-evidence from one named peer. `reconcile_collection_from` adds an explicit
-caller authorization phase and admits the whole accepted batch only after
-transport and validation have completed. Neither operation fetches referenced
-content.
-
-Every ordinary data operation requires a read-equivalent team capability. Resource-specific
-publication remains encoded by collection reach, not by a parallel branch
-authorization namespace.
-
-Capability request, issuance, renewal, and delivery state lives in private
-signer-owned collections. Those collections declare no reach, so ordinary
-evidence gossip cannot expose them — and because reach is part of a descriptor,
-no later signature can change that without naming a different collection. Capability-chain blobs may be
-fetched during mutual authentication and cached after verification.
+evidence from one named authenticated peer. `reconcile_collection_from` adds
+an explicit caller authorization phase and admits the complete accepted batch
+only after transport and validation finish. Neither operation fetches
+referenced content.
 
 ## Direction policy
 
-`PeerConfig::direction` controls participation without changing evidence
-semantics:
+`PeerConfig::direction` controls local participation without changing evidence
+or authority semantics:
 
-- `Bidirectional` admits incoming evidence, publishes local evidence, and
-  services WANTs;
+- `Bidirectional` admits incoming evidence, publishes local evidence and blob
+  announcements, and may service WANTs;
 - `ReadOnly` admits incoming evidence and may service WANTs, but publishes no
   local evidence or blob announcements; and
 - `WriteOnly` publishes but discards incoming evidence and does not fetch.
 
-These are runtime bandwidth policies, not durable retractions or alternate
-collection modes. They apply to replication data only: capability requests,
-deliveries, and delivery acknowledgements remain accepted so authorization can
-still be established and renewed.
+These are runtime bandwidth policies, not grants, durable retractions, or
+alternate collection modes. Every direct connection still presents the exact
+configured CONNECT proof. Selecting `gossip: false` similarly disables topic
+participation without changing direct-RPC authority.
 
 ## CLI
 
-The `trible` CLI exposes the same model:
+The `trible` CLI makes team and proof selection explicit:
 
 ```text
 trible pile net identity [--key PATH]
-    Print this node's iroh identity.
+    Initialize the key if needed and print this node's iroh identity.
 
-trible pile net status [--key PATH]
-    Show the node id, team root, and local capability handle.
+trible pile net status <PILE> --team-root HEX --grant ID [--key PATH]
+    Load the existing key, resolve the exact accepted local CONNECT grant,
+    reconstruct its portable ancestry, and report the proof step count.
 
-trible pile net sync <PILE> [--peers ...] [--key PATH]
+trible pile net sync <PILE> --team-root HEX --grant ID
+    [--peers ID_OR_TICKET,...] [--key PATH]
     Run collection-evidence gossip and durable WANT reconciliation.
-    --read-only suppresses publication; --write-only suppresses
-    admission and fetching; --no-lazy disables WANT servicing.
+    --read-only suppresses publication; --write-only suppresses admission
+    and fetching; --no-lazy disables WANT servicing.
 ```
 
-The mesh topic is the team-root public key. Multi-user deployments supply
-`TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP`; a missing root falls back to a
-single-user team-of-one. `--duration` and `--quiescent-for` bound a run, but
-quiescence is only an observation that no recent event or fulfillment occurred,
-not a distributed proof that every peer has converged.
+`status` and `sync` require all of the pile, team root, grant occurrence, and
+existing signing key. A missing or differently owned grant, inert ancestry,
+wrong action/resource, non-invoking leaf, absent key, or non-portable proof is
+an error before networking starts. There is no environment-variable fallback,
+all-zero grant sentinel, implicit team-of-one grant, or automatic key creation
+on these two paths.
+
+The mesh topic is the explicit team-root public key. `--duration` and
+`--quiescent-for` can bound a run, but quiescence means only that no recent
+network event or WANT fulfillment was observed. It is not a distributed proof
+that every peer has converged.
 
 ## Invariants worth retaining
 
 - Network discovery is set union, not last-writer-wins state.
 - A collection's declared reach authorizes relay, not semantic trust.
-- The relay carrying evidence is not its author or a presumed blob holder.
+- The gossip carrier is neither the commit author nor a presumed blob holder.
 - Observing a commit never creates hidden content demand.
 - Merge and derive receipts are evidence; their output blobs remain lazy.
-- Every network payload is strictly framed and content/signature checked before
-  it can affect local resolution.
+- Direct RPC starts with one inline, exact, claim-directed CONNECT proof.
+- CONNECT authenticates the session and grants no other action or storage
+  policy.
+- Every payload is strictly framed and content/signature checked before it can
+  affect local resolution.
 - Temporary unreachability remains “unknown,” never “absent.”

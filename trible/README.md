@@ -101,34 +101,31 @@ reach law, together with the representation and recipe descriptions.
 
 ### Distributed pile sync
 
-Built on `triblespace-net` (iroh QUIC + DHT + gossip). All commands
-authenticate via capability chains rooted at a team's pubkey; see
-the *Capability auth* section below for the team setup. Without a
-team configured, falls back to single-user team-of-one (the user is
-their own team root).
+Built on `triblespace-net` (iroh QUIC + DHT + gossip). Every connection
+authenticates with an exact, positive CONNECT grant chain rooted at the team's
+public key; see *Team authority* below. Runtime configuration is explicit: the
+local pile must contain the accepted chain named by `--team-root` and
+`--grant`.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
-- `pile net status [--key PATH]` — print the auth configuration this node would present on `OP_AUTH`: node id, team root, self_cap, and where each value comes from (env var vs fallback). For debugging stuck-auth scenarios.
-- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — long-running collection-evidence sync on the team's gossip mesh. The mesh is identified by the team root pubkey directly (no separate topic argument): every team has exactly one mesh, derived from its identity. Valid grant-backed commits converge by set union; referenced blobs and collection-operation receipts remain lazy until requested by durable wants. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars; falls back to the node's own pubkey for single-user / team-of-one workflows. Use `--read-only` or `--write-only` for directional operation and `--no-lazy` to suppress want reconciliation.
+- `pile net status <PILE> --team-root HEX --grant ID [--key PATH]` — resolve the exact local CONNECT grant, reconstruct its ancestry proof, and print the configuration the node would present during authentication.
+- `pile net sync <PILE> --team-root HEX --grant ID [--peers ID,...] [--key PATH]` — long-running collection-evidence sync on the team's gossip mesh. The mesh is identified by the team root directly. The exact accepted grant must invoke CONNECT for the local key; no ambient environment fallback or sentinel exists. Collection records converge by set union, while referenced blobs and operation receipts stay lazy until requested by durable wants. Use `--read-only` or `--write-only` for directional operation and `--no-lazy` to suppress want reconciliation.
 
-### Capability auth
+### Team authority
 
-Chain-of-trust capability system for distributed pile sync. A team
-has one immutable root keypair (used once at creation, then archived)
-that signs the founder's capability; every other capability chains
-off the founder's via delegation. See
-[`book/src/capability-auth.md`](../book/src/capability-auth.md) for
-the full design.
+Team authority is one public, grow-only collection of positive signed grant
+occurrences. A grant names one direct subject key, one exact resource, one
+action, an invoke/delegate mode, and optionally one exact delegating parent.
+There is no permission hierarchy, expiry, retraction, pending workflow, or
+mutable membership head in this kernel. A team root signs the founder grant;
+every invite carries the exact bounded parent chain needed to validate and
+import it.
 
-- `team create --pile PATH [--key KEY_PATH]` — mint a new team root keypair, sign the founder's self-cap with admin scope, and write both into the pile. Prints the team root pubkey (publish to peers), team root SECRET (archive offline), founder cap handles, and the cap's expiry timestamp.
-- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin)` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested team permission.
-- `team request-join --admin HEX --scope (read|write|admin) [--key PATH] [--pile PATH]` — send an `OP_REQUEST_CAP` to an admin asking to be issued a capability via the running auth-handshake daemon.
-- `team approve --pile PATH --entry HEX --team-root HEX --cap HEX [--key PATH]` — approve a pending join request, sign the cap, dispatch it via the auth-handshake ALPN, and add a renewal-policy entry so the cap stays renewed.
-- `team retract --pile PATH --entry HEX` — stop auto-renewing a (subject, scope) entry. The peer's cap chain dies at its next natural expiry. Pure local decision, takes effect on the next daemon tick. There is no team-root broadcast revocation primitive; eviction is per-issuer non-renewal.
-- `team list --pile PATH` — audit the pile: per-cap details (issuer → subject, scope, expiry — sorted soonest-expiry-first).
-- `team list-pending --pile PATH` — incoming join requests awaiting approval.
-- `team list-issued --pile PATH` — renewal-policy entries this node is keeping renewed.
-- `team show --pile PATH --cap HEX [--verify HEX] [--expected-subject HEX]` — walk one chain end-to-end and print each level with subject, issuer, scope, expiry, blob handles, and a signer-matches-issuer check. Bounded by MAX_DEPTH=32; the diagnostic deep-dive that complements `team list`'s summary view.
+- `team create --pile PATH [--key KEY_PATH]` — mint a team root, publish an explicit founder CONNECT grant with invocation and delegation, and print the root public key, offline root secret, and founder grant id.
+- `team invite --pile PATH --team-root HEX --parent ID --key ISSUER --invitee HEX [--delegate] --out FILE` — prove that ISSUER owns the exact delegating CONNECT parent, publish the child, and write a portable public proof bundle. Without `--delegate`, the child may connect but cannot invite.
+- `team join --pile PATH --key INVITEE --invite FILE` — verify that the self-contained bundle grants CONNECT to INVITEE on the exact team authority collection, then import its descriptor, grant data, and signed commits idempotently.
+- `team list --pile PATH --team-root HEX` — resolve and print accepted grants plus inert-candidate diagnostics.
+- `team show --pile PATH --team-root HEX --grant ID` — print the exact accepted root-to-leaf ancestry of one grant occurrence.
 
 ### Work with remote stores
 

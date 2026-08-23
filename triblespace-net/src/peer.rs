@@ -2,8 +2,7 @@
 //!
 //! Owns the inner store, spawns the iroh network thread on construction,
 //! and exposes the standard blob storage traits with network behavior built
-//! in. Its signer-owned policy collection stays on the
-//! inner store and is deliberately not exposed for gossip through `Peer`:
+//! in:
 //!
 //! - **Reads** auto-call [`refresh`](Peer::refresh), which drains pending
 //!   incoming gossip events into the wrapped store and re-publishes any
@@ -16,14 +15,14 @@
 //!   evidence without fetching its referenced blobs; semantic trust belongs to
 //!   later collection resolution.
 //! - **Blob writes** delegate to the inner store and announce content to the
-//!   DHT. Team capabilities authorize blob reads; collection descriptors and
-//!   WANTs independently govern publication and local demand.
+//!   DHT. CONNECT authority gates the direct-RPC channel; collection
+//!   descriptors and WANTs independently govern publication and local demand.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
 //! and any tiering (bounded want retention, generational eviction) lives
 //! in `S` — e.g. a [`Yard`](triblespace_core::repo::yard::Yard). Read-miss
 //! swarm fetches land in `S` under a **want** ([`WantStore`]),
-//! independently of private policy collections. The want is
+//! independently of authentication state. The want is
 //! recorded durably *before* the fetch — asserted AND
 //! flushed ([`StorageFlush`]), so the marker survives an immediate
 //! process exit — the demand IS the want-signal (a sync daemon's work
@@ -37,18 +36,17 @@
 //! "Promote to durable" is not an operation; the Peer performs no hidden
 //! publication or retention transition.
 //!
-//! Collection discovery is gossip-driven: immutable grant+commit evidence
+//! Collection discovery is gossip-driven: immutable signed commit evidence
 //! floods the team topic and arrives through `NetEvent`. Referenced content
 //! remains independently retrievable by hash, normally through durable wants.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::collection::{CollectionRecord, CollectionStore};
 use triblespace_core::id::Id;
@@ -61,7 +59,7 @@ use triblespace_core::repo::{
     StorageFlush, WantRequest, WantStore,
 };
 
-use crate::channel::{NetEvent, PublisherKey};
+use crate::channel::NetEvent;
 use crate::collection_sync::{
     IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_collection_batch,
 };
@@ -130,17 +128,9 @@ where
 
 /// Whether local direction policy admits this incoming event.
 ///
-/// Directionality governs replicated data, not the capability control plane:
-/// a pure publisher still has to receive join requests, issued capabilities,
-/// and delivery acknowledgements in order to administer its access policy.
 fn accepts_incoming_event(direction: SyncDirection, event: &NetEvent) -> bool {
     match event {
-        NetEvent::Blob(_) | NetEvent::CollectionEvidence(_) => {
-            direction != SyncDirection::WriteOnly
-        }
-        NetEvent::CapRequest { .. }
-        | NetEvent::CapDelivered { .. }
-        | NetEvent::CapDeliveryConfirmed { .. } => true,
+        NetEvent::CollectionEvidence(_) => direction != SyncDirection::WriteOnly,
     }
 }
 
@@ -150,40 +140,12 @@ fn accepts_incoming_event(direction: SyncDirection, event: &NetEvent) -> bool {
 ///
 /// # Example
 ///
-/// Single-user team-of-one setup against a [`Pile`]: the user is
-/// their own team root, and the relay accepts only caps signed by
-/// (or chained from) their own key. The `self_cap = [0u8; 32]`
-/// sentinel will fail any remote `OP_AUTH` it sends — fine for
-/// solo workflows where the peer is purely a server.
-///
-/// Multi-user setups load `team_root` and `self_cap` from the
-/// `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` environment variables;
-/// see the [Capability Auth] book chapter for the full team
-/// lifecycle.
-///
-/// [`Pile`]: triblespace_core::repo::pile::Pile
-/// [Capability Auth]: https://docs.rs/triblespace/latest/triblespace/book/capability-auth/index.html
-///
-/// ```rust,no_run
-/// use std::path::Path;
-/// use ed25519_dalek::SigningKey;
-/// use rand::rngs::OsRng;
-/// use triblespace_core::repo::pile::Pile;
-/// use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
-///
-/// let key = SigningKey::generate(&mut OsRng);
-/// let pile: Pile = Pile::open(Path::new("./team.pile")).unwrap();
-/// let peer = Peer::new(pile, key.clone(), PeerConfig {
-///     peers: vec![],                       // bootstrap nodes
-///     gossip: true,                        // false = serve/pull-only
-///     team_root: key.verifying_key(),      // single-user fallback
-///     self_cap: [0u8; 32],
-///     direction: SyncDirection::Bidirectional,
-/// });
-/// // From here `peer` provides network-aware blob storage. Store-specific
-/// // local state remains explicitly available through `peer.store()`.
-/// drop(peer);
-/// ```
+/// Construction requires the team root and a prebuilt
+/// [`AuthorityProof`](triblespace_core::authority::AuthorityProof) whose leaf
+/// authorizes this peer's transport key to invoke
+/// [`ACTION_CONNECT`](crate::protocol::ACTION_CONNECT). Proof selection is an
+/// application concern; the transport sends exactly the proof in
+/// [`PeerConfig::connect_proof`].
 pub struct Peer<S>
 where
     S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
@@ -205,7 +167,7 @@ where
     /// the last refresh.
     last_blob_reader: Option<S::Reader>,
 
-    /// Intrinsic commit ids whose matching grant-backed evidence has already
+    /// Intrinsic commit ids whose matching signed evidence has already
     /// been handed to the host gossip loop. This is only a publication-diff
     /// baseline: durable truth remains in the two grow-only stores.
     last_collection_commits: BTreeSet<Id>,
@@ -219,26 +181,6 @@ where
     /// in long-running sync drivers. Read through [`crate::clock`] so
     /// simulated runs measure quiescence in virtual time.
     last_event_at: crate::clock::Mono,
-
-    /// Team root pubkey, copied from `PeerConfig::team_root` so the
-    /// refresh loop can verify incoming `CapDelivered` events against
-    /// it without round-tripping through the network thread.
-    team_root: ed25519_dalek::VerifyingKey,
-
-    /// Cloned signing key. ed25519's SigningKey is 32 bytes of secret
-    /// scalar so cloning is cheap, but we keep it as an explicit
-    /// `Clone` instead of `Copy` so the surface area for accidental
-    /// duplication stays auditable. Used by `renewal_tick` to sign
-    /// fresh caps for heads in the renewal-policy version DAG.
-    signing_key: SigningKey,
-
-    /// Per-entry cooldown for undelivered-cap re-dispatch. The
-    /// renewal daemon's tick runs every 100 ms; without this gate it
-    /// would hammer iroh-connect attempts for any peer that's down.
-    /// Recorded against `entry.id`. Cleared (entry-level) when the
-    /// delivery confirms; the whole map is in-memory and rebuilds
-    /// naturally if the daemon restarts.
-    last_dispatch_attempt: HashMap<Id, crate::clock::Mono>,
 }
 
 impl<S> Peer<S>
@@ -251,10 +193,8 @@ where
     /// down when the Peer drops.
     pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Self {
         let direction = config.direction;
-        let team_root = config.team_root;
-        let signing_key = key.clone();
         let (sender, receiver) = host::spawn(key, config);
-        Self::assemble(store, sender, receiver, direction, team_root, signing_key)
+        Self::assemble(store, sender, receiver, direction)
     }
 
     /// Wrap a store in a Peer over caller-provided channel halves — the
@@ -265,13 +205,11 @@ where
     /// Pair with [`crate::host::wire`] + [`crate::host::run_host`].
     pub fn with_wiring(
         store: S,
-        signing_key: SigningKey,
         direction: SyncDirection,
-        team_root: ed25519_dalek::VerifyingKey,
         sender: host::NetSender,
         receiver: host::NetReceiver,
     ) -> Self {
-        Self::assemble(store, sender, receiver, direction, team_root, signing_key)
+        Self::assemble(store, sender, receiver, direction)
     }
 
     fn assemble(
@@ -279,8 +217,6 @@ where
         sender: host::NetSender,
         receiver: host::NetReceiver,
         direction: SyncDirection,
-        team_root: ed25519_dalek::VerifyingKey,
-        signing_key: SigningKey,
     ) -> Self {
         // Seed the snapshot served by the network thread so peers
         // requesting via the protocol see our current state immediately.
@@ -301,9 +237,6 @@ where
             last_collection_commits: BTreeSet::new(),
             direction,
             last_event_at: crate::clock::mono_now(),
-            team_root,
-            signing_key,
-            last_dispatch_attempt: HashMap::new(),
         };
 
         // Drive the first refresh synchronously so the DHT learns
@@ -384,7 +317,7 @@ where
             .await
     }
 
-    /// Fetch one exact collection's grant-backed commit evidence from `peer`.
+    /// Fetch one exact collection's signed commit evidence from `peer`.
     ///
     /// The transport runs on the jailed host runtime. The returned evidence
     /// is strictly verified but inert: this method does not mutate the local
@@ -450,101 +383,18 @@ where
     /// "do it now" semantics or tight loops with no read activity.
     pub fn refresh(&mut self) {
         // ── Phase 1: drain incoming events ────────────────────────────
-        // WriteOnly suppresses incoming *data* convergence while preserving
-        // capability-control traffic. Join requests, delivered capabilities,
-        // and delivery confirmations are operational messages required to
-        // administer even a pure publisher; silently discarding them would
-        // make directionality alter the authorization protocol itself.
+        // WriteOnly suppresses incoming collection convergence. CONNECT is
+        // verified in the transport before these events can exist and is not
+        // itself replicated state.
         let mut incoming_collection_evidence = Vec::new();
         while let Some(event) = self.receiver.try_recv() {
             self.last_event_at = crate::clock::mono_now();
             if !accepts_incoming_event(self.direction, &event) {
                 continue;
             }
-            match event {
-                NetEvent::Blob(data) => {
-                    // `data` is already an anybytes::Bytes (refcounted) —
-                    // pass it into the store without re-wrapping.
-                    let _ = self
-                        .store
-                        .lock()
-                        .expect("store mutex")
-                        .put::<UnknownBlob, Bytes>(data);
-                }
-                NetEvent::CollectionEvidence(evidence) => {
-                    incoming_collection_evidence.push(evidence);
-                }
-                NetEvent::CapRequest {
-                    requester,
-                    partial_cap_bytes,
-                } => {
-                    self.absorb_cap_request(requester, partial_cap_bytes);
-                }
-                NetEvent::CapDelivered {
-                    issuer,
-                    cap_bytes,
-                    sig_bytes,
-                } => {
-                    // Verify the delivered chain against our configured
-                    // team root, then store both blobs locally and append our
-                    // team-cap version, whose collection commit retains them
-                    // through compaction.
-                    self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes);
-                }
-                NetEvent::CapDeliveryConfirmed {
-                    subject,
-                    sig_handle,
-                } => {
-                    // The subject's daemon authenticated against us with
-                    // a cap we dispatched. `sig_handle` is the signature
-                    // blob handle (what OP_AUTH wires) — match by
-                    // subject + latest_sig and mark the entry delivered
-                    // so the daemon's next tick skips it from the
-                    // re-dispatch set.
-                    use triblespace_core::inline::Inline;
-                    use triblespace_core::inline::encodings::hash::Handle;
-                    let subject_key = match ed25519_dalek::VerifyingKey::from_bytes(&subject) {
-                        Ok(k) => k,
-                        Err(_) => continue,
-                    };
-                    let sig_inline: Inline<Handle<SimpleArchive>> = Inline::new(sig_handle);
-                    let mut store = self.store.lock().expect("store mutex");
-                    match crate::policy::find_policy_entry_by_subject_and_sig(
-                        &mut *store,
-                        &self.signing_key,
-                        subject_key,
-                        sig_inline,
-                    ) {
-                        Ok(Some(entry_id)) => {
-                            match crate::policy::mark_policy_delivered(
-                                &mut *store,
-                                &self.signing_key,
-                                entry_id,
-                            ) {
-                                Ok(()) => tracing::debug!(
-                                    subject = %hex::encode(&subject[..4]),
-                                    sig = %hex::encode(&sig_handle[..4]),
-                                    entry = ?entry_id,
-                                    "delivery confirmed; policy acknowledgement recorded"
-                                ),
-                                Err(error) => tracing::warn!(
-                                    entry = ?entry_id,
-                                    %error,
-                                    "delivery confirmation policy write failed"
-                                ),
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            subject = %hex::encode(&subject[..4]),
-                            %error,
-                            "delivery confirmation policy lookup failed"
-                        ),
-                    }
-                }
-            }
+            let NetEvent::CollectionEvidence(evidence) = event;
+            incoming_collection_evidence.push(evidence);
         }
-
         // Gossip is a duplicate-delivery medium, while the pure preparation
         // boundary accepts only a canonical, strictly ordered batch. Reduce
         // the entire drain first, then mutate and flush the store once.
@@ -617,420 +467,6 @@ where
 
         // Pin heads remain local storage state. Collection evidence above is
         // the only semantic state published through gossip.
-    }
-
-    /// Persist an incoming join request: store the partial-cap blob,
-    /// then commit a request and observation to the private node-policy
-    /// collection. The request id becomes the value `team approve <id>`
-    /// consumes; the partial-cap blob is recoverable from the entity's
-    /// `request_partial_cap` handle.
-    fn absorb_cap_request(&mut self, requester: PublisherKey, partial_cap_bytes: anybytes::Bytes) {
-        use triblespace_core::blob::Blob;
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::inline::TryToInline;
-
-        // Reconstitute the requester pubkey from bytes. If the bytes
-        // aren't a valid ed25519 pubkey, drop on the floor — only
-        // iroh-verified peers reach this code path, so this is
-        // defensive only.
-        let Ok(requester_pubkey) = ed25519_dalek::VerifyingKey::from_bytes(&requester) else {
-            tracing::warn!(
-                requester = %hex::encode(&requester[..4]),
-                "CapRequest: bad requester pubkey; dropping"
-            );
-            return;
-        };
-
-        let mut store = self.store.lock().expect("store mutex");
-
-        // Store the partial cap blob so the approver can later read
-        // its declared subject/scope/expiry without B re-sending.
-        // partial_cap_bytes is already an anybytes::Bytes — wrap it
-        // into a typed Blob without re-allocating.
-        let blob: Blob<SimpleArchive> = Blob::new(partial_cap_bytes);
-        let Ok(partial_cap_handle) = store.put::<SimpleArchive, Blob<SimpleArchive>>(blob) else {
-            tracing::warn!("CapRequest: failed to store partial cap blob");
-            return;
-        };
-
-        // Point-interval at "now" — pending-requests timeline is
-        // just "this arrived at T".
-        let now = crate::clock::epoch_now();
-        let received_at = (now, now).try_to_inline().expect("point interval");
-
-        match crate::policy::record_pending_request(
-            &mut *store,
-            &self.signing_key,
-            requester_pubkey,
-            partial_cap_handle,
-            received_at,
-        ) {
-            Ok(req_id) => {
-                let req_id_bytes: [u8; 16] = req_id.into();
-                tracing::info!(
-                    requester = %hex::encode(&requester[..4]),
-                    request_id = %hex::encode(req_id_bytes),
-                    "CapRequest recorded as pending"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    requester = %hex::encode(&requester[..4]),
-                    %error,
-                    "CapRequest: failed to record in policy collection"
-                );
-            }
-        }
-    }
-
-    /// Verify a peer-delivered cap chain against our configured team
-    /// root and, on success, store both blobs locally.
-    ///
-    /// The current pair is recorded as a version in the signer-owned policy
-    /// collection, independently of public collection gossip.
-    fn absorb_cap_delivery(
-        &mut self,
-        issuer: PublisherKey,
-        cap_bytes: anybytes::Bytes,
-        sig_bytes: anybytes::Bytes,
-    ) {
-        use triblespace_core::blob::Blob;
-        use triblespace_core::repo::BlobStoreGet;
-
-        // Verification + bounded proof retrieval of missing chain blobs
-        // already happened in the host thread's HandshakeHandler
-        // (the OP_DELIVER_CAP path doesn't ack STATUS_OK until the
-        // chain verifies under our pubkey). The cap+sig blobs +
-        // every fetched parent have already arrived as earlier
-        // `NetEvent::Blob` events on this channel, so by the time
-        // we get here the store already holds them and we only
-        // need to append our team-cap version naming the leaf pair.
-        let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes);
-        let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes);
-        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-
-        let mut store = self.store.lock().expect("store mutex");
-
-        // Defensive sanity: the cap+sig blobs really are in the
-        // store. If not, the host emitted the CapDelivered event
-        // without the preceding Blob events somehow — log and bail
-        // rather than record handles that won't resolve.
-        let Ok(reader) = store.reader() else {
-            tracing::warn!(
-                issuer = %hex::encode(&issuer[..4]),
-                "CapDelivered: pile reader unavailable; dropping"
-            );
-            return;
-        };
-        if reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle)
-            .is_err()
-            || reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(sig_handle)
-                .is_err()
-        {
-            tracing::warn!(
-                issuer = %hex::encode(&issuer[..4]),
-                "CapDelivered: blobs missing from store (host should have emitted Blob events first)"
-            );
-            return;
-        }
-
-        match crate::policy::set_team_cap(
-            &mut *store,
-            &self.signing_key,
-            self.team_root,
-            cap_handle,
-            sig_handle,
-        ) {
-            Ok(()) => {
-                tracing::info!(
-                    issuer = %hex::encode(&issuer[..4]),
-                    sig = %hex::encode(&sig_handle.raw[..4]),
-                    "CapDelivered: stored in private policy collection"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    issuer = %hex::encode(&issuer[..4]),
-                    %error,
-                    "CapDelivered: team-cap policy write failed"
-                );
-            }
-        }
-    }
-
-    /// Cooldown for re-dispatching undelivered cap blobs. The daemon's
-    /// tick cadence is sub-second; without this gate we'd hammer
-    /// iroh-connect against a down peer 10× per second.
-    const UNDELIVERED_REDISPATCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
-
-    /// Re-dispatch the cap+sig pairs for every renewal-policy entry
-    /// that's not yet been ack'd by its subject, rate-limited per
-    /// entry via `last_dispatch_attempt`. The cap is NOT re-signed —
-    /// the same `(latest_cap, latest_sig)` blobs are sent again, so
-    /// idempotent on the receiver side (their OP_DELIVER_CAP handler
-    /// content-hashes the bytes and dedupes against what's already
-    /// pinned).
-    ///
-    /// Returns the count of entries dispatched this tick.
-    fn redispatch_undelivered(&mut self) -> usize {
-        use triblespace_core::blob::Blob;
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::repo::BlobStoreGet;
-
-        let mut store = self.store.lock().expect("store mutex");
-
-        let entries = match crate::policy::undelivered_entries(&mut *store, &self.signing_key) {
-            Ok(entries) => entries,
-            Err(error) => {
-                tracing::warn!(%error, "redispatch_undelivered: policy read failed");
-                return 0;
-            }
-        };
-        if entries.is_empty() {
-            return 0;
-        }
-
-        let now = crate::clock::mono_now();
-        let Ok(reader) = store.reader() else {
-            return 0;
-        };
-
-        let mut dispatched = 0usize;
-        for entry in entries {
-            // Per-entry cooldown.
-            if let Some(prev) = self.last_dispatch_attempt.get(&entry.id) {
-                if now.duration_since(*prev) < Self::UNDELIVERED_REDISPATCH_COOLDOWN {
-                    continue;
-                }
-            }
-
-            let Ok(cap_blob) = reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
-            else {
-                continue;
-            };
-            let Ok(sig_blob) = reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_sig)
-            else {
-                continue;
-            };
-
-            self.sender.deliver_cap(
-                entry.subject.to_bytes(),
-                cap_blob.bytes.clone(),
-                sig_blob.bytes.clone(),
-            );
-            self.last_dispatch_attempt.insert(entry.id, now);
-            dispatched += 1;
-            tracing::debug!(
-                subject = %hex::encode(entry.subject.to_bytes()),
-                entry = ?entry.id,
-                "redispatch_undelivered: re-sent OP_DELIVER_CAP"
-            );
-        }
-        dispatched
-    }
-
-    /// Run one tick of the auto-renewal scan.
-    ///
-    /// Performs two pieces of work each tick:
-    ///
-    /// 1. **Redispatch undelivered entries.** For each renewal-policy
-    ///    entry that's not yet been ack'd by its subject, re-send the
-    ///    same `(latest_cap, latest_sig)` blobs via
-    ///    `crate::channel::NetCommand::DeliverCap`, rate-limited per
-    ///    entry by `Self::UNDELIVERED_REDISPATCH_COOLDOWN`. This is
-    ///    what catches the case where the initial `team approve`
-    ///    delivery failed (subject offline) and the subject comes back
-    ///    later.
-    ///
-    /// 2. **Re-sign near-expiry entries.** For each entry whose current
-    ///    cap upper bound falls within `renewal_window` of now, sign a
-    ///    fresh cap+sig (using our team-cap as parent) and dispatch.
-    ///    The policy entry is updated in lockstep, which also clears
-    ///    any `delivered_at` so step (1) on the next tick picks the
-    ///    fresh cap up for re-confirmation.
-    ///
-    /// Returns the total count of dispatches this tick (undelivered
-    /// re-sends + fresh renewals). `0` on every tick after the swarm
-    /// settles into steady state means the daemon is quiet.
-    ///
-    /// Designed to be called from `trible pile net sync`'s main loop
-    /// alongside `refresh`. The 1-hour default window assumes a tick
-    /// cadence well under that; tune both together for production
-    /// deployments.
-    pub fn renewal_tick(&mut self, renewal_window: hifitime::Duration) -> usize {
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::blob::{Blob, TryFromBlob};
-        use triblespace_core::inline::encodings::hash::Handle;
-        use triblespace_core::inline::{Inline, TryToInline};
-        use triblespace_core::repo::BlobStoreGet;
-
-        let redispatched = self.redispatch_undelivered();
-
-        let mut store = self.store.lock().expect("store mutex");
-
-        let entries =
-            match crate::policy::renewable_within(&mut *store, &self.signing_key, renewal_window) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    tracing::warn!(%error, "renewal_tick: policy read failed");
-                    return redispatched;
-                }
-            };
-        if entries.is_empty() {
-            return redispatched;
-        }
-
-        // Our own current cap is the parent for every renewal. If
-        // we don't have one, we can't sign — log and bail.
-        let (parent_cap_handle, parent_sig_handle) =
-            match crate::policy::current_team_cap(&mut *store, &self.signing_key, self.team_root) {
-                Ok(Some(pair)) => pair,
-                Ok(None) => {
-                    tracing::warn!(
-                        renewable = entries.len(),
-                        "renewal_tick: no team cap stored; cannot issue successors"
-                    );
-                    return redispatched;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "renewal_tick: team-cap policy read failed");
-                    return redispatched;
-                }
-            };
-
-        let Ok(reader) = store.reader() else {
-            tracing::warn!("renewal_tick: pile reader unavailable");
-            return 0;
-        };
-        let Ok(parent_cap_blob) =
-            reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_cap_handle)
-        else {
-            tracing::warn!("renewal_tick: parent cap blob missing");
-            return 0;
-        };
-        let Ok(parent_sig_blob) =
-            reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_sig_handle)
-        else {
-            tracing::warn!("renewal_tick: parent sig blob missing");
-            return 0;
-        };
-
-        let mut dispatched = 0usize;
-        for entry in entries {
-            // Re-derive scope_facts from the previous cap blob —
-            // policy entries carry only the scope_root id, not the
-            // facts hanging off it.
-            let Ok(prev_cap_blob) =
-                reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
-            else {
-                tracing::warn!(
-                    entry = ?entry.id,
-                    "renewal_tick: previous cap blob missing; skipping entry"
-                );
-                continue;
-            };
-            let Ok(prev_set): Result<triblespace_core::trible::TribleSet, _> =
-                TryFromBlob::try_from_blob(prev_cap_blob)
-            else {
-                continue;
-            };
-            // Extract all tribles hanging off the scope_root entity.
-            // pattern!() over the cap blob restricted to entities
-            // whose entity-id == scope_root gives us the scope sub-graph.
-            let scope_facts = extract_scope_subgraph(&prev_set, entry.scope);
-
-            // Fresh expiry interval: [now, now + window * 2]. The
-            // factor-of-two is a heuristic — we want the cap to cover
-            // at least one more renewal cycle so missed ticks don't
-            // immediately break the chain.
-            let now = crate::clock::epoch_now();
-            let new_upper = now + renewal_window * 2;
-            let Ok(new_expiry) = (now, new_upper).try_to_inline() else {
-                continue;
-            };
-
-            // Sign.
-            let (new_cap, new_sig) = match triblespace_core::repo::capability::build_capability(
-                &self.signing_key,
-                entry.subject,
-                Some((parent_cap_blob.clone(), parent_sig_blob.clone())),
-                entry.scope,
-                scope_facts,
-                new_expiry,
-            ) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::warn!(
-                        entry = ?entry.id,
-                        error = ?e,
-                        "renewal_tick: build_capability failed; skipping"
-                    );
-                    continue;
-                }
-            };
-
-            let new_cap_handle: Inline<Handle<SimpleArchive>> = (&new_cap).get_handle();
-            let new_sig_handle: Inline<Handle<SimpleArchive>> = (&new_sig).get_handle();
-
-            // Persist locally — the next tick's policy update points
-            // at these handles; the dispatch ships the bytes. Both
-            // sites share the same refcounted `anybytes::Bytes`
-            // backing the freshly-signed blob (clones are refcount
-            // bumps, no byte-copy).
-            let cap_bytes = new_cap.bytes.clone();
-            let sig_bytes = new_sig.bytes.clone();
-            if let Err(error) = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_cap) {
-                tracing::warn!(
-                    entry = ?entry.id,
-                    ?error,
-                    "renewal_tick: failed to persist successor cap; not recording or dispatching"
-                );
-                continue;
-            }
-            if let Err(error) = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_sig) {
-                tracing::warn!(
-                    entry = ?entry.id,
-                    ?error,
-                    "renewal_tick: failed to persist successor signature; not recording or dispatching"
-                );
-                continue;
-            }
-
-            // Publish the successor before dispatch. A crash can leave an
-            // undelivered durable version (which the retry loop repairs), but
-            // can never deliver a credential that policy forgot to record.
-            match crate::policy::update_policy_entry(
-                &mut *store,
-                &self.signing_key,
-                entry.id,
-                new_expiry,
-                new_cap_handle,
-                new_sig_handle,
-            ) {
-                Ok(new_entry) => {
-                    self.sender
-                        .deliver_cap(entry.subject.to_bytes(), cap_bytes, sig_bytes);
-                    self.last_dispatch_attempt
-                        .insert(new_entry, crate::clock::mono_now());
-                    dispatched += 1;
-                    tracing::info!(
-                        subject = %hex::encode(entry.subject.to_bytes()),
-                        entry = ?new_entry,
-                        predecessor = ?entry.id,
-                        "renewal_tick: successor recorded and dispatched"
-                    );
-                }
-                Err(error) => tracing::warn!(
-                    entry = ?entry.id,
-                    %error,
-                    "renewal_tick: successor policy write failed; not dispatching"
-                ),
-            }
-        }
-        dispatched + redispatched
     }
 
     /// Lock and borrow the underlying store. Use for store-specific
@@ -1353,65 +789,15 @@ mod collection_gossip_tests {
     }
 
     #[test]
-    fn write_only_rejects_replication_data_but_keeps_capability_control() {
+    fn write_only_rejects_incoming_collection_evidence() {
         let author = SigningKey::from_bytes(&[10; 32]);
         let collection = collection(4);
         let evidence = commit(&author, collection, 1);
-        let bytes = Bytes::from(vec![1, 2, 3]);
-
-        let cases = [
-            (NetEvent::Blob(bytes.clone()), false),
-            (NetEvent::CollectionEvidence(evidence), false),
-            (
-                NetEvent::CapRequest {
-                    requester: [1; 32],
-                    partial_cap_bytes: bytes.clone(),
-                },
-                true,
-            ),
-            (
-                NetEvent::CapDelivered {
-                    issuer: [2; 32],
-                    cap_bytes: bytes.clone(),
-                    sig_bytes: bytes,
-                },
-                true,
-            ),
-            (
-                NetEvent::CapDeliveryConfirmed {
-                    subject: [3; 32],
-                    sig_handle: [4; 32],
-                },
-                true,
-            ),
-        ];
-
-        for (event, expected) in cases {
-            assert_eq!(
-                accepts_incoming_event(SyncDirection::WriteOnly, &event),
-                expected,
-                "unexpected WriteOnly policy for {event:?}"
-            );
-        }
+        let event = NetEvent::CollectionEvidence(evidence);
+        assert!(!accepts_incoming_event(SyncDirection::WriteOnly, &event));
+        assert!(accepts_incoming_event(SyncDirection::ReadOnly, &event));
+        assert!(accepts_incoming_event(SyncDirection::Bidirectional, &event));
     }
-}
-
-/// Extract every trible whose entity is `scope_root` from `set`,
-/// returning them as a fresh TribleSet. Used by `renewal_tick` to
-/// reconstruct the scope-facts argument to `build_capability` from
-/// the previous-cap blob — policy entries carry only the
-/// `scope_root` id, not the facts hanging off it.
-fn extract_scope_subgraph(
-    set: &triblespace_core::trible::TribleSet,
-    scope_root: triblespace_core::id::Id,
-) -> triblespace_core::trible::TribleSet {
-    let mut result = triblespace_core::trible::TribleSet::new();
-    for trible in set.iter() {
-        if *trible.e() == scope_root {
-            result.insert(trible);
-        }
-    }
-    result
 }
 
 /// The read view of a [`Peer`]: the store's own reader (`L`) plus a

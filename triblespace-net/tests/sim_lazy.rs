@@ -100,11 +100,10 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
         let root = key(0xE1);
         let server_key = key(0xA1);
         let client_key = key(0xB1);
-        let server_cap = admin_cap(&root, &server_key);
-        let client_cap = admin_cap(&root, &client_key);
-        let caps = [server_cap.clone(), client_cap.clone()];
-        let mut server_store = store_with_caps(&caps);
-        let mut client_store = store_with_caps(&caps);
+        let server_proof = connect_proof(&root, &server_key);
+        let client_proof = connect_proof(&root, &client_key);
+        let mut server_store = empty_store();
+        let mut client_store = empty_store();
 
         // Only the identity matters here; the descriptor is never stored.
         let descriptor = simplearchive_union::descriptor(
@@ -135,7 +134,7 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            server_proof.clone(),
             false,
         );
         let mut client = bring_up_with_peers(
@@ -143,7 +142,7 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
             &client_key,
             client_store,
             root.verifying_key(),
-            self_cap_of(&client_cap.1),
+            client_proof.clone(),
             false,
             vec![pk(&server_key)],
         );
@@ -214,16 +213,16 @@ fn fetch_blob_pulls_from_the_holder() {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0x42);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         // A announces its blobs to the DHT via refresh's diff-and-announce;
         // settle the mesh (neighbor-up + announce).
@@ -264,17 +263,17 @@ fn lazy_read_lands_wanted_in_store() {
         let ka = key(0xA2);
         let kb = key(0xB2);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0x55);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
         // B is a lazy node: no eager content.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -340,20 +339,20 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         let ka = key(0xA3);
         let kb = key(0xB3);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         // A holds three content blobs; B holds none.
         let blobs: Vec<(Blob<SimpleArchive>, [u8; 32])> =
             (0..3u8).map(|i| content_blob(0x60 + i)).collect();
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         for (b, _) in &blobs {
             store_a.put::<SimpleArchive, _>(b.clone()).unwrap();
         }
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -437,16 +436,16 @@ fn async_lazy_read_awaits_swarm_and_lands_wanted() {
         let ka = key(0xA4);
         let kb = key(0xB4);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0x77);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -505,16 +504,16 @@ fn transparent_async_get_fetches_through_reader() {
         let ka = key(0xA5);
         let kb = key(0xB5);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0x88);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -579,10 +578,10 @@ fn fetch_blob_unavailable_is_clean() {
         let root = key(0xF1);
         let ka = key(0xA1);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
+        let proof_a = connect_proof(&root, &ka);
 
-        let store_a = store_with_caps(&[cap_a.clone()]);
-        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let store_a = empty_store();
+        let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
 
         let (_blob, hash) = content_blob(0x99);
         // providers_for has a 3s internal DHT timeout; give the sim
@@ -621,20 +620,20 @@ fn lazy_fetch_uses_live_gossip_neighbor_without_dht() {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         // A holds an otherwise unadvertised content blob. With a black-hole
         // DHT, B can discover a route only from live gossip topology.
         let (orphan_blob, orphan_hash) = content_blob(0x32);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a
             .put::<SimpleArchive, _>(orphan_blob.clone())
             .unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         // Settle the gossip mesh so NeighborUp makes A a live routing
         // candidate at B. No application payload is gossiped.
@@ -677,10 +676,10 @@ fn fetch_deadline_bounds_unavailable_resolution() {
         let root = key(0xFB);
         let ka = key(0xAB);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
+        let proof_a = connect_proof(&root, &ka);
 
-        let store_a = store_with_caps(&[cap_a.clone()]);
-        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let store_a = empty_store();
+        let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
         let _ = net; // keep the sim alive for the fetch
 
         let (_blob, hash) = content_blob(0x9A);
@@ -716,16 +715,16 @@ fn lazy_read_unavailable_under_partition_then_heals() {
         let ka = key(0xA6);
         let kb = key(0xB6);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0xC1);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -775,16 +774,16 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         let ka = key(0xA7);
         let kb = key(0xB7);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0xC2);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -821,16 +820,16 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
         let ka = key(0xAC);
         let kb = key(0xBC);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0xCD);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -888,16 +887,16 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
             let ka = key(0xAA);
             let kb = key(0xBA);
             let team_root = root.verifying_key();
-            let cap_a = admin_cap(&root, &ka);
-            let cap_b = admin_cap(&root, &kb);
+            let proof_a = connect_proof(&root, &ka);
+            let proof_b = connect_proof(&root, &kb);
 
             let (blob, hash) = content_blob(0xAB);
-            let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+            let mut store_a = empty_store();
             store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-            let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+            let store_b = empty_store();
 
-            let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-            let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+            let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+            let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
             for _ in 0..40u32 {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -970,22 +969,20 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
         let kb = key(0xB9);
         let kc = key(0xC9);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
-        let cap_c = admin_cap(&root, &kc);
-        let all = [cap_a.clone(), cap_b.clone(), cap_c.clone()];
-
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
+        let proof_c = connect_proof(&root, &kc);
         let (blob, hash) = content_blob(0xFB);
         // A and C both hold the blob; B does not.
-        let mut store_a = store_with_caps(&all);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let mut store_c = store_with_caps(&all);
+        let mut store_c = empty_store();
         store_c.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&all);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_c = bring_up(&net, &kc, store_c, team_root, proof_c.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..50u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1025,16 +1022,16 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0x42);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1075,16 +1072,16 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         let ka = key(0xA8);
         let kb = key(0xB8);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0xCC);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1162,16 +1159,16 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         let (blob, hash) = content_blob(0x42);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1276,19 +1273,19 @@ fn reconcile_tick_services_out_of_band_want() {
         let ka = key(0xAD);
         let kb = key(0xBD);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
+        let proof_a = connect_proof(&root, &ka);
+        let proof_b = connect_proof(&root, &kb);
 
         // A holds the blob locally; B's reconciliation must not alter A's
         // independent want state.
         let (blob, hash) = content_blob(0x21);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let mut store_a = empty_store();
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
         // B: no gossip — a pure leecher; only the want-reconcile fetches.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), false);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), false);
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -1366,10 +1363,10 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let root = key(0xFE);
         let ka = key(0xAE);
         let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
+        let proof_a = connect_proof(&root, &ka);
 
-        let store_a = store_with_caps(&[cap_a.clone()]);
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let store_a = empty_store();
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
 
         // A want for content nobody holds (an arbitrary content id).
         let hash = *blake3::hash(b"nobody holds this blob").as_bytes();

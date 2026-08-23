@@ -9,18 +9,18 @@ use std::sync::{Arc, OnceLock};
 
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::Blob;
+use triblespace_core::authority::{
+    AuthorityGrant, AuthorityMode, AuthorityProof, AuthorityProofStep,
+};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::clock::{self, VirtualClock};
+use triblespace_core::collection::{CollectionCommit, empty_metadata_handle};
 use triblespace_core::id::rngid::seed_ids;
-use triblespace_core::inline::encodings::time::NsTAIInterval;
-use triblespace_core::inline::{Inline, TryToInline};
-use triblespace_core::repo::BlobStorePut;
-use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::protocol::ACTION_CONNECT;
 use triblespace_net::transport::sim::SimNet;
 
 /// One virtual clock per test process (install_virtual is
@@ -54,34 +54,26 @@ pub fn pk(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
-/// Sign a PERM_ADMIN root cap for `subject` and return (cap, sig)
-/// blobs — the out-of-band provisioning a team admin would do.
-pub fn admin_cap(
-    root: &SigningKey,
-    subject: &SigningKey,
-) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::ExclusiveId;
-    use triblespace_core::id::ufoid;
-    use triblespace_core::macros::entity;
-
-    let scope_root = *ufoid();
-    let scope_facts = TribleSet::from(entity! {
-        ExclusiveId::force_ref(&scope_root) @
-        triblespace_core::metadata::tag: PERM_ADMIN,
-    });
-    let now = clock::epoch_now();
-    let expiry: Inline<NsTAIInterval> = (now, now + hifitime::Duration::from_days(30.0))
-        .try_to_inline()
-        .expect("interval");
-    capability::build_capability(
-        root,
+/// Sign the one-step positive proof authorizing `subject` to CONNECT to the
+/// team rooted at `root`.
+pub fn connect_proof(root: &SigningKey, subject: &SigningKey) -> AuthorityProof {
+    let collection = triblespace_core::authority::collection(root.verifying_key());
+    let grant = AuthorityGrant::root(
         subject.verifying_key(),
-        None,
-        scope_root,
-        scope_facts,
-        expiry,
-    )
-    .expect("build cap")
+        collection,
+        ACTION_CONNECT,
+        AuthorityMode::Invoke,
+    );
+    let data: Blob<SimpleArchive> = grant.fragment().into_facts().to_blob();
+    let commit = CollectionCommit::sign(
+        root,
+        collection,
+        triblespace_core::inline::encodings::hash::Handle::<SimpleArchive>::to_hash(
+            data.get_handle(),
+        ),
+        empty_metadata_handle(),
+    );
+    AuthorityProof::new(vec![AuthorityProofStep::new(commit, data)])
 }
 
 /// A paused, single-thread tokio runtime + LocalSet runner — the
@@ -111,14 +103,14 @@ where
 
 /// Bring one node up on `net`: join the sim mesh, wire the host loop
 /// as a local task, return the `Peer<MemoryRepo>`. `store` is the
-/// node's pre-seeded local store (caps already inserted). `gossip`
-/// controls team-topic participation.
+/// node's pre-seeded local store. The CONNECT proof is sent inline and need
+/// not be resident in that store. `gossip` controls team-topic participation.
 pub fn bring_up(
     net: &SimNet,
     signing_key: &SigningKey,
     store: MemoryRepo,
     team_root: ed25519_dalek::VerifyingKey,
-    self_cap: [u8; 32],
+    connect_proof: AuthorityProof,
     gossip: bool,
 ) -> Peer<MemoryRepo> {
     bring_up_with_peers(
@@ -126,7 +118,7 @@ pub fn bring_up(
         signing_key,
         store,
         team_root,
-        self_cap,
+        connect_proof,
         gossip,
         Vec::new(),
     )
@@ -142,7 +134,7 @@ pub fn bring_up_with_peers(
     signing_key: &SigningKey,
     store: MemoryRepo,
     team_root: ed25519_dalek::VerifyingKey,
-    self_cap: [u8; 32],
+    connect_proof: AuthorityProof,
     gossip: bool,
     peers: Vec<[u8; 32]>,
 ) -> Peer<MemoryRepo> {
@@ -162,34 +154,15 @@ pub fn bring_up_with_peers(
                 .collect(),
             gossip,
             team_root,
-            self_cap,
+            connect_proof,
             direction: SyncDirection::Bidirectional,
         },
         wiring,
     ));
-    Peer::with_wiring(
-        store,
-        signing_key.clone(),
-        SyncDirection::Bidirectional,
-        team_root,
-        sender,
-        receiver,
-    )
+    Peer::with_wiring(store, SyncDirection::Bidirectional, sender, receiver)
 }
 
-/// A MemoryRepo seeded with the given cap+sig blobs (so OP_AUTH
-/// verifies locally without a chain swarm-fetch).
-pub fn store_with_caps(caps: &[(Blob<SimpleArchive>, Blob<SimpleArchive>)]) -> MemoryRepo {
-    let mut store = MemoryRepo::default();
-    for (cap, sig) in caps {
-        store.put::<SimpleArchive, _>(cap.clone()).unwrap();
-        store.put::<SimpleArchive, _>(sig.clone()).unwrap();
-    }
-    store
-}
-
-/// Convenience: the `self_cap` handle (sig blob hash) for a (cap, sig)
-/// pair.
-pub fn self_cap_of(sig: &Blob<SimpleArchive>) -> [u8; 32] {
-    sig.get_handle().raw
+/// An empty store intentionally independent of CONNECT proof residency.
+pub fn empty_store() -> MemoryRepo {
+    MemoryRepo::default()
 }
