@@ -1,13 +1,8 @@
 //! Auto-trait and resumable-state regressions for the ordinary query iterator.
 
-use std::rc::Rc;
-use std::sync::Mutex;
-
 use triblespace::core::inline::encodings::iu256::U256BE;
 use triblespace::core::query::{Query, VariableContext};
 use triblespace::prelude::*;
-
-fn assert_send<T: Send>(_: T) {}
 
 /// The manual `Query::clone` bound must stay independent of `R: Clone` after
 /// the residual cursor has started.
