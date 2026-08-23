@@ -13,6 +13,8 @@ compile_error!("triblespace-rs requires a 64-bit little-endian target");
 /// Shared structural attributes for signed records and attestations.
 pub mod attestation;
 pub mod attribute;
+/// Positive signed authority grants and their enumerable fixed-point resolver.
+pub mod authority;
 /// Blob storage, schemas, and conversion traits.
 pub mod blob;
 /// Attribute definition and usage metadata.
