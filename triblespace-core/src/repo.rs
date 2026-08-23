@@ -449,22 +449,20 @@ pub trait BlobChildren: BlobStoreGet {
 /// A point-in-time snapshot of (pin id → head) mappings.
 ///
 /// PATCH keyed by 16-byte pin id, valued by the pinned head's handle.
-/// Cloning is O(1) (refcount bump), so this is the right primitive for
-/// handing pin state across threads or into long-lived serving views.
+/// This type exists only for explicit legacy pile migration and diagnosis;
+/// current serving paths use collection records directly.
 ///
 /// Returned by [`PinSnapshotSource::snapshot_pin_heads`].
 pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 
 /// Observational access to one point-in-time snapshot of pin heads.
 ///
-/// Consumers can inspect legacy pin state without gaining piecemeal access or
-/// compare-and-swap mutation. The returned snapshot remains fully inspectable.
-/// The mutable receiver permits stores such as
+/// Explicit migration and diagnosis tools can inspect legacy pile state
+/// without regaining piecemeal access or compare-and-swap mutation. The
+/// returned snapshot remains fully inspectable. The mutable receiver permits
 /// [`crate::repo::pile::Pile`] to refresh externally appended records before
-/// producing the snapshot; the capability itself is read-only.
-///
-/// Implementations opt in explicitly. Concrete stores and composition wrappers
-/// may forward this narrow capability without exposing any legacy mutation.
+/// producing the snapshot; the capability itself is read-only and is not
+/// forwarded by current storage composition wrappers.
 ///
 /// Implementations must return a complete snapshot or an error. Listing or
 /// per-head failures must never be hidden by returning a partial view.
@@ -478,48 +476,14 @@ pub trait PinSnapshotSource {
 
 #[cfg(test)]
 mod pin_snapshot_source_tests {
-    use std::convert::Infallible;
-
-    use super::{PinSnapshot, PinSnapshotSource};
-    use crate::repo::hybridstore::HybridStore;
-    use crate::repo::lazy::Lazy;
-    use crate::repo::memoryrepo::MemoryRepo;
+    use super::PinSnapshotSource;
     use crate::repo::pile::Pile;
-    use crate::repo::yard::Yard;
 
     fn assert_source<T: PinSnapshotSource>() {}
 
     #[test]
-    fn concrete_stores_and_composition_wrappers_opt_in_explicitly() {
+    fn only_pile_exposes_legacy_pin_inspection() {
         assert_source::<Pile>();
-        assert_source::<MemoryRepo>();
-        assert_source::<Yard>();
-        assert_source::<HybridStore<(), MemoryRepo>>();
-        assert_source::<Lazy<MemoryRepo>>();
-    }
-
-    struct SnapshotOnly(PinSnapshot);
-
-    impl PinSnapshotSource for SnapshotOnly {
-        type PinSnapshotError = Infallible;
-
-        fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
-            Ok(self.0.clone())
-        }
-    }
-
-    #[test]
-    fn hybrid_snapshot_forwarding_does_not_require_mutable_pin_access() {
-        let expected = PinSnapshot::new();
-        let mut store = HybridStore::new((), SnapshotOnly(expected.clone()));
-        assert_eq!(store.snapshot_pin_heads().unwrap(), expected);
-    }
-
-    #[test]
-    fn lazy_snapshot_forwarding_does_not_require_other_store_capabilities() {
-        let expected = PinSnapshot::new();
-        let mut store = Lazy::new(SnapshotOnly(expected.clone()));
-        assert_eq!(store.snapshot_pin_heads().unwrap(), expected);
     }
 }
 

@@ -32,7 +32,7 @@ use super::pile::{
 };
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    PinSnapshotSource, RetentionRoots, StorageClose, TransferError, WantRequest, WantStore,
+    RetentionRoots, StorageClose, TransferError, WantRequest, WantStore,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -776,94 +776,6 @@ impl CollectionStore for Yard {
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.generations[0].active_mut().pile_mut().insert(record)
-    }
-}
-
-/// Failure to produce one unambiguous legacy pin snapshot from a yard.
-#[derive(Debug)]
-pub enum YardPinSnapshotError {
-    /// A generation pile could not refresh its legacy record projection.
-    Read {
-        /// Young-to-old generation index.
-        level: usize,
-        /// Segment index within the generation.
-        segment: usize,
-        /// Underlying pile read failure.
-        source: ReadError,
-    },
-    /// Legacy pin heads appeared outside the active young segment.
-    ///
-    /// Per-pile snapshots intentionally omit tombstones, so combining final
-    /// projections from multiple logs could resurrect an older head. Refuse
-    /// that ambiguous shape rather than inventing cross-file LWW order.
-    OutsideActiveSegment {
-        /// Young-to-old generation index.
-        level: usize,
-        /// Segment index within the generation.
-        segment: usize,
-    },
-}
-
-impl fmt::Display for YardPinSnapshotError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read {
-                level,
-                segment,
-                source,
-            } => write!(
-                formatter,
-                "failed to read legacy pins from yard generation {level} segment {segment}: {source}"
-            ),
-            Self::OutsideActiveSegment { level, segment } => write!(
-                formatter,
-                "legacy pins outside active yard segment at generation {level} segment {segment}"
-            ),
-        }
-    }
-}
-
-impl Error for YardPinSnapshotError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Read { source, .. } => Some(source),
-            Self::OutsideActiveSegment { .. } => None,
-        }
-    }
-}
-
-impl PinSnapshotSource for Yard {
-    type PinSnapshotError = YardPinSnapshotError;
-
-    fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
-        let active_segment = self.generations[0].segments.len() - 1;
-        let snapshot = self.generations[0].segments[active_segment]
-            .pile_mut()
-            .snapshot_pin_heads()
-            .map_err(|source| YardPinSnapshotError::Read {
-                level: 0,
-                segment: active_segment,
-                source,
-            })?;
-
-        for (level, generation) in self.generations.iter_mut().enumerate() {
-            for (segment, storage) in generation.segments.iter_mut().enumerate() {
-                if level == 0 && segment == active_segment {
-                    continue;
-                }
-                let pins = storage.pile_mut().snapshot_pin_heads().map_err(|source| {
-                    YardPinSnapshotError::Read {
-                        level,
-                        segment,
-                        source,
-                    }
-                })?;
-                if !pins.is_empty() {
-                    return Err(YardPinSnapshotError::OutsideActiveSegment { level, segment });
-                }
-            }
-        }
-        Ok(snapshot)
     }
 }
 

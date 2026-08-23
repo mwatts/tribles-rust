@@ -10,15 +10,15 @@
 //!   `OP_REQUEST_CAP` (subject → issuer)
 //!     subject sends a partial cap blob (subject + scope + expiry it
 //!     wants). issuer responds with an ACK byte and closes. issuer then
-//!     either: (a) auto-approves via its renewal-policy branch and
+//!     either: (a) auto-approves via its private policy collection and
 //!     dispatches `OP_DELIVER_CAP` in the daemon's next tick, or
 //!     (b) queues the request for human approval — when the human
 //!     approves, the daemon dispatches `OP_DELIVER_CAP`.
 //!
 //!   `OP_DELIVER_CAP` (issuer → subject)
 //!     issuer ships the signed (cap, sig) bytes. subject ACKs and
-//!     closes. subject verifies + pins the cap into its team-cap
-//!     branch.
+//!     closes. subject verifies the cap and records it in its private
+//!     policy collection.
 //!
 //! Connection-level pubkey auth (iroh's QUIC TLS) is enough: A knows
 //! K_B from `connection.remote_id()`, B knows K_A from the dial

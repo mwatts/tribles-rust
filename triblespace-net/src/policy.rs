@@ -14,8 +14,8 @@
 //! gossip marker and [`Peer`](crate::peer::Peer) deliberately does not expose a
 //! `CollectionStore` implementation. Content-addressed capability blobs may be
 //! advertised by the ordinary blob layer, but the signed collection records
-//! that confer policy membership are not branch heads and are not announced as
-//! policy.
+//! that confer policy membership are not announced as public collection
+//! evidence.
 
 use std::collections::{BTreeMap, BTreeSet};
 use triblespace_core::collection::reach;

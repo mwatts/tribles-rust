@@ -98,8 +98,8 @@ use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
 };
 use super::{
-    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinSnapshotSource,
-    StorageFlush, WantRequest, WantStore,
+    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, StorageFlush, WantRequest,
+    WantStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -412,17 +412,6 @@ where
     }
 }
 
-impl<S> PinSnapshotSource for Lazy<S>
-where
-    S: PinSnapshotSource,
-{
-    type PinSnapshotError = S::PinSnapshotError;
-
-    fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
-        self.store.lock().expect("store mutex").snapshot_pin_heads()
-    }
-}
-
 impl<S> CollectionStore for Lazy<S>
 where
     S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
@@ -462,7 +451,7 @@ where
     S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     type WantError = S::WantError;
-    // Collected eagerly, same rationale as `pins`.
+    // Collected eagerly so the store lock is not held across iteration.
     type WantIter<'a>
         = std::vec::IntoIter<Result<WantRequest, S::WantError>>
     where

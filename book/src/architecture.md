@@ -199,6 +199,5 @@ merge/derive questions. In every case convergence means unioning evidence; it
 does not mean electing a winner.
 
 Legacy branch and pin records remain decodable only so old piles can be
-inspected, conservatively retained, authorized through an immutable
-`PinSnapshot`, and explicitly migrated. They are not part of the current
-publication model.
+inspected, conservatively retained, and explicitly migrated. They are not part
+of the current publication or authorization model.

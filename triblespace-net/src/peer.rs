@@ -16,15 +16,14 @@
 //!   evidence without fetching its referenced blobs; semantic trust belongs to
 //!   later collection resolution.
 //! - **Blob writes** delegate to the inner store and announce content to the
-//!   DHT. A read-only [`PinSnapshotSource`] supplies the pin-head view still
-//!   used by branch-restricted capability checks; pins are not replicated
-//!   state and `Peer` exposes no pin mutation API.
+//!   DHT. Team capabilities authorize blob reads; collection descriptors and
+//!   WANTs independently govern publication and local demand.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
 //! and any tiering (bounded want retention, generational eviction) lives
 //! in `S` — e.g. a [`Yard`](triblespace_core::repo::yard::Yard). Read-miss
 //! swarm fetches land in `S` under a **want** ([`WantStore`]),
-//! independently of named pins and private policy collections. The want is
+//! independently of private policy collections. The want is
 //! recorded durably *before* the fetch — asserted AND
 //! flushed ([`StorageFlush`]), so the marker survives an immediate
 //! process exit — the demand IS the want-signal (a sync daemon's work
@@ -35,8 +34,8 @@
 //! ([`PeerReaderGetError::WantRecord`] /
 //! [`Peer::get_or_fetch_async`]'s `Err`) instead of proceeding — the
 //! caller never observes a fetch whose demand isn't durably recorded.
-//! "Promote to durable" is not an operation — durability is
-//! reachability from strong pins; the Peer performs no promotion.
+//! "Promote to durable" is not an operation; the Peer performs no hidden
+//! publication or retention transition.
 //!
 //! Collection discovery is gossip-driven: immutable grant+commit evidence
 //! floods the team topic and arrives through `NetEvent`. Referenced content
@@ -59,7 +58,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    PinSnapshotSource, StorageFlush, WantRequest, WantStore,
+    StorageFlush, WantRequest, WantStore,
 };
 
 use crate::channel::{NetEvent, PublisherKey};
@@ -187,14 +186,7 @@ fn accepts_incoming_event(direction: SyncDirection, event: &NetEvent) -> bool {
 /// ```
 pub struct Peer<S>
 where
-    S: BlobStore
-        + BlobStorePut
-        + CollectionStore
-        + PinSnapshotSource
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
+    S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
     S::Reader: BlobStoreMeta,
 {
     /// The wrapped store, shared behind a mutex: a `&self` async read on
@@ -251,14 +243,7 @@ where
 
 impl<S> Peer<S>
 where
-    S: BlobStore
-        + BlobStorePut
-        + CollectionStore
-        + PinSnapshotSource
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
+    S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
     S::Reader: BlobStoreMeta,
 {
     /// Wrap a store in a Peer. Spawns the iroh network thread
@@ -702,7 +687,7 @@ where
     /// root and, on success, store both blobs locally.
     ///
     /// The current pair is recorded as a version in the signer-owned policy
-    /// collection, independently of branch authority or gossip permission.
+    /// collection, independently of public collection gossip.
     fn absorb_cap_delivery(
         &mut self,
         issuer: PublisherKey,
@@ -712,7 +697,7 @@ where
         use triblespace_core::blob::Blob;
         use triblespace_core::repo::BlobStoreGet;
 
-        // Verification + swarm-fetch of any missing chain blobs
+        // Verification + bounded proof retrieval of missing chain blobs
         // already happened in the host thread's HandshakeHandler
         // (the OP_DELIVER_CAP path doesn't ack STATUS_OK until the
         // chain verifies under our pubkey). The cap+sig blobs +
@@ -730,7 +715,7 @@ where
         // Defensive sanity: the cap+sig blobs really are in the
         // store. If not, the host emitted the CapDelivered event
         // without the preceding Blob events somehow — log and bail
-        // rather than pin handles that won't resolve.
+        // rather than record handles that won't resolve.
         let Ok(reader) = store.reader() else {
             tracing::warn!(
                 issuer = %hex::encode(&issuer[..4]),
@@ -1053,10 +1038,9 @@ where
     /// `Pile::flush`, `Yard::collect`, `WantStore::wants`).
     ///
     /// Writes through this borrow bypass the Peer's auto-publish and serving
-    /// snapshot. In particular, after changing a pin used by branch-restricted
-    /// authorization, drop the guard and call [`refresh`](Self::refresh) before
-    /// treating a pin revocation as effective. Don't hold the guard across
-    /// calls back into the Peer — its own methods take the same lock.
+    /// snapshot. Drop the guard and call [`refresh`](Self::refresh) after
+    /// store-specific writes. Don't hold the guard across calls back into the
+    /// Peer — its own methods take the same lock.
     pub fn store(&self) -> MutexGuard<'_, S> {
         self.store.lock().expect("store mutex")
     }
@@ -1165,20 +1149,11 @@ where
 //
 // Reads call `refresh()` first so they always see the latest collection
 // evidence and any external blob writes get announced. Blob writes delegate
-// to the inner store and then publish the new state. Local pin changes made
-// explicitly through `Peer::store()` enter the branch-restricted capability
-// view on the next `Peer::refresh()` and are never gossiped.
+// to the inner store and then publish the new state.
 
 impl<S> BlobStorePut for Peer<S>
 where
-    S: BlobStore
-        + BlobStorePut
-        + CollectionStore
-        + PinSnapshotSource
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
+    S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
     S::Reader: BlobStoreMeta,
 {
     type PutError = S::PutError;
@@ -1208,14 +1183,7 @@ where
 
 impl<S> BlobStore for Peer<S>
 where
-    S: BlobStore
-        + BlobStorePut
-        + CollectionStore
-        + PinSnapshotSource
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
+    S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
     S::Reader: BlobStoreMeta,
 {
     type Reader = PeerReader<S::Reader>;

@@ -10,7 +10,6 @@ use crate::blob::MemoryBlobStore;
 use crate::collection::store::selectors_match_record;
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::prelude::*;
-use crate::repo::{PinSnapshot, PinSnapshotSource};
 use crate::repo::{WantRequest, WantStore};
 
 use crate::inline::encodings::hash::Handle;
@@ -24,8 +23,6 @@ use crate::inline::InlineEncoding;
 pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
-    /// Read-only legacy pin state, retained only for snapshot composition.
-    legacy_pins: PinSnapshot,
     /// LWW-resolved typed requests (see [`WantStore`]). In memory the
     /// last-writer-wins resolution is just insert/remove. Wants here are
     /// exactly as ephemeral as the blobs themselves — the trait is a
@@ -118,14 +115,6 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
         }
         self.blobs
             .keep(handles.into_iter().chain(roots.expanded(&reader)));
-    }
-}
-
-impl PinSnapshotSource for MemoryRepo {
-    type PinSnapshotError = Infallible;
-
-    fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
-        Ok(self.legacy_pins.clone())
     }
 }
 

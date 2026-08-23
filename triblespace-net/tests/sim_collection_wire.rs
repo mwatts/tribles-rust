@@ -16,10 +16,8 @@ use triblespace_core::collection::{
     Collection, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
     CollectionRecord, CollectionStore, VerifyingKey, simplearchive_union,
 };
-use triblespace_core::inline::encodings::time::NsTAIInterval;
-use triblespace_core::inline::{Inline, TryToInline};
+use triblespace_core::inline::Inline;
 use triblespace_core::repo::WantRequest;
-use triblespace_core::repo::capability::{self, PERM_READ, scope_branch};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, WantStore};
 use triblespace_core::trible::Fragment as DescriptorFragment;
@@ -61,38 +59,6 @@ fn archive(byte: u8) -> Blob<SimpleArchive> {
 
 fn data(byte: u8) -> CollectionData {
     Inline::new([byte; 32])
-}
-
-fn branch_restricted_read_cap(
-    root: &SigningKey,
-    subject: &SigningKey,
-) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::{ExclusiveId, ufoid};
-    use triblespace_core::macros::entity;
-
-    let scope_root = *ufoid();
-    let branch = *ufoid();
-    let mut scope_facts = TribleSet::from(entity! {
-        ExclusiveId::force_ref(&scope_root) @
-        triblespace_core::metadata::tag: PERM_READ,
-    });
-    scope_facts += TribleSet::from(entity! {
-        ExclusiveId::force_ref(&scope_root) @
-        scope_branch: branch,
-    });
-    let now = triblespace_core::clock::epoch_now();
-    let expiry: Inline<NsTAIInterval> = (now, now + hifitime::Duration::from_days(30.0))
-        .try_to_inline()
-        .unwrap();
-    capability::build_capability(
-        root,
-        subject.verifying_key(),
-        None,
-        scope_root,
-        scope_facts,
-        expiry,
-    )
-    .unwrap()
 }
 
 #[test]
@@ -194,6 +160,64 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
     });
 }
 
+/// Two siblings provisioned with only their own private credential chains can
+/// still establish the first authenticated connection. The server obtains the
+/// client's exact proof over the one-shot pre-auth operation; no shared cap
+/// cache, gossip, or DHT fallback masks the bootstrap.
+#[test]
+fn sibling_members_bootstrap_with_disjoint_private_cap_stores() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011EC9, async {
+        let root = key(0xF9);
+        let server_key = key(0xA9);
+        let client_key = key(0xB9);
+        let (server_cap, server_sig) = admin_cap(&root, &server_key);
+        let (client_cap, client_sig) = admin_cap(&root, &client_key);
+
+        let mut server_store = store_with_caps(&[(server_cap.clone(), server_sig.clone())]);
+        let client_store = store_with_caps(&[(client_cap, client_sig.clone())]);
+        let descriptor = named_root("sibling-bootstrap");
+        let mut collection = Collection::new(
+            &mut server_store,
+            &collection_name("sibling-bootstrap"),
+            test_team(),
+            server_key.clone(),
+            reach::public(),
+        );
+        let commit = collection.commit(Fragment::empty()).unwrap();
+
+        let net = SimNet::new(
+            0xC011EC9,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let _server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            root.verifying_key(),
+            self_cap_of(&server_sig),
+            false,
+        );
+        let client = bring_up(
+            &net,
+            &client_key,
+            client_store,
+            root.verifying_key(),
+            self_cap_of(&client_sig),
+            false,
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let (_client, fetched) =
+            fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor))
+                .await;
+        assert_eq!(fetched, vec![commit]);
+    });
+}
+
 /// A collection that declares no reach serves nothing, to anyone.
 ///
 /// This used to be "omits commits without author grants": a commit was
@@ -261,51 +285,6 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
             fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor))
                 .await;
         assert!(fetched.is_empty());
-    });
-}
-
-#[test]
-fn branch_restricted_capability_cannot_enumerate_collections() {
-    let _guard = common::sim_guard();
-    run_paused(0xC011EC9, async {
-        let root = key(0xF2);
-        let server_key = key(0xA2);
-        let client_key = key(0xB2);
-        let (server_cap, server_sig) = admin_cap(&root, &server_key);
-        let (client_cap, client_sig) = branch_restricted_read_cap(&root, &client_key);
-        let server_store = store_with_caps(&[
-            (server_cap.clone(), server_sig.clone()),
-            (client_cap.clone(), client_sig.clone()),
-        ]);
-        let client_store = store_with_caps(&[
-            (server_cap, server_sig.clone()),
-            (client_cap, client_sig.clone()),
-        ]);
-
-        let net = SimNet::new(0xC011EC9, SimConfig::default());
-        let _server = bring_up(
-            &net,
-            &server_key,
-            server_store,
-            root.verifying_key(),
-            self_cap_of(&server_sig),
-            false,
-        );
-        let client = bring_up(
-            &net,
-            &client_key,
-            client_store,
-            root.verifying_key(),
-            self_cap_of(&client_sig),
-            false,
-        );
-        SimNet::step(&vclock(), Duration::from_millis(1)).await;
-
-        let collection = collection_of(&named_root("c5"));
-        let (_client, result) =
-            fetch_evidence_result_while_stepping(client, pk(&server_key), collection).await;
-        let error = result.unwrap_err();
-        assert!(error.to_string().contains("unrestricted read"));
     });
 }
 
@@ -691,78 +670,6 @@ fn configured_peer_probe_keeps_partial_evidence_and_recovers_conflict_after_stal
         assert!(
             recovered.complete,
             "after recovery every configured peer completed and the conflict is visible"
-        );
-    });
-}
-
-#[test]
-fn branch_restricted_capability_receives_no_operation_receipts() {
-    let _guard = common::sim_guard();
-    run_paused(0xC011ECC, async {
-        let root = key(0xF5);
-        let server_key = key(0xA5);
-        let client_key = key(0xB5);
-        let control_key = key(0xC5);
-        let server_cap = admin_cap(&root, &server_key);
-        let client_cap = branch_restricted_read_cap(&root, &client_key);
-        let control_cap = admin_cap(&root, &control_key);
-        let all_caps = [server_cap.clone(), client_cap.clone(), control_cap.clone()];
-        let mut server_store = store_with_caps(&all_caps);
-        let client_store = store_with_caps(&all_caps);
-        let control_store = store_with_caps(&all_caps);
-
-        let descriptor = named_root("c23");
-        let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
-        let receipt = CollectionRecord::Merge(CollectionMerge::new(
-            collection_of(&descriptor),
-            data(1),
-            data(2),
-            data(3),
-        ));
-        server_store.insert(receipt).unwrap();
-
-        let net = SimNet::new(0xC011ECC, SimConfig::default());
-        let _server = bring_up(
-            &net,
-            &server_key,
-            server_store,
-            root.verifying_key(),
-            self_cap_of(&server_cap.1),
-            false,
-        );
-        let client = bring_up_with_peers(
-            &net,
-            &client_key,
-            client_store,
-            root.verifying_key(),
-            self_cap_of(&client_cap.1),
-            false,
-            vec![pk(&server_key)],
-        );
-        let control = bring_up_with_peers(
-            &net,
-            &control_key,
-            control_store,
-            root.verifying_key(),
-            self_cap_of(&control_cap.1),
-            false,
-            vec![pk(&server_key)],
-        );
-        SimNet::step(&vclock(), Duration::from_millis(1)).await;
-
-        assert_eq!(
-            probe_operation_while_stepping(&control, request)
-                .await
-                .receipts,
-            vec![receipt],
-            "the same route serves an unrestricted reader"
-        );
-        assert!(
-            probe_operation_while_stepping(&client, request)
-                .await
-                .receipts
-                .is_empty(),
-            "the server's rejection is intentionally exposed as no receipts by the Peer probe"
         );
     });
 }

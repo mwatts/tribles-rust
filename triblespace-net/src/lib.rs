@@ -4,8 +4,9 @@
 //! iroh network thread internally and exposes the standard storage traits.
 //! Reads auto-drain immutable collection evidence; writes announce blobs to
 //! the DHT and publish commits whose collection descriptor declares that the
-//! collection travels. Local pins remain only as one input to
-//! capability-scoped blob serving.
+//! collection travels. Team capabilities authorize reads; collection
+//! descriptors and WANTs govern what evidence travels and which content a
+//! node retains.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 

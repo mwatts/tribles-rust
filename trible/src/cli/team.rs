@@ -70,11 +70,6 @@ pub enum Command {
         /// Scope to grant. Must be a subset of the issuer's own scope.
         #[arg(long, value_enum, default_value = "read")]
         scope: ScopeArg,
-        /// Restrict the cap to specific branches (hex branch ids,
-        /// 32-char). Repeatable. Without this flag the cap applies
-        /// to every branch within the granted permission set.
-        #[arg(long = "branch", value_name = "BRANCH_HEX")]
-        branches: Vec<String>,
     },
     /// List capabilities stored in the local pile.
     List {
@@ -231,8 +226,7 @@ pub fn run(cmd: Command) -> Result<()> {
             key,
             invitee,
             scope,
-            branches,
-        } => run_invite(pile, team_root, cap, key, invitee, scope, branches),
+        } => run_invite(pile, team_root, cap, key, invitee, scope),
         Command::List { pile } => run_list(pile),
         Command::ListPending { pile, key } => run_list_pending(pile, key),
         Command::ListIssued { pile, key } => run_list_issued(pile, key),
@@ -477,24 +471,11 @@ fn run_invite(
     key: Option<PathBuf>,
     invitee_hex: String,
     scope: ScopeArg,
-    branches_hex: Vec<String>,
 ) -> Result<()> {
     let issuer_key = load_existing_signing_key(key, &pile_path)?;
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
     let invitee = parse_pubkey_hex(&invitee_hex)?;
-    let branches: Vec<Id> = branches_hex
-        .iter()
-        .map(|h| {
-            let bytes: [u8; 16] = hex::decode(h.trim())
-                .map_err(|e| anyhow!("--branch decode '{h}': {e}"))?
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("--branch '{h}' must be 16 bytes (32 hex chars)"))?;
-            Id::new(bytes).ok_or_else(|| anyhow!("--branch '{h}' is the all-zeros nil id"))
-        })
-        .collect::<Result<_>>()?;
-
     let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
         // Verify the issuer's cap chain first — we don't sign
         // delegations off invalid/expired caps. This also confirms
@@ -521,25 +502,15 @@ fn run_invite(
 
         let (parent_cap_blob, parent_sig_blob) = fetch_cap_blob_pair(pile, issuer_cap_sig_handle)?;
 
-        // Build the invitee's scope: a permission tag plus zero or
-        // more `scope_branch` restrictions. Caller is responsible for
-        // ensuring the requested branch set is a subset of the
-        // issuer's own scope; verify_chain rejects the issued cap
-        // chain at use time if not (the relay's scope_subsumes check
-        // catches it).
+        // Build the invitee's team permission scope. `verify_chain` rejects
+        // the issued cap at use time if it exceeds the issuer's permission.
         let scope_root = *triblespace_core::id::ufoid();
         use triblespace_core::id::ExclusiveId;
         use triblespace_core::macros::entity;
-        let mut scope_facts = TribleSet::from(entity! {
+        let scope_facts = TribleSet::from(entity! {
             ExclusiveId::force_ref(&scope_root) @
             triblespace_core::metadata::tag: scope.perm_id(),
         });
-        for branch in &branches {
-            scope_facts += TribleSet::from(entity! {
-                ExclusiveId::force_ref(&scope_root) @
-                capability::scope_branch: *branch,
-            });
-        }
 
         let expiry = now_plus_30_days();
         let (cap_blob, sig_blob) = capability::build_capability(
@@ -601,7 +572,6 @@ struct CapSummary {
     subject: VerifyingKey,
     issuer: VerifyingKey,
     perms: Vec<Id>,
-    branches: Vec<Id>,
     expires_at: Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
 }
 
@@ -661,10 +631,8 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 Err(_) => continue,
             };
 
-            // Each cap blob has exactly one entity carrying these
-            // attributes (the cap itself); embedded parent sigs are
-            // sub-entities with `signed_by`/`signature_*` and don't
-            // match this shape.
+            // Each cap blob has exactly one entity carrying these attributes;
+            // recursive parent proofs live in the separate sig blob.
             for (_e, subject, issuer, scope_root, expires_at) in find!(
                 (
                     e: Id,
@@ -681,11 +649,9 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                     triblespace_core::metadata::expires_at: ?exp,
                 }])
             ) {
-                // Walk the scope sub-graph for permission tags AND any
-                // `scope_branch` restrictions. A scope can carry zero or
-                // more of either; a malformed cap with no perms surfaces
-                // as an empty list rather than breaking the whole
-                // listing.
+                // Walk the scope sub-graph for permission tags. A malformed
+                // cap with no permission surfaces as an empty list rather
+                // than breaking the whole audit listing.
                 let perms: Vec<Id> = find!(
                     (perm: Id),
                     pattern!(&set, [{
@@ -694,19 +660,10 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 )
                 .map(|(p,)| p)
                 .collect();
-                let branches: Vec<Id> = find!(
-                    (b: Id),
-                    pattern!(&set, [{
-                        scope_root @ capability::scope_branch: ?b
-                    }])
-                )
-                .map(|(b,)| b)
-                .collect();
                 caps.push(CapSummary {
                     subject,
                     issuer,
                     perms,
-                    branches,
                     expires_at: Some(expires_at),
                 });
             }
@@ -740,20 +697,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("|")
             };
-            let branch_str = if cap.branches.is_empty() {
-                String::new()
-            } else {
-                let mut bs: Vec<String> = cap
-                    .branches
-                    .iter()
-                    .map(|b| {
-                        let bytes: [u8; 16] = (*b).into();
-                        hex::encode(bytes)
-                    })
-                    .collect();
-                bs.sort();
-                format!(", branches=[{}]", bs.join(","))
-            };
             let expiry_str = cap
                 .expires_at
                 .as_ref()
@@ -761,7 +704,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 .unwrap_or_else(|| "<no expiry>".to_string());
             println!("    issuer:  {}", hex::encode(cap.issuer.to_bytes()),);
             println!("    subject: {}", hex::encode(cap.subject.to_bytes()),);
-            println!("    scope:   {perm_str}{branch_str}");
+            println!("    scope:   {perm_str}");
             println!("    expires: {expiry_str}");
             println!();
         }
@@ -870,32 +813,10 @@ fn run_show(
             )
             .map(|(p,)| p)
             .collect();
-            let branches: Vec<Id> = find!(
-                (b: Id),
-                pattern!(&cap_set, [{
-                    scope_root @ capability::scope_branch: ?b
-                }])
-            )
-            .map(|(b,)| b)
-            .collect();
-
             let perm_str = if perms.is_empty() {
                 "no perms".to_string()
             } else {
                 perms.iter().map(perm_label).collect::<Vec<_>>().join("|")
-            };
-            let branch_str = if branches.is_empty() {
-                String::new()
-            } else {
-                let mut bs: Vec<String> = branches
-                    .iter()
-                    .map(|b| {
-                        let bytes: [u8; 16] = (*b).into();
-                        hex::encode(bytes)
-                    })
-                    .collect();
-                bs.sort();
-                format!(", branches=[{}]", bs.join(","))
             };
             let signer_matches_issuer = if signer == issuer {
                 "✓"
@@ -906,7 +827,7 @@ fn run_show(
             println!("level {depth}:");
             println!("  issuer:   {}", hex::encode(issuer.to_bytes()));
             println!("  subject:  {}", hex::encode(subject.to_bytes()));
-            println!("  scope:    {perm_str}{branch_str}");
+            println!("  scope:    {perm_str}");
             println!("  expires:  {}", format_expiry(&expiry));
             println!("  cap blob: {}", hex::encode(cap_handle.raw));
             println!("  signer matches cap_issuer: {signer_matches_issuer}");
@@ -1061,8 +982,8 @@ fn run_show(
 
 // ── Descriptive-caps subcommands (decide#4b59ce27) ─────────────────────
 
-/// Print the pending join requests recorded on the local pending-
-/// requests branch. Each line shows the entry id (for `team approve`),
+/// Print the pending join requests recorded in the local policy
+/// collection. Each line shows the entry id (for `team approve`),
 /// requester pubkey, partial-cap handle, received-at instant, and
 /// status tag.
 fn run_list_pending(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {

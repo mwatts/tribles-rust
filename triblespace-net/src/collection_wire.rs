@@ -481,7 +481,7 @@ pub async fn op_collection_evidence<C: Conn>(
     let count = recv_u32_be(&mut recv).await?;
     if count == COLLECTION_EVIDENCE_REJECTED {
         return Err(anyhow::anyhow!(
-            "server rejected collection evidence request: unrestricted read capability required"
+            "server rejected collection evidence request: team read capability required"
         ));
     }
     if count > MAX_COLLECTION_EVIDENCE_ITEMS {

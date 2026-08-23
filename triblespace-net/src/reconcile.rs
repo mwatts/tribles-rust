@@ -6,10 +6,9 @@
 //! to the shared pile out-of-band; a long-running sync daemon
 //! (`trible pile net sync`) services that queue.
 //!
-//! Wants are independent from legacy named pins. The reconciler never changes
-//! legacy pin state. Blob demand becomes
-//! cache-retention interest after bytes land; operation wants are fulfilled by
-//! native collection records and never become blob roots.
+//! Blob demand becomes cache-retention interest after bytes land; operation
+//! wants are fulfilled by native collection records and never become hidden
+//! publication state.
 //! - **"Absent" is always "not obtained yet", never definitely-absent**
 //!   — existence is semidecidable. A want that can't be satisfied stays
 //!   pending and is retried with backoff; it is NOT an error and NOT
@@ -26,8 +25,7 @@ use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{CollectionRecord, CollectionStore};
 use triblespace_core::repo::{
-    BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, PinSnapshotSource, StorageFlush,
-    WantRequest, WantStore,
+    BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, StorageFlush, WantRequest, WantStore,
 };
 
 use crate::peer::Peer;
@@ -156,14 +154,7 @@ impl Reconciler {
     /// reachable, never an error.
     pub async fn tick<S>(&mut self, peer: &mut Peer<S>) -> ReconcileStats
     where
-        S: BlobStore
-            + BlobStorePut
-            + CollectionStore
-            + PinSnapshotSource
-            + WantStore
-            + StorageFlush
-            + Send
-            + 'static,
+        S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
         S::Reader: BlobStoreMeta,
     {
         let mut stats = ReconcileStats::default();
@@ -427,8 +418,7 @@ impl Reconciler {
                     // Land the verified bytes (fetch_blob hash-checked
                     // them) and cross the same durability barrier as
                     // collection receipts before reporting fulfillment. The
-                    // demand marker remains on record and retains the blob;
-                    // no pin state changes here.
+                    // demand marker remains on record and retains the blob.
                     let landing = {
                         let mut store = peer.store();
                         match store.put::<UnknownBlob, Bytes>(Bytes::from(bytes)) {

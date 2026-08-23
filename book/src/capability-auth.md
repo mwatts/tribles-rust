@@ -2,10 +2,11 @@
 
 The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
 crate ships a chain-of-trust capability system on top of iroh's
-TLS-verified peer identities. Every connection on the
-`/triblespace/pile-sync/5` ALPN must present a capability before any
-other op is served. This chapter explains the team model, the CLI
-lifecycle, and the two-tier scope gate the relay enforces.
+TLS-verified peer identities. Every ordinary data connection on the
+`/triblespace/pile-sync/5` ALPN must present a capability before data ops are
+served; a bounded one-shot proof connection bootstraps that authentication.
+This chapter explains the team model, the CLI lifecycle, and the team
+permission gate the relay enforces.
 
 For the design rationale (single team root vs multi-root web-of-trust,
 sign-the-bytes convention, embedded parent sig optimisation), see the
@@ -40,10 +41,10 @@ Signatures attest to the cap blob's canonical bytes, not to a hash of those
 bytes, keeping them hash-agnostic across any future change to the handle
 scheme.
 
-Non-root caps embed their parent's signature inline as a sub-entity
-within the cap blob (`cap_embedded_parent_sig`). This halves cold-cache
-verification fetch counts: at chain depth N, the verifier needs N+1
-blobs instead of 2N+1.
+For a delegated chain, the leaf sig blob carries the recursive parent proof:
+`sig_parent_cap` names the parent cap and `sig_embedded_parent_proof` links to
+the embedded parent signature entity. This halves cold-cache verification
+fetch counts: at chain depth N, the verifier needs N+1 blobs instead of 2N+1.
 
 ## Team Lifecycle (CLI)
 
@@ -61,7 +62,6 @@ trible team create --pile PATH [--key KEY_PATH]
 
 trible team invite --pile PATH --team-root HEX --cap HEX --key ISSUER
                    --invitee HEX --scope (read|write|admin)
-                   [--branch HEX]...
     Issue a sub-capability to another peer. ISSUER must hold a cap
     that subsumes the requested scope. The invitee's pubkey appears
     on its own (use `trible pile net identity` on the invitee's
@@ -167,17 +167,24 @@ Protocol v5 (`/triblespace/pile-sync/5`) makes auth mandatory:
 | `OP_AUTH` | 0x05 | Present a capability sig handle |
 | `OP_COLLECTION_EVIDENCE` | 0x06 | Fetch relayable commits for one collection |
 | `OP_COLLECTION_OPERATION_RECEIPTS` | 0x07 | Fetch exact merge/derive receipts |
+| `OP_CAPABILITY_PROOF` | 0x08 | One-shot bounded retrieval of one complete validated credential proof |
 
-The **first stream** on every connection must be `OP_AUTH`. The server
-fetches the referenced sig blob, walks back to the team root through
-embedded parent sigs and `cap_parent` handles, and either accepts
+The first stream on an ordinary connection must be `OP_AUTH`. The server
+fetches the referenced sig blob, walks back to the team root through embedded
+parent proofs and `sig_parent_cap` handles, and either accepts
 (`AUTH_OK = 0x00`) or rejects (`AUTH_REJECTED = 0x01`). Subsequent
-streams on the same connection inherit that verified capability for
-the lifetime of the connection — there's no per-stream re-auth.
+streams on the same connection reuse that verified capability without a
+second handshake, but the server rechecks the earliest expiry in the chain on
+every operation. Expired cached authority is cleared immediately.
 
-Streams sent before OP_AUTH or after AUTH_REJECTED are silently
-closed. The server doesn't leak a "you sent the wrong thing" error
-back to the client.
+`OP_CAPABILITY_PROOF` is the only pre-auth exception. It returns only the
+bounded artifacts reached by a full locally verified chain, then closes the
+connection. A requester may supply already received, hash-checked leaf
+artifacts (notably during capability delivery); these are merely untrusted
+lookup input to the same full verifier. This breaks circular first contact
+between sibling members without opening ordinary blob reads before
+authentication. Other streams sent before OP_AUTH or after AUTH_REJECTED are
+silently closed.
 
 ## Scope Gate
 
@@ -185,34 +192,14 @@ Capabilities encode their scope as tribles hung off `cap_scope_root`:
 
 - One or more `metadata::tag: PERM_*` triples granting permissions
   (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`).
-- Zero or more legacy `scope_branch: <branch_id>` triples restricting raw blob
-  reachability to an immutable pin snapshot. An empty restriction set means
-  unrestricted scope for that permission.
 
-The relay applies those legacy restrictions only to blob reachability. There is
-no wire operation that lists or mutates pin state, and new collection
-publication does not create pins.
-
-### Blob level (`OP_GET_BLOB`, `OP_CHILDREN`)
-
-A peer with a restricted legacy scope could otherwise circumvent the gate by
-guessing or probing raw blob hashes outside its retained graph. The blob-level
-gate closes that hole: a hash is in scope only if it is reachable (via 32-byte
-child chunks) from at least one granted head in the immutable `PinSnapshot`.
-Out-of-scope blobs surface as `None` (length =
-`u64::MAX`) on `OP_GET_BLOB`; `OP_CHILDREN` filters its returned list
-to in-scope hashes only.
-
-Unrestricted caps (`granted_branches() == None` — no `scope_branch` tribles)
-short-circuit to "every present blob is in scope." Collection-evidence and
-operation-receipt enumeration currently require unrestricted read authority;
-collection-scoped capabilities remain future work.
-
-Permission semantics mirror `scope_subsumes`: `PERM_WRITE` and
-`PERM_ADMIN` imply `PERM_READ`; `PERM_ADMIN` is required to delegate
-sub-capabilities. The reachability scan is recomputed per request
-today; per-stream caching is a future optimisation for
-chain-walk-heavy workloads.
+Permission semantics mirror `scope_subsumes` and form an attenuating order:
+read may delegate read, write may delegate write or read, and admin may
+delegate any supported permission. `PERM_WRITE` and `PERM_ADMIN` imply
+`PERM_READ`. All read protocol operations require a read-equivalent team
+permission. A scope with unknown permission tags or non-permission facts is
+rejected, so a capability from the retired branch-scoped model fails closed
+rather than silently widening to team-wide access.
 
 ## Eviction
 

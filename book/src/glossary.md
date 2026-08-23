@@ -34,10 +34,10 @@ Each capability is two `SimpleArchive` blobs: a `cap` blob carrying
 `cap_subject` (the pubkey it authorises), `cap_issuer`, `cap_scope_root`, and
 `metadata::expires_at`; and a `sig` blob whose `sig_signs` points at the cap
 blob's handle and carries the issuer's `signed_by` + `signature_r/s`. Caps chain
-off the team root (or off another cap with admin scope) and verify by walking
-back to the configured `team_root`. Holders present the sig blob's handle on
-connection (`OP_AUTH`); the relay enforces the verified scope on every
-subsequent op. See the [Capability Auth](capability-auth.md) chapter.
+off the team root (or off another cap while attenuating its permission) and
+verify by walking back to the configured `team_root`. Holders present the sig
+blob's handle on connection (`OP_AUTH`); the relay enforces the verified scope
+on every subsequent op. See the [Capability Auth](capability-auth.md) chapter.
 
 ### Commit
 A signed native collection membership assertion. A `CollectionCommit` names
@@ -143,13 +143,10 @@ referencing those blobs stay portable. The corresponding traits are
 ### Scope
 The set of permissions a [Capability](#capability) grants. Output as tribles
 hung off the cap's `cap_scope_root` entity: one or more `metadata::tag: PERM_*`
-triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`) optionally combined with
-legacy `scope_branch: <branch_id>` triples that restrict blob reachability to
-the immutable heads visible in a `PinSnapshot`. An empty restriction set grants
-the permission without that legacy filter. Native collection enumeration
-currently requires unrestricted read authority. Sub-capabilities must have a
+triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`). Sub-capabilities must have a
 scope no broader than their parent; `scope_subsumes` enforces this during the
-chain walk.
+chain walk. Unknown tags or non-permission facts make a scope invalid rather
+than introducing an ambient resource namespace.
 
 ### Team Root
 The single immutable keypair that anchors a triblespace network's

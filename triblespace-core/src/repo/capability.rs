@@ -22,12 +22,12 @@
 //!
 //! Scope is encoded as tribles inside the cap blob, anchored at
 //! `cap_scope_root`. Permissions are tagged via `metadata::tag` linking
-//! to constants like `PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`. Optional
-//! per-resource restrictions like `scope_branch` narrow a permission to a
-//! specific branch.
+//! to constants like `PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`. Capabilities
+//! authorize participation in one team; collection reach and content demand
+//! remain properties of collection descriptors and WANTs respectively.
 //!
-//! (Names like `cap_scope_root`, `metadata::tag`, `scope_branch`, and
-//! `PERM_*` are spelled in plain code formatting rather than as
+//! (Names like `cap_scope_root`, `metadata::tag`, and `PERM_*` are spelled in
+//! plain code formatting rather than as
 //! intra-doc links because the macro-generated attribute items and
 //! the `id_hex!`-defined constants don't reliably resolve as
 //! rustdoc link targets from a `//!` block.)
@@ -42,7 +42,9 @@ use crate::id_hex;
 pub const PERM_READ: Id = id_hex!("A75EED8224A553DD8002576E2E8A6823");
 /// Tag indicating a scope grants write access on the resources in scope.
 pub const PERM_WRITE: Id = id_hex!("C56AAF4191DD4FBB9F197B79435B881D");
-/// Tag indicating a scope grants admin (delegation) authority.
+/// Tag indicating the top team permission. Admin holders may delegate any
+/// supported permission; read and write holders may still delegate scopes no
+/// stronger than their own.
 pub const PERM_ADMIN: Id = id_hex!("EC68A0CBF9EF421F59A0A69ED80FD79F");
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -62,21 +64,15 @@ triblespace_core_macros::attributes! {
     /// issuer mismatch without an extra fetch.
     "2E9CD97ED0698FAF18EAEB74B5893685" unsafe as pub cap_issuer: ed::ED25519PublicKey;
     /// Entity id within the cap blob anchoring the scope tribles. The
-    /// scope sub-graph hanging off this id encodes which permissions
-    /// (and optionally which resources) the capability grants.
+    /// scope sub-graph hanging off this id encodes which permissions the
+    /// capability grants.
     "1A7DD2026BEFBE55A354CE10839CFDD6" unsafe as pub cap_scope_root: GenId;
-    // Note: chain references (cap_parent, embedded parent sig) live in
+    // Note: chain references (`sig_parent_cap`, embedded parent proof) live in
     // the sig blob, not the cap blob. A cap blob is a pure declaration
     // of (subject, issuer, scope, expiry) — independent of which
     // authority chain endorses it. See sig_parent_cap below.
 
     // ── Scope ─────────────────────────────────────────────────────────
-    /// Optional restriction of a permission to a specific branch.
-    /// Repeated when a permission applies to multiple branches; absent
-    /// when the permission is unrestricted (applies to every branch
-    /// the holder is otherwise authorised on).
-    "46246789D627C1B0F81B21418E179DFD" unsafe as pub scope_branch: GenId;
-
     // ── Sig blob ──────────────────────────────────────────────────────
     /// Handle of the cap blob this signature attests to. The signature
     /// itself is over the cap blob's canonical bytes (i.e.
@@ -138,35 +134,37 @@ pub enum BuildError {
     /// The provided parent signature blob did not contain exactly one
     /// signature entity (i.e. exactly one entity carrying [`sig_signs`]).
     ParentSigShape,
+    /// The scope root did not carry exactly the supported permission-tag
+    /// vocabulary. Resource restrictions from the retired branch model are
+    /// deliberately not accepted as team capabilities.
+    MalformedScope,
 }
 
 /// Build a capability link.
 ///
 /// Returns the pair `(cap_blob, sig_blob)`:
-/// - `cap_blob` carries the claim (subject pubkey, scope, expiry, parent
-///   pointer, embedded parent signature). Its content-addressed handle is
-///   what the sig blob attests to.
+/// - `cap_blob` carries only the claim (subject pubkey, issuer, scope, and
+///   expiry). Its content-addressed handle is what the sig blob attests to.
 /// - `sig_blob` carries the issuer's signature over `cap_blob.bytes` plus
-///   the issuer's pubkey, alongside a `sig_signs` handle pointing at the
-///   cap blob.
+///   the issuer's pubkey, alongside a `sig_signs` handle pointing at the cap
+///   blob and, for delegated capabilities, the recursive parent proof.
 ///
 /// `parent = None` constructs a root-issued capability: the issuer is
-/// expected to be the team root keypair, and the resulting cap has no
-/// `cap_parent` and no embedded parent signature. Verification terminates
-/// at this link when the issuer pubkey matches the team root.
+/// expected to be the team root keypair, and the resulting sig blob has no
+/// `sig_parent_cap` or embedded parent proof. Verification terminates at this
+/// link when the issuer pubkey matches the team root.
 ///
 /// `parent = Some((parent_cap, parent_sig))` constructs a delegated
-/// capability: the parent's signature is embedded inline in the new cap
+/// capability: the parent's signature is embedded inline in the new sig
 /// blob (via [`sig_embedded_parent_proof`] pointing at a sub-entity carrying
 /// `signed_by` + `signature_r` + `signature_s` reusing the existing
 /// commit-signature attribute conventions) so verifiers can walk one level
 /// up the chain without a separate fetch for the parent's signature.
 ///
-/// `scope_facts` should be a TribleSet anchored at `scope_root` describing
-/// the capability's scope (permission tags via [`crate::metadata::tag`],
-/// optional resource restrictions via [`scope_branch`], etc.). The caller
-/// is responsible for producing a scope that's a subset of any parent
-/// scope; this builder does not enforce subsumption.
+/// `scope_facts` should be a TribleSet anchored at `scope_root` containing one
+/// or more supported permission tags via [`crate::metadata::tag`]. The caller
+/// is responsible for producing a scope that's a subset of any parent scope;
+/// this builder does not enforce subsumption.
 ///
 /// # Example
 ///
@@ -187,7 +185,7 @@ pub enum BuildError {
 /// let team_root = SigningKey::generate(&mut OsRng);
 /// let founder = SigningKey::generate(&mut OsRng);
 ///
-/// // PERM_READ scope, no branch restriction (read-everything cap).
+/// // Team-wide PERM_READ scope.
 /// let scope_root = ufoid();
 /// let scope_facts: TribleSet = entity! {
 ///     ExclusiveId::force_ref(&scope_root) @
@@ -237,6 +235,10 @@ pub fn build_capability(
 
     let mut cap_set = TribleSet::from(cap_fragment);
     cap_set += scope_facts;
+
+    if collect_permissions(&cap_set, scope_root).is_none() {
+        return Err(BuildError::MalformedScope);
+    }
 
     let cap_blob: Blob<SimpleArchive> = cap_set.to_blob();
     let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
@@ -317,12 +319,17 @@ fn issuer_subject_value(key: VerifyingKey) -> Inline<ed::ED25519PublicKey> {
 
 // ── Scope subsumption ────────────────────────────────────────────────
 
-/// Collect the permission tag ids and branch restrictions from a scope
-/// sub-graph anchored at `scope_root`.
-fn collect_scope_facts(
+/// Validate and collect the permissions anchored at `scope_root`.
+///
+/// A current team scope consists only of one or more `metadata::tag` facts
+/// whose values are members of the closed `PERM_*` vocabulary. Counting all
+/// facts on the scope root as well as querying the tags is deliberate: an old
+/// `scope_branch` fact (or an unknown future restriction) makes the scope
+/// invalid instead of silently widening it to team-wide access.
+fn collect_permissions(
     set: &TribleSet,
     scope_root: crate::id::Id,
-) -> (HashSet<crate::id::Id>, HashSet<crate::id::Id>) {
+) -> Option<HashSet<crate::id::Id>> {
     let perms: HashSet<crate::id::Id> = find!(
         (perm: crate::id::Id),
         pattern!(set, [{ scope_root @ crate::metadata::tag: ?perm }])
@@ -330,39 +337,41 @@ fn collect_scope_facts(
     .map(|(p,)| p)
     .collect();
 
-    let branches: HashSet<crate::id::Id> = find!(
-        (branch: crate::id::Id),
-        pattern!(set, [{ scope_root @ scope_branch: ?branch }])
-    )
-    .map(|(b,)| b)
-    .collect();
-
-    (perms, branches)
+    let scope_fact_count = set
+        .iter()
+        .filter(|trible| *trible.e() == scope_root)
+        .count();
+    if perms.is_empty()
+        || scope_fact_count != perms.len()
+        || perms
+            .iter()
+            .any(|perm| !matches!(*perm, PERM_READ | PERM_WRITE | PERM_ADMIN))
+    {
+        return None;
+    }
+    Some(perms)
 }
 
 /// Check whether a parent scope authorises a child scope.
 ///
 /// Rules:
 /// - If parent grants `PERM_ADMIN`, parent subsumes every child scope.
-/// - Otherwise: every permission tag in the child must be in the
-///   parent's set (with `PERM_WRITE` implying `PERM_READ` for upgrade
-///   compatibility, but an explicit `PERM_READ`-only parent does *not*
-///   imply `PERM_WRITE` for the child).
-/// - Branch restriction: an empty `scope_branch` set means "all
-///   branches"; a non-empty set restricts the scope to those branches.
-///   The child's restriction set must be a subset of the parent's
-///   (where empty parent = all branches allowed).
-///
-/// Unknown permission tags in the child cause subsumption to fail
-/// closed.
+/// - Otherwise: read may delegate read, while write may delegate write or
+///   read. Neither may delegate admin.
+/// Unknown permissions and any non-permission facts on either scope root cause
+/// subsumption to fail closed.
 pub fn scope_subsumes(
     parent_set: &TribleSet,
     parent_scope_root: crate::id::Id,
     child_set: &TribleSet,
     child_scope_root: crate::id::Id,
 ) -> bool {
-    let (parent_perms, parent_branches) = collect_scope_facts(parent_set, parent_scope_root);
-    let (child_perms, child_branches) = collect_scope_facts(child_set, child_scope_root);
+    let Some(parent_perms) = collect_permissions(parent_set, parent_scope_root) else {
+        return false;
+    };
+    let Some(child_perms) = collect_permissions(child_set, child_scope_root) else {
+        return false;
+    };
 
     if parent_perms.contains(&PERM_ADMIN) {
         return true;
@@ -387,18 +396,6 @@ pub fn scope_subsumes(
         }
     }
 
-    // Branch restriction subsumption.
-    if !parent_branches.is_empty() {
-        if child_branches.is_empty() {
-            return false;
-        }
-        for b in &child_branches {
-            if !parent_branches.contains(b) {
-                return false;
-            }
-        }
-    }
-
     true
 }
 
@@ -418,6 +415,9 @@ pub enum VerifyError {
     /// Fetching a referenced blob (cap or sig) from the caller-supplied
     /// fetch function failed.
     Fetch,
+    /// The fetch function returned bytes whose content handle did not match
+    /// the exact handle requested by the signed proof.
+    BlobHandleMismatch,
     /// A signature failed to verify against the expected pubkey + cap
     /// blob bytes.
     BadSignature,
@@ -427,16 +427,20 @@ pub enum VerifyError {
     /// A cap's `cap_issuer` did not match the accompanying sig's
     /// `signed_by`.
     IssuerMismatch,
+    /// A child capability was not issued by the subject authorized by its
+    /// claimed parent capability.
+    DelegationSubjectMismatch,
     /// A cap or one of its parent caps has expired.
     Expired,
     /// A child cap's scope was not a subset of its parent's scope.
-    /// (Enforcement deferred to the scope-subsumption module — for now
-    /// this variant is reserved for future use.)
     ScopeNotSubset,
     /// A cap blob is missing required attributes (e.g. cap_subject,
     /// cap_issuer, cap_scope_root, expires_at) or has multiple
     /// conflicting values.
     MalformedCap,
+    /// A scope root is empty, contains an unknown permission, or carries a
+    /// resource restriction from an unsupported authorization model.
+    MalformedScope,
     /// A sig blob is missing required attributes or has multiple
     /// conflicting values.
     MalformedSig,
@@ -461,123 +465,51 @@ impl From<UnarchiveError> for VerifyError {
 /// A successfully verified leaf capability.
 ///
 /// Returned by [`verify_chain`] on a successful walk back to the
-/// configured `team_root`. Carries the leaf cap's full `TribleSet` so
+/// configured `team_root`. Carries the validated leaf permission set so
 /// callers can ask:
 ///
 /// - [`permissions`](Self::permissions) — which `PERM_*` tags are
 ///   hung on the scope root
-/// - [`granted_branches`](Self::granted_branches) — `Some(set)` if the
-///   cap restricts itself to specific branches, or `None` if it's
-///   unrestricted within its permission set
 /// - [`grants_read`](Self::grants_read) — convenience for "any read-
 ///   equivalent permission" (write/admin imply read)
-/// - [`grants_read_on`](Self::grants_read_on) — combines the two:
-///   read-permission AND (unrestricted OR branch-in-scope)
-///
-/// # Example
-///
-/// Build a `VerifiedCapability` directly (skipping `verify_chain` —
-/// the helpers operate on `cap_set` shape, not on the chain proof,
-/// so a hand-crafted instance suffices for testing scope predicates):
-///
-/// ```rust
-/// use std::collections::HashSet;
-/// use triblespace_core::id::{ufoid, ExclusiveId, Id};
-/// use triblespace_core::macros::entity;
-/// use triblespace_core::trible::TribleSet;
-/// use triblespace_core::repo::capability::{
-///     scope_branch, VerifiedCapability, PERM_READ,
-/// };
-/// use ed25519_dalek::SigningKey;
-/// use rand::rngs::OsRng;
-///
-/// let scope_root = ufoid();
-/// let allowed_branch = ufoid();
-/// // PERM_READ scope, restricted to one branch.
-/// let mut cap_set = TribleSet::new();
-/// cap_set += TribleSet::from(entity! {
-///     ExclusiveId::force_ref(&scope_root) @
-///     triblespace_core::metadata::tag: PERM_READ,
-/// });
-/// cap_set += TribleSet::from(entity! {
-///     ExclusiveId::force_ref(&scope_root) @
-///     scope_branch: *allowed_branch,
-/// });
-///
-/// let verified = VerifiedCapability {
-///     subject: SigningKey::generate(&mut OsRng).verifying_key(),
-///     scope_root: *scope_root,
-///     cap_set,
-/// };
-///
-/// // permissions() exposes the raw tag set.
-/// let perms = verified.permissions();
-/// assert_eq!(perms.len(), 1);
-/// assert!(perms.contains(&PERM_READ));
-///
-/// // granted_branches() returns Some(set) for restricted caps.
-/// let branches = verified.granted_branches().expect("restricted");
-/// assert!(branches.contains(&*allowed_branch));
-///
-/// // grants_read() short-circuits to "any read-equivalent perm".
-/// assert!(verified.grants_read());
-///
-/// // grants_read_on() composes both checks.
-/// assert!(verified.grants_read_on(&*allowed_branch));
-/// let other_branch: Id = *ufoid();
-/// assert!(!verified.grants_read_on(&other_branch));
-/// ```
 #[derive(Debug, Clone)]
 pub struct VerifiedCapability {
     /// The subject pubkey the leaf cap authorizes.
     pub subject: VerifyingKey,
     /// The scope root entity id within the leaf cap blob.
     pub scope_root: crate::id::Id,
-    /// The leaf cap's full TribleSet (caller can extract its scope by
-    /// querying tribles anchored at `scope_root`).
-    pub cap_set: TribleSet,
+    permissions: HashSet<crate::id::Id>,
+    valid_until: Epoch,
 }
 
 impl VerifiedCapability {
     /// Returns the set of permissions tagged on this cap's scope root
     /// (a subset of `{`[`PERM_READ`]`,`[`PERM_WRITE`]`,`[`PERM_ADMIN`]`}`).
     pub fn permissions(&self) -> HashSet<crate::id::Id> {
-        let (perms, _) = collect_scope_facts(&self.cap_set, self.scope_root);
-        perms
-    }
-
-    /// Returns `Some(set)` if the cap restricts itself to a specific
-    /// non-empty set of branches, or `None` if the cap is unrestricted
-    /// (i.e. applies to every branch within the granted permission set).
-    pub fn granted_branches(&self) -> Option<HashSet<crate::id::Id>> {
-        let (_, branches) = collect_scope_facts(&self.cap_set, self.scope_root);
-        if branches.is_empty() {
-            None
-        } else {
-            Some(branches)
-        }
+        self.permissions.clone()
     }
 
     /// Returns `true` if the cap grants any read-equivalent permission
     /// (read, write, or admin — write/admin imply read, matching the
     /// subsumption rules in [`scope_subsumes`]).
     pub fn grants_read(&self) -> bool {
-        let perms = self.permissions();
-        perms.contains(&PERM_READ) || perms.contains(&PERM_WRITE) || perms.contains(&PERM_ADMIN)
+        self.permissions.contains(&PERM_READ)
+            || self.permissions.contains(&PERM_WRITE)
+            || self.permissions.contains(&PERM_ADMIN)
     }
 
-    /// Returns `true` if the cap grants read-equivalent permission on
-    /// the given branch — i.e. the cap [`grants_read`](Self::grants_read)
-    /// AND either is unrestricted or its restriction set contains
-    /// `branch`.
-    pub fn grants_read_on(&self, branch: &crate::id::Id) -> bool {
-        if !self.grants_read() {
-            return false;
-        }
-        match self.granted_branches() {
-            None => true,
-            Some(set) => set.contains(branch),
-        }
+    /// Returns `true` while every link in the verified chain remains within
+    /// its signed validity interval.
+    pub fn is_current(&self) -> bool {
+        self.is_valid_at(crate::clock::epoch_now())
+    }
+
+    /// Check the chain's cached validity bound at an explicit instant.
+    ///
+    /// This is primarily useful to deterministic runtimes; serving code should
+    /// normally call [`is_current`](Self::is_current) for every operation.
+    pub fn is_valid_at(&self, now: Epoch) -> bool {
+        now <= self.valid_until
     }
 }
 
@@ -641,7 +573,7 @@ struct CapFields {
 /// `expected_subject` to act with the leaf cap's scope.
 ///
 /// `fetch_blob` is called to retrieve any cap blob referenced by a
-/// `cap_parent` handle during chain walk. The leaf sig and leaf cap
+/// `sig_parent_cap` handle during chain walk. The leaf sig and leaf cap
 /// blobs are also looked up via `fetch_blob`, given the
 /// `leaf_sig_handle`.
 ///
@@ -740,15 +672,13 @@ where
     // expiry-during-partition) are deterministically scriptable.
     let now: Epoch = crate::clock::epoch_now();
 
-    // Helper: a cap is valid until the *upper bound* of its expiry
-    // interval. We compare that upper bound against `now`.
-    let is_expired = |expiry: &Inline<NsTAIInterval>| -> bool {
-        match <(Epoch, Epoch)>::try_from_inline(expiry) {
-            Ok((_lower, upper)) => upper < now,
-            // A malformed/inverted interval is treated as expired so
-            // adversarial caps can't fall through.
-            Err(_) => true,
-        }
+    // A cap is valid through the upper bound of its expiry interval. Invalid
+    // intervals fail closed, and the verified result retains the earliest
+    // upper bound across the entire chain for per-operation rechecks.
+    let expiry_upper = |expiry: &Inline<NsTAIInterval>| {
+        <(Epoch, Epoch)>::try_from_inline(expiry)
+            .ok()
+            .map(|(_lower, upper)| upper)
     };
 
     // ── Leaf step ────────────────────────────────────────────────────
@@ -759,6 +689,9 @@ where
     // (sig_parent_cap + sig_embedded_parent_proof, each linking to the
     // next level's signer/signature/parent).
     let leaf_sig_blob = fetch_blob(leaf_sig_handle).ok_or(VerifyError::Fetch)?;
+    if crate::inline::encodings::hash::Blake3::digest(&leaf_sig_blob.bytes) != leaf_sig_handle.raw {
+        return Err(VerifyError::BlobHandleMismatch);
+    }
     let sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)?;
 
     // Find the leaf outer entity — the one carrying sig_signs.
@@ -774,14 +707,20 @@ where
 
     // Fetch + decode the leaf cap.
     let leaf_cap_blob = fetch_blob(leaf_cap_handle).ok_or(VerifyError::LeafCapMissing)?;
+    if crate::inline::encodings::hash::Blake3::digest(&leaf_cap_blob.bytes) != leaf_cap_handle.raw {
+        return Err(VerifyError::BlobHandleMismatch);
+    }
     let leaf_cap_set: TribleSet = TryFromBlob::try_from_blob(leaf_cap_blob.clone())?;
     let leaf_fields = extract_cap_fields(&leaf_cap_set)?;
+    let leaf_permissions = collect_permissions(&leaf_cap_set, leaf_fields.scope_root)
+        .ok_or(VerifyError::MalformedScope)?;
 
     // Subject must match the connecting peer.
     if leaf_fields.subject != expected_subject {
         return Err(VerifyError::SubjectMismatch);
     }
-    if is_expired(&leaf_fields.expiry) {
+    let mut valid_until = expiry_upper(&leaf_fields.expiry).ok_or(VerifyError::Expired)?;
+    if valid_until < now {
         return Err(VerifyError::Expired);
     }
 
@@ -812,7 +751,8 @@ where
             return Ok(VerifiedCapability {
                 subject: leaf_fields.subject,
                 scope_root: leaf_fields.scope_root,
-                cap_set: leaf_cap_set,
+                permissions: leaf_permissions,
+                valid_until,
             });
         }
 
@@ -838,8 +778,15 @@ where
 
         // Fetch + decode the parent cap.
         let parent_cap_blob = fetch_blob(parent_cap_handle).ok_or(VerifyError::Fetch)?;
+        if crate::inline::encodings::hash::Blake3::digest(&parent_cap_blob.bytes)
+            != parent_cap_handle.raw
+        {
+            return Err(VerifyError::BlobHandleMismatch);
+        }
         let parent_cap_set: TribleSet = TryFromBlob::try_from_blob(parent_cap_blob.clone())?;
         let parent_fields = extract_cap_fields(&parent_cap_set)?;
+        collect_permissions(&parent_cap_set, parent_fields.scope_root)
+            .ok_or(VerifyError::MalformedScope)?;
 
         // Verify the parent proof's sig attests to the parent cap's
         // bytes, signed by some authority.
@@ -847,8 +794,15 @@ where
         if parent_signer != parent_fields.issuer {
             return Err(VerifyError::IssuerMismatch);
         }
-        if is_expired(&parent_fields.expiry) {
+        if parent_fields.subject != current_signer {
+            return Err(VerifyError::DelegationSubjectMismatch);
+        }
+        let parent_valid_until = expiry_upper(&parent_fields.expiry).ok_or(VerifyError::Expired)?;
+        if parent_valid_until < now {
             return Err(VerifyError::Expired);
+        }
+        if parent_valid_until < valid_until {
+            valid_until = parent_valid_until;
         }
         // Each child link's scope must be a subset of its parent's.
         if !scope_subsumes(
@@ -908,6 +862,12 @@ mod tests {
     use rand::rngs::OsRng;
     use std::collections::HashMap;
 
+    // Historical attribute id, retained only to prove that a capability from
+    // the retired branch-scoped model is rejected rather than widened.
+    triblespace_core_macros::attributes! {
+        "46246789D627C1B0F81B21418E179DFD" unsafe as legacy_scope_branch: GenId;
+    }
+
     fn key() -> SigningKey {
         SigningKey::generate(&mut OsRng)
     }
@@ -928,11 +888,220 @@ mod tests {
     }
 
     fn empty_scope() -> (Id, TribleSet) {
+        scope_with(&[PERM_READ])
+    }
+
+    fn scope_with(perms: &[Id]) -> (Id, TribleSet) {
         let scope_root = crate::id::ufoid();
-        let facts = TribleSet::from(entity! { ExclusiveId::force_ref(&scope_root) @
+        let mut facts = TribleSet::new();
+        for perm in perms {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                crate::metadata::tag: *perm,
+            });
+        }
+        (*scope_root, facts)
+    }
+
+    fn sign_unchecked_capability(
+        issuer: &SigningKey,
+        subject: VerifyingKey,
+        scope_root: Id,
+        scope_facts: TribleSet,
+    ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
+        let mut cap_set = TribleSet::from(entity! {
+            cap_subject: issuer_subject_value(subject),
+            cap_issuer: issuer_subject_value(issuer.verifying_key()),
+            cap_scope_root: scope_root,
+            crate::metadata::expires_at: interval(3600.0),
+        });
+        cap_set += scope_facts;
+        let cap_blob: Blob<SimpleArchive> = cap_set.to_blob();
+        let signature: Signature = issuer.sign(&cap_blob.bytes);
+        let sig_blob: Blob<SimpleArchive> = TribleSet::from(entity! {
+            sig_signs: cap_blob.get_handle(),
+            crate::attestation::signed_by: issuer.verifying_key(),
+            crate::attestation::signature_r: signature,
+            crate::attestation::signature_s: signature,
+        })
+        .to_blob();
+        (cap_blob, sig_blob)
+    }
+
+    #[test]
+    fn retired_branch_scope_fails_closed() {
+        let team_root = key();
+        let member = key();
+        let scope_root = *crate::id::ufoid();
+        let branch = *crate::id::ufoid();
+        let mut scope_facts = TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
             crate::metadata::tag: PERM_READ,
         });
-        (*scope_root, facts)
+        scope_facts += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
+            legacy_scope_branch: branch,
+        });
+
+        assert!(matches!(
+            build_capability(
+                &team_root,
+                member.verifying_key(),
+                None,
+                scope_root,
+                scope_facts.clone(),
+                interval(3600.0),
+            ),
+            Err(BuildError::MalformedScope)
+        ));
+
+        // Bypass the current builder to model an already-signed historical
+        // cap. Verification must reject it before any read authorization is
+        // materialized.
+        let (cap_blob, sig_blob) =
+            sign_unchecked_capability(&team_root, member.verifying_key(), scope_root, scope_facts);
+        let sig_handle = sig_blob.get_handle();
+        let blobs = [cap_blob, sig_blob];
+        assert!(matches!(
+            verify_chain(
+                team_root.verifying_key(),
+                sig_handle,
+                member.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::MalformedScope)
+        ));
+    }
+
+    #[test]
+    fn permission_delegation_is_attenuating() {
+        let (admin_root, admin) = scope_with(&[PERM_ADMIN]);
+        let (write_root, write) = scope_with(&[PERM_WRITE]);
+        let (read_root, read) = scope_with(&[PERM_READ]);
+
+        assert!(scope_subsumes(&admin, admin_root, &admin, admin_root));
+        assert!(scope_subsumes(&admin, admin_root, &write, write_root));
+        assert!(scope_subsumes(&admin, admin_root, &read, read_root));
+        assert!(scope_subsumes(&write, write_root, &write, write_root));
+        assert!(scope_subsumes(&write, write_root, &read, read_root));
+        assert!(scope_subsumes(&read, read_root, &read, read_root));
+
+        assert!(!scope_subsumes(&read, read_root, &write, write_root));
+        assert!(!scope_subsumes(&read, read_root, &admin, admin_root));
+        assert!(!scope_subsumes(&write, write_root, &admin, admin_root));
+    }
+
+    #[test]
+    fn verifier_rejects_permission_escalation() {
+        let team_root = key();
+        let member = key();
+        let outsider = key();
+
+        let (member_scope_root, member_scope_facts) = scope_with(&[PERM_READ]);
+        let (member_cap, member_sig) = build_capability(
+            &team_root,
+            member.verifying_key(),
+            None,
+            member_scope_root,
+            member_scope_facts,
+            interval(3600.0),
+        )
+        .expect("build member cap");
+
+        let (outsider_scope_root, outsider_scope_facts) = scope_with(&[PERM_WRITE]);
+        let (outsider_cap, outsider_sig) = build_capability(
+            &member,
+            outsider.verifying_key(),
+            Some((member_cap.clone(), member_sig.clone())),
+            outsider_scope_root,
+            outsider_scope_facts,
+            interval(3600.0),
+        )
+        .expect("builder accepts signed declarations before chain verification");
+
+        let leaf_sig_handle = outsider_sig.get_handle();
+        let blobs = [member_cap, member_sig, outsider_cap, outsider_sig];
+        assert!(matches!(
+            verify_chain(
+                team_root.verifying_key(),
+                leaf_sig_handle,
+                outsider.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::ScopeNotSubset)
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_spliced_parent_proof() {
+        let team_root = key();
+        let founder = key();
+        let attacker = key();
+
+        let (founder_scope_root, founder_scope_facts) = scope_with(&[PERM_ADMIN]);
+        let (founder_cap, founder_sig) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            founder_scope_root,
+            founder_scope_facts,
+            interval(3600.0),
+        )
+        .expect("build founder cap");
+
+        // The attacker can copy a public founder proof and sign a new leaf,
+        // but does not possess the founder key named as the parent's subject.
+        let (attacker_scope_root, attacker_scope_facts) = scope_with(&[PERM_ADMIN]);
+        let (attacker_cap, attacker_sig) = build_capability(
+            &attacker,
+            attacker.verifying_key(),
+            Some((founder_cap.clone(), founder_sig.clone())),
+            attacker_scope_root,
+            attacker_scope_facts,
+            interval(3600.0),
+        )
+        .expect("builder can encode an untrusted declaration for verifier testing");
+
+        let leaf_sig_handle = attacker_sig.get_handle();
+        let blobs = [founder_cap, founder_sig, attacker_cap, attacker_sig];
+        assert!(matches!(
+            verify_chain(
+                team_root.verifying_key(),
+                leaf_sig_handle,
+                attacker.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::DelegationSubjectMismatch)
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_substituted_fetch_bytes() {
+        let team_root = key();
+        let member = key();
+        let (scope_root, scope_facts) = scope_with(&[PERM_READ]);
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            member.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            interval(3600.0),
+        )
+        .expect("build cap");
+        let sig_handle = sig_blob.get_handle();
+
+        // A storage callback is part of the verifier's trust boundary. The
+        // explicit `with_handle` constructor can cache any claimed handle, so
+        // verification must hash the bytes rather than trust that cache.
+        let substituted = Blob::with_handle(cap_blob.bytes.clone(), sig_handle);
+        let result = verify_chain(
+            team_root.verifying_key(),
+            sig_handle,
+            member.verifying_key(),
+            |_requested| Some(substituted.clone()),
+        );
+        assert!(matches!(result, Err(VerifyError::BlobHandleMismatch)));
     }
 
     /// Build a fetch_blob closure backed by an in-memory map.
@@ -1145,6 +1314,53 @@ mod tests {
         .expect_err("must reject expired intermediate");
 
         assert!(matches!(err, VerifyError::Expired));
+    }
+
+    #[test]
+    fn verified_chain_retains_earliest_expiry() {
+        let team_root = key();
+        let member = key();
+        let leaf = key();
+        let now = Epoch::now().expect("system time");
+        let member_expiry = (now, now + hifitime::Duration::from_seconds(100.0))
+            .try_to_inline()
+            .expect("valid member interval");
+        let leaf_expiry = (now, now + hifitime::Duration::from_seconds(200.0))
+            .try_to_inline()
+            .expect("valid leaf interval");
+
+        let (member_scope_root, member_scope_facts) = scope_with(&[PERM_READ]);
+        let (member_cap, member_sig) = build_capability(
+            &team_root,
+            member.verifying_key(),
+            None,
+            member_scope_root,
+            member_scope_facts,
+            member_expiry,
+        )
+        .expect("build member cap");
+        let (leaf_scope_root, leaf_scope_facts) = scope_with(&[PERM_READ]);
+        let (leaf_cap, leaf_sig) = build_capability(
+            &member,
+            leaf.verifying_key(),
+            Some((member_cap.clone(), member_sig.clone())),
+            leaf_scope_root,
+            leaf_scope_facts,
+            leaf_expiry,
+        )
+        .expect("build leaf cap");
+        let leaf_sig_handle = leaf_sig.get_handle();
+        let blobs = [member_cap, member_sig, leaf_cap, leaf_sig];
+        let verified = verify_chain(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            leaf.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("verify chain");
+
+        assert!(verified.is_valid_at(now + hifitime::Duration::from_seconds(99.0)));
+        assert!(!verified.is_valid_at(now + hifitime::Duration::from_seconds(101.0)));
     }
 
     // ── Structural checks ─────────────────────────────────────────────

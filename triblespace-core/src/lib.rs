@@ -35,7 +35,7 @@ pub mod patch;
 pub mod prelude;
 /// Query engine: constraints, variables, and the Atreides join algorithm.
 pub mod query;
-/// Blob-storage backends and the legacy branch/repository compatibility layer.
+/// Blob and record stores, WANTs, and explicit legacy-pile inspection.
 pub mod repo;
 /// Durable Ed25519 signing-key file resolution, loading, and initialization.
 pub mod signing_key_file;

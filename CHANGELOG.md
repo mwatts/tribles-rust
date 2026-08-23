@@ -32,7 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MERGE`/`DERIVE` equations, exact tickets, and orthogonal WANTs as one coherent
   workflow; obsolete speculative chapters and their retired proof harnesses are
   removed, while immutable legacy pin snapshots remain documented only for
-  authorization, retention, and explicit migration.
+  diagnosis, retention, and explicit migration.
+
+- Remove branch-scoped authorization from the current team protocol. Team
+  capabilities now contain only validated `PERM_READ`/`PERM_WRITE`/`PERM_ADMIN`
+  tags; historical capabilities carrying resource facts fail closed. Network
+  serving snapshots no longer contain pin heads, and `Peer`/`Reconciler` no
+  longer require a legacy pin-snapshot capability. The CLI no longer issues
+  `team invite --branch` credentials. Legacy pin decoding remains available to
+  explicit pile diagnosis and branch-to-collection migration. Capability
+  verification now binds every delegation issuer to its parent subject,
+  recomputes fetched content handles, and rechecks the earliest chain expiry on
+  every operation. A bounded one-shot proof operation bootstraps sibling peers
+  whose private stores contain only their own credential chains, without
+  opening ordinary blob reads before authentication.
 
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.

@@ -10,7 +10,7 @@
 //! Byte payloads use [`anybytes::Bytes`] rather than `Vec<u8>`:
 //! Bytes is Arc-refcounted, so cloning across the channel boundary
 //! is a refcount bump instead of a full byte-copy. The same payload
-//! can flow into multiple onward sinks (wire write + local pin)
+//! can flow into multiple onward sinks (wire write + local store)
 //! without re-materialising the buffer.
 
 use anybytes::Bytes;
@@ -86,7 +86,7 @@ pub enum NetEvent {
     /// blob carries the subject they're requesting for (must match
     /// `requester` — verified at connection time via iroh's TLS),
     /// the scope they're asking for, and their preferred expiry
-    /// interval. The local renewal-policy branch decides whether
+    /// interval. The local policy collection decides whether
     /// to auto-approve, queue for human review, or reject.
     CapRequest {
         requester: PublisherKey,
@@ -94,8 +94,8 @@ pub enum NetEvent {
     },
     /// A peer issued us a capability — either in response to a prior
     /// `CapRequest` we made, or as an unsolicited renewal push. The
-    /// cap+sig bytes are content-verified before pinning into the
-    /// local team-cap branch.
+    /// cap+sig bytes are content-verified before being recorded in the
+    /// local policy collection.
     CapDelivered {
         issuer: PublisherKey,
         cap_bytes: Bytes,

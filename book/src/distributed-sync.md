@@ -143,14 +143,19 @@ separate `Blob(result)` WANT.
 ## Authenticated read protocol
 
 All point-to-point operations use `PILE_SYNC_ALPN =
-"/triblespace/pile-sync/5"`. The first stream on a connection must be
-`OP_AUTH`, which proves a capability chain back to the configured team root.
+"/triblespace/pile-sync/5"`. An ordinary connection starts with `OP_AUTH`,
+which proves a capability chain back to the configured team root. The sole
+pre-auth exception is a bounded, one-shot `CAPABILITY_PROOF` connection used
+to obtain that exact chain when sibling members hold only their own private
+credentials. Already held leaf artifacts may accompany the request, but the
+server still verifies the complete chain before returning its exact closure.
 The remaining protocol is read-only:
 
 | Operation | Question | Response |
 |---|---|---|
 | `GET_BLOB` | exact 32-byte content handle | bytes or missing |
 | `CHILDREN` | exact parent handle | referenced present handles |
+| `CAPABILITY_PROOF` | exact capability sig handle | complete validated proof bundle, then close |
 | `COLLECTION_EVIDENCE` | exact collection descriptor handle | canonical commits the descriptor permits |
 | `COLLECTION_OPERATION_RECEIPTS` | exact merge/derive WANT key | canonical matching receipts |
 
@@ -160,12 +165,9 @@ caller authorization phase and admits the whole accepted batch only after
 transport and validation have completed. Neither operation fetches referenced
 content.
 
-Collection-native enumeration currently requires unrestricted read authority;
-collection-scoped capabilities are future work. Blob reads may still be
-restricted to the graph reachable from an immutable legacy pin snapshot. For
-that reason the read-only `PinSnapshotSource` remains part of capability
-evaluation even though pins are no longer a synchronization protocol or a
-remote source of truth.
+Every ordinary data operation requires a read-equivalent team capability. Resource-specific
+publication remains encoded by collection reach, not by a parallel branch
+authorization namespace.
 
 Capability request, issuance, renewal, and delivery state lives in private
 signer-owned collections. Those collections declare no reach, so ordinary

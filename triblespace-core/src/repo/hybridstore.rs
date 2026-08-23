@@ -6,7 +6,6 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
-use crate::repo::PinSnapshotSource;
 use crate::repo::StorageFlush;
 use crate::repo::{WantRequest, WantStore};
 use std::collections::BTreeSet;
@@ -22,7 +21,7 @@ use std::fmt;
 pub struct HybridStore<B, R> {
     /// Storage for content-addressed blobs and durable typed wants.
     pub blobs: B,
-    /// Storage for native collection records and legacy pin snapshots.
+    /// Storage for native collection records.
     pub records: R,
 }
 
@@ -111,17 +110,6 @@ where
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.blobs.reader()
-    }
-}
-
-impl<B, R> PinSnapshotSource for HybridStore<B, R>
-where
-    R: PinSnapshotSource,
-{
-    type PinSnapshotError = R::PinSnapshotError;
-
-    fn snapshot_pin_heads(&mut self) -> Result<crate::repo::PinSnapshot, Self::PinSnapshotError> {
-        self.records.snapshot_pin_heads()
     }
 }
 
