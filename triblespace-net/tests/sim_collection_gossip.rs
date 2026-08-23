@@ -17,6 +17,7 @@
 mod common;
 
 use std::time::Duration;
+use triblespace_core::authority::{self, ACTION_WRITE, AuthorityGrant, AuthorityMode};
 use triblespace_core::collection::reach;
 
 use triblespace_core::blob::Blob;
@@ -58,6 +59,23 @@ fn archive(byte: u8) -> Blob<SimpleArchive> {
     let mut facts = TribleSet::new();
     facts.insert(&Trible::force_raw(row).unwrap());
     facts.to_blob()
+}
+
+/// Drive one inline swarm read while advancing the deterministic network.
+async fn drive_future<T, Fut, F>(fut: Fut, mut on_step: F, steps: u32) -> Option<T>
+where
+    Fut: std::future::Future<Output = T>,
+    F: FnMut(),
+{
+    let mut fut = Box::pin(fut);
+    for _ in 0..steps {
+        if let std::task::Poll::Ready(value) = futures::poll!(fut.as_mut()) {
+            return Some(value);
+        }
+        SimNet::step(&vclock(), Duration::from_millis(20)).await;
+        on_step();
+    }
+    None
 }
 
 #[test]
@@ -269,5 +287,181 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
                 .is_err()
         );
         assert!(store.wants().unwrap().next().is_none());
+    });
+}
+
+#[test]
+fn sparse_gossip_retains_all_commits_but_authority_admits_only_the_writer() {
+    let _guard = common::sim_guard();
+    run_paused(0xA071_0A17, async {
+        let root = key(0xF0);
+        let writer = key(0xA2);
+        let stranger = key(0xC2);
+        let receiver = key(0xB2);
+        // Legacy capabilities only authenticate the two simulated transport
+        // endpoints. Target-data admission below comes solely from the new
+        // positive authority ledger.
+        let writer_cap = admin_cap(&root, &writer);
+        let receiver_cap = admin_cap(&root, &receiver);
+        let caps = [writer_cap.clone(), receiver_cap.clone()];
+        let mut source_store = store_with_caps(&caps);
+        let receiver_store = store_with_caps(&caps);
+
+        let name = collection_name("authority-boundary");
+        let target_descriptor = named_root(name.as_str());
+        let target = collection_of(&target_descriptor);
+        let writer_facts = TribleSet::try_from_blob(archive(0x61)).unwrap();
+        let stranger_facts = TribleSet::try_from_blob(archive(0x71)).unwrap();
+
+        let grant = authority::publish_grant(
+            &mut source_store,
+            root.verifying_key(),
+            &root,
+            AuthorityGrant::root(
+                writer.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
+        let writer_commit = simplearchive_union::publish_fragment_commit(
+            &mut source_store,
+            &target_descriptor,
+            Fragment::from(writer_facts.clone()),
+            &writer,
+        )
+        .unwrap();
+        let stranger_commit = simplearchive_union::publish_fragment_commit(
+            &mut source_store,
+            &target_descriptor,
+            Fragment::from(stranger_facts.clone()),
+            &stranger,
+        )
+        .unwrap();
+
+        let net = SimNet::new(0xA071_0A17, SimConfig::default());
+        let mut receiver_peer = bring_up(
+            &net,
+            &receiver,
+            receiver_store,
+            root.verifying_key(),
+            self_cap_of(&receiver_cap.1),
+            true,
+        );
+        let mut source_peer = bring_up(
+            &net,
+            &writer,
+            source_store,
+            root.verifying_key(),
+            self_cap_of(&writer_cap.1),
+            true,
+        );
+
+        let expected_records = std::collections::BTreeSet::from([
+            grant.id(),
+            writer_commit.id(),
+            stranger_commit.id(),
+        ]);
+        for _ in 0..100 {
+            SimNet::step(&vclock(), Duration::from_millis(1)).await;
+            source_peer.refresh();
+            receiver_peer.refresh();
+            let observed = receiver_peer
+                .store()
+                .records()
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|record| match record {
+                    CollectionRecord::Commit(commit) => Some(commit.id()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            if observed == expected_records {
+                break;
+            }
+        }
+
+        let stored = receiver_peer
+            .store()
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .filter_map(|record| match record {
+                    CollectionRecord::Commit(commit) => Some(commit.id()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_records,
+            "gossip storage retains valid evidence without deciding authority"
+        );
+        assert!(receiver_peer.try_local(grant.data().raw).is_none());
+        assert!(receiver_peer.try_local(writer_commit.data().raw).is_none());
+        assert!(
+            receiver_peer
+                .try_local(stranger_commit.data().raw)
+                .is_none()
+        );
+
+        // Sparse gossip carried only the records. Fetch every referenced blob,
+        // including the stranger's valid data, so physical absence cannot be
+        // what excludes that commit from the semantic snapshot below.
+        let mut closure = vec![
+            authority::collection(root.verifying_key()).raw,
+            target.raw,
+            grant.data().raw,
+            grant.metadata().raw,
+            writer_commit.data().raw,
+            writer_commit.metadata().raw,
+            stranger_commit.data().raw,
+            stranger_commit.metadata().raw,
+        ];
+        closure.sort_unstable();
+        closure.dedup();
+        for hash in closure {
+            let fetched = drive_future(
+                receiver_peer.get_or_fetch_async(hash),
+                || source_peer.refresh(),
+                200,
+            )
+            .await
+            .expect("swarm fetch completes")
+            .expect("MemoryRepo records the want")
+            .expect("source serves every referenced blob");
+            assert_eq!(blake3::hash(&fetched).as_bytes(), &hash);
+        }
+        assert!(
+            receiver_peer
+                .try_local(stranger_commit.data().raw)
+                .is_some()
+        );
+
+        let authority = {
+            let mut store = receiver_peer.store();
+            authority::resolve_authority(&mut *store, root.verifying_key()).unwrap()
+        };
+        assert!(authority.allows(&writer_commit.public_key(), ACTION_WRITE, target));
+        assert!(!authority.allows(&stranger_commit.public_key(), ACTION_WRITE, target));
+
+        let snapshot = {
+            let mut store = receiver_peer.store();
+            let mut collection = Collection::new(
+                &mut *store,
+                &name,
+                root.verifying_key(),
+                receiver.clone(),
+                reach::public(),
+            );
+            collection
+                .snapshot_authorized(|subject| authority.allows(subject, ACTION_WRITE, target))
+                .unwrap()
+        };
+        assert_eq!(snapshot.commits(), &[writer_commit]);
+        assert_eq!(snapshot.facts(), &writer_facts);
+        assert_ne!(snapshot.facts(), &stranger_facts);
     });
 }
