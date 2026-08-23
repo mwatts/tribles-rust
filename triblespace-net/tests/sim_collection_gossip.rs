@@ -5,13 +5,10 @@
 //! content remains independently lazy and gossip replay remains idempotent.
 //!
 //! These collections declare `reach::public()`, and that declaration is the
-//! whole reason anything replicates. There is no separate grant to sign: the
-//! author committed into a collection whose identity says it travels, and
-//! `Collection::commit` wrote that descriptor into the author's own store as a
-//! dependency, so the serving node can read its own permission without anyone
-//! having remembered to grant it. A test that used `reach::private()` here would
-//! observe nothing arriving, which is the point of
-//! `a_private_collection_does_not_replicate` below.
+//! whole reason their sparse evidence replicates. Relay reach and semantic
+//! `WRITE` authority are orthogonal: the first transport fixtures deliberately
+//! publish low-level commits without grants, while the final fixture proves
+//! that ordinary materialization admits only the separately authorized writer.
 #![cfg(feature = "sim")]
 
 mod common;
@@ -95,14 +92,12 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
         let metadata = archive(0x51);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(
+        let commit = simplearchive_union::publish_fragment_commit(
             &mut author_store,
-            &collection_name("c31"),
-            test_team(),
-            author.clone(),
-            reach::public(),
+            &descriptor,
+            fragment,
+            &author,
         )
-        .commit(fragment)
         .unwrap();
         assert_eq!(commit.collection(), collection_of(&descriptor));
         assert_eq!(commit.data(), data.get_handle().into());
@@ -200,14 +195,12 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
         let metadata = archive(0x52);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(
+        let commit = simplearchive_union::publish_fragment_commit(
             &mut author_store,
-            &collection_name("c32"),
-            test_team(),
-            author.clone(),
-            reach::public(),
+            &descriptor,
+            fragment,
+            &author,
         )
-        .commit(fragment)
         .unwrap();
 
         let net = SimNet::new(0xC011EC_1A7E, SimConfig::default());
@@ -322,12 +315,14 @@ fn sparse_gossip_retains_all_commits_but_authority_admits_only_the_writer() {
             ),
         )
         .unwrap();
-        let writer_commit = simplearchive_union::publish_fragment_commit(
+        let writer_commit = Collection::new(
             &mut source_store,
-            &target_descriptor,
-            Fragment::from(writer_facts.clone()),
-            &writer,
+            &name,
+            root.verifying_key(),
+            writer.clone(),
+            reach::public(),
         )
+        .commit(Fragment::from(writer_facts.clone()))
         .unwrap();
         let stranger_commit = simplearchive_union::publish_fragment_commit(
             &mut source_store,
@@ -453,9 +448,7 @@ fn sparse_gossip_retains_all_commits_but_authority_admits_only_the_writer() {
                 receiver.clone(),
                 reach::public(),
             );
-            collection
-                .snapshot_authorized(|subject| authority.allows(subject, ACTION_WRITE, target))
-                .unwrap()
+            collection.snapshot().unwrap()
         };
         assert_eq!(snapshot.commits(), &[writer_commit]);
         assert_eq!(snapshot.facts(), &writer_facts);

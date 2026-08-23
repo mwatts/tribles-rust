@@ -303,8 +303,9 @@ mod tests {
     fn valid_collection_commits_and_owned_closure_survive_memory_keep() {
         use ed25519_dalek::SigningKey;
 
+        use crate::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
         use crate::blob::encodings::utf8string::UTF8String;
-        use crate::collection::Collection;
+        use crate::collection::{simplearchive_union, Collection};
         use crate::repo::{BlobStoreGet, BlobStoreKeep};
 
         let mut repo = MemoryRepo::default();
@@ -313,8 +314,20 @@ mod tests {
         let name = crate::collection::records::CollectionName::new("owned").unwrap();
         let key = SigningKey::from_bytes(&[23; 32]);
         let team = key.verifying_key();
-        let collection =
-            Collection::new(&mut repo, &name, team, key.clone(), reach::private()).collection();
+        let descriptor = simplearchive_union::descriptor(&name, team, reach::private());
+        let collection = identity_for_tests(&descriptor);
+        authority::publish_grant(
+            &mut repo,
+            team,
+            &key,
+            AuthorityGrant::root(
+                key.verifying_key(),
+                collection,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
         let commit = Collection::new(&mut repo, &name, team, key, reach::private())
             .commit(fragment)
             .unwrap();

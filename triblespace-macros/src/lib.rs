@@ -18,6 +18,7 @@ use std::path::Path;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hex::FromHex;
 
+use triblespace_core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::Collection;
 use triblespace_core::id::fucid;
@@ -109,9 +110,26 @@ fn publish_metadata(
         pile,
         collection_name,
         collection_team,
-        signing_key,
+        signing_key.clone(),
         reach::private(),
     );
+    let target = collection.collection();
+    if authority::publish_grant(
+        collection.storage_mut(),
+        collection_team,
+        &signing_key,
+        AuthorityGrant::root(
+            signing_key.verifying_key(),
+            target,
+            ACTION_WRITE,
+            AuthorityMode::Invoke,
+        ),
+    )
+    .is_err()
+    {
+        let _ = collection.close();
+        return;
+    }
     let _ = collection.commit(fragment);
     let _ = collection.close();
 }
@@ -595,7 +613,7 @@ mod instrumentation_tests {
     }
 
     #[test]
-    fn publication_emits_one_signed_commit_with_self_contained_attachments() {
+    fn publication_bootstraps_write_and_emits_one_self_contained_target_commit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("instrumentation.pile");
         File::create(&path).unwrap();
@@ -612,6 +630,7 @@ mod instrumentation_tests {
         let name = CollectionName::new("macro-metadata").unwrap();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let team = signing_key.verifying_key();
+        publish_metadata(&path, &name, team, signing_key.clone(), fragment.clone());
         publish_metadata(&path, &name, team, signing_key, fragment);
 
         let mut pile = Pile::open(&path).unwrap();
@@ -619,14 +638,23 @@ mod instrumentation_tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(records.len(), 1, "the descriptor is a blob, not a record");
+        assert_eq!(
+            records.len(),
+            2,
+            "one authority grant and one target commit are native records"
+        );
+        let expected_descriptor =
+            collection::simplearchive_union::descriptor(&name, team, reach::private()).into_facts();
+        let target =
+            triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(expected_descriptor.clone())
+                .get_handle();
         let commit = records
             .iter()
             .find_map(|record| match record {
-                CollectionRecord::Commit(commit) => Some(*commit),
+                CollectionRecord::Commit(commit) if commit.collection() == target => Some(*commit),
                 _ => None,
             })
-            .expect("single collection commit");
+            .expect("single target collection commit");
         commit.verify_strict().unwrap();
 
         let reader = pile.reader().unwrap();
@@ -637,8 +665,7 @@ mod instrumentation_tests {
             )
             .unwrap();
         assert_eq!(
-            descriptor,
-            collection::simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
+            descriptor, expected_descriptor,
             "the commit names the descriptor the facade published"
         );
 

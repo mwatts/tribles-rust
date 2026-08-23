@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::iter::FromIterator;
+use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace::core::blob::encodings::succinctarchive::CachedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::CompressedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
@@ -957,14 +958,23 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
         let entities_per_commit = 100;
         let storage = MemoryRepo::default();
         let signing_key = SigningKey::generate(&mut OsRng);
+        let team = signing_key.verifying_key();
         let name = CollectionName::new("materialize-bench").expect("valid collection name");
-        let mut collection = Collection::new(
-            storage,
-            &name,
-            signing_key.verifying_key(),
-            signing_key,
-            reach::private(),
-        );
+        let mut collection =
+            Collection::new(storage, &name, team, signing_key.clone(), reach::private());
+        let target = collection.collection();
+        authority::publish_grant(
+            collection.storage_mut(),
+            team,
+            &signing_key,
+            AuthorityGrant::root(
+                signing_key.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .expect("authorize benchmark writer");
 
         let mut total_tribles: u64 = 0;
         for _ in 0..n_commits {

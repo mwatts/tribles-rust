@@ -32,17 +32,33 @@ through `Blocking`.
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::collection::reach;
+use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
+use triblespace::core::collection::{reach, simplearchive_union};
 use triblespace::prelude::*;
 
-let key = SigningKey::generate(&mut OsRng);
-let team = key.verifying_key();
+let team_key = SigningKey::generate(&mut OsRng);
+let writer = SigningKey::generate(&mut OsRng);
+let team = team_key.verifying_key();
 let name = CollectionName::new("models")?;
+let mut storage = MemoryRepo::default();
+let descriptor = simplearchive_union::descriptor(&name, team, reach::private());
+let target = descriptor.facts().clone().to_blob().get_handle();
+authority::publish_grant(
+    &mut storage,
+    team,
+    &team_key,
+    AuthorityGrant::root(
+        writer.verifying_key(),
+        target,
+        ACTION_WRITE,
+        AuthorityMode::Invoke,
+    ),
+)?;
 let mut models = Collection::new(
-    MemoryRepo::default(),
+    storage,
     &name,
     team,
-    key,
+    writer,
     reach::private(),
 );
 
@@ -53,6 +69,13 @@ models.flush()?;
 let storage = models.into_storage();
 ```
 
+The team root is retained by the facade because its positive authority ledger
+governs both reads and writes. `Collection::commit` preflights that the local
+signer may invoke `ACTION_WRITE` on the exact descriptor before writing any
+dependency. Ordinary reads admit every author with the same exact authority;
+the facade's local signing key is not an implicit trust boundary. Publishing
+authority grants remains an explicit low-level bootstrap operation.
+
 The reach argument is explicit because it participates in collection identity.
 `reach::private()` declares nothing and keeps commits local; `reach::public()`
 states that any holder may relay verified commits. A derived collection states
@@ -62,11 +85,13 @@ its own reach independently of its source.
 
 One `Collection::commit(fragment)` performs these semantic steps:
 
-1. canonicalize and store the collection descriptor;
-2. store the fragment's attachments;
-3. encode facts as the canonical data `SimpleArchive`;
-4. encode metafacts as the mandatory canonical metadata `SimpleArchive`; and
-5. insert a signed `COMMIT` naming those exact three handles.
+1. resolve the team's positive authority DAG and require exact `WRITE`
+   authority for the local signer;
+2. canonicalize and store the collection descriptor;
+3. store the fragment's attachments;
+4. encode facts as the canonical data `SimpleArchive`;
+5. encode metafacts as the mandatory canonical metadata `SimpleArchive`; and
+6. insert a signed `COMMIT` naming those exact three handles.
 
 Dependencies precede the record which gives them authority. Publication does
 not flush implicitly. Call `flush()` at the application's chosen durability
@@ -101,8 +126,9 @@ leaf.
 
 ## Known-prefix snapshots and exact tickets
 
-`Collection::snapshot()` performs one record-discovery pass, selects the exact
-strictly verified commits signed by the facade's key, opens one reader, and
+`Collection::snapshot()` first resolves one known prefix of the team's positive
+authority DAG, then discovers the exact strictly verified commits whose authors
+may invoke `ACTION_WRITE` on the collection. It opens one target reader and
 materializes only that authority set. It returns facts, commits, and reader
 together so downstream code cannot accidentally pair one logical frontier with
 a different physical view.
@@ -112,9 +138,9 @@ transaction. A concurrent immutable insert may appear on this call or a later
 call. Every selected commit is nevertheless present and valid in the returned
 snapshot, or the call fails instead of returning a partial set.
 
-`ticket()` performs only the discovery step. It neither opens a blob reader nor
-materializes facts. Freeze a ticket when another component will select or build
-a representation:
+`ticket()` resolves authority and performs target-record discovery, but does not
+fetch or materialize the target collection's data and metadata blobs. Freeze a
+ticket when another component will select or build a representation:
 
 ```rust,ignore
 let ticket = models.ticket()?;
@@ -130,11 +156,9 @@ let snapshot = source.snapshot_exact(models.storage_mut(), &ticket)?;
 An exact-ticket facade does not need the publishing key. Ticket members may
 have different authors, but each must byte-match one resident strictly verified
 record for the exact descriptor. Commits in storage but absent from the ticket
-remain inert.
-
-For a multi-author live collection, `ticket_authorized` and
-`snapshot_authorized` accept an explicit author-membership predicate. The
-facade never infers trust merely from seeing a valid signature.
+remain inert. Live membership policy is not supplied as an ambient callback:
+ordinary `ticket`, `snapshot`, and `materialize` all resolve the same team-rooted
+authority DAG.
 
 ## Reuse merge work without changing meaning
 
@@ -231,6 +255,12 @@ DAG, and converts each authored node into a native commit using its exact
 `repo::content` and `metadata::archive` handles. A missing metadata archive maps
 to the canonical empty archive. Contentless merge wrappers are validated but do
 not become members.
+
+Target authorization is established before any target dependency or commit is
+published. If the supplied signing key is the team root, the migration appends
+its idempotent root `WRITE`/Invoke grant. A delegated signing key must already
+hold exact `WRITE` authority for the target descriptor; otherwise migration
+fails after source validation but before changing the target collection.
 
 Legacy wrapper parents, messages, timestamps, authors, and signatures are not
 silently reinterpreted as application metadata. Two source nodes with identical

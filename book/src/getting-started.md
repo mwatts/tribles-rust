@@ -51,14 +51,33 @@ join recipe, and reach law. A single-user process is simply a team of one:
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::collection::reach;
+use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
+use triblespace::core::collection::{reach, simplearchive_union};
 use triblespace::prelude::*;
 
 let key = SigningKey::generate(&mut OsRng);
 let team = key.verifying_key();
 let name = CollectionName::new("library")?;
+let mut storage = MemoryRepo::default();
+
+// A signing key is not ambient authority. The team root explicitly grants
+// this writer permission to contribute to this exact collection.
+let descriptor = simplearchive_union::descriptor(&name, team, reach::private());
+let target = descriptor.facts().clone().to_blob().get_handle();
+authority::publish_grant(
+    &mut storage,
+    team,
+    &key,
+    AuthorityGrant::root(
+        key.verifying_key(),
+        target,
+        ACTION_WRITE,
+        AuthorityMode::Invoke,
+    ),
+)?;
+
 let mut library = Collection::new(
-    MemoryRepo::default(),
+    storage,
     &name,
     team,
     key,
@@ -69,6 +88,10 @@ let mut library = Collection::new(
 `reach::private()` means that network peers do not proactively gossip this
 collection. Use `reach::public()` only when the collection's identity should
 state that any holder may relay its verified commits.
+
+The authority grant is a separate positive fact anchored by the team root. It
+names one exact subject, collection, action, and mode. Even in a team of one,
+possessing the signing key alone does not implicitly grant `ACTION_WRITE`.
 
 ## 4. Build a self-contained fragment
 
@@ -111,10 +134,12 @@ let second = library.commit(entity! {
 assert_ne!(first.id(), second.id());
 ```
 
-Publication writes the descriptor, data archive, metadata archive, and fragment
-attachments before inserting the signed `COMMIT` record. The commit is the
-atomic assertion. There is no mutable head to advance: both records remain
-members and the collection value is their union.
+Publication first resolves the team's positive authority DAG and requires the
+local signer to have exact `ACTION_WRITE` invocation authority for this
+descriptor. It then writes the descriptor, data archive, metadata archive, and
+fragment attachments before inserting the signed `COMMIT` record. The commit
+is the atomic assertion. There is no mutable head to advance: both records
+remain members and the collection value is their union.
 
 Repeating byte-identical input produces the same record ID and is idempotent.
 Distinct input produces another coexisting member. Application-level
@@ -146,16 +171,19 @@ for (first, last, quote) in find!(
 }
 ```
 
-`snapshot()` discovers one exact verified commit set, opens one blob-reader
-view, and materializes facts solely from those commits. The returned
-`CollectionSnapshot` keeps all three together. A concurrent commit may appear
-on this call or a later call, but physically visible blobs from an unobserved
-commit cannot leak into the snapshot's authority set.
+`snapshot()` resolves the team's positive authority DAG, then discovers every
+exact verified commit whose author may invoke `ACTION_WRITE` on this
+descriptor. It opens one target blob-reader view and materializes facts solely
+from those commits. The returned `CollectionSnapshot` keeps facts, commits,
+and reader together. A concurrent grant or commit may appear on this call or a
+later call, but physically visible blobs from an unobserved commit cannot leak
+into the snapshot's authority set.
 
-Use `ticket()` when only the exact commit frontier is needed. It reads native
-records without opening a blob view or materializing facts, which is useful for
-feeding derived representations such as SuccinctArchive or path-index
-collections.
+Use `ticket()` when only the exact commit frontier is needed. It opens and
+reads the authority collection's canonical grant blobs while resolving
+`ACTION_WRITE`, but it does not fetch or materialize the selected target
+commits' data or metadata blobs. This is useful for feeding derived
+representations such as SuccinctArchive or path-index collections.
 
 ## 7. Choose durability explicitly
 
@@ -178,8 +206,10 @@ supports explicit close.
 
 - `entity!` builds intrinsic entities and carries required blobs.
 - `Fragment` is the self-contained publication value.
-- `Collection::commit` publishes one signed, independent member.
-- `Collection::snapshot` returns a coherent known-prefix view.
+- `Collection::commit` requires exact `ACTION_WRITE` invocation authority and
+  publishes one signed, independent member.
+- `Collection::snapshot` returns the coherent known-prefix view admitted by
+  the team-rooted positive authority DAG.
 - Replicas converge by unioning records; they never elect a branch head.
 - Derived indexes are reproducible collection images, not alternate authority.
 

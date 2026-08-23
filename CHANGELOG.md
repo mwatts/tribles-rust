@@ -21,8 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete reachable commit history before writing; preserves each authored
   commit's exact `repo::content` and `metadata::archive`; skips verified
   contentless merges; resolves both current and historical branch-name
-  encodings; and reports every source-to-target mapping, including deterministic
-  many-to-one collapse and idempotent replays.
+  encodings; establishes exact target `ACTION_WRITE` before target publication
+  (a team-root signer bootstraps itself, while a delegated signer must already
+  be authorized); and reports every source-to-target mapping, including
+  deterministic many-to-one collapse and idempotent replays.
 
 ### Changed
 
@@ -505,14 +507,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 3.22 ms to 0.41 ms, and eight commits from 199 us to 111 us, while a
   singleton remained 24 us. Initializing a fresh Rayon pool cost the first
   plural scope roughly 0.23--0.26 ms; a first singleton does not initialize it.
-- **Plural owned collection reads validate commit data in parallel.** Data
+- **Plural authorized collection reads validate commit data in parallel.** Data
   fetches and metadata validation remain sequential; no reader handle or
   backend error crosses into Rayon. Only successfully fetched bytes enter the
   parallel identity and canonical `SimpleArchive` checks. Results replay in
   intrinsic commit order, preserving data-before-metadata and deterministic
   fail-loud attribution. Single-commit snapshots and builds without the
   `parallel` feature retain the direct serial path.
-- **Owned collection reads validate each distinct data handle and each
+- **Authorized collection reads validate each distinct data handle and each
   distinct metadata handle once per snapshot.** Every observed commit still
   undergoes strict Ed25519 verification and remains in the snapshot's
   provenance, but commits that name identical content share one fetch,
@@ -533,12 +535,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   final six-index `TribleSet` once. This removes one transient `TribleSet` and
   PATCH union per collection leaf without changing collection semantics,
   persisted records, physical-cover selection, or the one-member path.
-- **Owned collection reads scope signed-commit verification before Ed25519.**
-  `Collection` now discards commits whose descriptor or signer field does not
-  exactly match the facade before verifying their signatures, while retaining
-  all native `MERGE` and `DERIVE` equations for downstream semantic closure.
-  Matching invalid signatures remain rejected diagnostics, unrelated invalid
-  signatures are inert, and structural storage failures still abort discovery.
+- **Authorized collection reads scope signed-commit verification before
+  Ed25519.** `Collection` now discards commits whose descriptor does not match
+  or whose signer lacks exact `ACTION_WRITE` invocation authority before
+  verifying their signatures, while retaining all native `MERGE` and `DERIVE`
+  equations for downstream semantic closure. Matching invalid signatures
+  remain rejected diagnostics, unrelated invalid signatures are inert, and
+  structural storage failures still abort discovery.
 - **The destructive pile CLI requires the current reader's exact boundary.**
   `trible pile amputate <path> --truncate-to <byte-offset>` refuses a guessed
   or stale offset before mutation. Read failures now say explicitly that a
@@ -641,12 +644,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needed, and it compiles to one short-circuited reverse-index probe per
   candidate.
 
-- **Owned collections expose record-only authority tickets.**
-  `Collection::ticket()` returns the exact strictly verified commits signed by
-  the facade's key for its canonical descriptor, ordered by intrinsic record
-  id after one deterministic collection-record pass. It requires only
-  `CollectionStore`, opens no blob reader, and shares snapshot/materialization's
-  scoped discovery path without changing their one-pass known-prefix contract.
+- **Ordinary collections expose authority-resolved exact tickets.**
+  `Collection::ticket()` resolves the team's positive authority DAG and returns
+  every exact strictly verified commit whose signer may invoke `ACTION_WRITE`
+  on the canonical descriptor, ordered by intrinsic record id. It opens and
+  reads authority grant blobs but does not fetch or materialize the selected
+  target commits' data or metadata blobs. Ticket, snapshot, and materialization
+  therefore share one multi-author known-prefix authority frontier rather than
+  treating the facade's signing key as ambient authority.
 
 - **Path summaries now form a native typed collection algebra.** A source
   `SimpleArchive` collection can be lowered through an automaton-specific
@@ -775,13 +780,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `9BB5B1F4D6FD8FB850B494C2CF51B5CA` was minted with `trible genid` on
   2026-08-12; its envelope stores collection, author, R, and S directly and
   remains valid before the named descriptor or commits arrive.
-- **Owned collections now expose coherent known-prefix snapshots.**
-  `Collection::snapshot()` performs one native-record discovery and returns
-  the materialized facts, exact signer-authorized commits, and the blob reader
-  used to validate them as one value. Later physically visible blobs cannot
-  alter that authority frontier, preventing derived indexes from mixing an old
-  fact view with a newer source ticket. `Collection::materialize()` shares the
-  same implementation while preserving its no-reader empty fast path.
+- **Ordinary collections now expose coherent authority-aware known-prefix
+  snapshots.** `Collection::snapshot()` resolves the team's positive authority
+  DAG, discovers every exact commit whose signer may invoke `ACTION_WRITE` on
+  the descriptor, and returns the materialized facts, admitted commits, and
+  target blob reader as one value. Later physically visible blobs cannot alter
+  that authority frontier, preventing derived indexes from mixing an old fact
+  view with a newer source ticket. `Collection::materialize()` shares the same
+  authority resolution and materialization path.
 - **New pile writes use a generic, length-delimited record envelope.** The
   envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` was minted with
   `trible genid` on 2026-08-11; the next 16 bytes reuse each current V3/V4

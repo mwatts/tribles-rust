@@ -5,6 +5,7 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
@@ -24,7 +25,20 @@ fn main() {
     let name = CollectionName::new("literature").expect("legal collection name");
     let signing_key = SigningKey::generate(&mut OsRng);
     let team = signing_key.verifying_key();
-    let mut collection = Collection::new(pile, &name, team, signing_key, reach::private());
+    let mut collection = Collection::new(pile, &name, team, signing_key.clone(), reach::private());
+    let target = collection.collection();
+    authority::publish_grant(
+        collection.storage_mut(),
+        team,
+        &signing_key,
+        AuthorityGrant::root(
+            signing_key.verifying_key(),
+            target,
+            ACTION_WRITE,
+            AuthorityMode::Invoke,
+        ),
+    )
+    .expect("authorize collection writer");
 
     // Each fragment is one independent signed collection member. Omitting an
     // explicit entity id makes every person intrinsic to their facts.
@@ -34,8 +48,8 @@ fn main() {
             .expect("publish person");
     }
 
-    // Freeze authority from native records alone: ticket() neither opens a
-    // blob reader nor materializes the source facts.
+    // Freeze the exact authorized target frontier. ticket() reads the
+    // authority grant blobs, but not these commits' data or metadata blobs.
     let ticket = collection.ticket().expect("discover exact ticket");
     assert_eq!(ticket.len(), 3);
 

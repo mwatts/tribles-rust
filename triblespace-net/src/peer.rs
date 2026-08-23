@@ -706,14 +706,13 @@ mod collection_gossip_tests {
     ///
     /// `relayable_commits` is tested on its own in `collection_wire`; what is
     /// checked here is the wiring, because a correct selection function
-    /// pointed at the wrong store is exactly as leaky as a wrong one. A real
-    /// `Collection::commit` writes its own descriptor as a dependency, so a
-    /// publisher's store holds its own permission by construction -- there is
-    /// no second act, and nothing to forget.
+    /// pointed at the wrong store is exactly as leaky as a wrong one. These
+    /// low-level fixture commits isolate descriptor reach from the orthogonal
+    /// authority required by the ordinary collection facade.
     #[test]
     fn a_peer_relays_only_what_its_own_store_says_may_travel() {
         use triblespace_core::collection::records::CollectionName;
-        use triblespace_core::collection::{Collection, reach};
+        use triblespace_core::collection::{reach, simplearchive_union};
         use triblespace_core::repo::memoryrepo::MemoryRepo;
         use triblespace_core::trible::{Fragment, TribleSet};
 
@@ -721,24 +720,30 @@ mod collection_gossip_tests {
         let team = author.verifying_key();
         let mut store = MemoryRepo::default();
 
-        let published = Collection::new(
-            &mut store,
+        let published_descriptor = simplearchive_union::descriptor(
             &CollectionName::new("published").unwrap(),
             team,
-            author.clone(),
             reach::public(),
+        );
+        let published = simplearchive_union::publish_fragment_commit(
+            &mut store,
+            &published_descriptor,
+            Fragment::from(TribleSet::new()),
+            &author,
         )
-        .commit(Fragment::from(TribleSet::new()))
         .unwrap();
 
-        let withheld = Collection::new(
-            &mut store,
+        let withheld_descriptor = simplearchive_union::descriptor(
             &CollectionName::new("withheld").unwrap(),
             team,
-            author.clone(),
             reach::private(),
+        );
+        let withheld = simplearchive_union::publish_fragment_commit(
+            &mut store,
+            &withheld_descriptor,
+            Fragment::from(TribleSet::new()),
+            &author,
         )
-        .commit(Fragment::from(TribleSet::new()))
         .unwrap();
 
         // Two collections, one author, one store. Only the one whose

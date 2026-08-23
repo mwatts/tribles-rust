@@ -33,7 +33,9 @@ pub enum Command {
     ///
     /// This is deliberately a same-pile migration: one frozen pin observation
     /// selects the head, a later append-only blob snapshot validates everything
-    /// it reaches, and only then are native records appended to that pile.
+    /// it reaches, and only then are native records appended to that pile. A
+    /// team-root signer bootstraps its own exact WRITE grant; any other signer
+    /// must already have exact WRITE authority for the target collection.
     BranchToCollection {
         /// Legacy branch to migrate, by exact name or 32-hex-character id.
         #[arg(long)]

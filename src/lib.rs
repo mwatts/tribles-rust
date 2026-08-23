@@ -111,13 +111,26 @@ mod readme_example {
 
     #[test]
     fn readme_example() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
         use crate::core::collection::reach;
 
         let storage = MemoryRepo::default();
         let key = SigningKey::generate(&mut OsRng);
+        let team = key.verifying_key();
         let name = CollectionName::new("library")?;
-        let mut library =
-            Collection::new(storage, &name, key.verifying_key(), key, reach::private());
+        let mut library = Collection::new(storage, &name, team, key.clone(), reach::private());
+        let target = library.collection();
+        authority::publish_grant(
+            library.storage_mut(),
+            team,
+            &key,
+            AuthorityGrant::root(
+                key.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )?;
 
         let mut initial = entity! {
             literature::firstname: "Frank",

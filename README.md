@@ -54,6 +54,7 @@ the facts that reference it.
 ```rust
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace::core::collection::reach;
 use triblespace::prelude::*;
 
@@ -80,13 +81,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = SigningKey::generate(&mut OsRng);
     let team = key.verifying_key();
     let name = CollectionName::new("library")?;
+    let storage = MemoryRepo::default();
     let mut library = Collection::new(
-        MemoryRepo::default(),
+        storage,
         &name,
         team,
-        key,
+        key.clone(),
         reach::private(),
     );
+    let target = library.collection();
+    authority::publish_grant(
+        library.storage_mut(),
+        team,
+        &key,
+        AuthorityGrant::root(
+            key.verifying_key(),
+            target,
+            ACTION_WRITE,
+            AuthorityMode::Invoke,
+        ),
+    )?;
 
     let author = entity! {
         literature::firstname: "Frank",
@@ -128,10 +142,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Each `Collection::commit` is an independent signed assertion. Identical retries
+Each `Collection::commit` first requires exact `ACTION_WRITE` invocation
+authority from the team's positive authority DAG, then publishes an independent
+signed assertion. The explicit root grant above bootstraps a team of one; merely
+holding the facade's signing key is not ambient authority. Identical retries
 deduplicate by intrinsic record identity; distinct commits coexist and a
-snapshot materializes their authorized union. Call `Collection::flush` when an
-application needs an explicit durability barrier.
+snapshot materializes every authorized author's union. Call `Collection::flush`
+when an application needs an explicit durability barrier.
 
 The [Getting Started](https://triblespace.github.io/triblespace-rs/getting-started.html)
 chapter breaks the example down, while [Collection

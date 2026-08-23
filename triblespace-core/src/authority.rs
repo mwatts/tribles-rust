@@ -1504,9 +1504,7 @@ mod tests {
             key(4),
             crate::collection::reach::private(),
         );
-        let facts = facade
-            .snapshot_authorized(|subject| authority.allows(subject, ACTION_WRITE, target))
-            .unwrap();
+        let facts = facade.snapshot().unwrap();
 
         assert_eq!(facts.facts(), writer_facts.facts());
         assert_eq!(authority.grants().count(), 1);

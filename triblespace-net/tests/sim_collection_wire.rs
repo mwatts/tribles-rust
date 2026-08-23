@@ -13,8 +13,8 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
-    Collection, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
-    CollectionRecord, CollectionStore, VerifyingKey, simplearchive_union,
+    CollectionData, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
+    CollectionStore, VerifyingKey, simplearchive_union,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::WantRequest;
@@ -85,14 +85,13 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             .unwrap();
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let mut collection = Collection::new(
+        let commit = simplearchive_union::publish_fragment_commit(
             &mut server_store,
-            &collection_name("c1"),
-            test_team(),
-            server_key.clone(),
-            reach::public(),
-        );
-        let commit = collection.commit(fragment).unwrap();
+            &descriptor,
+            fragment,
+            &server_key,
+        )
+        .unwrap();
 
         let net = SimNet::new(0xC011EC7, SimConfig::default());
         let server = bring_up(
@@ -168,14 +167,13 @@ fn sibling_members_bootstrap_without_resident_authority_state() {
         let mut server_store = empty_store();
         let client_store = empty_store();
         let descriptor = named_root("sibling-bootstrap");
-        let mut collection = Collection::new(
+        let commit = simplearchive_union::publish_fragment_commit(
             &mut server_store,
-            &collection_name("sibling-bootstrap"),
-            test_team(),
-            server_key.clone(),
-            reach::public(),
-        );
-        let commit = collection.commit(Fragment::empty()).unwrap();
+            &descriptor,
+            Fragment::empty(),
+            &server_key,
+        )
+        .unwrap();
 
         let net = SimNet::new(
             0xC011EC9,
@@ -276,14 +274,12 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
             .put::<SimpleArchive, _>(descriptor.clone().into_facts().to_blob())
             .unwrap();
         server_store.put::<SimpleArchive, _>(data.clone()).unwrap();
-        Collection::new(
+        simplearchive_union::publish_fragment_commit(
             &mut server_store,
-            &collection_name("c4"),
-            test_team(),
-            server_key.clone(),
-            reach::private(),
+            &descriptor,
+            Fragment::empty(),
+            &server_key,
         )
-        .commit(Fragment::empty())
         .unwrap();
 
         let net = SimNet::new(0xC011EC8, SimConfig::default());
@@ -327,14 +323,13 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
         let descriptor = named_root("c6");
         let data = archive(7);
         let facts = TribleSet::try_from_blob(data.clone()).unwrap();
-        let mut collection = Collection::new(
+        let commit = simplearchive_union::publish_fragment_commit(
             &mut server_store,
-            &collection_name("c6"),
-            test_team(),
-            server_key.clone(),
-            reach::public(),
-        );
-        let commit = collection.commit(Fragment::from(facts)).unwrap();
+            &descriptor,
+            Fragment::from(facts),
+            &server_key,
+        )
+        .unwrap();
 
         let net = SimNet::new(0xC011ECA, SimConfig::default());
         let _server = bring_up(

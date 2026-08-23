@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::attribute::Attribute;
+use triblespace_core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
@@ -106,8 +107,10 @@ fn migrate(
     let authored = prepared.len();
 
     // Preparation above performs no I/O. Once every reachable node has
-    // passed, publish each direct source mapping. Exact repeats naturally
-    // converge through the content-addressed blob and collection stores.
+    // passed, establish the target writer's exact authority before publishing
+    // any target dependency or record. Exact repeats naturally converge
+    // through the content-addressed blob and collection stores.
+    authorize_target_writer(pile, &descriptor, team, signer)?;
     let mut mappings = Vec::with_capacity(authored);
     for (source, prepared) in prepared {
         let staged = prepared
@@ -134,6 +137,45 @@ fn migrate(
         unique_targets,
     };
     Ok((report, mappings))
+}
+
+fn authorize_target_writer(
+    pile: &mut Pile,
+    descriptor: &triblespace_core::trible::Fragment,
+    team: VerifyingKey,
+    signer: &SigningKey,
+) -> Result<()> {
+    let target =
+        triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
+            .get_handle();
+    let writer = Inline::new(signer.verifying_key().to_bytes());
+    let resolved = authority::resolve_authority(pile, team)
+        .map_err(|error| anyhow!("resolve target collection authority: {error}"))?;
+    if resolved.allows(&writer, ACTION_WRITE, target) {
+        return Ok(());
+    }
+
+    if signer.verifying_key() != team {
+        bail!(
+            "migration signer {} has no exact WRITE authority for target collection {}; publish a team-rooted grant before migrating",
+            hex::encode_upper(signer.verifying_key().to_bytes()),
+            hex::encode_upper(target.raw),
+        );
+    }
+
+    authority::publish_grant(
+        pile,
+        team,
+        signer,
+        AuthorityGrant::root(
+            signer.verifying_key(),
+            target,
+            ACTION_WRITE,
+            AuthorityMode::Invoke,
+        ),
+    )
+    .map_err(|error| anyhow!("publish target collection WRITE authority: {error}"))?;
+    Ok(())
 }
 
 fn parse_team_root(text: &str) -> Result<VerifyingKey> {
@@ -465,6 +507,31 @@ mod tests {
         Inline::new(raw)
     }
 
+    fn grant_write(
+        pile: &mut Pile,
+        name: &CollectionName,
+        team_key: &SigningKey,
+        writer: &SigningKey,
+    ) {
+        let descriptor =
+            simplearchive_union::descriptor(name, team_key.verifying_key(), reach::private());
+        let target =
+            triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts())
+                .get_handle();
+        authority::publish_grant(
+            pile,
+            team_key.verifying_key(),
+            team_key,
+            AuthorityGrant::root(
+                writer.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
+    }
+
     fn authored_wrapper(
         author: &SigningKey,
         parents: impl IntoIterator<Item = CommitHandle>,
@@ -490,10 +557,12 @@ mod tests {
         let (file, branch) = frozen_fixture()?;
         let path = file.path().to_path_buf();
         let name = CollectionName::new("events").unwrap();
-        let team = key(2).verifying_key();
+        let team_key = key(2);
+        let team = team_key.verifying_key();
         let signer = key(3);
 
         let mut pile = super::super::super::open_refreshed(&path)?;
+        grant_write(&mut pile, &name, &team_key, &signer);
         let (first, first_map) = migrate(&mut pile, "legacy", &name, team, &signer)?;
         assert_eq!(first.branch, branch);
         assert_eq!(first.reachable, 5);
@@ -547,7 +616,84 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(fs::metadata(&path)?.len(), first_len);
-        assert_eq!(pile.records()?.collect::<Result<Vec<_>, _>>()?.len(), 3);
+        let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
+            simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
+        )
+        .get_handle();
+        assert_eq!(
+            pile.records()?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|record| {
+                    matches!(record, triblespace_core::collection::CollectionRecord::Commit(commit) if commit.collection() == target)
+                })
+                .count(),
+            3
+        );
+        pile.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn team_root_signer_bootstraps_exact_write_before_target_publication() -> Result<()> {
+        let (file, _) = frozen_fixture()?;
+        let path = file.path().to_path_buf();
+        let name = CollectionName::new("root-authored-events").unwrap();
+        let signer = key(4);
+        let team = signer.verifying_key();
+        let mut pile = super::super::super::open_refreshed(&path)?;
+
+        let (_, mappings) = migrate(&mut pile, "legacy", &name, team, &signer)?;
+
+        assert!(!mappings.is_empty());
+        let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
+            simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
+        )
+        .get_handle();
+        let writer = Inline::new(signer.verifying_key().to_bytes());
+        let resolved = authority::resolve_authority(&mut pile, team)
+            .map_err(|error| anyhow!("resolve bootstrapped authority: {error}"))?;
+        assert!(resolved.allows(&writer, ACTION_WRITE, target));
+        assert_eq!(
+            Collection::new(&mut pile, &name, team, signer, reach::private())
+                .ticket()
+                .map_err(|error| anyhow!("discover migrated commits: {error}"))?
+                .len(),
+            mappings
+                .iter()
+                .map(|(_, commit)| commit.id())
+                .collect::<BTreeSet<_>>()
+                .len()
+        );
+        pile.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn delegated_signer_without_exact_write_cannot_publish_target_records() -> Result<()> {
+        let (file, _) = frozen_fixture()?;
+        let path = file.path().to_path_buf();
+        let name = CollectionName::new("delegated-events").unwrap();
+        let team = key(5).verifying_key();
+        let signer = key(6);
+        let before = fs::metadata(&path)?.len();
+        let mut pile = super::super::super::open_refreshed(&path)?;
+
+        let error = migrate(&mut pile, "legacy", &name, team, &signer).unwrap_err();
+
+        assert!(error.to_string().contains("has no exact WRITE authority"));
+        assert_eq!(fs::metadata(&path)?.len(), before);
+        let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
+            simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
+        )
+        .get_handle();
+        assert!(!pile
+            .records()?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|record| {
+                matches!(record, triblespace_core::collection::CollectionRecord::Commit(commit) if commit.collection() == target)
+            }));
         pile.close()?;
         Ok(())
     }
@@ -575,8 +721,10 @@ mod tests {
         let merge_commit = pile.put::<SimpleArchive, _>(merge_wrapper)?;
 
         let collection_name = CollectionName::new("empty-preserved").unwrap();
-        let team = key(10).verifying_key();
+        let team_key = key(10);
+        let team = team_key.verifying_key();
         let signer = key(11);
+        grant_write(&mut pile, &collection_name, &team_key, &signer);
         let descriptor = simplearchive_union::descriptor(&collection_name, team, reach::private());
         let reader = pile.reader()?;
         let (reachable, contentless_merges, prepared) =

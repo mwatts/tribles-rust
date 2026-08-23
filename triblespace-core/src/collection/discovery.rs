@@ -401,7 +401,7 @@ where
     Ok(discovered)
 }
 
-/// Discover records for one exact collection and authorized signer.
+/// Discover records for one exact collection and one exact supplied signer.
 ///
 /// A commit's descriptor and public-key fields are structurally available
 /// before its signature is verified. Commits outside this exact scope are
@@ -476,12 +476,11 @@ where
 /// Discover records for one exact collection across *every* authorized signer.
 ///
 /// This is the multi-author counterpart of
-/// [`discover_collection_records_scoped`]. That one answers "what did *I*
-/// write?" by fixing the signer to the reader's own key; this one answers
-/// "what did anyone I trust write?" by asking `is_member` per commit. Both
-/// narrow to one exact collection, and both hand the result to the same
-/// key-agnostic validator, so foreign commits are admitted through exactly the
-/// path own commits already take rather than a parallel one.
+/// [`discover_collection_records_scoped`]. That function fixes one
+/// caller-supplied signer; this one asks `is_member` for each claimed signer.
+/// Both narrow to one exact collection, and both hand the result to the same
+/// key-agnostic validator, so every admitted author follows one verification
+/// path.
 ///
 /// `is_member` sees a commit's *claimed* public key, which -- like the
 /// descriptor and public-key fields [`discover_collection_records_scoped`]
@@ -489,15 +488,12 @@ where
 /// Narrowing first means a nonmember costs no Ed25519 verification, and
 /// claiming membership falsely buys nothing: strict verification afterwards
 /// binds that key to the signed bytes, so a forged claim fails there. The
-/// predicate is therefore a *scope*, never the trust decision itself.
-///
-/// The predicate is supplied by the caller rather than derived from the
-/// collection's own [`collection_team`](super::collection_team) root, because
-/// walking capability chains from a root requires enumerating the authority
-/// DAG downward and issued capabilities are currently sealed inside
-/// content-addressed blobs, reachable only from a leaf already in hand. When
-/// that enumeration exists, it becomes one predicate passed here; the read
-/// path does not change.
+/// predicate supplies the authorization scope, while strict verification
+/// establishes that the claimed signer actually authored the commit. Ordinary
+/// [`Collection`](super::Collection) reads resolve the team's positive
+/// authority DAG and pass exact `WRITE` membership here. This lower-level
+/// primitive accepts a callback so explicit-ticket and protocol code can bring
+/// an already-resolved authority set without resolving it again.
 ///
 /// `MERGE` and `DERIVE` records are retained in full, for the same reason
 /// [`discover_collection_records_scoped`] retains them: they are unsigned

@@ -65,6 +65,7 @@
 //! compilation (the design point of this file), never emulated at runtime.
 
 use std::time::Instant;
+use triblespace_core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
@@ -760,6 +761,19 @@ fn main() {
                 signing_key.clone(),
                 reach::private(),
             );
+            let target = source.collection();
+            authority::publish_grant(
+                source.storage_mut(),
+                team,
+                &signing_key,
+                AuthorityGrant::root(
+                    signing_key.verifying_key(),
+                    target,
+                    ACTION_WRITE,
+                    AuthorityMode::Invoke,
+                ),
+            )
+            .expect("authorize source benchmark writer");
             for chunk in &chunks {
                 source
                     .commit(Fragment::from(chunk.content.clone()))

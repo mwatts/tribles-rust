@@ -173,6 +173,7 @@ mod tests {
     use crate::collection::reach;
     use crate::id::Id;
 
+    use crate::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
@@ -236,22 +237,49 @@ mod tests {
 
     #[test]
     fn collection_publication_and_read_work_across_both_sides() {
-        let hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
+        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
         let signing_key = SigningKey::from_bytes(&[8; 32]);
-        let mut collection = Collection::new(
-            hybrid,
-            &CollectionName::new("hybrid").unwrap(),
-            signing_key.verifying_key(),
-            signing_key,
+        let name = CollectionName::new("hybrid").unwrap();
+        let team = signing_key.verifying_key();
+        let target = Collection::new(
+            &mut hybrid,
+            &name,
+            team,
+            signing_key.clone(),
             reach::private(),
-        );
+        )
+        .collection();
+        authority::publish_grant(
+            &mut hybrid,
+            team,
+            &signing_key,
+            AuthorityGrant::root(
+                signing_key.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
+        let mut collection = Collection::new(hybrid, &name, team, signing_key, reach::private());
 
         let commit = collection.commit(Fragment::empty()).unwrap();
         assert_eq!(collection.materialize().unwrap().len(), 0);
         assert_eq!(commit.collection(), collection.collection());
         assert!(collection.storage().blobs.blobs.len() >= 2);
         let storage = collection.storage_mut();
-        assert_eq!(storage.records.records().unwrap().count(), 1);
+        assert_eq!(
+            storage
+                .records
+                .records()
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|record| {
+                    matches!(record, CollectionRecord::Commit(commit) if commit.collection() == target)
+                })
+                .count(),
+            1
+        );
         assert_eq!(storage.blobs.records().unwrap().count(), 0);
     }
 

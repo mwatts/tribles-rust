@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use crate::core::collection::{reach, Collection};
 use crate::core::metadata;
 use crate::core::repo::pile::{Pile, ReadError};
@@ -394,8 +395,30 @@ impl Telemetry {
         // letting the facade assume it.
         let signing_key = SigningKey::generate(&mut OsRng);
         let team = signing_key.verifying_key();
-        let mut collection =
-            Collection::new(pile, &collection_name, team, signing_key, reach::private());
+        let mut collection = Collection::new(
+            pile,
+            &collection_name,
+            team,
+            signing_key.clone(),
+            reach::private(),
+        );
+        let target = collection.collection();
+        if authority::publish_grant(
+            collection.storage_mut(),
+            team,
+            &signing_key,
+            AuthorityGrant::root(
+                signing_key.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .is_err()
+        {
+            let _ = collection.close();
+            return None;
+        }
 
         // Commit session start entity.
         let session_entity = ExclusiveId::force_ref(&session_id);
@@ -538,6 +561,40 @@ fn span_end(batch: &mut Fragment, span_id: Id, at_ns: u64, duration_ns: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::collection::CollectionStore;
+
+    static TELEMETRY_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn layer_from_env_bootstraps_team_of_one_write_authority() {
+        let _env = TELEMETRY_ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.pile");
+        std::fs::File::create(&path).unwrap();
+        std::env::set_var(ENV_TELEMETRY_PILE, &path);
+        std::env::set_var(ENV_TELEMETRY_COLLECTION_NAME, "telemetry-test");
+
+        let (layer, telemetry) = Telemetry::layer_from_env("test session")
+            .expect("telemetry starts with explicit grant");
+        std::env::remove_var(ENV_TELEMETRY_PILE);
+        std::env::remove_var(ENV_TELEMETRY_COLLECTION_NAME);
+        drop(layer);
+        drop(telemetry);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        let records = pile
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            3,
+            "one authority grant plus session start and end commits"
+        );
+        pile.close().unwrap();
+    }
 
     #[test]
     fn unsupported_record_diagnostic_prioritizes_version_skew_without_destructive_advice() {

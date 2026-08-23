@@ -26,10 +26,12 @@ has two sorts:
 - a **recursive** root retains the blob and all resident descendants found by
   conservative traversal.
 
-Strong collection retention follows only signed ground truth. For every
-locally authorized, admitted `COMMIT`, the descriptor, signed data, and metadata
-handles are recursive roots, so all of their resident attachments remain
-owned. The descriptor is the canonical collection anchor, representation,
+Strong collection retention follows signed ground truth, independently of
+current WRITE admission. For every strictly verified native `COMMIT`, the
+descriptor, signed data, and metadata handles are recursive roots, so all of
+their resident attachments remain owned. This conservatism matters because a
+later positive grant may activate an already-resident commit. The descriptor is
+the canonical collection anchor, representation,
 recipe, and reach description encoded as a `SimpleArchive`; its 32-byte content
 handle is the `CollectionHandle` carried by the commit. The native commit record
 is preserved by `CollectionStore` rather than represented as a blob root.
@@ -45,7 +47,7 @@ ownership edge. A future cache planner can choose useful materializations under
 a separate budget without letting append-only unsigned claims manufacture
 durable ownership. This boundary also means the strong planner needs neither a
 requested-view set nor persistent validation-verdict machinery: admitted
-commits themselves determine the collections that are retained.
+strictly verified commits themselves determine the collections that are retained.
 
 Exact Succinct Rank9 fibers follow the same rule. Their raw-to-Rank9 `DERIVE`
 records may survive a conservative ledger rewrite, but neither the
@@ -75,7 +77,7 @@ publication or retention API. Legacy V3 collection records are different: their
 16-byte definition identities predate descriptor handles, so they are
 preserved byte-for-byte as
 inert physical evidence but grant no current collection authority and own no
-blobs. Node policy needs no separate root primitive: its valid signer-owned
+blobs. Node policy needs no separate root primitive: its strictly valid
 collection commits retain the resident descriptor, fact archive, metadata, and
 referenced capability/signature closure under the ordinary collection rule.
 Blob WANT records are an explicit rewrite choice. Preserving them copies their
@@ -83,12 +85,13 @@ demand markers but does not promote the requested blob to an ownership root;
 dropping them omits the markers entirely.
 
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
-collection registry. Every later collection or rewrite must rediscover
-records, apply the local signer/authorization policy, resolve the claims, and
-supply a fresh plan for all admitted commits. Ordinary Pile and Yard rewrites
-independently apply the conservative rule above: preserve every native record,
-then recursively retain the resident descriptor, data, and metadata closure of
-every strictly verified current `COMMIT`.
+collection registry. A caller selecting one semantic view must rediscover its
+records, resolve current positive authority, and supply a fresh plan for the
+commits it selected. Ordinary Pile and Yard rewrites do not use that narrower
+admission decision: they independently apply the conservative rule above,
+preserving every native record and recursively retaining the resident
+descriptor, data, and metadata closure of every strictly verified current
+`COMMIT`.
 
 Opaque records form a harder boundary: their bytes have a known span and
 ordinary replay can safely project them away, but the reader cannot know
@@ -112,7 +115,7 @@ chunks do not name another resident object.
 The retention procedure is therefore:
 
 1. enumerate native collection records from one observed store view;
-2. strictly verify each admitted commit before its fields gain authority;
+2. strictly verify each commit before its fields gain retention authority;
 3. add the resident descriptor, data, and metadata of valid commits as
    recursive roots;
 4. add caller-selected direct or recursive policy roots;
