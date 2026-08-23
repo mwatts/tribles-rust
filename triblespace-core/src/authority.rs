@@ -23,14 +23,14 @@ use std::fmt;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::{Blob, TryFromBlob};
+use crate::blob::{Blob, IntoBlob, TryFromBlob};
 use crate::collection::simplearchive_union::{
     self, PublicationError, SimpleArchiveUnionValidationError,
 };
 use crate::collection::{
     discover_collection_records_authorized, empty_metadata_handle, CollectionCommit,
     CollectionData, CollectionDiscoveryError, CollectionHandle, CollectionName,
-    CollectionRecordDiagnostic, CollectionStore,
+    CollectionRecordDiagnostic, CollectionStore, CommitVerificationError,
 };
 use crate::id::{id_hex, Id};
 use crate::inline::encodings::boolean::Boolean;
@@ -371,6 +371,233 @@ impl AcceptedAuthorityGrant {
     }
 }
 
+/// One self-contained step in a portable authority proof.
+///
+/// The commit carries the issuer, signature, collection, data identity, and
+/// canonical empty-metadata identity. `data` carries the exact canonical grant
+/// bytes named by that commit. A proof verifier recomputes the data identity;
+/// it never trusts the blob's cached handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityProofStep {
+    commit: CollectionCommit,
+    data: Blob<SimpleArchive>,
+}
+
+impl AuthorityProofStep {
+    /// Pair one signed authority commit with the grant bytes it names.
+    ///
+    /// Construction is deliberately permissive so received evidence can be
+    /// represented before it is trusted. [`AuthorityProof::verify`] is the
+    /// admission boundary.
+    pub fn new(commit: CollectionCommit, data: Blob<SimpleArchive>) -> Self {
+        Self { commit, data }
+    }
+
+    /// Signed authority commit carried by this step.
+    pub fn commit(&self) -> CollectionCommit {
+        self.commit
+    }
+
+    /// Exact candidate bytes carried by this step.
+    pub fn data(&self) -> &Blob<SimpleArchive> {
+        &self.data
+    }
+}
+
+/// Exact root-to-leaf evidence for one accepted authority occurrence.
+///
+/// This type deliberately defines no network framing. A transport may encode
+/// each commit using its existing dense representation and carry the adjacent
+/// blob bytes in whatever envelope it already uses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityProof {
+    steps: Vec<AuthorityProofStep>,
+}
+
+impl AuthorityProof {
+    /// Construct received evidence in claimed root-to-leaf order.
+    ///
+    /// No validation happens here; malformed, reordered, or unrelated steps
+    /// remain representable until [`Self::verify`] rejects them.
+    pub fn new(steps: Vec<AuthorityProofStep>) -> Self {
+        Self { steps }
+    }
+
+    /// Claimed root-to-leaf proof steps.
+    pub fn steps(&self) -> &[AuthorityProofStep] {
+        &self.steps
+    }
+
+    /// Verify this exact root-to-leaf chain against one team root.
+    ///
+    /// Every commit is strictly self-signed, belongs to the canonical public
+    /// authority collection for `team_root`, names canonical empty metadata,
+    /// and binds the adjacent canonical grant bytes. The first step must be a
+    /// root-issued grant. Every later step must name the immediately previous
+    /// occurrence, be signed by its subject, preserve its exact action and
+    /// resource, and follow a delegating parent.
+    ///
+    /// The returned value is the verified leaf. A protocol that asked for one
+    /// particular occurrence should compare [`CollectionCommit::id`] on that
+    /// leaf with the id it requested; a valid prefix is naturally also a proof
+    /// of its own final occurrence.
+    pub fn verify(
+        &self,
+        team_root: VerifyingKey,
+    ) -> Result<AcceptedAuthorityGrant, AuthorityProofError> {
+        let expected_descriptor = descriptor(team_root);
+        let root = Inline::<ED25519PublicKey>::new(team_root.to_bytes());
+        let mut previous: Option<AcceptedAuthorityGrant> = None;
+
+        if self.steps.is_empty() {
+            return Err(AuthorityProofError::Empty);
+        }
+
+        for (step, proof_step) in self.steps.iter().enumerate() {
+            let commit = proof_step.commit;
+            commit
+                .verify_strict()
+                .map_err(|source| AuthorityProofError::InvalidCommit {
+                    step,
+                    commit: commit.id(),
+                    source,
+                })?;
+            validate_authority_header(&commit).map_err(|source| AuthorityProofError::Rejected {
+                step,
+                diagnostic: source.into_diagnostic(commit.id()),
+            })?;
+            let grant = validate_authority_data(&expected_descriptor, &commit, &proof_step.data)
+                .map_err(|source| AuthorityProofError::Rejected {
+                    step,
+                    diagnostic: source.into_diagnostic(commit.id()),
+                })?;
+
+            let candidate = Candidate { commit, grant };
+            let accepted = match previous {
+                None => {
+                    if grant.parent.is_some() {
+                        return Err(AuthorityProofError::WrongParent {
+                            step,
+                            commit: commit.id(),
+                            expected: None,
+                            actual: grant.parent,
+                        });
+                    }
+                    if commit.public_key() != root {
+                        return Err(AuthorityProofError::Rejected {
+                            step,
+                            diagnostic: AuthorityDiagnostic::InvalidRootIssuer {
+                                commit: commit.id(),
+                            },
+                        });
+                    }
+                    AcceptedAuthorityGrant { commit, grant }
+                }
+                Some(parent) => {
+                    let expected_parent = Some(parent.commit.id());
+                    if grant.parent != expected_parent {
+                        return Err(AuthorityProofError::WrongParent {
+                            step,
+                            commit: commit.id(),
+                            expected: expected_parent,
+                            actual: grant.parent,
+                        });
+                    }
+                    if let Some(diagnostic) =
+                        delegation_rejection(parent.commit.id(), parent, commit.id(), candidate)
+                    {
+                        return Err(AuthorityProofError::Rejected { step, diagnostic });
+                    }
+                    AcceptedAuthorityGrant { commit, grant }
+                }
+            };
+            previous = Some(accepted);
+        }
+
+        Ok(previous.expect("a nonempty proof assigned one verified step"))
+    }
+}
+
+/// Why portable authority evidence failed standalone verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityProofError {
+    /// A proof must contain at least one root-issued grant.
+    Empty,
+    /// One commit failed strict Ed25519 verification.
+    InvalidCommit {
+        /// Zero-based root-to-leaf step index.
+        step: usize,
+        /// Intrinsic id of the rejected commit.
+        commit: Id,
+        /// Strict signature or key failure.
+        source: CommitVerificationError,
+    },
+    /// A step did not name exactly its preceding proof occurrence.
+    WrongParent {
+        /// Zero-based root-to-leaf step index.
+        step: usize,
+        /// Intrinsic id of the rejected commit.
+        commit: Id,
+        /// Required parent (`None` only for the root step).
+        expected: Option<Id>,
+        /// Parent actually encoded by the grant.
+        actual: Option<Id>,
+    },
+    /// One otherwise self-signed step failed ordinary authority admission.
+    Rejected {
+        /// Zero-based root-to-leaf step index.
+        step: usize,
+        /// The same semantic diagnostic produced by full-prefix resolution.
+        diagnostic: AuthorityDiagnostic,
+    },
+}
+
+impl fmt::Display for AuthorityProofError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("authority proof is empty"),
+            Self::InvalidCommit {
+                step,
+                commit,
+                source,
+            } => write!(
+                formatter,
+                "authority proof step {step} commit {commit:X} failed strict verification: {source}"
+            ),
+            Self::WrongParent {
+                step,
+                commit,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "authority proof step {step} commit {commit:X} names parent {actual:?}, expected {expected:?}"
+            ),
+            Self::Rejected { step, diagnostic } => write!(
+                formatter,
+                "authority proof step {step} was rejected: {diagnostic:?}"
+            ),
+        }
+    }
+}
+
+impl Error for AuthorityProofError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidCommit { source, .. } => Some(source),
+            Self::Rejected {
+                diagnostic: AuthorityDiagnostic::InvalidData { source, .. },
+                ..
+            } => Some(source),
+            Self::Rejected {
+                diagnostic: AuthorityDiagnostic::InvalidGrant { source, .. },
+                ..
+            } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// Per-candidate evidence that remained inert during authority resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthorityDiagnostic {
@@ -484,6 +711,37 @@ impl AuthorityResolution {
     /// Candidates excluded from this known-prefix fixed point.
     pub fn diagnostics(&self) -> &[AuthorityDiagnostic] {
         &self.diagnostics
+    }
+
+    /// Build the unique exact-parent proof of one accepted occurrence.
+    ///
+    /// Following parent ids makes the result independent of discovery and map
+    /// iteration order. The canonical grant bytes are reconstructed from the
+    /// already-decoded atom and checked against each signed data identity
+    /// before the proof is returned.
+    pub fn proof(&self, leaf: Id) -> Option<AuthorityProof> {
+        let mut steps = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut cursor = leaf;
+
+        loop {
+            if !visited.insert(cursor) {
+                return None;
+            }
+            let accepted = *self.accepted.get(&cursor)?;
+            let data: Blob<SimpleArchive> = accepted.grant.fragment().into_facts().to_blob();
+            if Handle::<SimpleArchive>::to_hash(data.get_handle()) != accepted.commit.data() {
+                return None;
+            }
+            steps.push(AuthorityProofStep::new(accepted.commit, data));
+            let Some(parent) = accepted.grant.parent else {
+                break;
+            };
+            cursor = parent;
+        }
+
+        steps.reverse();
+        Some(AuthorityProof::new(steps))
     }
 
     /// Whether `subject` may invoke one exact `(action, resource)` atom.
@@ -619,10 +877,8 @@ where
     let mut candidates = BTreeMap::<Id, Candidate>::new();
 
     for commit in discovered.commits().iter().copied() {
-        if commit.metadata() != empty_metadata_handle() {
-            diagnostics.push(AuthorityDiagnostic::NonCanonicalMetadata {
-                commit: commit.id(),
-            });
+        if let Err(source) = validate_authority_header(&commit) {
+            diagnostics.push(source.into_diagnostic(commit.id()));
             continue;
         }
 
@@ -637,24 +893,10 @@ where
                 continue;
             }
         };
-        if let Err(source) =
-            simplearchive_union::validate_commit(&expected_descriptor, &commit, &data_blob)
-        {
-            diagnostics.push(AuthorityDiagnostic::InvalidData {
-                commit: commit.id(),
-                source,
-            });
-            continue;
-        }
-        let facts = TribleSet::try_from_blob(data_blob)
-            .expect("validate_commit established canonical SimpleArchive data");
-        let grant = match AuthorityGrant::decode(&facts) {
+        let grant = match validate_authority_data(&expected_descriptor, &commit, &data_blob) {
             Ok(grant) => grant,
             Err(source) => {
-                diagnostics.push(AuthorityDiagnostic::InvalidGrant {
-                    commit: commit.id(),
-                    source,
-                });
+                diagnostics.push(source.into_diagnostic(commit.id()));
                 continue;
             }
         };
@@ -702,29 +944,7 @@ where
             let child = candidates
                 .get(&child_id)
                 .expect("child index contains only parsed candidates");
-            let rejection = if child.commit.public_key() != parent.grant.subject {
-                Some(AuthorityDiagnostic::ParentSubjectMismatch {
-                    commit: child_id,
-                    parent: parent_id,
-                })
-            } else if child.grant.resource != parent.grant.resource {
-                Some(AuthorityDiagnostic::ResourceEscalation {
-                    commit: child_id,
-                    parent: parent_id,
-                })
-            } else if child.grant.action != parent.grant.action {
-                Some(AuthorityDiagnostic::ActionEscalation {
-                    commit: child_id,
-                    parent: parent_id,
-                })
-            } else if !parent.grant.delegate() {
-                Some(AuthorityDiagnostic::ParentCannotDelegate {
-                    commit: child_id,
-                    parent: parent_id,
-                })
-            } else {
-                None
-            };
+            let rejection = delegation_rejection(parent_id, parent, child_id, *child);
 
             evaluated.insert(child_id);
             if let Some(diagnostic) = rejection {
@@ -767,6 +987,75 @@ where
 struct Candidate {
     commit: CollectionCommit,
     grant: AuthorityGrant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuthorityCandidateValidationError {
+    NonCanonicalMetadata,
+    InvalidData(SimpleArchiveUnionValidationError),
+    InvalidGrant(AuthorityGrantDecodeError),
+}
+
+impl AuthorityCandidateValidationError {
+    fn into_diagnostic(self, commit: Id) -> AuthorityDiagnostic {
+        match self {
+            Self::NonCanonicalMetadata => AuthorityDiagnostic::NonCanonicalMetadata { commit },
+            Self::InvalidData(source) => AuthorityDiagnostic::InvalidData { commit, source },
+            Self::InvalidGrant(source) => AuthorityDiagnostic::InvalidGrant { commit, source },
+        }
+    }
+}
+
+fn validate_authority_header(
+    commit: &CollectionCommit,
+) -> Result<(), AuthorityCandidateValidationError> {
+    if commit.metadata() != empty_metadata_handle() {
+        return Err(AuthorityCandidateValidationError::NonCanonicalMetadata);
+    }
+    Ok(())
+}
+
+fn validate_authority_data(
+    expected_descriptor: &Fragment,
+    commit: &CollectionCommit,
+    data: &Blob<SimpleArchive>,
+) -> Result<AuthorityGrant, AuthorityCandidateValidationError> {
+    simplearchive_union::validate_commit(expected_descriptor, commit, data)
+        .map_err(AuthorityCandidateValidationError::InvalidData)?;
+    let facts = TribleSet::try_from_blob(data.clone())
+        .expect("validate_commit established canonical SimpleArchive data");
+    AuthorityGrant::decode(&facts).map_err(AuthorityCandidateValidationError::InvalidGrant)
+}
+
+fn delegation_rejection(
+    parent_id: Id,
+    parent: AcceptedAuthorityGrant,
+    child_id: Id,
+    child: Candidate,
+) -> Option<AuthorityDiagnostic> {
+    if child.commit.public_key() != parent.grant.subject {
+        Some(AuthorityDiagnostic::ParentSubjectMismatch {
+            commit: child_id,
+            parent: parent_id,
+        })
+    } else if child.grant.resource != parent.grant.resource {
+        Some(AuthorityDiagnostic::ResourceEscalation {
+            commit: child_id,
+            parent: parent_id,
+        })
+    } else if child.grant.action != parent.grant.action {
+        Some(AuthorityDiagnostic::ActionEscalation {
+            commit: child_id,
+            parent: parent_id,
+        })
+    } else if !parent.grant.delegate() {
+        Some(AuthorityDiagnostic::ParentCannotDelegate {
+            commit: child_id,
+            parent: parent_id,
+        })
+    } else {
+        None
+    }
 }
 
 fn exactly_one<T>(
@@ -818,6 +1107,180 @@ mod tests {
         let handle = crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
             .get_handle();
         (descriptor, handle)
+    }
+
+    fn delegated_resolution() -> (
+        VerifyingKey,
+        CollectionHandle,
+        [CollectionCommit; 3],
+        AuthorityResolution,
+    ) {
+        let root = key(80);
+        let delegate = key(81);
+        let subdelegate = key(82);
+        let writer = key(83);
+        let (_, target) = target(root.verifying_key(), "portable-proof");
+        let mut repo = MemoryRepo::default();
+
+        let first = publish_grant(
+            &mut repo,
+            root.verifying_key(),
+            &root,
+            AuthorityGrant::root(
+                delegate.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Delegate,
+            ),
+        )
+        .unwrap();
+        let second = publish_grant(
+            &mut repo,
+            root.verifying_key(),
+            &delegate,
+            AuthorityGrant::delegated(
+                first.id(),
+                subdelegate.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::InvokeAndDelegate,
+            ),
+        )
+        .unwrap();
+        let third = publish_grant(
+            &mut repo,
+            root.verifying_key(),
+            &subdelegate,
+            AuthorityGrant::delegated(
+                second.id(),
+                writer.verifying_key(),
+                target,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
+        let resolution = resolve_authority(&mut repo, root.verifying_key()).unwrap();
+
+        (
+            root.verifying_key(),
+            target,
+            [first, second, third],
+            resolution,
+        )
+    }
+
+    #[test]
+    fn resolution_constructs_one_deterministic_root_to_leaf_proof() {
+        let (root, target, commits, resolution) = delegated_resolution();
+
+        let proof = resolution.proof(commits[2].id()).unwrap();
+        assert_eq!(proof, resolution.proof(commits[2].id()).unwrap());
+        assert_eq!(
+            proof
+                .steps()
+                .iter()
+                .map(|step| step.commit().id())
+                .collect::<Vec<_>>(),
+            commits.iter().map(CollectionCommit::id).collect::<Vec<_>>()
+        );
+        for step in proof.steps() {
+            assert_eq!(
+                Handle::<SimpleArchive>::to_hash(step.data().get_handle()),
+                step.commit().data()
+            );
+        }
+
+        let leaf = proof.verify(root).unwrap();
+        assert_eq!(leaf.commit(), commits[2]);
+        assert_eq!(leaf.grant().resource(), target);
+        assert_eq!(leaf.grant().action(), ACTION_WRITE);
+        assert!(leaf.grant().invoke());
+        assert!(!leaf.grant().delegate());
+        assert!(resolution
+            .proof(id_hex!("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"))
+            .is_none());
+    }
+
+    #[test]
+    fn portable_proof_rejects_tampering_reordering_and_missing_ancestry() {
+        let (root, _, commits, resolution) = delegated_resolution();
+        let proof = resolution.proof(commits[2].id()).unwrap();
+
+        let mut tampered_steps = proof.steps().to_vec();
+        let mut tampered_commit = tampered_steps[2].commit().to_bytes();
+        *tampered_commit.last_mut().unwrap() ^= 1;
+        tampered_steps[2] = AuthorityProofStep::new(
+            CollectionCommit::from_bytes(tampered_commit),
+            tampered_steps[2].data().clone(),
+        );
+        assert!(matches!(
+            AuthorityProof::new(tampered_steps).verify(root),
+            Err(AuthorityProofError::InvalidCommit { step: 2, .. })
+        ));
+
+        let mut reordered_steps = proof.steps().to_vec();
+        reordered_steps.swap(1, 2);
+        assert!(matches!(
+            AuthorityProof::new(reordered_steps).verify(root),
+            Err(AuthorityProofError::WrongParent { step: 1, .. })
+        ));
+
+        let missing_root = AuthorityProof::new(proof.steps()[1..].to_vec());
+        assert!(matches!(
+            missing_root.verify(root),
+            Err(AuthorityProofError::WrongParent {
+                step: 0,
+                expected: None,
+                actual: Some(_),
+                ..
+            })
+        ));
+
+        let missing_middle =
+            AuthorityProof::new(vec![proof.steps()[0].clone(), proof.steps()[2].clone()]);
+        assert!(matches!(
+            missing_middle.verify(root),
+            Err(AuthorityProofError::WrongParent { step: 1, .. })
+        ));
+
+        // Removing only the final step yields a valid proof of its parent. The
+        // caller compares the returned leaf with the occurrence it requested.
+        let valid_prefix = AuthorityProof::new(proof.steps()[..2].to_vec());
+        assert_ne!(valid_prefix.verify(root).unwrap().commit(), commits[2]);
+    }
+
+    #[test]
+    fn portable_proof_rejects_wrong_root_and_wrong_data() {
+        let (root, _, commits, resolution) = delegated_resolution();
+        let proof = resolution.proof(commits[2].id()).unwrap();
+
+        assert!(matches!(
+            proof.verify(key(84).verifying_key()),
+            Err(AuthorityProofError::Rejected {
+                step: 0,
+                diagnostic: AuthorityDiagnostic::InvalidData {
+                    source: SimpleArchiveUnionValidationError::WrongCollection { .. },
+                    ..
+                },
+            })
+        ));
+
+        let mut wrong_data_steps = proof.steps().to_vec();
+        wrong_data_steps[2] = AuthorityProofStep::new(
+            wrong_data_steps[2].commit(),
+            wrong_data_steps[0].data().clone(),
+        );
+        assert!(matches!(
+            AuthorityProof::new(wrong_data_steps).verify(root),
+            Err(AuthorityProofError::Rejected {
+                step: 2,
+                diagnostic: AuthorityDiagnostic::InvalidData {
+                    source: SimpleArchiveUnionValidationError::EndpointMismatch { .. },
+                    ..
+                },
+            })
+        ));
     }
 
     #[test]
