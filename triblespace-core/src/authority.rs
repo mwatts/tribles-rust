@@ -121,6 +121,11 @@ impl AuthorityMode {
     pub fn delegates(self) -> bool {
         matches!(self, Self::Delegate | Self::InvokeAndDelegate)
     }
+
+    /// Whether this mode contains every use required by `required`.
+    pub fn satisfies(self, required: Self) -> bool {
+        (!required.invokes() || self.invokes()) && (!required.delegates() || self.delegates())
+    }
 }
 
 impl AuthorityGrant {
@@ -371,6 +376,64 @@ impl AcceptedAuthorityGrant {
     }
 }
 
+/// Exact authority a portable proof is expected to establish.
+///
+/// Proof verification is always claim-directed: validating a chain without
+/// checking its leaf would let a truncated prefix authenticate a different
+/// subject or use than the caller intended. `required` is a minimum; a grant
+/// carrying both invocation and delegation satisfies either individual use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthorityClaim {
+    subject: Inline<ED25519PublicKey>,
+    action: Id,
+    resource: CollectionHandle,
+    required: AuthorityMode,
+}
+
+impl AuthorityClaim {
+    /// Construct one exact subject/action/resource claim with required uses.
+    pub fn new(
+        subject: VerifyingKey,
+        action: Id,
+        resource: CollectionHandle,
+        required: AuthorityMode,
+    ) -> Self {
+        Self {
+            subject: Inline::new(subject.to_bytes()),
+            action,
+            resource,
+            required,
+        }
+    }
+
+    /// Public-key principal whose authority must be proven.
+    pub fn subject(&self) -> Inline<ED25519PublicKey> {
+        self.subject
+    }
+
+    /// Exact action whose authority must be proven.
+    pub fn action(&self) -> Id {
+        self.action
+    }
+
+    /// Exact collection resource whose authority must be proven.
+    pub fn resource(&self) -> CollectionHandle {
+        self.resource
+    }
+
+    /// Minimum invocation/delegation uses the leaf must carry.
+    pub fn required(&self) -> AuthorityMode {
+        self.required
+    }
+
+    fn is_satisfied_by(&self, grant: AuthorityGrant) -> bool {
+        grant.subject == self.subject
+            && grant.action == self.action
+            && grant.resource == self.resource
+            && grant.mode.satisfies(self.required)
+    }
+}
+
 /// One self-contained step in a portable authority proof.
 ///
 /// The commit carries the issuer, signature, collection, data identity, and
@@ -387,8 +450,8 @@ impl AuthorityProofStep {
     /// Pair one signed authority commit with the grant bytes it names.
     ///
     /// Construction is deliberately permissive so received evidence can be
-    /// represented before it is trusted. [`AuthorityProof::verify`] is the
-    /// admission boundary.
+    /// represented before it is trusted. [`AuthorityProof::verify_claim`] is
+    /// the admission boundary.
     pub fn new(commit: CollectionCommit, data: Blob<SimpleArchive>) -> Self {
         Self { commit, data }
     }
@@ -418,7 +481,7 @@ impl AuthorityProof {
     /// Construct received evidence in claimed root-to-leaf order.
     ///
     /// No validation happens here; malformed, reordered, or unrelated steps
-    /// remain representable until [`Self::verify`] rejects them.
+    /// remain representable until [`Self::verify_claim`] rejects them.
     pub fn new(steps: Vec<AuthorityProofStep>) -> Self {
         Self { steps }
     }
@@ -428,7 +491,7 @@ impl AuthorityProof {
         &self.steps
     }
 
-    /// Verify this exact root-to-leaf chain against one team root.
+    /// Verify that this exact root-to-leaf chain establishes `claim`.
     ///
     /// Every commit is strictly self-signed, belongs to the canonical public
     /// authority collection for `team_root`, names canonical empty metadata,
@@ -437,11 +500,27 @@ impl AuthorityProof {
     /// occurrence, be signed by its subject, preserve its exact action and
     /// resource, and follow a delegating parent.
     ///
-    /// The returned value is the verified leaf. A protocol that asked for one
-    /// particular occurrence should compare [`CollectionCommit::id`] on that
-    /// leaf with the id it requested; a valid prefix is naturally also a proof
-    /// of its own final occurrence.
-    pub fn verify(
+    /// The chain is validated before the verified leaf is compared with the
+    /// exact subject, action, resource, and minimum use in `claim`. A valid
+    /// prefix is naturally proof of its own leaf, but cannot accidentally
+    /// authorize a caller that required a later descendant.
+    pub fn verify_claim(
+        &self,
+        team_root: VerifyingKey,
+        claim: AuthorityClaim,
+    ) -> Result<AcceptedAuthorityGrant, AuthorityProofError> {
+        let leaf = self.verify_chain(team_root)?;
+        if !claim.is_satisfied_by(leaf.grant) {
+            return Err(AuthorityProofError::ClaimMismatch {
+                leaf: leaf.commit.id(),
+                claim,
+                actual: leaf.grant,
+            });
+        }
+        Ok(leaf)
+    }
+
+    fn verify_chain(
         &self,
         team_root: VerifyingKey,
     ) -> Result<AcceptedAuthorityGrant, AuthorityProofError> {
@@ -550,6 +629,15 @@ pub enum AuthorityProofError {
         /// The same semantic diagnostic produced by full-prefix resolution.
         diagnostic: AuthorityDiagnostic,
     },
+    /// The valid chain's leaf does not establish the caller's exact claim.
+    ClaimMismatch {
+        /// Intrinsic id of the valid but unsuitable leaf occurrence.
+        leaf: Id,
+        /// Exact authority the caller required.
+        claim: AuthorityClaim,
+        /// Authority actually carried by the verified leaf.
+        actual: AuthorityGrant,
+    },
 }
 
 impl fmt::Display for AuthorityProofError {
@@ -576,6 +664,14 @@ impl fmt::Display for AuthorityProofError {
             Self::Rejected { step, diagnostic } => write!(
                 formatter,
                 "authority proof step {step} was rejected: {diagnostic:?}"
+            ),
+            Self::ClaimMismatch {
+                leaf,
+                claim,
+                actual,
+            } => write!(
+                formatter,
+                "authority proof leaf {leaf:X} carries {actual:?}, which does not satisfy {claim:?}"
             ),
         }
     }
@@ -1173,6 +1269,12 @@ mod tests {
     #[test]
     fn resolution_constructs_one_deterministic_root_to_leaf_proof() {
         let (root, target, commits, resolution) = delegated_resolution();
+        let claim = AuthorityClaim::new(
+            key(83).verifying_key(),
+            ACTION_WRITE,
+            target,
+            AuthorityMode::Invoke,
+        );
 
         let proof = resolution.proof(commits[2].id()).unwrap();
         assert_eq!(proof, resolution.proof(commits[2].id()).unwrap());
@@ -1191,7 +1293,7 @@ mod tests {
             );
         }
 
-        let leaf = proof.verify(root).unwrap();
+        let leaf = proof.verify_claim(root, claim).unwrap();
         assert_eq!(leaf.commit(), commits[2]);
         assert_eq!(leaf.grant().resource(), target);
         assert_eq!(leaf.grant().action(), ACTION_WRITE);
@@ -1204,8 +1306,14 @@ mod tests {
 
     #[test]
     fn portable_proof_rejects_tampering_reordering_and_missing_ancestry() {
-        let (root, _, commits, resolution) = delegated_resolution();
+        let (root, target, commits, resolution) = delegated_resolution();
         let proof = resolution.proof(commits[2].id()).unwrap();
+        let claim = AuthorityClaim::new(
+            key(83).verifying_key(),
+            ACTION_WRITE,
+            target,
+            AuthorityMode::Invoke,
+        );
 
         let mut tampered_steps = proof.steps().to_vec();
         let mut tampered_commit = tampered_steps[2].commit().to_bytes();
@@ -1215,20 +1323,20 @@ mod tests {
             tampered_steps[2].data().clone(),
         );
         assert!(matches!(
-            AuthorityProof::new(tampered_steps).verify(root),
+            AuthorityProof::new(tampered_steps).verify_claim(root, claim),
             Err(AuthorityProofError::InvalidCommit { step: 2, .. })
         ));
 
         let mut reordered_steps = proof.steps().to_vec();
         reordered_steps.swap(1, 2);
         assert!(matches!(
-            AuthorityProof::new(reordered_steps).verify(root),
+            AuthorityProof::new(reordered_steps).verify_claim(root, claim),
             Err(AuthorityProofError::WrongParent { step: 1, .. })
         ));
 
         let missing_root = AuthorityProof::new(proof.steps()[1..].to_vec());
         assert!(matches!(
-            missing_root.verify(root),
+            missing_root.verify_claim(root, claim),
             Err(AuthorityProofError::WrongParent {
                 step: 0,
                 expected: None,
@@ -1240,23 +1348,24 @@ mod tests {
         let missing_middle =
             AuthorityProof::new(vec![proof.steps()[0].clone(), proof.steps()[2].clone()]);
         assert!(matches!(
-            missing_middle.verify(root),
+            missing_middle.verify_claim(root, claim),
             Err(AuthorityProofError::WrongParent { step: 1, .. })
         ));
-
-        // Removing only the final step yields a valid proof of its parent. The
-        // caller compares the returned leaf with the occurrence it requested.
-        let valid_prefix = AuthorityProof::new(proof.steps()[..2].to_vec());
-        assert_ne!(valid_prefix.verify(root).unwrap().commit(), commits[2]);
     }
 
     #[test]
     fn portable_proof_rejects_wrong_root_and_wrong_data() {
-        let (root, _, commits, resolution) = delegated_resolution();
+        let (root, target, commits, resolution) = delegated_resolution();
         let proof = resolution.proof(commits[2].id()).unwrap();
+        let claim = AuthorityClaim::new(
+            key(83).verifying_key(),
+            ACTION_WRITE,
+            target,
+            AuthorityMode::Invoke,
+        );
 
         assert!(matches!(
-            proof.verify(key(84).verifying_key()),
+            proof.verify_claim(key(84).verifying_key(), claim),
             Err(AuthorityProofError::Rejected {
                 step: 0,
                 diagnostic: AuthorityDiagnostic::InvalidData {
@@ -1272,7 +1381,7 @@ mod tests {
             wrong_data_steps[0].data().clone(),
         );
         assert!(matches!(
-            AuthorityProof::new(wrong_data_steps).verify(root),
+            AuthorityProof::new(wrong_data_steps).verify_claim(root, claim),
             Err(AuthorityProofError::Rejected {
                 step: 2,
                 diagnostic: AuthorityDiagnostic::InvalidData {
@@ -1281,6 +1390,72 @@ mod tests {
                 },
             })
         ));
+    }
+
+    #[test]
+    fn portable_proof_requires_the_exact_leaf_claim() {
+        let (root, target, commits, resolution) = delegated_resolution();
+        let proof = resolution.proof(commits[2].id()).unwrap();
+        let writer_claim = AuthorityClaim::new(
+            key(83).verifying_key(),
+            ACTION_WRITE,
+            target,
+            AuthorityMode::Invoke,
+        );
+
+        assert!(proof.verify_claim(root, writer_claim).is_ok());
+
+        // A structurally valid prefix proves its intermediate subject, not the
+        // intended descendant. Claim-directed verification makes truncation a
+        // failure instead of an `is_ok()` authorization footgun.
+        let truncated = AuthorityProof::new(proof.steps()[..2].to_vec());
+        assert!(matches!(
+            truncated.verify_claim(root, writer_claim),
+            Err(AuthorityProofError::ClaimMismatch { leaf, .. }) if leaf == commits[1].id()
+        ));
+        for required in [
+            AuthorityMode::Invoke,
+            AuthorityMode::Delegate,
+            AuthorityMode::InvokeAndDelegate,
+        ] {
+            let actual_prefix_claim =
+                AuthorityClaim::new(key(82).verifying_key(), ACTION_WRITE, target, required);
+            assert!(truncated.verify_claim(root, actual_prefix_claim).is_ok());
+        }
+
+        let (_, other_resource) = self::target(root, "wrong-claim-resource");
+        let wrong_claims = [
+            AuthorityClaim::new(
+                key(84).verifying_key(),
+                ACTION_WRITE,
+                target,
+                AuthorityMode::Invoke,
+            ),
+            AuthorityClaim::new(
+                key(83).verifying_key(),
+                id_hex!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                target,
+                AuthorityMode::Invoke,
+            ),
+            AuthorityClaim::new(
+                key(83).verifying_key(),
+                ACTION_WRITE,
+                other_resource,
+                AuthorityMode::Invoke,
+            ),
+            AuthorityClaim::new(
+                key(83).verifying_key(),
+                ACTION_WRITE,
+                target,
+                AuthorityMode::Delegate,
+            ),
+        ];
+        for claim in wrong_claims {
+            assert!(matches!(
+                proof.verify_claim(root, claim),
+                Err(AuthorityProofError::ClaimMismatch { .. })
+            ));
+        }
     }
 
     #[test]
