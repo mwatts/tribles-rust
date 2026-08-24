@@ -125,11 +125,15 @@ invoke/delegate mode, optional parent signature handle, and optional inclusive
 validity interval. Proofs follow those handles from one designated leaf; there
 is no authority collection, resolver, global membership registry, or list
 operation. An invite carries the complete bounded root-to-leaf proof needed for
-standalone verification.
+standalone verification. `create`, `invite`, and `join` also commit the chosen
+leaf signature archive to a private local `capability-wallet` collection. That
+collection is not team authority or a global roster; it is the node's durable
+ownership decision, so retained rewrites preserve the complete referenced
+proof ancestry.
 
-- `team create --pile PATH [--key KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — mint a team root, issue the founder CONNECT in `invoke+delegate` mode, store the exact claim/signature blobs, and print the root public key, offline root secret, and founder credential handle.
+- `team create --pile PATH [--key KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — mint a team root, issue the founder CONNECT in `invoke+delegate` mode, store and locally retain the exact proof, and print the root public key, offline root secret, and founder credential handle.
 - `team invite --pile PATH --team-root HEX --parent HANDLE --key ISSUER --invitee HEX [--delegate] [--valid-from RFC3339 --valid-until RFC3339] --out FILE` — load one exact resident parent, verify its delegation capability at the current time, issue and store the child blobs, and write a portable proof bundle. Without `--delegate`, the child may connect but cannot invite.
-- `team join --pile PATH --key INVITEE --invite FILE` — verify the bundle's exact root, subject, CONNECT atom, minimum invoke mode, and current validity before storing its claim/signature blobs idempotently. It prints the accepted leaf credential.
+- `team join --pile PATH --key INVITEE --invite FILE` — verify the bundle's exact root, subject, CONNECT atom, minimum invoke mode, and current validity before storing and locally retaining its proof idempotently. It prints the accepted leaf credential.
 - `team show --pile PATH --team-root HEX --credential HANDLE` — load, verify, and print the exact root-to-leaf ancestry of one designated credential.
 
 ### Work with remote stores

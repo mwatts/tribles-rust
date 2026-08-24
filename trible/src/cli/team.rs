@@ -17,13 +17,17 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::Blob;
+use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityBlobHandle, CapabilityClaim, CapabilityGrant,
     CapabilityMode, CapabilityProof, CapabilityProofStep, CapabilityValidity,
 };
+use triblespace_core::collection::reach;
+use triblespace_core::collection::records::CollectionName;
+use triblespace_core::collection::simplearchive_union;
 use triblespace_core::repo::pile::{GetBlobError, Pile};
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::trible::TribleSet;
 
 use triblespace_net::protocol::{
     connect_capability_atom, decode_capability_proof, encode_capability_proof, ACTION_CONNECT,
@@ -32,6 +36,7 @@ use triblespace_net::protocol::{
 
 const TEAM_ROOT_BYTES: usize = 32;
 const MAX_INVITE_BYTES: usize = TEAM_ROOT_BYTES + MAX_CAPABILITY_PROOF_BYTES;
+const CAPABILITY_WALLET_COLLECTION: &str = "capability-wallet";
 
 #[derive(Parser)]
 pub enum Command {
@@ -255,7 +260,19 @@ fn load_proof(pile: &mut Pile, credential: CapabilityBlobHandle) -> Result<Capab
     })
 }
 
-fn store_proof(pile: &mut Pile, proof: &CapabilityProof) -> Result<()> {
+/// Store exact proof blobs and make the leaf a durable local ownership root.
+///
+/// Raw blobs alone are intentionally cache-like: a retained Pile rewrite or
+/// Yard collection may discard them. The private wallet is not an authority
+/// registry. It is an ordinary local collection whose signed data element is
+/// the leaf signature archive itself. Native COMMIT retention therefore walks
+/// signature -> claim -> parent signature and owns the complete resident
+/// ancestry without making team membership globally enumerable.
+fn store_proof(pile: &mut Pile, wallet_key: &SigningKey, proof: &CapabilityProof) -> Result<()> {
+    let leaf = proof
+        .steps()
+        .last()
+        .context("cannot store an empty capability proof")?;
     for (index, step) in proof.steps().iter().enumerate() {
         // Rebuild from bytes before insertion so Pile never receives a blob
         // carrying an unverified cached handle. Proof verification likewise
@@ -278,6 +295,18 @@ fn store_proof(pile: &mut Pile, proof: &CapabilityProof) -> Result<()> {
             bail!("stored capability signature {index} under a different content handle");
         }
     }
+
+    let wallet_name = CollectionName::new(CAPABILITY_WALLET_COLLECTION)
+        .expect("the static capability wallet name is valid");
+    let wallet = simplearchive_union::descriptor(
+        &wallet_name,
+        wallet_key.verifying_key(),
+        None,
+        reach::private(),
+    );
+    let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
+    simplearchive_union::publish_commit(pile, &wallet, leaf.signature(), &metadata, wallet_key)
+        .map_err(|error| anyhow!("retain capability proof in local wallet: {error}"))?;
     Ok(())
 }
 
@@ -363,7 +392,7 @@ fn run_create(
     let proof = CapabilityProof::new(vec![founder_step]);
     encode_capability_proof(&proof)
         .map_err(|error| anyhow!("founder proof is not portable: {error}"))?;
-    with_pile(&pile_path, |pile| store_proof(pile, &proof))?;
+    with_pile(&pile_path, |pile| store_proof(pile, &founder, &proof))?;
     let credential = proof
         .credential()
         .expect("a one-step founder proof has one leaf credential");
@@ -438,7 +467,7 @@ fn run_invite(
         let proof = CapabilityProof::new(steps);
         encode_capability_proof(&proof)
             .map_err(|error| anyhow!("child proof is not portable: {error}"))?;
-        store_proof(pile, &proof)?;
+        store_proof(pile, &issuer_key, &proof)?;
         Ok(proof)
     })?;
 
@@ -467,7 +496,7 @@ fn run_join(pile_path: PathBuf, key_path: Option<PathBuf>, invite_path: PathBuf)
         )
         .map_err(|error| anyhow!("invite proof rejected: {error}"))?;
 
-    with_pile(&pile_path, |pile| store_proof(pile, &proof))?;
+    with_pile(&pile_path, |pile| store_proof(pile, &local_key, &proof))?;
 
     println!("team root:           {}", hex::encode(team_root.to_bytes()));
     println!(
@@ -572,4 +601,77 @@ fn run_show(pile_path: PathBuf, team_root_text: String, credential_text: String)
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace_core::repo::pile::WantRewritePolicy;
+    use triblespace_core::repo::RetentionRoots;
+
+    fn key(byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[byte; 32])
+    }
+
+    #[test]
+    fn local_wallet_retains_complete_proof_through_pile_rewrite() {
+        let root = key(1);
+        let issuer = key(2);
+        let member = key(3);
+        let root_step = CapabilityProofStep::issue(
+            &root,
+            CapabilityGrant::root(
+                issuer.verifying_key(),
+                connect_atom(root.verifying_key()),
+                CapabilityMode::InvokeAndDelegate,
+                None,
+            ),
+        );
+        let leaf_step = CapabilityProofStep::issue(
+            &issuer,
+            CapabilityGrant::delegated(
+                root_step.signature_handle(),
+                member.verifying_key(),
+                connect_atom(root.verifying_key()),
+                CapabilityMode::Invoke,
+                None,
+            ),
+        );
+        let proof = CapabilityProof::new(vec![root_step, leaf_step]);
+        let credential = proof.credential().expect("nonempty proof");
+
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.pile");
+        let destination_path = directory.path().join("destination.pile");
+        std::fs::File::create(&source_path).unwrap();
+        std::fs::File::create(&destination_path).unwrap();
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        store_proof(&mut source, &issuer, &proof).unwrap();
+        source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+
+        let retained = load_proof(&mut destination, credential).unwrap();
+        assert_eq!(retained, proof);
+        retained
+            .verify_claim(
+                root.verifying_key(),
+                triblespace_core::clock::epoch_now(),
+                CapabilityClaim::new(
+                    member.verifying_key(),
+                    connect_atom(root.verifying_key()),
+                    CapabilityMode::Invoke,
+                ),
+            )
+            .unwrap();
+
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
 }

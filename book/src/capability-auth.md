@@ -131,7 +131,12 @@ on the connection.
 ## Team CLI
 
 The `trible team` surface has four commands. All claim/signature evidence lives
-as ordinary blobs in the supplied pile.
+as ordinary blobs in the supplied pile. A chosen leaf signature archive is
+also the data element of a private, signer-namespaced `capability-wallet`
+collection. This wallet is local retention policy, not authority and not a
+team-wide registry: its ordinary signed COMMIT makes conservative collection
+walks retain the leaf signature, its claim, and every resident parent in the
+exact ancestry.
 
 ```text
 trible team create --pile PATH [--key KEY_PATH]
@@ -140,7 +145,7 @@ trible team create --pile PATH [--key KEY_PATH]
 
 Creates a fresh team-root key, initializes the founder key at its conventional
 path if needed, issues a root-signed founder CONNECT credential in
-`InvokeAndDelegate` mode, and stores its exact blobs. It prints the team-root
+`InvokeAndDelegate` mode, and stores and locally retains its exact proof. It prints the team-root
 public key, offline root secret, and 64-hex-character founder credential. The
 root secret is not written to the pile or a key file; anyone holding it can
 issue an independent root credential for the team.
@@ -164,7 +169,7 @@ trible team join --pile PATH --key INVITEE_KEY --invite FILE
 
 Loads the invitee's existing key and verifies the bundle's exact root, subject,
 CONNECT atom, minimum invocation mode, and current validity before writing
-anything. It then stores every claim/signature blob idempotently and prints the
+anything. It then stores and locally retains every claim/signature blob idempotently and prints the
 accepted leaf credential.
 
 ```text
