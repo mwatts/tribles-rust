@@ -179,13 +179,14 @@ referencing those blobs stay portable. The corresponding traits are
 `InlineEncoding` and `BlobEncoding`.
 
 ### Team Root
-The Ed25519 key whose public half identifies a team and its one canonical
-[authority collection](#authority-collection). A no-parent authority grant is
-grounded only when its collection commit is signed by this root. Keeping the
-secret offline after bootstrap is operational practice, not a one-use rule in
-the algebra: anyone holding it can publish another independent root grant.
-`PeerConfig.team_root` fixes both the CONNECT proof anchor and, when gossip is
-enabled, the team topic ID.
+The Ed25519 trust-root key used to anchor a team's blob-native capability
+proofs. A no-parent claim is grounded only when its signature comes from this
+root. For transport, the public key's exact 32 bytes are also the CONNECT
+resource. The root does not imply a membership registry or gossip rendezvous;
+`PeerConfig.connect_root` and its independently chosen `gossip_topic` keep
+those concerns separate. Keeping the secret offline after bootstrap is
+operational practice, not a one-use rule: anyone holding it can issue another
+independent root credential.
 
 ### Trible
 A three-part tuple of entity, attribute, and value stored in a fixed 64-byte

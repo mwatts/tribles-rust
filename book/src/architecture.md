@@ -45,10 +45,10 @@ ambient policy oracle. A capability-guarded descriptor names an external trust
 root, while the facade owns explicit root-to-leaf proofs naming one expected
 subject, exact collection resource, action, and invocation/delegation mode.
 Ordinary collection operations verify those presentations directly at one
-clock instant. The separate positive, enumerable authority collection remains
-available to protocols which deliberately choose a store-resolved grant DAG,
-but the high-level collection facade neither scans nor depends on it. Holding a
-facade's signing key alone grants nothing in capability mode.
+clock instant. Capability claims and signatures are ordinary blobs followed
+from one explicitly named leaf credential; there is no authority collection,
+store scan, or global membership registry. Holding a facade's signing key alone
+grants nothing in capability mode.
 
 ## Architectural layers
 
