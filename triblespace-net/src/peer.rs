@@ -724,6 +724,7 @@ mod collection_gossip_tests {
         let published_descriptor = simplearchive_union::descriptor(
             &CollectionName::new("published").unwrap(),
             team,
+            Some(team),
             reach::public(),
         );
         let published = simplearchive_union::publish_fragment_commit(
@@ -737,6 +738,7 @@ mod collection_gossip_tests {
         let withheld_descriptor = simplearchive_union::descriptor(
             &CollectionName::new("withheld").unwrap(),
             team,
+            Some(team),
             reach::private(),
         );
         let withheld = simplearchive_union::publish_fragment_commit(

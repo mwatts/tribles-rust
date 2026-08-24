@@ -39,7 +39,12 @@ fn test_team() -> VerifyingKey {
 }
 
 fn named_root(name: &str) -> DescriptorFragment {
-    simplearchive_union::descriptor(&collection_name(name), test_team(), reach::public())
+    simplearchive_union::descriptor(
+        &collection_name(name),
+        test_team(),
+        Some(test_team()),
+        reach::public(),
+    )
 }
 
 /// The identity of a descriptor these simulations only address, never store.

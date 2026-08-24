@@ -1533,6 +1533,7 @@ mod collection_evidence_gossip_tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("gossiped").unwrap(),
             author.verifying_key(),
+            Some(author.verifying_key()),
             reach::private(),
         );
         // Gossip only ever carries the identity; nothing here stores the

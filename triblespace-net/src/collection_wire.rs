@@ -514,6 +514,7 @@ mod tests {
         simplearchive_union::descriptor(
             &CollectionName::new(name).unwrap(),
             test_team(),
+            Some(test_team()),
             reach::private(),
         )
     }
@@ -524,6 +525,7 @@ mod tests {
         simplearchive_union::descriptor(
             &CollectionName::new(name).unwrap(),
             test_team(),
+            Some(test_team()),
             reach::public(),
         )
     }

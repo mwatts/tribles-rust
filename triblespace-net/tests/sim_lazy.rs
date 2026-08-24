@@ -109,6 +109,7 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("lazy").unwrap(),
             key(0xF1).verifying_key(),
+            Some(key(0xF1).verifying_key()),
             reach::private(),
         )
         .into_facts()

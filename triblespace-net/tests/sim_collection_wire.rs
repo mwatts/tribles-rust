@@ -46,7 +46,12 @@ fn test_team() -> VerifyingKey {
 
 /// A named root of the canonical `SimpleArchive` union kind.
 fn named_root(name: &str) -> DescriptorFragment {
-    simplearchive_union::descriptor(&collection_name(name), test_team(), reach::public())
+    simplearchive_union::descriptor(
+        &collection_name(name),
+        test_team(),
+        Some(test_team()),
+        reach::public(),
+    )
 }
 
 /// The identity of a descriptor these simulations only address, never store.
@@ -385,8 +390,12 @@ fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() 
         let client_store = empty_store();
 
         // Deliberately NOT `named_root`, which declares `reach::public()`.
-        let descriptor =
-            simplearchive_union::descriptor(&collection_name("c4"), test_team(), reach::private());
+        let descriptor = simplearchive_union::descriptor(
+            &collection_name("c4"),
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+        );
         let data: Blob<SimpleArchive> = TribleSet::new().to_blob();
         server_store
             .put::<SimpleArchive, _>(descriptor.clone().into_facts().to_blob())
