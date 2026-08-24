@@ -41,7 +41,8 @@ let writer = SigningKey::generate(&mut OsRng);
 let team = team_key.verifying_key();
 let name = CollectionName::new("models")?;
 let mut storage = MemoryRepo::default();
-let descriptor = simplearchive_union::descriptor(&name, team, reach::private());
+let descriptor =
+    simplearchive_union::descriptor(&name, team, Some(team), reach::private());
 let target = descriptor.facts().clone().to_blob().get_handle();
 authority::publish_grant(
     &mut storage,

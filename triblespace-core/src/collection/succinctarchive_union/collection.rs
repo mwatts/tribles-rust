@@ -26,7 +26,7 @@ use crate::collection::exact_derived::{
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
-use crate::collection::records::CollectionName;
+use crate::collection::records::{collection_authority, CollectionName};
 use crate::collection::simplearchive_union;
 use crate::trible::Fragment;
 // Reach arrives here as a builder argument; only the tests name a
@@ -151,7 +151,12 @@ impl SuccinctArchiveCollection {
 
     /// Canonical source SimpleArchive-union descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.team, self.source_reach.clone())
+        simplearchive_union::descriptor(
+            &self.name,
+            self.team,
+            Some(self.team),
+            self.source_reach.clone(),
+        )
     }
 
     /// Identity of the source collection this projection reads.
@@ -162,7 +167,11 @@ impl SuccinctArchiveCollection {
 
     /// Canonical target raw-SuccinctArchive-union descriptor.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(self.source_collection(), self.reach.clone())
+        super::descriptor(
+            self.source_collection(),
+            Some(self.team),
+            self.reach.clone(),
+        )
     }
 
     /// Identity of the raw Succinct cover this projection maintains.
@@ -190,6 +199,7 @@ impl SuccinctArchiveCollection {
         crate::prelude::entity! {
             crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_source: self.collection(),
+            collection_authority: self.team,
             collection_representation: representation,
             collection_recipe: recipe,
         }
@@ -863,6 +873,7 @@ mod tests {
             identity_for_tests(&simplearchive_union::descriptor(
                 name,
                 test_team(),
+                Some(test_team()),
                 reach::private(),
             )),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),

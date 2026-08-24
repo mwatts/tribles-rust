@@ -9,12 +9,11 @@
 //! Nothing here validates shape. A descriptor may carry attributes this binary
 //! has never heard of: they are arguments to a recipe it does not implement,
 //! they travel through untouched, and classifying them is nobody's business
-//! but that recipe's. By convention a root carries
-//! [`collection_name`] and [`collection_team`] while a derived collection
-//! carries [`collection_source`] instead, but that is what the recipes agree
-//! on, not something enforced here.
-
-use std::fmt;
+//! but that recipe's. By convention a root carries [`collection_name`] and
+//! [`collection_namespace`] while a derived collection carries
+//! [`collection_source`] instead. Either kind may independently declare an
+//! optional [`collection_authority`]; authority is never inferred by walking
+//! the source chain. These are recipe conventions, not generic shape checks.
 
 use ed25519_dalek::VerifyingKey;
 
@@ -35,9 +34,9 @@ use crate::trible::{Fragment, TribleSet};
 #[cfg(test)]
 use super::reach;
 use super::records::{
-    collection_name, collection_reach, collection_recipe, collection_representation,
-    collection_source, collection_team, CollectionHandle, CollectionName, RecordDecodeError,
-    KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_name, collection_namespace, collection_reach,
+    collection_recipe, collection_representation, collection_source, CollectionHandle,
+    CollectionName, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
 };
 
 /// Build a root descriptor that names its representation and recipe without
@@ -61,7 +60,8 @@ use super::records::{
 /// signature to state them.
 pub fn naming(
     name: &CollectionName,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
+    authority: Option<VerifyingKey>,
     representation: Id,
     recipe: Id,
     reach: Fragment,
@@ -69,7 +69,8 @@ pub fn naming(
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_name: name.as_str(),
-        collection_team: team,
+        collection_namespace: namespace,
+        collection_authority?: authority,
         collection_representation: representation,
         collection_recipe: recipe,
         collection_reach*: reach,
@@ -139,7 +140,7 @@ pub fn source(facts: &TribleSet) -> Option<CollectionHandle> {
     .next()
 }
 
-/// The name a root collection is known by within its team.
+/// The name a root collection is known by within its namespace.
 ///
 /// A derived collection has no name of its own and answers `None`: its anchor
 /// is its source, and its name is whatever that source is called.
@@ -160,129 +161,35 @@ pub fn name(facts: &TribleSet) -> Option<Result<CollectionName, RecordDecodeErro
     )
 }
 
-/// Root public key of the team a root collection belongs to.
+/// Public-key namespace which distinguishes root collection names.
 ///
-/// A derived collection answers `None` and inherits its team from its source,
-/// transitively.
-pub fn team(facts: &TribleSet) -> Option<Result<VerifyingKey, RecordDecodeError>> {
+/// Derived descriptors carry no namespace: their exact source handle is their
+/// identity anchor instead.
+pub fn namespace(facts: &TribleSet) -> Option<Result<VerifyingKey, RecordDecodeError>> {
     let key = find!(
         (v: VerifyingKey?),
-        pattern!(facts, [{ _?e @ collection_team: ?v }])
+        pattern!(facts, [{ _?e @ collection_namespace: ?v }])
     )
     .map(|(v,)| v)
     .next()?;
-    Some(key.map_err(|_| RecordDecodeError::InvalidId("collection_team")))
+    Some(key.map_err(|_| RecordDecodeError::InvalidId("collection_namespace")))
 }
 
-/// How deep a team-root walk will follow [`collection_source`].
+/// Optional external capability trust root declared by this descriptor.
 ///
-/// Not a safety bound against cycles -- see [`team_root`], which explains why
-/// there cannot be one -- but against a chain long enough that walking it is
-/// itself the attack. Real derivation pipelines stack a handful of
-/// representations deep.
-pub const MAX_DERIVATION_DEPTH: usize = 64;
-
-/// Why a collection's team root could not be established.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TeamRootError {
-    /// A descriptor on the chain is not available to the lookup.
-    ///
-    /// This is not a verdict about the collection. The team root is simply not
-    /// knowable yet, exactly as an absent blob makes a claim pending rather
-    /// than invalid.
-    NotResident(CollectionHandle),
-    /// A descriptor decoded, but the field the walk needed did not.
-    Invalid {
-        /// Descriptor holding the unreadable field.
-        collection: CollectionHandle,
-        /// What went wrong reading it.
-        source: RecordDecodeError,
-    },
-    /// The chain is longer than [`MAX_DERIVATION_DEPTH`].
-    TooDeep {
-        /// Descriptor the walk gave up on.
-        collection: CollectionHandle,
-    },
-    /// The chain reached a root that anchors to no team.
-    ///
-    /// A root with neither a source nor a team has no authority to inherit, so
-    /// there is no owner to report for anything derived from it.
-    NoTeam(CollectionHandle),
-}
-
-impl fmt::Display for TeamRootError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotResident(collection) => write!(
-                f,
-                "collection descriptor {} is not resident",
-                hex::encode_upper(collection.raw),
-            ),
-            Self::Invalid { collection, source } => write!(
-                f,
-                "collection descriptor {} is invalid: {source}",
-                hex::encode_upper(collection.raw),
-            ),
-            Self::TooDeep { collection } => write!(
-                f,
-                "derivation chain through {} is deeper than {MAX_DERIVATION_DEPTH}",
-                hex::encode_upper(collection.raw),
-            ),
-            Self::NoTeam(collection) => write!(
-                f,
-                "root collection descriptor {} names no team",
-                hex::encode_upper(collection.raw),
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TeamRootError {}
-
-/// Walk [`collection_source`] to the root and read the team it anchors to.
-///
-/// A root carries its own [`collection_team`]; a derived collection carries
-/// only its source and inherits the team transitively. Asking who owns a
-/// derived collection therefore means walking to that root, which is what
-/// `trible pile collection show` does to report a derivation's team. `lookup`
-/// answers with a descriptor's facts, or `None` when the descriptor is not
-/// available locally.
-///
-/// **The walk terminates by construction, and no cycle is representable.** A
-/// descriptor is named by the hash of its own bytes, and `collection_source`
-/// holds such a name, so a descriptor can only ever point at bytes that
-/// already existed when it was written. A cycle would require a descriptor
-/// containing its own hash -- a preimage. This is not a rule anyone enforces;
-/// content addressing makes the derivation graph acyclic in the same way it
-/// makes a Merkle tree acyclic. [`MAX_DERIVATION_DEPTH`] therefore guards
-/// against absurd length, not against looping.
-///
-/// The cost is one small archive fetch per hop, and a real pipeline is one to
-/// three hops deep. The case worth planning for is not depth but residency: a
-/// missing source descriptor makes the team root *unknown*, which a caller
-/// should treat as pending rather than as a rejection.
-pub fn team_root(
-    collection: CollectionHandle,
-    mut lookup: impl FnMut(CollectionHandle) -> Option<TribleSet>,
-) -> Result<(CollectionHandle, VerifyingKey), TeamRootError> {
-    let mut current = collection;
-    for _ in 0..MAX_DERIVATION_DEPTH {
-        let facts = lookup(current).ok_or(TeamRootError::NotResident(current))?;
-        if let Some(team) = team(&facts) {
-            let team = team.map_err(|source| TeamRootError::Invalid {
-                collection: current,
-                source,
-            })?;
-            return Ok((current, team));
-        }
-        match source(&facts) {
-            Some(next) => current = next,
-            None => return Err(TeamRootError::NoTeam(current)),
-        }
-    }
-    Err(TeamRootError::TooDeep {
-        collection: current,
-    })
+/// This lookup is deliberately local. A derived descriptor either names its
+/// own authority or has none; the source descriptor cannot silently supply
+/// one. Namespace and authority therefore have distinct semantic roles, while
+/// both remain identity-bearing facts in the descriptor's content handle.
+/// Locality also avoids making authorization depend on source residency.
+pub fn authority(facts: &TribleSet) -> Option<Result<VerifyingKey, RecordDecodeError>> {
+    let key = find!(
+        (v: VerifyingKey?),
+        pattern!(facts, [{ _?e @ collection_authority: ?v }])
+    )
+    .map(|(v,)| v)
+    .next()?;
+    Some(key.map_err(|_| RecordDecodeError::InvalidId("collection_authority")))
 }
 
 /// Look up one recipe argument by attribute.
@@ -320,18 +227,20 @@ fn exactly_one<T>(
     })
 }
 
-/// A root descriptor under one fixed test team, named by `name`.
+/// A root descriptor under one fixed test namespace and authority, named by
+/// `name`.
 ///
 /// Tests overwhelmingly want "some collection, distinct from that other one".
-/// Spelling that as a name under a fixed team keeps the distinction readable
-/// in the test itself, which is the whole reason a name replaced an opaque
-/// scope id.
+/// Spelling that as a name under a fixed namespace keeps the distinction
+/// readable in the test itself, which is the whole reason a name replaced an
+/// opaque scope id.
 #[cfg(test)]
 pub(crate) fn named_for_tests(name: &str, representation: Id, recipe: Id) -> Fragment {
-    let team = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]).verifying_key();
+    let root = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]).verifying_key();
     naming(
         &CollectionName::new(name).expect("test collection name"),
-        team,
+        root,
+        Some(root),
         representation,
         recipe,
         reach::private(),
@@ -361,184 +270,102 @@ pub(crate) fn identity_for_tests(descriptor: &Fragment) -> CollectionHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use ed25519_dalek::SigningKey;
 
     use super::*;
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::collection::records::collection_source;
+    use crate::collection::records::{collection_authority, collection_source};
     use crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use crate::metadata;
-
-    fn store(descriptors: &[Fragment]) -> BTreeMap<CollectionHandle, TribleSet> {
-        descriptors
-            .iter()
-            .map(|fragment| (identity_for_tests(fragment), fragment.facts().clone()))
-            .collect()
-    }
 
     fn team_key(byte: u8) -> ed25519_dalek::VerifyingKey {
         SigningKey::from_bytes(&[byte; 32]).verifying_key()
     }
 
-    fn root(name: &str, team: ed25519_dalek::VerifyingKey) -> Fragment {
+    fn root(
+        name: &str,
+        namespace: ed25519_dalek::VerifyingKey,
+        authority: Option<ed25519_dalek::VerifyingKey>,
+    ) -> Fragment {
         naming(
             &CollectionName::new(name).unwrap(),
-            team,
+            namespace,
+            authority,
             <SimpleArchive as crate::metadata::MetaDescribe>::id(),
             TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
         )
     }
 
-    fn derived(source_of: &Fragment) -> Fragment {
+    fn derived(source_of: &Fragment, authority: Option<ed25519_dalek::VerifyingKey>) -> Fragment {
         crate::prelude::entity! {
             metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
             collection_source: identity_for_tests(source_of),
+            collection_authority?: authority,
         }
     }
 
     #[test]
-    fn a_root_is_its_own_team_root() {
-        let team = team_key(3);
-        let fragment = root("ledger", team);
-        let resident = store(&[fragment.clone()]);
+    fn roots_separate_identity_namespace_from_optional_authority() {
+        let namespace_key = team_key(3);
+        let trust_root = team_key(4);
+        let fragment = root("ledger", namespace_key, Some(trust_root));
+
         assert_eq!(
-            team_root(identity_for_tests(&fragment), |handle| resident
-                .get(&handle)
-                .cloned()),
-            Ok((identity_for_tests(&fragment), team))
+            namespace(fragment.facts()),
+            Some(Ok(namespace_key)),
+            "the root identity namespace is read directly"
+        );
+        assert_eq!(
+            authority(fragment.facts()),
+            Some(Ok(trust_root)),
+            "authority is a distinct descriptor field"
         );
     }
 
     #[test]
-    fn a_derived_collection_inherits_its_team_through_the_source_chain() {
-        let team = team_key(4);
-        let base = root("ledger", team);
-        let mid = derived(&base);
-        let top = derived(&mid);
-        let resident = store(&[base.clone(), mid, top.clone()]);
+    fn derived_authority_is_local_and_never_inherited() {
+        let root_authority = team_key(5);
+        let derived_authority = team_key(6);
+        let base = root("ledger", team_key(7), Some(root_authority));
+        let ungoverned = derived(&base, None);
+        let governed = derived(&base, Some(derived_authority));
 
-        // Three hops, one small archive fetch each, and the answer is the
-        // root's team rather than anything the derived descriptors say.
-        assert_eq!(
-            team_root(identity_for_tests(&top), |handle| resident
-                .get(&handle)
-                .cloned()),
-            Ok((identity_for_tests(&base), team))
-        );
+        assert_eq!(namespace(ungoverned.facts()), None);
+        assert_eq!(authority(ungoverned.facts()), None);
+        assert_eq!(authority(governed.facts()), Some(Ok(derived_authority)));
     }
 
     #[test]
-    fn a_missing_source_descriptor_makes_the_team_root_unknown_not_wrong() {
-        let base = root("ledger", team_key(5));
-        let mid = derived(&base);
-        // The root is absent: its team is not knowable, which is a different
-        // answer from "this collection has no team".
-        let resident = store(&[mid.clone()]);
-        assert_eq!(
-            team_root(identity_for_tests(&mid), |handle| resident
-                .get(&handle)
-                .cloned()),
-            Err(TeamRootError::NotResident(identity_for_tests(&base)))
-        );
-    }
-
-    #[test]
-    fn a_chain_that_reaches_no_team_says_so() {
-        let orphan = crate::prelude::entity! {
-            metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
-        };
-        let resident = store(&[orphan.clone()]);
-        assert_eq!(
-            team_root(identity_for_tests(&orphan), |handle| resident
-                .get(&handle)
-                .cloned()),
-            Err(TeamRootError::NoTeam(identity_for_tests(&orphan)))
-        );
-    }
-
-    #[test]
-    fn an_absurdly_long_chain_is_abandoned_rather_than_walked() {
-        // A cycle is not representable -- a descriptor is named by the hash of
-        // its own bytes, so pointing at itself would need a preimage -- but a
-        // very long chain is, and the walk gives up rather than paying for it.
-        let team = team_key(6);
-        let mut fragments = vec![root("ledger", team)];
-        for _ in 0..MAX_DERIVATION_DEPTH + 2 {
-            let next = derived(fragments.last().unwrap());
-            fragments.push(next);
-        }
-        let resident = store(&fragments);
-        let deepest = identity_for_tests(fragments.last().unwrap());
-        assert!(matches!(
-            team_root(deepest, |handle| resident.get(&handle).cloned()),
-            Err(TeamRootError::TooDeep { .. })
-        ));
-
-        // The same chain, walked from inside the bound, still resolves.
-        let shallow = identity_for_tests(&fragments[3]);
-        assert_eq!(
-            team_root(shallow, |handle| resident.get(&handle).cloned()),
-            Ok((identity_for_tests(&fragments[0]), team))
-        );
-    }
-
-    /// A descriptor that declares no reach hashes exactly as it did before the
-    /// attribute existed.
-    ///
-    /// These four handles were captured from this crate at commit e72b20db,
-    /// the last one built before `collection_reach` was declared. They are
-    /// pinned rather than recomputed because recomputing them would prove
-    /// nothing: the question is whether today's builders agree with a version
-    /// of the code that is no longer here to ask.
-    ///
-    /// This is the whole reason the attribute is optional. `self.pile` holds
-    /// 69 collections of which only 23 are named, the other 46 being the same
-    /// data under earlier descriptor shapes; a mandatory field would have made
-    /// it 138.
-    #[test]
-    fn a_descriptor_without_reach_keeps_the_identity_it_had_before_reach_existed() {
-        let team = team_key(0xAA);
+    fn authority_participates_in_descriptor_identity_but_is_optional() {
+        let namespace_key = team_key(8);
+        let trust_root = team_key(9);
         let name = CollectionName::new("ledger").unwrap();
 
-        let bare = naming(
+        let ungoverned = naming(
             &name,
-            team,
+            namespace_key,
+            None,
             crate::id::id_hex!("11111111111111111111111111111111"),
             crate::id::id_hex!("22222222222222222222222222222222"),
             reach::private(),
         );
-        assert_eq!(
-            hex::encode_upper(identity_for_tests(&bare).raw),
-            "9D413F35934206B916104EE38F03E40E0D1F3AEE2332E00F61FB23B12B422F15"
-        );
-
-        let root =
-            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
-        let root_handle = identity_for_tests(&root);
-        assert_eq!(
-            hex::encode_upper(root_handle.raw),
-            "8D492ED32C9A96F6F1B6EED0ED565376F8A9CA6C7073A155C8F84783747B465E"
-        );
-
-        let succinct =
-            crate::collection::succinctarchive_union::descriptor(root_handle, reach::private());
-        assert_eq!(
-            hex::encode_upper(identity_for_tests(&succinct).raw),
-            "C1E12A2FB1CA64CC38D138039F13C9F99DC9AE1A9F73FC610D4201E0FBB84052"
-        );
-
-        let observed = crate::collection::observed_union::descriptor(
-            root_handle,
-            crate::id::id_hex!("33333333333333333333333333333333"),
+        let governed = naming(
+            &name,
+            namespace_key,
+            Some(trust_root),
+            crate::id::id_hex!("11111111111111111111111111111111"),
+            crate::id::id_hex!("22222222222222222222222222222222"),
             reach::private(),
         );
-        assert_eq!(
-            hex::encode_upper(identity_for_tests(&observed).raw),
-            "CCE515D8FE869D2709DC328894FDEBEDBE287FC1E69640C0AE2F71424B721F33"
+
+        assert_eq!(authority(ungoverned.facts()), None);
+        assert_eq!(authority(governed.facts()), Some(Ok(trust_root)));
+        assert_ne!(
+            identity_for_tests(&ungoverned),
+            identity_for_tests(&governed)
         );
+        assert_eq!(ungoverned.facts().len() + 1, governed.facts().len());
     }
 
     /// Declaring reach is a rename, which is the entire point.
@@ -554,17 +381,21 @@ mod tests {
     fn declaring_reach_makes_a_different_collection() {
         let team = team_key(9);
         let name = CollectionName::new("ledger").unwrap();
-        let private =
-            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
-        let public =
-            crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
+        let private = crate::collection::simplearchive_union::descriptor(
+            &name,
+            team,
+            Some(team),
+            reach::private(),
+        );
+        let public = crate::collection::simplearchive_union::descriptor(
+            &name,
+            team,
+            Some(team),
+            reach::public(),
+        );
 
         assert_ne!(identity_for_tests(&private), identity_for_tests(&public));
         assert_eq!(private.facts().len() + 1, public.facts().len());
-        assert_eq!(
-            hex::encode_upper(identity_for_tests(&public).raw),
-            "719258222ECBADFF790DCC7EE1A1ABA1C7F7A4E35641C0D653D954E66ED78ED0"
-        );
     }
 
     /// A descriptor answers whether it travels, and silence is a refusal.
@@ -573,13 +404,21 @@ mod tests {
         let team = team_key(10);
         let name = CollectionName::new("ledger").unwrap();
 
-        let private =
-            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
+        let private = crate::collection::simplearchive_union::descriptor(
+            &name,
+            team,
+            Some(team),
+            reach::private(),
+        );
         assert_eq!(reach::declared(private.facts()), None);
         assert!(!reach::travels(private.facts()));
 
-        let public =
-            crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
+        let public = crate::collection::simplearchive_union::descriptor(
+            &name,
+            team,
+            Some(team),
+            reach::public(),
+        );
         assert_eq!(reach::declared(public.facts()), Some(reach::PUBLIC));
         assert!(reach::travels(public.facts()));
     }
@@ -632,41 +471,49 @@ mod tests {
     /// Both directions matter. A public index over a private source would
     /// leak the source's shape if reach were inherited downward, and a
     /// deliberately published aggregate over private inputs would be
-    /// impossible if reach were inherited upward. Contrast
-    /// [`team_root`], which *does* walk, because ownership genuinely is
-    /// inherited.
+    /// impossible if reach were inherited upward. Authority follows the same
+    /// local-descriptor rule rather than walking the source chain.
     #[test]
     fn a_derived_collection_declares_reach_independently_of_its_source() {
         let team = team_key(11);
         let name = CollectionName::new("ledger").unwrap();
 
-        let private_root =
-            crate::collection::simplearchive_union::descriptor(&name, team, reach::private());
+        let private_root = crate::collection::simplearchive_union::descriptor(
+            &name,
+            team,
+            Some(team),
+            reach::private(),
+        );
         let private_root_handle = identity_for_tests(&private_root);
 
         // A public derivation of a private source.
         let public_index = crate::collection::succinctarchive_union::descriptor(
             private_root_handle,
+            Some(team),
             reach::public(),
         );
         assert!(!reach::travels(private_root.facts()));
         assert!(reach::travels(public_index.facts()));
 
-        let public_root =
-            crate::collection::simplearchive_union::descriptor(&name, team, reach::public());
+        let public_root = crate::collection::simplearchive_union::descriptor(
+            &name,
+            team,
+            Some(team),
+            reach::public(),
+        );
         let public_root_handle = identity_for_tests(&public_root);
 
         // And a private derivation of a public source.
         let private_index = crate::collection::succinctarchive_union::descriptor(
             public_root_handle,
+            Some(team),
             reach::private(),
         );
         assert!(reach::travels(public_root.facts()));
         assert!(!reach::travels(private_index.facts()));
 
         // Reading reach never walks `collection_source`, so an absent source
-        // descriptor cannot change the answer -- unlike `team_root`, which
-        // would report the chain unresolvable here.
+        // descriptor cannot change the answer.
         let orphan = crate::prelude::entity! {
             metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
             collection_source: identity_for_tests(&public_root),

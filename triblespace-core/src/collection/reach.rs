@@ -93,11 +93,10 @@ pub fn declared(facts: &TribleSet) -> Option<Id> {
 
 /// Whether this collection may be relayed to a peer.
 ///
-/// **Read the collection's own descriptor and nothing else.** Unlike
-/// [`team_root`](crate::collection::descriptor::team_root), which walks
-/// [`collection_source`](crate::collection::records::collection_source)
-/// because a derivation genuinely inherits its owner, reach never walks: a
-/// derived collection declares its own or has none. Inheriting would be wrong
+/// **Read the collection's own descriptor and nothing else.** Authority is
+/// likewise a local optional descriptor field; neither property walks
+/// [`collection_source`](crate::collection::records::collection_source). A
+/// derived collection declares its own reach or has none. Inheriting would be wrong
 /// in both directions. A derivation can expose what its source did not -- an
 /// index over private material still leaks the material's shape -- so
 /// publishing a source must not publish everything computed from it. And an

@@ -3,7 +3,8 @@
 //! elements.
 //!
 //! This is the first concrete production collection kind. A collection pairs
-//! a name within a team with the existing `SimpleArchive` representation and the
+//! a name within a public-key namespace with the existing `SimpleArchive`
+//! representation and the
 //! [`TRIBLE_SET_UNION_RECIPE_V1`](crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1)
 //! semantic recipe. Every element is an exact, canonical EAV-ordered stream of
 //! 64-byte tribles. Its join is ordinary set union, so canonical output bytes
@@ -26,8 +27,9 @@ use crate::prelude::entity;
 use ed25519_dalek::VerifyingKey;
 
 use super::records::{
-    collection_name, collection_reach, collection_recipe, collection_representation,
-    collection_team, CollectionName, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_name, collection_namespace, collection_reach,
+    collection_recipe, collection_representation, CollectionName, RecordDecodeError,
+    KIND_COLLECTION_DESCRIPTOR,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -389,22 +391,30 @@ where
     }
 }
 
-/// Describe this collection kind as a root named within a team.
+/// Describe this collection kind as a root named within a namespace.
 ///
 /// This is the one home for what a `SimpleArchive` set-union collection *is*:
 /// that representation, that recipe. Everything else about a particular
-/// collection -- which one it is -- is the name and team passed in.
+/// collection -- which one it is -- is the name and namespace passed in.
+/// `authority` is an optional capability trust root with a distinct semantic
+/// role; when present, it is nevertheless an identity-bearing descriptor fact.
 ///
 /// It returns the facts, not a handle. Getting a handle means putting the
 /// blob, and `put` gives you the handle back, so a stored descriptor is a
 /// side effect of naming one rather than a second thing to remember. Hashing
 /// a descriptor you never stored would leave a phantom collection: records
 /// that reference it, and nothing that can decode what they reference.
-pub fn descriptor(name: &CollectionName, team: VerifyingKey, reach: Fragment) -> Fragment {
+pub fn descriptor(
+    name: &CollectionName,
+    namespace: VerifyingKey,
+    authority: Option<VerifyingKey>,
+    reach: Fragment,
+) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_name: name.as_str(),
-        collection_team: team,
+        collection_namespace: namespace,
+        collection_authority?: authority,
         collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
         collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
         collection_reach*: reach,
@@ -1134,6 +1144,7 @@ mod tests {
         super::descriptor(
             &CollectionName::new(name).unwrap(),
             test_team(),
+            Some(test_team()),
             reach::private(),
         )
     }
@@ -1145,6 +1156,7 @@ mod tests {
         crate::collection::descriptor::naming(
             &CollectionName::new("first").unwrap(),
             test_team(),
+            Some(test_team()),
             representation,
             recipe,
             reach::private(),
@@ -1999,7 +2011,7 @@ mod tests {
             "first"
         );
         assert_eq!(
-            crate::collection::descriptor::team(descriptor.facts())
+            crate::collection::descriptor::namespace(descriptor.facts())
                 .unwrap()
                 .unwrap(),
             test_team()
@@ -2008,15 +2020,13 @@ mod tests {
         // root moves only when those attributes move.
         assert_eq!(
             descriptor.root().unwrap(),
-            id_hex!("17FD0CF5060E5294185ECCA941A18D4F")
+            id_hex!("C4E24340A80C70267458E2B6DD8EFDE4")
         );
-        // The handle did move, once, when the schema's and the law's own
-        // descriptions began travelling inside the descriptor archive. That is
-        // the whole cost of making a collection legible to a reader who does
-        // not already hold the code that minted its ids.
+        // The handle pins the whole current descriptor: namespace, optional
+        // authority, reach, and the travelling schema and law descriptions.
         assert_eq!(
             identity_for_tests(&descriptor).raw,
-            hex!("7C6B421DB77D383A66AD7423FCC2644A69F670B8C6FE791C8A973D160CC8531E")
+            hex!("F5C0F55C167849EBE735E6C29A332BAD43298F3A55E9DB20A4944375CF8ADE79")
         );
         assert_eq!(
             IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle(),

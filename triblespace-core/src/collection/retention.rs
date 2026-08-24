@@ -221,6 +221,7 @@ mod tests {
         simplearchive_union::descriptor(
             &crate::collection::records::CollectionName::new(name).unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         )
     }

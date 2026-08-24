@@ -69,7 +69,7 @@ impl SimpleArchiveCollection {
 
     /// Canonical `SimpleArchive` set-union descriptor facts.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(&self.name, self.team, self.reach.clone())
+        super::descriptor(&self.name, self.team, Some(self.team), self.reach.clone())
     }
 
     /// Content identity of this collection's descriptor.

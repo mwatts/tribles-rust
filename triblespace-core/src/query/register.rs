@@ -998,7 +998,7 @@ mod tests {
     fn registers_share_a_law_and_differ_by_their_parameters() {
         use crate::collection::descriptor;
         use crate::collection::records::{
-            collection_name, collection_recipe, collection_representation, collection_team,
+            collection_name, collection_namespace, collection_recipe, collection_representation,
             CollectionName, KIND_COLLECTION_DESCRIPTOR,
         };
         // The law is one minted name, identical for every stated-order register.
@@ -1022,7 +1022,7 @@ mod tests {
             crate::macros::entity! { _ @
                 crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
                 collection_name: name.as_str(),
-                collection_team: team,
+                collection_namespace: team,
                 collection_representation: representation,
                 collection_recipe*: <StatedOrderV1 as crate::metadata::MetaDescribe>::describe(),
                 register_identity: identity,

@@ -193,6 +193,7 @@ mod tests {
         let facts = descriptor::naming(
             &CollectionName::new("hybrid").unwrap(),
             team,
+            Some(team),
             id(2),
             id(3),
             reach::private(),

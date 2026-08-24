@@ -34,9 +34,10 @@ pub mod succinctarchive_union;
 
 /// Ed25519 public key, re-exported.
 ///
-/// A collection names its team by root public key, so this type is part of
-/// the collection API's surface. Downstream crates should not have to take a
-/// direct `ed25519-dalek` dependency to name a type this API demands of them.
+/// Root descriptors use public keys for their identity namespace and may use
+/// another as an external capability trust root. Downstream crates should not
+/// have to take a direct `ed25519-dalek` dependency to name a type this API
+/// demands of them.
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;

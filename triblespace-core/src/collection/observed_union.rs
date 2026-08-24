@@ -78,8 +78,8 @@ use super::exact_derived::{
     ExactDerivedCollectionError,
 };
 use super::records::{
-    collection_reach, collection_recipe, collection_representation, collection_source,
-    CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_reach, collection_recipe, collection_representation,
+    collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
 use super::{simplearchive_union, CollectionCommit, CollectionStore};
 use crate::repo::{BlobStore, BlobStoreMeta};
@@ -239,12 +239,20 @@ pub fn join(
     Ok(Blob::new(Bytes::from_source(merged)))
 }
 
-/// Construct the observed-set collection for one dataset scope and edge.
-pub fn descriptor(source: CollectionHandle, observes: Id, reach: Fragment) -> Fragment {
+/// Construct the observed-set collection for one source and edge.
+///
+/// The target's optional authority is explicit and independent of its source.
+pub fn descriptor(
+    source: CollectionHandle,
+    observes: Id,
+    authority: Option<VerifyingKey>,
+    reach: Fragment,
+) -> Fragment {
     let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
     let fragment = entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
+        collection_authority?: authority,
         collection_representation*: <ObservedSetBlob as MetaDescribe>::describe(),
         collection_recipe*: <ObservedUnionV1 as MetaDescribe>::describe(),
         register_observes: observes,
@@ -381,7 +389,12 @@ impl ObservedSetCollection {
 
     /// Canonical source `SimpleArchive` collection descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.team, self.source_reach.clone())
+        simplearchive_union::descriptor(
+            &self.name,
+            self.team,
+            Some(self.team),
+            self.source_reach.clone(),
+        )
     }
 
     /// Identity of the source collection this projection reads.
@@ -392,7 +405,12 @@ impl ObservedSetCollection {
 
     /// Canonical target observed-set collection descriptor.
     pub fn descriptor(&self) -> Fragment {
-        descriptor(self.source_collection(), self.observes, self.reach.clone())
+        descriptor(
+            self.source_collection(),
+            self.observes,
+            Some(self.team),
+            self.reach.clone(),
+        )
     }
 
     /// Attach the observed set already resident for `ticket`.
@@ -648,6 +666,7 @@ mod tests {
                 simplearchive_union::descriptor(
                     &crate::collection::records::CollectionName::new(name).unwrap(),
                     ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key()),
                     reach::private(),
                 )
                 .into_facts(),
@@ -656,16 +675,16 @@ mod tests {
         };
         let source = root("source");
         assert_ne!(
-            descriptor(source, metadata::supersedes.id(), reach::private()),
-            descriptor(source, metadata::tag.id(), reach::private()),
+            descriptor(source, metadata::supersedes.id(), None, reach::private()),
+            descriptor(source, metadata::tag.id(), None, reach::private()),
             "two registers over different edges are different collections"
         );
         // A derived collection carries no anchor of its own; two derivations
         // of the same shape differ exactly when their sources differ.
         let other = root("other-source");
         assert_ne!(
-            descriptor(source, metadata::tag.id(), reach::private()),
-            descriptor(other, metadata::tag.id(), reach::private()),
+            descriptor(source, metadata::tag.id(), None, reach::private()),
+            descriptor(other, metadata::tag.id(), None, reach::private()),
             "the same derivation over different sources is a different collection"
         );
         // ... and the derivation genuinely reads the attribute it is told to.

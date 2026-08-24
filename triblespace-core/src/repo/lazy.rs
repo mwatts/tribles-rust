@@ -851,6 +851,7 @@ mod tests {
         let facts = descriptor::naming(
             &CollectionName::new("lazy").unwrap(),
             team,
+            Some(team),
             id(2),
             id(3),
             reach::private(),

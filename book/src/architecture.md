@@ -41,7 +41,7 @@ because it is convenient, and why collecting an accelerator does not erase the
 committed facts from which it can be rebuilt.
 
 Who may make that signed assertion is itself positive, enumerable evidence.
-Every root descriptor names a team root whose grow-only authority collection
+A descriptor may name an authority root whose grow-only authority collection
 contains signed grants. A grant names one exact subject, collection resource,
 action, invocation/delegation mode, and optional parent occurrence. Ordinary
 collection operations admit a commit only when the resolved positive DAG gives
@@ -116,13 +116,14 @@ A collection descriptor is an ordinary `TribleSet`, encoded as a canonical
 `SimpleArchive`. Its content handle is the `CollectionHandle`. A root descriptor
 normally states:
 
-- a human-readable name within a team;
-- the team root;
+- a human-readable name within a public-key namespace;
+- an optional capability authority root;
 - the element representation;
 - the join recipe; and
 - a reach law governing proactive relay.
 
-A derived descriptor names its source collection and the homomorphism recipe.
+A derived descriptor names its source collection, the homomorphism recipe, and
+its own optional authority root. Authority never inherits from the source.
 Descriptions of the representation and recipe travel in the same archive, so a
 record naming the descriptor remains interpretable without a separate registry
 entry.

@@ -562,7 +562,7 @@ impl<S> Collection<S> {
     ) -> Self {
         Self {
             storage,
-            descriptor: simplearchive_union::descriptor(name, team, reach),
+            descriptor: simplearchive_union::descriptor(name, team, Some(team), reach),
             team_root: team,
             signing_key,
         }
@@ -1365,7 +1365,8 @@ mod tests {
         S::PutError: fmt::Debug,
         S::InsertError: fmt::Debug,
     {
-        let descriptor = simplearchive_union::descriptor(name, test_team(), reach::private());
+        let descriptor =
+            simplearchive_union::descriptor(name, test_team(), Some(test_team()), reach::private());
         authority::publish_grant(
             store,
             test_team(),
@@ -1431,11 +1432,13 @@ mod tests {
         let collection_id = identity_for_tests(&simplearchive_union::descriptor(
             &name,
             test_team(),
+            Some(test_team()),
             reach::private(),
         ));
         let other_collection = identity_for_tests(&simplearchive_union::descriptor(
             &other_name(),
             test_team(),
+            Some(test_team()),
             reach::private(),
         ));
         let metadata = super::super::empty_metadata_handle();
@@ -1506,7 +1509,12 @@ mod tests {
 
         assert_eq!(
             collection.descriptor(),
-            &simplearchive_union::descriptor(&name, test_team(), reach::private())
+            &simplearchive_union::descriptor(
+                &name,
+                test_team(),
+                Some(test_team()),
+                reach::private(),
+            )
         );
         assert!(collection.storage().blobs.is_empty());
         assert!(collection.storage_mut().records().unwrap().next().is_none());
@@ -1537,6 +1545,7 @@ mod tests {
         let target = identity_for_tests(&simplearchive_union::descriptor(
             &name,
             test_team(),
+            Some(test_team()),
             reach::private(),
         ));
         let discovered = discover_collection_records(&mut storage).unwrap();
@@ -1565,7 +1574,12 @@ mod tests {
         let local_key = SigningKey::from_bytes(&[7; 32]);
         let remote_key = SigningKey::from_bytes(&[9; 32]);
         let stranger_key = SigningKey::from_bytes(&[11; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
+        let descriptor = simplearchive_union::descriptor(
+            &name,
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+        );
         let mut storage = MemoryRepo::default();
         grant_write(&mut storage, &name, &local_key);
         grant_write(&mut storage, &name, &remote_key);
@@ -1629,7 +1643,12 @@ mod tests {
         let name = test_name();
         let writer = SigningKey::from_bytes(&[9; 32]);
         let observer = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
+        let descriptor = simplearchive_union::descriptor(
+            &name,
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+        );
         let expected = fragment(2, false);
         let mut storage = MemoryRepo::default();
         let commit = simplearchive_union::publish_fragment_commit(
@@ -1695,7 +1714,12 @@ mod tests {
         let name = test_name();
         let delegate = SigningKey::from_bytes(&[6; 32]);
         let writer = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
+        let descriptor = simplearchive_union::descriptor(
+            &name,
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+        );
         let target = identity_for_tests(&descriptor);
         let mut storage = MemoryRepo::default();
 
@@ -1739,11 +1763,13 @@ mod tests {
         let target = identity_for_tests(&simplearchive_union::descriptor(
             &name,
             test_team(),
+            Some(test_team()),
             reach::private(),
         ));
         let other = identity_for_tests(&simplearchive_union::descriptor(
             &other_name(),
             test_team(),
+            Some(test_team()),
             reach::private(),
         ));
 
@@ -1993,7 +2019,12 @@ mod tests {
     fn shared_commit_handles_are_validated_once_without_losing_provenance() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
+        let descriptor = simplearchive_union::descriptor(
+            &name,
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+        );
         let first_data = archive(1);
         let second_data = archive(2);
         let first_metadata = archive(8);
@@ -2170,7 +2201,12 @@ mod tests {
     fn authorized_commit_without_its_descriptor_blob_fails_loud() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
+        let descriptor = simplearchive_union::descriptor(
+            &name,
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+        );
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let commit = CollectionCommit::sign(
@@ -2198,7 +2234,12 @@ mod tests {
     fn authorized_descriptor_bytes_must_match_the_collection_handle() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(&name, test_team(), reach::private());
+        let descriptor = simplearchive_union::descriptor(
+            &name,
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+        );
         let descriptor_handle = identity_for_tests(&descriptor);
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
@@ -2209,8 +2250,13 @@ mod tests {
             metadata.get_handle(),
         );
         let wrong_descriptor = IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(&other_name(), test_team(), reach::private())
-                .into_facts(),
+            simplearchive_union::descriptor(
+                &other_name(),
+                test_team(),
+                Some(test_team()),
+                reach::private(),
+            )
+            .into_facts(),
         );
         let actual = wrong_descriptor.get_handle();
         let mut storage = MemoryRepo::default();

@@ -45,8 +45,9 @@ attribute's exact historical bytes when its old identity cannot be re-derived.
 ## 3. Open a collection
 
 A root collection is identified by the content handle of its descriptor. The
-descriptor names the collection within a team and states its representation,
-join recipe, and reach law. A single-user process is simply a team of one:
+descriptor names the collection within a public-key namespace and states its
+optional authority root, representation, join recipe, and reach law. A
+single-user process may use the same key for namespace and authority:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
@@ -62,7 +63,8 @@ let mut storage = MemoryRepo::default();
 
 // A signing key is not ambient authority. The team root explicitly grants
 // this writer permission to contribute to this exact collection.
-let descriptor = simplearchive_union::descriptor(&name, team, reach::private());
+let descriptor =
+    simplearchive_union::descriptor(&name, team, Some(team), reach::private());
 let target = descriptor.facts().clone().to_blob().get_handle();
 authority::publish_grant(
     &mut storage,

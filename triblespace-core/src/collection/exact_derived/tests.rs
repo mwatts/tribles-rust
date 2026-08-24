@@ -35,7 +35,12 @@ fn test_name(name: &str) -> CollectionName {
 }
 
 fn source_root() -> Fragment {
-    simplearchive_union::descriptor(&test_name("source"), test_team(), reach::private())
+    simplearchive_union::descriptor(
+        &test_name("source"),
+        test_team(),
+        Some(test_team()),
+        reach::private(),
+    )
 }
 
 fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
@@ -44,6 +49,7 @@ fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
         descriptor::naming(
             &test_name("target"),
             test_team(),
+            Some(test_team()),
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
@@ -1492,6 +1498,7 @@ fn algebra_rejects_a_lying_source_descriptor() {
     let lying_source = descriptor::naming(
         &test_name("source"),
         test_team(),
+        Some(test_team()),
         <UnknownBlob as MetaDescribe>::id(),
         id(99),
         reach::private(),

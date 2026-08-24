@@ -22,14 +22,15 @@ use crate::id::ExclusiveId;
 // particular one.
 use super::descriptor as descriptor_facts;
 use super::records::{
-    collection_reach, collection_recipe, collection_representation, collection_source,
-    RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_reach, collection_recipe, collection_representation,
+    collection_source, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
 };
 #[cfg(test)]
 use crate::collection::reach;
 use crate::metadata;
 use crate::prelude::entity;
 use crate::trible::Fragment;
+use ed25519_dalek::VerifyingKey;
 use std::error::Error;
 use std::fmt;
 
@@ -339,14 +340,22 @@ impl Error for SuccinctArchiveUnionValidationError {
 /// Describe the raw SuccinctArchive collection derived from one source.
 ///
 /// A derivation is anchored by the collection it is computed from, so this
-/// takes that source's handle and carries no name or team of its own.
+/// takes that source's handle and carries no name or namespace of its own.
+/// Authority is local: the target either names its own trust root or declares
+/// none. When present, that fact changes the target descriptor's content
+/// handle just like every other descriptor fact.
 ///
 /// This intentionally reuses the SimpleArchive collection's set-union recipe.
 /// Representation, not recipe proliferation, distinguishes the two lattices.
-pub fn descriptor(source: CollectionHandle, reach: Fragment) -> Fragment {
+pub fn descriptor(
+    source: CollectionHandle,
+    authority: Option<VerifyingKey>,
+    reach: Fragment,
+) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
+        collection_authority?: authority,
         collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
         collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
         collection_reach*: reach,
@@ -544,6 +553,7 @@ mod tests {
         simplearchive_union::descriptor(
             &CollectionName::new(name).unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         )
     }
@@ -580,7 +590,7 @@ mod tests {
     #[test]
     fn the_index_derives_from_the_raw_collection_under_the_same_law() {
         let source = raw_root("first");
-        let target = descriptor(identity_for_tests(&source), reach::private());
+        let target = descriptor(identity_for_tests(&source), None, reach::private());
 
         // The target points at exactly this source, and carries no anchor of
         // its own: what it derives from is what anchors it.
@@ -602,6 +612,7 @@ mod tests {
             identity_for_tests(&target),
             identity_for_tests(&descriptor(
                 identity_for_tests(&raw_root("second")),
+                None,
                 reach::private()
             ))
         );
@@ -628,8 +639,11 @@ mod tests {
     #[test]
     fn canonical_empty_is_the_derived_bottom_and_merge_identity() {
         let source_descriptor = raw_root("first");
-        let target_descriptor =
-            descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor = descriptor(
+            identity_for_tests(&raw_root("first")),
+            None,
+            reach::private(),
+        );
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let derived_empty = derive_element(&source_empty).unwrap();
         let canonical_empty = empty();
@@ -670,8 +684,11 @@ mod tests {
     #[test]
     fn derive_and_merge_commute_to_identical_canonical_bytes() {
         let source_descriptor = raw_root("first");
-        let target_descriptor =
-            descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor = descriptor(
+            identity_for_tests(&raw_root("first")),
+            None,
+            reach::private(),
+        );
         let shared = row(3, 10, 40);
         let left = archive([row(2, 10, 60), shared]);
         let right = archive([row(1, 10, 20), shared]);
@@ -721,8 +738,11 @@ mod tests {
     #[test]
     fn validators_reject_valid_but_wrong_canonical_outputs() {
         let source_descriptor = raw_root("first");
-        let target_descriptor =
-            descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor = descriptor(
+            identity_for_tests(&raw_root("first")),
+            None,
+            reach::private(),
+        );
         let input = archive([row(1, 9, 3)]);
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
@@ -764,8 +784,11 @@ mod tests {
     #[test]
     fn malformed_target_is_rejected_before_equation_admission() {
         let source_descriptor = raw_root("first");
-        let target_descriptor =
-            descriptor(identity_for_tests(&raw_root("first")), reach::private());
+        let target_descriptor = descriptor(
+            identity_for_tests(&raw_root("first")),
+            None,
+            reach::private(),
+        );
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
         let claim = CollectionDerive::new(

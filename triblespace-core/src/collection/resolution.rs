@@ -2257,6 +2257,7 @@ mod tests {
         let definition = simplearchive_union::descriptor(
             &crate::collection::records::CollectionName::new("resolved").unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         );
         let left = archive([row(1, 1, 1)]);

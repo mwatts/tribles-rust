@@ -73,6 +73,7 @@ fn build(
     let source = descriptor::naming(
         &CollectionName::new("source").unwrap(),
         team,
+        Some(team),
         id(2),
         id(3),
         reach::private(),
@@ -81,6 +82,7 @@ fn build(
     let target = descriptor::naming(
         &CollectionName::new("target").unwrap(),
         team,
+        Some(team),
         id(5),
         id(6),
         reach::private(),

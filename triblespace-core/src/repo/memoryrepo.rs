@@ -314,7 +314,7 @@ mod tests {
         let name = crate::collection::records::CollectionName::new("owned").unwrap();
         let key = SigningKey::from_bytes(&[23; 32]);
         let team = key.verifying_key();
-        let descriptor = simplearchive_union::descriptor(&name, team, reach::private());
+        let descriptor = simplearchive_union::descriptor(&name, team, Some(team), reach::private());
         let collection = identity_for_tests(&descriptor);
         authority::publish_grant(
             &mut repo,

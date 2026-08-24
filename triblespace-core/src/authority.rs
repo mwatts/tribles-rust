@@ -916,6 +916,7 @@ pub fn descriptor(team_root: VerifyingKey) -> Fragment {
         &CollectionName::new(AUTHORITY_COLLECTION_NAME)
             .expect("the static authority collection name is valid"),
         team_root,
+        Some(team_root),
         crate::collection::reach::public(),
     )
 }
@@ -1198,6 +1199,7 @@ mod tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new(name).unwrap(),
             team_root,
+            Some(team_root),
             crate::collection::reach::private(),
         );
         let handle = crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())

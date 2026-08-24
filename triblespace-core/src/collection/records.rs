@@ -88,10 +88,10 @@ pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B
 
 /// Byte length of a canonical bare root collection-descriptor `SimpleArchive`.
 ///
-/// Five facts: the kind tag, the name and team that anchor the root, and the
-/// representation and recipe it names. A descriptor that embeds its
-/// representation's and recipe's own descriptions, or that carries recipe
-/// arguments, is longer.
+/// Five facts: the kind tag, the name and namespace that anchor the root, and
+/// the representation and recipe it names. A descriptor that carries an
+/// authority root, embeds its representation's and recipe's own descriptions,
+/// or carries recipe arguments is longer.
 pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
@@ -107,9 +107,9 @@ pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
 pub const COLLECTION_RECORD_ID_DOMAIN: &[u8] = b"triblespace.collection.record.id";
 
 attributes! {
-    /// The name a *root* collection is known by within its team.
+    /// The name a *root* collection is known by within its namespace.
     ///
-    /// Half of a root's anchor; see [`collection_team`] for the other half.
+    /// Half of a root's anchor; see [`collection_namespace`] for the other half.
     /// Together they replaced an opaque minted scope id, which discriminated
     /// roots correctly but told a reader nothing: every faculty carried its
     /// scope as a hex constant in its own source, so "which collection is
@@ -122,22 +122,25 @@ attributes! {
     ///
     /// Minted with `trible genid` on 2026-08-20.
     "436A04C372CBBFBD9C619CF50F59C4A1" unsafe as pub collection_name: ShortString;
-    /// Root public key of the team a *root* collection belongs to.
+    /// Public-key namespace which distinguishes root collection names.
     ///
-    /// The other half of a root's anchor. A team has one immutable root
-    /// keypair, generated at team creation and thereafter archived offline, so
-    /// it is a genesis fact rather than an operational one and can be part of
-    /// an identity without going stale. Membership evolves as capabilities
-    /// delegated beneath it.
+    /// This is the other half of a root's identity anchor. It is only a
+    /// namespace: it says which `collection_name` vocabulary the root belongs
+    /// to, not who may write, read, relay, or delegate for the collection.
     ///
-    /// Naming it here is what lets a collection authorize itself: a reader
-    /// holding this descriptor and the pile can walk cap chains from this root
-    /// and decide which commits may count, instead of being handed an
-    /// authorized set out of band. A pile with no team uses its own node key,
-    /// which is a team of one.
+    /// Anchor minted with `trible genid` on 2026-08-24:
+    /// `C2F006810F7C0C695EC88E1EB820C4C0`.
+    "C2F006810F7C0C695EC88E1EB820C4C0" as pub collection_namespace: ED25519PublicKey;
+    /// Optional external capability trust root for this exact collection.
     ///
-    /// Minted with `trible genid` on 2026-08-20.
-    "6C1ED6495491E32FEBB9FDD4EE5E8907" unsafe as pub collection_team: ED25519PublicKey;
+    /// Authority is not an identity namespace and is not inherited through
+    /// [`collection_source`]. Every descriptor that wants an authority policy
+    /// names its trust root directly; absence means the descriptor declares no
+    /// external capability root at this layer.
+    ///
+    /// Anchor minted with `trible genid` on 2026-08-24:
+    /// `7C31D328E9C369CCB6049D05CC8E8C77`.
+    "7C31D328E9C369CCB6049D05CC8E8C77" as pub collection_authority: ED25519PublicKey;
     /// The collection this one derives from, by descriptor handle.
     ///
     /// This says *what* a derived collection is computed from; which state of
@@ -955,33 +958,47 @@ mod tests {
         SigningKey::from_bytes(&[7; 32])
     }
 
-    /// A root is anchored by its name *and* its team, and its identity is a
-    /// function of that anchor together with the representation and recipe it
-    /// names. Change any one of the four and it is a different collection.
+    /// A root is named by its name *and* namespace. Authority has a distinct
+    /// semantic role, but as a descriptor fact it still participates in the
+    /// content identity, as do representation and recipe.
     #[test]
     fn collection_descriptor_is_anchor_specific_and_roundtrips() {
         use crate::collection::descriptor;
 
-        let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let other_team = SigningKey::from_bytes(&[2; 32]).verifying_key();
+        let namespace = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let other_namespace = SigningKey::from_bytes(&[2; 32]).verifying_key();
+        let authority = SigningKey::from_bytes(&[3; 32]).verifying_key();
         let name = CollectionName::new("first").unwrap();
         let other_name = CollectionName::new("second").unwrap();
 
-        let a = descriptor::naming(&name, team, id(2), id(3), reach::private()).into_facts();
+        let a =
+            descriptor::naming(&name, namespace, None, id(2), id(3), reach::private()).into_facts();
         let renamed =
-            descriptor::naming(&other_name, team, id(2), id(3), reach::private()).into_facts();
-        let reteamed =
-            descriptor::naming(&name, other_team, id(2), id(3), reach::private()).into_facts();
+            descriptor::naming(&other_name, namespace, None, id(2), id(3), reach::private())
+                .into_facts();
+        let renamespaced =
+            descriptor::naming(&name, other_namespace, None, id(2), id(3), reach::private())
+                .into_facts();
+        let governed = descriptor::naming(
+            &name,
+            namespace,
+            Some(authority),
+            id(2),
+            id(3),
+            reach::private(),
+        )
+        .into_facts();
         let other_representation =
-            descriptor::naming(&name, team, id(4), id(3), reach::private()).into_facts();
+            descriptor::naming(&name, namespace, None, id(4), id(3), reach::private()).into_facts();
         let other_recipe =
-            descriptor::naming(&name, team, id(2), id(4), reach::private()).into_facts();
+            descriptor::naming(&name, namespace, None, id(2), id(4), reach::private()).into_facts();
 
         let handle = |facts: &TribleSet| {
             <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
         };
         assert_ne!(handle(&a), handle(&renamed));
-        assert_ne!(handle(&a), handle(&reteamed));
+        assert_ne!(handle(&a), handle(&renamespaced));
+        assert_ne!(handle(&a), handle(&governed));
         assert_ne!(handle(&a), handle(&other_representation));
         assert_ne!(handle(&a), handle(&other_recipe));
 
@@ -1000,7 +1017,8 @@ mod tests {
             name,
             "the anchor reads back as what was written"
         );
-        assert_eq!(descriptor::team(&a).unwrap().unwrap(), team);
+        assert_eq!(descriptor::namespace(&a).unwrap().unwrap(), namespace);
+        assert_eq!(descriptor::authority(&a), None);
     }
 
     #[test]
@@ -1197,6 +1215,7 @@ mod tests {
         let descriptor = crate::collection::descriptor::naming(
             &CollectionName::new("first").unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            None,
             id(2),
             id(3),
             reach::private(),
@@ -1209,14 +1228,15 @@ mod tests {
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
         let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
 
-        // Descriptor wire bytes are unchanged by the identity cutover.
+        // Pin the bare root shape. Adding authority deliberately adds a fact
+        // and therefore produces a distinct descriptor identity.
         assert_eq!(
             crate::collection::descriptor::entity(&descriptor).unwrap(),
-            id_hex!("D3942D72389636880F528243079C24DF")
+            id_hex!("B92AA6B7EE11DEB972843981F6C6532A")
         );
         assert_eq!(
             descriptor_blob.get_handle().raw,
-            hex!("27BDE8E0150DCEC4F5330DF88D12EAEE0E1B174AA59AB6F2E10A3F9B20B8B8D7")
+            hex!("B35B0EF7BAE1E9C06940439D1C7066524C853D2F7CCCEFBCE339E5429B43AE91")
         );
         assert_eq!(
             descriptor_blob.bytes.len() as u64,
