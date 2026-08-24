@@ -4,7 +4,7 @@
 //! iroh network thread internally and exposes the standard storage traits.
 //! Reads auto-drain immutable collection evidence; writes announce blobs to
 //! the DHT and publish commits whose collection descriptor declares that the
-//! collection travels. A positive CONNECT authority proof admits direct RPC;
+//! collection travels. A blob-native CONNECT capability proof admits direct RPC;
 //! collection descriptors and WANTs govern what evidence travels and which
 //! content a node retains.
 //!

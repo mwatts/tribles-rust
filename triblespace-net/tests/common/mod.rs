@@ -9,18 +9,15 @@ use std::sync::{Arc, OnceLock};
 
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::authority::{
-    AuthorityGrant, AuthorityMode, AuthorityProof, AuthorityProofStep,
+use triblespace_core::capability::{
+    CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep, CapabilityValidity,
 };
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::clock::{self, VirtualClock};
-use triblespace_core::collection::{CollectionCommit, empty_metadata_handle};
 use triblespace_core::id::rngid::seed_ids;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
-use triblespace_net::protocol::ACTION_CONNECT;
+use triblespace_net::protocol::connect_capability_atom;
 use triblespace_net::transport::sim::SimNet;
 
 /// One virtual clock per test process (install_virtual is
@@ -55,25 +52,25 @@ pub fn pk(k: &SigningKey) -> [u8; 32] {
 }
 
 /// Sign the one-step positive proof authorizing `subject` to CONNECT to the
-/// team rooted at `root`.
-pub fn connect_proof(root: &SigningKey, subject: &SigningKey) -> AuthorityProof {
-    let collection = triblespace_core::authority::collection(root.verifying_key());
-    let grant = AuthorityGrant::root(
-        subject.verifying_key(),
-        collection,
-        ACTION_CONNECT,
-        AuthorityMode::Invoke,
-    );
-    let data: Blob<SimpleArchive> = grant.fragment().into_facts().to_blob();
-    let commit = CollectionCommit::sign(
+/// trust domain rooted at `root`.
+pub fn connect_proof(root: &SigningKey, subject: &SigningKey) -> CapabilityProof {
+    connect_proof_with_validity(root, subject, None)
+}
+
+pub fn connect_proof_with_validity(
+    root: &SigningKey,
+    subject: &SigningKey,
+    validity: Option<CapabilityValidity>,
+) -> CapabilityProof {
+    CapabilityProof::new(vec![CapabilityProofStep::issue(
         root,
-        collection,
-        triblespace_core::inline::encodings::hash::Handle::<SimpleArchive>::to_hash(
-            data.get_handle(),
+        CapabilityGrant::root(
+            subject.verifying_key(),
+            connect_capability_atom(root.verifying_key()),
+            CapabilityMode::Invoke,
+            validity,
         ),
-        empty_metadata_handle(),
-    );
-    AuthorityProof::new(vec![AuthorityProofStep::new(commit, data)])
+    )])
 }
 
 /// A paused, single-thread tokio runtime + LocalSet runner — the
@@ -109,15 +106,15 @@ pub fn bring_up(
     net: &SimNet,
     signing_key: &SigningKey,
     store: MemoryRepo,
-    team_root: ed25519_dalek::VerifyingKey,
-    connect_proof: AuthorityProof,
+    connect_root: ed25519_dalek::VerifyingKey,
+    connect_proof: CapabilityProof,
     gossip: bool,
 ) -> Peer<MemoryRepo> {
     bring_up_with_peers(
         net,
         signing_key,
         store,
-        team_root,
+        connect_root,
         connect_proof,
         gossip,
         Vec::new(),
@@ -133,13 +130,14 @@ pub fn bring_up_with_peers(
     net: &SimNet,
     signing_key: &SigningKey,
     store: MemoryRepo,
-    team_root: ed25519_dalek::VerifyingKey,
-    connect_proof: AuthorityProof,
+    connect_root: ed25519_dalek::VerifyingKey,
+    connect_proof: CapabilityProof,
     gossip: bool,
     peers: Vec<[u8; 32]>,
 ) -> Peer<MemoryRepo> {
     let id = pk(signing_key);
-    let harness = net.join(id, gossip);
+    let gossip_topic = gossip.then_some(connect_root.to_bytes());
+    let harness = net.join(id, gossip_topic);
     let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id).expect("endpoint id"));
     tokio::task::spawn_local(host::run_host(
         harness,
@@ -152,8 +150,8 @@ pub fn bring_up_with_peers(
                     )
                 })
                 .collect(),
-            gossip,
-            team_root,
+            gossip_topic,
+            connect_root,
             connect_proof,
             direction: SyncDirection::Bidirectional,
         },

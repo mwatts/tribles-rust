@@ -74,7 +74,7 @@ pub trait Conn: Clone + Send + Sync + 'static {
     fn close(&self, code: u32, reason: &[u8]);
 }
 
-/// Events surfaced by the gossip mesh for the team topic.
+/// Events surfaced by the explicitly selected gossip topic.
 #[derive(Debug, Clone)]
 pub enum GossipEvent {
     /// A broadcast frame arrived. `delivered_from` is the mesh

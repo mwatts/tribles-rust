@@ -8,15 +8,12 @@ use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::{TestNetwork, to_custom_addr};
 use iroh_base::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use rand::rngs::OsRng;
-use triblespace_core::authority::{
-    AuthorityGrant, AuthorityMode, AuthorityProof, AuthorityProofStep,
+use triblespace_core::capability::{
+    CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep,
 };
-use triblespace_core::blob::IntoBlob;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::collection::{CollectionCommit, empty_metadata_handle};
 
 use triblespace_net::host::{PeerConfig, SyncDirection};
-use triblespace_net::protocol::{ACTION_CONNECT, PILE_SYNC_ALPN};
+use triblespace_net::protocol::{PILE_SYNC_ALPN, connect_capability_atom};
 use triblespace_net::transport::{Transport, iroh::bind_with_endpoint};
 
 async fn undiscoverable_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
@@ -41,31 +38,23 @@ fn direct_addr(id: EndpointId) -> EndpointAddr {
     )
 }
 
-fn connect_proof(key: &SigningKey) -> AuthorityProof {
-    let collection = triblespace_core::authority::collection(key.verifying_key());
-    let grant = AuthorityGrant::root(
-        key.verifying_key(),
-        collection,
-        ACTION_CONNECT,
-        AuthorityMode::Invoke,
-    );
-    let data = grant.fragment().into_facts().to_blob();
-    let commit = CollectionCommit::sign(
+fn connect_proof(key: &SigningKey) -> CapabilityProof {
+    CapabilityProof::new(vec![CapabilityProofStep::issue(
         key,
-        collection,
-        triblespace_core::inline::encodings::hash::Handle::<SimpleArchive>::to_hash(
-            data.get_handle(),
+        CapabilityGrant::root(
+            key.verifying_key(),
+            connect_capability_atom(key.verifying_key()),
+            CapabilityMode::Invoke,
+            None,
         ),
-        empty_metadata_handle(),
-    );
-    AuthorityProof::new(vec![AuthorityProofStep::new(commit, data)])
+    )])
 }
 
 fn config(key: &SigningKey, peers: Vec<EndpointAddr>) -> PeerConfig {
     PeerConfig {
         peers,
-        gossip: false,
-        team_root: key.verifying_key(),
+        gossip_topic: None,
+        connect_root: key.verifying_key(),
         connect_proof: connect_proof(key),
         direction: SyncDirection::Bidirectional,
     }

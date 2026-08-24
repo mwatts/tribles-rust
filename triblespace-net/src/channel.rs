@@ -16,7 +16,7 @@ use triblespace_core::collection::CollectionCommit;
 /// Commands sent to the network thread.
 ///
 /// The surface is minimal by design. Immutable collection evidence floods the
-/// team topic, while content remains independently addressable through the
+/// configured topic, while content remains independently addressable through the
 /// DHT-routed `OP_GET_BLOB` path or exact collection RPCs.
 pub enum NetCommand {
     /// Announce a blob hash to the DHT (fire-and-forget). Local

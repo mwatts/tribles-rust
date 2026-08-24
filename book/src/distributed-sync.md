@@ -5,7 +5,8 @@ crate synchronizes TribleSpace's native collection algebra over
 [iroh](https://www.iroh.computer/). Its three transport mechanisms have
 separate jobs:
 
-- a team gossip mesh discovers immutable signed collection evidence;
+- an explicitly selected gossip mesh discovers immutable signed collection
+  evidence;
 - a DHT discovers providers for content-addressed blobs; and
 - CONNECT-authenticated QUIC answers exact blob, collection, and
   operation-receipt questions.
@@ -28,8 +29,8 @@ use triblespace::net::peer::{Peer, PeerConfig, SyncDirection};
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint],
-    gossip: true,
-    team_root,
+    gossip_topic: Some(shared_topic),
+    connect_root,
     connect_proof,
     direction: SyncDirection::Bidirectional,
 });
@@ -37,11 +38,11 @@ let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
 peer.refresh();
 ```
 
-`connect_proof` is a complete root-to-leaf positive authority proof whose leaf
-invokes `ACTION_CONNECT` for `signing_key` on
-`authority::collection(team_root)`. The caller selects and builds that proof;
-the transport sends exactly those bytes and never searches for authority
-implicitly.
+`connect_proof` is a complete root-to-leaf blob-native capability proof whose
+leaf invokes `ACTION_CONNECT` for `signing_key` on the exact 32 public-key
+bytes of `connect_root`. The caller selects and builds that proof; the
+transport sends exactly those bytes and never searches for authority
+implicitly. `gossip_topic` is a separate rendezvous choice.
 
 ## The synchronized object is evidence
 
@@ -94,11 +95,9 @@ Gossiping a `COMMIT` does not transfer any referenced blob. The receiver may
 learn exact handles for the descriptor, data, metadata, and attachments while
 possessing none of their bytes. Admission also does not manufacture a WANT.
 
-This applies to the team's public authority collection too. Gossip may carry a
-signed grant commit as sparse evidence, but its grant archive remains an
-independent content-addressed blob. A portable invite or CONNECT proof carries
-the exact grant archives it needs inline; authentication never relies on a
-pre-auth network fetch.
+Capability claims and signatures are ordinary content-addressed blobs, but
+CONNECT carries the exact required ancestry inline. Authentication never
+enumerates a collection or relies on a pre-auth network fetch.
 
 Sparse discovery lets a node learn a large global frontier and then apply its
 own cache, trust, authority, and derivation policy. Evidence answers “what has
@@ -106,11 +105,11 @@ been asserted?” A WANT answers “what content or computation should this node
 obtain?” Treating the first as the second would turn observation into
 involuntary full replication.
 
-The team root's public bytes identify the gossip topic. Knowing or joining
-that topic is not authority. In particular, a CONNECT grant does not grant
-gossip membership or make a gossip carrier trusted. Safety comes from strict
-verification of each signed commit plus reach checks at relay time, not from
-trusting the mesh participant that forwarded it.
+The application selects the gossip topic explicitly. It need not equal the
+CONNECT trust root, and knowing or joining it is not authority. In particular,
+a CONNECT capability does not grant gossip membership or make a gossip carrier
+trusted. Safety comes from strict verification of each signed commit plus reach
+checks at relay time, not from trusting the mesh participant that forwarded it.
 
 `Peer::refresh` performs both sides of local sparse synchronization:
 
@@ -154,17 +153,19 @@ answered; partial answers remain useful evidence but temporary unreachability
 never becomes proof of absence. Obtaining a receipt's result bytes is a
 separate `Blob(result)` WANT.
 
-## Positive CONNECT authentication
+## Blob-native CONNECT authentication
 
 All direct point-to-point operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/6"`. The first stream on every
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/7"`. The first stream on every
 connection must be `OP_AUTH`. Its request carries a length-prefixed canonical
-authority proof inline:
+capability proof inline:
 
 ```text
 OP_AUTH
 proof_length:u32
-proof: version:u8, count:u8, (commit:192, data_length:u16, data:bytes)*
+proof: version:u8, count:u8,
+       (claim_length:u16, signature_length:u16,
+        claim:bytes, signature:bytes)*
 ```
 
 The server obtains the caller's Ed25519 public key from the authenticated
@@ -173,20 +174,24 @@ transport and verifies this exact claim:
 ```text
 subject  = transport peer key
 action   = ACTION_CONNECT
-resource = authority::collection(configured team root)
+resource = configured CONNECT trust-root public-key bytes
 mode     = Invoke
 ```
 
-The proof must start with a team-root-signed occurrence, follow each exact
+The proof must start with a trust-root-signed occurrence, follow each exact
 parent in order, preserve action and resource, and end at the claimed peer.
-Every signed commit and adjacent canonical grant archive is verified directly
-from the stream. Empty, truncated, oversized, reordered, malformed, or
-claim-mismatched proofs are rejected. The response is `AUTH_OK` (`0x00`) or
-`AUTH_REJECTED` (`0x01`); a rejected connection is closed.
+Every canonical claim and signature blob is verified directly from the stream
+at the explicit current epoch. Empty, truncated, oversized, reordered,
+malformed, expired, not-yet-valid, or claim-mismatched proofs are rejected. The
+response is `AUTH_OK` (`0x00`) or `AUTH_REJECTED` (`0x01`); a rejected
+connection is closed. A successful connection is also closed immediately after
+the proof chain's effective inclusive upper bound, including when it is idle in
+the shared connection pool.
 
 There is no pre-auth exception, remote proof-fetch operation, ambient store
-lookup, expiry check, or renewal exchange. After a successful first stream,
-later streams on that connection may use the read-only direct RPC surface:
+lookup, or renewal exchange. After a successful first stream, later streams on
+that connection may use the read-only direct RPC surface while its proof
+remains valid:
 
 | Operation | Byte | Question | Response |
 |---|---:|---|---|
@@ -224,8 +229,8 @@ or authority semantics:
 
 These are runtime bandwidth policies, not grants, durable retractions, or
 alternate collection modes. Every direct connection still presents the exact
-configured CONNECT proof. Selecting `gossip: false` similarly disables topic
-participation without changing direct-RPC authority.
+configured CONNECT proof. Selecting `gossip_topic: None` similarly disables
+topic participation without changing direct-RPC authority.
 
 ## CLI
 
@@ -253,10 +258,10 @@ an error before networking starts. There is no environment-variable fallback,
 all-zero grant sentinel, implicit team-of-one grant, or automatic key creation
 on these two paths.
 
-The mesh topic is the explicit team-root public key. `--duration` and
-`--quiescent-for` can bound a run, but quiescence means only that no recent
-network event or WANT fulfillment was observed. It is not a distributed proof
-that every peer has converged.
+The mesh topic is an explicit application choice independent of the CONNECT
+root. `--duration` and `--quiescent-for` can bound a run, but quiescence means
+only that no recent network event or WANT fulfillment was observed. It is not
+a distributed proof that every peer has converged.
 
 ## Invariants worth retaining
 

@@ -128,10 +128,10 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
 }
 
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
-/// `Default` impl — auth is mandatory in protocol v6 so every peer
-/// construction site must explicitly choose a team root. For solo
-/// workflows the convention is `team_root = signing_key.verifying_key()`
-/// (the user is the team root and the founder of a team-of-one);
+/// `Default` impl — auth is mandatory in protocol v7 so every peer
+/// construction site must explicitly choose a CONNECT trust root. For solo
+/// workflows the convention is `connect_root = signing_key.verifying_key()`
+/// (the user is their own trust root);
 /// see the `Peer` struct's doctest for the full pattern.
 pub struct PeerConfig {
     /// Bootstrap peers — for both the gossip mesh and the DHT.
@@ -142,21 +142,20 @@ pub struct PeerConfig {
     /// dedicated fabric instead of accidentally falling back to a management
     /// interface or relay.
     pub peers: Vec<EndpointAddr>,
-    /// Whether to subscribe to live collection-evidence gossip. The topic id
-    /// is the team root pubkey's 32 bytes — every team has exactly one gossip
-    /// mesh, derived from its identity. `false` = serve-/pull-only (no
-    /// subscription, no broadcasts).
-    pub gossip: bool,
-    /// The team root public key. Every connection's first stream must carry a
-    /// complete CONNECT authority proof rooted here. When `gossip = true`, it
-    /// also serves as the gossip topic id.
-    pub team_root: ed25519_dalek::VerifyingKey,
+    /// Explicit collection-evidence gossip topic. `None` is serve-/pull-only
+    /// (no subscription, no broadcasts). This rendezvous choice is orthogonal
+    /// to CONNECT authorization and is never derived from `connect_root`.
+    pub gossip_topic: Option<[u8; 32]>,
+    /// External trust-root public key for direct RPC. Every connection's first
+    /// stream must carry a complete capability proof rooted here whose leaf
+    /// invokes exact CONNECT on these same 32 public-key bytes.
+    pub connect_root: ed25519_dalek::VerifyingKey,
     /// Complete, prebuilt root-to-leaf proof authorizing this node's TLS key
-    /// to invoke [`crate::protocol::ACTION_CONNECT`] on the team's authority
-    /// collection. Outgoing dials send these bytes inline; the transport never
-    /// selects a grant or fetches proof state implicitly.
-    pub connect_proof: triblespace_core::authority::AuthorityProof,
-    /// Direction of participation in the team swarm. Controls whether this
+    /// to invoke [`crate::protocol::ACTION_CONNECT`] on the exact
+    /// `connect_root` resource. Outgoing dials send these bytes inline; the
+    /// transport never constructs or fetches proof state implicitly.
+    pub connect_proof: triblespace_core::capability::CapabilityProof,
+    /// Direction of participation in the evidence swarm. Controls whether this
     /// node publishes collection evidence (write side) and/or admits incoming
     /// collection evidence (read side). Default is `Bidirectional`. Use
     /// [`SyncDirection::ReadOnly`] for follower/catch-up workflows; use
@@ -165,7 +164,7 @@ pub struct PeerConfig {
     pub direction: SyncDirection,
 }
 
-/// Which directions of the team swarm this node participates in.
+/// Which directions of the evidence swarm this node participates in.
 ///
 /// The wire protocol is symmetric — every peer runs the same code path
 /// — but locally we can choose to suppress one side of the data flow.
@@ -186,10 +185,9 @@ pub enum SyncDirection {
     WriteOnly,
 }
 
-// No `Default` impl: every PeerConfig must specify a team root because
-// auth is mandatory in protocol v5. For a single-user OSS deployment
-// the convention is `team_root = signing_key.verifying_key()` (the user
-// is the team root and the founder of a team-of-one).
+// No `Default` impl: every PeerConfig must specify a trust root because auth
+// is mandatory in protocol v7. For a single-user OSS deployment the convention
+// is `connect_root = signing_key.verifying_key()`.
 
 /// Snapshot of store state for serving protocol requests.
 pub struct StoreSnapshot<R> {
@@ -336,13 +334,14 @@ pub struct CollectionOperationProbe {
     pub complete: bool,
 }
 
-/// Dialable team peers, most-recent live gossip neighbor first. Explicitly
+/// Dialable peers, most-recent live gossip neighbor first. Explicitly
 /// configured peers seed the list; neighbor events keep it current. These are
 /// routing candidates, not claims that a peer holds any particular blob.
 /// `Vec` preserves deterministic simulation replay order.
 type RoutingCandidates = Arc<Mutex<Vec<PeerId>>>;
 
-/// Cap on the remembered routing list. Team meshes are small; eight recent
+/// Cap on the remembered routing list. Gossip meshes are expected to be small;
+/// eight recent
 /// peers bounds the worst-case dial fan-out of a DHT-independent miss (each
 /// attempt is also bounded by the caller's overall fetch budget).
 const ROUTING_CANDIDATE_CAP: usize = 8;
@@ -397,7 +396,7 @@ fn collection_evidence_for_rebroadcast(
 struct NetCap<T: Transport> {
     transport: T,
     pool: SharedPool<T::Conn>,
-    connect_proof: triblespace_core::authority::AuthorityProof,
+    connect_proof: triblespace_core::capability::CapabilityProof,
     my_id: PeerId,
     /// Configured peers and live gossip neighbors — consulted before the DHT
     /// on every on-demand fetch. Membership is only a routing hint; callers
@@ -425,7 +424,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
             .filter(|p| *p != my_id)
             .collect();
         Box::pin(async move {
-            // Route-first: try known dialable team peers before the DHT. They
+            // Route-first: try known dialable peers before the DHT. They
             // are not presumed holders; an ordinary miss simply falls through.
             let mut data = if known.is_empty() {
                 None
@@ -814,7 +813,7 @@ const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 async fn connect_authed<T: Transport>(
     t: &T,
     peer: PeerId,
-    connect_proof: &triblespace_core::authority::AuthorityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProof,
 ) -> anyhow::Result<T::Conn> {
     let conn = t.dial(peer, PILE_SYNC_ALPN).await.map_err(|e| {
         warn!(error = %e, "connect failed");
@@ -887,7 +886,7 @@ async fn host_loop<T: Transport>(
     // accepts sequential bi-streams until the peer closes.
     let snapshot_handler = SnapshotHandler {
         snapshot: snapshot.clone(),
-        team_root: config.team_root,
+        connect_root: config.connect_root,
     };
     let mut incoming = incoming;
     tokio::spawn(async move {
@@ -1099,7 +1098,7 @@ async fn pool_get<T: Transport>(
     t: &T,
     pool: &SharedPool<T::Conn>,
     provider: PeerId,
-    connect_proof: &triblespace_core::authority::AuthorityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProof,
 ) -> Option<T::Conn> {
     let cell = {
         let mut guard = pool.lock().await;
@@ -1159,7 +1158,7 @@ async fn fetch_one<T: Transport>(
     hash: &RawHash,
     pool: &SharedPool<T::Conn>,
     publisher_id: PeerId,
-    connect_proof: &triblespace_core::authority::AuthorityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProof,
 ) -> Option<Vec<u8>> {
     let providers = providers_for(t, hash, publisher_id).await;
     fetch_from_providers(t, hash, pool, &providers, connect_proof).await
@@ -1176,7 +1175,7 @@ async fn fetch_from_providers<T: Transport>(
     hash: &RawHash,
     pool: &SharedPool<T::Conn>,
     providers: &[PeerId],
-    connect_proof: &triblespace_core::authority::AuthorityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProof,
 ) -> Option<Vec<u8>> {
     for &provider in providers {
         let Some(conn) = pool_get(t, pool, provider, connect_proof).await else {
@@ -1209,16 +1208,46 @@ async fn fetch_from_providers<T: Transport>(
 
 // ── Protocol handler ─────────────────────────────────────────────────
 
+/// Wait until the first clock reading strictly after an inclusive capability
+/// upper bound. Long intervals are rechecked daily so converting hifitime's
+/// i128 range into Tokio's timer range cannot overflow.
+fn capability_expired(expires: Option<hifitime::Epoch>) -> bool {
+    expires.is_some_and(|upper| crate::clock::epoch_now() > upper)
+}
+
+async fn wait_until_after(expires: Option<hifitime::Epoch>) {
+    let Some(upper) = expires else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let upper_ns = upper.to_tai_duration().total_nanoseconds();
+    const MAX_SLEEP_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+    loop {
+        let now_ns = crate::clock::epoch_now()
+            .to_tai_duration()
+            .total_nanoseconds();
+        if now_ns > upper_ns {
+            return;
+        }
+        let remaining_ns = upper_ns.saturating_sub(now_ns).saturating_add(1);
+        let sleep_ns = u64::try_from(remaining_ns)
+            .unwrap_or(u64::MAX)
+            .min(MAX_SLEEP_NS);
+        tokio::time::sleep(std::time::Duration::from_nanos(sleep_ns)).await;
+    }
+}
+
 #[derive(Clone)]
 struct SnapshotHandler {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    team_root: ed25519_dalek::VerifyingKey,
+    connect_root: ed25519_dalek::VerifyingKey,
 }
 
 impl SnapshotHandler {
     async fn handle<T: Transport>(&self, connection: T::Conn) {
         let snapshot = self.snapshot.clone();
-        let team_root = self.team_root;
+        let connect_root = self.connect_root;
         let peer_id = connection.remote_id();
         let span = info_span!(
             "connection",
@@ -1245,12 +1274,14 @@ impl SnapshotHandler {
                 return;
             };
             let authenticated =
-                authenticate_connection::<T::Conn>(team_root, peer, &mut send, &mut recv).await;
+                authenticate_connection::<T::Conn>(connect_root, peer, &mut send, &mut recv).await;
             let _ = send.shutdown().await;
-            match authenticated {
-                Ok(true) => {}
-                Ok(false) => {
-                    connection.close(1, b"CONNECT authority required");
+            let expires = match authenticated {
+                Ok(Some(verified)) => verified
+                    .effective_validity()
+                    .map(|validity| validity.bounds().1),
+                Ok(None) => {
+                    connection.close(1, b"CONNECT capability required");
                     return;
                 }
                 Err(error) => {
@@ -1258,13 +1289,31 @@ impl SnapshotHandler {
                     connection.close(1, b"malformed authentication");
                     return;
                 }
-            }
+            };
+
+            let expiry = wait_until_after(expires);
+            tokio::pin!(expiry);
 
             loop {
-                let Some((mut send, mut recv)) = connection.accept_bi().await else {
+                let stream = tokio::select! {
+                    stream = connection.accept_bi() => stream,
+                    () = &mut expiry => {
+                        info!("CONNECT capability expired; closing connection");
+                        connection.close(1, b"CONNECT capability expired");
+                        return;
+                    }
+                };
+                let Some((mut send, mut recv)) = stream else {
                     debug!("accept_bi ended; connection closing");
                     break;
                 };
+                // Recheck at the admission boundary as well as using the idle
+                // timer above. This closes the one scheduler race where the
+                // wall clock advances just before the expiry task is polled.
+                if capability_expired(expires) {
+                    connection.close(1, b"CONNECT capability expired");
+                    return;
+                }
                 let snapshot = snapshot.clone();
                 tokio::spawn(
                     async move {
@@ -1285,12 +1334,12 @@ impl SnapshotHandler {
 }
 
 async fn authenticate_connection<C: Conn>(
-    team_root: ed25519_dalek::VerifyingKey,
+    connect_root: ed25519_dalek::VerifyingKey,
     peer: ed25519_dalek::VerifyingKey,
     send: &mut C::SendHalf,
     recv: &mut C::RecvHalf,
-) -> anyhow::Result<bool> {
-    use triblespace_core::authority::{AuthorityClaim, AuthorityMode};
+) -> anyhow::Result<Option<triblespace_core::capability::VerifiedCapability>> {
+    use triblespace_core::capability::{CapabilityClaim, CapabilityMode};
 
     let verdict = async {
         let op = recv_u8(recv).await?;
@@ -1300,34 +1349,34 @@ async fn authenticate_connection<C: Conn>(
                 op_name(op)
             );
         }
-        let proof = recv_authority_proof(recv).await?;
+        let proof = recv_capability_proof(recv).await?;
         let mut trailing = [0u8; 1];
         if recv.read(&mut trailing).await? != 0 {
             anyhow::bail!("OP_AUTH contains trailing bytes");
         }
-        proof.verify_claim(
-            team_root,
-            AuthorityClaim::new(
+        let verified = proof.verify_claim(
+            connect_root,
+            crate::clock::epoch_now(),
+            CapabilityClaim::new(
                 peer,
-                ACTION_CONNECT,
-                triblespace_core::authority::collection(team_root),
-                AuthorityMode::Invoke,
+                connect_capability_atom(connect_root),
+                CapabilityMode::Invoke,
             ),
         )?;
-        anyhow::Ok(())
+        anyhow::Ok(verified)
     }
     .await;
 
     match verdict {
-        Ok(()) => {
-            info!("CONNECT authority verified");
+        Ok(verified) => {
+            info!("CONNECT capability verified");
             send_u8(send, AUTH_OK).await?;
-            Ok(true)
+            Ok(Some(verified))
         }
         Err(error) => {
-            warn!(%error, "CONNECT authority rejected");
+            warn!(%error, "CONNECT capability rejected");
             send_u8(send, AUTH_REJECTED).await?;
-            Ok(false)
+            Ok(None)
         }
     }
 }

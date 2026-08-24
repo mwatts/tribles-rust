@@ -32,13 +32,12 @@ use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::TestNetwork;
 use iroh_base::{EndpointAddr, EndpointId, SecretKey};
-use triblespace_core::authority::{
-    AuthorityGrant, AuthorityMode, AuthorityProof, AuthorityProofStep,
-};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::collection::{CollectionCommit, empty_metadata_handle};
+use triblespace_core::capability::{
+    CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep,
+};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::BlobStore;
@@ -47,29 +46,23 @@ use triblespace_core::repo::{BlobStoreGet, BlobStorePut, WantRequest, WantStore}
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
-use triblespace_net::protocol::ACTION_CONNECT;
+use triblespace_net::protocol::connect_capability_atom;
 use triblespace_net::reconcile::Reconciler;
 
 fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
 }
 
-fn connect_proof(root: &SigningKey, subject: &SigningKey) -> AuthorityProof {
-    let collection = triblespace_core::authority::collection(root.verifying_key());
-    let grant = AuthorityGrant::root(
-        subject.verifying_key(),
-        collection,
-        ACTION_CONNECT,
-        AuthorityMode::Invoke,
-    );
-    let data: Blob<SimpleArchive> = grant.fragment().into_facts().to_blob();
-    let commit = CollectionCommit::sign(
+fn connect_proof(root: &SigningKey, subject: &SigningKey) -> CapabilityProof {
+    CapabilityProof::new(vec![CapabilityProofStep::issue(
         root,
-        collection,
-        Handle::<SimpleArchive>::to_hash(data.get_handle()),
-        empty_metadata_handle(),
-    );
-    AuthorityProof::new(vec![AuthorityProofStep::new(commit, data)])
+        CapabilityGrant::root(
+            subject.verifying_key(),
+            connect_capability_atom(root.verifying_key()),
+            CapabilityMode::Invoke,
+            None,
+        ),
+    )])
 }
 
 /// A fresh pile file. CONNECT proof bytes travel inline and are deliberately
@@ -109,8 +102,8 @@ async fn bring_up(
     network: &TestNetwork,
     signing_key: &SigningKey,
     store: Pile,
-    team_root: ed25519_dalek::VerifyingKey,
-    connect_proof: AuthorityProof,
+    connect_root: ed25519_dalek::VerifyingKey,
+    connect_proof: CapabilityProof,
     bootstrap: Vec<EndpointAddr>,
 ) -> Peer<Pile> {
     let secret = triblespace_net::identity::iroh_secret(signing_key);
@@ -118,8 +111,8 @@ async fn bring_up(
     let ep = test_endpoint(network, secret).await;
     let config = PeerConfig {
         peers: bootstrap,
-        gossip: true,
-        team_root,
+        gossip_topic: Some(connect_root.to_bytes()),
+        connect_root,
         connect_proof,
         direction: SyncDirection::Bidirectional,
     };
@@ -139,7 +132,7 @@ fn init_tracing() {
         .try_init();
 }
 
-/// The shared two-node bring-up: one team root, two inline CONNECT proofs, and
+/// The shared two-node bring-up: one trust root, two inline CONNECT proofs, and
 /// two piles that contain no authentication state.
 struct TwoNodes {
     peer_a: Peer<Pile>,

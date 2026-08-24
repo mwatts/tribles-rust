@@ -11,6 +11,10 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
+use triblespace_core::capability::{
+    CapabilityAtom, CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep,
+    CapabilityResource, CapabilityValidity,
+};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     CollectionData, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
@@ -23,10 +27,12 @@ use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, WantStore};
 use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 use triblespace_net::peer::Peer;
+use triblespace_net::protocol::ACTION_CONNECT;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
 
 use common::{
-    bring_up, bring_up_with_peers, connect_proof, empty_store, key, pk, run_paused, vclock,
+    bring_up, bring_up_with_peers, connect_proof, connect_proof_with_validity, empty_store, key,
+    pk, run_paused, vclock,
 };
 
 fn collection_name(name: &str) -> CollectionName {
@@ -121,8 +127,8 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
         assert_eq!(fetched[0], commit);
         assert_eq!(fetched[0].collection(), collection_of(&descriptor));
 
-        // Fetch is inert sparse evidence: neither the commit/grant nor any
-        // blob it names is admitted into the client store.
+        // Fetch is inert sparse evidence: neither the commit nor any blob it
+        // names is admitted into the client store.
         assert!(client.store().records().unwrap().next().is_none());
         let reader = client.store().reader().unwrap();
         assert!(
@@ -243,6 +249,118 @@ fn connect_proof_subject_must_equal_the_tls_peer() {
         )
         .await;
         assert!(result.is_err(), "a proof for another TLS peer was admitted");
+    });
+}
+
+#[test]
+fn connect_proof_resource_must_equal_the_configured_root_bytes() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ED2, async {
+        let root = key(0xE2);
+        let server_key = key(0xA2);
+        let client_key = key(0xB2);
+        let wrong_resource_proof = CapabilityProof::new(vec![CapabilityProofStep::issue(
+            &root,
+            CapabilityGrant::root(
+                client_key.verifying_key(),
+                CapabilityAtom::new(ACTION_CONNECT.into(), CapabilityResource::new([0xFF; 32])),
+                CapabilityMode::Invoke,
+                None,
+            ),
+        )]);
+
+        let net = SimNet::new(0xC011ED2, SimConfig::default());
+        let _server = bring_up(
+            &net,
+            &server_key,
+            empty_store(),
+            root.verifying_key(),
+            connect_proof(&root, &server_key),
+            false,
+        );
+        let client = bring_up(
+            &net,
+            &client_key,
+            empty_store(),
+            root.verifying_key(),
+            wrong_resource_proof,
+            false,
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let descriptor = named_root("wrong-connect-resource");
+        let (_client, result) = fetch_evidence_result_while_stepping(
+            client,
+            pk(&server_key),
+            collection_of(&descriptor),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a CONNECT proof for a different exact resource was admitted"
+        );
+    });
+}
+
+#[test]
+fn pooled_connection_is_closed_after_connect_proof_expiry() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ED1, async {
+        let root = key(0xE1);
+        let server_key = key(0xA1);
+        let client_key = key(0xB1);
+        let start = triblespace_core::clock::epoch_now();
+        let upper = start + hifitime::Duration::from_total_nanoseconds(1_000_000_000);
+        let validity = CapabilityValidity::new(start, upper).unwrap();
+
+        let mut server_store = empty_store();
+        let descriptor = named_root("expiring-connect");
+        let commit = simplearchive_union::publish_fragment_commit(
+            &mut server_store,
+            &descriptor,
+            Fragment::empty(),
+            &server_key,
+        )
+        .unwrap();
+
+        let net = SimNet::new(0xC011ED1, SimConfig::default());
+        let _server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            root.verifying_key(),
+            connect_proof(&root, &server_key),
+            false,
+        );
+        let client = bring_up(
+            &net,
+            &client_key,
+            empty_store(),
+            root.verifying_key(),
+            connect_proof_with_validity(&root, &client_key, Some(validity)),
+            false,
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let (client, first) = fetch_evidence_result_while_stepping(
+            client,
+            pk(&server_key),
+            collection_of(&descriptor),
+        )
+        .await;
+        assert_eq!(first.unwrap(), vec![commit]);
+
+        SimNet::step(&vclock(), Duration::from_secs(2)).await;
+        let (_client, after_expiry) = fetch_evidence_result_while_stepping(
+            client,
+            pk(&server_key),
+            collection_of(&descriptor),
+        )
+        .await;
+        assert!(
+            after_expiry.is_err(),
+            "a pooled connection outlived the verified proof interval"
+        );
     });
 }
 
@@ -382,7 +500,7 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
 }
 
 #[test]
-fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_gossip_grants() {
+fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_gossip() {
     let _guard = common::sim_guard();
     run_paused(0xC011ECB, async {
         let root = key(0xF4);

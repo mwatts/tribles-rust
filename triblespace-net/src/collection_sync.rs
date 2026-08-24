@@ -36,9 +36,8 @@ use triblespace_core::repo::StorageFlush;
 /// Purely verify one canonically ordered batch of sparse replication evidence.
 ///
 /// Evidence must be in strictly increasing intrinsic commit-id order. Every
-/// commit and grant is strictly signature-verified, and each pair must name
-/// the same collection and author. No blob lookup or destination mutation is
-/// performed.
+/// commit is strictly signature-verified. No blob lookup or destination
+/// mutation is performed.
 pub fn prepare_incoming_collection_batch(
     evidence: Vec<CollectionCommit>,
 ) -> Result<PreparedIncomingCollectionBatch, IncomingBatchValidationError> {

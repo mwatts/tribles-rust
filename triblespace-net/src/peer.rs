@@ -15,7 +15,7 @@
 //!   evidence without fetching its referenced blobs; semantic trust belongs to
 //!   later collection resolution.
 //! - **Blob writes** delegate to the inner store and announce content to the
-//!   DHT. CONNECT authority gates the direct-RPC channel; collection
+//!   DHT. A CONNECT capability gates the direct-RPC channel; collection
 //!   descriptors and WANTs independently govern publication and local demand.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
@@ -37,7 +37,7 @@
 //! publication or retention transition.
 //!
 //! Collection discovery is gossip-driven: immutable signed commit evidence
-//! floods the team topic and arrives through `NetEvent`. Referenced content
+//! floods the configured topic and arrives through `NetEvent`. Referenced content
 //! remains independently retrievable by hash, normally through durable wants.
 
 use std::collections::BTreeSet;
@@ -140,12 +140,13 @@ fn accepts_incoming_event(direction: SyncDirection, event: &NetEvent) -> bool {
 ///
 /// # Example
 ///
-/// Construction requires the team root and a prebuilt
-/// [`AuthorityProof`](triblespace_core::authority::AuthorityProof) whose leaf
-/// authorizes this peer's transport key to invoke
-/// [`ACTION_CONNECT`](crate::protocol::ACTION_CONNECT). Proof selection is an
-/// application concern; the transport sends exactly the proof in
-/// [`PeerConfig::connect_proof`].
+/// Construction requires a CONNECT trust root and a prebuilt
+/// [`CapabilityProof`](triblespace_core::capability::CapabilityProof) whose
+/// leaf authorizes this peer's transport key to invoke exact
+/// [`ACTION_CONNECT`](crate::protocol::ACTION_CONNECT) on that root's public-key
+/// bytes. Proof selection is an application concern; the transport sends
+/// exactly the proof in [`PeerConfig::connect_proof`]. Gossip rendezvous is a
+/// separate explicit choice in [`PeerConfig::gossip_topic`].
 pub struct Peer<S>
 where
     S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,

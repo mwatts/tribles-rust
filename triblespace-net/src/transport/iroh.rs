@@ -306,17 +306,17 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
         );
     }
 
-    // Gossip: join the team topic (topic id = team root pubkey — one
-    // mesh per team) and translate iroh-gossip events into the
-    // transport-agnostic GossipEvent stream. Always `subscribe`
+    // Gossip: join the explicitly configured topic and translate
+    // iroh-gossip events into the transport-agnostic GossipEvent stream.
+    // Authorization never chooses rendezvous topology. Always `subscribe`
     // (non-blocking): the join completes in the background as peers
     // come online; `subscribe_and_join` would hang nodes that start
     // at different times.
     let mut gossip = None;
-    if config.gossip {
+    if let Some(gossip_topic) = config.gossip_topic {
         let g = Gossip::builder().spawn(ep.clone());
         router_builder = router_builder.accept(iroh_gossip::ALPN, g.clone());
-        let topic_id = iroh_gossip::TopicId::from_bytes(config.team_root.to_bytes());
+        let topic_id = iroh_gossip::TopicId::from_bytes(gossip_topic);
         match g.subscribe(topic_id, bootstrap_ids.clone()).await {
             Ok(topic) => {
                 let (sender, receiver) = topic.split();

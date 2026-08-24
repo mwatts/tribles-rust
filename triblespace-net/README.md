@@ -2,8 +2,8 @@
 
 Distributed collection synchronization for TribleSpace over
 [iroh](https://www.iroh.computer). Immutable signed collection evidence is
-flooded through a team gossip mesh, content-addressed blobs are discovered
-through a DHT, and exact reads travel over authenticated QUIC.
+flooded through explicitly selected gossip meshes, content-addressed blobs are
+discovered through a DHT, and exact reads travel over authenticated QUIC.
 
 The user-facing surface is `Peer<S>`, a wrapper that gives a local store a
 network presence without turning the synchronous storage traits into async
@@ -27,8 +27,8 @@ use triblespace::net::peer::{Peer, PeerConfig, SyncDirection};
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint],
-    gossip: true,
-    team_root,
+    gossip_topic: Some(shared_topic),
+    connect_root,
     connect_proof,
     direction: SyncDirection::Bidirectional,
 });
@@ -42,6 +42,12 @@ fetch the collection descriptor, data,
 metadata, or attachments and does not manufacture a WANT. Those resources
 remain independently content-addressed and are fetched only when local policy
 asks for them.
+
+CONNECT authorization and gossip rendezvous are independent. The CONNECT
+proof must invoke the exact action on the configured trust root's 32 public-key
+bytes; `gossip_topic` is an unrelated optional 32-byte topic chosen by the
+application. An expiring proof closes the authenticated connection immediately
+after its inclusive effective upper bound.
 
 The full model, wire formats, authorization boundaries, durable WANT behavior,
 and CLI surface live in the book's

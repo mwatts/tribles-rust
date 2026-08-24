@@ -46,22 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed, while immutable legacy pin snapshots remain documented only for
   diagnosis, retention, and explicit migration.
 
-- Replace the expiring descriptive-capability protocol with positive,
-  enumerable authority. Each team root now identifies one public grow-only
-  `SimpleArchive`-union authority collection whose signed grant occurrences
-  name one exact subject, resource, action, invoke/delegate mode, and optional
-  exact parent. Resolution computes the grounded positive fixed point, while
-  claim-directed portable root-to-leaf proofs carry every signed commit and
-  canonical grant archive needed for standalone verification. Pile-sync moves
-  to ALPN v6 and authenticates direct RPC by carrying an exact CONNECT proof
-  inline on the first `OP_AUTH` stream. CONNECT grants no WRITE, generic READ,
-  gossip, reach, custody, or retention authority. The `trible team` surface is
-  now only `create`, `invite`, `join`, `list`, and `show`; `pile net status` and
-  `sync` require explicit `--team-root` and `--grant` plus an existing key.
-  Expiry, renewal, retraction, admin-scope hierarchy, pending approval, ambient
-  environment fallback, sentinels, pre-auth proof fetch, and the associated
-  private policy/handshake machinery are removed. Durable removal is a
-  successor team, collection, or key epoch outside this monotone kernel.
+- Replace enumerable authority collections with blob-native capability trees.
+  Each proof carries only the exact root-to-leaf canonical claim/signature blob
+  pairs needed for one externally supplied trust root, explicit epoch, subject,
+  action, resource, and invocation/delegation mode. Pile-sync moves to ALPN v7
+  with a bounded v2 carrier while the kernel itself remains unbounded, verifies
+  CONNECT for the TLS peer on the trust root's exact 32 public-key bytes, and
+  closes authenticated connections after the proof's effective inclusive upper
+  bound. `PeerConfig::gossip_topic` is now an independent optional 32-byte
+  rendezvous choice rather than a topology inferred from authorization.
 
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.

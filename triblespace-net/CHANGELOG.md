@@ -9,22 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Move pile sync to ALPN `/triblespace/pile-sync/6` and replace
-  handle-addressed capability authentication with one bounded, claim-directed
-  positive authority proof carried inline by the first `OP_AUTH` stream. The
-  verified leaf must invoke the exact `ACTION_CONNECT` atom for the transport
-  peer on the configured team's public authority collection. CONNECT admits
-  direct authenticated RPC only; it grants no WRITE, generic READ, gossip,
-  collection reach, custody, retention, or semantic author trust.
+- Move pile sync to ALPN `/triblespace/pile-sync/7` and carry one bounded
+  blob-native capability proof in the first `OP_AUTH` stream. The public v2
+  codec frames canonical claim/signature blob pairs and retains transport-only
+  depth and byte limits while the capability kernel remains unbounded. The
+  verified leaf must invoke exact `ACTION_CONNECT` for the TLS peer on the
+  configured trust root's 32 public-key bytes at the explicit current epoch.
+  The effective proof interval now closes an authenticated connection after
+  its inclusive upper bound, so a pooled connection cannot outlive authority.
+- Separate `PeerConfig::connect_root` from
+  `PeerConfig::gossip_topic: Option<[u8; 32]>`. Gossip topology is selected
+  explicitly and is never inferred from authorization identity; production
+  iroh and the deterministic simulator both enforce the separation.
 
 ### Removed
 
-- Remove the old expiry, renewal, retraction, permission-scope, private-policy,
-  pending-approval, capability-delivery, and auth-handshake machinery,
-  including the pre-auth capability-proof fetch operation and its separate
-  handshake ALPN. Proofs are now self-contained; there is no ambient
-  environment fallback, sentinel credential, remote proof bootstrap, or
-  per-operation expiry refresh.
+- Remove the enumerable authority-collection proof carrier and its 192-byte
+  commit plus grant-archive step format. Proofs now carry only the exact
+  content-addressed claim/signature ancestry needed by the caller; CONNECT has
+  no ambient grant discovery or compatibility codec.
 
 ## [0.41.4] - 2026-05-17
 

@@ -115,6 +115,7 @@ impl Default for SimConfig {
 struct NodeSlot {
     incoming_tx: mpsc::UnboundedSender<Incoming<SimConn>>,
     gossip_tx: Option<mpsc::UnboundedSender<GossipEvent>>,
+    gossip_topic: Option<[u8; 32]>,
     up: bool,
     /// PlumTree-style dedupe cache: message-id (blake3 of frame) ->
     /// suppression deadline in virtual nanoseconds. Duplicates seen
@@ -191,18 +192,18 @@ impl SimNet {
         }
     }
 
-    /// Join the network as `id`. Returns the transport harness for
-    /// the node's host loop. `gossip` controls whether the node
-    /// participates in the team topic (mirrors `PeerConfig::gossip`).
+    /// Join the network as `id`. Returns the transport harness for the node's
+    /// host loop. `gossip_topic` independently selects the gossip mesh; `None`
+    /// disables gossip (mirrors `PeerConfig::gossip_topic`).
     ///
     /// Joining emits `NeighborUp` both ways between the new node and
     /// every existing gossip participant — the sim mesh is fully
     /// connected, which makes `delivered_from` always the original
     /// publisher (a simplification PlumTree converges to for small
     /// meshes anyway).
-    pub fn join(&self, id: PeerId, gossip: bool) -> Harness<SimTransport> {
+    pub fn join(&self, id: PeerId, gossip_topic: Option<[u8; 32]>) -> Harness<SimTransport> {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let gossip_pair = if gossip {
+        let gossip_pair = if gossip_topic.is_some() {
             Some(mpsc::unbounded_channel())
         } else {
             None
@@ -211,7 +212,9 @@ impl SimNet {
         let mut inner = self.inner.lock().unwrap();
         if let Some((new_tx, _)) = &gossip_pair {
             for (other_id, other) in inner.nodes.iter() {
-                if let Some(other_tx) = &other.gossip_tx {
+                if other.gossip_topic == gossip_topic
+                    && let Some(other_tx) = &other.gossip_tx
+                {
                     let _ = other_tx.send(GossipEvent::NeighborUp(id));
                     let _ = new_tx.send(GossipEvent::NeighborUp(*other_id));
                 }
@@ -222,6 +225,7 @@ impl SimNet {
             NodeSlot {
                 incoming_tx,
                 gossip_tx: gossip_pair.as_ref().map(|(tx, _)| tx.clone()),
+                gossip_topic,
                 up: true,
                 gossip_seen: std::collections::HashMap::new(),
             },
@@ -244,6 +248,7 @@ impl SimNet {
                 SimGossip {
                     net: self.clone(),
                     from: id,
+                    topic: gossip_topic.expect("gossip pair requires a configured topic"),
                     _tx: tx,
                 },
                 b_rx,
@@ -474,6 +479,7 @@ impl Transport for SimTransport {
 pub struct SimGossip {
     net: SimNet,
     from: PeerId,
+    topic: [u8; 32],
     /// Keeps the node's own event channel alive for the lifetime of
     /// the sink (mirrors iroh-gossip, where dropping the topic handle
     /// ends the subscription).
@@ -493,7 +499,12 @@ impl GossipSink for SimGossip {
             let targets: Vec<PeerId> = inner
                 .nodes
                 .iter()
-                .filter(|(id, slot)| **id != self.from && slot.up && slot.gossip_tx.is_some())
+                .filter(|(id, slot)| {
+                    **id != self.from
+                        && slot.up
+                        && slot.gossip_topic == Some(self.topic)
+                        && slot.gossip_tx.is_some()
+                })
                 .map(|(id, _)| *id)
                 .collect();
             let dedupe = inner.config.gossip_dedupe;
@@ -697,5 +708,37 @@ mod tests {
             c_recv.read_exact(&mut resp).await.is_err(),
             "client read on an abandoned stream must EOF, not hang"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_topics_isolate_gossip_independently_of_node_identity() {
+        let net = SimNet::new(7, SimConfig::default());
+        let mut a = net.join([1; 32], Some([0xA0; 32]));
+        let mut b = net.join([2; 32], Some([0xB0; 32]));
+        let mut c = net.join([3; 32], Some([0xA0; 32]));
+        let (a_sink, mut a_events) = a.gossip.take().unwrap();
+        let (_, mut b_events) = b.gossip.take().unwrap();
+        let (_, mut c_events) = c.gossip.take().unwrap();
+
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            a_events.try_recv(),
+            Ok(GossipEvent::NeighborUp(peer)) if peer == [3; 32]
+        ));
+        assert!(matches!(
+            c_events.try_recv(),
+            Ok(GossipEvent::NeighborUp(peer)) if peer == [1; 32]
+        ));
+        assert!(b_events.try_recv().is_err());
+
+        a_sink.broadcast(vec![1, 2, 3]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            c_events.try_recv(),
+            Ok(GossipEvent::Received { bytes, .. }) if bytes == vec![1, 2, 3]
+        ));
+        assert!(b_events.try_recv().is_err());
     }
 }
