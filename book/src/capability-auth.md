@@ -1,202 +1,179 @@
-# Positive Authority and CONNECT
+# Blob-Native Capabilities and CONNECT
 
-TribleSpace authority is a public, grow-only set of positive grant
-occurrences. Each occurrence is an ordinary signed collection commit: the
-commit signer is the issuer, the commit's intrinsic ID is the grant occurrence
-ID, and the committed `SimpleArchive` contains one exact grant atom.
+TribleSpace capabilities are exact signed claim trees. Each claim and each
+signature is an ordinary canonical `SimpleArchive` blob, named by its Blake3
+content handle. A credential is simply the 32-byte handle of the leaf signature
+blob.
 
-The kernel has no mutable membership record, negative grant, permission
-hierarchy, expiry, renewal, or retraction. Independent valid grants combine by
-set union. Delegation follows exact parent occurrences, so portable evidence is
-a concrete root-to-leaf chain rather than a lookup into ambient policy.
+There is no authority collection, policy resolver, membership scan, or global
+credential registry. A caller designates one leaf handle, loads only the blobs
+that exact ancestry names, and verifies one explicit claim against an external
+trust root and instant.
 
-## One public authority collection per team
+## Claims, signatures, and credentials
 
-A team is rooted in one Ed25519 public key. That key determines a canonical
-collection descriptor named `authority` with:
-
-- `SimpleArchive` elements;
-- set union as its join law; and
-- public reach, so signed grant evidence may be relayed.
-
-The descriptor's content handle is
-`authority::collection(team_root)`. There is exactly one such authority
-collection for a team root. It is an ordinary native collection, not a new
-storage primitive or a mutable policy table.
-
-Every accepted authority record is a `CollectionCommit` in that collection.
-Its data must be exactly one canonical grant entity and its metadata must be
-the canonical empty archive. A grant names:
+A capability claim names:
 
 | Field | Meaning |
 |---|---|
 | subject | one direct Ed25519 public-key principal |
-| resource | one exact collection descriptor handle |
+| resource | one exact opaque 32-byte resource |
 | action | one exact, uninterpreted action ID |
-| parent | zero or one exact grant occurrence ID |
-| invoke | whether the subject may perform the action |
-| delegate | whether the subject may issue a child for the same action and resource |
+| mode | `Invoke`, `Delegate`, or `InvokeAndDelegate` |
+| parent | zero or one exact parent signature-blob handle |
+| validity | zero or one inclusive lower/upper TAI interval |
 
-Invocation and delegation are independent uses. A grant may carry invocation,
-delegation, or both, but never neither. Actions do not imply one another: a
-grant for one action is not a weaker or stronger spelling of another action.
-Resources are equally exact; there is no ambient resource namespace or
-wildcard.
+Invocation and delegation are independent uses. A mode satisfies a requested
+mode only when it contains every requested use. Actions do not imply one
+another, and resources have no wildcard or ambient namespace.
 
-`triblespace-core` defines `ACTION_WRITE` for authorizing a subject to
-contribute signed commits to one exact collection. `triblespace-net` defines a
-separate `ACTION_CONNECT`. A grant for either one says nothing about the
-other.
+A signature blob names the exact claim-blob handle, signer public key, and
+Ed25519 signature over those claim bytes. A root claim has no parent and must be
+signed by the externally supplied trust root. A child names the immediately
+preceding signature blob and must be signed by that parent's subject.
 
-## Positive fixed-point resolution
+Claims and signatures are stored through the ordinary blob API. Storing a
+proof adds no membership occurrence or mutable head: inserting the same bytes
+again has the same handles. The leaf signature handle is therefore enough to
+identify one credential without a separate index.
 
-Authority resolution observes one known prefix of the team's authority
-collection and computes its least positive fixed point.
+## Exact reconstruction and verification
 
-A no-parent occurrence is accepted only when its collection commit is signed
-by the team root. A child occurrence is accepted only when all of the
-following hold:
+`CapabilityProof::load` starts from one leaf credential. It loads the exact
+signature blob, follows that signature's exact claim handle, then follows the
+claim's exact parent signature handle until it reaches a root. It neither lists
+storage nor searches for alternative grants. Missing, malformed,
+wrongly-addressed, or cyclic evidence is an error.
 
-1. its exact named parent occurrence is already accepted;
-2. the child commit signer is the parent grant's subject;
-3. the child preserves the parent's exact action and resource; and
-4. the parent grants delegation.
+Loading proves only that the named blobs can be reconstructed. Admission is
+`CapabilityProof::verify_claim`, whose caller supplies:
 
-The child's direct subject and invoke/delegate mode are its own explicit
-fields. Several independently grounded grants are alternatives: any one exact
-accepted occurrence can establish the requested authority.
+- the external trust-root public key;
+- the exact verification instant; and
+- the expected leaf subject, action/resource atom, and minimum mode.
 
-Malformed or incomplete candidates remain inert instead of poisoning the
-whole observation. Resolution reports diagnostics for invalid signatures,
-non-canonical metadata or grant data, unavailable data blobs, wrong root
-issuers, signer/subject mismatches, changed actions or resources,
-non-delegating parents, and unresolved parents. Adding a previously missing
-parent or data blob can ground more grants on a later observation; an already
-accepted grant is never removed by set growth.
+Verification hashes every blob from its bytes, parses closed canonical shapes,
+and strictly checks every signature. It also requires:
 
-## Claim-directed portable proofs
+1. the first claim to have no parent and its signature to come from the trust
+   root;
+2. every child to name the immediately preceding signature blob;
+3. every child signature to come from its parent's subject;
+4. every parent to carry delegation and contain the child's mode;
+5. the exact action/resource atom to remain unchanged; and
+6. the explicit instant to lie inside every bounded inclusive validity
+   interval.
 
-An `AuthorityProof` carries the exact accepted ancestry needed for one claim.
-Its steps are ordered root to leaf. Each step contains:
+The verified capability reports the intersection of all bounded intervals as
+its effective validity. `None` means every step is unbounded. A valid proof
+prefix proves only its own leaf; it cannot substitute for a descendant the
+caller expected.
 
-- the complete 192-byte signed authority `CollectionCommit`; and
-- the canonical grant archive whose content identity that commit names.
+## Portable proofs and invite bundles
 
-Verification is standalone. It strictly verifies every commit, recomputes and
-checks every adjacent data identity, requires the canonical team authority
-collection and empty metadata, and enforces the exact parent, issuer, action,
-resource, and delegation rules at every step.
-
-Verification is also claim-directed. After validating the chain, the verifier
-compares its leaf with the caller's required subject, action, resource, and
-minimum invoke/delegate mode. A valid prefix proves its own leaf; it cannot be
-mistaken for proof of a descendant that the caller expected. A grant carrying
-both uses satisfies a claim requiring invocation alone or delegation alone.
-
-The portable wire codec is versioned and bounded. Version 1 encodes:
+A portable `CapabilityProof` is the root-to-leaf sequence of exact claim and
+signature blobs. The network codec is versioned and bounded. Version 2 encodes:
 
 ```text
 version:u8
 step_count:u8
 repeat step_count times:
-    commit:192
-    grant_data_length:u16
-    grant_data:bytes
+    claim_length:u16
+    signature_length:u16
+    claim:bytes
+    signature:bytes
 ```
 
-The one-byte count bounds a transport proof to 255 steps. Each grant archive
-is bounded by the seven tribles in the canonical delegated shape. Decoding
-checks the complete framing before allocating step payloads. These are
-transport bounds, not an expiry or a depth limit in the authority algebra.
+The one-byte count bounds one transport proof to 255 steps. Claim and signature
+lengths are bounded by their largest canonical archive shapes, and decoding
+validates the complete frame before allocating step blobs. These are carrier
+bounds; the capability algebra and exact-handle loader do not impose a depth
+limit.
 
-Invite bundles prepend the 32-byte team-root public key to the same proof
-bytes. They are public, self-contained evidence. Possessing a bundle does not
-let another key use it because verification binds the leaf subject to the
-claim, and CONNECT authentication binds that claim to the transport peer's
-Ed25519 key.
+A team invite prepends the team's 32-byte trust-root public key to those proof
+bytes. The bundle is public and self-contained. Possessing it does not let a
+different key use it because verification binds the leaf subject to the
+caller's expected key.
 
 ## CONNECT authenticates direct RPC only
 
-`ACTION_CONNECT` authorizes one exact subject to establish an authenticated
-direct-RPC connection for one team. Its required resource is always that
-team's authority collection:
+For a team, the CONNECT resource is the trust-root public key's exact 32 bytes:
 
 ```text
 subject = transport peer's Ed25519 key
 action = ACTION_CONNECT
-resource = authority::collection(team_root)
+resource = team trust-root public-key bytes
 required mode = Invoke
 ```
 
-That atom grants no `WRITE`, generic `READ`, gossip membership, collection
-reach, blob custody, retention, or semantic trust. Collection reach still
-decides which signed commits a holder may proactively relay. Author admission
-still belongs to the resolver selecting a collection view. Gossip remains a
-sparse evidence transport, and local WANT/retention policy remains local.
-After CONNECT admits a session, the endpoint may answer its configured
-read-only RPC surface; that disclosure is a property of the host's serving
-snapshot, not a READ grant carried by CONNECT.
+CONNECT grants no collection `WRITE`, generic `READ`, gossip membership,
+collection reach, blob custody, retention, or semantic trust. It authorizes the
+configured direct-RPC surface only. Collection reach still controls proactive
+relay, and local WANT/retention policy remains local.
 
-The direct protocol uses ALPN `/triblespace/pile-sync/6`. The first stream on
+`PeerConfig` keeps authentication and rendezvous separate:
+
+- `connect_root` is the external trust root and exact CONNECT resource;
+- `connect_proof` is the already selected complete proof for this peer; and
+- `gossip_topic` is an independent optional 32-byte application choice.
+
+The direct protocol uses ALPN `/triblespace/pile-sync/7`. The first stream on
 every connection must be `OP_AUTH` (`0x05`) carrying the complete bounded proof
-inline. The server verifies an exact CONNECT claim for the TLS peer and replies
-with `AUTH_OK` or `AUTH_REJECTED`. Only after success are the read-only direct
-RPC operations served on later streams.
+inline. The server verifies CONNECT for the authenticated transport key at the
+explicit current epoch and replies with `AUTH_OK` or `AUTH_REJECTED`. A bounded
+successful session is closed after the proof's effective inclusive upper
+bound.
 
-There is no pre-auth proof-fetch operation and no ambient proof lookup. A
-caller must already possess the complete proof it presents. `OP_AUTH` cannot
-appear again later on the connection.
+There is no pre-auth proof fetch or ambient proof lookup. A caller already
+possesses the exact proof it presents, and `OP_AUTH` cannot be repeated later
+on the connection.
 
 ## Team CLI
 
-The `trible team` surface has five commands. All authority evidence lives in
-the supplied pile.
+The `trible team` surface has four commands. All claim/signature evidence lives
+as ordinary blobs in the supplied pile.
 
 ```text
 trible team create --pile PATH [--key KEY_PATH]
+    [--valid-from RFC3339 --valid-until RFC3339]
 ```
 
 Creates a fresh team-root key, initializes the founder key at its conventional
-path if needed, and publishes a root-signed founder CONNECT grant with both
-invocation and delegation. It prints the team-root public key, the team-root
-secret, and the founder grant ID. The root secret is not a mutable membership
-database and is not written to the pile or a key file; capture it from the
-command output and store it offline because anyone holding it can publish
-independent root grants for that team.
+path if needed, issues a root-signed founder CONNECT credential in
+`InvokeAndDelegate` mode, and stores its exact blobs. It prints the team-root
+public key, offline root secret, and 64-hex-character founder credential. The
+root secret is not written to the pile or a key file; anyone holding it can
+issue an independent root credential for the team.
 
 ```text
-trible team invite --pile PATH --team-root HEX --parent ID \
-    --key ISSUER_KEY --invitee HEX [--delegate] --out FILE
+trible team invite --pile PATH --team-root HEX --parent HANDLE \
+    --key ISSUER_KEY --invitee HEX [--delegate] \
+    [--valid-from RFC3339 --valid-until RFC3339] --out FILE
 ```
 
-Loads an existing issuer key and requires `--parent` to be an accepted exact
-CONNECT grant whose subject is that issuer and whose mode permits delegation.
-It publishes a child occurrence and writes a self-contained invite bundle.
-Without `--delegate`, the child invokes CONNECT only. With `--delegate`, it
-both invokes and may issue another child.
+Loads exactly the designated parent credential from the pile and verifies that
+the issuer holds CONNECT delegation at the current time. It signs the child,
+stores the extended proof's exact blobs, writes a self-contained bundle, and
+prints the child's leaf credential. Without `--delegate`, the child carries
+invocation only; with it, the child carries invocation and delegation. Validity
+bounds are optional, inclusive, and must be supplied as a pair.
 
 ```text
 trible team join --pile PATH --key INVITEE_KEY --invite FILE
 ```
 
-Loads the invitee's existing key, verifies the bundle against an exact CONNECT
-claim for that key, and idempotently imports the authority descriptor, empty
-metadata archive, grant data archives, and signed commits.
+Loads the invitee's existing key and verifies the bundle's exact root, subject,
+CONNECT atom, minimum invocation mode, and current validity before writing
+anything. It then stores every claim/signature blob idempotently and prints the
+accepted leaf credential.
 
 ```text
-trible team list --pile PATH --team-root HEX
+trible team show --pile PATH --team-root HEX --credential HANDLE
 ```
 
-Prints accepted occurrences in intrinsic commit-ID order and the diagnostics
-for inert candidates.
-
-```text
-trible team show --pile PATH --team-root HEX --grant ID
-```
-
-Prints one accepted occurrence's exact ancestry from the root grant to the
-selected leaf. An inert or absent occurrence is an error rather than a partial
-chain.
+Loads one designated credential by exact handle, verifies it at the current
+time, and prints its root-to-leaf ancestry. There is deliberately no team-wide
+`list`: ordinary blob storage is not a global credential registry.
 
 A complete bootstrap is explicit:
 
@@ -204,17 +181,17 @@ A complete bootstrap is explicit:
 # Founder
 trible pile create founder.pile
 trible team create --pile founder.pile --key founder.key
-# Save the printed team root and founder grant ID.
+# Save the printed team root and founder credential.
 
 # Invitee creates only its local transport key.
 trible pile create member.pile
 trible pile net identity --key member.key
 
-# Founder publishes the child and writes a portable bundle.
+# Founder issues the child and writes a portable bundle.
 trible team invite \
   --pile founder.pile \
   --team-root <TEAM_ROOT> \
-  --parent <FOUNDER_GRANT_ID> \
+  --parent <FOUNDER_CREDENTIAL> \
   --key founder.key \
   --invitee <MEMBER_PUBLIC_KEY> \
   --out member.invite
@@ -226,35 +203,37 @@ trible team join \
   --invite member.invite
 ```
 
-`pile net status` and `pile net sync` then require the pile, team root, and
-exact accepted grant explicitly:
+`pile net status` requires the exact trust root and credential. `sync` also
+requires an independent gossip topic; it is never inferred from authorization:
 
 ```bash
 trible pile net status member.pile \
-  --key member.key --team-root <TEAM_ROOT> --grant <MEMBER_GRANT_ID>
+  --key member.key \
+  --team-root <TEAM_ROOT> \
+  --credential <MEMBER_CREDENTIAL>
 
 trible pile net sync member.pile \
-  --key member.key --team-root <TEAM_ROOT> --grant <MEMBER_GRANT_ID> \
+  --key member.key \
+  --team-root <TEAM_ROOT> \
+  --credential <MEMBER_CREDENTIAL> \
+  --gossip-topic <32_BYTE_HEX_TOPIC> \
   --peers <FOUNDER_ENDPOINT>
 ```
 
-Both commands load an existing key, resolve that exact local occurrence,
-confirm it invokes CONNECT for the key, reconstruct its ancestry, and reject a
-proof that exceeds the transport bounds. There is no environment-variable
-fallback, all-zero sentinel, implicit team-of-one credential, or automatic key
-creation on these paths. `pile net identity` is the explicit key-initialization
-command.
+Both commands load the existing key and exact local proof, verify CONNECT for
+that key at the current time, and reject evidence outside the transport bounds.
+There is no environment-variable fallback, all-zero sentinel, inferred topic,
+implicit team-of-one credential, or automatic key creation on these paths.
+`pile net identity` is the explicit key-initialization command.
 
-## Deliberate boundary: no removal inside an epoch
+## Validity is not revocation
 
-Positive authority is monotone. A valid occurrence does not expire and cannot
-be retracted, renewed, denied by an admin hierarchy, or hidden behind a pending
-approval workflow. The kernel also has no distinguished "current membership"
-head whose replacement could invalidate earlier proofs.
+Optional inclusive bounds let a credential be not-yet-valid or expire. They do
+not create mutable policy, renewal, retraction, negative grants, an admin
+hierarchy, or a distinguished current-membership head. An unbounded valid
+credential remains valid under the same served trust root.
 
-Durable removal is therefore an epoch change outside this kernel: move to a
-successor team, collection, or key epoch and enforce the cutoff at that new
-epoch's external admission boundary. Merely issuing a new subject key under
-the same still-served team root does not invalidate an old CONNECT proof. That
-cost is explicit. It is what keeps authority proof verification local,
-portable, and invariant under pile concatenation.
+Ending authority before a signed upper bound is therefore an epoch or serving
+policy change outside this kernel: move to a successor team/root/key epoch or
+stop serving the old trust root. That explicit cost keeps verification local,
+portable, claim-directed, and independent of storage enumeration.

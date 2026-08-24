@@ -240,23 +240,25 @@ The `trible` CLI makes team and proof selection explicit:
 trible pile net identity [--key PATH]
     Initialize the key if needed and print this node's iroh identity.
 
-trible pile net status <PILE> --team-root HEX --grant ID [--key PATH]
-    Load the existing key, resolve the exact accepted local CONNECT grant,
-    reconstruct its portable ancestry, and report the proof step count.
+trible pile net status <PILE> --team-root HEX --credential HANDLE [--key PATH]
+    Load the existing key and exact credential blobs, reconstruct and verify
+    the CONNECT proof at the current time, and report the proof step count.
 
-trible pile net sync <PILE> --team-root HEX --grant ID
+trible pile net sync <PILE> --team-root HEX --credential HANDLE
+    --gossip-topic HEX
     [--peers ID_OR_TICKET,...] [--key PATH]
     Run collection-evidence gossip and durable WANT reconciliation.
     --read-only suppresses publication; --write-only suppresses admission
     and fetching; --no-lazy disables WANT servicing.
 ```
 
-`status` and `sync` require all of the pile, team root, grant occurrence, and
-existing signing key. A missing or differently owned grant, inert ancestry,
-wrong action/resource, non-invoking leaf, absent key, or non-portable proof is
-an error before networking starts. There is no environment-variable fallback,
-all-zero grant sentinel, implicit team-of-one grant, or automatic key creation
-on these two paths.
+`status` and `sync` require the pile, CONNECT trust root, exact leaf credential,
+and existing signing key; `sync` additionally requires its independent gossip
+topic. Missing exact blobs, a different subject, invalid ancestry, wrong
+action/resource, non-invoking or currently invalid leaves, absent keys, and
+non-portable proofs are errors before networking starts. There is no
+environment-variable fallback, all-zero credential sentinel, inferred topic,
+implicit team-of-one credential, or automatic key creation on these two paths.
 
 The mesh topic is an explicit application choice independent of the CONNECT
 root. `--duration` and `--quiescent-for` can bound a run, but quiescence means

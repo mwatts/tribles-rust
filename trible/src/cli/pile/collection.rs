@@ -3,9 +3,10 @@
 //! A collection is identified by the blake3 handle of its *descriptor blob*,
 //! not by the entity id inside that blob. The descriptor is an ordinary
 //! canonical `SimpleArchive` of one intrinsic entity: the
-//! `KIND_COLLECTION_DESCRIPTOR` tag, an anchor — `name` + `team` for a root,
-//! `source` for a derivation — plus the blob `representation` and the join
-//! `recipe`, and whatever arguments its recipe carries.
+//! `KIND_COLLECTION_DESCRIPTOR` tag, an anchor — `name` + `namespace` for a
+//! root, `source` for a derivation — plus an optional local capability
+//! authority, the blob `representation`, the join `recipe`, and whatever
+//! arguments its recipe carries.
 //!
 //! Without this module the only way to look at one was
 //! `pile blob inspect <PILE> blake3:<HEX>`, which reports "256 bytes, Binary"
@@ -14,7 +15,7 @@
 //! and retention use, so the CLI view can never drift from the semantics.
 //!
 //! Names are what the listing leads with. A root carries the name it is known
-//! by inside its team, and that name — not the 64 hex characters of its
+//! by inside its namespace, and that name — not the 64 hex characters of its
 //! descriptor handle — is what an operator came to read. Every subcommand that
 //! takes a collection therefore accepts either spelling; the two can never be
 //! confused, because a name is `[a-z0-9-]{1,32}` starting with a letter and a
@@ -67,7 +68,7 @@ pub enum Command {
         /// Also show the descriptor blob's size and storage timestamp.
         #[arg(long)]
         metadata: bool,
-        /// Print handles and team keys in full instead of abbreviated.
+        /// Print handles, namespace keys, and authority keys in full.
         #[arg(long)]
         long: bool,
     },
@@ -298,7 +299,7 @@ struct Enumerated {
     fields: Fields,
 }
 
-/// What a descriptor is anchored to. A root is named within a team, a
+/// What a descriptor is anchored to. A root is named within a namespace, a
 /// derivation is anchored by the collection it derives from, and a descriptor
 /// that claims neither is neither — the listing says so rather than demanding
 /// one.
@@ -306,7 +307,7 @@ enum Anchor {
     Root {
         /// `Err` when the stored name is not a legal collection name.
         name: Result<CollectionName, String>,
-        team: Option<Result<String, String>>,
+        namespace: Option<Result<String, String>>,
     },
     Derived(CollectionHandle),
     /// Anchored by the opaque scope id that naming replaced.
@@ -322,7 +323,8 @@ enum Anchor {
 /// constant in its own source, so "which collection is this?" was answerable
 /// only by someone holding the code. That is the complaint naming exists to
 /// answer, and the library deleted the attribute along with the semantics
-/// when `collection_name` + `collection_team` replaced it.
+/// when `collection_name` + `collection_team` first replaced it. Current
+/// descriptors use the distinct `collection_namespace` anchor instead.
 ///
 /// A pile keeps what it was written with, so a reader still meets it — 46 of
 /// the 69 collections in a live pile are anchored this way. Recognizing the
@@ -357,8 +359,9 @@ fn anchor(fields: &Fields) -> Anchor {
     match descriptor::name(facts) {
         Some(name) => Anchor::Root {
             name: name.map_err(|e| e.to_string()),
-            team: descriptor::team(facts).map(|team| {
-                team.map(|team| hex::encode_upper(team.to_bytes()))
+            namespace: descriptor::namespace(facts).map(|namespace| {
+                namespace
+                    .map(|namespace| hex::encode_upper(namespace.to_bytes()))
                     .map_err(|e| e.to_string())
             }),
         },
@@ -441,7 +444,7 @@ fn resolve(rows: &[Enumerated], reference: &str) -> Result<CollectionHandle> {
         }
         many => Err(anyhow!(
             "{} collections in this pile are named {name} — a name identifies a collection only \
-             within one team, and these disagree. Pass one of the handles instead:\n{}",
+             within one namespace, and these disagree. Pass one of the handles instead:\n{}",
             many.len(),
             many.iter()
                 .map(|handle| format!("  {}", handle_hex(*handle)))
@@ -524,6 +527,11 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
             let mut cells = vec![
                 row.refs.total().to_string(),
                 abbrev(&handle_hex(row.handle), long),
+                match row.fields.facts().and_then(descriptor::authority) {
+                    Some(Ok(authority)) => abbrev(&hex::encode_upper(authority.to_bytes()), long),
+                    Some(Err(error)) => format!("<invalid: {error}>"),
+                    None => "-".to_owned(),
+                },
                 match row.fields.facts() {
                     Some(facts) => {
                         short_named_id(descriptor::representation(facts), representation_name)
@@ -560,14 +568,14 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         let mut scoped = 0usize;
         for row in &rows {
             match anchor(&row.fields) {
-                Anchor::Root { name, team } => {
+                Anchor::Root { name, namespace } => {
                     let mut cells = vec![
                         match &name {
                             Ok(name) => name.as_str().to_owned(),
                             Err(e) => format!("<invalid: {e}>"),
                         },
-                        match &team {
-                            Some(Ok(team)) => abbrev(team, long),
+                        match &namespace {
+                            Some(Ok(namespace)) => abbrev(namespace, long),
                             Some(Err(e)) => format!("<invalid: {e}>"),
                             None => "-".to_owned(),
                         },
@@ -615,8 +623,20 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
             summary.join(", ")
         );
 
-        let mut tail_headers: Vec<&str> = vec!["RECORDS", "COLLECTION", "REPRESENTATION", "RECIPE"];
-        let mut tail_aligns = vec![Align::Right, Align::Left, Align::Left, Align::Left];
+        let mut tail_headers: Vec<&str> = vec![
+            "RECORDS",
+            "COLLECTION",
+            "AUTHORITY",
+            "REPRESENTATION",
+            "RECIPE",
+        ];
+        let mut tail_aligns = vec![
+            Align::Right,
+            Align::Left,
+            Align::Left,
+            Align::Left,
+            Align::Left,
+        ];
         if metadata {
             tail_headers.extend(["BYTES", "STORED"]);
             tail_aligns.extend([Align::Right, Align::Left]);
@@ -624,7 +644,7 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
 
         if !named.is_empty() {
             println!();
-            let mut headers = vec!["NAME", "TEAM"];
+            let mut headers = vec!["NAME", "NAMESPACE"];
             headers.extend(tail_headers.iter().copied());
             let mut aligns = vec![Align::Left, Align::Left];
             aligns.extend(tail_aligns.iter().map(|align| match align {
@@ -721,37 +741,19 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
             .map_err(|e| anyhow!("decode collection descriptor: {e:?}"))?;
         println!("entity id:      {:X}", descriptor::entity(&descriptor)?);
         match anchor(&Fields::Decoded(descriptor.clone())) {
-            Anchor::Root { name, team } => {
+            Anchor::Root { name, namespace } => {
                 match name {
                     Ok(name) => println!("name:           {name}"),
                     Err(e) => println!("name:           <invalid: {e}>"),
                 }
-                match team {
-                    Some(Ok(team)) => println!("team:           {team}"),
-                    Some(Err(e)) => println!("team:           <invalid: {e}>"),
-                    None => println!("team:           <none>"),
+                match namespace {
+                    Some(Ok(namespace)) => println!("namespace:      {namespace}"),
+                    Some(Err(e)) => println!("namespace:      <invalid: {e}>"),
+                    None => println!("namespace:      <none>"),
                 }
             }
             Anchor::Derived(source) => {
                 println!("source:         {}", handle_hex(source));
-                // A derivation has no team of its own; it inherits one by
-                // walking `collection_source` to the root that has it. The
-                // walk reads descriptors out of this pile, so it answers only
-                // as far as the pile is complete — and says which link it is
-                // missing when it is not.
-                let team_root = descriptor::team_root(handle, |collection| {
-                    match Fields::load(&reader, collection) {
-                        Fields::Decoded(facts) => Some(facts),
-                        _ => None,
-                    }
-                });
-                match team_root {
-                    Ok((root, team)) => {
-                        println!("team:           {}", hex::encode_upper(team.to_bytes()));
-                        println!("team root:      {}", handle_hex(root));
-                    }
-                    Err(e) => println!("team:           <not established: {e}>"),
-                }
             }
             Anchor::RetiredScope => println!(
                 "anchor:         retired `collection_scope` — this descriptor predates naming, \n\
@@ -759,6 +761,14 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
             ),
             Anchor::Bare => println!("anchor:         <none>"),
             Anchor::Unreadable(why) => println!("anchor:         <{why}>"),
+        }
+        match descriptor::authority(&descriptor) {
+            Some(Ok(authority)) => println!(
+                "authority:      {}",
+                hex::encode_upper(authority.to_bytes())
+            ),
+            Some(Err(error)) => println!("authority:      <invalid: {error}>"),
+            None => println!("authority:      <none>"),
         }
         println!(
             "representation: {}",
@@ -953,11 +963,13 @@ mod tests {
     #[test]
     fn show_decodes_a_descriptor_addressed_by_its_blob_handle() {
         let name = CollectionName::new("inspected").unwrap();
-        let team = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let namespace = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let authority = SigningKey::from_bytes(&[8; 32]).verifying_key();
         let representation = <SimpleArchive as MetaDescribe>::id();
         let fragment = descriptor::naming(
             &name,
-            team,
+            namespace,
+            Some(authority),
             representation,
             TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
@@ -976,12 +988,13 @@ mod tests {
 
         let reader = store.reader().expect("reader");
         let blob: Blob<SimpleArchive> = reader.get(handle).expect("read descriptor blob");
-        assert_eq!(blob.bytes.len(), 320, "five tribles at 64 bytes each");
+        assert_eq!(blob.bytes.len(), 384, "six tribles at 64 bytes each");
 
         let decoded = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob)
             .expect("decode descriptor");
         assert_eq!(descriptor::name(&decoded).unwrap().unwrap(), name);
-        assert_eq!(descriptor::team(&decoded).unwrap().unwrap(), team);
+        assert_eq!(descriptor::namespace(&decoded).unwrap().unwrap(), namespace);
+        assert_eq!(descriptor::authority(&decoded).unwrap().unwrap(), authority);
         assert_eq!(
             descriptor::representation(&decoded).unwrap(),
             representation
@@ -996,12 +1009,12 @@ mod tests {
         let facts: TribleSet = reader
             .get::<TribleSet, SimpleArchive>(handle)
             .expect("unarchive descriptor");
-        assert_eq!(facts.len(), 5);
+        assert_eq!(facts.len(), 6);
         let entities: BTreeSet<Id> = facts.iter().map(|t| *t.e()).collect();
         assert_eq!(
             entities,
             BTreeSet::from([entity_id]),
-            "all five tribles hang off one intrinsic entity"
+            "all six tribles hang off one intrinsic entity"
         );
     }
 
@@ -1072,13 +1085,14 @@ mod tests {
     }
 
     /// Build one descriptor's decoded fields the way `list` sees them.
-    fn root(name: &str, team_seed: u8) -> Fields {
+    fn root(name: &str, namespace_seed: u8) -> Fields {
         let name = CollectionName::new(name).expect("legal name");
-        let team = SigningKey::from_bytes(&[team_seed; 32]).verifying_key();
+        let namespace = SigningKey::from_bytes(&[namespace_seed; 32]).verifying_key();
         Fields::Decoded(
             descriptor::naming(
                 &name,
-                team,
+                namespace,
+                Some(namespace),
                 <SimpleArchive as MetaDescribe>::id(),
                 TRIBLE_SET_UNION_RECIPE_V1,
                 reach::private(),
@@ -1132,11 +1146,12 @@ mod tests {
         );
     }
 
-    /// A name identifies a collection within one team, so two teams may both
-    /// have a `wiki` in one pile. That is not a lookup failure to paper over
-    /// with a first match — it is an ambiguity the operator has to break.
+    /// A name identifies a collection within one namespace, so two namespaces
+    /// may both have a `wiki` in one pile. That is not a lookup failure to
+    /// paper over with a first match — it is an ambiguity the operator has to
+    /// break.
     #[test]
-    fn a_name_shared_by_two_teams_refuses_to_resolve() {
+    fn a_name_shared_by_two_namespaces_refuses_to_resolve() {
         let rows = vec![row(3, root("wiki", 7)), row(5, root("wiki", 9))];
         let err = resolve(&rows, "wiki").expect_err("ambiguous");
         let text = err.to_string();

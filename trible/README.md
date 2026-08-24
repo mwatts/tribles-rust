@@ -78,7 +78,9 @@ trible pile migrate <PILE> branch-to-collection \
 ```
 
 This is an explicit compatibility operation over an immutable legacy pin
-snapshot. The current CLI does not create, advance, merge, or delete branches.
+snapshot. Here `--team-root` is deliberately both the target name namespace
+and its optional capability authority, matching the current named-collection
+facade. The current CLI does not create, advance, merge, or delete branches.
 
 #### Blobs
 
@@ -90,42 +92,45 @@ snapshot. The current CLI does not create, advance, merge, or delete branches.
 #### Collections
 
 A collection is identified by the blake3 handle of its canonical descriptor
-blob — a `SimpleArchive` naming its anchor, representation, join recipe, and
-reach law, together with the representation and recipe descriptions.
+blob — a `SimpleArchive` naming its root (`name` + public-key namespace) or
+derived source, optional local capability authority, representation, join
+recipe, and reach law, together with the representation and recipe
+descriptions.
 `pile blob inspect` sees only the encoded blob; these subcommands decode it.
 
-- `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded scope, representation, and recipe (known representation and recipe ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
+- `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded namespace/source anchor, local authority, representation, and recipe (known representation and recipe ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
 - `pile collection show <PILE> <HANDLE>` — decode one descriptor, its anchor,
-  representation, recipe, reach law, and referencing record counts. The handle
-  is accepted with or without the `blake3:` prefix.
+  local authority, representation, recipe, reach law, and referencing record
+  counts. The handle is accepted with or without the `blake3:` prefix.
 
 ### Distributed pile sync
 
 Built on `triblespace-net` (iroh QUIC + DHT + gossip). Every connection
-authenticates with an exact, positive CONNECT grant chain rooted at the team's
-public key; see *Team authority* below. Runtime configuration is explicit: the
-local pile must contain the accepted chain named by `--team-root` and
-`--grant`.
+authenticates with an exact CONNECT capability proof rooted at the team's
+public key; see *Team capabilities* below. Runtime configuration is explicit:
+the local pile must contain the exact claim/signature chain named by
+`--team-root` and `--credential`. Authentication identity and gossip
+rendezvous are independent inputs.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
-- `pile net status <PILE> --team-root HEX --grant ID [--key PATH]` — resolve the exact local CONNECT grant, reconstruct its ancestry proof, and print the configuration the node would present during authentication.
-- `pile net sync <PILE> --team-root HEX --grant ID [--peers ID,...] [--key PATH]` — long-running collection-evidence sync on the team's gossip mesh. The mesh is identified by the team root directly. The exact accepted grant must invoke CONNECT for the local key; no ambient environment fallback or sentinel exists. Collection records converge by set union, while referenced blobs and operation receipts stay lazy until requested by durable wants. Use `--read-only` or `--write-only` for directional operation and `--no-lazy` to suppress want reconciliation.
+- `pile net status <PILE> --team-root HEX --credential HANDLE [--key PATH]` — load the designated credential by exact blob handle, reconstruct and verify its CONNECT proof for the local key at the current time, and print the authentication configuration.
+- `pile net sync <PILE> --team-root HEX --credential HANDLE --gossip-topic HEX [--peers ID,...] [--key PATH]` — long-running collection-evidence sync. `--team-root` selects the CONNECT trust root and exact resource; the separately required `--gossip-topic` selects rendezvous without inference or fallback. The designated credential must invoke CONNECT for the local key. Collection records converge by set union, while referenced blobs and operation receipts stay lazy until requested by durable wants. Use `--read-only` or `--write-only` for directional operation and `--no-lazy` to suppress want reconciliation.
 
-### Team authority
+### Team capabilities
 
-Team authority is one public, grow-only collection of positive signed grant
-occurrences. A grant names one direct subject key, one exact resource, one
-action, an invoke/delegate mode, and optionally one exact delegating parent.
-There is no permission hierarchy, expiry, retraction, pending workflow, or
-mutable membership head in this kernel. A team root signs the founder grant;
-every invite carries the exact bounded parent chain needed to validate and
-import it.
+A team is identified by an Ed25519 trust-root public key, whose exact 32 bytes
+are also its CONNECT resource. Each capability step is one canonical claim blob
+and one signature blob. A claim names one subject, exact action/resource atom,
+invoke/delegate mode, optional parent signature handle, and optional inclusive
+validity interval. Proofs follow those handles from one designated leaf; there
+is no authority collection, resolver, global membership registry, or list
+operation. An invite carries the complete bounded root-to-leaf proof needed for
+standalone verification.
 
-- `team create --pile PATH [--key KEY_PATH]` — mint a team root, publish an explicit founder CONNECT grant with invocation and delegation, and print the root public key, offline root secret, and founder grant id.
-- `team invite --pile PATH --team-root HEX --parent ID --key ISSUER --invitee HEX [--delegate] --out FILE` — prove that ISSUER owns the exact delegating CONNECT parent, publish the child, and write a portable public proof bundle. Without `--delegate`, the child may connect but cannot invite.
-- `team join --pile PATH --key INVITEE --invite FILE` — verify that the self-contained bundle grants CONNECT to INVITEE on the exact team authority collection, then import its descriptor, grant data, and signed commits idempotently.
-- `team list --pile PATH --team-root HEX` — resolve and print accepted grants plus inert-candidate diagnostics.
-- `team show --pile PATH --team-root HEX --grant ID` — print the exact accepted root-to-leaf ancestry of one grant occurrence.
+- `team create --pile PATH [--key KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — mint a team root, issue the founder CONNECT in `invoke+delegate` mode, store the exact claim/signature blobs, and print the root public key, offline root secret, and founder credential handle.
+- `team invite --pile PATH --team-root HEX --parent HANDLE --key ISSUER --invitee HEX [--delegate] [--valid-from RFC3339 --valid-until RFC3339] --out FILE` — load one exact resident parent, verify its delegation capability at the current time, issue and store the child blobs, and write a portable proof bundle. Without `--delegate`, the child may connect but cannot invite.
+- `team join --pile PATH --key INVITEE --invite FILE` — verify the bundle's exact root, subject, CONNECT atom, minimum invoke mode, and current validity before storing its claim/signature blobs idempotently. It prints the accepted leaf credential.
+- `team show --pile PATH --team-root HEX --credential HANDLE` — load, verify, and print the exact root-to-leaf ancestry of one designated credential.
 
 ### Work with remote stores
 

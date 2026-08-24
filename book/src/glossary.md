@@ -5,10 +5,10 @@ when you encounter unfamiliar terminology or need a refresher on how concepts
 relate to one another in TribleSpace.
 
 ### Action
-An uninterpreted 128-bit identifier naming one exact operation in the positive
-authority kernel. Actions do not form a hierarchy and never imply one another.
-For example, `ACTION_WRITE` and `ACTION_CONNECT` are separate atoms even when
-they concern collections associated with the same team.
+An uninterpreted 128-bit identifier naming one exact operation. Actions do not
+form a hierarchy and never imply one another. For example, `ACTION_WRITE` and
+`ACTION_CONNECT` are separate atoms even when they concern collections
+associated with the same team.
 
 ### Attribute
 A property that describes some aspect of an entity. Attributes occupy the
@@ -26,15 +26,17 @@ takes the root for you), which is handy for short-lived or internal attributes.
 The canonical public `SimpleArchive`-union collection named `authority` for one
 team root. Its content handle is `authority::collection(team_root)`. Signed
 grant occurrences are ordinary commits in this grow-only collection, with
-canonical empty metadata; there is no separate mutable membership store.
+canonical empty metadata; there is no separate mutable membership store. This
+is the positive collection-write admission structure. Blob-native CONNECT
+credentials and the `trible team` CLI do not use or enumerate it.
 
 ### Authority Grant
-One atomic positive authority statement carried by one signed authority
-collection commit. The outer commit signer is the issuer and its intrinsic
-commit ID is the grant occurrence ID. The canonical grant names one direct
-subject key, one exact resource collection handle, one exact action, optional
-exact parent occurrence, and explicit invoke/delegate uses. Independent
-accepted grants are alternatives under set union.
+One atomic statement in the positive authority-collection model, carried by
+one signed collection commit. The outer commit signer is the issuer and its
+intrinsic commit ID is the grant occurrence ID. The canonical grant names one
+direct subject key, one exact resource collection handle, one exact action,
+optional exact parent occurrence, and explicit invoke/delegate uses.
+Independent accepted grants are alternatives under set union.
 
 ### Authority Proof
 A self-contained, root-to-leaf sequence of authority commits paired with their
@@ -57,6 +59,24 @@ An abstraction that persists immutable content-addressed blobs. Implementations
 back local piles, in-memory collections, or remote object stores while exposing
 small capability traits for insertion, retrieval, metadata, and enumeration.
 
+### Capability Claim
+A closed canonical blob naming one direct Ed25519 subject, exact 32-byte
+resource, exact action, invoke/delegate mode, optional parent signature-blob
+handle, and optional inclusive validity interval. A root claim has no parent;
+each child names its exact predecessor.
+
+### Capability Credential
+The content handle of one capability leaf's signature blob. It is a precise
+entry point for reconstructing one proof by exact blob lookups, not an entry in
+a global registry.
+
+### Capability Proof
+A claim-directed root-to-leaf sequence of exact claim and signature blobs.
+Verification takes an external trust root, explicit instant, and expected leaf;
+checks every canonical shape, content identity, strict signature, parent,
+issuer, mode attenuation, atom, and validity bound; then requires the leaf to
+match the expected subject/action/resource/minimum mode.
+
 ### Commit
 A signed native collection membership assertion. A `CollectionCommit` names
 the exact collection descriptor, data element, mandatory metadata archive, and
@@ -70,10 +90,12 @@ map elements into another collection through a canonical homomorphism. A
 collection has no distinguished head.
 
 ### Collection Descriptor
-A canonical `SimpleArchive` describing a collection's anchor, element
+A canonical `SimpleArchive` describing a collection's root name and public-key
+namespace or exact derived source, optional local capability authority, element
 representation, join recipe, and reach law. Its content handle is the
 `CollectionHandle`, so every native record which names a collection can resolve
-its meaning through the ordinary blob store.
+its meaning through the ordinary blob store. A derived descriptor never
+inherits namespace or authority through its source.
 
 ### Collection Store
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
@@ -86,12 +108,12 @@ their dependencies.
 
 ### CONNECT
 The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
-direct-RPC session. Its resource is the team's
-`authority::collection(team_root)`, and its claimed subject must equal the
-transport peer key. CONNECT grants no WRITE, generic READ, gossip, collection
-reach, semantic trust, custody, or retention authority. Protocol v6 carries
-the complete claim-directed proof inline on the connection's first `OP_AUTH`
-stream.
+direct-RPC session. Its resource is the team's exact 32-byte trust-root public
+key, and its claimed subject must equal the transport peer key. CONNECT grants
+no WRITE, generic READ, gossip, collection reach, semantic trust, custody, or
+retention authority. Protocol v7 carries the complete blob-native capability
+proof inline on the connection's first `OP_AUTH` stream; the gossip topic is a
+separate application choice.
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,

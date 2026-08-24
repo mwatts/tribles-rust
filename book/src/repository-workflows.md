@@ -258,10 +258,13 @@ to the canonical empty archive. Contentless merge wrappers are validated but do
 not become members.
 
 Target authorization is established before any target dependency or commit is
-published. If the supplied signing key is the team root, the migration appends
-its idempotent root `WRITE`/Invoke grant. A delegated signing key must already
-hold exact `WRITE` authority for the target descriptor; otherwise migration
-fails after source validation but before changing the target collection.
+published. For this compatibility command, `--team-root` intentionally fills
+both the target collection's public-key name namespace and its optional local
+capability authority, matching the current named-collection facade. If the
+supplied signing key is that root, the migration appends its idempotent root
+`WRITE`/Invoke grant. A delegated signing key must already hold exact `WRITE`
+authority for the target descriptor; otherwise migration fails after source
+validation but before changing the target collection.
 
 Legacy wrapper parents, messages, timestamps, authors, and signatures are not
 silently reinterpreted as application metadata. Two source nodes with identical

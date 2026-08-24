@@ -93,13 +93,12 @@ fn migrate(
     let head = validate_branch_head(&reader, branch, &branch_meta)?;
     // Migrated history stays put. A legacy branch carried no notion of reach,
     // so declaring one here would be inventing a decision on the user's behalf
-    // about data they wrote before the question existed -- and it would change
-    // the collection's handle, which is the one thing a migration must let the
-    // owner predict. `reach::private()` writes no reach attribute at all, so the
-    // descriptor is byte-identical to what this migration produced before the
-    // attribute existed. Publishing migrated material stays a deliberate
-    // re-commit into a differently-named collection.
-    let descriptor = simplearchive_union::descriptor(name, team, reach::private());
+    // about data they wrote before the question existed. `reach::private()`
+    // writes no reach fact, so reach does not independently rename the target;
+    // its explicit namespace and authority still participate in descriptor
+    // identity. Publishing migrated material stays a deliberate re-commit into
+    // a differently named collection.
+    let descriptor = simplearchive_union::descriptor(name, team, Some(team), reach::private());
     let (reachable, contentless_merges, prepared) = match head {
         Some(head) => prepare_reachable(&reader, head, &descriptor)?,
         None => (0, 0, Vec::new()),
@@ -513,8 +512,8 @@ mod tests {
         team_key: &SigningKey,
         writer: &SigningKey,
     ) {
-        let descriptor =
-            simplearchive_union::descriptor(name, team_key.verifying_key(), reach::private());
+        let team = team_key.verifying_key();
+        let descriptor = simplearchive_union::descriptor(name, team, Some(team), reach::private());
         let target =
             triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts())
                 .get_handle();
@@ -617,7 +616,7 @@ mod tests {
         );
         assert_eq!(fs::metadata(&path)?.len(), first_len);
         let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
+            simplearchive_union::descriptor(&name, team, Some(team), reach::private()).into_facts(),
         )
         .get_handle();
         assert_eq!(
@@ -647,7 +646,7 @@ mod tests {
 
         assert!(!mappings.is_empty());
         let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
+            simplearchive_union::descriptor(&name, team, Some(team), reach::private()).into_facts(),
         )
         .get_handle();
         let writer = Inline::new(signer.verifying_key().to_bytes());
@@ -684,7 +683,7 @@ mod tests {
         assert!(error.to_string().contains("has no exact WRITE authority"));
         assert_eq!(fs::metadata(&path)?.len(), before);
         let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(&name, team, reach::private()).into_facts(),
+            simplearchive_union::descriptor(&name, team, Some(team), reach::private()).into_facts(),
         )
         .get_handle();
         assert!(!pile
@@ -725,7 +724,8 @@ mod tests {
         let team = team_key.verifying_key();
         let signer = key(11);
         grant_write(&mut pile, &collection_name, &team_key, &signer);
-        let descriptor = simplearchive_union::descriptor(&collection_name, team, reach::private());
+        let descriptor =
+            simplearchive_union::descriptor(&collection_name, team, Some(team), reach::private());
         let reader = pile.reader()?;
         let (reachable, contentless_merges, prepared) =
             prepare_reachable(&reader, merge_commit, &descriptor)?;
@@ -829,6 +829,7 @@ mod tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("random-subject").unwrap(),
             key(14).verifying_key(),
+            Some(key(14).verifying_key()),
             reach::private(),
         );
         let (reachable, merges, prepared) = prepare_reachable(&reader, handle, &descriptor)?;
@@ -866,6 +867,7 @@ mod tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("target").unwrap(),
             key(6).verifying_key(),
+            Some(key(6).verifying_key()),
             reach::private(),
         );
         let reader = pile.reader()?;

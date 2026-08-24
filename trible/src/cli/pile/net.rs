@@ -38,6 +38,14 @@ fn parse_peers(strs: &[String]) -> Result<Vec<EndpointAddr>> {
         .collect()
 }
 
+fn parse_gossip_topic(text: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(text).map_err(|error| anyhow!("decode gossip topic hex: {error}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("gossip topic must be 32 bytes"))
+}
+
 fn load_existing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
     let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
     triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
@@ -55,7 +63,7 @@ pub enum Command {
     },
     /// Resolve and show the exact CONNECT proof this node would present.
     Status {
-        /// Pile containing the accepted authority chain.
+        /// Pile containing the credential's exact claim/signature blobs.
         pile: PathBuf,
         /// Path to the node's signing key.
         #[arg(long)]
@@ -63,11 +71,11 @@ pub enum Command {
         /// Team root public key (32-byte hex).
         #[arg(long)]
         team_root: String,
-        /// Exact accepted CONNECT grant occurrence (16-byte hex id).
+        /// Exact CONNECT credential (32-byte leaf signature-blob handle).
         #[arg(long)]
-        grant: String,
+        credential: String,
     },
-    /// Sync with peers on one explicitly authorized team's gossip mesh.
+    /// Sync with peers using explicit authentication and gossip identities.
     Sync {
         pile: PathBuf,
         #[arg(long, value_delimiter = ',')]
@@ -77,9 +85,12 @@ pub enum Command {
         /// Team root public key (32-byte hex).
         #[arg(long)]
         team_root: String,
-        /// Exact accepted CONNECT grant occurrence (16-byte hex id).
+        /// Exact CONNECT credential (32-byte leaf signature-blob handle).
         #[arg(long)]
-        grant: String,
+        credential: String,
+        /// Exact collection-evidence gossip topic (32-byte hex).
+        #[arg(long)]
+        gossip_topic: String,
         /// Don't publish our own collection evidence — receive only. Useful
         /// for follower / leecher workflows where we're catching up.
         #[arg(long, conflicts_with = "write_only")]
@@ -124,14 +135,15 @@ pub fn run(cmd: Command) -> Result<()> {
             pile,
             key,
             team_root,
-            grant,
-        } => run_status(pile, key, team_root, grant),
+            credential,
+        } => run_status(pile, key, team_root, credential),
         Command::Sync {
             pile,
             peers,
             key,
             team_root,
-            grant,
+            credential,
+            gossip_topic,
             read_only,
             write_only,
             duration,
@@ -151,7 +163,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 peers,
                 key,
                 team_root,
-                grant,
+                credential,
+                gossip_topic,
                 direction,
                 duration,
                 quiescent_for,
@@ -180,17 +193,17 @@ fn run_status(
     pile_path: PathBuf,
     key_path: Option<PathBuf>,
     team_root_text: String,
-    grant_text: String,
+    credential_text: String,
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
     let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
-    let grant = crate::cli::team::parse_grant_id(&grant_text)?;
+    let credential = crate::cli::team::parse_credential(&credential_text)?;
     let mut pile = open_pile(&pile_path)?;
     let proof = match crate::cli::team::resolve_connect_proof(
         &mut pile,
         team_root,
-        grant,
+        credential,
         key.verifying_key(),
     ) {
         Ok(proof) => proof,
@@ -204,7 +217,7 @@ fn run_status(
 
     println!("node:        {public}");
     println!("team_root:   {}", hex::encode(team_root.to_bytes()));
-    println!("grant:       {grant:X}");
+    println!("credential:  {}", hex::encode(credential.raw));
     println!("proof_steps: {}", proof.steps().len());
     println!("authorization: CONNECT accepted");
     Ok(())
@@ -218,7 +231,8 @@ fn run_sync(
     peer_strs: Vec<String>,
     key_path: Option<PathBuf>,
     team_root_text: String,
-    grant_text: String,
+    credential_text: String,
+    gossip_topic_text: String,
     direction: SyncDirection,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
@@ -235,11 +249,12 @@ fn run_sync(
     // Repository workspace nor mutable branch mirrors.
     let mut pile = open_pile(&pile_path)?;
     let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
-    let grant = crate::cli::team::parse_grant_id(&grant_text)?;
+    let credential = crate::cli::team::parse_credential(&credential_text)?;
+    let gossip_topic = parse_gossip_topic(&gossip_topic_text)?;
     let connect_proof = match crate::cli::team::resolve_connect_proof(
         &mut pile,
         team_root,
-        grant,
+        credential,
         key.verifying_key(),
     ) {
         Ok(proof) => proof,
@@ -253,17 +268,18 @@ fn run_sync(
         key.clone(),
         PeerConfig {
             peers,
-            gossip: true,
-            team_root,
+            gossip_topic: Some(gossip_topic),
+            connect_root: team_root,
             connect_proof,
             direction,
         },
     );
     eprintln!("node: {}", peer.id());
     eprintln!(
-        "team_root: {}  (gossip topic)",
+        "team_root: {}  (CONNECT trust root)",
         hex::encode(team_root.to_bytes())
     );
+    eprintln!("gossip_topic: {}", hex::encode(gossip_topic));
     let dir_label = match direction {
         SyncDirection::Bidirectional => "bidirectional",
         SyncDirection::ReadOnly => "read-only (no publish)",
@@ -409,5 +425,12 @@ mod tests {
         assert_eq!(parse_peers(&[id.to_string()]).unwrap(), vec![id.into()]);
         assert_eq!(parse_peers(&[ticket]).unwrap(), vec![direct]);
         assert!(parse_peers(&["not-a-peer".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn gossip_topics_are_exact_32_byte_hex_values() {
+        assert_eq!(parse_gossip_topic(&"ab".repeat(32)).unwrap(), [0xab; 32]);
+        assert!(parse_gossip_topic(&"ab".repeat(31)).is_err());
+        assert!(parse_gossip_topic("not-hex").is_err());
     }
 }

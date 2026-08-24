@@ -17,14 +17,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `trible pile migrate <pile> branch-to-collection` as the generic,
   same-pile bridge from one legacy `Repository` branch to a native
   `SimpleArchive` union collection. The command requires the target collection
-  name, team root, and signing key explicitly; validates the branch head and
-  complete reachable commit history before writing; preserves each authored
-  commit's exact `repo::content` and `metadata::archive`; skips verified
-  contentless merges; resolves both current and historical branch-name
+  name, team root, and signing key explicitly; uses that root as both the
+  target name namespace and optional local capability authority; validates the
+  branch head and complete reachable commit history before writing; preserves
+  each authored commit's exact `repo::content` and `metadata::archive`; skips
+  verified contentless merges; resolves both current and historical branch-name
   encodings; establishes exact target `ACTION_WRITE` before target publication
   (a team-root signer bootstraps itself, while a delegated signer must already
   be authorized); and reports every source-to-target mapping, including
   deterministic many-to-one collapse and idempotent replays.
+
+- Cut `trible team` over to exact blob-native capability credentials. `create`
+  stores a root-signed founder CONNECT claim in invoke-and-delegate mode;
+  `invite` loads one exact delegating parent signature handle and exports the
+  extended proof; `join` verifies the root, subject, CONNECT atom, minimum
+  invocation mode, and explicit current time before storing the exact ordinary
+  blobs; and `show` follows one designated leaf. The authority resolver and
+  global `list` surface are gone. Optional paired RFC 3339 bounds map to the
+  kernel's inclusive validity interval. `pile net` likewise selects an exact
+  `--credential`, while `sync` requires a separate explicit `--gossip-topic`.
 
 ### Changed
 

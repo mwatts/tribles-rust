@@ -1,4 +1,4 @@
-//! End-to-end tests for explicit `pile net status` authority resolution.
+//! End-to-end tests for explicit `pile net` capability configuration.
 
 use assert_cmd::Command;
 use tempfile::tempdir;
@@ -13,7 +13,7 @@ fn field(stdout: &[u8], label: &str) -> String {
 }
 
 #[test]
-fn status_resolves_the_exact_local_connect_grant() {
+fn status_loads_the_exact_local_connect_credential() {
     let dir = tempdir().unwrap();
     let pile = dir.path().join("team.pile");
     let key = dir.path().join("node.key");
@@ -35,7 +35,7 @@ fn status_resolves_the_exact_local_connect_grant() {
         .stdout
         .clone();
     let root = field(&create, "team root pubkey:");
-    let grant = field(&create, "founder grant:");
+    let credential = field(&create, "founder credential:");
 
     let status = Command::cargo_bin("trible")
         .unwrap()
@@ -48,8 +48,8 @@ fn status_resolves_the_exact_local_connect_grant() {
             key.to_str().unwrap(),
             "--team-root",
             &root,
-            "--grant",
-            &grant,
+            "--credential",
+            &credential,
         ])
         .assert()
         .success()
@@ -58,7 +58,7 @@ fn status_resolves_the_exact_local_connect_grant() {
         .clone();
     let status = String::from_utf8(status).unwrap();
     assert!(status.contains(&format!("team_root:   {root}")));
-    assert!(status.contains(&format!("grant:       {grant}")));
+    assert!(status.contains(&format!("credential:  {credential}")));
     assert!(status.contains("proof_steps: 1"));
     assert!(status.contains("authorization: CONNECT accepted"));
 }
@@ -75,8 +75,43 @@ fn status_has_no_ambient_or_sentinel_configuration() {
         .clone();
     let help = String::from_utf8(help).unwrap();
     assert!(help.contains("--team-root"));
-    assert!(help.contains("--grant"));
+    assert!(help.contains("--credential"));
+    assert!(!help.contains("--grant"));
     assert!(!help.contains("TRIBLE_TEAM_ROOT"));
     assert!(!help.contains("TRIBLE_TEAM_CAP"));
     assert!(!help.contains("self_cap"));
+}
+
+#[test]
+fn sync_requires_a_separate_explicit_gossip_topic() {
+    let help = Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "net", "sync", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(help).unwrap();
+    assert!(help.contains("--team-root"));
+    assert!(help.contains("--credential"));
+    assert!(help.contains("--gossip-topic"));
+    assert!(!help.contains("--grant"));
+
+    let handle = "00".repeat(32);
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "net",
+            "sync",
+            "unused.pile",
+            "--team-root",
+            &handle,
+            "--credential",
+            &handle,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--gossip-topic"));
 }

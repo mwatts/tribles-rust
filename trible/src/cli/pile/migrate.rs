@@ -43,7 +43,7 @@ pub enum Command {
         /// Immutable name of the target root collection.
         #[arg(long)]
         collection_name: String,
-        /// Exact Ed25519 team-root public key (64 hex characters).
+        /// Ed25519 key used as both target namespace and authority root.
         #[arg(long)]
         team_root: String,
         /// Durable target signing-key file (64-hex-character seed).

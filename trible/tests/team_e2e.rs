@@ -1,4 +1,4 @@
-//! End-to-end tests for the positive authority team CLI.
+//! End-to-end tests for exact blob-native team credentials.
 
 use assert_cmd::Command;
 use tempfile::tempdir;
@@ -6,7 +6,7 @@ use tempfile::tempdir;
 struct CreatedTeam {
     root: String,
     root_secret: String,
-    founder_grant: String,
+    founder_credential: String,
 }
 
 fn output_field(stdout: &[u8], label: &str) -> String {
@@ -37,7 +37,7 @@ fn create_team(pile: &std::path::Path, key: &std::path::Path) -> CreatedTeam {
     CreatedTeam {
         root: output_field(&output, "team root pubkey:"),
         root_secret: output_field(&output, "team root SECRET:"),
-        founder_grant: output_field(&output, "founder grant:"),
+        founder_credential: output_field(&output, "founder credential:"),
     }
 }
 
@@ -54,7 +54,7 @@ fn identity(key: &std::path::Path) -> String {
 }
 
 #[test]
-fn create_invite_join_and_delegate_compose() {
+fn create_invite_join_and_delegate_compose_by_exact_handles() {
     let dir = tempdir().unwrap();
     let founder_pile = dir.path().join("founder.pile");
     let invitee_pile = dir.path().join("invitee.pile");
@@ -71,28 +71,30 @@ fn create_invite_join_and_delegate_compose() {
     let team = create_team(&founder_pile, &founder_key);
     assert_eq!(team.root.len(), 64);
     assert_eq!(team.root_secret.len(), 64);
-    assert_eq!(team.founder_grant.len(), 32);
+    assert_eq!(team.founder_credential.len(), 64);
 
-    let founder_list = Command::cargo_bin("trible")
+    let founder_show = Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
-            "list",
+            "show",
             "--pile",
             founder_pile.to_str().unwrap(),
             "--team-root",
             &team.root,
+            "--credential",
+            &team.founder_credential,
         ])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
-    let founder_list = String::from_utf8(founder_list).unwrap();
-    assert!(founder_list.contains("accepted grants: 1"));
-    assert!(founder_list.contains("action:   CONNECT"));
-    assert!(founder_list.contains("delegate: true"));
-    assert!(founder_list.contains("diagnostics:     0"));
+    let founder_show = String::from_utf8(founder_show).unwrap();
+    assert!(founder_show.contains("ancestry:   1 step(s), root to leaf"));
+    assert!(founder_show.contains("action:     CONNECT"));
+    assert!(founder_show.contains("mode:       invoke+delegate"));
+    assert!(founder_show.contains(&format!("resource:   {}", team.root)));
 
     let invitee = identity(&invitee_key);
     let invite_output = Command::cargo_bin("trible")
@@ -105,7 +107,7 @@ fn create_invite_join_and_delegate_compose() {
             "--team-root",
             &team.root,
             "--parent",
-            &team.founder_grant,
+            &team.founder_credential,
             "--key",
             founder_key.to_str().unwrap(),
             "--invitee",
@@ -119,8 +121,8 @@ fn create_invite_join_and_delegate_compose() {
         .get_output()
         .stdout
         .clone();
-    let invitee_grant = output_field(&invite_output, "issued grant:");
-    assert_eq!(invitee_grant.len(), 32);
+    let invitee_credential = output_field(&invite_output, "issued credential:");
+    assert_eq!(invitee_credential.len(), 64);
     assert_eq!(output_field(&invite_output, "proof steps:"), "2");
 
     let join_output = Command::cargo_bin("trible")
@@ -141,11 +143,14 @@ fn create_invite_join_and_delegate_compose() {
         .stdout
         .clone();
     assert_eq!(output_field(&join_output, "team root:"), team.root);
-    assert_eq!(output_field(&join_output, "accepted grant:"), invitee_grant);
+    assert_eq!(
+        output_field(&join_output, "accepted credential:"),
+        invitee_credential
+    );
     assert_eq!(output_field(&join_output, "proof steps:"), "2");
 
-    // Import is a set insertion, so replaying the same portable evidence is
-    // an idempotent success rather than a second logical membership event.
+    // Importing the same exact blobs is idempotent; it does not create a
+    // second membership or registry occurrence.
     Command::cargo_bin("trible")
         .unwrap()
         .args([
@@ -161,29 +166,6 @@ fn create_invite_join_and_delegate_compose() {
         .assert()
         .success();
 
-    let status = Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "net",
-            "status",
-            invitee_pile.to_str().unwrap(),
-            "--key",
-            invitee_key.to_str().unwrap(),
-            "--team-root",
-            &team.root,
-            "--grant",
-            &invitee_grant,
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let status = String::from_utf8(status).unwrap();
-    assert!(status.contains("proof_steps: 2"));
-    assert!(status.contains("authorization: CONNECT accepted"));
-
     let third = identity(&third_key);
     let third_invite = Command::cargo_bin("trible")
         .unwrap()
@@ -195,7 +177,7 @@ fn create_invite_join_and_delegate_compose() {
             "--team-root",
             &team.root,
             "--parent",
-            &invitee_grant,
+            &invitee_credential,
             "--key",
             invitee_key.to_str().unwrap(),
             "--invitee",
@@ -208,7 +190,8 @@ fn create_invite_join_and_delegate_compose() {
         .get_output()
         .stdout
         .clone();
-    let third_grant = output_field(&third_invite, "issued grant:");
+    let third_credential = output_field(&third_invite, "issued credential:");
+    assert_eq!(third_credential.len(), 64);
     assert_eq!(output_field(&third_invite, "proof steps:"), "3");
 
     Command::cargo_bin("trible")
@@ -235,8 +218,8 @@ fn create_invite_join_and_delegate_compose() {
             third_pile.to_str().unwrap(),
             "--team-root",
             &team.root,
-            "--grant",
-            &third_grant,
+            "--credential",
+            &third_credential,
         ])
         .assert()
         .success()
@@ -244,15 +227,15 @@ fn create_invite_join_and_delegate_compose() {
         .stdout
         .clone();
     let show = String::from_utf8(show).unwrap();
-    assert!(show.contains("ancestry: 3 step(s), root to leaf"));
+    assert!(show.contains("ancestry:   3 step(s), root to leaf"));
     assert!(show.contains("level 0:"));
     assert!(show.contains("level 1:"));
     assert!(show.contains("level 2:"));
-    assert!(show.contains("delegate: false"));
+    assert!(show.contains("mode:       invoke"));
 }
 
 #[test]
-fn join_rejects_a_bundle_for_another_key() {
+fn join_rejects_a_bundle_for_another_key_without_importing_it() {
     let dir = tempdir().unwrap();
     let founder_pile = dir.path().join("founder.pile");
     let receiver_pile = dir.path().join("receiver.pile");
@@ -266,7 +249,7 @@ fn join_rejects_a_bundle_for_another_key() {
     let intended = identity(&intended_key);
     let _ = identity(&wrong_key);
 
-    Command::cargo_bin("trible")
+    let invite = Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
@@ -276,7 +259,7 @@ fn join_rejects_a_bundle_for_another_key() {
             "--team-root",
             &team.root,
             "--parent",
-            &team.founder_grant,
+            &team.founder_credential,
             "--key",
             founder_key.to_str().unwrap(),
             "--invitee",
@@ -285,7 +268,11 @@ fn join_rejects_a_bundle_for_another_key() {
             bundle.to_str().unwrap(),
         ])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let credential = output_field(&invite, "issued credential:");
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -303,28 +290,25 @@ fn join_rejects_a_bundle_for_another_key() {
         .failure()
         .stderr(predicates::str::contains("invite proof rejected"));
 
-    let list = Command::cargo_bin("trible")
+    Command::cargo_bin("trible")
         .unwrap()
         .args([
             "team",
-            "list",
+            "show",
             "--pile",
             receiver_pile.to_str().unwrap(),
             "--team-root",
             &team.root,
+            "--credential",
+            &credential,
         ])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    assert!(String::from_utf8(list)
-        .unwrap()
-        .contains("accepted grants: 0"));
+        .failure()
+        .stderr(predicates::str::contains("load credential"));
 }
 
 #[test]
-fn invite_requires_the_exact_accepted_delegating_parent() {
+fn invite_requires_the_exact_resident_delegating_parent_handle() {
     let dir = tempdir().unwrap();
     let pile = dir.path().join("team.pile");
     std::fs::File::create(&pile).unwrap();
@@ -344,7 +328,7 @@ fn invite_requires_the_exact_accepted_delegating_parent() {
             "--team-root",
             &team.root,
             "--parent",
-            "11111111111111111111111111111111",
+            &"11".repeat(32),
             "--key",
             founder_key.to_str().unwrap(),
             "--invitee",
@@ -354,8 +338,145 @@ fn invite_requires_the_exact_accepted_delegating_parent() {
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("is not accepted"));
+        .stderr(predicates::str::contains("requires a missing blob"));
     assert!(!out.exists());
+}
+
+#[test]
+fn join_rejects_an_expired_child_at_the_explicit_current_time() {
+    let dir = tempdir().unwrap();
+    let founder_pile = dir.path().join("founder.pile");
+    let receiver_pile = dir.path().join("receiver.pile");
+    std::fs::File::create(&founder_pile).unwrap();
+    std::fs::File::create(&receiver_pile).unwrap();
+    let founder_key = dir.path().join("founder.key");
+    let receiver_key = dir.path().join("receiver.key");
+    let bundle = dir.path().join("expired.team");
+    let team = create_team(&founder_pile, &founder_key);
+    let receiver = identity(&receiver_key);
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "invite",
+            "--pile",
+            founder_pile.to_str().unwrap(),
+            "--team-root",
+            &team.root,
+            "--parent",
+            &team.founder_credential,
+            "--key",
+            founder_key.to_str().unwrap(),
+            "--invitee",
+            &receiver,
+            "--valid-from",
+            "2000-01-01T00:00:00Z",
+            "--valid-until",
+            "2001-01-01T00:00:00Z",
+            "--out",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "join",
+            "--pile",
+            receiver_pile.to_str().unwrap(),
+            "--key",
+            receiver_key.to_str().unwrap(),
+            "--invite",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("expired"));
+}
+
+#[test]
+fn invite_rejects_inverted_or_half_specified_validity() {
+    let dir = tempdir().unwrap();
+    let pile = dir.path().join("team.pile");
+    std::fs::File::create(&pile).unwrap();
+    let founder_key = dir.path().join("founder.key");
+    let invitee_key = dir.path().join("invitee.key");
+    let out = dir.path().join("invite.team");
+    let team = create_team(&pile, &founder_key);
+    let invitee = identity(&invitee_key);
+    let base = [
+        "team",
+        "invite",
+        "--pile",
+        pile.to_str().unwrap(),
+        "--team-root",
+        &team.root,
+        "--parent",
+        &team.founder_credential,
+        "--key",
+        founder_key.to_str().unwrap(),
+        "--invitee",
+        &invitee,
+    ];
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(base)
+        .args([
+            "--valid-from",
+            "2030-01-01T00:00:00Z",
+            "--valid-until",
+            "2029-01-01T00:00:00Z",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("inverted"));
+    assert!(!out.exists());
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(base)
+        .args([
+            "--valid-from",
+            "2030-01-01T00:00:00Z",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--valid-until"));
+}
+
+#[test]
+fn show_rejects_the_right_credential_under_a_different_team_resource() {
+    let dir = tempdir().unwrap();
+    let first_pile = dir.path().join("first.pile");
+    let second_pile = dir.path().join("second.pile");
+    std::fs::File::create(&first_pile).unwrap();
+    std::fs::File::create(&second_pile).unwrap();
+    let first = create_team(&first_pile, &dir.path().join("first.key"));
+    let second = create_team(&second_pile, &dir.path().join("second.key"));
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "show",
+            "--pile",
+            first_pile.to_str().unwrap(),
+            "--team-root",
+            &second.root,
+            "--credential",
+            &first.founder_credential,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("credential proof rejected"));
 }
 
 #[test]
@@ -368,7 +489,7 @@ fn join_rejects_an_oversized_bundle_before_decoding() {
     let _ = identity(&key);
     std::fs::write(
         &bundle,
-        vec![0; 32 + triblespace_net::protocol::MAX_AUTHORITY_PROOF_BYTES + 1],
+        vec![0; 32 + triblespace_net::protocol::MAX_CAPABILITY_PROOF_BYTES + 1],
     )
     .unwrap();
 
@@ -390,7 +511,7 @@ fn join_rejects_an_oversized_bundle_before_decoding() {
 }
 
 #[test]
-fn retired_capability_commands_are_absent() {
+fn team_surface_has_no_enumeration_or_retired_workflow() {
     let help = Command::cargo_bin("trible")
         .unwrap()
         .args(["team", "--help"])
@@ -401,6 +522,7 @@ fn retired_capability_commands_are_absent() {
         .clone();
     let help = String::from_utf8(help).unwrap();
     for retired in [
+        "list",
         "list-pending",
         "list-issued",
         "retract",
@@ -409,7 +531,7 @@ fn retired_capability_commands_are_absent() {
     ] {
         assert!(!help.contains(retired), "retired command {retired} remains");
     }
-    for current in ["create", "invite", "join", "list", "show"] {
+    for current in ["create", "invite", "join", "show"] {
         assert!(
             help.contains(current),
             "current command {current} is missing"
