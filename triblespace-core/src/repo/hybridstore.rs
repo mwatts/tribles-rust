@@ -173,12 +173,11 @@ mod tests {
     use crate::collection::reach;
     use crate::id::Id;
 
-    use crate::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
     use crate::collection::records::CollectionName;
-    use crate::collection::{Collection, CollectionHandle, CollectionMerge};
+    use crate::collection::{Collection, CollectionAdmission, CollectionHandle, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::trible::Fragment;
     use ed25519_dalek::SigningKey;
@@ -248,21 +247,17 @@ mod tests {
             team,
             signing_key.clone(),
             reach::private(),
+            CollectionAdmission::Open,
         )
         .collection();
-        authority::publish_grant(
-            &mut hybrid,
+        let mut collection = Collection::new(
+            hybrid,
+            &name,
             team,
-            &signing_key,
-            AuthorityGrant::root(
-                signing_key.verifying_key(),
-                target,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        let mut collection = Collection::new(hybrid, &name, team, signing_key, reach::private());
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        );
 
         let commit = collection.commit(Fragment::empty()).unwrap();
         assert_eq!(collection.materialize().unwrap().len(), 0);

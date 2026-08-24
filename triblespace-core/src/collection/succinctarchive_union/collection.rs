@@ -100,8 +100,10 @@ impl From<super::Rank9FiberError> for SuccinctArchiveCollectionError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccinctArchiveCollection {
     name: CollectionName,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
+    source_authority: Option<VerifyingKey>,
     source_reach: Fragment,
+    authority: Option<VerifyingKey>,
     reach: Fragment,
 }
 
@@ -115,16 +117,23 @@ impl SuccinctArchiveCollection {
     /// source and a private index over a public one are both ordinary things
     /// to want, and an index can expose what its source did not, so the two
     /// are stated separately rather than derived from one another.
+    /// `source_authority` and `authority` are likewise independent descriptor
+    /// facts: the former must exactly match the root ticket, while the latter
+    /// governs the raw Succinct and Rank9 derived family.
     pub fn new(
         name: CollectionName,
-        team: VerifyingKey,
+        namespace: VerifyingKey,
+        source_authority: Option<VerifyingKey>,
         source_reach: Fragment,
+        authority: Option<VerifyingKey>,
         reach: Fragment,
     ) -> Self {
         Self {
             name,
-            team,
+            namespace,
+            source_authority,
             source_reach,
+            authority,
             reach,
         }
     }
@@ -144,17 +153,27 @@ impl SuccinctArchiveCollection {
         &self.name
     }
 
-    /// Team owning the root collection this projection is taken over.
-    pub fn team(&self) -> VerifyingKey {
-        self.team
+    /// Public-key namespace which scopes the source root's name.
+    pub fn namespace(&self) -> VerifyingKey {
+        self.namespace
+    }
+
+    /// Optional capability trust root declared by the source descriptor.
+    pub fn source_authority(&self) -> Option<VerifyingKey> {
+        self.source_authority
+    }
+
+    /// Optional capability trust root declared by this derived family.
+    pub fn authority(&self) -> Option<VerifyingKey> {
+        self.authority
     }
 
     /// Canonical source SimpleArchive-union descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
         simplearchive_union::descriptor(
             &self.name,
-            self.team,
-            Some(self.team),
+            self.namespace,
+            self.source_authority,
             self.source_reach.clone(),
         )
     }
@@ -167,11 +186,7 @@ impl SuccinctArchiveCollection {
 
     /// Canonical target raw-SuccinctArchive-union descriptor.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(
-            self.source_collection(),
-            Some(self.team),
-            self.reach.clone(),
-        )
+        super::descriptor(self.source_collection(), self.authority, self.reach.clone())
     }
 
     /// Identity of the raw Succinct cover this projection maintains.
@@ -199,7 +214,7 @@ impl SuccinctArchiveCollection {
         crate::prelude::entity! {
             crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_source: self.collection(),
-            collection_authority: self.team,
+            collection_authority?: self.authority,
             collection_representation: representation,
             collection_recipe: recipe,
         }
@@ -415,9 +430,32 @@ mod tests {
         SuccinctArchiveCollection::new(
             CollectionName::new(name).unwrap(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         )
+    }
+
+    #[test]
+    fn open_source_and_derived_descriptors_omit_authority_exactly() {
+        let name = CollectionName::new("open-source").unwrap();
+        let collection = SuccinctArchiveCollection::new(
+            name.clone(),
+            test_team(),
+            None,
+            reach::private(),
+            None,
+            reach::private(),
+        );
+
+        assert_eq!(
+            collection.source_descriptor(),
+            simplearchive_union::descriptor(&name, test_team(), None, reach::private())
+        );
+        assert!(descriptor::authority(collection.source_descriptor().facts()).is_none());
+        assert!(descriptor::authority(collection.descriptor().facts()).is_none());
+        assert!(descriptor::authority(collection.rank9_descriptor().facts()).is_none());
     }
 
     #[test]
@@ -963,7 +1001,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1085,7 +1125,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let a = facts([(1, 3)]).to_blob();
@@ -1197,7 +1239,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1442,7 +1486,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut base = CollectionOnly::default();
@@ -1489,7 +1535,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut base = CollectionOnly::default();
@@ -1571,7 +1619,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1631,7 +1681,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1662,7 +1714,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1693,7 +1747,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1724,7 +1780,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1757,7 +1815,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1803,7 +1863,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1850,7 +1912,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1901,7 +1965,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1938,7 +2004,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();
@@ -1972,7 +2040,9 @@ mod tests {
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
+            Some(test_team()),
             reach::private(),
+            Some(test_team()),
             reach::private(),
         );
         let mut store = CollectionOnly::default();

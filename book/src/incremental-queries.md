@@ -90,6 +90,7 @@ let new_commits: Vec<_> = current
 let view = SimpleArchiveCollection::new(
     name.clone(),
     team,
+    collection.admission().trust_root(),
     reach::private(),
 );
 let changed = view.attach_exact(collection.storage_mut(), &new_commits)?;

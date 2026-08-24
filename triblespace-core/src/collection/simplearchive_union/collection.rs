@@ -38,7 +38,8 @@ use crate::trible::{Fragment, TribleSet};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleArchiveCollection {
     name: CollectionName,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
+    authority: Option<VerifyingKey>,
     reach: Fragment,
 }
 
@@ -48,8 +49,18 @@ impl SimpleArchiveCollection {
     /// `reach` is not decoration on a read facade: it is part of the
     /// descriptor this facade hashes, so a facade that names the wrong reach
     /// names a different collection and matches no ticket.
-    pub fn new(name: CollectionName, team: VerifyingKey, reach: Fragment) -> Self {
-        Self { name, team, reach }
+    pub fn new(
+        name: CollectionName,
+        namespace: VerifyingKey,
+        authority: Option<VerifyingKey>,
+        reach: Fragment,
+    ) -> Self {
+        Self {
+            name,
+            namespace,
+            authority,
+            reach,
+        }
     }
 
     /// How far this collection may travel.
@@ -57,19 +68,29 @@ impl SimpleArchiveCollection {
         &self.reach
     }
 
-    /// Name this collection is known by within its team.
+    /// Name this collection is known by within its namespace.
     pub fn name(&self) -> &CollectionName {
         &self.name
     }
 
-    /// Team owning this collection.
-    pub fn team(&self) -> VerifyingKey {
-        self.team
+    /// Public-key namespace which scopes this root's name.
+    pub fn namespace(&self) -> VerifyingKey {
+        self.namespace
+    }
+
+    /// Optional external capability trust root in this descriptor.
+    pub fn authority(&self) -> Option<VerifyingKey> {
+        self.authority
     }
 
     /// Canonical `SimpleArchive` set-union descriptor facts.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(&self.name, self.team, Some(self.team), self.reach.clone())
+        super::descriptor(
+            &self.name,
+            self.namespace,
+            self.authority,
+            self.reach.clone(),
+        )
     }
 
     /// Content identity of this collection's descriptor.
@@ -211,6 +232,7 @@ mod tests {
         SimpleArchiveCollection::new(
             CollectionName::new(name).unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         )
     }

@@ -86,12 +86,12 @@ dropping them omits the markers entirely.
 
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
 collection registry. A caller selecting one semantic view must rediscover its
-records, resolve current positive authority, and supply a fresh plan for the
-commits it selected. Ordinary Pile and Yard rewrites do not use that narrower
-admission decision: they independently apply the conservative rule above,
-preserving every native record and recursively retaining the resident
-descriptor, data, and metadata closure of every strictly verified current
-`COMMIT`.
+records, apply its explicit open or capability admission, and supply a fresh
+plan for the commits it selected. Ordinary Pile and Yard rewrites do not use
+that narrower admission decision: they independently apply the conservative
+rule above, preserving every native record and recursively retaining the
+resident descriptor, data, and metadata closure of every strictly verified
+current `COMMIT`.
 
 Opaque records form a harder boundary: their bytes have a known span and
 ordinary replay can safely project them away, but the reader cannot know

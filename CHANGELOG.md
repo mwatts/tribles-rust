@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the high-level `Collection` facade's ambient, store-enumerated
+  authority resolution with explicit admission. `CollectionAdmission::Open`
+  admits every strictly verified signer; capability admission accepts owned
+  `CapabilityPresentation`s and fails loud unless every proof verifies at one
+  operation-wide clock instant against its trust root, expected leaf subject,
+  and exact `ACTION_WRITE`/collection atom. The admission choice determines the
+  descriptor's optional authority fact, empty capability admission denies all
+  writes and yields an empty ticket, and newly supplied proofs can expose
+  already-resident foreign commits without publishing new collection state.
+  `ACTION_WRITE` now lives in `collection`; the generic positive-authority
+  resolver remains available for independent consumers but is no longer a
+  facade dependency. Exact `SimpleArchive` and Succinct-derived facades now
+  carry namespace and optional source/target authorities independently, so
+  tickets from open roots preserve descriptor identity through derivation.
+
 - Split a collection descriptor's public-key namespace from its optional
   capability authority. Roots are named by `collection_name` plus
   `collection_namespace`; roots and derivations may each state their own

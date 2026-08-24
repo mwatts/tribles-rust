@@ -27,6 +27,7 @@ use crate::blob::{Blob, IntoBlob, TryFromBlob};
 use crate::collection::simplearchive_union::{
     self, PublicationError, SimpleArchiveUnionValidationError,
 };
+pub use crate::collection::ACTION_WRITE;
 use crate::collection::{
     discover_collection_records_authorized, empty_metadata_handle, CollectionCommit,
     CollectionData, CollectionDiscoveryError, CollectionHandle, CollectionName,
@@ -47,11 +48,6 @@ use crate::trible::{Fragment, TribleSet};
 ///
 /// Minted with `trible genid` on 2026-08-22.
 pub const KIND_AUTHORITY_GRANT: Id = id_hex!("411A564F0ED4EA6B577C9F9E2B492600");
-
-/// The action required to contribute a signed commit to a collection.
-///
-/// Minted with `trible genid` on 2026-08-22.
-pub const ACTION_WRITE: Id = id_hex!("66B660A5481E04E552A1FA96AA9ECC48");
 
 /// Stable name of the public authority collection rooted in each team.
 pub const AUTHORITY_COLLECTION_NAME: &str = "authority";
@@ -1186,7 +1182,7 @@ mod tests {
 
     use super::*;
     use crate::blob::IntoBlob;
-    use crate::collection::{Collection, CollectionRecord};
+    use crate::collection::CollectionRecord;
     use crate::inline::encodings::hash::Handle;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::BlobStorePut;
@@ -1499,16 +1495,16 @@ mod tests {
         .unwrap();
 
         let authority = resolve_authority(&mut repo, root.verifying_key()).unwrap();
-        let mut facade = Collection::new(
-            repo,
-            &CollectionName::new("documents").unwrap(),
-            root.verifying_key(),
-            key(4),
-            crate::collection::reach::private(),
-        );
-        let facts = facade.snapshot().unwrap();
+        let discovered = discover_collection_records_authorized(&mut repo, target, |subject| {
+            authority.allows(subject, ACTION_WRITE, target)
+        })
+        .unwrap();
 
-        assert_eq!(facts.facts(), writer_facts.facts());
+        assert_eq!(discovered.commits().len(), 1);
+        assert_eq!(
+            discovered.commits()[0].public_key().raw,
+            writer.verifying_key().to_bytes()
+        );
         assert_eq!(authority.grants().count(), 1);
         assert!(authority.diagnostics().is_empty());
     }

@@ -40,13 +40,15 @@ That separation is why a materialized index does not become ground truth merely
 because it is convenient, and why collecting an accelerator does not erase the
 committed facts from which it can be rebuilt.
 
-Who may make that signed assertion is itself positive, enumerable evidence.
-A descriptor may name an authority root whose grow-only authority collection
-contains signed grants. A grant names one exact subject, collection resource,
-action, invocation/delegation mode, and optional parent occurrence. Ordinary
-collection operations admit a commit only when the resolved positive DAG gives
-its author invocation authority for exact `ACTION_WRITE` on that descriptor.
-Holding a facade's signing key is never ambient authority.
+Who may make that signed assertion can be proven without making storage an
+ambient policy oracle. A capability-guarded descriptor names an external trust
+root, while the facade owns explicit root-to-leaf proofs naming one expected
+subject, exact collection resource, action, and invocation/delegation mode.
+Ordinary collection operations verify those presentations directly at one
+clock instant. The separate positive, enumerable authority collection remains
+available to protocols which deliberately choose a store-resolved grant DAG,
+but the high-level collection facade neither scans nor depends on it. Holding a
+facade's signing key alone grants nothing in capability mode.
 
 ## Architectural layers
 
@@ -149,30 +151,33 @@ above it.
 
 ## Publishing and observing
 
-`Collection<S>` owns a storage backend, one canonical descriptor, its team
-root, and one signing key. `Collection::commit(fragment)` first resolves the
-team-rooted positive authority DAG and requires that key to have exact
-`ACTION_WRITE` invocation authority on the descriptor. Only then does it store
-the descriptor, attachments, canonical data archive, and canonical metadata
-archive before inserting the signed native commit record. It does not flush
+`Collection<S>` owns a storage backend, one canonical descriptor, one signing
+key, and one explicit admission policy. Open admission accepts every strictly
+verified signer and writes no authority fact into the descriptor. Capability
+admission writes its trust root there and retains owned presentations in the
+facade. `Collection::commit(fragment)` observes the clock once, verifies every
+presentation for the expected subject and exact `ACTION_WRITE` atom, and
+requires its signing key among those subjects before storing the descriptor,
+attachments, canonical data archive, canonical metadata archive, and signed
+native commit record. It never enumerates storage for grants and does not flush
 implicitly; callers choose durability cadence with `Collection::flush` or the
 backend's explicit close operation.
 
 Reads are exact about what they observed, not magical about global time:
 
-- `ticket()` resolves authority and returns every exact verified commit whose
-  author may invoke `ACTION_WRITE` on the descriptor; this reads authority
-  blobs but not the selected target commits' data or metadata blobs;
-- `snapshot()` carries materialized facts, that exact authority-admitted
+- `ticket()` verifies explicit presentations and returns every exact verified
+  commit by the resulting subjects; this reads native records but not the
+  selected commits' data or metadata blobs;
+- `snapshot()` carries materialized facts, that exact admission-selected
   commit set, and the target blob reader which validated them; and
 - exact-ticket facades let another consumer materialize a caller-selected
-  multi-author authority frontier without holding a publishing key.
+  multi-author commit frontier without holding a publishing key.
 
 Each call observes one known prefix of an append-only store. A concurrent
-grant or commit may appear now or on the next call, but a snapshot never
-combines facts from one authority frontier with commits from another. The
-facade's local signing key does not narrow reads: all exact `WRITE`-authorized
-authors participate.
+commit may appear now or on the next call, but a snapshot never
+combines facts from one admission frontier with commits from another. The
+facade's local signing key does not narrow reads: all explicitly presented
+subjects participate, or every strict signer in open mode.
 
 ## Derived physical representations
 

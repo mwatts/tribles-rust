@@ -41,7 +41,8 @@ pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
 pub use crate::collection::records::CollectionName;
 pub use crate::collection::{
-    Collection, CollectionSnapshot, CollectionStore, SimpleArchiveCollection, VerifyingKey,
+    CapabilityPresentation, Collection, CollectionAdmission, CollectionSnapshot, CollectionStore,
+    SimpleArchiveCollection, VerifyingKey,
 };
 pub use crate::id::fucid;
 pub use crate::id::genid;

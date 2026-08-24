@@ -16,7 +16,7 @@ merge or derivation equations provide reusable physical work.
   collection's anchor, element representation, join recipe, and reach law. Its
   content handle is the `CollectionHandle`.
 - **Ticket** — the exact byte-identical set of signed commits selected as
-  authority for one read or derivation.
+  admitted ground truth for one read or derivation.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
 
@@ -32,35 +32,45 @@ through `Blocking`.
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
-use triblespace::core::collection::{reach, simplearchive_union};
+use triblespace::core::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityGrant, CapabilityMode,
+    CapabilityProof, CapabilityProofStep, CapabilityResource,
+};
+use triblespace::core::collection::{reach, simplearchive_union, ACTION_WRITE};
 use triblespace::prelude::*;
 
 let team_key = SigningKey::generate(&mut OsRng);
 let writer = SigningKey::generate(&mut OsRng);
 let team = team_key.verifying_key();
+let writer_subject = writer.verifying_key();
 let name = CollectionName::new("models")?;
 let mut storage = MemoryRepo::default();
 let descriptor =
     simplearchive_union::descriptor(&name, team, Some(team), reach::private());
 let target = descriptor.facts().clone().to_blob().get_handle();
-authority::publish_grant(
-    &mut storage,
-    team,
+let atom = CapabilityAtom::new(
+    CapabilityAction::new(ACTION_WRITE),
+    CapabilityResource::from(target),
+);
+let proof = CapabilityProof::new(vec![CapabilityProofStep::issue(
     &team_key,
-    AuthorityGrant::root(
-        writer.verifying_key(),
-        target,
-        ACTION_WRITE,
-        AuthorityMode::Invoke,
+    CapabilityGrant::root(
+        writer_subject,
+        atom,
+        CapabilityMode::Invoke,
+        None,
     ),
-)?;
+)]);
 let mut models = Collection::new(
     storage,
     &name,
     team,
     writer,
     reach::private(),
+    CollectionAdmission::capability(
+        team,
+        vec![CapabilityPresentation::new(writer_subject, proof)],
+    ),
 );
 
 let commit = models.commit(entity! { metadata::name: "first-model" })?;
@@ -70,12 +80,14 @@ models.flush()?;
 let storage = models.into_storage();
 ```
 
-The team root is retained by the facade because its positive authority ledger
-governs both reads and writes. `Collection::commit` preflights that the local
-signer may invoke `ACTION_WRITE` on the exact descriptor before writing any
-dependency. Ordinary reads admit every author with the same exact authority;
-the facade's local signing key is not an implicit trust boundary. Publishing
-authority grants remains an explicit low-level bootstrap operation.
+Capability admission stores the trust root in the descriptor and retains the
+presented proof in the facade. Each operation observes the clock once and
+verifies every presentation against that root, the expected leaf subject, and
+exact `ACTION_WRITE` on this descriptor before touching storage. Ordinary reads
+admit every explicitly presented subject, so a foreign author remains visible
+when its proof is supplied. Invalid explicit evidence fails loud; an empty
+presentation set is a valid policy that admits nobody. `CollectionAdmission::Open`
+is the deliberate alternative which admits every strictly verified signer.
 
 The reach argument is explicit because it participates in collection identity.
 `reach::private()` declares nothing and keeps commits local; `reach::public()`
@@ -86,8 +98,8 @@ its own reach independently of its source.
 
 One `Collection::commit(fragment)` performs these semantic steps:
 
-1. resolve the team's positive authority DAG and require exact `WRITE`
-   authority for the local signer;
+1. verify the facade's explicit admission evidence at one clock instant and
+   require the local signer to be admitted for exact `WRITE`;
 2. canonicalize and store the collection descriptor;
 3. store the fragment's attachments;
 4. encode facts as the canonical data `SimpleArchive`;
@@ -127,21 +139,21 @@ leaf.
 
 ## Known-prefix snapshots and exact tickets
 
-`Collection::snapshot()` first resolves one known prefix of the team's positive
-authority DAG, then discovers the exact strictly verified commits whose authors
-may invoke `ACTION_WRITE` on the collection. It opens one target reader and
-materializes only that authority set. It returns facts, commits, and reader
-together so downstream code cannot accidentally pair one logical frontier with
-a different physical view.
+`Collection::snapshot()` observes one clock instant, verifies every explicit
+capability presentation, then discovers the exact strictly verified commits by
+the resulting subjects. Open admission accepts every strict signer instead. It
+opens one target reader and materializes only that admitted set. It returns
+facts, commits, and reader together so downstream code cannot accidentally pair
+one logical frontier with a different physical view.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear on this call or a later
 call. Every selected commit is nevertheless present and valid in the returned
 snapshot, or the call fails instead of returning a partial set.
 
-`ticket()` resolves authority and performs target-record discovery, but does not
-fetch or materialize the target collection's data and metadata blobs. Freeze a
-ticket when another component will select or build a representation:
+`ticket()` performs the same admission check and target-record discovery, but
+does not fetch or materialize the target collection's data and metadata blobs.
+Freeze a ticket when another component will select or build a representation:
 
 ```rust,ignore
 let ticket = models.ticket()?;
@@ -149,6 +161,7 @@ let ticket = models.ticket()?;
 let source = SimpleArchiveCollection::new(
     name.clone(),
     team,
+    models.admission().trust_root(),
     reach::private(),
 );
 let snapshot = source.snapshot_exact(models.storage_mut(), &ticket)?;
@@ -158,8 +171,8 @@ An exact-ticket facade does not need the publishing key. Ticket members may
 have different authors, but each must byte-match one resident strictly verified
 record for the exact descriptor. Commits in storage but absent from the ticket
 remain inert. Live membership policy is not supplied as an ambient callback:
-ordinary `ticket`, `snapshot`, and `materialize` all resolve the same team-rooted
-authority DAG.
+ordinary `ticket`, `snapshot`, and `materialize` all enforce the facade's same
+explicit admission value.
 
 ## Reuse merge work without changing meaning
 
@@ -198,10 +211,13 @@ The raw SuccinctArchive facade applies this model directly:
 ```rust,ignore
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 
+let authority = models.admission().trust_root();
 let succinct = SuccinctArchiveCollection::new(
     name.clone(),
     team,
+    authority,
     reach::private(), // source reach, and therefore source identity
+    authority,
     reach::private(), // target reach
 );
 

@@ -6,6 +6,14 @@
 //! test-only: it exercises algebraic laws rather than serving as another
 //! runtime implementation.
 
+use crate::id::{id_hex, Id};
+
+/// The exact action required to contribute a signed commit to a collection.
+///
+/// Minted with `trible genid` on 2026-08-22. Capability policies pair this
+/// stable action with one exact collection descriptor handle.
+pub const ACTION_WRITE: Id = id_hex!("66B660A5481E04E552A1FA96AA9ECC48");
+
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
 /// Reading one collection descriptor's facts.

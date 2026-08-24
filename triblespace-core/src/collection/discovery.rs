@@ -473,7 +473,7 @@ where
     Ok(discovered)
 }
 
-/// Discover records for one exact collection across *every* authorized signer.
+/// Discover records for one exact collection across every caller-admitted signer.
 ///
 /// This is the multi-author counterpart of
 /// [`discover_collection_records_scoped`]. That function fixes one
@@ -488,12 +488,12 @@ where
 /// Narrowing first means a nonmember costs no Ed25519 verification, and
 /// claiming membership falsely buys nothing: strict verification afterwards
 /// binds that key to the signed bytes, so a forged claim fails there. The
-/// predicate supplies the authorization scope, while strict verification
+/// predicate supplies the admission scope, while strict verification
 /// establishes that the claimed signer actually authored the commit. Ordinary
-/// [`Collection`](super::Collection) reads resolve the team's positive
-/// authority DAG and pass exact `WRITE` membership here. This lower-level
-/// primitive accepts a callback so explicit-ticket and protocol code can bring
-/// an already-resolved authority set without resolving it again.
+/// [`Collection`](super::Collection) reads pass either their explicitly
+/// verified capability subjects or an open predicate here. This lower-level
+/// primitive accepts a callback so protocols can supply any already-decided
+/// signer set without coupling discovery to how that decision was made.
 ///
 /// `MERGE` and `DERIVE` records are retained in full, for the same reason
 /// [`discover_collection_records_scoped`] retains them: they are unsigned

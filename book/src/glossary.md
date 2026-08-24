@@ -22,31 +22,6 @@ omit the literal to derive a deterministic id from the attribute name and
 encoding (the macro wraps the name + encoding id in an `entity!{}` fragment and
 takes the root for you), which is handy for short-lived or internal attributes.
 
-### Authority Collection
-The canonical public `SimpleArchive`-union collection named `authority` for one
-team root. Its content handle is `authority::collection(team_root)`. Signed
-grant occurrences are ordinary commits in this grow-only collection, with
-canonical empty metadata; there is no separate mutable membership store. This
-is the positive collection-write admission structure. Blob-native CONNECT
-credentials and the `trible team` CLI do not use or enumerate it.
-
-### Authority Grant
-One atomic statement in the positive authority-collection model, carried by
-one signed collection commit. The outer commit signer is the issuer and its
-intrinsic commit ID is the grant occurrence ID. The canonical grant names one
-direct subject key, one exact resource collection handle, one exact action,
-optional exact parent occurrence, and explicit invoke/delegate uses.
-Independent accepted grants are alternatives under set union.
-
-### Authority Proof
-A self-contained, root-to-leaf sequence of authority commits paired with their
-exact canonical grant archives. Verification checks the team-root anchor,
-signatures, data identities, exact parent links, issuer/subject binding,
-unchanged action and resource, and delegation at every step, then checks the
-leaf against the caller's exact subject/action/resource/mode claim. This
-claim-directed final check prevents a valid truncated prefix from authorizing
-the intended descendant.
-
 ### Blob
 An immutable chunk of binary data addressed by the hash of its contents. Blobs
 store payloads that do not fit in the fixed 32-byte value slot—long strings,
@@ -83,19 +58,33 @@ the exact collection descriptor, data element, mandatory metadata archive, and
 author. Its intrinsic record ID is derived from the canonical 192-byte payload.
 Commits are independent leaves rather than snapshots in a parent chain.
 
+### Capability Presentation
+One owned blob-native `CapabilityProof` paired with the exact leaf subject the
+caller expects it to establish. The expectation prevents a valid proof for an
+unintended subject from silently becoming an admission decision.
+
 ### Collection
 A self-describing grow-only join semilattice. Signed commits introduce members;
 validated merge records describe joins within the lattice; derivation records
 map elements into another collection through a canonical homomorphism. A
 collection has no distinguished head.
 
+### Collection Admission
+The explicit signer policy held by a high-level `Collection` facade. Open
+admission accepts every strictly verified signer. Capability admission accepts
+only expected subjects whose owned root-to-leaf proofs verify at one clock
+instant against its trust root and exact `ACTION_WRITE`/collection atom. It does
+not enumerate storage for grants; an empty capability presentation set admits
+nobody.
+
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's root name and public-key
 namespace or exact derived source, optional local capability authority, element
 representation, join recipe, and reach law. Its content handle is the
 `CollectionHandle`, so every native record which names a collection can resolve
-its meaning through the ordinary blob store. A derived descriptor never
-inherits namespace or authority through its source.
+its meaning through the ordinary blob store. Open facade admission omits the
+authority fact; capability admission writes exactly its trust root. A derived
+descriptor never inherits namespace or authority through its source.
 
 ### Collection Store
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
@@ -103,7 +92,7 @@ idempotent by intrinsic record ID; combining two stores is set union.
 
 ### Collection Snapshot
 One coherent known-prefix observation containing materialized facts, the exact
-verified commit set which authorized them, and the blob reader which validated
+verified commit set which admitted them, and the blob reader which validated
 their dependencies.
 
 ### CONNECT

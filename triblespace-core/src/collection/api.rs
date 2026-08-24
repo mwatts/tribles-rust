@@ -2,9 +2,9 @@
 //!
 //! [`Collection`] owns the storage, canonical `SimpleArchive`-union
 //! descriptor, and signing key needed to publish [`Fragment`] values and read
-//! the complete known union admitted by its team's positive `WRITE` authority
-//! ledger. It is not a repository abstraction: it has no head, branch, CAS,
-//! retry, read-admission, or planning policy.
+//! the complete known union admitted by an explicit capability presentation or
+//! by an explicitly open policy. It is not a repository abstraction: it has no
+//! head, branch, CAS, retry, ambient authority lookup, or planning policy.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
@@ -13,9 +13,13 @@ use std::fmt;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use crate::authority::{self, AuthorityResolutionError, ACTION_WRITE};
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::Blob;
+use crate::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+    CapabilityProofError, CapabilityResource,
+};
+use crate::clock;
 use crate::id::Id;
 use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
@@ -38,30 +42,161 @@ use super::{
     resolve_collection_semantics, CollectionClaimValidation, CollectionCommit, CollectionData,
     CollectionDiscoveryError, CollectionFunctionalConflict, CollectionHandle,
     CollectionResolutionError, CollectionStore, CollectionValidationRequest,
-    DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError,
+    DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError, ACTION_WRITE,
 };
+
+/// One owned proof together with the exact leaf subject it is expected to
+/// authorize.
+///
+/// Keeping the expectation beside the untrusted proof prevents callers from
+/// accidentally treating whatever subject a proof happens to contain as an
+/// admission decision. Verification still binds the proof to the exact
+/// collection action/resource atom at operation time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityPresentation {
+    subject: VerifyingKey,
+    proof: CapabilityProof,
+}
+
+impl CapabilityPresentation {
+    /// Pair an expected leaf subject with one untrusted owned proof.
+    pub fn new(subject: VerifyingKey, proof: CapabilityProof) -> Self {
+        Self { subject, proof }
+    }
+
+    /// Exact leaf subject this presentation is expected to authorize.
+    pub fn subject(&self) -> VerifyingKey {
+        self.subject
+    }
+
+    /// Candidate root-to-leaf proof, verified afresh for each operation.
+    pub fn proof(&self) -> &CapabilityProof {
+        &self.proof
+    }
+
+    /// Consume the presentation into its expected subject and proof.
+    pub fn into_parts(self) -> (VerifyingKey, CapabilityProof) {
+        (self.subject, self.proof)
+    }
+}
+
+/// Explicit signer-admission policy for one collection facade.
+///
+/// `Open` admits every strictly self-signed commit for the exact descriptor.
+/// `Capability` admits exactly the subjects whose supplied proofs verify
+/// against `trust_root`; it never enumerates a store looking for more grants.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionAdmission {
+    /// Admit every strictly verified commit signer.
+    Open,
+    /// Admit exactly the subjects established by these presentations.
+    Capability {
+        /// External trust root against which every proof is verified.
+        trust_root: VerifyingKey,
+        /// Explicit candidate proofs. Every entry must verify or the operation
+        /// fails rather than silently omitting it.
+        presentations: Vec<CapabilityPresentation>,
+    },
+}
+
+impl CollectionAdmission {
+    /// Construct explicitly open admission.
+    pub const fn open() -> Self {
+        Self::Open
+    }
+
+    /// Construct explicit capability admission.
+    pub fn capability(
+        trust_root: VerifyingKey,
+        presentations: Vec<CapabilityPresentation>,
+    ) -> Self {
+        Self::Capability {
+            trust_root,
+            presentations,
+        }
+    }
+
+    /// Descriptor authority declared by this policy.
+    pub fn trust_root(&self) -> Option<VerifyingKey> {
+        match self {
+            Self::Open => None,
+            Self::Capability { trust_root, .. } => Some(*trust_root),
+        }
+    }
+
+    /// Explicit presentations, empty for open admission.
+    pub fn presentations(&self) -> &[CapabilityPresentation] {
+        match self {
+            Self::Open => &[],
+            Self::Capability { presentations, .. } => presentations,
+        }
+    }
+}
+
+/// One explicitly supplied capability presentation failed verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionAdmissionError {
+    presentation: usize,
+    subject: VerifyingKey,
+    source: CapabilityProofError,
+}
+
+impl CollectionAdmissionError {
+    /// Zero-based index of the invalid presentation.
+    pub const fn presentation(&self) -> usize {
+        self.presentation
+    }
+
+    /// Expected leaf subject paired with the invalid proof.
+    pub fn subject(&self) -> VerifyingKey {
+        self.subject
+    }
+
+    /// Exact proof-verification failure.
+    pub const fn proof_error(&self) -> &CapabilityProofError {
+        &self.source
+    }
+}
+
+impl fmt::Display for CollectionAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "capability presentation {} for subject {} is invalid: {}",
+            self.presentation,
+            hex::encode_upper(self.subject.to_bytes()),
+            self.source,
+        )
+    }
+}
+
+impl Error for CollectionAdmissionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// A scoped `SimpleArchive`-union collection and one prospective writer.
 ///
 /// Construction is pure with respect to `storage`: the canonical descriptor
 /// is derived in memory and is not inserted until a [`commit`](Self::commit)
 /// publication begins. The signing key is not ambient authority: ordinary
-/// reads admit every signer with positive `WRITE` authority from `team_root`,
-/// and publication first proves that this key has the same exact authority.
+/// reads admit signers according to `admission`, and publication proves the
+/// local signing key is in that same admitted set before writing anything.
 pub struct Collection<S> {
     storage: S,
     descriptor: Fragment,
-    team_root: VerifyingKey,
     signing_key: SigningKey,
+    admission: CollectionAdmission,
 }
 
 /// One coherent known-prefix view of a scoped collection.
 ///
 /// [`commits`](Self::commits) is the exact set of commits from the single
-/// collection-record discovery pass that authorized [`facts`](Self::facts).
+/// collection-record discovery pass that admitted [`facts`](Self::facts).
 /// [`reader`](Self::reader) is the blob-reader snapshot used to validate and
 /// materialize those facts. The reader may contain physically available blobs
-/// published after record discovery, but those blobs acquire no authority
+/// published after record discovery, but those blobs acquire no semantic role
 /// unless their commits are present in this snapshot.
 pub struct CollectionSnapshot<R> {
     facts: TribleSet,
@@ -70,12 +205,12 @@ pub struct CollectionSnapshot<R> {
 }
 
 impl<R> CollectionSnapshot<R> {
-    /// Materialized union authorized by this snapshot's exact commit set.
+    /// Materialized union admitted by this snapshot's exact commit set.
     pub fn facts(&self) -> &TribleSet {
         &self.facts
     }
 
-    /// Exact authorized commits, ordered by intrinsic record id.
+    /// Exact admitted commits, ordered by intrinsic record id.
     pub fn commits(&self) -> &[CollectionCommit] {
         &self.commits
     }
@@ -96,72 +231,67 @@ impl<R> CollectionSnapshot<R> {
     }
 }
 
-/// Failure to discover one exact `WRITE`-authorized commit ticket.
+/// Failure to discover one exact admitted commit ticket.
 #[derive(Debug)]
-pub enum CollectionTicketError<RecordsError, ReaderError> {
-    /// The team's positive authority ledger could not be observed.
-    Authority(AuthorityResolutionError<RecordsError, ReaderError>),
+pub enum CollectionTicketError<RecordsError> {
+    /// One explicitly supplied capability proof was invalid at this operation's
+    /// single clock observation.
+    Admission(CollectionAdmissionError),
     /// Target collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
 }
 
-impl<RecordsError, ReaderError> fmt::Display for CollectionTicketError<RecordsError, ReaderError>
+impl<RecordsError> fmt::Display for CollectionTicketError<RecordsError>
 where
     RecordsError: fmt::Display,
-    ReaderError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Authority(source) => write!(formatter, "resolve collection authority: {source}"),
+            Self::Admission(source) => source.fmt(formatter),
             Self::Discovery(source) => source.fmt(formatter),
         }
     }
 }
 
-impl<RecordsError, ReaderError> Error for CollectionTicketError<RecordsError, ReaderError>
+impl<RecordsError> Error for CollectionTicketError<RecordsError>
 where
     RecordsError: Error + 'static,
-    ReaderError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Authority(source) => Some(source),
+            Self::Admission(source) => Some(source),
             Self::Discovery(source) => Some(source),
         }
     }
 }
 
-/// Failure to publish one collection element through explicit `WRITE` authority.
+/// Failure to publish one collection element through explicit admission.
 #[derive(Debug)]
-pub enum CollectionCommitError<RecordsError, ReaderError, PutError, InsertError> {
-    /// The team's positive authority ledger could not be observed.
-    Authority(AuthorityResolutionError<RecordsError, ReaderError>),
-    /// The facade's signing key has no accepted invocation grant for this
-    /// exact collection and the `WRITE` action.
+pub enum CollectionCommitError<PutError, InsertError> {
+    /// One explicitly supplied capability proof was invalid.
+    Admission(CollectionAdmissionError),
+    /// The facade's signing key is absent from the admitted signer set.
     WriteDenied {
         /// Prospective commit signer.
         writer: Inline<ED25519PublicKey>,
-        /// Exact collection descriptor governed by the missing grant.
+        /// Exact collection descriptor for which the writer was denied.
         collection: CollectionHandle,
     },
-    /// Authority succeeded, but canonical fragment publication failed.
+    /// Admission succeeded, but canonical fragment publication failed.
     Publication(PublicationError<PutError, InsertError>),
 }
 
-impl<RecordsError, ReaderError, PutError, InsertError> fmt::Display
-    for CollectionCommitError<RecordsError, ReaderError, PutError, InsertError>
+impl<PutError, InsertError> fmt::Display for CollectionCommitError<PutError, InsertError>
 where
-    RecordsError: fmt::Display,
-    ReaderError: fmt::Display,
     PutError: fmt::Display,
     InsertError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Authority(source) => write!(formatter, "resolve collection authority: {source}"),
+            Self::Admission(source) => source.fmt(formatter),
             Self::WriteDenied { writer, collection } => write!(
                 formatter,
-                "writer {} has no positive WRITE authority for collection {}",
+                "writer {} is not admitted to WRITE collection {}",
                 hex::encode_upper(writer.raw),
                 hex::encode_upper(collection.raw),
             ),
@@ -170,38 +300,35 @@ where
     }
 }
 
-impl<RecordsError, ReaderError, PutError, InsertError> Error
-    for CollectionCommitError<RecordsError, ReaderError, PutError, InsertError>
+impl<PutError, InsertError> Error for CollectionCommitError<PutError, InsertError>
 where
-    RecordsError: Error + 'static,
-    ReaderError: Error + 'static,
     PutError: Error + 'static,
     InsertError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Authority(source) => Some(source),
+            Self::Admission(source) => Some(source),
             Self::WriteDenied { .. } => None,
             Self::Publication(source) => Some(source),
         }
     }
 }
 
-/// Failure to materialize the complete authorized value of a collection.
+/// Failure to materialize the complete admitted value of a collection.
 ///
-/// Every authorized strictly verified commit is ground truth, so its
+/// Every admitted strictly verified commit is ground truth, so its
 /// descriptor, data, and metadata fail loud. Unsigned equations are only
 /// replaceable cache evidence: missing or invalid equations are omitted from
 /// the resolved semantics and cannot hide a valid committed leaf.
 #[derive(Debug)]
 pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError> {
-    /// The team's positive authority ledger could not be observed.
-    Authority(AuthorityResolutionError<RecordsError, ReaderError>),
+    /// One explicitly supplied capability proof was invalid.
+    Admission(CollectionAdmissionError),
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
-    /// A supplied exact ticket was not an exact resident authority set.
+    /// A supplied exact ticket was not an exact resident commit set.
     ExactTicket(ExactTicketError),
-    /// An authorized commit's canonical descriptor blob could not be fetched.
+    /// An admitted commit's canonical descriptor blob could not be fetched.
     DescriptorGet {
         /// Canonical collection-descriptor handle.
         collection: CollectionHandle,
@@ -232,7 +359,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
     },
     /// The blob reader could not be created after record discovery.
     Reader(ReaderError),
-    /// An authorized commit's data blob could not be fetched.
+    /// An admitted commit's data blob could not be fetched.
     CommitDataGet {
         /// Intrinsic commit record id.
         commit: Id,
@@ -241,7 +368,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Backend fetch failure.
         source: GetError,
     },
-    /// An authorized commit's data failed exact `SimpleArchive` collection
+    /// An admitted commit's data failed exact `SimpleArchive` collection
     /// validation.
     InvalidCommitData {
         /// Intrinsic commit record id.
@@ -249,7 +376,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Exact representation or identity diagnostic.
         source: SimpleArchiveUnionValidationError,
     },
-    /// An authorized commit's mandatory metadata archive could not be fetched.
+    /// An admitted commit's mandatory metadata archive could not be fetched.
     CommitMetadataGet {
         /// Intrinsic commit record id.
         commit: Id,
@@ -258,7 +385,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Backend fetch failure.
         source: GetError,
     },
-    /// An authorized commit's mandatory metadata was not a canonical
+    /// An admitted commit's mandatory metadata was not a canonical
     /// `SimpleArchive`.
     InvalidCommitMetadata {
         /// Intrinsic commit record id.
@@ -268,7 +395,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Canonical archive failure.
         source: UnarchiveError,
     },
-    /// An authorized commit's canonical metadata bytes did not have the exact
+    /// An admitted commit's canonical metadata bytes did not have the exact
     /// identity signed by the commit.
     InvalidCommitMetadataIdentity {
         /// Intrinsic commit record id.
@@ -284,13 +411,12 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
     Materialize(MaterializationError<MetaError, GetError>),
 }
 
-impl<RecordsError, ReaderError, MetaError, GetError>
-    From<CollectionTicketError<RecordsError, ReaderError>>
+impl<RecordsError, ReaderError, MetaError, GetError> From<CollectionTicketError<RecordsError>>
     for CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError>
 {
-    fn from(source: CollectionTicketError<RecordsError, ReaderError>) -> Self {
+    fn from(source: CollectionTicketError<RecordsError>) -> Self {
         match source {
-            CollectionTicketError::Authority(source) => Self::Authority(source),
+            CollectionTicketError::Admission(source) => Self::Admission(source),
             CollectionTicketError::Discovery(source) => Self::Discovery(source),
         }
     }
@@ -306,28 +432,28 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Authority(source) => write!(f, "resolve collection authority: {source}"),
+            Self::Admission(source) => source.fmt(f),
             Self::Discovery(source) => source.fmt(f),
             Self::ExactTicket(source) => write!(f, "invalid exact ticket: {source}"),
             Self::DescriptorGet { collection, source } => write!(
                 f,
-                "failed to fetch authorized collection descriptor {}: {source}",
+                "failed to fetch admitted collection descriptor {}: {source}",
                 hex::encode_upper(collection.raw),
             ),
             Self::InvalidDescriptor { collection, source } => write!(
                 f,
-                "authorized collection descriptor {} is invalid: {source}",
+                "admitted collection descriptor {} is invalid: {source}",
                 hex::encode_upper(collection.raw),
             ),
             Self::DescriptorIdentity { expected, actual } => write!(
                 f,
-                "authorized collection descriptor bytes hash to {} instead of {}",
+                "admitted collection descriptor bytes hash to {} instead of {}",
                 hex::encode_upper(actual.raw),
                 hex::encode_upper(expected.raw),
             ),
             Self::DescriptorMismatch { collection } => write!(
                 f,
-                "authorized collection descriptor {} does not match the facade descriptor",
+                "admitted collection descriptor {} does not match the facade descriptor",
                 hex::encode_upper(collection.raw),
             ),
             Self::Reader(source) => write!(f, "failed to open collection blob view: {source}"),
@@ -337,11 +463,11 @@ where
                 source,
             } => write!(
                 f,
-                "failed to fetch data {} for authorized commit {commit:X}: {source}",
+                "failed to fetch data {} for admitted commit {commit:X}: {source}",
                 hex::encode_upper(data.raw),
             ),
             Self::InvalidCommitData { commit, source } => {
-                write!(f, "authorized commit {commit:X} has invalid data: {source}")
+                write!(f, "admitted commit {commit:X} has invalid data: {source}")
             }
             Self::CommitMetadataGet {
                 commit,
@@ -349,7 +475,7 @@ where
                 source,
             } => write!(
                 f,
-                "failed to fetch metadata {} for authorized commit {commit:X}: {source}",
+                "failed to fetch metadata {} for admitted commit {commit:X}: {source}",
                 hex::encode_upper(metadata.raw),
             ),
             Self::InvalidCommitMetadata {
@@ -358,7 +484,7 @@ where
                 source,
             } => write!(
                 f,
-                "authorized commit {commit:X} has invalid metadata {}: {source}",
+                "admitted commit {commit:X} has invalid metadata {}: {source}",
                 hex::encode_upper(metadata.raw),
             ),
             Self::InvalidCommitMetadataIdentity {
@@ -367,7 +493,7 @@ where
                 actual,
             } => write!(
                 f,
-                "authorized commit {commit:X} metadata bytes hash to {} instead of signed {}",
+                "admitted commit {commit:X} metadata bytes hash to {} instead of signed {}",
                 hex::encode_upper(actual.raw),
                 hex::encode_upper(expected.raw),
             ),
@@ -387,7 +513,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Authority(source) => Some(source),
+            Self::Admission(source) => Some(source),
             Self::Discovery(source) => Some(source),
             Self::ExactTicket(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
@@ -539,13 +665,16 @@ where
 }
 
 impl<S> Collection<S> {
-    /// Construct a write facade without reading from or writing to `storage`.
+    /// Construct a collection facade without reading from or writing to
+    /// `storage`.
     ///
-    /// `team` is the team's *root* key, which is a genesis fact archived
-    /// offline, not the key that signs commits. They coincide only for a team
-    /// of one, and a caller that wants that must say so by passing
-    /// `signing_key.verifying_key()`. Defaulting to it would quietly root every
-    /// collection at whichever key happened to be writing.
+    /// `namespace` distinguishes this root's name. It does not grant
+    /// authority. `admission` independently determines both runtime signer
+    /// admission and the descriptor's optional authority fact: open admission
+    /// writes none, while capability admission writes exactly its trust root.
+    /// There is therefore no separately supplied authority value which could
+    /// disagree with the policy actually enforced.
+    ///
     /// `reach` states whether this collection travels, and there is no
     /// default because the answer is part of the collection's name: a private
     /// and a public collection of the same content are different collections
@@ -556,20 +685,22 @@ impl<S> Collection<S> {
     pub fn new(
         storage: S,
         name: &CollectionName,
-        team: VerifyingKey,
+        namespace: VerifyingKey,
         signing_key: SigningKey,
         reach: Fragment,
+        admission: CollectionAdmission,
     ) -> Self {
+        let authority = admission.trust_root();
         Self {
             storage,
-            descriptor: simplearchive_union::descriptor(name, team, Some(team), reach),
-            team_root: team,
+            descriptor: simplearchive_union::descriptor(name, namespace, authority, reach),
             signing_key,
+            admission,
         }
     }
 
     /// Canonical collection descriptor facts built from the constructor name
-    /// and team.
+    /// and namespace, with authority fixed by admission.
     pub fn descriptor(&self) -> &Fragment {
         &self.descriptor
     }
@@ -584,9 +715,9 @@ impl<S> Collection<S> {
             .get_handle()
     }
 
-    /// Root key whose positive authority ledger governs this collection.
-    pub fn team_root(&self) -> VerifyingKey {
-        self.team_root
+    /// Explicit admission policy enforced by this facade.
+    pub fn admission(&self) -> &CollectionAdmission {
+        &self.admission
     }
 
     /// Borrow the underlying storage.
@@ -603,42 +734,87 @@ impl<S> Collection<S> {
     pub fn into_storage(self) -> S {
         self.storage
     }
+
+    /// Verify every explicit presentation at one shared operation instant.
+    ///
+    /// `None` denotes open admission. `Some(empty)` is intentionally distinct:
+    /// it is a valid closed capability policy which admits nobody.
+    fn admitted_subjects_at(
+        &self,
+        instant: hifitime::Epoch,
+    ) -> Result<Option<BTreeSet<Inline<ED25519PublicKey>>>, CollectionAdmissionError> {
+        let CollectionAdmission::Capability {
+            trust_root,
+            presentations,
+        } = &self.admission
+        else {
+            return Ok(None);
+        };
+
+        let atom = CapabilityAtom::new(
+            CapabilityAction::new(ACTION_WRITE),
+            CapabilityResource::from(self.collection()),
+        );
+        let mut admitted = BTreeSet::new();
+        for (presentation_index, presentation) in presentations.iter().enumerate() {
+            presentation
+                .proof()
+                .verify_claim(
+                    *trust_root,
+                    instant,
+                    CapabilityClaim::new(presentation.subject(), atom, CapabilityMode::Invoke),
+                )
+                .map_err(|source| CollectionAdmissionError {
+                    presentation: presentation_index,
+                    subject: presentation.subject(),
+                    source,
+                })?;
+            admitted.insert(Inline::new(presentation.subject().to_bytes()));
+        }
+        Ok(Some(admitted))
+    }
 }
 
 impl<S> Collection<S>
 where
-    S: BlobStore + CollectionStore,
+    S: CollectionStore,
 {
-    /// Discover the exact strictly verified `WRITE`-authorized commits.
+    /// Discover the exact strictly verified admitted commits.
     ///
-    /// The team's positive authority ledger is resolved first. A later target
-    /// discovery admits every strictly verified commit whose signer may invoke
-    /// [`ACTION_WRITE`] on this exact descriptor, independent of which key this
-    /// facade itself holds. Unauthorized and invalid commits remain inert. The
-    /// returned ticket is ordered by intrinsic commit id.
+    /// The operation observes the clock once, verifies every explicit proof
+    /// against [`ACTION_WRITE`] on this exact descriptor, then discovers target
+    /// records. Open admission accepts every strict signer; capability
+    /// admission accepts exactly the presented subjects. Unadmitted and invalid
+    /// commits remain inert. The returned ticket is ordered by intrinsic id.
     ///
     /// This is a known-prefix observation rather than a global-latest
-    /// transaction. A grant first observed after authority resolution or a
-    /// commit first observed after target discovery appears in a later ticket.
+    /// transaction. A commit inserted after target discovery appears in a
+    /// later ticket. Newly acquired evidence participates only after the
+    /// caller supplies it in a later facade's explicit admission policy.
     pub fn ticket(
         &mut self,
-    ) -> Result<Vec<CollectionCommit>, CollectionTicketError<S::RecordsError, S::ReaderError>> {
-        let (_, commits) = self.discover_authorized_commits()?;
+    ) -> Result<Vec<CollectionCommit>, CollectionTicketError<S::RecordsError>> {
+        let instant = clock::epoch_now();
+        let (_, commits) = self.discover_admitted_commits_at(instant)?;
         Ok(commits)
     }
 
-    fn discover_authorized_commits(
+    fn discover_admitted_commits_at(
         &mut self,
+        instant: hifitime::Epoch,
     ) -> Result<
         (DiscoveredCollectionRecords, Vec<CollectionCommit>),
-        CollectionTicketError<S::RecordsError, S::ReaderError>,
+        CollectionTicketError<S::RecordsError>,
     > {
         let collection = self.collection();
-        let authority = authority::resolve_authority(&mut self.storage, self.team_root)
-            .map_err(CollectionTicketError::Authority)?;
+        let admitted = self
+            .admitted_subjects_at(instant)
+            .map_err(CollectionTicketError::Admission)?;
         let discovered =
             discover_collection_records_authorized(&mut self.storage, collection, |subject| {
-                authority.allows(subject, ACTION_WRITE, collection)
+                admitted
+                    .as_ref()
+                    .map_or(true, |subjects| subjects.contains(subject))
             })
             .map_err(CollectionTicketError::Discovery)?;
         let commits = discovered.commits().to_vec();
@@ -649,18 +825,16 @@ where
 
 impl<S> Collection<S>
 where
-    S: BlobStore + BlobStorePut + CollectionStore,
+    S: BlobStorePut + CollectionStore,
 {
-    /// Publish one self-contained fragment under explicit `WRITE` authority.
+    /// Publish one self-contained fragment under explicit admission.
     ///
-    /// The team's authority ledger is resolved before any target-collection
-    /// descriptor, attachment, data, metadata, or record is written. On a lazy
-    /// store, resolving unavailable authority evidence may still record the
-    /// corresponding durable [`WantRequest`](crate::repo::WantRequest); that
-    /// is orthogonal demand state, not collection publication. The local
-    /// signing key must have an accepted invocation grant for [`ACTION_WRITE`]
-    /// on this exact descriptor. Facts are the collection element, metafacts
-    /// are commit metadata, and fragment attachments are then staged through
+    /// The operation observes the clock once and verifies every explicit
+    /// capability proof before any descriptor, attachment, data, metadata, or
+    /// record is written. The local signing key must be in the resulting
+    /// admitted set; open admission includes it automatically. Facts are the
+    /// collection element, metafacts are commit metadata, and fragment
+    /// attachments are then staged through
     /// the same ordered, content-addressed path as
     /// [`simplearchive_union::publish_fragment_commit`]. Repeating identical
     /// input is idempotent; distinct commits coexist without selecting a head.
@@ -669,15 +843,17 @@ where
     pub fn commit(
         &mut self,
         fragment: Fragment,
-    ) -> Result<
-        CollectionCommit,
-        CollectionCommitError<S::RecordsError, S::ReaderError, S::PutError, S::InsertError>,
-    > {
+    ) -> Result<CollectionCommit, CollectionCommitError<S::PutError, S::InsertError>> {
+        let instant = clock::epoch_now();
         let collection = self.collection();
         let writer = Inline::new(self.signing_key.verifying_key().to_bytes());
-        let authority = authority::resolve_authority(&mut self.storage, self.team_root)
-            .map_err(CollectionCommitError::Authority)?;
-        if !authority.allows(&writer, ACTION_WRITE, collection) {
+        let admitted = self
+            .admitted_subjects_at(instant)
+            .map_err(CollectionCommitError::Admission)?;
+        if admitted
+            .as_ref()
+            .is_some_and(|subjects| !subjects.contains(&writer))
+        {
             return Err(CollectionCommitError::WriteDenied { writer, collection });
         }
         simplearchive_union::publish_fragment_commit(
@@ -695,16 +871,17 @@ where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
 {
-    /// Capture one coherent known-prefix snapshot of this authorized collection.
+    /// Capture one coherent known-prefix snapshot of this admitted collection.
     ///
-    /// The call resolves the team's positive authority ledger, discovers the
-    /// exact commits whose signers may invoke [`ACTION_WRITE`] on this
-    /// descriptor, and then opens one target blob-reader snapshot. The returned
-    /// facts are materialized solely from that commit set. Unauthorized commits
-    /// remain inert even when every byte they name is locally resident.
+    /// The call observes the clock once, verifies every explicit capability
+    /// presentation, discovers commits from exactly the resulting signer set,
+    /// and then opens one target blob-reader snapshot. Open admission instead
+    /// accepts every strictly verified signer. The returned facts are
+    /// materialized solely from that commit set; unadmitted commits remain
+    /// inert even when every byte they name is locally resident.
     ///
     /// This is not a global-latest transaction: a later call may observe more
-    /// commits. It is a coherent authority boundary for consumers that need
+    /// commits. It is a coherent admission boundary for consumers that need
     /// to carry facts, source commits, and the validating blob view together.
     pub fn snapshot(
         &mut self,
@@ -717,19 +894,20 @@ where
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
+        let instant = clock::epoch_now();
         let (discovered, commits) = self
-            .discover_authorized_commits()
+            .discover_admitted_commits_at(instant)
             .map_err(CollectionMaterializationError::from)?;
         Self::snapshot_from_observation(&mut self.storage, &self.descriptor, discovered, commits)
     }
 
-    /// Materialize the complete known `TribleSet` admitted by `WRITE` authority.
+    /// Materialize the complete known `TribleSet` admitted by this facade.
     ///
     /// One call first discovers a deterministic observed view of native
     /// collection records, then opens a blob-reader snapshot. Every strictly
-    /// signed commit in that record view whose signer has positive
-    /// [`ACTION_WRITE`] authority for this exact collection is mandatory
-    /// membership. All authorized commit dependencies are exact-validated and
+    /// signed commit in that record view whose signer is admitted for exact
+    /// [`ACTION_WRITE`] on this collection is mandatory membership. All
+    /// admitted commit dependencies are exact-validated and
     /// fail loud. Merge validation is restricted to the subgraph between
     /// authenticated leaves and resident result artifacts, while allowing
     /// nonresident intermediate equations. Exact resident results may replace
@@ -738,15 +916,15 @@ where
     /// committed leaves remain authoritative.
     /// Derivations are not admitted by this `SimpleArchive`-only facade.
     /// This boundary assumes records have already passed deployment admission:
-    /// it prevents unsigned records from acquiring blob authority, but does
+    /// it prevents unsigned records from acquiring semantic authority, but does
     /// not bound CPU spent validating arbitrarily many admitted equations.
     ///
     /// This is a **known-prefix** read, not a global-latest transaction:
     /// [`CollectionStore`] does not promise a coherent snapshot under
     /// concurrent insertion. A commit first observed after this discovery pass
     /// appears on a later call. The returned set is nevertheless complete for
-    /// all authorized commits observed by this pass, or the call returns an
-    /// error instead of a partial set. If no authorized commit is observed,
+    /// all admitted commits observed by this pass, or the call returns an
+    /// error instead of a partial set. If no admitted commit is observed,
     /// the result is empty without fetching the target descriptor.
     pub fn materialize(
         &mut self,
@@ -759,8 +937,9 @@ where
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
+        let instant = clock::epoch_now();
         let (discovered, commits) = self
-            .discover_authorized_commits()
+            .discover_admitted_commits_at(instant)
             .map_err(CollectionMaterializationError::from)?;
         if commits.is_empty() {
             return Ok(TribleSet::new());
@@ -769,7 +948,7 @@ where
             .map(CollectionSnapshot::into_facts)
     }
 
-    /// Materialize one already-discovered exact authority frontier.
+    /// Materialize one already-discovered exact commit frontier.
     ///
     /// Both ordinary and exact-ticket facades use this single validator
     /// so descriptor, mandatory dependency, merge-cover, and reader-snapshot
@@ -791,7 +970,7 @@ where
         let collection =
             crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
                 .get_handle();
-        let authorized: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
+        let admitted: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
 
         let reader = storage
             .reader()
@@ -805,7 +984,7 @@ where
             });
         }
 
-        // The descriptor handle is the collection identity. Once an authorized
+        // The descriptor handle is the collection identity. Once an admitted
         // commit makes this collection nonempty, its descriptor is mandatory
         // ground truth just like the signed data and metadata below. Fetch by
         // the exact handle, recompute the identity rather than trusting a
@@ -1094,7 +1273,7 @@ where
         // A plain collection facade owns one root collection and derives
         // nothing, so it declares no lineage.
         let resolution =
-            resolve_collection_semantics(&discovered, &BTreeMap::new(), &authorized, |request| {
+            resolve_collection_semantics(&discovered, &BTreeMap::new(), &admitted, |request| {
                 Ok::<CollectionClaimValidation<()>, Infallible>(match request {
                     CollectionValidationRequest::Commit { .. } => {
                         CollectionClaimValidation::Accepted
@@ -1259,22 +1438,22 @@ mod tests {
 
     use crate::blob::encodings::{utf8string::UTF8String, UnknownBlob};
     use crate::blob::{BlobEncoding, Bytes, IntoBlob};
+    use crate::capability::{
+        CapabilityGrant, CapabilityProofStep, CapabilityValidity, KIND_CAPABILITY_CLAIM,
+    };
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::{discover_collection_records, CollectionMerge, CollectionRecord};
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
-    use crate::repo::lazy::Lazy;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{WantRequest, WantStore};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
-    /// The one team root every collection in these tests belongs to.
-    fn test_team_key() -> SigningKey {
+    fn test_trust_key() -> SigningKey {
         SigningKey::from_bytes(&[1; 32])
     }
 
-    fn test_team() -> VerifyingKey {
-        test_team_key().verifying_key()
+    fn test_namespace() -> VerifyingKey {
+        test_trust_key().verifying_key()
     }
 
     fn test_name() -> CollectionName {
@@ -1302,9 +1481,9 @@ mod tests {
                 .records()?
                 .collect::<Result<Vec<_>, Infallible>>()?;
             self.records_calls += 1;
-            // `snapshot` first resolves authority, then discovers the target.
-            // Admit only the earlier target frontier on that second pass.
-            if self.records_calls == 2 {
+            // Admission is supplied explicitly, so `snapshot` performs one
+            // target discovery. Admit only the earlier frontier on that pass.
+            if self.records_calls == 1 {
                 records.retain(|record| self.initially_visible.contains(&record.id()));
             }
             Ok(records.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
@@ -1359,56 +1538,62 @@ mod tests {
         built
     }
 
-    fn grant_write<S>(store: &mut S, name: &CollectionName, writer: &SigningKey)
-    where
-        S: BlobStorePut + CollectionStore,
-        S::PutError: fmt::Debug,
-        S::InsertError: fmt::Debug,
-    {
-        let descriptor =
-            simplearchive_union::descriptor(name, test_team(), Some(test_team()), reach::private());
-        authority::publish_grant(
-            store,
-            test_team(),
-            &test_team_key(),
-            authority::AuthorityGrant::root(
-                writer.verifying_key(),
-                identity_for_tests(&descriptor),
-                ACTION_WRITE,
-                authority::AuthorityMode::Invoke,
-            ),
+    fn write_atom(collection: CollectionHandle) -> CapabilityAtom {
+        CapabilityAtom::new(
+            CapabilityAction::new(ACTION_WRITE),
+            CapabilityResource::from(collection),
         )
-        .unwrap();
     }
 
-    fn authorized_collection(
-        name: &CollectionName,
-        signing_key: SigningKey,
-    ) -> Collection<MemoryRepo> {
-        let mut storage = MemoryRepo::default();
-        grant_write(&mut storage, name, &signing_key);
-        Collection::new(storage, name, test_team(), signing_key, reach::private())
+    fn root_presentation(
+        root: &SigningKey,
+        subject: VerifyingKey,
+        collection: CollectionHandle,
+        mode: CapabilityMode,
+    ) -> CapabilityPresentation {
+        CapabilityPresentation::new(
+            subject,
+            CapabilityProof::new(vec![CapabilityProofStep::issue(
+                root,
+                CapabilityGrant::root(subject, write_atom(collection), mode, None),
+            )]),
+        )
     }
 
-    fn keep_authority_and<I>(store: &mut MemoryRepo, handles: I)
+    fn capability_descriptor(name: &CollectionName, trust_root: VerifyingKey) -> Fragment {
+        simplearchive_union::descriptor(name, test_namespace(), Some(trust_root), reach::private())
+    }
+
+    fn capability_admission(
+        root: &SigningKey,
+        subjects: impl IntoIterator<Item = VerifyingKey>,
+        collection: CollectionHandle,
+    ) -> CollectionAdmission {
+        CollectionAdmission::capability(
+            root.verifying_key(),
+            subjects
+                .into_iter()
+                .map(|subject| root_presentation(root, subject, collection, CapabilityMode::Invoke))
+                .collect(),
+        )
+    }
+
+    fn open_collection(name: &CollectionName, signing_key: SigningKey) -> Collection<MemoryRepo> {
+        Collection::new(
+            MemoryRepo::default(),
+            name,
+            test_namespace(),
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        )
+    }
+
+    fn keep_only<I>(store: &mut MemoryRepo, handles: I)
     where
         I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
     {
-        let authority_collection = authority::collection(test_team());
-        let discovered = discover_collection_records(store).unwrap();
-        let mut keep: Vec<_> = handles.into_iter().collect();
-        for commit in discovered
-            .commits()
-            .iter()
-            .filter(|commit| commit.collection() == authority_collection)
-        {
-            keep.extend([
-                authority_collection.transmute(),
-                Handle::<SimpleArchive>::from_hash(commit.data()).transmute(),
-                commit.metadata().transmute(),
-            ]);
-        }
-        store.blobs.keep(keep);
+        store.blobs.keep(handles);
     }
 
     fn invalid_signature(commit: CollectionCommit) -> CollectionCommit {
@@ -1425,20 +1610,20 @@ mod tests {
     }
 
     #[test]
-    fn ticket_discovers_only_exact_strictly_verified_authorized_commits() {
+    fn open_ticket_discovers_every_exact_strictly_verified_commit() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
         let collection_id = identity_for_tests(&simplearchive_union::descriptor(
             &name,
-            test_team(),
-            Some(test_team()),
+            test_namespace(),
+            None,
             reach::private(),
         ));
         let other_collection = identity_for_tests(&simplearchive_union::descriptor(
             &other_name(),
-            test_team(),
-            Some(test_team()),
+            test_namespace(),
+            None,
             reach::private(),
         ));
         let metadata = super::super::empty_metadata_handle();
@@ -1462,7 +1647,6 @@ mod tests {
         ));
 
         let mut store = MemoryRepo::default();
-        grant_write(&mut store, &name, &signing_key);
         for record in [
             CollectionRecord::Commit(second),
             CollectionRecord::Commit(foreign_signer),
@@ -1472,24 +1656,32 @@ mod tests {
         ] {
             store.insert(record).unwrap();
         }
-        let mut collection =
-            Collection::new(store, &name, test_team(), signing_key, reach::private());
+        let mut collection = Collection::new(
+            store,
+            &name,
+            test_namespace(),
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        );
 
         let ticket = collection.ticket().unwrap();
-        let mut expected = vec![first, second];
+        let mut expected = vec![first, second, foreign_signer];
         expected.sort_unstable_by_key(CollectionCommit::id);
 
         assert_eq!(ticket, expected);
     }
 
     #[test]
-    fn ticket_for_an_empty_authorized_collection_is_empty() {
+    fn empty_capability_admission_yields_an_empty_ticket() {
+        let root = test_trust_key();
         let mut collection = Collection::new(
             MemoryRepo::default(),
             &test_name(),
-            test_team(),
+            test_namespace(),
             SigningKey::from_bytes(&[7; 32]),
             reach::private(),
+            CollectionAdmission::capability(root.verifying_key(), Vec::new()),
         );
 
         assert!(collection.ticket().unwrap().is_empty());
@@ -1502,20 +1694,17 @@ mod tests {
         let mut collection = Collection::new(
             MemoryRepo::default(),
             &name,
-            test_team(),
+            test_namespace(),
             signing_key,
             reach::private(),
+            CollectionAdmission::Open,
         );
 
         assert_eq!(
             collection.descriptor(),
-            &simplearchive_union::descriptor(
-                &name,
-                test_team(),
-                Some(test_team()),
-                reach::private(),
-            )
+            &simplearchive_union::descriptor(&name, test_namespace(), None, reach::private(),)
         );
+        assert_eq!(collection.admission(), &CollectionAdmission::Open);
         assert!(collection.storage().blobs.is_empty());
         assert!(collection.storage_mut().records().unwrap().next().is_none());
 
@@ -1528,15 +1717,15 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let expected = fragment(1, false);
         let mut storage = MemoryRepo::default();
-        grant_write(&mut storage, &name, &signing_key);
 
         {
             let mut collection = Collection::new(
                 &mut storage,
                 &name,
-                test_team(),
+                test_namespace(),
                 signing_key.clone(),
                 reach::private(),
+                CollectionAdmission::Open,
             );
             collection.commit(expected.clone()).unwrap();
             assert_eq!(collection.materialize().unwrap(), expected.facts().clone());
@@ -1544,8 +1733,8 @@ mod tests {
 
         let target = identity_for_tests(&simplearchive_union::descriptor(
             &name,
-            test_team(),
-            Some(test_team()),
+            test_namespace(),
+            None,
             reach::private(),
         ));
         let discovered = discover_collection_records(&mut storage).unwrap();
@@ -1561,28 +1750,59 @@ mod tests {
         let mut collection = Collection::new(
             &mut storage,
             &name,
-            test_team(),
+            test_namespace(),
             signing_key,
             reach::private(),
+            CollectionAdmission::Open,
         );
         assert_eq!(collection.materialize().unwrap(), expected.into_facts());
     }
 
     #[test]
-    fn ordinary_snapshot_unions_all_write_authorized_authors() {
+    fn open_ticket_attaches_through_a_matching_exact_facade() {
         let name = test_name();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let expected = fragment(1, false);
+        let mut collection = open_collection(&name, signing_key);
+        let commit = collection.commit(expected.clone()).unwrap();
+        let ticket = collection.ticket().unwrap();
+        let exact = simplearchive_union::SimpleArchiveCollection::new(
+            name.clone(),
+            test_namespace(),
+            collection.admission().trust_root(),
+            reach::private(),
+        );
+        let succinct = crate::collection::succinctarchive_union::SuccinctArchiveCollection::new(
+            name,
+            test_namespace(),
+            collection.admission().trust_root(),
+            reach::private(),
+            None,
+            reach::private(),
+        );
+
+        assert_eq!(ticket, vec![commit]);
+        assert_eq!(
+            exact
+                .attach_exact(collection.storage_mut(), &ticket)
+                .unwrap(),
+            expected.into_facts()
+        );
+        succinct
+            .ensure_exact(collection.storage_mut(), &ticket)
+            .unwrap();
+    }
+
+    #[test]
+    fn capability_admission_gates_exact_presented_subjects() {
+        let name = test_name();
+        let root = test_trust_key();
         let local_key = SigningKey::from_bytes(&[7; 32]);
         let remote_key = SigningKey::from_bytes(&[9; 32]);
         let stranger_key = SigningKey::from_bytes(&[11; 32]);
-        let descriptor = simplearchive_union::descriptor(
-            &name,
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        );
+        let descriptor = capability_descriptor(&name, root.verifying_key());
+        let collection_handle = identity_for_tests(&descriptor);
         let mut storage = MemoryRepo::default();
-        grant_write(&mut storage, &name, &local_key);
-        grant_write(&mut storage, &name, &remote_key);
         let local_commit = simplearchive_union::publish_fragment_commit(
             &mut storage,
             &descriptor,
@@ -1605,7 +1825,19 @@ mod tests {
         )
         .unwrap();
 
-        let mut local = Collection::new(storage, &name, test_team(), local_key, reach::private());
+        let admission = capability_admission(
+            &root,
+            [local_key.verifying_key(), remote_key.verifying_key()],
+            collection_handle,
+        );
+        let mut local = Collection::new(
+            storage,
+            &name,
+            test_namespace(),
+            local_key,
+            reach::private(),
+            admission,
+        );
 
         assert_eq!(
             discover_collection_records(local.storage_mut())
@@ -1639,16 +1871,13 @@ mod tests {
     }
 
     #[test]
-    fn later_positive_grant_activates_already_resident_commit() {
+    fn newly_presented_proof_activates_an_already_resident_commit() {
         let name = test_name();
+        let root = test_trust_key();
         let writer = SigningKey::from_bytes(&[9; 32]);
         let observer = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(
-            &name,
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        );
+        let descriptor = capability_descriptor(&name, root.verifying_key());
+        let collection_handle = identity_for_tests(&descriptor);
         let expected = fragment(2, false);
         let mut storage = MemoryRepo::default();
         let commit = simplearchive_union::publish_fragment_commit(
@@ -1658,28 +1887,45 @@ mod tests {
             &writer,
         )
         .unwrap();
-        let mut collection =
-            Collection::new(storage, &name, test_team(), observer, reach::private());
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            test_namespace(),
+            observer.clone(),
+            reach::private(),
+            CollectionAdmission::capability(root.verifying_key(), Vec::new()),
+        );
 
         assert!(collection.ticket().unwrap().is_empty());
         assert_eq!(collection.materialize().unwrap(), TribleSet::new());
 
-        grant_write(collection.storage_mut(), &name, &writer);
+        let storage = collection.into_storage();
+        let admission = capability_admission(&root, [writer.verifying_key()], collection_handle);
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            test_namespace(),
+            observer,
+            reach::private(),
+            admission,
+        );
 
         assert_eq!(collection.ticket().unwrap(), vec![commit]);
         assert_eq!(collection.materialize().unwrap(), expected.into_facts());
     }
 
     #[test]
-    fn commit_without_write_authority_is_rejected_before_collection_publication() {
+    fn empty_capability_admission_rejects_commit_before_collection_publication() {
         let name = test_name();
+        let root = test_trust_key();
         let writer = SigningKey::from_bytes(&[7; 32]);
         let mut collection = Collection::new(
             MemoryRepo::default(),
             &name,
-            test_team(),
+            test_namespace(),
             writer.clone(),
             reach::private(),
+            CollectionAdmission::capability(root.verifying_key(), Vec::new()),
         );
         let before_blobs = collection.storage().blobs.len();
         let before_records = collection
@@ -1710,103 +1956,166 @@ mod tests {
     }
 
     #[test]
-    fn delegated_invoke_authority_enables_commit_and_read() {
+    fn delegated_invoke_capability_enables_commit_and_read() {
         let name = test_name();
+        let root = test_trust_key();
         let delegate = SigningKey::from_bytes(&[6; 32]);
         let writer = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(
-            &name,
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        );
+        let descriptor = capability_descriptor(&name, root.verifying_key());
         let target = identity_for_tests(&descriptor);
-        let mut storage = MemoryRepo::default();
-
-        let parent = authority::publish_grant(
-            &mut storage,
-            test_team(),
-            &test_team_key(),
-            authority::AuthorityGrant::root(
+        let parent = CapabilityProofStep::issue(
+            &root,
+            CapabilityGrant::root(
                 delegate.verifying_key(),
-                target,
-                ACTION_WRITE,
-                authority::AuthorityMode::Delegate,
+                write_atom(target),
+                CapabilityMode::InvokeAndDelegate,
+                None,
             ),
-        )
-        .unwrap();
-        authority::publish_grant(
-            &mut storage,
-            test_team(),
+        );
+        let child = CapabilityProofStep::issue(
             &delegate,
-            authority::AuthorityGrant::delegated(
-                parent.id(),
+            CapabilityGrant::delegated(
+                parent.signature_handle(),
                 writer.verifying_key(),
-                target,
-                ACTION_WRITE,
-                authority::AuthorityMode::Invoke,
+                write_atom(target),
+                CapabilityMode::Invoke,
+                None,
             ),
-        )
-        .unwrap();
+        );
+        let admission = CollectionAdmission::capability(
+            root.verifying_key(),
+            vec![CapabilityPresentation::new(
+                writer.verifying_key(),
+                CapabilityProof::new(vec![parent, child]),
+            )],
+        );
 
         let expected = fragment(4, false);
-        let mut collection = Collection::new(storage, &name, test_team(), writer, reach::private());
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            &name,
+            test_namespace(),
+            writer,
+            reach::private(),
+            admission,
+        );
         collection.commit(expected.clone()).unwrap();
 
         assert_eq!(collection.materialize().unwrap(), expected.into_facts());
     }
 
     #[test]
-    fn authority_atoms_do_not_bleed_across_mode_action_or_resource() {
+    fn bounded_invoke_and_delegate_capability_satisfies_minimum_invoke() {
         let name = test_name();
+        let root = test_trust_key();
         let writer = SigningKey::from_bytes(&[7; 32]);
-        let target = identity_for_tests(&simplearchive_union::descriptor(
-            &name,
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        ));
-        let other = identity_for_tests(&simplearchive_union::descriptor(
-            &other_name(),
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        ));
-
-        for (resource, action, mode) in [
-            (target, ACTION_WRITE, authority::AuthorityMode::Delegate),
-            (
-                target,
-                authority::KIND_AUTHORITY_GRANT,
-                authority::AuthorityMode::Invoke,
+        let target = identity_for_tests(&capability_descriptor(&name, root.verifying_key()));
+        let now_ns = clock::epoch_now().to_tai_duration().total_nanoseconds();
+        let validity = CapabilityValidity::new(
+            hifitime::Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(
+                now_ns - 60_000_000_000,
+            )),
+            hifitime::Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(
+                now_ns + 60_000_000_000,
+            )),
+        )
+        .unwrap();
+        let proof = CapabilityProof::new(vec![CapabilityProofStep::issue(
+            &root,
+            CapabilityGrant::root(
+                writer.verifying_key(),
+                write_atom(target),
+                CapabilityMode::InvokeAndDelegate,
+                Some(validity),
             ),
-            (other, ACTION_WRITE, authority::AuthorityMode::Invoke),
-        ] {
-            let mut storage = MemoryRepo::default();
-            authority::publish_grant(
-                &mut storage,
-                test_team(),
-                &test_team_key(),
-                authority::AuthorityGrant::root(writer.verifying_key(), resource, action, mode),
-            )
-            .unwrap();
-            let before_blobs = storage.blobs.len();
-            let before_records = storage
+        )]);
+        let admission = CollectionAdmission::capability(
+            root.verifying_key(),
+            vec![CapabilityPresentation::new(writer.verifying_key(), proof)],
+        );
+        let expected = fragment(5, false);
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            &name,
+            test_namespace(),
+            writer,
+            reach::private(),
+            admission,
+        );
+
+        collection.commit(expected.clone()).unwrap();
+        assert_eq!(collection.materialize().unwrap(), expected.into_facts());
+    }
+
+    #[test]
+    fn wrong_capability_atom_mode_or_subject_fails_loud_before_publication() {
+        let name = test_name();
+        let root = test_trust_key();
+        let writer = SigningKey::from_bytes(&[7; 32]);
+        let other_subject = SigningKey::from_bytes(&[8; 32]);
+        let target = identity_for_tests(&capability_descriptor(&name, root.verifying_key()));
+        let other = identity_for_tests(&capability_descriptor(&other_name(), root.verifying_key()));
+
+        let cases = [
+            CapabilityGrant::root(
+                writer.verifying_key(),
+                write_atom(target),
+                CapabilityMode::Delegate,
+                None,
+            ),
+            CapabilityGrant::root(
+                writer.verifying_key(),
+                CapabilityAtom::new(
+                    CapabilityAction::new(KIND_CAPABILITY_CLAIM),
+                    CapabilityResource::from(target),
+                ),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            CapabilityGrant::root(
+                writer.verifying_key(),
+                write_atom(other),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            CapabilityGrant::root(
+                other_subject.verifying_key(),
+                write_atom(target),
+                CapabilityMode::Invoke,
+                None,
+            ),
+        ];
+
+        for grant in cases {
+            let admission = CollectionAdmission::capability(
+                root.verifying_key(),
+                vec![CapabilityPresentation::new(
+                    writer.verifying_key(),
+                    CapabilityProof::new(vec![CapabilityProofStep::issue(&root, grant)]),
+                )],
+            );
+            let mut collection = Collection::new(
+                MemoryRepo::default(),
+                &name,
+                test_namespace(),
+                writer.clone(),
+                reach::private(),
+                admission,
+            );
+            let before_blobs = collection.storage().blobs.len();
+            let before_records = collection
+                .storage_mut()
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
-            let mut collection = Collection::new(
-                storage,
-                &name,
-                test_team(),
-                writer.clone(),
-                reach::private(),
-            );
 
             assert!(matches!(
                 collection.commit(fragment(1, true)),
-                Err(CollectionCommitError::WriteDenied { .. })
+                Err(CollectionCommitError::Admission(CollectionAdmissionError {
+                    source: CapabilityProofError::ClaimMismatch { .. },
+                    ..
+                }))
             ));
             assert_eq!(collection.storage().blobs.len(), before_blobs);
             assert_eq!(
@@ -1822,62 +2131,49 @@ mod tests {
     }
 
     #[test]
-    fn lazy_authority_miss_records_only_orthogonal_demand_state() {
+    fn one_invalid_explicit_presentation_rejects_the_whole_admission_set() {
         let name = test_name();
+        let root = test_trust_key();
         let writer = SigningKey::from_bytes(&[7; 32]);
-        let missing_data = Inline::new([0x42; 32]);
-        let candidate = CollectionCommit::sign(
-            &test_team_key(),
-            authority::collection(test_team()),
-            missing_data,
-            super::super::empty_metadata_handle(),
+        let target = identity_for_tests(&capability_descriptor(&name, root.verifying_key()));
+        let valid = root_presentation(
+            &root,
+            writer.verifying_key(),
+            target,
+            CapabilityMode::Invoke,
         );
-        let mut storage = MemoryRepo::default();
-        storage.insert(CollectionRecord::Commit(candidate)).unwrap();
-        let before_records = storage
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let invalid = CapabilityPresentation::new(
+            writer.verifying_key(),
+            CapabilityProof::new(vec![CapabilityProofStep::issue(
+                &root,
+                CapabilityGrant::root(
+                    writer.verifying_key(),
+                    write_atom(target),
+                    CapabilityMode::Delegate,
+                    None,
+                ),
+            )]),
+        );
         let mut collection = Collection::new(
-            Lazy::new(storage),
+            MemoryRepo::default(),
             &name,
-            test_team(),
+            test_namespace(),
             writer,
             reach::private(),
+            CollectionAdmission::capability(root.verifying_key(), vec![valid, invalid]),
         );
 
         assert!(matches!(
-            collection.commit(fragment(1, true)),
-            Err(CollectionCommitError::WriteDenied { .. })
+            collection.ticket(),
+            Err(CollectionTicketError::Admission(error)) if error.presentation() == 1
         ));
-        assert_eq!(
-            collection
-                .storage_mut()
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![WantRequest::blob(Handle::<SimpleArchive>::from_hash(
-                missing_data
-            ))]
-        );
-        assert_eq!(
-            collection
-                .storage_mut()
-                .records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            before_records
-        );
     }
 
     #[test]
     fn distinct_commits_coexist_and_repeated_commits_are_idempotent() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut collection = authorized_collection(&name, signing_key);
+        let mut collection = open_collection(&name, signing_key);
         let first_fragment = fragment(1, true);
         let second_fragment = fragment(2, false);
 
@@ -1924,7 +2220,7 @@ mod tests {
                 .collect::<Result<Vec<CollectionRecord>, _>>()
                 .unwrap()
                 .len(),
-            3
+            2
         );
     }
 
@@ -1933,9 +2229,10 @@ mod tests {
         let mut collection = Collection::new(
             MemoryRepo::default(),
             &test_name(),
-            test_team(),
+            test_namespace(),
             SigningKey::from_bytes(&[7; 32]),
             reach::private(),
+            CollectionAdmission::Open,
         );
 
         let snapshot = collection.snapshot().unwrap();
@@ -1945,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_keeps_one_authority_frontier_when_a_commit_appears_before_reader_open() {
+    fn snapshot_keeps_one_record_frontier_when_a_commit_appears_before_reader_open() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let first = fragment(1, false);
@@ -1954,15 +2251,12 @@ mod tests {
         expected_all += second.facts().clone();
 
         let mut seeded = Collection::new(
-            {
-                let mut storage = MemoryRepo::default();
-                grant_write(&mut storage, &name, &signing_key);
-                storage
-            },
+            MemoryRepo::default(),
             &name,
-            test_team(),
+            test_namespace(),
             signing_key.clone(),
             reach::private(),
+            CollectionAdmission::Open,
         );
         let first_commit = seeded.commit(first.clone()).unwrap();
         let second_commit = seeded.commit(second).unwrap();
@@ -1971,17 +2265,23 @@ mod tests {
             initially_visible: BTreeSet::from([first_commit.id()]),
             records_calls: 0,
         };
-        let mut collection =
-            Collection::new(storage, &name, test_team(), signing_key, reach::private());
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            test_namespace(),
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        );
 
         let snapshot = collection.snapshot().unwrap();
         assert_eq!(snapshot.facts(), first.facts());
         assert_eq!(snapshot.commits(), &[first_commit]);
-        assert_eq!(collection.storage().records_calls, 2);
+        assert_eq!(collection.storage().records_calls, 1);
 
         // The later commit's bytes are already in the captured blob reader.
         // They remain semantically inert because its signed record was not in
-        // the exact authority frontier returned with this snapshot.
+        // the exact record frontier returned with this snapshot.
         let _: Blob<SimpleArchive> = snapshot
             .reader()
             .get(Handle::<SimpleArchive>::from_hash(second_commit.data()))
@@ -1996,12 +2296,12 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([first_commit.id(), second_commit.id()])
         );
-        assert_eq!(collection.storage().records_calls, 4);
+        assert_eq!(collection.storage().records_calls, 2);
     }
 
     #[test]
-    fn authorized_commits_materialize_completely_and_repeat_deterministically() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+    fn admitted_commits_materialize_completely_and_repeat_deterministically() {
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let first = fragment(1, false);
         let second = fragment(2, false);
         let mut expected = first.facts().clone();
@@ -2019,18 +2319,13 @@ mod tests {
     fn shared_commit_handles_are_validated_once_without_losing_provenance() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(
-            &name,
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        );
+        let descriptor =
+            simplearchive_union::descriptor(&name, test_namespace(), None, reach::private());
         let first_data = archive(1);
         let second_data = archive(2);
         let first_metadata = archive(8);
         let second_metadata = archive(9);
         let mut storage = MemoryRepo::default();
-        grant_write(&mut storage, &name, &signing_key);
         let first_commit = simplearchive_union::publish_commit(
             &mut storage,
             &descriptor,
@@ -2093,8 +2388,14 @@ mod tests {
         let mut expected = first_data.clone().try_from_blob::<TribleSet>().unwrap();
         expected += second_data.clone().try_from_blob::<TribleSet>().unwrap();
 
-        let mut collection =
-            Collection::new(storage, &name, test_team(), signing_key, reach::private());
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            test_namespace(),
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        );
         let snapshot = collection.snapshot().unwrap();
         assert_eq!(snapshot.facts(), &expected);
         assert_eq!(
@@ -2110,7 +2411,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_dependency_fetches_keep_serial_stage_order() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let mut commits = [
             collection.commit(fragment(1, false)).unwrap(),
             collection.commit(fragment(2, false)).unwrap(),
@@ -2169,24 +2470,24 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_foreign_commit_is_inert() {
-        let authorized_key = SigningKey::from_bytes(&[7; 32]);
+    fn invalid_foreign_commit_is_inert_in_open_mode() {
+        let admitted_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
-        let mut collection = authorized_collection(&test_name(), authorized_key);
+        let mut collection = open_collection(&test_name(), admitted_key);
         let descriptor = collection.descriptor().clone();
         let expected = fragment(2, false);
-        let authorized_commit = collection.commit(expected.clone()).unwrap();
+        let admitted_commit = collection.commit(expected.clone()).unwrap();
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
 
-        let foreign = simplearchive_union::publish_commit(
-            collection.storage_mut(),
-            &descriptor,
-            &data,
-            &metadata,
+        let foreign = CollectionCommit::sign(
             &foreign_key,
-        )
-        .unwrap();
+            identity_for_tests(&descriptor),
+            Handle::<SimpleArchive>::to_hash(data.get_handle()),
+            metadata.get_handle(),
+        );
+        collection.storage_mut().blobs.insert(data);
+        collection.storage_mut().blobs.insert(metadata);
         collection
             .storage_mut()
             .insert(CollectionRecord::Commit(invalid_signature(foreign)))
@@ -2194,19 +2495,15 @@ mod tests {
 
         let snapshot = collection.snapshot().unwrap();
         assert_eq!(snapshot.facts(), expected.facts());
-        assert_eq!(snapshot.commits(), &[authorized_commit]);
+        assert_eq!(snapshot.commits(), &[admitted_commit]);
     }
 
     #[test]
-    fn authorized_commit_without_its_descriptor_blob_fails_loud() {
+    fn admitted_commit_without_its_descriptor_blob_fails_loud() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(
-            &name,
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        );
+        let descriptor =
+            simplearchive_union::descriptor(&name, test_namespace(), None, reach::private());
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let commit = CollectionCommit::sign(
@@ -2216,12 +2513,17 @@ mod tests {
             metadata.get_handle(),
         );
         let mut storage = MemoryRepo::default();
-        grant_write(&mut storage, &name, &signing_key);
         storage.blobs.insert(data);
         storage.blobs.insert(metadata);
         storage.insert(CollectionRecord::Commit(commit)).unwrap();
-        let mut collection =
-            Collection::new(storage, &name, test_team(), signing_key, reach::private());
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            test_namespace(),
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        );
 
         assert!(matches!(
             collection.materialize(),
@@ -2231,15 +2533,11 @@ mod tests {
     }
 
     #[test]
-    fn authorized_descriptor_bytes_must_match_the_collection_handle() {
+    fn admitted_descriptor_bytes_must_match_the_collection_handle() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(
-            &name,
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        );
+        let descriptor =
+            simplearchive_union::descriptor(&name, test_namespace(), None, reach::private());
         let descriptor_handle = identity_for_tests(&descriptor);
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
@@ -2252,23 +2550,28 @@ mod tests {
         let wrong_descriptor = IntoBlob::<SimpleArchive>::to_blob(
             simplearchive_union::descriptor(
                 &other_name(),
-                test_team(),
-                Some(test_team()),
+                test_namespace(),
+                None,
                 reach::private(),
             )
             .into_facts(),
         );
         let actual = wrong_descriptor.get_handle();
         let mut storage = MemoryRepo::default();
-        grant_write(&mut storage, &name, &signing_key);
         storage.blobs.insert(data);
         storage.blobs.insert(metadata);
         storage
             .blobs
             .insert(Blob::with_handle(wrong_descriptor.bytes, descriptor_handle));
         storage.insert(CollectionRecord::Commit(commit)).unwrap();
-        let mut collection =
-            Collection::new(storage, &name, test_team(), signing_key, reach::private());
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            test_namespace(),
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        );
 
         assert!(matches!(
             collection.materialize(),
@@ -2280,11 +2583,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_signature_claiming_an_authorized_key_is_inert() {
+    fn invalid_signature_claiming_an_admitted_key_is_inert() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let expected = fragment(1, false);
-        let mut collection = authorized_collection(&name, signing_key);
+        let mut collection = open_collection(&name, signing_key);
         let valid = collection.commit(expected.clone()).unwrap();
         let invalid = invalid_signature(valid);
         collection
@@ -2296,13 +2599,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_authorized_data_fails_loud() {
+    fn missing_or_corrupt_admitted_data_fails_loud() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut missing = authorized_collection(&name, signing_key.clone());
+        let mut missing = open_collection(&name, signing_key.clone());
         let missing_commit = missing.commit(fragment_with_metadata(1, 8)).unwrap();
         let missing_descriptor = missing.collection();
-        keep_authority_and(
+        keep_only(
             missing.storage_mut(),
             [
                 missing_descriptor.transmute::<Handle<UnknownBlob>>(),
@@ -2315,10 +2618,10 @@ mod tests {
                 if commit == missing_commit.id()
         ));
 
-        let mut corrupt = authorized_collection(&name, signing_key);
+        let mut corrupt = open_collection(&name, signing_key);
         let corrupt_commit = corrupt.commit(fragment_with_metadata(1, 8)).unwrap();
         let corrupt_descriptor = corrupt.collection();
-        keep_authority_and(
+        keep_only(
             corrupt.storage_mut(),
             [
                 corrupt_descriptor.transmute::<Handle<UnknownBlob>>(),
@@ -2338,13 +2641,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_authorized_metadata_fails_loud() {
+    fn missing_or_corrupt_admitted_metadata_fails_loud() {
         let name = test_name();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut missing = authorized_collection(&name, signing_key.clone());
+        let mut missing = open_collection(&name, signing_key.clone());
         let missing_commit = missing.commit(fragment_with_metadata(1, 8)).unwrap();
         let missing_descriptor = missing.collection();
-        keep_authority_and(
+        keep_only(
             missing.storage_mut(),
             [
                 missing_descriptor.transmute::<Handle<UnknownBlob>>(),
@@ -2358,10 +2661,10 @@ mod tests {
                 if commit == missing_commit.id()
         ));
 
-        let mut corrupt = authorized_collection(&name, signing_key);
+        let mut corrupt = open_collection(&name, signing_key);
         let corrupt_commit = corrupt.commit(fragment_with_metadata(1, 8)).unwrap();
         let corrupt_descriptor = corrupt.collection();
-        keep_authority_and(
+        keep_only(
             corrupt.storage_mut(),
             [
                 corrupt_descriptor.transmute::<Handle<UnknownBlob>>(),
@@ -2381,12 +2684,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_authorized_metadata_must_match_the_signed_handle() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+    fn canonical_admitted_metadata_must_match_the_signed_handle() {
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let commit = collection.commit(fragment_with_metadata(1, 8)).unwrap();
         let wrong_metadata = archive(9);
         let descriptor = collection.collection();
-        keep_authority_and(
+        keep_only(
             collection.storage_mut(),
             [
                 descriptor.transmute::<Handle<UnknownBlob>>(),
@@ -2411,7 +2714,7 @@ mod tests {
 
     #[test]
     fn valid_merge_cover_materializes_the_committed_union() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let left_fragment = fragment(1, false);
         let right_fragment = fragment(2, false);
         let left = left_fragment.facts().clone().to_blob();
@@ -2435,7 +2738,7 @@ mod tests {
 
     #[test]
     fn resident_top_cover_can_use_a_nonresident_intermediate() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let first = fragment(1, false);
         let second = fragment(2, false);
         let third = fragment(3, false);
@@ -2464,7 +2767,7 @@ mod tests {
             Handle::<SimpleArchive>::to_hash(third_blob.get_handle()),
         )
         .unwrap();
-        keep_authority_and(
+        keep_only(
             collection.storage_mut(),
             [
                 identity_for_tests(&descriptor).transmute(),
@@ -2483,7 +2786,7 @@ mod tests {
 
     #[test]
     fn shared_nonresident_intermediate_lives_through_all_consumers() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let fragments = [
             fragment(1, false),
             fragment(2, false),
@@ -2541,14 +2844,14 @@ mod tests {
             keep.push(commit.metadata().transmute());
         }
         keep.push(top.get_handle().transmute());
-        keep_authority_and(collection.storage_mut(), keep);
+        keep_only(collection.storage_mut(), keep);
 
         assert_eq!(collection.materialize().unwrap(), expected);
     }
 
     #[test]
     fn corrupt_optional_merge_result_falls_back_to_committed_leaves() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let left_fragment = fragment(1, false);
         let right_fragment = fragment(2, false);
         let left_blob = left_fragment.facts().clone().to_blob();
@@ -2567,7 +2870,7 @@ mod tests {
         .unwrap();
         let merged_handle = merged.get_handle();
 
-        keep_authority_and(
+        keep_only(
             collection.storage_mut(),
             [
                 identity_for_tests(&descriptor).transmute(),
@@ -2588,7 +2891,7 @@ mod tests {
 
     #[test]
     fn broken_unsigned_merge_falls_back_to_committed_leaves() {
-        let mut collection = authorized_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[7; 32]));
         let left_fragment = fragment(1, false);
         let right_fragment = fragment(2, false);
         let mut expected = left_fragment.facts().clone();
