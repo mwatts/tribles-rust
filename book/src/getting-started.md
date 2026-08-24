@@ -46,10 +46,10 @@ attribute's exact historical bytes when its old identity cannot be re-derived.
 
 A root collection is identified by the content handle of its descriptor. The
 descriptor names the collection within a public-key namespace and states its
-optional authority root, representation, join recipe, and reach law. The
-constructor derives that optional fact from admission: open mode omits it,
-while capability mode stores its trust root. A single-user process may use its
-signing key as the namespace:
+optional capability trust root, representation, join recipe, and reach law.
+The constructor derives that optional fact from admission: open mode omits it,
+while capability mode stores its trust root. The namespace is identity, not
+permission. A single-user process may use its signing key as the namespace:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;

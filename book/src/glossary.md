@@ -45,6 +45,14 @@ The content handle of one capability leaf's signature blob. It is a precise
 entry point for reconstructing one proof by exact blob lookups, not an entry in
 a global registry.
 
+### Capability Wallet
+A private, signer-namespaced collection used only to retain locally selected
+capability credentials through conservative garbage collection. Its committed
+data element is the leaf signature archive, whose content links retain the
+claim and parent ancestry. A wallet does not grant authority, enumerate a
+team, resolve policy, or make its contents valid; callers still name and verify
+one exact credential against an external trust root.
+
 ### Capability Proof
 A claim-directed root-to-leaf sequence of exact claim and signature blobs.
 Verification takes an external trust root, explicit instant, and expected leaf;
@@ -79,12 +87,12 @@ nobody.
 
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's root name and public-key
-namespace or exact derived source, optional local capability authority, element
+namespace or exact derived source, optional capability trust root, element
 representation, join recipe, and reach law. Its content handle is the
 `CollectionHandle`, so every native record which names a collection can resolve
 its meaning through the ordinary blob store. Open facade admission omits the
-authority fact; capability admission writes exactly its trust root. A derived
-descriptor never inherits namespace or authority through its source.
+trust-root fact; capability admission writes exactly its trust root. A derived
+descriptor never inherits namespace or trust through its source.
 
 ### Collection Store
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is

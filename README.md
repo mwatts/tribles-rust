@@ -133,8 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 This example chooses `CollectionAdmission::Open`, so every strictly verified
 signer for the exact descriptor is visible and the local signer may publish.
 Capability admission instead accepts only explicitly supplied root-to-leaf
-proofs for exact `ACTION_WRITE` on that descriptor; it never scans storage for
-ambient grants. Identical retries deduplicate by intrinsic record identity,
+proofs for exact `ACTION_WRITE` under the descriptor's optional capability
+trust root; it never scans storage for ambient grants. The descriptor's
+public-key namespace names the collection and does not authorize a signer.
+Identical retries deduplicate by intrinsic record identity,
 distinct commits coexist, and a snapshot materializes every admitted author's
 union. Call `Collection::flush` when an application needs an explicit
 durability barrier.

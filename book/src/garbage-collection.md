@@ -77,9 +77,12 @@ publication or retention API. Legacy V3 collection records are different: their
 16-byte definition identities predate descriptor handles, so they are
 preserved byte-for-byte as
 inert physical evidence but grant no current collection authority and own no
-blobs. Node policy needs no separate root primitive: its strictly valid
-collection commits retain the resident descriptor, fact archive, metadata, and
-referenced capability/signature closure under the ordinary collection rule.
+blobs. Capability retention needs no separate root primitive either. The team
+CLI commits each locally selected leaf signature archive as data in a private,
+signer-namespaced capability-wallet collection. The ordinary recursive rule
+for that valid commit then retains the resident signature, claim, and parent
+ancestry. This wallet is only a local lifetime edge: it neither validates the
+proof nor creates an enumerable authority roster.
 Blob WANT records are an explicit rewrite choice. Preserving them copies their
 demand markers but does not promote the requested blob to an ownership root;
 dropping them omits the markers entirely.

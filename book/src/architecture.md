@@ -119,13 +119,13 @@ A collection descriptor is an ordinary `TribleSet`, encoded as a canonical
 normally states:
 
 - a human-readable name within a public-key namespace;
-- an optional capability authority root;
+- an optional capability trust root;
 - the element representation;
 - the join recipe; and
 - a reach law governing proactive relay.
 
 A derived descriptor names its source collection, the homomorphism recipe, and
-its own optional authority root. Authority never inherits from the source.
+its own optional capability trust root. Trust never inherits from the source.
 Descriptions of the representation and recipe travel in the same archive, so a
 record naming the descriptor remains interpretable without a separate registry
 entry.
@@ -153,15 +153,15 @@ above it.
 
 `Collection<S>` owns a storage backend, one canonical descriptor, one signing
 key, and one explicit admission policy. Open admission accepts every strictly
-verified signer and writes no authority fact into the descriptor. Capability
-admission writes its trust root there and retains owned presentations in the
-facade. `Collection::commit(fragment)` observes the clock once, verifies every
-presentation for the expected subject and exact `ACTION_WRITE` atom, and
-requires its signing key among those subjects before storing the descriptor,
-attachments, canonical data archive, canonical metadata archive, and signed
-native commit record. It never enumerates storage for grants and does not flush
-implicitly; callers choose durability cadence with `Collection::flush` or the
-backend's explicit close operation.
+verified signer and omits the descriptor's capability trust-root fact.
+Capability admission writes that exact trust root and retains owned
+presentations in the facade. `Collection::commit(fragment)` observes the clock
+once, verifies every presentation for the expected subject and exact
+`ACTION_WRITE` atom, and requires its signing key among those subjects before
+storing the descriptor, attachments, canonical data archive, canonical
+metadata archive, and signed native commit record. It never enumerates storage
+for grants and does not flush implicitly; callers choose durability cadence
+with `Collection::flush` or the backend's explicit close operation.
 
 Reads are exact about what they observed, not magical about global time:
 

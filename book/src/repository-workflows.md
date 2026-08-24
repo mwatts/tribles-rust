@@ -211,13 +211,13 @@ The raw SuccinctArchive facade applies this model directly:
 ```rust,ignore
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 
-let authority = models.admission().trust_root();
+let trust_root = models.admission().trust_root();
 let succinct = SuccinctArchiveCollection::new(
     name.clone(),
     team,
-    authority,
+    trust_root,
     reach::private(), // source reach, and therefore source identity
-    authority,
+    trust_root,
     reach::private(), // target reach
 );
 
@@ -273,21 +273,39 @@ DAG, and converts each authored node into a native commit using its exact
 to the canonical empty archive. Contentless merge wrappers are validated but do
 not become members.
 
-`--namespace` only participates in the target collection's name. With no other
-flags, admission is explicitly open. To publish into a capability-controlled
-collection, add `--authority <TRUST_ROOT> --credential <LEAF_HANDLE>`. The
-command loads only that exact proof and verifies its trust root, signer subject,
-`WRITE` action, target descriptor resource, and minimum Invoke mode at one
-instant before any target dependency or commit is staged. `--credential`
-therefore requires `--authority`; there is no ambient grant search.
+`--namespace` contributes only to the target descriptor's identity. With no
+further options the target uses `CollectionAdmission::Open`; the namespace key
+does not implicitly authorize, admit, or identify the signing key.
+
+To migrate into a capability-guarded target, name its independent trust root
+and the signing key's exact local credential:
+
+```text
+trible pile migrate data.pile branch-to-collection \
+  --branch legacy-events \
+  --collection-name events \
+  --namespace <64-hex-character-ed25519-public-key> \
+  --authority <64-hex-character-ed25519-public-key> \
+  --credential <64-hex-character-leaf-signature-handle> \
+  --signing-key ./writer.key
+```
+
+The command reconstructs that one root-to-leaf proof by exact blob lookups and
+verifies its trust root, signer subject, `ACTION_WRITE`, exact target descriptor
+resource, and minimum Invoke mode at one shared instant. It never scans a
+roster or resolves ambient grants. `--credential` therefore requires
+`--authority`.
 
 The one bootstrap case is deliberately explicit: when the migration signing
-key is itself `--authority`, the credential may be omitted. The command mints
-the exact root `WRITE`/Invoke proof in memory, verifies it through the same
-boundary, stores its claim/signature blobs, retains the leaf in the local
-capability wallet, and prints its credential handle. A non-root signer without
-a credential fails after complete source validation but before changing the
-target collection.
+key is itself `--authority`, the credential may be omitted. The command issues
+one deterministic root `WRITE`/Invoke proof in memory, verifies it through the
+same boundary, then stores its claim/signature blobs and retains the leaf in
+the private local capability wallet. A delegated signer must supply a
+credential.
+
+The complete source DAG and target admission are validated before any target
+descriptor, dependency, capability blob, wallet entry, or commit is published.
+An authorization failure therefore leaves the target untouched.
 
 Legacy wrapper parents, messages, timestamps, authors, and signatures are not
 silently reinterpreted as application metadata. Two source nodes with identical
