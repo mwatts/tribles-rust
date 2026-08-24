@@ -34,8 +34,9 @@ pub enum Command {
     /// This is deliberately a same-pile migration: one frozen pin observation
     /// selects the head, a later append-only blob snapshot validates everything
     /// it reaches, and only then are native records appended to that pile. A
-    /// team-root signer bootstraps its own exact WRITE grant; any other signer
-    /// must already have exact WRITE authority for the target collection.
+    /// An omitted authority makes admission explicitly open. An authority-root
+    /// signer may bootstrap its own exact WRITE credential; any other signer
+    /// must designate an existing exact credential.
     BranchToCollection {
         /// Legacy branch to migrate, by exact name or 32-hex-character id.
         #[arg(long)]
@@ -43,9 +44,16 @@ pub enum Command {
         /// Immutable name of the target root collection.
         #[arg(long)]
         collection_name: String,
-        /// Ed25519 key used as both target namespace and authority root.
+        /// Public-key namespace used only to name the target collection.
         #[arg(long)]
-        team_root: String,
+        namespace: String,
+        /// Optional capability trust root. Omit for explicitly open admission.
+        #[arg(long)]
+        authority: Option<String>,
+        /// Exact WRITE credential. Requires --authority; omit only when the
+        /// signing key itself is the authority root.
+        #[arg(long, requires = "authority")]
+        credential: Option<String>,
         /// Durable target signing-key file (64-hex-character seed).
         #[arg(long)]
         signing_key: PathBuf,
@@ -68,9 +76,19 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
         Command::BranchToCollection {
             branch,
             collection_name,
-            team_root,
+            namespace,
+            authority,
+            credential,
             signing_key,
-        } => branch_to_collection::run(pile_path, branch, collection_name, team_root, signing_key),
+        } => branch_to_collection::run(
+            pile_path,
+            branch,
+            collection_name,
+            namespace,
+            authority,
+            credential,
+            signing_key,
+        ),
         Command::Run { migration, dry_run } => {
             match migration {
                 None | Some(Migration::RecordKindDescriptions) => {

@@ -262,7 +262,7 @@ inspect and migrate that evidence without restoring the old publication API.
 trible pile migrate data.pile branch-to-collection \
   --branch legacy-events \
   --collection-name events \
-  --team-root <64-hex-character-ed25519-public-key> \
+  --namespace <64-hex-character-ed25519-public-key> \
   --signing-key ./writer.key
 ```
 
@@ -273,14 +273,21 @@ DAG, and converts each authored node into a native commit using its exact
 to the canonical empty archive. Contentless merge wrappers are validated but do
 not become members.
 
-Target authorization is established before any target dependency or commit is
-published. For this compatibility command, `--team-root` intentionally fills
-both the target collection's public-key name namespace and its optional local
-capability authority, matching the current named-collection facade. If the
-supplied signing key is that root, the migration appends its idempotent root
-`WRITE`/Invoke grant. A delegated signing key must already hold exact `WRITE`
-authority for the target descriptor; otherwise migration fails after source
-validation but before changing the target collection.
+`--namespace` only participates in the target collection's name. With no other
+flags, admission is explicitly open. To publish into a capability-controlled
+collection, add `--authority <TRUST_ROOT> --credential <LEAF_HANDLE>`. The
+command loads only that exact proof and verifies its trust root, signer subject,
+`WRITE` action, target descriptor resource, and minimum Invoke mode at one
+instant before any target dependency or commit is staged. `--credential`
+therefore requires `--authority`; there is no ambient grant search.
+
+The one bootstrap case is deliberately explicit: when the migration signing
+key is itself `--authority`, the credential may be omitted. The command mints
+the exact root `WRITE`/Invoke proof in memory, verifies it through the same
+boundary, stores its claim/signature blobs, retains the leaf in the local
+capability wallet, and prints its credential handle. A non-root signer without
+a credential fails after complete source validation but before changing the
+target collection.
 
 Legacy wrapper parents, messages, timestamps, authors, and signatures are not
 silently reinterpreted as application metadata. Two source nodes with identical

@@ -187,7 +187,7 @@ pub(crate) fn parse_team_root(text: &str) -> Result<VerifyingKey> {
     parse_public_key(text, "team root")
 }
 
-fn parse_public_key(text: &str, label: &str) -> Result<VerifyingKey> {
+pub(crate) fn parse_public_key(text: &str, label: &str) -> Result<VerifyingKey> {
     let bytes = hex::decode(text).map_err(|error| anyhow!("decode {label} hex: {error}"))?;
     let raw: [u8; 32] = bytes
         .as_slice()
@@ -242,7 +242,10 @@ fn format_credential(credential: CapabilityBlobHandle) -> String {
     hex::encode(credential.raw)
 }
 
-fn load_proof(pile: &mut Pile, credential: CapabilityBlobHandle) -> Result<CapabilityProof> {
+pub(crate) fn load_capability_proof(
+    pile: &mut Pile,
+    credential: CapabilityBlobHandle,
+) -> Result<CapabilityProof> {
     let reader = pile.reader().context("open capability blob snapshot")?;
     CapabilityProof::load(credential, |handle| {
         let result: std::result::Result<Blob<SimpleArchive>, _> = reader.get(handle);
@@ -268,7 +271,11 @@ fn load_proof(pile: &mut Pile, credential: CapabilityBlobHandle) -> Result<Capab
 /// the leaf signature archive itself. Native COMMIT retention therefore walks
 /// signature -> claim -> parent signature and owns the complete resident
 /// ancestry without making team membership globally enumerable.
-fn store_proof(pile: &mut Pile, wallet_key: &SigningKey, proof: &CapabilityProof) -> Result<()> {
+pub(crate) fn store_capability_proof(
+    pile: &mut Pile,
+    wallet_key: &SigningKey,
+    proof: &CapabilityProof,
+) -> Result<()> {
     let leaf = proof
         .steps()
         .last()
@@ -317,7 +324,7 @@ pub(crate) fn resolve_connect_proof(
     credential: CapabilityBlobHandle,
     expected_subject: VerifyingKey,
 ) -> Result<CapabilityProof> {
-    let proof = load_proof(pile, credential)?;
+    let proof = load_capability_proof(pile, credential)?;
     proof
         .verify_claim(
             team_root,
@@ -392,7 +399,9 @@ fn run_create(
     let proof = CapabilityProof::new(vec![founder_step]);
     encode_capability_proof(&proof)
         .map_err(|error| anyhow!("founder proof is not portable: {error}"))?;
-    with_pile(&pile_path, |pile| store_proof(pile, &founder, &proof))?;
+    with_pile(&pile_path, |pile| {
+        store_capability_proof(pile, &founder, &proof)
+    })?;
     let credential = proof
         .credential()
         .expect("a one-step founder proof has one leaf credential");
@@ -431,7 +440,7 @@ fn run_invite(
     let instant = triblespace_core::clock::epoch_now();
 
     let proof = with_pile(&pile_path, |pile| {
-        let parent_proof = load_proof(pile, parent_credential)?;
+        let parent_proof = load_capability_proof(pile, parent_credential)?;
         let parent = parent_proof
             .verify_claim(
                 team_root,
@@ -467,7 +476,7 @@ fn run_invite(
         let proof = CapabilityProof::new(steps);
         encode_capability_proof(&proof)
             .map_err(|error| anyhow!("child proof is not portable: {error}"))?;
-        store_proof(pile, &issuer_key, &proof)?;
+        store_capability_proof(pile, &issuer_key, &proof)?;
         Ok(proof)
     })?;
 
@@ -496,7 +505,9 @@ fn run_join(pile_path: PathBuf, key_path: Option<PathBuf>, invite_path: PathBuf)
         )
         .map_err(|error| anyhow!("invite proof rejected: {error}"))?;
 
-    with_pile(&pile_path, |pile| store_proof(pile, &local_key, &proof))?;
+    with_pile(&pile_path, |pile| {
+        store_capability_proof(pile, &local_key, &proof)
+    })?;
 
     println!("team root:           {}", hex::encode(team_root.to_bytes()));
     println!(
@@ -565,7 +576,7 @@ fn run_show(pile_path: PathBuf, team_root_text: String, credential_text: String)
     let team_root = parse_team_root(&team_root_text)?;
     let credential = parse_credential(&credential_text)?;
     with_pile(&pile_path, |pile| {
-        let proof = load_proof(pile, credential)?;
+        let proof = load_capability_proof(pile, credential)?;
         let leaf = proof
             .steps()
             .last()
@@ -648,7 +659,7 @@ mod tests {
         let mut source = Pile::open(&source_path).unwrap();
         let mut destination = Pile::open(&destination_path).unwrap();
 
-        store_proof(&mut source, &issuer, &proof).unwrap();
+        store_capability_proof(&mut source, &issuer, &proof).unwrap();
         source
             .rewrite_retained_into(
                 &mut destination,
@@ -657,7 +668,7 @@ mod tests {
             )
             .unwrap();
 
-        let retained = load_proof(&mut destination, credential).unwrap();
+        let retained = load_capability_proof(&mut destination, credential).unwrap();
         assert_eq!(retained, proof);
         retained
             .verify_claim(

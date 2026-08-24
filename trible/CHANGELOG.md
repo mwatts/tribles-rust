@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Split legacy branch migration naming from admission: `--namespace` now only
+  names the target, omission of `--authority` selects explicit open admission,
+  and controlled targets consume one exact blob-native WRITE credential. An
+  authority-root signer may bootstrap and retain its own exact root proof.
 - Replaced the expiring scoped-capability team workflow with one positive
   authority ledger. `team create`, `invite`, `join`, `list`, and `show` now
   publish, carry, resolve, and inspect exact CONNECT grant occurrences.

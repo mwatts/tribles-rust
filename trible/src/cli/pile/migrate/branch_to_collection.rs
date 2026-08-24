@@ -13,14 +13,20 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::attribute::Attribute;
-use triblespace_core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityBlobHandle, CapabilityClaim, CapabilityGrant,
+    CapabilityMode, CapabilityProof, CapabilityProofStep, CapabilityResource,
+};
+use triblespace_core::clock;
 use triblespace_core::collection::reach;
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::simplearchive_union::{self, PreparedCollectionCommit};
-use triblespace_core::collection::CollectionCommit;
+use triblespace_core::collection::{
+    CapabilityPresentation, CollectionAdmission, CollectionCommit, ACTION_WRITE,
+};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::shortstring::ShortString;
@@ -45,27 +51,78 @@ struct MigrationReport {
     unique_targets: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetAdmissionRequest {
+    Open,
+    Capability {
+        trust_root: VerifyingKey,
+        credential: Option<CapabilityBlobHandle>,
+    },
+}
+
+impl TargetAdmissionRequest {
+    fn from_options(
+        authority: Option<VerifyingKey>,
+        credential: Option<CapabilityBlobHandle>,
+    ) -> Result<Self> {
+        match (authority, credential) {
+            (None, None) => Ok(Self::Open),
+            (Some(trust_root), credential) => Ok(Self::Capability {
+                trust_root,
+                credential,
+            }),
+            (None, Some(_)) => bail!("--credential requires --authority"),
+        }
+    }
+
+    fn trust_root(self) -> Option<VerifyingKey> {
+        match self {
+            Self::Open => None,
+            Self::Capability { trust_root, .. } => Some(trust_root),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorizedTarget {
+    admission: CollectionAdmission,
+    credential: Option<CapabilityBlobHandle>,
+}
+
 pub(super) fn run(
     pile_path: PathBuf,
     branch: String,
     collection_name: String,
-    team_root: String,
+    namespace: String,
+    authority: Option<String>,
+    credential: Option<String>,
     signing_key: PathBuf,
 ) -> Result<()> {
     let name = CollectionName::new(&collection_name)
         .map_err(|error| anyhow!("invalid target collection name {collection_name:?}: {error}"))?;
-    let team = parse_team_root(&team_root)?;
+    let namespace = crate::cli::team::parse_public_key(&namespace, "namespace")?;
+    let authority = authority
+        .as_deref()
+        .map(|value| crate::cli::team::parse_public_key(value, "authority"))
+        .transpose()?;
+    let credential = credential
+        .as_deref()
+        .map(crate::cli::team::parse_credential)
+        .transpose()?;
+    let admission = TargetAdmissionRequest::from_options(authority, credential)?;
     let signer = load_signing_key(&Some(signing_key))?;
 
     let mut pile = super::super::open_refreshed(&pile_path)?;
-    let result = migrate(&mut pile, &branch, &name, team, &signer);
+    let result = migrate(&mut pile, &branch, &name, namespace, admission, &signer);
     let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
-    let (report, mappings) = result?;
+    let (report, mappings, authorized) = result?;
     close?;
     print_report(
         &pile_path,
         &name,
-        team,
+        namespace,
+        authorized.admission.trust_root(),
+        authorized.credential,
         signer.verifying_key(),
         report,
         &mappings,
@@ -77,9 +134,14 @@ fn migrate(
     pile: &mut Pile,
     branch_reference: &str,
     name: &CollectionName,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
+    admission: TargetAdmissionRequest,
     signer: &SigningKey,
-) -> Result<(MigrationReport, Vec<(CommitHandle, CollectionCommit)>)> {
+) -> Result<(
+    MigrationReport,
+    Vec<(CommitHandle, CollectionCommit)>,
+    AuthorizedTarget,
+)> {
     // Freeze the mutable names first, then take one append-only blob view.
     // A concurrent append may enter the later reader, but cannot change the
     // selected head; every handle reachable from that frozen head predates it.
@@ -98,7 +160,8 @@ fn migrate(
     // its explicit namespace and authority still participate in descriptor
     // identity. Publishing migrated material stays a deliberate re-commit into
     // a differently named collection.
-    let descriptor = simplearchive_union::descriptor(name, team, Some(team), reach::private());
+    let descriptor =
+        simplearchive_union::descriptor(name, namespace, admission.trust_root(), reach::private());
     let (reachable, contentless_merges, prepared) = match head {
         Some(head) => prepare_reachable(&reader, head, &descriptor)?,
         None => (0, 0, Vec::new()),
@@ -106,10 +169,10 @@ fn migrate(
     let authored = prepared.len();
 
     // Preparation above performs no I/O. Once every reachable node has
-    // passed, establish the target writer's exact authority before publishing
+    // passed, establish the target writer's exact admission before publishing
     // any target dependency or record. Exact repeats naturally converge
     // through the content-addressed blob and collection stores.
-    authorize_target_writer(pile, &descriptor, team, signer)?;
+    let authorized = authorize_target_writer(pile, &descriptor, admission, signer)?;
     let mut mappings = Vec::with_capacity(authored);
     for (source, prepared) in prepared {
         let staged = prepared
@@ -135,57 +198,69 @@ fn migrate(
         contentless_merges,
         unique_targets,
     };
-    Ok((report, mappings))
+    Ok((report, mappings, authorized))
 }
 
 fn authorize_target_writer(
     pile: &mut Pile,
     descriptor: &triblespace_core::trible::Fragment,
-    team: VerifyingKey,
+    requested: TargetAdmissionRequest,
     signer: &SigningKey,
-) -> Result<()> {
+) -> Result<AuthorizedTarget> {
+    let TargetAdmissionRequest::Capability {
+        trust_root,
+        credential,
+    } = requested
+    else {
+        return Ok(AuthorizedTarget {
+            admission: CollectionAdmission::Open,
+            credential: None,
+        });
+    };
+
     let target =
         triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
             .get_handle();
-    let writer = Inline::new(signer.verifying_key().to_bytes());
-    let resolved = authority::resolve_authority(pile, team)
-        .map_err(|error| anyhow!("resolve target collection authority: {error}"))?;
-    if resolved.allows(&writer, ACTION_WRITE, target) {
-        return Ok(());
-    }
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(target),
+    );
+    let proof = match credential {
+        Some(credential) => crate::cli::team::load_capability_proof(pile, credential)?,
+        None if signer.verifying_key() == trust_root => {
+            CapabilityProof::new(vec![CapabilityProofStep::issue(
+                signer,
+                CapabilityGrant::root(signer.verifying_key(), atom, CapabilityMode::Invoke, None),
+            )])
+        }
+        None => {
+            bail!(
+                "--authority without --credential can bootstrap only when the migration signer is the authority root"
+            )
+        }
+    };
 
-    if signer.verifying_key() != team {
-        bail!(
-            "migration signer {} has no exact WRITE authority for target collection {}; publish a team-rooted grant before migrating",
-            hex::encode_upper(signer.verifying_key().to_bytes()),
-            hex::encode_upper(target.raw),
-        );
-    }
-
-    authority::publish_grant(
-        pile,
-        team,
-        signer,
-        AuthorityGrant::root(
-            signer.verifying_key(),
-            target,
-            ACTION_WRITE,
-            AuthorityMode::Invoke,
-        ),
-    )
-    .map_err(|error| anyhow!("publish target collection WRITE authority: {error}"))?;
-    Ok(())
-}
-
-fn parse_team_root(text: &str) -> Result<VerifyingKey> {
-    let bytes = hex::decode(text.trim()).context("team root must be hexadecimal")?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-        anyhow!(
-            "team root must be exactly 32 bytes (64 hex characters), found {} bytes",
-            bytes.len()
+    // One clock observation governs the complete admission boundary. Nothing
+    // in the target collection has been staged yet.
+    let instant = clock::epoch_now();
+    proof
+        .verify_claim(
+            trust_root,
+            instant,
+            CapabilityClaim::new(signer.verifying_key(), atom, CapabilityMode::Invoke),
         )
-    })?;
-    VerifyingKey::from_bytes(&bytes).context("team root is not a valid Ed25519 public key")
+        .map_err(|error| anyhow!("target WRITE credential rejected: {error}"))?;
+    crate::cli::team::store_capability_proof(pile, signer, &proof)?;
+    let credential = proof
+        .credential()
+        .expect("a verified nonempty proof has a leaf credential");
+    Ok(AuthorizedTarget {
+        admission: CollectionAdmission::capability(
+            trust_root,
+            vec![CapabilityPresentation::new(signer.verifying_key(), proof)],
+        ),
+        credential: Some(credential),
+    })
 }
 
 fn resolve_branch(
@@ -427,7 +502,9 @@ fn handle_hex(handle: ArchiveHandle) -> String {
 fn print_report(
     pile_path: &PathBuf,
     name: &CollectionName,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
+    authority: Option<VerifyingKey>,
+    credential: Option<CapabilityBlobHandle>,
     signer: VerifyingKey,
     report: MigrationReport,
     mappings: &[(CommitHandle, CollectionCommit)],
@@ -442,7 +519,19 @@ fn print_report(
             .unwrap_or_else(|| "<none>".to_owned())
     );
     println!("collection name: {name}");
-    println!("team root: {}", hex::encode_upper(team.to_bytes()));
+    println!("namespace: {}", hex::encode_upper(namespace.to_bytes()));
+    println!(
+        "authority: {}",
+        authority
+            .map(|key| hex::encode_upper(key.to_bytes()))
+            .unwrap_or_else(|| "<open>".to_owned())
+    );
+    println!(
+        "write credential: {}",
+        credential
+            .map(|handle| hex::encode_upper(handle.raw))
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
     println!("target signer: {}", hex::encode_upper(signer.to_bytes()));
     println!("SOURCE COMMIT                                                     TARGET COMMIT");
     for (source, target) in mappings {
@@ -506,29 +595,79 @@ mod tests {
         Inline::new(raw)
     }
 
-    fn grant_write(
-        pile: &mut Pile,
+    fn target_descriptor(
         name: &CollectionName,
-        team_key: &SigningKey,
-        writer: &SigningKey,
-    ) {
-        let team = team_key.verifying_key();
-        let descriptor = simplearchive_union::descriptor(name, team, Some(team), reach::private());
-        let target =
-            triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts())
-                .get_handle();
-        authority::publish_grant(
-            pile,
-            team_key.verifying_key(),
-            team_key,
-            AuthorityGrant::root(
-                writer.verifying_key(),
-                target,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
+        namespace: VerifyingKey,
+        authority: Option<VerifyingKey>,
+    ) -> triblespace_core::trible::Fragment {
+        simplearchive_union::descriptor(name, namespace, authority, reach::private())
+    }
+
+    fn target_handle(
+        name: &CollectionName,
+        namespace: VerifyingKey,
+        authority: Option<VerifyingKey>,
+    ) -> ArchiveHandle {
+        target_descriptor(name, namespace, authority)
+            .into_facts()
+            .to_blob()
+            .get_handle()
+    }
+
+    fn write_atom(target: ArchiveHandle) -> CapabilityAtom {
+        CapabilityAtom::new(
+            CapabilityAction::new(ACTION_WRITE),
+            CapabilityResource::from(target),
         )
-        .unwrap();
+    }
+
+    fn root_proof(
+        root: &SigningKey,
+        subject: VerifyingKey,
+        atom: CapabilityAtom,
+        mode: CapabilityMode,
+    ) -> CapabilityProof {
+        CapabilityProof::new(vec![CapabilityProofStep::issue(
+            root,
+            CapabilityGrant::root(subject, atom, mode, None),
+        )])
+    }
+
+    fn delegated_proof(
+        root: &SigningKey,
+        delegate: &SigningKey,
+        subject: VerifyingKey,
+        atom: CapabilityAtom,
+    ) -> CapabilityProof {
+        let parent = CapabilityProofStep::issue(
+            root,
+            CapabilityGrant::root(
+                delegate.verifying_key(),
+                atom,
+                CapabilityMode::InvokeAndDelegate,
+                None,
+            ),
+        );
+        let child = CapabilityProofStep::issue(
+            delegate,
+            CapabilityGrant::delegated(
+                parent.signature_handle(),
+                subject,
+                atom,
+                CapabilityMode::Invoke,
+                None,
+            ),
+        );
+        CapabilityProof::new(vec![parent, child])
+    }
+
+    fn retain_proof(
+        pile: &mut Pile,
+        wallet_key: &SigningKey,
+        proof: &CapabilityProof,
+    ) -> CapabilityBlobHandle {
+        crate::cli::team::store_capability_proof(pile, wallet_key, proof).unwrap();
+        proof.credential().expect("test proof has a leaf")
     }
 
     fn authored_wrapper(
@@ -552,17 +691,24 @@ mod tests {
     }
 
     #[test]
-    fn released_fixture_migrates_many_to_one_and_replays_idempotently() -> Result<()> {
+    fn open_migration_replays_idempotently_and_preserves_many_to_one_collapse() -> Result<()> {
         let (file, branch) = frozen_fixture()?;
         let path = file.path().to_path_buf();
         let name = CollectionName::new("events").unwrap();
-        let team_key = key(2);
-        let team = team_key.verifying_key();
+        let namespace = key(2).verifying_key();
         let signer = key(3);
 
         let mut pile = super::super::super::open_refreshed(&path)?;
-        grant_write(&mut pile, &name, &team_key, &signer);
-        let (first, first_map) = migrate(&mut pile, "legacy", &name, team, &signer)?;
+        let (first, first_map, first_authorized) = migrate(
+            &mut pile,
+            "legacy",
+            &name,
+            namespace,
+            TargetAdmissionRequest::Open,
+            &signer,
+        )?;
+        assert_eq!(first_authorized.admission, CollectionAdmission::Open);
+        assert_eq!(first_authorized.credential, None);
         assert_eq!(first.branch, branch);
         assert_eq!(first.reachable, 5);
         assert_eq!(first.authored, 4);
@@ -592,18 +738,31 @@ mod tests {
         let mut expected_union = fact(1);
         expected_union += fact(2);
         expected_union += fact(3);
-        let materialized =
-            Collection::new(&mut pile, &name, team, signer.clone(), reach::private())
-                .materialize()
-                .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
+        let materialized = Collection::new(
+            &mut pile,
+            &name,
+            namespace,
+            signer.clone(),
+            reach::private(),
+            first_authorized.admission.clone(),
+        )
+        .materialize()
+        .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
         assert_eq!(materialized, expected_union);
 
         pile.flush()?;
         let first_len = fs::metadata(&path)?.len();
-        let (second, second_map) =
-            migrate(&mut pile, &format!("{branch:X}"), &name, team, &signer)?;
+        let (second, second_map, second_authorized) = migrate(
+            &mut pile,
+            &format!("{branch:X}"),
+            &name,
+            namespace,
+            TargetAdmissionRequest::Open,
+            &signer,
+        )?;
         pile.flush()?;
         assert_eq!(second, first);
+        assert_eq!(second_authorized, first_authorized);
         assert_eq!(
             first_map
                 .iter()
@@ -615,10 +774,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(fs::metadata(&path)?.len(), first_len);
-        let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(&name, team, Some(team), reach::private()).into_facts(),
-        )
-        .get_handle();
+        let target = target_handle(&name, namespace, None);
         assert_eq!(
             pile.records()?
                 .collect::<Result<Vec<_>, _>>()?
@@ -634,30 +790,54 @@ mod tests {
     }
 
     #[test]
-    fn team_root_signer_bootstraps_exact_write_before_target_publication() -> Result<()> {
+    fn authority_root_signer_bootstraps_and_retains_exact_write_proof() -> Result<()> {
         let (file, _) = frozen_fixture()?;
         let path = file.path().to_path_buf();
         let name = CollectionName::new("root-authored-events").unwrap();
+        let namespace = key(3).verifying_key();
         let signer = key(4);
-        let team = signer.verifying_key();
+        let authority = signer.verifying_key();
         let mut pile = super::super::super::open_refreshed(&path)?;
 
-        let (_, mappings) = migrate(&mut pile, "legacy", &name, team, &signer)?;
+        let (_, mappings, authorized) = migrate(
+            &mut pile,
+            "legacy",
+            &name,
+            namespace,
+            TargetAdmissionRequest::Capability {
+                trust_root: authority,
+                credential: None,
+            },
+            &signer,
+        )?;
 
         assert!(!mappings.is_empty());
-        let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(&name, team, Some(team), reach::private()).into_facts(),
-        )
-        .get_handle();
-        let writer = Inline::new(signer.verifying_key().to_bytes());
-        let resolved = authority::resolve_authority(&mut pile, team)
-            .map_err(|error| anyhow!("resolve bootstrapped authority: {error}"))?;
-        assert!(resolved.allows(&writer, ACTION_WRITE, target));
+        let target = target_handle(&name, namespace, Some(authority));
+        let credential = authorized.credential.expect("bootstrapped credential");
+        let retained = crate::cli::team::load_capability_proof(&mut pile, credential)?;
+        retained
+            .verify_claim(
+                authority,
+                clock::epoch_now(),
+                CapabilityClaim::new(
+                    signer.verifying_key(),
+                    write_atom(target),
+                    CapabilityMode::Invoke,
+                ),
+            )
+            .map_err(|error| anyhow!("verify retained bootstrap proof: {error}"))?;
         assert_eq!(
-            Collection::new(&mut pile, &name, team, signer, reach::private())
-                .ticket()
-                .map_err(|error| anyhow!("discover migrated commits: {error}"))?
-                .len(),
+            Collection::new(
+                &mut pile,
+                &name,
+                namespace,
+                signer,
+                reach::private(),
+                authorized.admission,
+            )
+            .ticket()
+            .map_err(|error| anyhow!("discover migrated commits: {error}"))?
+            .len(),
             mappings
                 .iter()
                 .map(|(_, commit)| commit.id())
@@ -669,32 +849,192 @@ mod tests {
     }
 
     #[test]
-    fn delegated_signer_without_exact_write_cannot_publish_target_records() -> Result<()> {
+    fn delegated_write_proof_admits_the_migration_signer() -> Result<()> {
         let (file, _) = frozen_fixture()?;
         let path = file.path().to_path_buf();
         let name = CollectionName::new("delegated-events").unwrap();
-        let team = key(5).verifying_key();
-        let signer = key(6);
+        let namespace = key(5).verifying_key();
+        let root = key(6);
+        let delegate = key(7);
+        let signer = key(8);
+        let mut pile = super::super::super::open_refreshed(&path)?;
+        let target = target_handle(&name, namespace, Some(root.verifying_key()));
+        let proof = delegated_proof(&root, &delegate, signer.verifying_key(), write_atom(target));
+        let credential = retain_proof(&mut pile, &signer, &proof);
+
+        let (_, mappings, authorized) = migrate(
+            &mut pile,
+            "legacy",
+            &name,
+            namespace,
+            TargetAdmissionRequest::Capability {
+                trust_root: root.verifying_key(),
+                credential: Some(credential),
+            },
+            &signer,
+        )?;
+
+        assert!(!mappings.is_empty());
+        assert_eq!(authorized.credential, Some(credential));
+        assert_eq!(
+            Collection::new(
+                &mut pile,
+                &name,
+                namespace,
+                signer,
+                reach::private(),
+                authorized.admission,
+            )
+            .ticket()
+            .map_err(|error| anyhow!("discover delegated migration: {error}"))?
+            .len(),
+            mappings
+                .iter()
+                .map(|(_, commit)| commit.id())
+                .collect::<BTreeSet<_>>()
+                .len()
+        );
+        pile.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_write_proof_atoms_fail_before_any_target_write() -> Result<()> {
+        #[derive(Clone, Copy, Debug)]
+        enum Fault {
+            Root,
+            Subject,
+            Action,
+            Resource,
+            Mode,
+        }
+
+        for (index, fault) in [
+            Fault::Root,
+            Fault::Subject,
+            Fault::Action,
+            Fault::Resource,
+            Fault::Mode,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (file, _) = frozen_fixture()?;
+            let path = file.path().to_path_buf();
+            let name = CollectionName::new(&format!("rejected-{index}"))?;
+            let namespace = key(20).verifying_key();
+            let authority = key(21);
+            let wrong_root = key(22);
+            let signer = key(23);
+            let wrong_subject = key(24).verifying_key();
+            let target = target_handle(&name, namespace, Some(authority.verifying_key()));
+            let expected_atom = write_atom(target);
+            let proof_root = match fault {
+                Fault::Root => &wrong_root,
+                _ => &authority,
+            };
+            let subject = match fault {
+                Fault::Subject => wrong_subject,
+                _ => signer.verifying_key(),
+            };
+            let atom = match fault {
+                Fault::Action => CapabilityAtom::new(
+                    CapabilityAction::new(Id::new([0xA1; 16]).unwrap()),
+                    CapabilityResource::from(target),
+                ),
+                Fault::Resource => CapabilityAtom::new(
+                    CapabilityAction::new(ACTION_WRITE),
+                    CapabilityResource::new([0xA2; 32]),
+                ),
+                _ => expected_atom,
+            };
+            let mode = match fault {
+                Fault::Mode => CapabilityMode::Delegate,
+                _ => CapabilityMode::Invoke,
+            };
+            let proof = root_proof(proof_root, subject, atom, mode);
+
+            let mut pile = super::super::super::open_refreshed(&path)?;
+            let credential = retain_proof(&mut pile, &signer, &proof);
+            let before = fs::metadata(&path)?.len();
+            let error = migrate(
+                &mut pile,
+                "legacy",
+                &name,
+                namespace,
+                TargetAdmissionRequest::Capability {
+                    trust_root: authority.verifying_key(),
+                    credential: Some(credential),
+                },
+                &signer,
+            )
+            .expect_err("a mismatched proof must fail before publication");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("target WRITE credential rejected"),
+                "{fault:?}: {error:#}"
+            );
+            assert_eq!(
+                fs::metadata(&path)?.len(),
+                before,
+                "{fault:?} changed the pile"
+            );
+            assert!(!pile
+                .records()?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .any(|record| {
+                    matches!(record, triblespace_core::collection::CollectionRecord::Commit(commit) if commit.collection() == target)
+                }));
+            pile.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_authority_root_can_bootstrap_without_a_credential() -> Result<()> {
+        let (file, _) = frozen_fixture()?;
+        let path = file.path().to_path_buf();
+        let name = CollectionName::new("not-the-root")?;
+        let namespace = key(30).verifying_key();
+        let authority = key(31).verifying_key();
+        let signer = key(32);
         let before = fs::metadata(&path)?.len();
         let mut pile = super::super::super::open_refreshed(&path)?;
 
-        let error = migrate(&mut pile, "legacy", &name, team, &signer).unwrap_err();
-
-        assert!(error.to_string().contains("has no exact WRITE authority"));
-        assert_eq!(fs::metadata(&path)?.len(), before);
-        let target = triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(&name, team, Some(team), reach::private()).into_facts(),
+        let error = migrate(
+            &mut pile,
+            "legacy",
+            &name,
+            namespace,
+            TargetAdmissionRequest::Capability {
+                trust_root: authority,
+                credential: None,
+            },
+            &signer,
         )
-        .get_handle();
+        .expect_err("a non-root signer cannot bootstrap a proof");
+
+        assert!(error.to_string().contains("signer is the authority root"));
+        assert_eq!(fs::metadata(&path)?.len(), before);
         assert!(!pile
             .records()?
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .any(|record| {
-                matches!(record, triblespace_core::collection::CollectionRecord::Commit(commit) if commit.collection() == target)
+                matches!(record, triblespace_core::collection::CollectionRecord::Commit(commit)
+                    if commit.collection() == target_handle(&name, namespace, Some(authority)))
             }));
         pile.close()?;
         Ok(())
+    }
+
+    #[test]
+    fn a_credential_without_an_authority_is_not_an_admission_policy() {
+        let credential = Inline::new([0xCC; 32]);
+        assert!(TargetAdmissionRequest::from_options(None, Some(credential)).is_err());
     }
 
     #[test]
@@ -720,12 +1060,9 @@ mod tests {
         let merge_commit = pile.put::<SimpleArchive, _>(merge_wrapper)?;
 
         let collection_name = CollectionName::new("empty-preserved").unwrap();
-        let team_key = key(10);
-        let team = team_key.verifying_key();
+        let namespace = key(10).verifying_key();
         let signer = key(11);
-        grant_write(&mut pile, &collection_name, &team_key, &signer);
-        let descriptor =
-            simplearchive_union::descriptor(&collection_name, team, Some(team), reach::private());
+        let descriptor = target_descriptor(&collection_name, namespace, None);
         let reader = pile.reader()?;
         let (reachable, contentless_merges, prepared) =
             prepare_reachable(&reader, merge_commit, &descriptor)?;
@@ -760,10 +1097,16 @@ mod tests {
         assert_eq!(data_target.data().raw, data.get_handle().raw);
         assert_eq!(data_target.metadata(), empty_metadata);
 
-        let materialized =
-            Collection::new(&mut pile, &collection_name, team, signer, reach::private())
-                .materialize()
-                .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
+        let materialized = Collection::new(
+            &mut pile,
+            &collection_name,
+            namespace,
+            signer,
+            reach::private(),
+            CollectionAdmission::Open,
+        )
+        .materialize()
+        .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
         assert_eq!(materialized, fact(9));
         pile.close()?;
         Ok(())
@@ -829,7 +1172,7 @@ mod tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("random-subject").unwrap(),
             key(14).verifying_key(),
-            Some(key(14).verifying_key()),
+            None,
             reach::private(),
         );
         let (reachable, merges, prepared) = prepare_reachable(&reader, handle, &descriptor)?;
@@ -867,7 +1210,7 @@ mod tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("target").unwrap(),
             key(6).verifying_key(),
-            Some(key(6).verifying_key()),
+            None,
             reach::private(),
         );
         let reader = pile.reader()?;

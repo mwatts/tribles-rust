@@ -73,14 +73,19 @@ Legacy piles can be migrated directly into native collections:
 trible pile migrate <PILE> branch-to-collection \
   --branch <LEGACY_BRANCH> \
   --collection-name <NAME> \
-  --team-root <PUBLIC_KEY> \
+  --namespace <PUBLIC_KEY> \
   --signing-key <KEY_PATH>
 ```
 
 This is an explicit compatibility operation over an immutable legacy pin
-snapshot. Here `--team-root` is deliberately both the target name namespace
-and its optional capability authority, matching the current named-collection
-facade. The current CLI does not create, advance, merge, or delete branches.
+snapshot. `--namespace` names the target but grants no authority; omission of
+authorization flags selects explicitly open admission. For controlled
+admission, pass `--authority <TRUST_ROOT> --credential <LEAF_HANDLE>`. The
+credential must prove exact WRITE/Invoke for the signing key and target before
+target bytes are staged. The credential may be omitted only when the signing
+key is the authority root, in which case the command mints, stores, retains,
+and prints the exact root proof. The current CLI does not create, advance,
+merge, or delete branches.
 
 #### Blobs
 
