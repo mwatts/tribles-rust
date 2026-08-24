@@ -36,7 +36,7 @@
 //! DATASET MODES (mirrors the main bench):
 //!   --pile <path>  first k commits of the data branch for the rung target.
 //!                  ALWAYS chunk-aligned: the rung SNAPS to the nearest
-//!                  cumulative-commit boundary (the source authority is one
+//!                  cumulative-commit boundary (the source input is one
 //!                  native collection commit per input commit, so a carved
 //!                  prefix would change the benchmark workload) via the SAME
 //!                  `snap_to_chunk` the main bench applies under
@@ -65,7 +65,6 @@
 //! compilation (the design point of this file), never emulated at runtime.
 
 use std::time::Instant;
-use triblespace_core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
@@ -74,6 +73,7 @@ use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
+use triblespace_core::collection::CollectionAdmission;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
@@ -673,9 +673,9 @@ fn benchmark_name() -> CollectionName {
     CollectionName::new("portable-succinct-benchmark").expect("legal collection name")
 }
 
-/// The benchmark's team, a team of one: the same key that signs its commits.
+/// The public-key namespace shared by the benchmark's source and projection.
 /// Fixed so every iteration exercises byte-identical descriptors and records.
-fn benchmark_team() -> VerifyingKey {
+fn benchmark_namespace() -> VerifyingKey {
     SigningKey::from_bytes(&[0x5A; 32]).verifying_key()
 }
 
@@ -741,11 +741,17 @@ fn main() {
     // Per iteration: publish the source chunks and freeze their exact ticket
     // in a fresh scratch store (untimed), then time one fixed end-to-end call
     // that returns a query-ready exact cover. Source signing/publication is an
-    // authority setup cost, not part of Succinct construction.
+    // admission setup cost, not part of Succinct construction.
     let name = benchmark_name();
-    let team = benchmark_team();
-    let succinct =
-        SuccinctArchiveCollection::new(name.clone(), team, reach::private(), reach::private());
+    let namespace = benchmark_namespace();
+    let succinct = SuccinctArchiveCollection::new(
+        name.clone(),
+        namespace,
+        None,
+        reach::private(),
+        None,
+        reach::private(),
+    );
     let signing_key = SigningKey::from_bytes(&[0x5A; 32]);
     let mut all: Vec<(String, Outcome)> = Vec::new();
     let built = quiet_catch(|| {
@@ -757,23 +763,11 @@ fn main() {
             let mut source = Collection::new(
                 MemoryRepo::default(),
                 &name,
-                team,
+                namespace,
                 signing_key.clone(),
                 reach::private(),
+                CollectionAdmission::Open,
             );
-            let target = source.collection();
-            authority::publish_grant(
-                source.storage_mut(),
-                team,
-                &signing_key,
-                AuthorityGrant::root(
-                    signing_key.verifying_key(),
-                    target,
-                    ACTION_WRITE,
-                    AuthorityMode::Invoke,
-                ),
-            )
-            .expect("authorize source benchmark writer");
             for chunk in &chunks {
                 source
                     .commit(Fragment::from(chunk.content.clone()))

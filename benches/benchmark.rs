@@ -11,12 +11,11 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::iter::FromIterator;
-use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace::core::blob::encodings::succinctarchive::CachedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::CompressedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::collection::{reach, Collection, CollectionName};
+use triblespace::core::collection::{reach, Collection, CollectionAdmission, CollectionName};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::BlobStorePut;
 
@@ -953,28 +952,21 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
 
     // Build one native collection with N independent signed commits. Each
     // commit carries its own SimpleArchive element, so materialization must
-    // validate and union the complete authority frontier.
+    // validate and union the complete admitted frontier.
     for &n_commits in &[10usize, 100, 1000] {
         let entities_per_commit = 100;
         let storage = MemoryRepo::default();
         let signing_key = SigningKey::generate(&mut OsRng);
-        let team = signing_key.verifying_key();
+        let namespace = signing_key.verifying_key();
         let name = CollectionName::new("materialize-bench").expect("valid collection name");
-        let mut collection =
-            Collection::new(storage, &name, team, signing_key.clone(), reach::private());
-        let target = collection.collection();
-        authority::publish_grant(
-            collection.storage_mut(),
-            team,
-            &signing_key,
-            AuthorityGrant::root(
-                signing_key.verifying_key(),
-                target,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .expect("authorize benchmark writer");
+        let mut collection = Collection::new(
+            storage,
+            &name,
+            namespace,
+            signing_key,
+            reach::private(),
+            CollectionAdmission::Open,
+        );
 
         let mut total_tribles: u64 = 0;
         for _ in 0..n_commits {

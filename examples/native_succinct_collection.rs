@@ -5,8 +5,8 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
+use triblespace::core::collection::CollectionAdmission;
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
 use triblespace_core::collection::reach;
@@ -19,26 +19,19 @@ fn main() {
     let mut pile = Pile::open(&path).expect("open pile");
     pile.refresh().expect("load pile");
 
-    // A root collection is anchored by a name within a team. This example is
-    // a team of one, so the signing key is also the team root: it says so
-    // explicitly rather than letting the facade assume it.
+    // A root collection is anchored by a name within a public-key namespace.
+    // This local example explicitly uses open signer admission.
     let name = CollectionName::new("literature").expect("legal collection name");
     let signing_key = SigningKey::generate(&mut OsRng);
-    let team = signing_key.verifying_key();
-    let mut collection = Collection::new(pile, &name, team, signing_key.clone(), reach::private());
-    let target = collection.collection();
-    authority::publish_grant(
-        collection.storage_mut(),
-        team,
-        &signing_key,
-        AuthorityGrant::root(
-            signing_key.verifying_key(),
-            target,
-            ACTION_WRITE,
-            AuthorityMode::Invoke,
-        ),
-    )
-    .expect("authorize collection writer");
+    let namespace = signing_key.verifying_key();
+    let mut collection = Collection::new(
+        pile,
+        &name,
+        namespace,
+        signing_key,
+        reach::private(),
+        CollectionAdmission::Open,
+    );
 
     // Each fragment is one independent signed collection member. Omitting an
     // explicit entity id makes every person intrinsic to their facts.
@@ -48,15 +41,21 @@ fn main() {
             .expect("publish person");
     }
 
-    // Freeze the exact authorized target frontier. ticket() reads the
-    // authority grant blobs, but not these commits' data or metadata blobs.
+    // Freeze the exact admitted target frontier. ticket() reads collection
+    // records, but not these commits' data or metadata blobs.
     let ticket = collection.ticket().expect("discover exact ticket");
     assert_eq!(ticket.len(), 3);
 
     // Build any missing canonical raw Succinct shards and their exact Rank9
     // fibers, then query the admitted physical cover directly.
-    let succinct =
-        SuccinctArchiveCollection::new(name.clone(), team, reach::private(), reach::private());
+    let succinct = SuccinctArchiveCollection::new(
+        name.clone(),
+        namespace,
+        None,
+        reach::private(),
+        None,
+        reach::private(),
+    );
     let archive = succinct
         .ensure_exact(collection.storage_mut(), &ticket)
         .expect("ensure exact Succinct projection");

@@ -53,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   facade dependency. Exact `SimpleArchive` and Succinct-derived facades now
   carry namespace and optional source/target authorities independently, so
   tickets from open roots preserve descriptor identity through derivation.
+  Built-in examples, telemetry, macro instrumentation, and benchmarks now
+  select open local admission directly instead of publishing synthetic
+  team-of-one authority grants.
 
 - Split a collection descriptor's public-key namespace from its optional
   capability authority. Roots are named by `collection_name` plus

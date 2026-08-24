@@ -18,9 +18,8 @@ use std::path::Path;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hex::FromHex;
 
-use triblespace_core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace_core::collection::records::CollectionName;
-use triblespace_core::collection::Collection;
+use triblespace_core::collection::{Collection, CollectionAdmission};
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
@@ -98,7 +97,7 @@ fn parse_collection_name(value: &str) -> Option<CollectionName> {
 fn publish_metadata(
     pile_path: &Path,
     collection_name: &CollectionName,
-    collection_team: VerifyingKey,
+    collection_namespace: VerifyingKey,
     signing_key: SigningKey,
     fragment: Fragment,
 ) {
@@ -109,27 +108,11 @@ fn publish_metadata(
     let mut collection = Collection::new(
         pile,
         collection_name,
-        collection_team,
-        signing_key.clone(),
+        collection_namespace,
+        signing_key,
         reach::private(),
+        CollectionAdmission::Open,
     );
-    let target = collection.collection();
-    if authority::publish_grant(
-        collection.storage_mut(),
-        collection_team,
-        &signing_key,
-        AuthorityGrant::root(
-            signing_key.verifying_key(),
-            target,
-            ACTION_WRITE,
-            AuthorityMode::Invoke,
-        ),
-    )
-    .is_err()
-    {
-        let _ = collection.close();
-        return;
-    }
     let _ = collection.commit(fragment);
     let _ = collection.close();
 }
@@ -178,9 +161,9 @@ where
         None => return,
     };
 
-    // The instrumentation pile is written by exactly one key, so its team is
-    // that key: a team of one, said explicitly rather than defaulted to.
-    let collection_team = signing_key.verifying_key();
+    // The instrumentation pile is written by exactly one key, which also
+    // scopes the local collection's name.
+    let collection_namespace = signing_key.verifying_key();
 
     let span = invocation_span(input);
     let mut fragment = Fragment::empty();
@@ -226,7 +209,7 @@ where
     publish_metadata(
         Path::new(&pile_path),
         &collection_name,
-        collection_team,
+        collection_namespace,
         signing_key,
         context.fragment,
     );
@@ -613,7 +596,7 @@ mod instrumentation_tests {
     }
 
     #[test]
-    fn publication_bootstraps_write_and_emits_one_self_contained_target_commit() {
+    fn publication_emits_one_self_contained_target_commit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("instrumentation.pile");
         File::create(&path).unwrap();
@@ -629,9 +612,15 @@ mod instrumentation_tests {
 
         let name = CollectionName::new("macro-metadata").unwrap();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let team = signing_key.verifying_key();
-        publish_metadata(&path, &name, team, signing_key.clone(), fragment.clone());
-        publish_metadata(&path, &name, team, signing_key, fragment);
+        let namespace = signing_key.verifying_key();
+        publish_metadata(
+            &path,
+            &name,
+            namespace,
+            signing_key.clone(),
+            fragment.clone(),
+        );
+        publish_metadata(&path, &name, namespace, signing_key, fragment);
 
         let mut pile = Pile::open(&path).unwrap();
         let records = CollectionStore::records(&mut pile)
@@ -640,11 +629,12 @@ mod instrumentation_tests {
             .unwrap();
         assert_eq!(
             records.len(),
-            2,
-            "one authority grant and one target commit are native records"
+            1,
+            "one target commit is the only native record"
         );
         let expected_descriptor =
-            collection::simplearchive_union::descriptor(&name, team, reach::private()).into_facts();
+            collection::simplearchive_union::descriptor(&name, namespace, None, reach::private())
+                .into_facts();
         let target =
             triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(expected_descriptor.clone())
                 .get_handle();

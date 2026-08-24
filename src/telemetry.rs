@@ -3,8 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
-use crate::core::collection::{reach, Collection};
+use crate::core::collection::{reach, Collection, CollectionAdmission};
 use crate::core::metadata;
 use crate::core::repo::pile::{Pile, ReadError};
 use crate::prelude::blobencodings::UTF8String;
@@ -390,35 +389,19 @@ impl Telemetry {
             return None;
         }
 
-        // The sink generates its own key per session, so its collection is a
-        // team of one rooted at that key. It says so explicitly rather than
-        // letting the facade assume it.
+        // The sink generates its own namespace and signing key per session.
+        // Telemetry is process-local, so its collection explicitly admits
+        // every strictly signed commit instead of publishing authority state.
         let signing_key = SigningKey::generate(&mut OsRng);
-        let team = signing_key.verifying_key();
+        let namespace = signing_key.verifying_key();
         let mut collection = Collection::new(
             pile,
             &collection_name,
-            team,
-            signing_key.clone(),
+            namespace,
+            signing_key,
             reach::private(),
+            CollectionAdmission::Open,
         );
-        let target = collection.collection();
-        if authority::publish_grant(
-            collection.storage_mut(),
-            team,
-            &signing_key,
-            AuthorityGrant::root(
-                signing_key.verifying_key(),
-                target,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .is_err()
-        {
-            let _ = collection.close();
-            return None;
-        }
 
         // Commit session start entity.
         let session_entity = ExclusiveId::force_ref(&session_id);
@@ -566,7 +549,7 @@ mod tests {
     static TELEMETRY_ENV: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn layer_from_env_bootstraps_team_of_one_write_authority() {
+    fn layer_from_env_uses_an_open_process_local_collection() {
         let _env = TELEMETRY_ENV.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.pile");
@@ -574,8 +557,8 @@ mod tests {
         std::env::set_var(ENV_TELEMETRY_PILE, &path);
         std::env::set_var(ENV_TELEMETRY_COLLECTION_NAME, "telemetry-test");
 
-        let (layer, telemetry) = Telemetry::layer_from_env("test session")
-            .expect("telemetry starts with explicit grant");
+        let (layer, telemetry) =
+            Telemetry::layer_from_env("test session").expect("telemetry starts");
         std::env::remove_var(ENV_TELEMETRY_PILE);
         std::env::remove_var(ENV_TELEMETRY_COLLECTION_NAME);
         drop(layer);
@@ -590,8 +573,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             records.len(),
-            3,
-            "one authority grant plus session start and end commits"
+            2,
+            "session start and end are the only collection records"
         );
         pile.close().unwrap();
     }
