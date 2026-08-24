@@ -128,9 +128,11 @@ attributes! {
     /// namespace: it says which `collection_name` vocabulary the root belongs
     /// to, not who may write, read, relay, or delegate for the collection.
     ///
-    /// Anchor minted with `trible genid` on 2026-08-24:
-    /// `C2F006810F7C0C695EC88E1EB820C4C0`.
-    "C2F006810F7C0C695EC88E1EB820C4C0" as pub collection_namespace: ED25519PublicKey;
+    /// This is the narrowed meaning of the published `collection_team` wire
+    /// field. Renaming the Rust symbol must not rename every collection on
+    /// disk, so its exact byte identity remains pinned while authority moves
+    /// to the separate optional field below.
+    "6C1ED6495491E32FEBB9FDD4EE5E8907" unsafe as pub collection_namespace: ED25519PublicKey;
     /// Optional external capability trust root for this exact collection.
     ///
     /// Authority is not an identity namespace and is not inherited through
@@ -1212,6 +1214,11 @@ mod tests {
 
     #[test]
     fn transcript_and_record_roots_are_golden() {
+        assert_eq!(
+            collection_namespace.id(),
+            id_hex!("6C1ED6495491E32FEBB9FDD4EE5E8907"),
+            "the namespace rename must preserve published descriptor bytes"
+        );
         let descriptor = crate::collection::descriptor::naming(
             &CollectionName::new("first").unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
@@ -1228,15 +1235,16 @@ mod tests {
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
         let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
 
-        // Pin the bare root shape. Adding authority deliberately adds a fact
-        // and therefore produces a distinct descriptor identity.
+        // Pin the historical bare-root shape. Renaming `collection_team` to
+        // `collection_namespace` preserves these bytes; adding authority
+        // deliberately adds a fact and produces a distinct identity.
         assert_eq!(
             crate::collection::descriptor::entity(&descriptor).unwrap(),
-            id_hex!("B92AA6B7EE11DEB972843981F6C6532A")
+            id_hex!("D3942D72389636880F528243079C24DF")
         );
         assert_eq!(
             descriptor_blob.get_handle().raw,
-            hex!("B35B0EF7BAE1E9C06940439D1C7066524C853D2F7CCCEFBCE339E5429B43AE91")
+            hex!("27BDE8E0150DCEC4F5330DF88D12EAEE0E1B174AA59AB6F2E10A3F9B20B8B8D7")
         );
         assert_eq!(
             descriptor_blob.bytes.len() as u64,

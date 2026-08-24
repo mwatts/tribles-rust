@@ -64,10 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `collection_namespace`; roots and derivations may each state their own
   `collection_authority`, and derived descriptors never inherit authority by
   walking `collection_source`. Both fields remain ordinary identity-bearing
-  descriptor facts. The namespace anchor
-  `C2F006810F7C0C695EC88E1EB820C4C0` and authority anchor
-  `7C31D328E9C369CCB6049D05CC8E8C77` were minted with `trible genid` on
-  2026-08-24.
+  descriptor facts. `collection_namespace` retains the published wire identity
+  `6C1ED6495491E32FEBB9FDD4EE5E8907` of the former `collection_team` field, so
+  an old root reconstructed with no explicit authority keeps its descriptor
+  handle. The new authority anchor `7C31D328E9C369CCB6049D05CC8E8C77`
+  was minted with `trible genid` on 2026-08-24.
 
 - Replace the current-facing Repository, Workspace, mutable branch, pin, and
   compare-and-swap documentation with the native collection model. The book now
