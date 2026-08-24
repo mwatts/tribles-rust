@@ -12,14 +12,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   names the target, omission of `--authority` selects explicit open admission,
   and controlled targets consume one exact blob-native WRITE credential. An
   authority-root signer may bootstrap and retain its own exact root proof.
-- Replaced the expiring scoped-capability team workflow with one positive
-  authority ledger. `team create`, `invite`, `join`, `list`, and `show` now
-  publish, carry, resolve, and inspect exact CONNECT grant occurrences.
+- Replaced the expiring scoped-capability and intermediate enumerable-ledger
+  workflows with exact blob-native credentials. `team create`, `invite`,
+  `join`, and `show` issue, carry, retain, and inspect one designated CONNECT
+  proof; there is no global `list`, roster scan, or ambient authority lookup.
   Pending requests, approval, renewal, retraction, permission scopes, ambient
-  `TRIBLE_TEAM_*` configuration, and zero sentinels were removed.
-- `pile net status` and `pile net sync` now require an explicit team root and
-  local accepted grant id, reconstruct the bounded authority proof from the
-  pile, and pass that proof directly to transport authentication.
+  `TRIBLE_TEAM_*` configuration, and zero sentinels were removed. Accepted
+  proof ancestry is retained through conservative GC by a private local
+  capability-wallet collection which grants no authority itself.
+- `pile net status` and `pile net sync` now require an explicit CONNECT trust
+  root and local leaf credential, reconstruct that exact bounded proof from the
+  pile, and pass it directly to transport authentication. Gossip uses a
+  separate explicit topic and is never inferred from authorization identity.
 
 ## [0.41.4] - 2026-05-17
 

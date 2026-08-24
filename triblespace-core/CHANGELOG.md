@@ -18,21 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enumerates storage; a closure-based exact-handle loader reconstructs portable
   root-to-leaf proofs from a leaf credential without a depth cap.
 
-- Add `authority.rs`, a positive enumerable authority kernel backed by one
-  public grow-only `SimpleArchive`-union collection per team root. Signed grant
-  occurrences bind one exact subject, resource, action, invoke/delegate mode,
-  and optional exact parent; resolution computes their grounded least fixed
-  point without letting malformed or unavailable candidates poison independent
-  authority. Add claim-directed portable root-to-leaf proofs carrying each
-  signed collection commit beside its canonical grant archive, with standalone
-  verification of the exact leaf subject, action, resource, and required mode.
-
 ### Removed
 
 - Remove `repo::capability` and its expiring capability blobs, permission-scope
   hierarchy, revocation/renewal model, and ambient chain lookup. Durable removal
   now requires a successor team, collection, or key epoch outside the monotone
-  authority kernel.
+  capability kernel.
+- Remove the intermediate enumerable `authority` collection and fixed-point
+  resolver. Authorization consumers now verify one exact blob-native
+  root-to-leaf capability proof against a caller-supplied trust root instead of
+  scanning ambient records.
 
 ## [0.41.4] - 2026-05-17
 

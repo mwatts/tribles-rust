@@ -17,15 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `trible pile migrate <pile> branch-to-collection` as the generic,
   same-pile bridge from one legacy `Repository` branch to a native
   `SimpleArchive` union collection. The command requires the target collection
-  name, team root, and signing key explicitly; uses that root as both the
-  target name namespace and optional local capability authority; validates the
-  branch head and complete reachable commit history before writing; preserves
-  each authored commit's exact `repo::content` and `metadata::archive`; skips
-  verified contentless merges; resolves both current and historical branch-name
-  encodings; establishes exact target `ACTION_WRITE` before target publication
-  (a team-root signer bootstraps itself, while a delegated signer must already
-  be authorized); and reports every source-to-target mapping, including
-  deterministic many-to-one collapse and idempotent replays.
+  name, public-key namespace, and signing key explicitly; admission is open
+  unless an independent `--authority` trust root is supplied. A delegated
+  signer designates one exact local `--credential`, while a signer equal to the
+  trust root may bootstrap its own deterministic WRITE/Invoke proof. The
+  command validates the branch head, complete reachable commit history, and
+  target admission before writing; preserves each authored commit's exact
+  `repo::content` and `metadata::archive`; skips verified contentless merges;
+  resolves both current and historical branch-name encodings; retains accepted
+  proof ancestry in the private capability wallet; and reports every
+  source-to-target mapping, including deterministic many-to-one collapse and
+  idempotent replays.
 
 - Cut `trible team` over to exact blob-native capability credentials. `create`
   stores a root-signed founder CONNECT claim in invoke-and-delegate mode;
@@ -48,14 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   descriptor's optional authority fact, empty capability admission denies all
   writes and yields an empty ticket, and newly supplied proofs can expose
   already-resident foreign commits without publishing new collection state.
-  `ACTION_WRITE` now lives in `collection`; the generic positive-authority
-  resolver remains available for independent consumers but is no longer a
-  facade dependency. Exact `SimpleArchive` and Succinct-derived facades now
-  carry namespace and optional source/target authorities independently, so
-  tickets from open roots preserve descriptor identity through derivation.
-  Built-in examples, telemetry, macro instrumentation, and benchmarks now
-  select open local admission directly instead of publishing synthetic
-  team-of-one authority grants.
+  `ACTION_WRITE` now lives in `collection`, and the obsolete enumerable
+  authority resolver has been removed entirely. Exact `SimpleArchive`,
+  Succinct-derived, and regular-path facades now carry namespace and optional
+  source/target authorities independently, so tickets from both open and
+  capability-governed roots preserve descriptor identity through derivation.
+  Built-in examples, telemetry, macro instrumentation, and benchmarks select
+  open local admission directly instead of publishing synthetic team-of-one
+  authority grants.
 
 - Split a collection descriptor's public-key namespace from its optional
   capability authority. Roots are named by `collection_name` plus
