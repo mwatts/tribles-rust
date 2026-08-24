@@ -17,6 +17,8 @@ pub mod attribute;
 pub mod authority;
 /// Blob storage, schemas, and conversion traits.
 pub mod blob;
+/// Store-independent, blob-native capability claims and proofs.
+pub mod capability;
 /// Attribute definition and usage metadata.
 pub mod clock;
 /// Typed collection records, storage, publication, discovery, and resolution.

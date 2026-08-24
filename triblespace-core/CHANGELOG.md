@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add top-level `capability`, a collection-free blob-native authorization
+  kernel. Canonical `SimpleArchive` claim/signature pairs bind one exact typed
+  action/resource atom, Ed25519 subject, attenuating invoke/delegate mode,
+  optional inclusive validity interval, and exact parent signature blob.
+  Claim-directed verification accepts an external trust root and explicit
+  instant, returns the chain's effective validity intersection, and never
+  enumerates storage; a closure-based exact-handle loader reconstructs portable
+  root-to-leaf proofs from a leaf credential without a depth cap.
+
 - Add `authority.rs`, a positive enumerable authority kernel backed by one
   public grow-only `SimpleArchive`-union collection per team root. Signed grant
   occurrences bind one exact subject, resource, action, invoke/delegate mode,
