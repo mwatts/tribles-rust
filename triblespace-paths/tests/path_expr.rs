@@ -92,11 +92,12 @@ fn canonical_expression_construction_stabilizes_automaton_fingerprints() {
 fn compiled_expression_roundtrips_through_native_collection_and_query_constraint() {
     let expression = PathExpr::from(Step::Forward(metadata::tag.id().into())).plus();
     let signing_key = SigningKey::from_bytes(&[17; 32]);
-    let team = signing_key.verifying_key();
+    let namespace = signing_key.verifying_key();
     let name = CollectionName::new("graph").unwrap();
     let paths = PathSummaryCollection::new(
         name.clone(),
-        team,
+        namespace,
+        None,
         expression.compile(),
         reach::private(),
         reach::private(),
@@ -110,7 +111,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
         .unwrap();
     let source = store
         .put::<SimpleArchive, _>(
-            simplearchive_union::descriptor(&name, team, reach::private())
+            simplearchive_union::descriptor(&name, namespace, None, reach::private())
                 .into_facts()
                 .to_blob(),
         )

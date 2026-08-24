@@ -473,8 +473,8 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
-    /// The one team every collection in these tests belongs to; a team of one.
-    fn team() -> VerifyingKey {
+    /// Public-key namespace shared by these test source collections.
+    fn namespace() -> VerifyingKey {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
@@ -484,7 +484,7 @@ mod tests {
 
     /// The source collection these tests summarise.
     fn source_collection() -> Fragment {
-        simplearchive_union::descriptor(&name("edges"), team(), reach::private())
+        simplearchive_union::descriptor(&name("edges"), namespace(), None, reach::private())
     }
 
     /// These tests only need identities to bind claims to; nothing stores the
@@ -551,17 +551,16 @@ mod tests {
             descriptor::name(first.facts()).is_none(),
             "a derivation needs no anchor"
         );
-        assert!(
-            descriptor::team(first.facts()).is_none(),
-            "a derivation inherits its team"
-        );
+        assert!(descriptor::namespace(first.facts()).is_none());
+        assert!(descriptor::authority(first.facts()).is_none());
         // The same automaton over a different source is a different summary.
         assert_ne!(
             collection_of(&first),
             collection_of(&descriptor(
                 collection_of(&simplearchive_union::descriptor(
                     &name("other-edges"),
-                    team(),
+                    namespace(),
+                    None,
                     reach::private()
                 )),
                 &first_automaton,

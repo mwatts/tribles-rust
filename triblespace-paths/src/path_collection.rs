@@ -71,7 +71,8 @@ impl From<ExactDerivedCollectionError> for PathSummaryCollectionError {
 #[derive(Clone, Debug)]
 pub struct PathSummaryCollection {
     name: CollectionName,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
+    source_authority: Option<VerifyingKey>,
     automaton: Automaton,
     source_reach: Fragment,
     reach: Fragment,
@@ -80,21 +81,23 @@ pub struct PathSummaryCollection {
 impl PathSummaryCollection {
     /// Construct the canonical path projection for one named root and
     /// `automaton`.
-    /// `source_reach` completes the root's identity; `reach` is this
-    /// projection's own. A path summary over private material can be a
-    /// perfectly reasonable thing to publish, and a private summary over
-    /// published material an equally reasonable thing to keep, so neither
-    /// answer is derived from the other.
+    /// `namespace`, `source_authority`, and `source_reach` complete the root's
+    /// identity; `reach` is this projection's own. A path summary over private
+    /// material can be a perfectly reasonable thing to publish, and a private
+    /// summary over published material an equally reasonable thing to keep, so
+    /// neither answer is derived from the other.
     pub fn new(
         name: CollectionName,
-        team: VerifyingKey,
+        namespace: VerifyingKey,
+        source_authority: Option<VerifyingKey>,
         automaton: Automaton,
         source_reach: Fragment,
         reach: Fragment,
     ) -> Self {
         Self {
             name,
-            team,
+            namespace,
+            source_authority,
             automaton,
             source_reach,
             reach,
@@ -116,9 +119,14 @@ impl PathSummaryCollection {
         &self.name
     }
 
-    /// Team owning the root collection this projection is taken over.
-    pub fn team(&self) -> VerifyingKey {
-        self.team
+    /// Public-key namespace naming the root collection being projected.
+    pub fn namespace(&self) -> VerifyingKey {
+        self.namespace
+    }
+
+    /// Optional capability trust root declared by the source collection.
+    pub fn source_authority(&self) -> Option<VerifyingKey> {
+        self.source_authority
     }
 
     /// Fixed automaton whose fingerprint participates in collection identity.
@@ -128,7 +136,12 @@ impl PathSummaryCollection {
 
     /// Canonical source `SimpleArchive` collection descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.team, self.source_reach.clone())
+        simplearchive_union::descriptor(
+            &self.name,
+            self.namespace,
+            self.source_authority,
+            self.source_reach.clone(),
+        )
     }
 
     /// Identity of the source collection this projection reads.
@@ -332,8 +345,8 @@ mod tests {
         triblespace_core::id::Id::new([byte; 16]).unwrap()
     }
 
-    /// The one team every collection in these tests belongs to.
-    fn test_team() -> VerifyingKey {
+    /// The public-key namespace shared by the test source collections.
+    fn test_namespace() -> VerifyingKey {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
@@ -384,7 +397,8 @@ mod tests {
             &SigningKey::from_bytes(&[key; 32]),
             collection_of(&simplearchive_union::descriptor(
                 name,
-                test_team(),
+                test_namespace(),
+                None,
                 reach::private(),
             )),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
@@ -402,6 +416,35 @@ mod tests {
 
     fn assert_cross_fragment_path(index: &PathIndex) {
         assert!(index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
+    }
+
+    #[test]
+    fn source_authority_is_explicit_and_participates_in_both_identities() {
+        let name = test_name("c9");
+        let namespace = test_namespace();
+        let trust_root = SigningKey::from_bytes(&[2; 32]).verifying_key();
+        let open = PathSummaryCollection::new(
+            name.clone(),
+            namespace,
+            None,
+            plus(),
+            reach::private(),
+            reach::private(),
+        );
+        let governed = PathSummaryCollection::new(
+            name,
+            namespace,
+            Some(trust_root),
+            plus(),
+            reach::private(),
+            reach::private(),
+        );
+
+        assert_eq!(open.namespace(), namespace);
+        assert_eq!(open.source_authority(), None);
+        assert_eq!(governed.source_authority(), Some(trust_root));
+        assert_ne!(open.source_collection(), governed.source_collection());
+        assert_ne!(open.collection(), governed.collection());
     }
 
     #[test]
@@ -423,7 +466,8 @@ mod tests {
         let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
         let paths = PathSummaryCollection::new(
             test_name("c9"),
-            test_team(),
+            test_namespace(),
+            None,
             automaton.clone(),
             reach::private(),
             reach::private(),
@@ -447,7 +491,8 @@ mod tests {
         let mut store = CollectionOnly::default();
         let paths = PathSummaryCollection::new(
             test_name("c9"),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -465,7 +510,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -493,7 +539,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -531,7 +578,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -561,7 +609,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -594,7 +643,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -635,7 +685,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -694,7 +745,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
@@ -744,7 +796,8 @@ mod tests {
         let name = test_name("c9");
         let paths = PathSummaryCollection::new(
             name.clone(),
-            test_team(),
+            test_namespace(),
+            None,
             plus(),
             reach::private(),
             reach::private(),
