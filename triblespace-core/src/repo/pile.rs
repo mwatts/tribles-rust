@@ -2499,6 +2499,16 @@ impl std::fmt::Display for FlushError {
 impl std::error::Error for FlushError {}
 
 impl Pile {
+    /// Metadata for the exact backing file opened by this handle.
+    ///
+    /// This is deliberately derived from the held file descriptor rather than
+    /// by resolving the original pathname again. Callers that need a
+    /// host-local coordination key can therefore use the physical file
+    /// identity without a rename or hard-link ambiguity.
+    pub fn backing_file_metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
     /// Opens an existing pile file. Returns an error if the file does not
     /// exist — create the file first with [`std::fs::File::create`] or
     /// equivalent if you need a fresh pile.
