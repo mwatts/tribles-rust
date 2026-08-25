@@ -2020,13 +2020,13 @@ mod tests {
         // root moves only when those attributes move.
         assert_eq!(
             descriptor.root().unwrap(),
-            id_hex!("C4E24340A80C70267458E2B6DD8EFDE4")
+            id_hex!("8A286DB5010DCBB0CCD84470A8E6C85A")
         );
         // The handle pins the whole current descriptor: namespace, optional
         // authority, reach, and the travelling schema and law descriptions.
         assert_eq!(
             identity_for_tests(&descriptor).raw,
-            hex!("F5C0F55C167849EBE735E6C29A332BAD43298F3A55E9DB20A4944375CF8ADE79")
+            hex!("54F139C7A5E46DBD3FB62768279800782357B5C953DEE4F9C578B6F91796B931")
         );
         assert_eq!(
             IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle(),
