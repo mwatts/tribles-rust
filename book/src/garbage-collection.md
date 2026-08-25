@@ -77,12 +77,14 @@ publication or retention API. Legacy V3 collection records are different: their
 16-byte definition identities predate descriptor handles, so they are
 preserved byte-for-byte as
 inert physical evidence but grant no current collection authority and own no
-blobs. Capability retention needs no separate root primitive either. The team
-CLI commits each locally selected leaf signature archive as data in a private,
-signer-namespaced capability-wallet collection. The ordinary recursive rule
-for that valid commit then retains the resident signature, claim, and parent
-ancestry. This wallet is only a local lifetime edge: it neither validates the
-proof nor creates an enumerable authority roster.
+blobs. Capability proofs have their own direct native root. Conservative
+rewrites preserve every canonical proof record. When the proof's native
+`K0 (S C K)+` signatures verify, each resident claim handle in that proof is a
+direct root. The proof already enumerates the complete ancestry, so claim
+contents are deliberately not scanned for child handles. Missing claims remain
+missing, and an invalidly signed proof roots nothing. This signature check
+establishes only a safe local lifetime edge: semantic authority still requires
+an external trust root, expected leaf, instant, and exact request.
 Blob WANT records are an explicit rewrite choice. Preserving them copies their
 demand markers but does not promote the requested blob to an ownership root;
 dropping them omits the markers entirely.
@@ -117,10 +119,13 @@ chunks do not name another resident object.
 
 The retention procedure is therefore:
 
-1. enumerate native collection records from one observed store view;
-2. strictly verify each commit before its fields gain retention authority;
+1. enumerate native collection and capability-proof records from one observed
+   store view;
+2. strictly verify each commit and each proof's direct signatures before their
+   fields gain retention authority;
 3. add the resident descriptor, data, and metadata of valid commits as
-   recursive roots;
+   recursive roots, and each resident claim explicitly named by a validly
+   signed proof as a direct root;
 4. add caller-selected direct or recursive policy roots;
 5. recursively mark resident candidate handles; and
 6. rewrite or evict everything outside that conservative live set while

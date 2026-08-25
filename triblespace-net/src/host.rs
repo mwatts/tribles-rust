@@ -128,7 +128,7 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
 }
 
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
-/// `Default` impl — auth is mandatory in protocol v7 so every peer
+/// `Default` impl — auth is mandatory in protocol v8 so every peer
 /// construction site must explicitly choose a CONNECT trust root. For solo
 /// workflows the convention is `connect_root = signing_key.verifying_key()`
 /// (the user is their own trust root);
@@ -147,14 +147,14 @@ pub struct PeerConfig {
     /// to CONNECT authorization and is never derived from `connect_root`.
     pub gossip_topic: Option<[u8; 32]>,
     /// External trust-root public key for direct RPC. Every connection's first
-    /// stream must carry a complete capability proof rooted here whose leaf
-    /// invokes exact CONNECT on these same 32 public-key bytes.
+    /// stream must carry a complete capability proof bundle rooted here whose
+    /// final key invokes exact CONNECT on these same 32 public-key bytes.
     pub connect_root: ed25519_dalek::VerifyingKey,
-    /// Complete, prebuilt root-to-leaf proof authorizing this node's TLS key
-    /// to invoke [`crate::protocol::ACTION_CONNECT`] on the exact
+    /// Complete, prebuilt root-to-leaf proof bundle authorizing this node's
+    /// TLS key to invoke [`crate::protocol::ACTION_CONNECT`] on the exact
     /// `connect_root` resource. Outgoing dials send these bytes inline; the
-    /// transport never constructs or fetches proof state implicitly.
-    pub connect_proof: triblespace_core::capability::CapabilityProof,
+    /// transport never constructs or fetches claim state implicitly.
+    pub connect_proof: triblespace_core::capability::CapabilityProofBundle,
     /// Direction of participation in the evidence swarm. Controls whether this
     /// node publishes collection evidence (write side) and/or admits incoming
     /// collection evidence (read side). Default is `Bidirectional`. Use
@@ -186,7 +186,7 @@ pub enum SyncDirection {
 }
 
 // No `Default` impl: every PeerConfig must specify a trust root because auth
-// is mandatory in protocol v7. For a single-user OSS deployment the convention
+// is mandatory in protocol v8. For a single-user OSS deployment the convention
 // is `connect_root = signing_key.verifying_key()`.
 
 /// Snapshot of store state for serving protocol requests.
@@ -396,7 +396,7 @@ fn collection_evidence_for_rebroadcast(
 struct NetCap<T: Transport> {
     transport: T,
     pool: SharedPool<T::Conn>,
-    connect_proof: triblespace_core::capability::CapabilityProof,
+    connect_proof: triblespace_core::capability::CapabilityProofBundle,
     my_id: PeerId,
     /// Configured peers and live gossip neighbors — consulted before the DHT
     /// on every on-demand fetch. Membership is only a routing hint; callers
@@ -792,13 +792,18 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 // ── Network thread event loop ────────────────────────────────────────
 
 /// Deadline for establishing + authenticating a connection (the `pool_get`
-/// init future: dial + inline CONNECT proof round trip). A connection
+/// init future: dial + inline CONNECT proof-bundle round trip). A connection
 /// attempt that exceeds this counts as failed: the pool's
 /// singleflight cell resets so the next walk re-dials, instead of
 /// every later fetch to that peer queueing forever behind one
 /// stalled authentication exchange. Generous relative to real-world QUIC + relay
 /// setup times; deterministic under simulated virtual time.
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Deadline for an accepted connection to open its first stream and complete
+/// the whole OP_AUTH exchange. This bounds unauthenticated connection state
+/// even when a peer opens no stream or dribbles an incomplete proof bundle.
+const INBOUND_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Deadline for a single protocol op (OP_CHILDREN / OP_GET_BLOB request + full
 /// response) on an established connection. On expiry the op reports an error
@@ -808,19 +813,19 @@ const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Connect to a peer over the pile-sync ALPN and immediately present
-/// our complete CONNECT proof so subsequent direct RPCs are admitted.
+/// our complete CONNECT proof bundle so subsequent direct RPCs are admitted.
 #[instrument(level = "info", skip(t, connect_proof), fields(peer = %hex::encode(&peer[..4])))]
 async fn connect_authed<T: Transport>(
     t: &T,
     peer: PeerId,
-    connect_proof: &triblespace_core::capability::CapabilityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProofBundle,
 ) -> anyhow::Result<T::Conn> {
     let conn = t.dial(peer, PILE_SYNC_ALPN).await.map_err(|e| {
         warn!(error = %e, "connect failed");
         anyhow::anyhow!("connect: {e}")
     })?;
     debug!(
-        steps = connect_proof.steps().len(),
+        steps = connect_proof.proof().step_count(),
         "connected; sending OP_AUTH"
     );
     op_auth(&conn, connect_proof).await.map_err(|e| {
@@ -1098,7 +1103,7 @@ async fn pool_get<T: Transport>(
     t: &T,
     pool: &SharedPool<T::Conn>,
     provider: PeerId,
-    connect_proof: &triblespace_core::capability::CapabilityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProofBundle,
 ) -> Option<T::Conn> {
     let cell = {
         let mut guard = pool.lock().await;
@@ -1158,7 +1163,7 @@ async fn fetch_one<T: Transport>(
     hash: &RawHash,
     pool: &SharedPool<T::Conn>,
     publisher_id: PeerId,
-    connect_proof: &triblespace_core::capability::CapabilityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProofBundle,
 ) -> Option<Vec<u8>> {
     let providers = providers_for(t, hash, publisher_id).await;
     fetch_from_providers(t, hash, pool, &providers, connect_proof).await
@@ -1175,7 +1180,7 @@ async fn fetch_from_providers<T: Transport>(
     hash: &RawHash,
     pool: &SharedPool<T::Conn>,
     providers: &[PeerId],
-    connect_proof: &triblespace_core::capability::CapabilityProof,
+    connect_proof: &triblespace_core::capability::CapabilityProofBundle,
 ) -> Option<Vec<u8>> {
     for &provider in providers {
         let Some(conn) = pool_get(t, pool, provider, connect_proof).await else {
@@ -1269,22 +1274,40 @@ impl SnapshotHandler {
             // Authentication is deliberately structural control flow rather
             // than mutable per-connection state: the first stream proves the
             // exact CONNECT claim, then and only then can request streams run.
-            let Some((mut send, mut recv)) = connection.accept_bi().await else {
-                debug!("connection ended before OP_AUTH");
-                return;
-            };
-            let authenticated =
-                authenticate_connection::<T::Conn>(connect_root, peer, &mut send, &mut recv).await;
-            let _ = send.shutdown().await;
+            // One deadline covers both an absent first stream and a partial
+            // auth body, including its required EOF/trailing-byte check.
+            let authenticated = tokio::time::timeout(INBOUND_AUTH_DEADLINE, async {
+                let Some((mut send, mut recv)) = connection.accept_bi().await else {
+                    return None;
+                };
+                let authenticated =
+                    authenticate_connection::<T::Conn>(connect_root, peer, &mut send, &mut recv)
+                        .await;
+                let _ = send.shutdown().await;
+                Some(authenticated)
+            })
+            .await;
             let expires = match authenticated {
-                Ok(Some(verified)) => verified
+                Err(_) => {
+                    warn!(
+                        deadline = ?INBOUND_AUTH_DEADLINE,
+                        "inbound authentication deadline exceeded"
+                    );
+                    connection.close(1, b"authentication deadline exceeded");
+                    return;
+                }
+                Ok(None) => {
+                    debug!("connection ended before OP_AUTH");
+                    return;
+                }
+                Ok(Some(Ok(Some(verified)))) => verified
                     .effective_validity()
                     .map(|validity| validity.bounds().1),
-                Ok(None) => {
+                Ok(Some(Ok(None))) => {
                     connection.close(1, b"CONNECT capability required");
                     return;
                 }
-                Err(error) => {
+                Ok(Some(Err(error))) => {
                     warn!(%error, "authentication stream failed");
                     connection.close(1, b"malformed authentication");
                     return;
@@ -1339,7 +1362,7 @@ async fn authenticate_connection<C: Conn>(
     send: &mut C::SendHalf,
     recv: &mut C::RecvHalf,
 ) -> anyhow::Result<Option<triblespace_core::capability::VerifiedCapability>> {
-    use triblespace_core::capability::{CapabilityClaim, CapabilityMode};
+    use triblespace_core::capability::{CapabilityMode, CapabilityRequest};
 
     let verdict = async {
         let op = recv_u8(recv).await?;
@@ -1349,16 +1372,16 @@ async fn authenticate_connection<C: Conn>(
                 op_name(op)
             );
         }
-        let proof = recv_capability_proof(recv).await?;
+        let bundle = recv_capability_proof_bundle(recv).await?;
         let mut trailing = [0u8; 1];
         if recv.read(&mut trailing).await? != 0 {
             anyhow::bail!("OP_AUTH contains trailing bytes");
         }
-        let verified = proof.verify_claim(
+        let verified = bundle.verify(
             connect_root,
             crate::clock::epoch_now(),
-            CapabilityClaim::new(
-                peer,
+            peer,
+            CapabilityRequest::new(
                 connect_capability_atom(connect_root),
                 CapabilityMode::Invoke,
             ),
@@ -1656,5 +1679,66 @@ mod collection_evidence_gossip_tests {
         remove_transient_routing_candidate(&candidates, &configured, transient_peer);
         remove_transient_routing_candidate(&candidates, &configured, configured_peer);
         assert_eq!(*candidates.lock().unwrap(), vec![configured_peer]);
+    }
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod inbound_auth_deadline_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use ed25519_dalek::SigningKey;
+
+    use super::{AnySnapshot, INBOUND_AUTH_DEADLINE, SnapshotHandler};
+    use crate::protocol::PILE_SYNC_ALPN;
+    use crate::transport::sim::{SimConfig, SimNet, SimTransport};
+    use crate::transport::{Conn, Transport};
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_connection_that_opens_no_auth_stream_hits_deadline() {
+        let config = SimConfig {
+            latency: Duration::ZERO..Duration::from_nanos(1),
+            ..SimConfig::default()
+        };
+        let net = SimNet::new(0xA117, config);
+        let server_key = SigningKey::from_bytes(&[0xA1; 32]);
+        let client_key = SigningKey::from_bytes(&[0xA2; 32]);
+        let root_key = SigningKey::from_bytes(&[0xA3; 32]);
+        let server_id = server_key.verifying_key().to_bytes();
+        let client_id = client_key.verifying_key().to_bytes();
+        let mut server = net.join(server_id, None);
+        let client = net.join(client_id, None);
+
+        let client_connection = client
+            .transport
+            .dial(server_id, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let incoming = server.incoming.recv().await.unwrap();
+        assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
+
+        let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
+        let handler = SnapshotHandler {
+            snapshot,
+            connect_root: root_key.verifying_key(),
+        };
+        let task = tokio::spawn(async move {
+            handler.handle::<SimTransport>(incoming.conn).await;
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(INBOUND_AUTH_DEADLINE - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "an idle inbound connection remains admitted until its auth deadline"
+        );
+
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        task.await.unwrap();
+        assert!(
+            client_connection.open_bi().await.is_err(),
+            "the auth deadline closes the unauthenticated connection"
+        );
     }
 }

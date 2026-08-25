@@ -33,8 +33,8 @@ through `Blocking`.
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityGrant, CapabilityMode,
-    CapabilityProof, CapabilityProofStep, CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode,
+    CapabilityProofBundle, CapabilityResource,
 };
 use triblespace::core::collection::{reach, simplearchive_union, ACTION_WRITE};
 use triblespace::prelude::*;
@@ -52,15 +52,11 @@ let atom = CapabilityAtom::new(
     CapabilityAction::new(ACTION_WRITE),
     CapabilityResource::from(target),
 );
-let proof = CapabilityProof::new(vec![CapabilityProofStep::issue(
+let proof = CapabilityProofBundle::issue_root(
     &team_key,
-    CapabilityGrant::root(
-        writer_subject,
-        atom,
-        CapabilityMode::Invoke,
-        None,
-    ),
-)]);
+    CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+    writer_subject,
+)?;
 let mut models = Collection::new(
     storage,
     &name,
@@ -80,14 +76,15 @@ models.flush()?;
 let storage = models.into_storage();
 ```
 
-Capability admission stores the trust root in the descriptor and retains the
-presented proof in the facade. Each operation observes the clock once and
-verifies every presentation against that root, the expected leaf subject, and
-exact `ACTION_WRITE` on this descriptor before touching storage. Ordinary reads
-admit every explicitly presented subject, so a foreign author remains visible
-when its proof is supplied. Invalid explicit evidence fails loud; an empty
-presentation set is a valid policy that admits nobody. `CollectionAdmission::Open`
-is the deliberate alternative which admits every strictly verified signer.
+Capability admission stores the trust root in the descriptor and retains each
+expected leaf plus complete proof bundle in the facade. Each operation observes
+the clock once and verifies the bundle against that root, leaf, and exact
+`ACTION_WRITE` request for this descriptor before touching storage. Ordinary
+reads admit every explicitly presented leaf, so a foreign author remains
+visible when its proof is supplied. Invalid explicit evidence fails loud; an
+empty presentation set is a valid policy that admits nobody.
+`CollectionAdmission::Open` is the deliberate alternative which admits every
+strictly verified signer.
 
 The reach argument is explicit because it participates in collection identity.
 `reach::private()` declares nothing and keeps commits local; `reach::public()`
@@ -278,7 +275,7 @@ further options the target uses `CollectionAdmission::Open`; the namespace key
 does not implicitly authorize, admit, or identify the signing key.
 
 To migrate into a capability-guarded target, name its independent trust root
-and the signing key's exact local credential:
+and the signing key's exact local proof:
 
 ```text
 trible pile migrate data.pile branch-to-collection \
@@ -286,26 +283,25 @@ trible pile migrate data.pile branch-to-collection \
   --collection-name events \
   --namespace <64-hex-character-ed25519-public-key> \
   --authority <64-hex-character-ed25519-public-key> \
-  --credential <64-hex-character-leaf-signature-handle> \
+  --proof <64-hex-character-proof-id> \
   --signing-key ./writer.key
 ```
 
-The command reconstructs that one root-to-leaf proof by exact blob lookups and
-verifies its trust root, signer subject, `ACTION_WRITE`, exact target descriptor
-resource, and minimum Invoke mode at one shared instant. It never scans a
-roster or resolves ambient grants. `--credential` therefore requires
-`--authority`.
+The command loads that one native proof by its BLAKE3 ID, loads only the claim
+blobs named by the proof, and verifies its trust root, signer leaf,
+`ACTION_WRITE`, exact target descriptor resource, and minimum Invoke mode at
+one shared instant. It does not choose a path by scanning keys or claims.
+`--proof` therefore requires `--authority`.
 
-The one bootstrap case is deliberately explicit: when the migration signing
-key is itself `--authority`, the credential may be omitted. The command issues
-one deterministic root `WRITE`/Invoke proof in memory, verifies it through the
-same boundary, then stores its claim/signature blobs and retains the leaf in
-the private local capability wallet. A delegated signer must supply a
-credential.
+The one bootstrap case is explicit: when the migration signing key is itself
+`--authority`, the proof may be omitted. The command issues one deterministic
+root `WRITE`/Invoke claim and proof in memory, verifies it through the same
+boundary, then stores the claim blob and native proof. A delegated signer must
+supply a proof.
 
 The complete source DAG and target admission are validated before any target
-descriptor, dependency, capability blob, wallet entry, or commit is published.
-An authorization failure therefore leaves the target untouched.
+descriptor, dependency, claim blob, proof record, or commit is published. An
+authorization failure therefore leaves the target untouched.
 
 Legacy wrapper parents, messages, timestamps, authors, and signatures are not
 silently reinterpreted as application metadata. Two source nodes with identical

@@ -1,10 +1,10 @@
-//! `trible team` -- exact blob-native team capabilities.
+//! `trible team` -- direct, exact team capability proofs.
 //!
 //! A team is identified by one Ed25519 trust-root public key. CONNECT uses
-//! those exact 32 bytes as its capability resource. Claims and signatures are
-//! ordinary content-addressed blobs: commands load one explicitly named leaf
-//! credential and follow only its parent handles. There is no authority
-//! collection, membership scan, or ambient credential registry.
+//! those exact 32 bytes as its capability resource. A portable proof is the
+//! canonical `K (S C K)+` body together with the exact ordered claim blobs it
+//! names. Piles retain accepted proofs natively; there is no authority
+//! collection, credential wallet, membership scan, or ambient registry.
 
 use std::fs;
 use std::io::Read;
@@ -17,30 +17,22 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::blob::Blob;
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityBlobHandle, CapabilityClaim, CapabilityGrant,
-    CapabilityMode, CapabilityProof, CapabilityProofStep, CapabilityValidity,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+    CapabilityProofId, CapabilityRequest, CapabilityValidity, MAX_CAPABILITY_PROOF_BUNDLE_BYTES,
 };
-use triblespace_core::collection::reach;
-use triblespace_core::collection::records::CollectionName;
-use triblespace_core::collection::simplearchive_union;
 use triblespace_core::repo::pile::{GetBlobError, Pile};
+use triblespace_core::repo::proof::CapabilityProofStore;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
-use triblespace_core::trible::TribleSet;
 
-use triblespace_net::protocol::{
-    connect_capability_atom, decode_capability_proof, encode_capability_proof, ACTION_CONNECT,
-    MAX_CAPABILITY_PROOF_BYTES,
-};
+use triblespace_net::protocol::{connect_capability_atom, ACTION_CONNECT};
 
-const TEAM_ROOT_BYTES: usize = 32;
-const MAX_INVITE_BYTES: usize = TEAM_ROOT_BYTES + MAX_CAPABILITY_PROOF_BYTES;
-const CAPABILITY_WALLET_COLLECTION: &str = "capability-wallet";
+const MAX_INVITE_BYTES: usize = MAX_CAPABILITY_PROOF_BUNDLE_BYTES;
 
 #[derive(Parser)]
 pub enum Command {
-    /// Create a team and issue the founder an exact CONNECT credential.
+    /// Create a team and issue the founder a direct CONNECT proof.
     Create {
         /// Path to the local pile file.
         #[arg(long)]
@@ -48,6 +40,9 @@ pub enum Command {
         /// Founder's signing key (generated at the conventional path if absent).
         #[arg(long)]
         key: Option<PathBuf>,
+        /// Durable offline team-root key file. Defaults beside the pile.
+        #[arg(long)]
+        root_key: Option<PathBuf>,
         /// Inclusive RFC 3339 lower validity bound (requires --valid-until).
         #[arg(long, value_parser = parse_epoch, requires = "valid_until")]
         valid_from: Option<Epoch>,
@@ -55,7 +50,7 @@ pub enum Command {
         #[arg(long, value_parser = parse_epoch, requires = "valid_from")]
         valid_until: Option<Epoch>,
     },
-    /// Issue one portable CONNECT invite from an exact parent credential.
+    /// Issue one portable CONNECT invite from an exact parent proof.
     Invite {
         /// Path to the issuer's pile file.
         #[arg(long)]
@@ -63,16 +58,16 @@ pub enum Command {
         /// Team trust-root public key (32-byte hex).
         #[arg(long)]
         team_root: String,
-        /// Exact parent credential (32-byte leaf signature-blob handle).
+        /// Exact parent proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        parent: String,
+        parent_proof: String,
         /// Issuer's existing signing key.
         #[arg(long)]
         key: Option<PathBuf>,
         /// Invitee's Ed25519 public key (32-byte hex).
         #[arg(long)]
         invitee: String,
-        /// Let the invitee issue child CONNECT credentials too.
+        /// Let the invitee issue child CONNECT proofs too.
         #[arg(long)]
         delegate: bool,
         /// Inclusive RFC 3339 lower validity bound (requires --valid-until).
@@ -90,6 +85,9 @@ pub enum Command {
         /// Path to the receiving pile file.
         #[arg(long)]
         pile: PathBuf,
+        /// Expected team trust-root public key (32-byte hex).
+        #[arg(long)]
+        team_root: String,
         /// Invitee's existing signing key.
         #[arg(long)]
         key: Option<PathBuf>,
@@ -97,7 +95,7 @@ pub enum Command {
         #[arg(long)]
         invite: PathBuf,
     },
-    /// Verify and show one exact credential ancestry.
+    /// Verify and show one exact proof ancestry.
     Show {
         /// Path to the local pile file.
         #[arg(long)]
@@ -105,9 +103,9 @@ pub enum Command {
         /// Team trust-root public key (32-byte hex).
         #[arg(long)]
         team_root: String,
-        /// Exact credential (32-byte leaf signature-blob handle).
+        /// Exact proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        credential: String,
+        proof: String,
     },
 }
 
@@ -116,13 +114,14 @@ pub fn run(command: Command) -> Result<()> {
         Command::Create {
             pile,
             key,
+            root_key,
             valid_from,
             valid_until,
-        } => run_create(pile, key, valid_from, valid_until),
+        } => run_create(pile, key, root_key, valid_from, valid_until),
         Command::Invite {
             pile,
             team_root,
-            parent,
+            parent_proof,
             key,
             invitee,
             delegate,
@@ -132,7 +131,7 @@ pub fn run(command: Command) -> Result<()> {
         } => run_invite(
             pile,
             team_root,
-            parent,
+            parent_proof,
             key,
             invitee,
             delegate,
@@ -140,12 +139,17 @@ pub fn run(command: Command) -> Result<()> {
             valid_until,
             out,
         ),
-        Command::Join { pile, key, invite } => run_join(pile, key, invite),
+        Command::Join {
+            pile,
+            team_root,
+            key,
+            invite,
+        } => run_join(pile, team_root, key, invite),
         Command::Show {
             pile,
             team_root,
-            credential,
-        } => run_show(pile, team_root, credential),
+            proof,
+        } => run_show(pile, team_root, proof),
     }
 }
 
@@ -177,10 +181,10 @@ fn load_existing_signing_key(path: Option<PathBuf>, pile: &Path) -> Result<Signi
     triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
 }
 
-fn fresh_signing_key() -> Result<SigningKey> {
-    let mut seed = [0; 32];
-    getrandom::fill(&mut seed).map_err(|error| anyhow!("generate key: {error}"))?;
-    Ok(SigningKey::from_bytes(&seed))
+fn load_or_generate_root_key(path: Option<PathBuf>, pile: &Path) -> Result<(PathBuf, SigningKey)> {
+    let path = path.unwrap_or_else(|| pile.with_extension("team-root.key"));
+    let key = triblespace_core::signing_key_file::init(&path)?;
+    Ok((path, key))
 }
 
 pub(crate) fn parse_team_root(text: &str) -> Result<VerifyingKey> {
@@ -196,12 +200,12 @@ pub(crate) fn parse_public_key(text: &str, label: &str) -> Result<VerifyingKey> 
     VerifyingKey::from_bytes(&raw).map_err(|error| anyhow!("invalid {label}: {error}"))
 }
 
-pub(crate) fn parse_credential(text: &str) -> Result<CapabilityBlobHandle> {
-    let bytes = hex::decode(text).map_err(|error| anyhow!("decode credential hex: {error}"))?;
+pub(crate) fn parse_proof_id(text: &str) -> Result<CapabilityProofId> {
+    let bytes = hex::decode(text).map_err(|error| anyhow!("decode proof id hex: {error}"))?;
     let raw: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow!("credential must be a 32-byte signature-blob handle"))?;
+        .map_err(|_| anyhow!("proof id must be a 32-byte BLAKE3 digest"))?;
     Ok(triblespace_core::inline::Inline::new(raw))
 }
 
@@ -238,184 +242,150 @@ fn connect_atom(team_root: VerifyingKey) -> CapabilityAtom {
     connect_capability_atom(team_root)
 }
 
-fn format_credential(credential: CapabilityBlobHandle) -> String {
-    hex::encode(credential.raw)
+fn format_proof_id(id: CapabilityProofId) -> String {
+    hex::encode(id.raw)
 }
 
-pub(crate) fn load_capability_proof(
+/// Load one explicitly named proof and only the claim blobs it names.
+pub(crate) fn load_capability_bundle(
     pile: &mut Pile,
-    credential: CapabilityBlobHandle,
-) -> Result<CapabilityProof> {
-    let reader = pile.reader().context("open capability blob snapshot")?;
-    CapabilityProof::load(credential, |handle| {
-        let result: std::result::Result<Blob<SimpleArchive>, _> = reader.get(handle);
-        match result {
-            Ok(blob) => Ok(Some(blob)),
-            Err(GetBlobError::BlobNotFound) => Ok(None),
-            Err(error) => Err(anyhow!("read capability blob: {error}")),
-        }
-    })
-    .map_err(|error| {
-        anyhow!(
-            "load credential {} by exact blob handles: {error}",
-            format_credential(credential)
-        )
-    })
+    proof_id: CapabilityProofId,
+) -> Result<CapabilityProofBundle> {
+    let proof = pile
+        .proof(proof_id)
+        .map_err(|error| anyhow!("read capability proof store: {error}"))?
+        .with_context(|| {
+            format!(
+                "capability proof {} is not present",
+                format_proof_id(proof_id)
+            )
+        })?;
+    let reader = pile.reader().context("open capability claim snapshot")?;
+    let mut claims = Vec::with_capacity(proof.step_count());
+    for (step, handle) in proof.claim_handles().enumerate() {
+        let claim: Blob<SimpleArchive> = match reader.get(handle) {
+            Ok(claim) => claim,
+            Err(GetBlobError::BlobNotFound) => {
+                bail!(
+                    "capability proof {} is missing claim {step} ({})",
+                    format_proof_id(proof_id),
+                    hex::encode(handle.raw)
+                )
+            }
+            Err(error) => return Err(anyhow!("read capability claim {step}: {error}")),
+        };
+        claims.push(claim);
+    }
+    Ok(CapabilityProofBundle::new(proof, claims))
 }
 
-/// Store exact proof blobs and make the leaf a durable local ownership root.
-///
-/// Raw blobs alone are intentionally cache-like: a retained Pile rewrite or
-/// Yard collection may discard them. The private wallet is not an authority
-/// registry. It is an ordinary local collection whose signed data element is
-/// the leaf signature archive itself. Native COMMIT retention therefore walks
-/// signature -> claim -> parent signature and owns the complete resident
-/// ancestry without making team membership globally enumerable.
-pub(crate) fn store_capability_proof(
+/// Persist an accepted claim closure first, then publish its native proof root.
+pub(crate) fn store_capability_bundle(
     pile: &mut Pile,
-    wallet_key: &SigningKey,
-    proof: &CapabilityProof,
+    bundle: &CapabilityProofBundle,
 ) -> Result<()> {
-    let leaf = proof
-        .steps()
-        .last()
-        .context("cannot store an empty capability proof")?;
-    for (index, step) in proof.steps().iter().enumerate() {
-        // Rebuild from bytes before insertion so Pile never receives a blob
-        // carrying an unverified cached handle. Proof verification likewise
-        // hashes the bytes rather than trusting that cache.
-        let claim = Blob::<SimpleArchive>::new(step.claim().bytes.clone());
-        let expected_claim = claim.get_handle();
-        let actual_claim = pile
+    if bundle.claims().len() != bundle.proof().step_count() {
+        bail!(
+            "capability bundle has {} claims for {} proof steps",
+            bundle.claims().len(),
+            bundle.proof().step_count()
+        );
+    }
+    for (step, (claim, expected)) in bundle
+        .claims()
+        .iter()
+        .zip(bundle.proof().claim_handles())
+        .enumerate()
+    {
+        // Rebuild from bytes so no untrusted cached handle crosses into Pile.
+        let claim = Blob::<SimpleArchive>::new(claim.bytes.clone());
+        let actual = pile
             .put::<SimpleArchive, _>(claim)
-            .map_err(|error| anyhow!("store capability claim {index}: {error:?}"))?;
-        if actual_claim != expected_claim {
-            bail!("stored capability claim {index} under a different content handle");
-        }
-
-        let signature = Blob::<SimpleArchive>::new(step.signature().bytes.clone());
-        let expected_signature = signature.get_handle();
-        let actual_signature = pile
-            .put::<SimpleArchive, _>(signature)
-            .map_err(|error| anyhow!("store capability signature {index}: {error:?}"))?;
-        if actual_signature != expected_signature {
-            bail!("stored capability signature {index} under a different content handle");
+            .map_err(|error| anyhow!("store capability claim {step}: {error:?}"))?;
+        if actual != expected {
+            bail!(
+                "capability claim {step} hashes to {} instead of signed {}",
+                hex::encode(actual.raw),
+                hex::encode(expected.raw)
+            );
         }
     }
-
-    let wallet_name = CollectionName::new(CAPABILITY_WALLET_COLLECTION)
-        .expect("the static capability wallet name is valid");
-    let wallet = simplearchive_union::descriptor(
-        &wallet_name,
-        wallet_key.verifying_key(),
-        None,
-        reach::private(),
-    );
-    let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
-    simplearchive_union::publish_commit(pile, &wallet, leaf.signature(), &metadata, wallet_key)
-        .map_err(|error| anyhow!("retain capability proof in local wallet: {error}"))?;
-    Ok(())
+    pile.insert_proof(bundle.proof().clone())
+        .map_err(|error| anyhow!("store native capability proof: {error}"))
 }
 
 /// Load and verify the exact CONNECT proof used by `pile net`.
-pub(crate) fn resolve_connect_proof(
+pub(crate) fn resolve_connect_bundle(
     pile: &mut Pile,
     team_root: VerifyingKey,
-    credential: CapabilityBlobHandle,
+    proof_id: CapabilityProofId,
     expected_subject: VerifyingKey,
-) -> Result<CapabilityProof> {
-    let proof = load_capability_proof(pile, credential)?;
-    proof
-        .verify_claim(
+) -> Result<CapabilityProofBundle> {
+    let bundle = load_capability_bundle(pile, proof_id)?;
+    bundle
+        .verify(
             team_root,
             triblespace_core::clock::epoch_now(),
-            CapabilityClaim::new(
-                expected_subject,
-                connect_atom(team_root),
-                CapabilityMode::Invoke,
-            ),
+            expected_subject,
+            CapabilityRequest::new(connect_atom(team_root), CapabilityMode::Invoke),
         )
-        .map_err(|error| anyhow!("CONNECT credential rejected: {error}"))?;
-    encode_capability_proof(&proof)
+        .map_err(|error| anyhow!("CONNECT proof rejected: {error}"))?;
+    bundle
+        .to_bytes()
         .map_err(|error| anyhow!("CONNECT proof is not transport-portable: {error}"))?;
-    Ok(proof)
+    Ok(bundle)
 }
 
-fn write_invite(path: &Path, team_root: VerifyingKey, proof: &CapabilityProof) -> Result<()> {
-    let encoded = encode_capability_proof(proof)
-        .map_err(|error| anyhow!("encode capability proof: {error}"))?;
-    let mut bundle = Vec::with_capacity(TEAM_ROOT_BYTES + encoded.len());
-    bundle.extend_from_slice(&team_root.to_bytes());
-    bundle.extend_from_slice(&encoded);
-    fs::write(path, bundle).map_err(|error| anyhow!("write invite {}: {error}", path.display()))
+fn write_invite(path: &Path, bundle: &CapabilityProofBundle) -> Result<()> {
+    let encoded = bundle
+        .to_bytes()
+        .map_err(|error| anyhow!("encode capability proof bundle: {error}"))?;
+    fs::write(path, encoded).map_err(|error| anyhow!("write invite {}: {error}", path.display()))
 }
 
-fn read_invite(path: &Path) -> Result<(VerifyingKey, CapabilityProof)> {
+fn read_invite(path: &Path) -> Result<CapabilityProofBundle> {
     let file =
         fs::File::open(path).map_err(|error| anyhow!("open invite {}: {error}", path.display()))?;
-    let mut bundle = Vec::with_capacity(MAX_INVITE_BYTES + 1);
+    let mut bytes = Vec::with_capacity(MAX_INVITE_BYTES + 1);
     file.take((MAX_INVITE_BYTES + 1) as u64)
-        .read_to_end(&mut bundle)
+        .read_to_end(&mut bytes)
         .map_err(|error| anyhow!("read invite {}: {error}", path.display()))?;
-    if bundle.len() > MAX_INVITE_BYTES {
+    if bytes.len() > MAX_INVITE_BYTES {
         bail!("invite bundle exceeds the {MAX_INVITE_BYTES}-byte limit");
     }
-    if bundle.len() <= TEAM_ROOT_BYTES {
-        bail!("invite bundle is truncated");
-    }
-    let root_bytes: [u8; 32] = bundle[..TEAM_ROOT_BYTES]
-        .try_into()
-        .expect("a 32-byte prefix has a 32-byte array shape");
-    let team_root = VerifyingKey::from_bytes(&root_bytes)
-        .map_err(|error| anyhow!("invite has an invalid team root: {error}"))?;
-    let proof = decode_capability_proof(&bundle[TEAM_ROOT_BYTES..])
-        .map_err(|error| anyhow!("decode capability proof: {error}"))?;
-    Ok((team_root, proof))
+    let bundle = CapabilityProofBundle::from_bytes(&bytes)
+        .map_err(|error| anyhow!("decode capability proof bundle: {error}"))?;
+    Ok(bundle)
 }
 
-fn print_root_secret_warning() {
-    eprintln!("TEAM ROOT SECRET -- STORE OFFLINE");
-    eprintln!("Anyone holding it can issue independent root credentials for this team.");
+fn print_root_key_warning() {
+    eprintln!("TEAM ROOT KEY -- STORE OFFLINE");
+    eprintln!("Anyone holding it can issue independent root proofs for this team.");
 }
 
 fn run_create(
     pile_path: PathBuf,
     key_path: Option<PathBuf>,
+    root_key_path: Option<PathBuf>,
     valid_from: Option<Epoch>,
     valid_until: Option<Epoch>,
 ) -> Result<()> {
     let founder = load_or_generate_signing_key(key_path, &pile_path)?;
-    let team_root_key = fresh_signing_key()?;
+    let (root_key_path, team_root_key) = load_or_generate_root_key(root_key_path, &pile_path)?;
     let team_root = team_root_key.verifying_key();
-    let founder_step = CapabilityProofStep::issue(
-        &team_root_key,
-        CapabilityGrant::root(
-            founder.verifying_key(),
-            connect_atom(team_root),
-            CapabilityMode::InvokeAndDelegate,
-            validity(valid_from, valid_until)?,
-        ),
+    let claim = CapabilityClaim::root(
+        connect_atom(team_root),
+        CapabilityMode::InvokeAndDelegate,
+        validity(valid_from, valid_until)?,
     );
-    let proof = CapabilityProof::new(vec![founder_step]);
-    encode_capability_proof(&proof)
-        .map_err(|error| anyhow!("founder proof is not portable: {error}"))?;
-    with_pile(&pile_path, |pile| {
-        store_capability_proof(pile, &founder, &proof)
-    })?;
-    let credential = proof
-        .credential()
-        .expect("a one-step founder proof has one leaf credential");
+    let bundle = CapabilityProofBundle::issue_root(&team_root_key, claim, founder.verifying_key())
+        .map_err(|error| anyhow!("issue founder proof: {error}"))?;
+    with_pile(&pile_path, |pile| store_capability_bundle(pile, &bundle))?;
 
-    println!(
-        "team root pubkey:     {}",
-        hex::encode(team_root.to_bytes())
-    );
-    print_root_secret_warning();
-    println!(
-        "team root SECRET:     {}",
-        hex::encode(team_root_key.to_bytes())
-    );
-    println!("founder credential:  {}", format_credential(credential));
+    println!("team root pubkey: {}", hex::encode(team_root.to_bytes()));
+    print_root_key_warning();
+    println!("team root key:    {}", root_key_path.display());
+    println!("founder proof id: {}", format_proof_id(bundle.proof().id()));
     Ok(())
 }
 
@@ -432,89 +402,71 @@ fn run_invite(
     out: PathBuf,
 ) -> Result<()> {
     let team_root = parse_team_root(&team_root_text)?;
-    let parent_credential = parse_credential(&parent_text)?;
+    let parent_id = parse_proof_id(&parent_text)?;
     let issuer_key = load_existing_signing_key(key_path, &pile_path)?;
     let issuer = issuer_key.verifying_key();
     let invitee = parse_public_key(&invitee_text, "invitee public key")?;
     let child_validity = validity(valid_from, valid_until)?;
     let instant = triblespace_core::clock::epoch_now();
 
-    let proof = with_pile(&pile_path, |pile| {
-        let parent_proof = load_capability_proof(pile, parent_credential)?;
-        let parent = parent_proof
-            .verify_claim(
+    let bundle = with_pile(&pile_path, |pile| {
+        let parent_bundle = load_capability_bundle(pile, parent_id)?;
+        let parent = parent_bundle
+            .verify(
                 team_root,
                 instant,
-                CapabilityClaim::new(issuer, connect_atom(team_root), CapabilityMode::Delegate),
+                issuer,
+                CapabilityRequest::new(connect_atom(team_root), CapabilityMode::Delegate),
             )
-            .map_err(|error| anyhow!("parent credential rejected: {error}"))?;
-        if parent.credential() != parent_credential {
-            bail!("loaded proof does not end at the designated parent credential");
-        }
+            .map_err(|error| anyhow!("parent proof rejected: {error}"))?;
 
         let child_mode = if delegate {
             CapabilityMode::InvokeAndDelegate
         } else {
             CapabilityMode::Invoke
         };
-        if !parent.grant().mode().satisfies(child_mode) {
-            bail!("parent credential does not contain the requested child mode");
-        }
-
-        let child = CapabilityProofStep::issue(
-            &issuer_key,
-            CapabilityGrant::delegated(
-                parent_credential,
-                invitee,
-                connect_atom(team_root),
-                child_mode,
-                child_validity,
-            ),
+        let child = CapabilityClaim::delegated(
+            parent.claim_handle(),
+            connect_atom(team_root),
+            child_mode,
+            child_validity,
         );
-        let mut steps = parent_proof.steps().to_vec();
-        steps.push(child);
-        let proof = CapabilityProof::new(steps);
-        encode_capability_proof(&proof)
-            .map_err(|error| anyhow!("child proof is not portable: {error}"))?;
-        store_capability_proof(pile, &issuer_key, &proof)?;
-        Ok(proof)
+        let bundle = parent
+            .delegate(&issuer_key, child, invitee)
+            .map_err(|error| anyhow!("issue child proof: {error}"))?;
+        store_capability_bundle(pile, &bundle)?;
+        Ok(bundle)
     })?;
 
-    write_invite(&out, team_root, &proof)?;
-    let credential = proof
-        .credential()
-        .expect("an issued child proof has one leaf credential");
-    println!("issued credential:  {}", format_credential(credential));
-    println!("invite bundle:      {}", out.display());
-    println!("proof steps:        {}", proof.steps().len());
+    write_invite(&out, &bundle)?;
+    println!("issued proof id: {}", format_proof_id(bundle.proof().id()));
+    println!("invite bundle:   {}", out.display());
+    println!("proof steps:     {}", bundle.proof().step_count());
     Ok(())
 }
 
-fn run_join(pile_path: PathBuf, key_path: Option<PathBuf>, invite_path: PathBuf) -> Result<()> {
+fn run_join(
+    pile_path: PathBuf,
+    team_root_text: String,
+    key_path: Option<PathBuf>,
+    invite_path: PathBuf,
+) -> Result<()> {
     let local_key = load_existing_signing_key(key_path, &pile_path)?;
-    let (team_root, proof) = read_invite(&invite_path)?;
-    let verified = proof
-        .verify_claim(
+    let team_root = parse_team_root(&team_root_text)?;
+    let bundle = read_invite(&invite_path)?;
+    bundle
+        .verify(
             team_root,
             triblespace_core::clock::epoch_now(),
-            CapabilityClaim::new(
-                local_key.verifying_key(),
-                connect_atom(team_root),
-                CapabilityMode::Invoke,
-            ),
+            local_key.verifying_key(),
+            CapabilityRequest::new(connect_atom(team_root), CapabilityMode::Invoke),
         )
         .map_err(|error| anyhow!("invite proof rejected: {error}"))?;
+    with_pile(&pile_path, |pile| store_capability_bundle(pile, &bundle))?;
 
-    with_pile(&pile_path, |pile| {
-        store_capability_proof(pile, &local_key, &proof)
-    })?;
-
-    println!("team root:           {}", hex::encode(team_root.to_bytes()));
-    println!(
-        "accepted credential:  {}",
-        format_credential(verified.credential())
-    );
-    println!("proof steps:         {}", proof.steps().len());
+    println!("team root:        {}", hex::encode(team_root.to_bytes()));
+    println!("accepted proof:   {}", format_proof_id(bundle.proof().id()));
+    println!("proof steps:      {}", bundle.proof().step_count());
     Ok(())
 }
 
@@ -534,81 +486,86 @@ fn mode_label(mode: CapabilityMode) -> &'static str {
     }
 }
 
-fn print_grant(
-    grant: CapabilityGrant,
-    credential: CapabilityBlobHandle,
-    issuer: VerifyingKey,
-    indent: &str,
+fn print_claim(
+    claim: CapabilityClaim,
+    handle: triblespace_core::capability::CapabilityClaimHandle,
 ) {
-    println!("{indent}credential: {}", format_credential(credential));
-    println!("{indent}issuer:     {}", hex::encode(issuer.to_bytes()));
-    println!(
-        "{indent}subject:    {}",
-        hex::encode(grant.subject().to_bytes())
-    );
-    println!(
-        "{indent}action:     {}",
-        action_label(grant.atom().action())
-    );
-    println!(
-        "{indent}resource:   {}",
-        hex::encode(grant.atom().resource().into_bytes())
-    );
-    match grant.parent() {
-        Some(parent) => println!("{indent}parent:     {}", format_credential(parent)),
-        None => println!("{indent}parent:     root"),
+    println!("  claim:      {}", hex::encode(handle.raw));
+    match claim.parent() {
+        Some(parent) => println!("  parent:     {}", hex::encode(parent.raw)),
+        None => println!("  parent:     root"),
     }
-    println!("{indent}mode:       {}", mode_label(grant.mode()));
-    match grant.validity() {
+    println!("  action:     {}", action_label(claim.atom().action()));
+    println!(
+        "  resource:   {}",
+        hex::encode(claim.atom().resource().into_bytes())
+    );
+    println!("  mode:       {}", mode_label(claim.mode()));
+    match claim.validity() {
         Some(validity) => {
             let (lower, upper) = validity.bounds();
             println!(
-                "{indent}validity:   {}..={} TAI ns",
+                "  validity:   {}..={} TAI ns",
                 lower.to_tai_duration().total_nanoseconds(),
                 upper.to_tai_duration().total_nanoseconds()
             );
         }
-        None => println!("{indent}validity:   unbounded"),
+        None => println!("  validity:   unbounded"),
     }
 }
 
-fn run_show(pile_path: PathBuf, team_root_text: String, credential_text: String) -> Result<()> {
+fn run_show(pile_path: PathBuf, team_root_text: String, proof_text: String) -> Result<()> {
     let team_root = parse_team_root(&team_root_text)?;
-    let credential = parse_credential(&credential_text)?;
+    let proof_id = parse_proof_id(&proof_text)?;
     with_pile(&pile_path, |pile| {
-        let proof = load_capability_proof(pile, credential)?;
-        let leaf = proof
-            .steps()
-            .last()
-            .context("loaded capability proof is empty")?;
-        let leaf_grant = CapabilityGrant::from_blob(leaf.claim().clone())
-            .map_err(|error| anyhow!("decode leaf capability claim: {error}"))?;
-        let verified = proof
-            .verify_claim(
+        let bundle = load_capability_bundle(pile, proof_id)?;
+        let mut claims = bundle
+            .claims()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(step, blob)| {
+                CapabilityClaim::from_blob(blob)
+                    .map_err(|error| anyhow!("decode capability claim {step}: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let first = *claims.first().context("capability proof has no claims")?;
+        let mut effective_mode = first.mode();
+        for claim in &claims[1..] {
+            effective_mode = effective_mode
+                .meet(claim.mode())
+                .context("capability proof has an empty mode meet")?;
+        }
+        let required = if effective_mode.satisfies(CapabilityMode::Invoke) {
+            CapabilityMode::Invoke
+        } else {
+            CapabilityMode::Delegate
+        };
+        let verified = bundle
+            .verify(
                 team_root,
                 triblespace_core::clock::epoch_now(),
-                CapabilityClaim::new(
-                    leaf_grant.subject(),
-                    connect_atom(team_root),
-                    leaf_grant.mode(),
-                ),
+                bundle.proof().leaf_key(),
+                CapabilityRequest::new(connect_atom(team_root), required),
             )
-            .map_err(|error| anyhow!("credential proof rejected: {error}"))?;
-        if verified.credential() != credential {
-            bail!("loaded proof does not end at the designated credential");
-        }
+            .map_err(|error| anyhow!("capability proof rejected: {error}"))?;
 
-        println!("team root:  {}", hex::encode(team_root.to_bytes()));
-        println!("credential: {}", format_credential(credential));
-        println!("ancestry:   {} step(s), root to leaf", proof.steps().len());
-        let mut issuer = team_root;
-        for (level, step) in proof.steps().iter().enumerate() {
-            let grant = CapabilityGrant::from_blob(step.claim().clone())
-                .map_err(|error| anyhow!("decode capability claim at level {level}: {error}"))?;
+        println!("team root:      {}", hex::encode(team_root.to_bytes()));
+        println!("proof id:       {}", format_proof_id(proof_id));
+        println!(
+            "leaf principal:  {}",
+            hex::encode(verified.subject().to_bytes())
+        );
+        println!("effective mode: {}", mode_label(verified.effective_mode()));
+        println!("ancestry:       {} step(s), root to leaf", claims.len());
+        for (level, (claim, handle)) in claims
+            .drain(..)
+            .zip(bundle.proof().claim_handles())
+            .enumerate()
+        {
             println!();
             println!("level {level}:");
-            print_grant(grant, step.signature_handle(), issuer, "  ");
-            issuer = grant.subject();
+            print_claim(claim, handle);
         }
         Ok(())
     })
@@ -625,31 +582,38 @@ mod tests {
     }
 
     #[test]
-    fn local_wallet_retains_complete_proof_through_pile_rewrite() {
+    fn native_proof_retains_complete_claim_closure_through_pile_rewrite() {
         let root = key(1);
         let issuer = key(2);
         let member = key(3);
-        let root_step = CapabilityProofStep::issue(
-            &root,
-            CapabilityGrant::root(
+        let root_claim = CapabilityClaim::root(
+            connect_atom(root.verifying_key()),
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let root_bundle =
+            CapabilityProofBundle::issue_root(&root, root_claim, issuer.verifying_key()).unwrap();
+        let verified = root_bundle
+            .verify(
+                root.verifying_key(),
+                triblespace_core::clock::epoch_now(),
                 issuer.verifying_key(),
-                connect_atom(root.verifying_key()),
-                CapabilityMode::InvokeAndDelegate,
-                None,
-            ),
+                CapabilityRequest::new(
+                    connect_atom(root.verifying_key()),
+                    CapabilityMode::Delegate,
+                ),
+            )
+            .unwrap();
+        let leaf_claim = CapabilityClaim::delegated(
+            verified.claim_handle(),
+            connect_atom(root.verifying_key()),
+            CapabilityMode::Invoke,
+            None,
         );
-        let leaf_step = CapabilityProofStep::issue(
-            &issuer,
-            CapabilityGrant::delegated(
-                root_step.signature_handle(),
-                member.verifying_key(),
-                connect_atom(root.verifying_key()),
-                CapabilityMode::Invoke,
-                None,
-            ),
-        );
-        let proof = CapabilityProof::new(vec![root_step, leaf_step]);
-        let credential = proof.credential().expect("nonempty proof");
+        let bundle = verified
+            .delegate(&issuer, leaf_claim, member.verifying_key())
+            .unwrap();
+        let proof_id = bundle.proof().id();
 
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("source.pile");
@@ -659,7 +623,7 @@ mod tests {
         let mut source = Pile::open(&source_path).unwrap();
         let mut destination = Pile::open(&destination_path).unwrap();
 
-        store_capability_proof(&mut source, &issuer, &proof).unwrap();
+        store_capability_bundle(&mut source, &bundle).unwrap();
         source
             .rewrite_retained_into(
                 &mut destination,
@@ -668,17 +632,14 @@ mod tests {
             )
             .unwrap();
 
-        let retained = load_capability_proof(&mut destination, credential).unwrap();
-        assert_eq!(retained, proof);
+        let retained = load_capability_bundle(&mut destination, proof_id).unwrap();
+        assert_eq!(retained, bundle);
         retained
-            .verify_claim(
+            .verify(
                 root.verifying_key(),
                 triblespace_core::clock::epoch_now(),
-                CapabilityClaim::new(
-                    member.verifying_key(),
-                    connect_atom(root.verifying_key()),
-                    CapabilityMode::Invoke,
-                ),
+                member.verifying_key(),
+                CapabilityRequest::new(connect_atom(root.verifying_key()), CapabilityMode::Invoke),
             )
             .unwrap();
 

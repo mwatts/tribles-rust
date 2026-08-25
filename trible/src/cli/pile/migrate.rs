@@ -35,8 +35,8 @@ pub enum Command {
     /// selects the head, a later append-only blob snapshot validates everything
     /// it reaches, and only then are native records appended to that pile. A
     /// An omitted authority makes admission explicitly open. An authority-root
-    /// signer may bootstrap its own exact WRITE credential; any other signer
-    /// must designate an existing exact credential.
+    /// signer may bootstrap its own exact WRITE proof; any other signer must
+    /// designate an existing exact proof.
     BranchToCollection {
         /// Legacy branch to migrate, by exact name or 32-hex-character id.
         #[arg(long)]
@@ -50,10 +50,10 @@ pub enum Command {
         /// Optional capability trust root. Omit for explicitly open admission.
         #[arg(long)]
         authority: Option<String>,
-        /// Exact WRITE credential. Requires --authority; omit only when the
+        /// Exact WRITE proof id. Requires --authority; omit only when the
         /// signing key itself is the authority root.
         #[arg(long, requires = "authority")]
-        credential: Option<String>,
+        proof: Option<String>,
         /// Durable target signing-key file (64-hex-character seed).
         #[arg(long)]
         signing_key: PathBuf,
@@ -78,7 +78,7 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
             collection_name,
             namespace,
             authority,
-            credential,
+            proof,
             signing_key,
         } => branch_to_collection::run(
             pile_path,
@@ -86,7 +86,7 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
             collection_name,
             namespace,
             authority,
-            credential,
+            proof,
             signing_key,
         ),
         Command::Run { migration, dry_run } => {
@@ -218,11 +218,12 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
             .map_err(|e| anyhow!("reframe: {e}"))?;
         println!(
             "Reframed into {}:\n  blobs: {}\n  pin updates: {}\n  wants: {}\n  \
-             collection records: {}\n  dropped inert records: {}",
+             capability proofs: {}\n  collection records: {}\n  dropped inert records: {}",
             destination.display(),
             stats.blobs,
             stats.pin_updates,
             stats.wants,
+            stats.capability_proofs,
             stats.collection_records,
             stats.dropped_inert,
         );

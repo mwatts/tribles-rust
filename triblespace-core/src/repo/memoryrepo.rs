@@ -2,14 +2,18 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
+use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::selectors_match_record;
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::prelude::*;
+use crate::repo::proof::CapabilityProofStore;
 use crate::repo::{WantRequest, WantStore};
 
 use crate::inline::encodings::hash::Handle;
@@ -30,6 +34,68 @@ pub struct MemoryRepo {
     pub wants: HashSet<WantRequest>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: BTreeMap<Id, CollectionRecord>,
+    /// Canonical complete capability proofs keyed by exact-body content id.
+    capability_proofs: BTreeMap<CapabilityProofId, CapabilityProof>,
+}
+
+/// Failure while admitting a proof to [`MemoryRepo`].
+#[derive(Debug)]
+pub enum MemoryProofInsertError {
+    /// An infeasible BLAKE3 collision named different canonical proof bytes.
+    IdCollision { id: CapabilityProofId },
+}
+
+impl fmt::Display for MemoryProofInsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdCollision { id } => {
+                write!(f, "capability proof id {id:?} names different bytes")
+            }
+        }
+    }
+}
+
+impl Error for MemoryProofInsertError {}
+
+impl CapabilityProofStore for MemoryRepo {
+    type ProofsError = Infallible;
+    type InsertError = MemoryProofInsertError;
+    type ProofIter<'a> = std::vec::IntoIter<Result<CapabilityProof, Self::ProofsError>>;
+
+    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        Ok(self
+            .capability_proofs
+            .values()
+            .cloned()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    fn proof(
+        &mut self,
+        id: CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        Ok(self.capability_proofs.get(&id).cloned())
+    }
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        let id = proof.id();
+        match self.capability_proofs.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(proof);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get().as_bytes() == proof.as_bytes() =>
+            {
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(MemoryProofInsertError::IdCollision { id })
+            }
+        }
+    }
 }
 
 impl CollectionStore for MemoryRepo {
@@ -113,6 +179,17 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
                 }
             }
         }
+        for proof in self.capability_proofs.values() {
+            if proof.verify_signatures().is_err() {
+                continue;
+            }
+            for claim in proof.claim_handles() {
+                let claim: Inline<Handle<UnknownBlob>> = claim.transmute();
+                if crate::repo::BlobStoreList::contains_blob(&reader, claim).unwrap_or(false) {
+                    roots.retain_direct(claim);
+                }
+            }
+        }
         self.blobs
             .keep(handles.into_iter().chain(roots.expanded(&reader)));
     }
@@ -164,6 +241,13 @@ impl crate::repo::StorageClose for MemoryRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anybytes::Bytes;
+    use ed25519_dalek::SigningKey;
+
+    use crate::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
     use crate::collection::reach;
 
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
@@ -171,6 +255,82 @@ mod tests {
 
     fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
         Inline::new([byte; 32])
+    }
+
+    #[test]
+    fn capability_proofs_are_an_idempotent_set_and_root_verified_claims() {
+        use crate::repo::{BlobStore, BlobStoreGet, BlobStoreKeep};
+
+        let mut repo = MemoryRepo::default();
+        let root = SigningKey::from_bytes(&[61; 32]);
+        let leaf = SigningKey::from_bytes(&[62; 32]);
+        let action = CapabilityAction::new(Id::new([63; 16]).unwrap());
+        let claim = CapabilityClaim::root(
+            CapabilityAtom::new(action, CapabilityResource::new([64; 32])),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let bundle = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key()).unwrap();
+        let proof = bundle.proof().clone();
+        let claim_handle = repo
+            .put::<crate::blob::encodings::simplearchive::SimpleArchive, _>(
+                bundle.claims()[0].clone(),
+            )
+            .unwrap();
+
+        repo.insert_proof(proof.clone()).unwrap();
+        repo.insert_proof(proof.clone()).unwrap();
+        assert_eq!(repo.proof(proof.id()).unwrap(), Some(proof.clone()));
+        assert_eq!(repo.proof(Inline::new([0; 32])).unwrap(), None);
+        assert_eq!(
+            repo.proofs()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![proof]
+        );
+
+        repo.keep(std::iter::empty());
+        let reader = repo.reader().unwrap();
+        assert!(reader
+            .get::<Blob<crate::blob::encodings::simplearchive::SimpleArchive>, _>(claim_handle)
+            .is_ok());
+    }
+
+    #[test]
+    fn capability_proof_claim_roots_do_not_follow_coincident_resource_handles() {
+        use crate::repo::{BlobStore, BlobStoreGet, BlobStoreKeep};
+
+        let mut repo = MemoryRepo::default();
+        let coincident_resource = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(b"opaque resource".to_vec()))
+            .unwrap();
+        let root = SigningKey::from_bytes(&[65; 32]);
+        let leaf = SigningKey::from_bytes(&[66; 32]);
+        let claim = CapabilityClaim::root(
+            CapabilityAtom::new(
+                CapabilityAction::new(Id::new([67; 16]).unwrap()),
+                CapabilityResource::new(coincident_resource.raw),
+            ),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let bundle = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key()).unwrap();
+        let claim_handle = repo
+            .put::<crate::blob::encodings::simplearchive::SimpleArchive, _>(
+                bundle.claims()[0].clone(),
+            )
+            .unwrap();
+        repo.insert_proof(bundle.proof().clone()).unwrap();
+
+        repo.keep(std::iter::empty());
+        let reader = repo.reader().unwrap();
+        assert!(reader
+            .get::<Blob<crate::blob::encodings::simplearchive::SimpleArchive>, _>(claim_handle)
+            .is_ok());
+        assert!(reader
+            .get::<Blob<UnknownBlob>, _>(coincident_resource)
+            .is_err());
     }
 
     /// Wants resolve last-writer-wins: want → listed, unwant →

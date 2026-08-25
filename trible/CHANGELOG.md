@@ -10,19 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Split legacy branch migration naming from admission: `--namespace` now only
   names the target, omission of `--authority` selects explicit open admission,
-  and controlled targets consume one exact blob-native WRITE credential. An
-  authority-root signer may bootstrap and retain its own exact root proof.
-- Replaced the expiring scoped-capability and intermediate enumerable-ledger
-  workflows with exact blob-native credentials. `team create`, `invite`,
-  `join`, and `show` issue, carry, retain, and inspect one designated CONNECT
-  proof; there is no global `list`, roster scan, or ambient authority lookup.
-  Pending requests, approval, renewal, retraction, permission scopes, ambient
-  `TRIBLE_TEAM_*` configuration, and zero sentinels were removed. Accepted
-  proof ancestry is retained through conservative GC by a private local
-  capability-wallet collection which grants no authority itself.
+  and controlled targets consume one exact native WRITE proof plus its named
+  claims. An authority-root signer may bootstrap and store its own root proof.
+- Use direct proof IDs throughout `team create`, `invite`, `join`, and `show`.
+  Keyless claims hold semantic restrictions, native `K0 (S C K)+` proofs hold
+  principal delegation, and invites carry the complete bounded proof bundle.
+  Accepted claims and proofs are stored directly and remain exactly selectable
+  without an auxiliary retention collection. Team roots live in private,
+  durable key files instead of depending on secret material printed once to a
+  terminal. `team join` takes the expected team root separately from the
+  bundle, so an invitation can never nominate its own trust root.
 - `pile net status` and `pile net sync` now require an explicit CONNECT trust
-  root and local leaf credential, reconstruct that exact bounded proof from the
-  pile, and pass it directly to transport authentication. Gossip uses a
+  root and local proof ID, load that exact proof and its claims from the pile,
+  and pass a complete bundle to transport authentication. Gossip uses a
   separate explicit topic and is never inferred from authorization identity.
 
 ## [0.41.4] - 2026-05-17

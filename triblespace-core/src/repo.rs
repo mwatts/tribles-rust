@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
-//! Content-addressed blob storage, collection records, durable wants, and
-//! read-only access to legacy named-pin snapshots.
+//! Content-addressed blob storage, complete capability proofs, collection
+//! records, durable wants, and read-only access to legacy named-pin snapshots.
 //!
 //! Collections are the mutable-history replacement. Legacy pin and commit
 //! encodings remain readable so existing piles can be migrated and retained,
@@ -21,6 +21,9 @@ pub mod memoryrepo;
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
+/// Grow-only native storage for complete capability proofs.
+pub mod proof;
+pub use proof::CapabilityProofStore;
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 

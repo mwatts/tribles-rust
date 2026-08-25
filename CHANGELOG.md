@@ -19,34 +19,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SimpleArchive` union collection. The command requires the target collection
   name, public-key namespace, and signing key explicitly; admission is open
   unless an independent `--authority` trust root is supplied. A delegated
-  signer designates one exact local `--credential`, while a signer equal to the
-  trust root may bootstrap its own deterministic WRITE/Invoke proof. The
-  command validates the branch head, complete reachable commit history, and
+  signer designates one exact local `--proof`, while a signer equal to the
+  trust root may bootstrap its own deterministic WRITE/Invoke claim and proof.
+  The command validates the branch head, complete reachable commit history, and
   target admission before writing; preserves each authored commit's exact
   `repo::content` and `metadata::archive`; skips verified contentless merges;
-  resolves both current and historical branch-name encodings; retains accepted
-  proof ancestry in the private capability wallet; and reports every
+  resolves both current and historical branch-name encodings; stores accepted
+  claim blobs and native proofs directly; and reports every
   source-to-target mapping, including deterministic many-to-one collapse and
   idempotent replays.
 
-- Cut `trible team` over to exact blob-native capability credentials. `create`
-  stores a root-signed founder CONNECT claim in invoke-and-delegate mode;
-  `invite` loads one exact delegating parent signature handle and exports the
-  extended proof; `join` verifies the root, subject, CONNECT atom, minimum
-  invocation mode, and explicit current time before storing the exact ordinary
-  blobs; and `show` follows one designated leaf. The authority resolver and
-  global `list` surface are gone. Optional paired RFC 3339 bounds map to the
-  kernel's inclusive validity interval. `pile net` likewise selects an exact
-  `--credential`, while `sync` requires a separate explicit `--gossip-topic`.
+- Add direct team proofs to `trible team`. `create` stores a keyless founder
+  CONNECT claim and native `K0 (S C K)+` proof; `invite` loads one exact parent
+  proof ID and exports the extended portable bundle; `join` verifies the root,
+  expected leaf, CONNECT atom, mode meet, and explicit current time against a
+  separately supplied trust root before storing its claims and proof; and
+  `show` selects one proof by ID. Optional
+  paired RFC 3339 bounds map to inclusive validity intervals. `pile net`
+  likewise selects an exact `--proof`, while `sync` requires a separate
+  explicit `--gossip-topic`.
 
 ### Changed
 
 - Replace the high-level `Collection` facade's ambient, store-enumerated
   authority resolution with explicit admission. `CollectionAdmission::Open`
   admits every strictly verified signer; capability admission accepts owned
-  `CapabilityPresentation`s and fails loud unless every proof verifies at one
-  operation-wide clock instant against its trust root, expected leaf subject,
-  and exact `ACTION_WRITE`/collection atom. The admission choice determines the
+  `CapabilityPresentation`s pairing an expected leaf with a complete proof
+  bundle, and fails loud unless every bundle verifies at one operation-wide
+  clock instant against its trust root and exact `ACTION_WRITE`/collection atom.
+  The admission choice determines the
   descriptor's optional authority fact, empty capability admission denies all
   writes and yields an empty ticket, and newly supplied proofs can expose
   already-resident foreign commits without publishing new collection state.
@@ -78,15 +79,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed, while immutable legacy pin snapshots remain documented only for
   diagnosis, retention, and explicit migration.
 
-- Replace enumerable authority collections with blob-native capability trees.
-  Each proof carries only the exact root-to-leaf canonical claim/signature blob
-  pairs needed for one externally supplied trust root, explicit epoch, subject,
-  action, resource, and invocation/delegation mode. Pile-sync moves to ALPN v7
-  with a bounded v2 carrier while the kernel itself remains unbounded, verifies
-  CONNECT for the TLS peer on the trust root's exact 32 public-key bytes, and
-  closes authenticated connections after the proof's effective inclusive upper
-  bound. `PeerConfig::gossip_topic` is now an independent optional 32-byte
-  rendezvous choice rather than a topology inferred from authorization.
+- Add the clean direct capability kernel. Keyless canonical claim blobs carry
+  exact action/resource, mode, validity, and parent-claim restrictions; a
+  bounded native `K0 (S C K)+` proof binds issuer, claim handle, and delegate at
+  every edge and is addressed by BLAKE3 over its exact bytes. Verification
+  takes an external trust root, expected leaf, explicit epoch, and request, and
+  computes the claims' meet without storage discovery. Pile-sync moves to ALPN
+  v8 and carries one self-contained proof bundle in the first `OP_AUTH` stream.
+  Proof records are a native grow-only set with exact lookup and direct claim
+  rooting; their presence grants no authority and creates no implicit gossip or
+  WANT. `PeerConfig::gossip_topic` remains an independent rendezvous choice.
 
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.

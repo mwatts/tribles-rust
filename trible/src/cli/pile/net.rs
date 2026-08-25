@@ -63,7 +63,7 @@ pub enum Command {
     },
     /// Resolve and show the exact CONNECT proof this node would present.
     Status {
-        /// Pile containing the credential's exact claim/signature blobs.
+        /// Pile containing the native proof and its exact claim closure.
         pile: PathBuf,
         /// Path to the node's signing key.
         #[arg(long)]
@@ -71,9 +71,9 @@ pub enum Command {
         /// Team root public key (32-byte hex).
         #[arg(long)]
         team_root: String,
-        /// Exact CONNECT credential (32-byte leaf signature-blob handle).
+        /// Exact CONNECT proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        credential: String,
+        proof: String,
     },
     /// Sync with peers using explicit authentication and gossip identities.
     Sync {
@@ -85,9 +85,9 @@ pub enum Command {
         /// Team root public key (32-byte hex).
         #[arg(long)]
         team_root: String,
-        /// Exact CONNECT credential (32-byte leaf signature-blob handle).
+        /// Exact CONNECT proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        credential: String,
+        proof: String,
         /// Exact collection-evidence gossip topic (32-byte hex).
         #[arg(long)]
         gossip_topic: String,
@@ -135,14 +135,14 @@ pub fn run(cmd: Command) -> Result<()> {
             pile,
             key,
             team_root,
-            credential,
-        } => run_status(pile, key, team_root, credential),
+            proof,
+        } => run_status(pile, key, team_root, proof),
         Command::Sync {
             pile,
             peers,
             key,
             team_root,
-            credential,
+            proof,
             gossip_topic,
             read_only,
             write_only,
@@ -163,7 +163,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 peers,
                 key,
                 team_root,
-                credential,
+                proof,
                 gossip_topic,
                 direction,
                 duration,
@@ -193,17 +193,17 @@ fn run_status(
     pile_path: PathBuf,
     key_path: Option<PathBuf>,
     team_root_text: String,
-    credential_text: String,
+    proof_text: String,
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
     let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
-    let credential = crate::cli::team::parse_credential(&credential_text)?;
+    let proof_id = crate::cli::team::parse_proof_id(&proof_text)?;
     let mut pile = open_pile(&pile_path)?;
-    let proof = match crate::cli::team::resolve_connect_proof(
+    let bundle = match crate::cli::team::resolve_connect_bundle(
         &mut pile,
         team_root,
-        credential,
+        proof_id,
         key.verifying_key(),
     ) {
         Ok(proof) => proof,
@@ -217,8 +217,8 @@ fn run_status(
 
     println!("node:        {public}");
     println!("team_root:   {}", hex::encode(team_root.to_bytes()));
-    println!("credential:  {}", hex::encode(credential.raw));
-    println!("proof_steps: {}", proof.steps().len());
+    println!("proof_id:    {}", hex::encode(proof_id.raw));
+    println!("proof_steps: {}", bundle.proof().step_count());
     println!("authorization: CONNECT accepted");
     Ok(())
 }
@@ -231,7 +231,7 @@ fn run_sync(
     peer_strs: Vec<String>,
     key_path: Option<PathBuf>,
     team_root_text: String,
-    credential_text: String,
+    proof_text: String,
     gossip_topic_text: String,
     direction: SyncDirection,
     duration: Option<u64>,
@@ -249,12 +249,12 @@ fn run_sync(
     // Repository workspace nor mutable branch mirrors.
     let mut pile = open_pile(&pile_path)?;
     let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
-    let credential = crate::cli::team::parse_credential(&credential_text)?;
+    let proof_id = crate::cli::team::parse_proof_id(&proof_text)?;
     let gossip_topic = parse_gossip_topic(&gossip_topic_text)?;
-    let connect_proof = match crate::cli::team::resolve_connect_proof(
+    let connect_proof = match crate::cli::team::resolve_connect_bundle(
         &mut pile,
         team_root,
-        credential,
+        proof_id,
         key.verifying_key(),
     ) {
         Ok(proof) => proof,

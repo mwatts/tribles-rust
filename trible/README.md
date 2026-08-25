@@ -80,12 +80,12 @@ trible pile migrate <PILE> branch-to-collection \
 This is an explicit compatibility operation over an immutable legacy pin
 snapshot. `--namespace` names the target but grants no authority; omission of
 authorization flags selects explicitly open admission. For controlled
-admission, pass `--authority <TRUST_ROOT> --credential <LEAF_HANDLE>`. The
-credential must prove exact WRITE/Invoke for the signing key and target before
-target bytes are staged. The credential may be omitted only when the signing
-key is the authority root, in which case the command mints, stores, retains,
-and prints the exact root proof. The current CLI does not create, advance,
-merge, or delete branches.
+admission, pass `--authority <TRUST_ROOT> --proof <PROOF_ID>`. The exact native
+proof and its named claim blobs must prove WRITE/Invoke for the signing key and
+target before target bytes are staged. The proof may be omitted only when the
+signing key is the authority root, in which case the command mints, stores, and
+prints the exact root proof. The current CLI does not create, advance, merge,
+or delete branches.
 
 #### Blobs
 
@@ -113,33 +113,28 @@ descriptions.
 Built on `triblespace-net` (iroh QUIC + DHT + gossip). Every connection
 authenticates with an exact CONNECT capability proof rooted at the team's
 public key; see *Team capabilities* below. Runtime configuration is explicit:
-the local pile must contain the exact claim/signature chain named by
-`--team-root` and `--credential`. Authentication identity and gossip
-rendezvous are independent inputs.
+the local pile must contain the native proof selected by `--proof` and every
+claim blob it names. Authentication identity and gossip rendezvous are
+independent inputs.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
-- `pile net status <PILE> --team-root HEX --credential HANDLE [--key PATH]` — load the designated credential by exact blob handle, reconstruct and verify its CONNECT proof for the local key at the current time, and print the authentication configuration.
-- `pile net sync <PILE> --team-root HEX --credential HANDLE --gossip-topic HEX [--peers ID,...] [--key PATH]` — long-running collection-evidence sync. `--team-root` selects the CONNECT trust root and exact resource; the separately required `--gossip-topic` selects rendezvous without inference or fallback. The designated credential must invoke CONNECT for the local key. Collection records converge by set union, while referenced blobs and operation receipts stay lazy until requested by durable wants. Use `--read-only` or `--write-only` for directional operation and `--no-lazy` to suppress want reconciliation.
+- `pile net status <PILE> --team-root HEX --proof ID [--key PATH]` — load the exact native proof and its named claims, verify CONNECT for the local key at the current time, and print the authentication configuration.
+- `pile net sync <PILE> --team-root HEX --proof ID --gossip-topic HEX [--peers ID,...] [--key PATH]` — long-running collection-evidence sync. `--team-root` selects the CONNECT trust root and exact resource; the separately required `--gossip-topic` selects rendezvous without inference or fallback. The proof must invoke CONNECT for the local key. Collection records converge by set union, while referenced blobs and operation receipts stay lazy until requested by durable wants. Use `--read-only` or `--write-only` for directional operation and `--no-lazy` to suppress want reconciliation.
 
 ### Team capabilities
 
 A team is identified by an Ed25519 trust-root public key, whose exact 32 bytes
-are also its CONNECT resource. Each capability step is one canonical claim blob
-and one signature blob. A claim names one subject, exact action/resource atom,
-invoke/delegate mode, optional parent signature handle, and optional inclusive
-validity interval. Proofs follow those handles from one designated leaf; there
-is no authority collection, resolver, global membership registry, or list
-operation. An invite carries the complete bounded root-to-leaf proof needed for
-standalone verification. `create`, `invite`, and `join` also commit the chosen
-leaf signature archive to a private local `capability-wallet` collection. That
-collection is not team authority or a global roster; it is the node's durable
-ownership decision, so retained rewrites preserve the complete referenced
-proof ancestry.
+are also its CONNECT resource. Semantic restrictions are keyless canonical
+claim blobs linked by parent claim handles. Principal delegation is one native
+`K0 (S C K)+` proof whose signatures bind issuer key, exact claim handle, and
+delegate key. Its BLAKE3 digest is the proof ID used for exact lookup. An invite
+carries the complete proof and ordered claims required for standalone
+verification.
 
-- `team create --pile PATH [--key KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — mint a team root, issue the founder CONNECT in `invoke+delegate` mode, store and locally retain the exact proof, and print the root public key, offline root secret, and founder credential handle.
-- `team invite --pile PATH --team-root HEX --parent HANDLE --key ISSUER --invitee HEX [--delegate] [--valid-from RFC3339 --valid-until RFC3339] --out FILE` — load one exact resident parent, verify its delegation capability at the current time, issue and store the child blobs, and write a portable proof bundle. Without `--delegate`, the child may connect but cannot invite.
-- `team join --pile PATH --key INVITEE --invite FILE` — verify the bundle's exact root, subject, CONNECT atom, minimum invoke mode, and current validity before storing and locally retaining its proof idempotently. It prints the accepted leaf credential.
-- `team show --pile PATH --team-root HEX --credential HANDLE` — load, verify, and print the exact root-to-leaf ancestry of one designated credential.
+- `team create --pile PATH [--key KEY_PATH] [--root-key ROOT_KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — initialize a durable offline team-root key, issue the founder CONNECT in `invoke+delegate` mode, store its claim and native proof, and print the root public key, root-key path, and founder proof ID.
+- `team invite --pile PATH --team-root HEX --parent-proof ID --key ISSUER --invitee HEX [--delegate] [--valid-from RFC3339 --valid-until RFC3339] --out FILE` — load one exact resident proof, verify its current delegation capability, extend it for the invitee, and write a portable proof bundle. Without `--delegate`, the child may connect but cannot invite.
+- `team join --pile PATH --team-root HEX --key INVITEE --invite FILE` — verify the bundle against the externally supplied team root, expected leaf, exact CONNECT atom, minimum invoke mode, and current validity before storing its claims and native proof idempotently. It prints the accepted proof ID.
+- `team show --pile PATH --team-root HEX --proof ID` — load, verify, and print one exact proof and its claim ancestry.
 
 ### Work with remote stores
 

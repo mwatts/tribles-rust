@@ -1,5 +1,5 @@
-//! Generational collection of piles for lazy-retention blob storage and a
-//! generation-independent native collection-record union.
+//! Generational collection of piles for lazy-retention blob storage plus
+//! generation-independent native collection-record and complete-proof unions.
 //!
 //! A [`Yard`](crate::repo::yard::Yard) keeps an ordered young-to-old sequence of [`Pile`](crate::repo::pile::Pile)
 //! generations. Writes land in the youngest generation, reads search the union
@@ -21,6 +21,7 @@ use anybytes::Bytes;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
+use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
@@ -28,8 +29,10 @@ use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use super::pile::{
-    CollectionInsertError, GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError,
+    CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError, Pile, PileReader,
+    PileWriteError, ReadError,
 };
+use super::proof::CapabilityProofStore;
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     RetentionRoots, StorageClose, TransferError, WantRequest, WantStore,
@@ -390,11 +393,12 @@ impl Yard {
     /// themselves; recursive roots retain their resident descendants. Callers
     /// must supply the same policy on every later collection pass for the
     /// corresponding data to remain live. Strictly verified native collection
-    /// commits add their resident data and metadata as recursive roots;
-    /// invalid commits authenticate nothing, dangling dependencies remain for
-    /// later synchronization, and unsigned equations add no roots. Pass an
-    /// empty [`RetentionRoots`] explicitly when verified commits are the only
-    /// desired strong roots.
+    /// commits add their resident data and metadata as recursive roots, and
+    /// signature-valid complete proofs add their resident claim handles.
+    /// Invalid evidence authenticates nothing, dangling dependencies remain
+    /// for later synchronization, and unsigned equations add no roots. Pass an
+    /// empty [`RetentionRoots`] explicitly when native evidence supplies the
+    /// only desired strong roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
         let opaque_records = self
             .opaque_record_count()
@@ -407,6 +411,9 @@ impl Yard {
         let retention = self
             .retention_with_native_commits(retention)
             .map_err(YardCollectError::CollectionRecords)?;
+        let retention = self
+            .retention_with_capability_proofs(&retention)
+            .map_err(YardCollectError::CapabilityProofs)?;
         let reader = self.reader().map_err(YardCollectError::Reader)?;
         let strong_keep = self.strong_keep_set(&reader, &retention);
         let present = reader.live_set();
@@ -431,7 +438,7 @@ impl Yard {
     /// Strong survivors descend when a level exceeds its strong budget. The
     /// whole surviving tier moves together; wanted survivors remain evictable
     /// under the want budget after they descend. Pass an empty
-    /// [`RetentionRoots`] explicitly when verified commits are the only
+    /// [`RetentionRoots`] explicitly when native evidence supplies the only
     /// desired strong roots.
     pub fn compact(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
         self.collect(retention)?;
@@ -442,6 +449,9 @@ impl Yard {
             let retention = self
                 .retention_with_native_commits(retention)
                 .map_err(YardCollectError::CollectionRecords)?;
+            let retention = self
+                .retention_with_capability_proofs(&retention)
+                .map_err(YardCollectError::CapabilityProofs)?;
             let reader = self.reader().map_err(YardCollectError::Reader)?;
             let strong_keep = self.strong_keep_set(&reader, &retention);
 
@@ -521,10 +531,10 @@ impl Yard {
     /// generation's live PATCH set, so evicted blobs stop being readable through
     /// Yard readers, but they do not mutate the underlying append-only pile
     /// files. `reclaim` is the explicit physical step. For each generation it
-    /// writes the current live handles and every native collection record to a
-    /// sibling temporary pile, closes both piles, atomically renames the
-    /// temporary file over the original on the same filesystem, and reopens
-    /// the generation.
+    /// writes the current live handles, every native collection record, and
+    /// every canonical complete proof to a sibling temporary pile, closes both
+    /// piles, atomically renames the temporary file over the original on the
+    /// same filesystem, and reopens the generation.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         let opaque_records = self.opaque_record_count().map_err(YardReclaimError::Pile)?;
         if opaque_records != 0 {
@@ -632,6 +642,37 @@ impl Yard {
         Ok(combined)
     }
 
+    /// Add resident claim ownership edges carried by strictly signature-valid
+    /// complete proofs. Structurally canonical but invalid proofs remain
+    /// replicated evidence and authenticate no lifetime roots.
+    fn retention_with_capability_proofs(
+        &mut self,
+        retention: &RetentionRoots,
+    ) -> Result<RetentionRoots, YardCapabilityProofError> {
+        let mut combined = retention.clone();
+        let proofs = self
+            .proofs()?
+            .collect::<Result<Vec<_>, YardCapabilityProofError>>()?;
+        for proof in proofs {
+            if proof.verify_signatures().is_err() {
+                continue;
+            }
+            for claim in proof.claim_handles() {
+                let claim = Inline::<Handle<UnknownBlob>>::new(claim.raw);
+                let live = self.generations.iter().any(|generation| {
+                    generation
+                        .segments
+                        .iter()
+                        .any(|segment| segment.live.get(&claim.raw).is_some())
+                });
+                if live {
+                    combined.retain_direct(claim);
+                }
+            }
+        }
+        Ok(combined)
+    }
+
     fn strong_keep_set(&self, reader: &YardReader, retention: &RetentionRoots) -> HandleSet {
         let mut keep = HandleSet::new();
         // Explicit policy roots remain strong even if the same handle or an
@@ -707,6 +748,116 @@ impl Error for YardCollectionRecordsError {
             Self::Pile(error) => Some(error),
             Self::IdCollision { .. } => None,
         }
+    }
+}
+
+/// Deterministic owned snapshot of complete proofs visible across a yard.
+pub struct YardCapabilityProofIter {
+    inner: std::collections::btree_map::IntoValues<[u8; 32], CapabilityProof>,
+}
+
+impl Iterator for YardCapabilityProofIter {
+    type Item = Result<CapabilityProof, YardCapabilityProofError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+}
+
+/// Failure while replaying the complete-proof union of a yard.
+#[derive(Debug)]
+pub enum YardCapabilityProofError {
+    /// One generation could not refresh or decode its pile.
+    Pile(ReadError),
+    /// An infeasible BLAKE3 collision named different canonical proof bytes.
+    IdCollision { id: CapabilityProofId },
+}
+
+impl fmt::Display for YardCapabilityProofError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pile(error) => write!(f, "failed to replay yard proof records: {error}"),
+            Self::IdCollision { id } => write!(
+                f,
+                "capability proof id {} names different bytes across generations",
+                hex::encode_upper(id.raw)
+            ),
+        }
+    }
+}
+
+impl Error for YardCapabilityProofError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Pile(error) => Some(error),
+            Self::IdCollision { .. } => None,
+        }
+    }
+}
+
+impl CapabilityProofStore for Yard {
+    type ProofsError = YardCapabilityProofError;
+    type InsertError = CapabilityProofInsertError;
+    type ProofIter<'a> = YardCapabilityProofIter;
+
+    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        let mut proofs = BTreeMap::<[u8; 32], CapabilityProof>::new();
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                for proof in segment
+                    .pile_mut()
+                    .proofs()
+                    .map_err(YardCapabilityProofError::Pile)?
+                {
+                    let proof = proof.map_err(YardCapabilityProofError::Pile)?;
+                    let id = proof.id();
+                    match proofs.entry(id.raw) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(proof);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if entry.get().as_bytes() == proof.as_bytes() => {}
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            return Err(YardCapabilityProofError::IdCollision { id });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(YardCapabilityProofIter {
+            inner: proofs.into_values(),
+        })
+    }
+
+    fn proof(
+        &mut self,
+        id: CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        let mut found: Option<CapabilityProof> = None;
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                let Some(candidate) = segment
+                    .pile_mut()
+                    .proof(id)
+                    .map_err(YardCapabilityProofError::Pile)?
+                else {
+                    continue;
+                };
+                match &found {
+                    None => found = Some(candidate),
+                    Some(existing) if existing.as_bytes() == candidate.as_bytes() => {}
+                    Some(_) => return Err(YardCapabilityProofError::IdCollision { id }),
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        self.generations[0]
+            .active_mut()
+            .pile_mut()
+            .insert_proof(proof)
     }
 }
 
@@ -1132,6 +1283,11 @@ fn reclaim_generation(
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
+    let capability_proofs = old_pile
+        .proofs()
+        .map_err(YardReclaimError::Pile)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(YardReclaimError::Pile)?;
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
@@ -1151,6 +1307,11 @@ fn reclaim_generation(
         new_pile
             .insert(record)
             .map_err(YardReclaimError::CollectionRecord)?;
+    }
+    for proof in capability_proofs {
+        new_pile
+            .insert_proof(proof)
+            .map_err(YardReclaimError::CapabilityProof)?;
     }
     new_pile.close().map_err(YardReclaimError::Close)?;
     drop(reader);
@@ -1264,6 +1425,7 @@ pub enum YardCollectError {
         count: usize,
     },
     CollectionRecords(YardCollectionRecordsError),
+    CapabilityProofs(YardCapabilityProofError),
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
     Flush(super::pile::FlushError),
     Reclaim(YardReclaimError),
@@ -1280,6 +1442,9 @@ impl fmt::Display for YardCollectError {
             ),
             Self::CollectionRecords(err) => {
                 write!(f, "failed to replay yard collection records: {err}")
+            }
+            Self::CapabilityProofs(err) => {
+                write!(f, "failed to replay yard capability proofs: {err}")
             }
             Self::Transfer(err) => write!(f, "failed to compact yard generation: {err}"),
             Self::Flush(err) => write!(f, "failed to flush yard generation pile: {err}"),
@@ -1323,6 +1488,7 @@ pub enum YardReclaimError {
     },
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
+    CapabilityProof(CapabilityProofInsertError),
     Close(super::pile::FlushError),
     WantMarkers(std::io::Error),
     /// A generation rewrite failed (`primary`) and the subsequent
@@ -1351,6 +1517,9 @@ impl fmt::Display for YardReclaimError {
             Self::CollectionRecord(err) => {
                 write!(f, "failed to copy a yard collection record: {err}")
             }
+            Self::CapabilityProof(err) => {
+                write!(f, "failed to copy a yard capability proof: {err}")
+            }
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WantMarkers(err) => {
                 write!(f, "failed to re-record want markers: {err}")
@@ -1371,6 +1540,10 @@ mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::encodings::simplearchive::SimpleArchive;
+    use crate::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
         empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionMerge,
@@ -1524,6 +1697,77 @@ mod tests {
                 .unwrap(),
             expected
         );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn capability_proofs_union_generations_root_claims_and_survive_reclaim() {
+        let config = YardConfig::default();
+        let (_dir, paths, mut yard) = yard_with_paths(2, config);
+        let attachment = yard
+            .put::<RawBytes, _>(raw_blob(b"proof-owned attachment"))
+            .unwrap();
+        let root = SigningKey::from_bytes(&[71; 32]);
+        let leaf = SigningKey::from_bytes(&[72; 32]);
+        let claim = CapabilityClaim::root(
+            CapabilityAtom::new(
+                CapabilityAction::new(pin_id(73)),
+                CapabilityResource::new(attachment.raw),
+            ),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let bundle = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key()).unwrap();
+        let proof = bundle.proof().clone();
+        let claim_handle = yard
+            .put::<SimpleArchive, _>(bundle.claims()[0].clone())
+            .unwrap();
+
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .insert_proof(proof.clone())
+            .unwrap();
+        yard.insert_proof(proof.clone()).unwrap();
+        assert_eq!(yard.proof(proof.id()).unwrap(), Some(proof.clone()));
+        assert_eq!(yard.proof(Inline::new([0; 32])).unwrap(), None);
+        assert_eq!(
+            yard.proofs()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![proof.clone()]
+        );
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        let reader = yard.reader().unwrap();
+        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_err());
+        assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
+        drop(reader);
+
+        yard.reclaim().unwrap();
+        assert_eq!(
+            yard.proofs()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![proof.clone()]
+        );
+        yard.close().unwrap();
+
+        let mut reopened = Yard::open(&paths, config).unwrap();
+        assert_eq!(
+            reopened
+                .proofs()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![proof]
+        );
+        let reader = reopened.reader().unwrap();
+        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_err());
+        assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
+        drop(reader);
         reopened.close().unwrap();
     }
 

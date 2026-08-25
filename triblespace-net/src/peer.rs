@@ -141,8 +141,8 @@ fn accepts_incoming_event(direction: SyncDirection, event: &NetEvent) -> bool {
 /// # Example
 ///
 /// Construction requires a CONNECT trust root and a prebuilt
-/// [`CapabilityProof`](triblespace_core::capability::CapabilityProof) whose
-/// leaf authorizes this peer's transport key to invoke exact
+/// [`CapabilityProofBundle`](triblespace_core::capability::CapabilityProofBundle)
+/// whose final proof key authorizes this peer's transport key to invoke exact
 /// [`ACTION_CONNECT`](crate::protocol::ACTION_CONNECT) on that root's public-key
 /// bytes. Proof selection is an application concern; the transport sends
 /// exactly the proof in [`PeerConfig::connect_proof`]. Gossip rendezvous is a

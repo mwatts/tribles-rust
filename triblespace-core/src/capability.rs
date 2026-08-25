@@ -1,25 +1,28 @@
-//! Store-independent, blob-native capability verification.
+//! Direct, claim-addressed capability proofs.
 //!
-//! A capability occurrence is two ordinary canonical
-//! [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive)
-//! blobs:
+//! A claim is one canonical [`SimpleArchive`] blob containing only semantic
+//! restrictions and an optional parent-claim handle. Principals do not occur
+//! in claims. A proof binds one root-to-leaf principal path directly:
 //!
-//! - a claim naming one subject, one exact action/resource atom, an
-//!   invocation/delegation mode, an optional inclusive validity interval, and
-//!   an optional exact parent signature blob; and
-//! - a signature record naming that exact claim blob and carrying the
-//!   issuer's Ed25519 signature over the claim's canonical bytes.
+//! ```text
+//! K0 (S0 C0 K1) (S1 C1 K2) ... (Sn Cn Kn+1)
+//! ```
 //!
-//! Proofs carry those pairs in root-to-leaf order. Verification needs only the
-//! proof, an externally supplied trust root, an explicit instant, and the
-//! exact leaf claim the caller expects. It does not enumerate a store, resolve
-//! a collection, consult a log, or infer ambient authority.
+//! Each `Si` is an Ed25519 signature by `Ki` over a domain-separated
+//! transcript containing `Ki`, exact claim handle `Ci`, and delegate `Ki+1`.
+//! Proof bytes are therefore canonical, fixed-stride, and independently
+//! content-addressable. Claims remain shared blobs, while a portable
+//! [`CapabilityProofBundle`] carries their exact ordered closure.
+//!
+//! Verification needs no roster, mutable head, collection scan, or ambient
+//! authorization state. The caller supplies one external trust root, one
+//! expected leaf key, one explicit instant, and one exact request.
 
-use std::collections::HashSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
+use anybytes::Bytes;
 use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -28,24 +31,19 @@ use hifitime::{Duration, Epoch};
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, IntoBlob, TryFromBlob};
 use crate::id::{id_hex, ExclusiveId, Id};
-use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED25519SComponent};
 use crate::inline::encodings::genid::GenId;
-use crate::inline::encodings::hash::{Blake3, Handle};
+use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::encodings::time::NsTAIInterval;
 use crate::inline::{Encodes, Inline, InlineEncoding, TryFromInline, TryToInline};
 use crate::metadata::{self, MetaDescribe};
 use crate::prelude::{attributes, entity, find, pattern};
 use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
-/// Stable kind of a canonical capability claim blob.
+/// Stable kind of a key-free canonical capability claim blob.
 ///
-/// Minted with `trible genid` on 2026-08-24.
-pub const KIND_CAPABILITY_CLAIM: Id = id_hex!("A5A0B81E2FABC64DDE9E81C4F4772768");
-
-/// Stable kind of a canonical capability signature blob.
-///
-/// Minted with `trible genid` on 2026-08-24.
-pub const KIND_CAPABILITY_SIGNATURE: Id = id_hex!("B59FB06BE8FB5201B3E8341C1DD844DC");
+/// Minted with `trible genid` on 2026-08-25. This is deliberately distinct
+/// from the unpublished subject-bearing claim epoch.
+pub const KIND_CAPABILITY_CLAIM: Id = id_hex!("AB9C8E839B9825D890ECB37F236C4968");
 
 /// Stable stored value for [`CapabilityMode::Invoke`].
 ///
@@ -62,11 +60,32 @@ const MODE_DELEGATE: Id = id_hex!("1A9F33A5DC8CEAE7C2ACDF77945CE2EF");
 /// Minted with `trible genid` on 2026-08-24.
 const MODE_INVOKE_AND_DELEGATE: Id = id_hex!("3838CF88E3EB1596DBAD87666801ADF3");
 
+/// Version of the bounded portable proof-bundle codec.
+pub const CAPABILITY_PROOF_BUNDLE_VERSION: u8 = 1;
+
+/// Maximum number of delegation edges in one portable or resident proof.
+pub const MAX_CAPABILITY_PROOF_STEPS: usize = u8::MAX as usize;
+
+const PUBLIC_KEY_LEN: usize = 32;
+const SIGNATURE_LEN: usize = 64;
+const CLAIM_HANDLE_LEN: usize = 32;
+const PROOF_EDGE_LEN: usize = SIGNATURE_LEN + CLAIM_HANDLE_LEN + PUBLIC_KEY_LEN;
+const MIN_PROOF_LEN: usize = PUBLIC_KEY_LEN + PROOF_EDGE_LEN;
+const CLAIM_REQUIRED_TRIBLES: usize = 4;
+const CLAIM_MAX_TRIBLES: usize = 6;
+/// Largest canonical portable bundle under the 255-step and closed-claim bounds.
+pub const MAX_CAPABILITY_PROOF_BUNDLE_BYTES: usize = 2
+    + PUBLIC_KEY_LEN
+    + MAX_CAPABILITY_PROOF_STEPS * (PROOF_EDGE_LEN + 2 + CLAIM_MAX_TRIBLES * TRIBLE_LEN);
+const PROOF_EDGE_DOMAIN: &[u8] = b"triblespace.capability.proof-edge\0";
+const PROOF_EDGE_VERSION: u32 = 1;
+const PROOF_EDGE_TRANSCRIPT_LEN: usize = PROOF_EDGE_DOMAIN.len() + 4 + 3 * PUBLIC_KEY_LEN;
+
 /// Inline encoding for an action-specific, type-erased resource identity.
 ///
 /// The kernel compares these 32 bytes exactly. An action-specific adapter is
 /// responsible for converting its concrete Rust resource type to and from
-/// [`CapabilityResource`]; the kernel deliberately has no resource registry.
+/// [`CapabilityResource`].
 pub struct CapabilityResourceEncoding;
 
 impl MetaDescribe for CapabilityResourceEncoding {
@@ -88,10 +107,6 @@ impl InlineEncoding for CapabilityResourceEncoding {
 }
 
 /// Exact, opaque 32-byte identity of a resource governed by an action.
-///
-/// Use [`From<Inline<S>>`](Self::from) to erase a typed inline resource into
-/// the kernel. Decoding it again belongs to the adapter for the associated
-/// [`CapabilityAction`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct CapabilityResource([u8; 32]);
@@ -144,9 +159,6 @@ impl TryFromInline<'_, CapabilityResourceEncoding> for CapabilityResource {
 }
 
 /// Exact, uninterpreted 128-bit action identity.
-///
-/// Actions do not imply one another. Invocation and delegation modes apply
-/// only to the same byte-exact action/resource atom.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct CapabilityAction(Id);
@@ -193,17 +205,19 @@ impl CapabilityAtom {
     }
 }
 
-/// The three nonempty invocation/delegation modes.
+/// The three nonempty invocation/delegation restrictions.
 ///
-/// Invocation and delegation are independent uses. A mode satisfies a
-/// requirement when it contains every use the requirement names.
+/// Effective authority is the meet (bitwise intersection) of every mode in a
+/// proof. A syntactically wider child is therefore harmless rather than an
+/// escalation: it simply adds no restriction on the bits its parent already
+/// removed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityMode {
-    /// Invoke this exact action on this exact resource.
+    /// Invoke the exact action/resource atom.
     Invoke,
-    /// Delegate this exact action/resource atom without invoking it.
+    /// Delegate the exact atom without invoking it.
     Delegate,
-    /// Both invoke and delegate this exact action/resource atom.
+    /// Invoke and delegate the exact atom.
     InvokeAndDelegate,
 }
 
@@ -213,9 +227,14 @@ impl CapabilityMode {
         self.bits() & required.bits() == required.bits()
     }
 
-    /// Whether this mode may issue a child capability.
+    /// Whether this mode carries delegation authority.
     pub const fn delegates(self) -> bool {
         self.bits() & Self::Delegate.bits() != 0
+    }
+
+    /// Meet two nonempty mode restrictions.
+    pub const fn meet(self, other: Self) -> Option<Self> {
+        Self::from_bits(self.bits() & other.bits())
     }
 
     const fn id(self) -> Id {
@@ -242,9 +261,18 @@ impl CapabilityMode {
             Self::InvokeAndDelegate => 0b11,
         }
     }
+
+    const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0b01 => Some(Self::Invoke),
+            0b10 => Some(Self::Delegate),
+            0b11 => Some(Self::InvokeAndDelegate),
+            _ => None,
+        }
+    }
 }
 
-/// A validated inclusive validity interval for a capability claim.
+/// A validated inclusive validity interval for one claim restriction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilityValidity(Inline<NsTAIInterval>);
 
@@ -296,7 +324,7 @@ impl CapabilityValidity {
             Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower)),
             Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper)),
         )
-        .expect("the intersection of valid intervals is valid")
+        .expect("the intersection of nonempty valid intervals is valid")
     }
 
     fn bounds_ns(self) -> (i128, i128) {
@@ -337,143 +365,129 @@ impl fmt::Display for CapabilityValidityError {
 
 impl Error for CapabilityValidityError {}
 
-/// Content identity of a capability claim or signature `SimpleArchive` blob.
-pub type CapabilityBlobHandle = Inline<Handle<SimpleArchive>>;
+/// Content identity of one canonical capability claim.
+pub type CapabilityClaimHandle = Inline<Handle<SimpleArchive>>;
+
+/// Exact BLAKE3 identity of canonical proof bytes.
+pub type CapabilityProofId = Inline<Hash<Blake3>>;
 
 attributes! {
-    /// Direct Ed25519 subject receiving the capability.
-    /// Anchor minted with `trible genid` on 2026-08-24.
-    "FDE6F0937778AE0E1DB227EF1287EFCE" as capability_subject: ED25519PublicKey;
     /// Exact opaque resource identity interpreted by the action.
     /// Anchor minted with `trible genid` on 2026-08-24.
     "39739A88E72B2B219E2E4CFEF204F5E4" as capability_resource: CapabilityResourceEncoding;
     /// Exact uninterpreted action identifier.
     /// Anchor minted with `trible genid` on 2026-08-24.
     "E68BACD3068B30DA051D3A4A2B8795FC" as capability_action: GenId;
-    /// Exact nonempty invocation/delegation mode.
+    /// Exact nonempty invocation/delegation restriction.
     /// Anchor minted with `trible genid` on 2026-08-24.
     "BFA79BC8429F869C461039CFBC303F37" as capability_mode: GenId;
-    /// Exact parent signature blob for a delegated occurrence.
-    /// Anchor minted with `trible genid` on 2026-08-24.
-    "DC08211F1A8F0E9A7C3074A32EC0C515" as capability_parent: Handle<SimpleArchive>;
-    /// Optional inclusive interval during which this claim participates.
+    /// Exact semantic parent claim; absent only at a proof root.
+    /// Anchor minted with `trible genid` on 2026-08-25.
+    "93DA834819E8A5D763FA028EF57990C4" as capability_parent_claim: Handle<SimpleArchive>;
+    /// Optional inclusive interval restricting this claim.
     /// Anchor minted with `trible genid` on 2026-08-24.
     "3641AFF8C318A1B8F42E3DD6B624C64F" as capability_validity: NsTAIInterval;
-    /// Exact claim blob attested to by a capability signature blob.
-    /// Anchor minted with `trible genid` on 2026-08-24.
-    "0C8B33A0D75D5D39194D55EC96F7038C" as capability_signed_claim: Handle<SimpleArchive>;
 }
 
-const CLAIM_REQUIRED_TRIBLES: usize = 5;
-const CLAIM_MAX_TRIBLES: usize = 7;
-const SIGNATURE_TRIBLES: usize = 5;
-
-/// One canonical capability claim before its issuer signs it.
+/// One key-free canonical semantic capability claim.
+///
+/// Principal delegation lives entirely in [`CapabilityProof`]. The same
+/// content-addressed claim ancestry can consequently participate in distinct
+/// root and principal paths without changing claim identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CapabilityGrant {
-    parent: Option<CapabilityBlobHandle>,
-    subject: Inline<ED25519PublicKey>,
+pub struct CapabilityClaim {
+    parent: Option<CapabilityClaimHandle>,
     atom: CapabilityAtom,
     mode: CapabilityMode,
     validity: Option<CapabilityValidity>,
 }
 
-impl CapabilityGrant {
-    /// Construct a trust-root-issued claim.
-    pub fn root(
-        subject: VerifyingKey,
-        atom: CapabilityAtom,
-        mode: CapabilityMode,
-        validity: Option<CapabilityValidity>,
-    ) -> Self {
-        Self::new(None, subject, atom, mode, validity)
-    }
-
-    /// Construct a delegated claim naming one exact parent signature blob.
-    pub fn delegated(
-        parent_signature: CapabilityBlobHandle,
-        subject: VerifyingKey,
-        atom: CapabilityAtom,
-        mode: CapabilityMode,
-        validity: Option<CapabilityValidity>,
-    ) -> Self {
-        Self::new(Some(parent_signature), subject, atom, mode, validity)
-    }
-
-    fn new(
-        parent: Option<CapabilityBlobHandle>,
-        subject: VerifyingKey,
+impl CapabilityClaim {
+    /// Construct a parentless restriction issued directly by a trust root.
+    pub const fn root(
         atom: CapabilityAtom,
         mode: CapabilityMode,
         validity: Option<CapabilityValidity>,
     ) -> Self {
         Self {
-            parent,
-            subject: Inline::new(subject.to_bytes()),
+            parent: None,
             atom,
             mode,
             validity,
         }
     }
 
-    /// Exact parent signature blob, absent only on a root claim.
-    pub fn parent(self) -> Option<CapabilityBlobHandle> {
+    /// Construct a restriction naming one exact semantic parent claim.
+    pub const fn delegated(
+        parent: CapabilityClaimHandle,
+        atom: CapabilityAtom,
+        mode: CapabilityMode,
+        validity: Option<CapabilityValidity>,
+    ) -> Self {
+        Self {
+            parent: Some(parent),
+            atom,
+            mode,
+            validity,
+        }
+    }
+
+    /// Exact semantic parent, absent only on a root claim.
+    pub const fn parent(self) -> Option<CapabilityClaimHandle> {
         self.parent
     }
 
-    /// Direct Ed25519 subject receiving this claim.
-    pub fn subject(self) -> VerifyingKey {
-        VerifyingKey::from_bytes(&self.subject.raw)
-            .expect("CapabilityGrant validates subject bytes when decoded or constructed")
-    }
-
-    /// Exact action/resource atom governed by this claim.
+    /// Exact action/resource restriction.
     pub const fn atom(self) -> CapabilityAtom {
         self.atom
     }
 
-    /// Invocation/delegation mode carried by this claim.
+    /// Invocation/delegation restriction.
     pub const fn mode(self) -> CapabilityMode {
         self.mode
     }
 
-    /// Optional inclusive validity interval; `None` is unbounded.
+    /// Optional inclusive validity restriction; `None` is unbounded.
     pub const fn validity(self) -> Option<CapabilityValidity> {
         self.validity
     }
 
-    /// Encode this claim as its canonical content-addressed archive blob.
+    /// Encode this claim as its closed canonical archive blob.
     pub fn to_blob(self) -> Blob<SimpleArchive> {
         entity! {
             metadata::tag: KIND_CAPABILITY_CLAIM,
-            capability_subject: self.subject,
             capability_resource: self.atom.resource,
             capability_action: self.atom.action.id(),
             capability_mode: self.mode.id(),
-            capability_parent?: self.parent,
+            capability_parent_claim?: self.parent,
             capability_validity?: self.validity.map(CapabilityValidity::inline),
         }
         .into_facts()
         .to_blob()
     }
 
-    /// Parse one closed canonical capability-claim shape.
-    pub fn from_blob(blob: Blob<SimpleArchive>) -> Result<Self, CapabilityGrantDecodeError> {
-        decode_grant(&blob)
+    /// Parse one closed canonical claim shape.
+    pub fn from_blob(blob: Blob<SimpleArchive>) -> Result<Self, CapabilityClaimDecodeError> {
+        decode_claim(&blob)
+    }
+
+    /// Recompute the exact content handle of this claim.
+    pub fn handle(self) -> CapabilityClaimHandle {
+        content_handle(&self.to_blob())
     }
 }
 
-impl TryFromBlob<SimpleArchive> for CapabilityGrant {
-    type Error = CapabilityGrantDecodeError;
+impl TryFromBlob<SimpleArchive> for CapabilityClaim {
+    type Error = CapabilityClaimDecodeError;
 
     fn try_from_blob(blob: Blob<SimpleArchive>) -> Result<Self, Self::Error> {
         Self::from_blob(blob)
     }
 }
 
-/// Why a capability claim blob was not one closed canonical grant.
+/// Why a capability claim blob was not one closed canonical claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CapabilityGrantDecodeError {
+pub enum CapabilityClaimDecodeError {
     /// The archive cannot have the closed claim shape at this byte length.
     InvalidLength {
         /// Shortest canonical claim, in bytes.
@@ -489,19 +503,17 @@ pub enum CapabilityGrantDecodeError {
     MissingField(&'static str),
     /// A single-valued field occurs more than once.
     RepeatedField(&'static str),
-    /// The subject bytes are not an Ed25519 public key.
-    InvalidSubject,
-    /// An identifier field is nil or not in canonical `GenId` form.
+    /// An identifier field is nil or malformed.
     InvalidId(&'static str),
     /// The stored mode is not one of the three protocol modes.
     InvalidMode,
     /// The optional validity interval is inverted.
     InvalidValidity(CapabilityValidityError),
-    /// Extra fields, entities, or a non-intrinsic entity id were present.
+    /// Extra fields, entities, or a non-intrinsic entity ID were present.
     NonCanonicalShape,
 }
 
-impl fmt::Display for CapabilityGrantDecodeError {
+impl fmt::Display for CapabilityClaimDecodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLength { min, max, actual } => write!(
@@ -511,9 +523,6 @@ impl fmt::Display for CapabilityGrantDecodeError {
             Self::Archive(error) => write!(formatter, "invalid claim archive: {error}"),
             Self::MissingField(field) => write!(formatter, "capability claim is missing {field}"),
             Self::RepeatedField(field) => write!(formatter, "capability claim repeats {field}"),
-            Self::InvalidSubject => {
-                formatter.write_str("capability claim subject is not an Ed25519 key")
-            }
             Self::InvalidId(field) => write!(formatter, "capability claim has invalid {field}"),
             Self::InvalidMode => formatter.write_str("capability claim has an unknown mode"),
             Self::InvalidValidity(error) => write!(formatter, "{error}"),
@@ -524,7 +533,7 @@ impl fmt::Display for CapabilityGrantDecodeError {
     }
 }
 
-impl Error for CapabilityGrantDecodeError {
+impl Error for CapabilityClaimDecodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Archive(error) => Some(error),
@@ -534,24 +543,25 @@ impl Error for CapabilityGrantDecodeError {
     }
 }
 
-impl From<UnarchiveError> for CapabilityGrantDecodeError {
+impl From<UnarchiveError> for CapabilityClaimDecodeError {
     fn from(error: UnarchiveError) -> Self {
         Self::Archive(error)
     }
 }
 
-fn decode_grant(blob: &Blob<SimpleArchive>) -> Result<CapabilityGrant, CapabilityGrantDecodeError> {
+fn decode_claim(blob: &Blob<SimpleArchive>) -> Result<CapabilityClaim, CapabilityClaimDecodeError> {
     let min = CLAIM_REQUIRED_TRIBLES * TRIBLE_LEN;
     let max = CLAIM_MAX_TRIBLES * TRIBLE_LEN;
     if !(min..=max).contains(&blob.bytes.len()) {
-        return Err(CapabilityGrantDecodeError::InvalidLength {
+        return Err(CapabilityClaimDecodeError::InvalidLength {
             min,
             max,
             actual: blob.bytes.len(),
         });
     }
+
     let facts: TribleSet = TryFromBlob::try_from_blob(blob.clone())?;
-    let entity = exactly_one::<_, CapabilityGrantDecodeError>(
+    let entity = exactly_one(
         find!(
             (entity: Id),
             pattern!(&facts, [{ ?entity @ metadata::tag: KIND_CAPABILITY_CLAIM }])
@@ -559,19 +569,7 @@ fn decode_grant(blob: &Blob<SimpleArchive>) -> Result<CapabilityGrant, Capabilit
         .map(|(entity,)| entity),
         "metadata::tag",
     )?;
-
-    let subject = exactly_one::<_, CapabilityGrantDecodeError>(
-        find!(
-            (value: Inline<ED25519PublicKey>),
-            pattern!(&facts, [{ entity @ capability_subject: ?value }])
-        )
-        .map(|(value,)| value),
-        "capability_subject",
-    )?;
-    VerifyingKey::from_bytes(&subject.raw)
-        .map_err(|_| CapabilityGrantDecodeError::InvalidSubject)?;
-
-    let resource = exactly_one::<_, CapabilityGrantDecodeError>(
+    let resource = exactly_one(
         find!(
             (value: Inline<CapabilityResourceEncoding>),
             pattern!(&facts, [{ entity @ capability_resource: ?value }])
@@ -579,8 +577,7 @@ fn decode_grant(blob: &Blob<SimpleArchive>) -> Result<CapabilityGrant, Capabilit
         .map(|(value,)| CapabilityResource(value.raw)),
         "capability_resource",
     )?;
-
-    let action = exactly_one::<_, CapabilityGrantDecodeError>(
+    let action = exactly_one(
         find!(
             (value: Inline<GenId>),
             pattern!(&facts, [{ entity @ capability_action: ?value }])
@@ -589,9 +586,8 @@ fn decode_grant(blob: &Blob<SimpleArchive>) -> Result<CapabilityGrant, Capabilit
         "capability_action",
     )?
     .try_from_inline::<Id>()
-    .map_err(|_| CapabilityGrantDecodeError::InvalidId("capability_action"))?;
-
-    let mode = exactly_one::<_, CapabilityGrantDecodeError>(
+    .map_err(|_| CapabilityClaimDecodeError::InvalidId("capability_action"))?;
+    let mode = exactly_one(
         find!(
             (value: Inline<GenId>),
             pattern!(&facts, [{ entity @ capability_mode: ?value }])
@@ -600,19 +596,17 @@ fn decode_grant(blob: &Blob<SimpleArchive>) -> Result<CapabilityGrant, Capabilit
         "capability_mode",
     )?
     .try_from_inline::<Id>()
-    .map_err(|_| CapabilityGrantDecodeError::InvalidId("capability_mode"))?;
-    let mode = CapabilityMode::from_id(mode).ok_or(CapabilityGrantDecodeError::InvalidMode)?;
-
-    let parent = at_most_one::<_, CapabilityGrantDecodeError>(
+    .map_err(|_| CapabilityClaimDecodeError::InvalidId("capability_mode"))?;
+    let mode = CapabilityMode::from_id(mode).ok_or(CapabilityClaimDecodeError::InvalidMode)?;
+    let parent = at_most_one(
         find!(
-            (value: CapabilityBlobHandle),
-            pattern!(&facts, [{ entity @ capability_parent: ?value }])
+            (value: CapabilityClaimHandle),
+            pattern!(&facts, [{ entity @ capability_parent_claim: ?value }])
         )
         .map(|(value,)| value),
-        "capability_parent",
+        "capability_parent_claim",
     )?;
-
-    let validity = at_most_one::<_, CapabilityGrantDecodeError>(
+    let validity = at_most_one(
         find!(
             (value: Inline<NsTAIInterval>),
             pattern!(&facts, [{ entity @ capability_validity: ?value }])
@@ -622,391 +616,559 @@ fn decode_grant(blob: &Blob<SimpleArchive>) -> Result<CapabilityGrant, Capabilit
     )?
     .map(CapabilityValidity::from_inline)
     .transpose()
-    .map_err(CapabilityGrantDecodeError::InvalidValidity)?;
+    .map_err(CapabilityClaimDecodeError::InvalidValidity)?;
 
-    let grant = CapabilityGrant {
+    let claim = CapabilityClaim {
         parent,
-        subject,
-        atom: CapabilityAtom::new(CapabilityAction(action), resource),
+        atom: CapabilityAtom::new(action.into(), resource),
         mode,
         validity,
     };
-    if grant.to_blob().bytes != blob.bytes {
-        return Err(CapabilityGrantDecodeError::NonCanonicalShape);
+    if claim.to_blob().bytes != blob.bytes {
+        return Err(CapabilityClaimDecodeError::NonCanonicalShape);
     }
-    Ok(grant)
+    Ok(claim)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CapabilitySignature {
-    claim: CapabilityBlobHandle,
-    signer: Inline<ED25519PublicKey>,
-    r: Inline<ED25519RComponent>,
-    s: Inline<ED25519SComponent>,
+fn exactly_one<T>(
+    mut rows: impl Iterator<Item = T>,
+    field: &'static str,
+) -> Result<T, CapabilityClaimDecodeError> {
+    let first = rows
+        .next()
+        .ok_or(CapabilityClaimDecodeError::MissingField(field))?;
+    if rows.next().is_some() {
+        return Err(CapabilityClaimDecodeError::RepeatedField(field));
+    }
+    Ok(first)
 }
 
-impl CapabilitySignature {
-    fn new(claim: CapabilityBlobHandle, signer: VerifyingKey, signature: Signature) -> Self {
-        Self {
-            claim,
-            signer: Inline::new(signer.to_bytes()),
-            r: ED25519RComponent::from_signature(signature),
-            s: ED25519SComponent::from_signature(signature),
-        }
+fn at_most_one<T>(
+    mut rows: impl Iterator<Item = T>,
+    field: &'static str,
+) -> Result<Option<T>, CapabilityClaimDecodeError> {
+    let first = rows.next();
+    if rows.next().is_some() {
+        return Err(CapabilityClaimDecodeError::RepeatedField(field));
     }
-
-    fn to_blob(self) -> Blob<SimpleArchive> {
-        entity! {
-            metadata::tag: KIND_CAPABILITY_SIGNATURE,
-            capability_signed_claim: self.claim,
-            crate::attestation::signed_by: self.signer,
-            crate::attestation::signature_r: self.r,
-            crate::attestation::signature_s: self.s,
-        }
-        .into_facts()
-        .to_blob()
-    }
-
-    fn signer(self) -> VerifyingKey {
-        VerifyingKey::from_bytes(&self.signer.raw)
-            .expect("CapabilitySignature validates signer bytes when decoded or constructed")
-    }
-
-    fn signature(self) -> Signature {
-        Signature::from_components(self.r.raw, self.s.raw)
-    }
+    Ok(first)
 }
 
-/// Why a capability signature blob was not one closed canonical signature.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CapabilitySignatureDecodeError {
-    /// The archive was not exactly the five-field signature shape in length.
-    InvalidLength {
-        /// Required byte length.
-        expected: usize,
-        /// Actual byte length.
-        actual: usize,
-    },
-    /// The bytes were not a canonical `SimpleArchive`.
-    Archive(UnarchiveError),
-    /// A required field is absent.
-    MissingField(&'static str),
-    /// A single-valued field occurs more than once.
-    RepeatedField(&'static str),
-    /// The signer bytes are not an Ed25519 public key.
-    InvalidSigner,
-    /// Extra fields, entities, or a non-intrinsic entity id were present.
-    NonCanonicalShape,
-}
-
-impl fmt::Display for CapabilitySignatureDecodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidLength { expected, actual } => write!(
-                formatter,
-                "capability signature has {actual} bytes; expected exactly {expected}"
-            ),
-            Self::Archive(error) => write!(formatter, "invalid signature archive: {error}"),
-            Self::MissingField(field) => {
-                write!(formatter, "capability signature is missing {field}")
-            }
-            Self::RepeatedField(field) => {
-                write!(formatter, "capability signature repeats {field}")
-            }
-            Self::InvalidSigner => {
-                formatter.write_str("capability signature signer is not an Ed25519 key")
-            }
-            Self::NonCanonicalShape => formatter
-                .write_str("capability signature is not one closed canonical signature entity"),
-        }
-    }
-}
-
-impl Error for CapabilitySignatureDecodeError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Archive(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<UnarchiveError> for CapabilitySignatureDecodeError {
-    fn from(error: UnarchiveError) -> Self {
-        Self::Archive(error)
-    }
-}
-
-fn decode_signature(
-    blob: &Blob<SimpleArchive>,
-) -> Result<CapabilitySignature, CapabilitySignatureDecodeError> {
-    let expected = SIGNATURE_TRIBLES * TRIBLE_LEN;
-    if blob.bytes.len() != expected {
-        return Err(CapabilitySignatureDecodeError::InvalidLength {
-            expected,
-            actual: blob.bytes.len(),
-        });
-    }
-    let facts: TribleSet = TryFromBlob::try_from_blob(blob.clone())?;
-    let entity = exactly_one::<_, CapabilitySignatureDecodeError>(
-        find!(
-            (entity: Id),
-            pattern!(&facts, [{ ?entity @ metadata::tag: KIND_CAPABILITY_SIGNATURE }])
-        )
-        .map(|(entity,)| entity),
-        "metadata::tag",
-    )?;
-    let claim = exactly_one::<_, CapabilitySignatureDecodeError>(
-        find!(
-            (value: CapabilityBlobHandle),
-            pattern!(&facts, [{ entity @ capability_signed_claim: ?value }])
-        )
-        .map(|(value,)| value),
-        "capability_signed_claim",
-    )?;
-    let signer = exactly_one::<_, CapabilitySignatureDecodeError>(
-        find!(
-            (value: Inline<ED25519PublicKey>),
-            pattern!(&facts, [{ entity @ crate::attestation::signed_by: ?value }])
-        )
-        .map(|(value,)| value),
-        "attestation::signed_by",
-    )?;
-    VerifyingKey::from_bytes(&signer.raw)
-        .map_err(|_| CapabilitySignatureDecodeError::InvalidSigner)?;
-    let r = exactly_one::<_, CapabilitySignatureDecodeError>(
-        find!(
-            (value: Inline<ED25519RComponent>),
-            pattern!(&facts, [{ entity @ crate::attestation::signature_r: ?value }])
-        )
-        .map(|(value,)| value),
-        "attestation::signature_r",
-    )?;
-    let s = exactly_one::<_, CapabilitySignatureDecodeError>(
-        find!(
-            (value: Inline<ED25519SComponent>),
-            pattern!(&facts, [{ entity @ crate::attestation::signature_s: ?value }])
-        )
-        .map(|(value,)| value),
-        "attestation::signature_s",
-    )?;
-    let signature = CapabilitySignature {
-        claim,
-        signer,
-        r,
-        s,
-    };
-    if signature.to_blob().bytes != blob.bytes {
-        return Err(CapabilitySignatureDecodeError::NonCanonicalShape);
-    }
-    Ok(signature)
-}
-
-/// One received claim/signature pair in a portable proof.
+/// Exact authority requested at a verification boundary.
 ///
-/// Construction is permissive so untrusted bytes can be represented before
-/// verification. [`CapabilityProof::verify_claim`] is the admission boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapabilityProofStep {
-    claim: Blob<SimpleArchive>,
-    signature: Blob<SimpleArchive>,
-}
-
-impl CapabilityProofStep {
-    /// Pair received claim and signature blobs without trusting them.
-    pub fn new(claim: Blob<SimpleArchive>, signature: Blob<SimpleArchive>) -> Self {
-        Self { claim, signature }
-    }
-
-    /// Canonically encode and sign one grant.
-    pub fn issue(issuer: &SigningKey, grant: CapabilityGrant) -> Self {
-        let claim = grant.to_blob();
-        let claim_handle = content_handle(&claim);
-        let signature = issuer.sign(&claim.bytes);
-        let signature =
-            CapabilitySignature::new(claim_handle, issuer.verifying_key(), signature).to_blob();
-        Self { claim, signature }
-    }
-
-    /// Candidate claim blob.
-    pub fn claim(&self) -> &Blob<SimpleArchive> {
-        &self.claim
-    }
-
-    /// Candidate signature blob.
-    pub fn signature(&self) -> &Blob<SimpleArchive> {
-        &self.signature
-    }
-
-    /// Recomputed content identity of this step's signature blob.
-    pub fn signature_handle(&self) -> CapabilityBlobHandle {
-        content_handle(&self.signature)
-    }
-}
-
-/// Exact leaf authority a caller expects a proof to establish.
+/// The expected subject is deliberately not part of this value: it is the
+/// final key in the proof and is supplied separately by the caller, normally
+/// from an authenticated transport or a collection author field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CapabilityClaim {
-    subject: Inline<ED25519PublicKey>,
+pub struct CapabilityRequest {
     atom: CapabilityAtom,
     required: CapabilityMode,
 }
 
-impl CapabilityClaim {
-    /// Construct an exact subject/action/resource claim with a minimum mode.
-    pub fn new(subject: VerifyingKey, atom: CapabilityAtom, required: CapabilityMode) -> Self {
-        Self {
-            subject: Inline::new(subject.to_bytes()),
-            atom,
-            required,
-        }
+impl CapabilityRequest {
+    /// Request one exact atom and minimum invocation/delegation mode.
+    pub const fn new(atom: CapabilityAtom, required: CapabilityMode) -> Self {
+        Self { atom, required }
     }
 
-    /// Expected leaf subject.
-    pub fn subject(self) -> VerifyingKey {
-        VerifyingKey::from_bytes(&self.subject.raw)
-            .expect("CapabilityClaim is constructed from a valid key")
-    }
-
-    /// Expected exact action/resource atom.
+    /// Exact requested action/resource atom.
     pub const fn atom(self) -> CapabilityAtom {
         self.atom
     }
 
-    /// Minimum mode the leaf must carry.
+    /// Minimum requested mode.
     pub const fn required(self) -> CapabilityMode {
         self.required
     }
-
-    fn is_satisfied_by(self, grant: CapabilityGrant) -> bool {
-        self.subject == grant.subject
-            && self.atom == grant.atom
-            && grant.mode.satisfies(self.required)
-    }
 }
 
-/// A root-to-leaf sequence of exact claim/signature blob pairs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
+struct CapabilityProofEdge {
+    signature: Signature,
+    claim: CapabilityClaimHandle,
+    delegate: VerifyingKey,
+}
+
+/// Canonical direct root-to-leaf capability proof bytes.
+///
+/// The grammar is `K0 (S C K)+`: one 32-byte Ed25519 root followed by one or
+/// more fixed 128-byte edges. Construction accepts no padding, count field,
+/// alternate ordering, or trailing bytes.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CapabilityProof {
-    steps: Vec<CapabilityProofStep>,
+    bytes: Vec<u8>,
 }
 
 impl CapabilityProof {
-    /// Construct received evidence in claimed root-to-leaf order.
-    pub fn new(steps: Vec<CapabilityProofStep>) -> Self {
-        Self { steps }
-    }
-
-    /// Claimed root-to-leaf steps.
-    pub fn steps(&self) -> &[CapabilityProofStep] {
-        &self.steps
-    }
-
-    /// Recomputed content identity of the leaf signature blob.
-    pub fn credential(&self) -> Option<CapabilityBlobHandle> {
-        self.steps.last().map(CapabilityProofStep::signature_handle)
-    }
-
-    /// Load a root-to-leaf proof from one leaf signature handle.
-    ///
-    /// `get_blob` is the only storage adapter: it performs exact-handle lookup
-    /// in whatever blob store the caller already uses. The walk follows each
-    /// canonical signature to its claim and each claim to its exact parent
-    /// signature, stopping only at a root claim and reversing the gathered
-    /// steps once. It neither enumerates storage nor imposes a depth limit.
-    /// Returned blobs are rehashed rather than trusting cached handles.
-    ///
-    /// This reconstructs evidence but does not authorize it. Pass the result
-    /// to [`Self::verify_claim`] with an external trust root, explicit instant,
-    /// and expected leaf claim.
-    pub fn load<E>(
-        credential: CapabilityBlobHandle,
-        mut get_blob: impl FnMut(CapabilityBlobHandle) -> Result<Option<Blob<SimpleArchive>>, E>,
-    ) -> Result<Self, CapabilityProofLoadError<E>> {
-        let mut next = credential;
-        let mut seen = HashSet::new();
-        let mut reverse_steps = Vec::new();
-
-        loop {
-            if !seen.insert(next) {
-                return Err(CapabilityProofLoadError::RepeatedSignature { handle: next });
-            }
-
-            let signature_blob = load_exact_blob(next, &mut get_blob)?;
-            let signature = decode_signature(&signature_blob).map_err(|source| {
-                CapabilityProofLoadError::InvalidSignatureBlob {
-                    handle: next,
-                    source,
-                }
-            })?;
-
-            let claim_blob = load_exact_blob(signature.claim, &mut get_blob)?;
-            let grant = decode_grant(&claim_blob).map_err(|source| {
-                CapabilityProofLoadError::InvalidClaim {
-                    handle: signature.claim,
-                    source,
-                }
-            })?;
-            reverse_steps.push(CapabilityProofStep::new(claim_blob, signature_blob));
-
-            match grant.parent {
-                Some(parent) => next = parent,
-                None => break,
-            }
+    /// Parse canonical proof bytes without assigning them authority.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CapabilityProofDecodeError> {
+        if bytes.len() < MIN_PROOF_LEN || (bytes.len() - PUBLIC_KEY_LEN) % PROOF_EDGE_LEN != 0 {
+            return Err(CapabilityProofDecodeError::InvalidLength {
+                actual: bytes.len(),
+            });
+        }
+        let step_count = (bytes.len() - PUBLIC_KEY_LEN) / PROOF_EDGE_LEN;
+        if step_count > MAX_CAPABILITY_PROOF_STEPS {
+            return Err(CapabilityProofDecodeError::TooManySteps {
+                count: step_count,
+                limit: MAX_CAPABILITY_PROOF_STEPS,
+            });
         }
 
-        reverse_steps.reverse();
-        Ok(Self::new(reverse_steps))
+        parse_key(&bytes[..PUBLIC_KEY_LEN])
+            .map_err(|_| CapabilityProofDecodeError::InvalidKey { key: 0 })?;
+        for (step, edge) in bytes[PUBLIC_KEY_LEN..]
+            .chunks_exact(PROOF_EDGE_LEN)
+            .enumerate()
+        {
+            parse_key(&edge[SIGNATURE_LEN + CLAIM_HANDLE_LEN..])
+                .map_err(|_| CapabilityProofDecodeError::InvalidKey { key: step + 1 })?;
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
     }
 
-    /// Verify this exact chain against an external trust root and leaf claim.
+    /// Borrow the exact canonical proof body.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the proof and return its exact canonical body.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Exact BLAKE3 identity of the complete canonical body.
+    pub fn id(&self) -> CapabilityProofId {
+        Inline::new(Blake3::digest(&self.bytes))
+    }
+
+    /// Number of signed delegation edges.
+    pub fn step_count(&self) -> usize {
+        (self.bytes.len() - PUBLIC_KEY_LEN) / PROOF_EDGE_LEN
+    }
+
+    /// External trust root encoded at the start of this proof.
+    pub fn root_key(&self) -> VerifyingKey {
+        parse_key(&self.bytes[..PUBLIC_KEY_LEN])
+            .expect("CapabilityProof validates every key at construction")
+    }
+
+    /// Final delegated principal.
+    pub fn leaf_key(&self) -> VerifyingKey {
+        let start = self.bytes.len() - PUBLIC_KEY_LEN;
+        parse_key(&self.bytes[start..])
+            .expect("CapabilityProof validates every key at construction")
+    }
+
+    /// Principal that signed the final proof edge.
     ///
-    /// Every blob is parsed as a closed canonical shape and named from its
-    /// bytes rather than its cached handle. Every signature is verified
-    /// strictly over the adjacent claim bytes. The first signature must be by
-    /// `trust_root`; each later claim must name the immediately preceding
-    /// signature blob and be signed by the preceding subject. The parent's
-    /// mode must grant delegation and contain the child's mode. Action and
-    /// resource remain byte-exact throughout.
-    /// Optional validity intervals are inclusive, and both their lower and
-    /// upper bounds are enforced at `instant` for every step.
-    pub fn verify_claim(
+    /// This is the root key for a one-step proof and the penultimate delegated
+    /// key for a longer proof.
+    pub fn leaf_issuer(&self) -> VerifyingKey {
+        let last_edge = self.bytes.len() - PROOF_EDGE_LEN;
+        parse_key(&self.bytes[last_edge - PUBLIC_KEY_LEN..last_edge])
+            .expect("CapabilityProof validates every key at construction")
+    }
+
+    /// Final semantic claim handle.
+    pub fn leaf_claim(&self) -> CapabilityClaimHandle {
+        self.claim_handles()
+            .next_back()
+            .expect("CapabilityProof is nonempty")
+    }
+
+    /// Exact semantic claim handles in root-to-leaf order.
+    pub fn claim_handles(
+        &self,
+    ) -> impl ExactSizeIterator<Item = CapabilityClaimHandle> + DoubleEndedIterator + '_ {
+        self.bytes[PUBLIC_KEY_LEN..]
+            .chunks_exact(PROOF_EDGE_LEN)
+            .map(|edge| {
+                let mut raw = [0; CLAIM_HANDLE_LEN];
+                raw.copy_from_slice(&edge[SIGNATURE_LEN..SIGNATURE_LEN + CLAIM_HANDLE_LEN]);
+                Inline::new(raw)
+            })
+    }
+
+    /// Strictly verify every direct `K S C K` edge signature.
+    pub fn verify_signatures(&self) -> Result<(), CapabilityProofError> {
+        let mut issuer = self.root_key();
+        for (step, edge) in self.edges().enumerate() {
+            issuer
+                .verify_strict(
+                    &proof_edge_transcript(issuer, edge.claim, edge.delegate),
+                    &edge.signature,
+                )
+                .map_err(|_| CapabilityProofError::InvalidSignature { step })?;
+            issuer = edge.delegate;
+        }
+        Ok(())
+    }
+
+    fn issue_root(
+        issuer: &SigningKey,
+        claim: CapabilityClaimHandle,
+        delegate: VerifyingKey,
+    ) -> Self {
+        let mut bytes = Vec::with_capacity(MIN_PROOF_LEN);
+        bytes.extend_from_slice(&issuer.verifying_key().to_bytes());
+        append_edge(&mut bytes, issuer, claim, delegate);
+        Self { bytes }
+    }
+
+    fn extend(
+        &self,
+        issuer: &SigningKey,
+        claim: CapabilityClaimHandle,
+        delegate: VerifyingKey,
+    ) -> Result<Self, CapabilityIssueError> {
+        if self.step_count() == MAX_CAPABILITY_PROOF_STEPS {
+            return Err(CapabilityIssueError::TooManySteps {
+                limit: MAX_CAPABILITY_PROOF_STEPS,
+            });
+        }
+        let mut bytes = Vec::with_capacity(self.bytes.len() + PROOF_EDGE_LEN);
+        bytes.extend_from_slice(&self.bytes);
+        append_edge(&mut bytes, issuer, claim, delegate);
+        Ok(Self { bytes })
+    }
+
+    fn edges(&self) -> impl ExactSizeIterator<Item = CapabilityProofEdge> + '_ {
+        self.bytes[PUBLIC_KEY_LEN..]
+            .chunks_exact(PROOF_EDGE_LEN)
+            .map(|edge| {
+                let mut r = [0; 32];
+                let mut s = [0; 32];
+                let mut claim = [0; 32];
+                r.copy_from_slice(&edge[..32]);
+                s.copy_from_slice(&edge[32..SIGNATURE_LEN]);
+                claim.copy_from_slice(&edge[SIGNATURE_LEN..SIGNATURE_LEN + CLAIM_HANDLE_LEN]);
+                CapabilityProofEdge {
+                    signature: Signature::from_components(r, s),
+                    claim: Inline::new(claim),
+                    delegate: parse_key(&edge[SIGNATURE_LEN + CLAIM_HANDLE_LEN..])
+                        .expect("CapabilityProof validates every key at construction"),
+                }
+            })
+    }
+}
+
+fn append_edge(
+    bytes: &mut Vec<u8>,
+    issuer: &SigningKey,
+    claim: CapabilityClaimHandle,
+    delegate: VerifyingKey,
+) {
+    let signature = issuer.sign(&proof_edge_transcript(
+        issuer.verifying_key(),
+        claim,
+        delegate,
+    ));
+    bytes.extend_from_slice(&signature.to_bytes());
+    bytes.extend_from_slice(&claim.raw);
+    bytes.extend_from_slice(&delegate.to_bytes());
+}
+
+fn proof_edge_transcript(
+    issuer: VerifyingKey,
+    claim: CapabilityClaimHandle,
+    delegate: VerifyingKey,
+) -> [u8; PROOF_EDGE_TRANSCRIPT_LEN] {
+    let mut transcript = [0; PROOF_EDGE_TRANSCRIPT_LEN];
+    let mut cursor = PROOF_EDGE_DOMAIN.len();
+    transcript[..cursor].copy_from_slice(PROOF_EDGE_DOMAIN);
+    transcript[cursor..cursor + 4].copy_from_slice(&PROOF_EDGE_VERSION.to_be_bytes());
+    cursor += 4;
+    transcript[cursor..cursor + PUBLIC_KEY_LEN].copy_from_slice(&issuer.to_bytes());
+    cursor += PUBLIC_KEY_LEN;
+    transcript[cursor..cursor + CLAIM_HANDLE_LEN].copy_from_slice(&claim.raw);
+    cursor += CLAIM_HANDLE_LEN;
+    transcript[cursor..cursor + PUBLIC_KEY_LEN].copy_from_slice(&delegate.to_bytes());
+    transcript
+}
+
+fn parse_key(bytes: &[u8]) -> Result<VerifyingKey, ed25519_dalek::SignatureError> {
+    let raw: [u8; PUBLIC_KEY_LEN] = bytes
+        .try_into()
+        .expect("all proof key slices have fixed width");
+    VerifyingKey::from_bytes(&raw)
+}
+
+/// Structural failure while parsing canonical direct-proof bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapabilityProofDecodeError {
+    /// A proof is not exactly `32 + 128n` bytes for some nonzero `n`.
+    InvalidLength { actual: usize },
+    /// The fixed carrier bound was exceeded.
+    TooManySteps { count: usize, limit: usize },
+    /// Root (`0`) or one delegated key (`1..=n`) is not an Ed25519 key.
+    InvalidKey { key: usize },
+}
+
+impl fmt::Display for CapabilityProofDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength { actual } => write!(
+                formatter,
+                "capability proof has {actual} bytes; expected 32 + 128n for nonzero n"
+            ),
+            Self::TooManySteps { count, limit } => {
+                write!(
+                    formatter,
+                    "capability proof has {count} steps; limit is {limit}"
+                )
+            }
+            Self::InvalidKey { key } => {
+                write!(formatter, "capability proof key {key} is not valid Ed25519")
+            }
+        }
+    }
+}
+
+impl Error for CapabilityProofDecodeError {}
+
+/// A canonical proof together with the exact ordered claim blobs it names.
+///
+/// The bundle is the portable one-round-trip representation used for invites
+/// and authentication. Verification checks every handle from bytes and
+/// persists nothing; callers may store only the accepted closure afterward.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityProofBundle {
+    proof: CapabilityProof,
+    claims: Vec<Blob<SimpleArchive>>,
+}
+
+impl CapabilityProofBundle {
+    /// Pair an untrusted proof and candidate ordered claim closure.
+    pub fn new(proof: CapabilityProof, claims: Vec<Blob<SimpleArchive>>) -> Self {
+        Self { proof, claims }
+    }
+
+    /// Issue one parentless root claim directly to `delegate`.
+    pub fn issue_root(
+        root: &SigningKey,
+        claim: CapabilityClaim,
+        delegate: VerifyingKey,
+    ) -> Result<Self, CapabilityIssueError> {
+        if claim.parent().is_some() {
+            return Err(CapabilityIssueError::RootHasParent);
+        }
+        let claim_blob = claim.to_blob();
+        let claim_handle = content_handle(&claim_blob);
+        Ok(Self {
+            proof: CapabilityProof::issue_root(root, claim_handle, delegate),
+            claims: vec![claim_blob],
+        })
+    }
+
+    /// Borrow the canonical direct proof.
+    pub const fn proof(&self) -> &CapabilityProof {
+        &self.proof
+    }
+
+    /// Borrow candidate claim blobs in claimed root-to-leaf order.
+    pub fn claims(&self) -> &[Blob<SimpleArchive>] {
+        &self.claims
+    }
+
+    /// Consume the bundle into its persistence-friendly proof and claim parts.
+    ///
+    /// Stores should publish the claim blobs before the native proof record.
+    pub fn into_parts(self) -> (CapabilityProof, Vec<Blob<SimpleArchive>>) {
+        (self.proof, self.claims)
+    }
+
+    /// Encode the bounded canonical transport bundle.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CapabilityProofBundleError> {
+        let count = self.proof.step_count();
+        if self.claims.len() != count {
+            return Err(CapabilityProofBundleError::ClaimCount {
+                expected: count,
+                actual: self.claims.len(),
+            });
+        }
+        let mut capacity = 2usize
+            .checked_add(self.proof.as_bytes().len())
+            .ok_or(CapabilityProofBundleError::FrameTooLarge)?;
+        for (step, claim) in self.claims.iter().enumerate() {
+            let min = CLAIM_REQUIRED_TRIBLES * TRIBLE_LEN;
+            let max = CLAIM_MAX_TRIBLES * TRIBLE_LEN;
+            if !(min..=max).contains(&claim.bytes.len()) || claim.bytes.len() % TRIBLE_LEN != 0 {
+                return Err(CapabilityProofBundleError::ClaimLength {
+                    step,
+                    min,
+                    max,
+                    actual: claim.bytes.len(),
+                });
+            }
+            capacity = capacity
+                .checked_add(2)
+                .and_then(|size| size.checked_add(claim.bytes.len()))
+                .ok_or(CapabilityProofBundleError::FrameTooLarge)?;
+        }
+        if capacity > MAX_CAPABILITY_PROOF_BUNDLE_BYTES {
+            return Err(CapabilityProofBundleError::FrameTooLarge);
+        }
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.push(CAPABILITY_PROOF_BUNDLE_VERSION);
+        bytes.push(count as u8);
+        bytes.extend_from_slice(self.proof.as_bytes());
+        for claim in &self.claims {
+            bytes.extend_from_slice(&(claim.bytes.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(&claim.bytes);
+        }
+        Ok(bytes)
+    }
+
+    /// Decode one bounded transport bundle without assigning it authority.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CapabilityProofBundleError> {
+        if bytes.len() > MAX_CAPABILITY_PROOF_BUNDLE_BYTES {
+            return Err(CapabilityProofBundleError::FrameTooLarge);
+        }
+        if bytes.len() < 2 {
+            return Err(CapabilityProofBundleError::Truncated { offset: 0 });
+        }
+        if bytes[0] != CAPABILITY_PROOF_BUNDLE_VERSION {
+            return Err(CapabilityProofBundleError::Version {
+                expected: CAPABILITY_PROOF_BUNDLE_VERSION,
+                actual: bytes[0],
+            });
+        }
+        let count = bytes[1] as usize;
+        if count == 0 {
+            return Err(CapabilityProofBundleError::Empty);
+        }
+        let proof_len = PUBLIC_KEY_LEN
+            .checked_add(
+                PROOF_EDGE_LEN
+                    .checked_mul(count)
+                    .ok_or(CapabilityProofBundleError::FrameTooLarge)?,
+            )
+            .ok_or(CapabilityProofBundleError::FrameTooLarge)?;
+        let proof_end = 2usize
+            .checked_add(proof_len)
+            .ok_or(CapabilityProofBundleError::FrameTooLarge)?;
+        if bytes.len() < proof_end {
+            return Err(CapabilityProofBundleError::Truncated { offset: 2 });
+        }
+        let proof = CapabilityProof::from_bytes(&bytes[2..proof_end])
+            .map_err(CapabilityProofBundleError::Proof)?;
+        let mut cursor = proof_end;
+        let mut claims = Vec::with_capacity(count);
+        for step in 0..count {
+            let length_end = cursor
+                .checked_add(2)
+                .ok_or(CapabilityProofBundleError::FrameTooLarge)?;
+            if bytes.len() < length_end {
+                return Err(CapabilityProofBundleError::Truncated { offset: cursor });
+            }
+            let length = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+            cursor = length_end;
+            let min = CLAIM_REQUIRED_TRIBLES * TRIBLE_LEN;
+            let max = CLAIM_MAX_TRIBLES * TRIBLE_LEN;
+            if !(min..=max).contains(&length) || length % TRIBLE_LEN != 0 {
+                return Err(CapabilityProofBundleError::ClaimLength {
+                    step,
+                    min,
+                    max,
+                    actual: length,
+                });
+            }
+            let claim_end = cursor
+                .checked_add(length)
+                .ok_or(CapabilityProofBundleError::FrameTooLarge)?;
+            if bytes.len() < claim_end {
+                return Err(CapabilityProofBundleError::Truncated { offset: cursor });
+            }
+            claims.push(Blob::<SimpleArchive>::new(Bytes::from(
+                bytes[cursor..claim_end].to_vec(),
+            )));
+            cursor = claim_end;
+        }
+        if cursor != bytes.len() {
+            return Err(CapabilityProofBundleError::TrailingBytes {
+                bytes: bytes.len() - cursor,
+            });
+        }
+        Ok(Self { proof, claims })
+    }
+
+    /// Verify this exact closure against an external root and request.
+    pub fn verify(
         &self,
         trust_root: VerifyingKey,
         instant: Epoch,
-        expected: CapabilityClaim,
+        expected_leaf: VerifyingKey,
+        request: CapabilityRequest,
     ) -> Result<VerifiedCapability, CapabilityProofError> {
-        if self.steps.is_empty() {
-            return Err(CapabilityProofError::Empty);
+        if self.proof.root_key() != trust_root {
+            return Err(CapabilityProofError::WrongRoot {
+                expected: trust_root.to_bytes(),
+                actual: self.proof.root_key().to_bytes(),
+            });
+        }
+        if self.claims.len() != self.proof.step_count() {
+            return Err(CapabilityProofError::ClaimCount {
+                expected: self.proof.step_count(),
+                actual: self.claims.len(),
+            });
         }
 
+        self.proof.verify_signatures()?;
+
         let instant_ns = instant.to_tai_duration().total_nanoseconds();
-        let trust_root = Inline::<ED25519PublicKey>::new(trust_root.to_bytes());
-        let mut previous: Option<(CapabilityGrant, CapabilityBlobHandle)> = None;
-        let mut leaf: Option<(CapabilityGrant, CapabilityBlobHandle, CapabilityBlobHandle)> = None;
+        let mut previous_handle = None;
+        let mut effective_atom: Option<CapabilityAtom> = None;
+        let mut effective_mode: Option<CapabilityMode> = None;
         let mut effective_validity: Option<(i128, i128)> = None;
+        let mut leaf_claim = None;
 
-        for (step, proof_step) in self.steps.iter().enumerate() {
-            let claim_handle = content_handle(&proof_step.claim);
-            let signature_handle = content_handle(&proof_step.signature);
-            let grant = decode_grant(&proof_step.claim)
-                .map_err(|source| CapabilityProofError::InvalidClaim { step, source })?;
-            let signature = decode_signature(&proof_step.signature)
-                .map_err(|source| CapabilityProofError::InvalidSignatureBlob { step, source })?;
-
-            if signature.claim != claim_handle {
-                return Err(CapabilityProofError::SignatureNamesWrongClaim {
+        for (step, (edge, claim_blob)) in self.proof.edges().zip(&self.claims).enumerate() {
+            let actual_handle = content_handle(claim_blob);
+            if edge.claim != actual_handle {
+                return Err(CapabilityProofError::ClaimHandleMismatch {
                     step,
-                    expected: claim_handle,
-                    actual: signature.claim,
+                    expected: edge.claim,
+                    actual: actual_handle,
                 });
             }
-            signature
-                .signer()
-                .verify_strict(&proof_step.claim.bytes, &signature.signature())
-                .map_err(|_| CapabilityProofError::InvalidSignature { step })?;
+            let claim = CapabilityClaim::from_blob(claim_blob.clone())
+                .map_err(|source| CapabilityProofError::InvalidClaim { step, source })?;
+            if claim.parent() != previous_handle {
+                return Err(CapabilityProofError::WrongParent {
+                    step,
+                    expected: previous_handle,
+                    actual: claim.parent(),
+                });
+            }
 
-            if let Some(validity) = grant.validity {
+            if let Some(parent_mode) = effective_mode {
+                if !parent_mode.delegates() {
+                    return Err(CapabilityProofError::ParentCannotDelegate { step });
+                }
+            }
+
+            effective_atom = Some(match effective_atom {
+                None => claim.atom(),
+                Some(parent) if parent == claim.atom() => parent,
+                Some(parent) => {
+                    return Err(CapabilityProofError::AtomMismatch {
+                        step,
+                        parent,
+                        child: claim.atom(),
+                    });
+                }
+            });
+            effective_mode = Some(match effective_mode {
+                None => claim.mode(),
+                Some(parent) => parent
+                    .meet(claim.mode())
+                    .ok_or(CapabilityProofError::EmptyMode { step })?,
+            });
+
+            if let Some(validity) = claim.validity() {
                 let (lower, upper) = validity.bounds_ns();
                 if instant_ns < lower {
                     return Err(CapabilityProofError::NotYetValid { step, lower });
@@ -1015,375 +1177,397 @@ impl CapabilityProof {
                     return Err(CapabilityProofError::Expired { step, upper });
                 }
                 effective_validity = Some(match effective_validity {
-                    Some((effective_lower, effective_upper)) => {
-                        (effective_lower.max(lower), effective_upper.min(upper))
-                    }
                     None => (lower, upper),
+                    Some((parent_lower, parent_upper)) => {
+                        let intersection = (parent_lower.max(lower), parent_upper.min(upper));
+                        if intersection.0 > intersection.1 {
+                            return Err(CapabilityProofError::EmptyValidity { step });
+                        }
+                        intersection
+                    }
                 });
             }
 
-            match previous {
-                None => {
-                    if grant.parent.is_some() {
-                        return Err(CapabilityProofError::WrongParent {
-                            step,
-                            expected: None,
-                            actual: grant.parent,
-                        });
-                    }
-                    if signature.signer != trust_root {
-                        return Err(CapabilityProofError::WrongRootSigner { step });
-                    }
-                }
-                Some((parent, parent_signature)) => {
-                    if grant.parent != Some(parent_signature) {
-                        return Err(CapabilityProofError::WrongParent {
-                            step,
-                            expected: Some(parent_signature),
-                            actual: grant.parent,
-                        });
-                    }
-                    if signature.signer != parent.subject {
-                        return Err(CapabilityProofError::IssuerIsNotParentSubject { step });
-                    }
-                    if !parent.mode.delegates() {
-                        return Err(CapabilityProofError::ParentCannotDelegate { step });
-                    }
-                    if !parent.mode.satisfies(grant.mode) {
-                        return Err(CapabilityProofError::ModeEscalation {
-                            step,
-                            parent: parent.mode,
-                            child: grant.mode,
-                        });
-                    }
-                    if grant.atom != parent.atom {
-                        return Err(CapabilityProofError::AtomChanged {
-                            step,
-                            parent: parent.atom,
-                            child: grant.atom,
-                        });
-                    }
-                }
-            }
-
-            previous = Some((grant, signature_handle));
-            leaf = Some((grant, claim_handle, signature_handle));
+            previous_handle = Some(actual_handle);
+            leaf_claim = Some(claim);
         }
 
-        let (grant, claim_handle, credential) =
-            leaf.expect("a nonempty proof always assigns one leaf");
-        if !expected.is_satisfied_by(grant) {
-            return Err(CapabilityProofError::ClaimMismatch {
-                expected,
-                actual: grant,
+        let actual_leaf = self.proof.leaf_key();
+        if actual_leaf != expected_leaf {
+            return Err(CapabilityProofError::WrongLeaf {
+                expected: expected_leaf.to_bytes(),
+                actual: actual_leaf.to_bytes(),
             });
         }
+        let effective_atom = effective_atom.expect("nonempty proof has an effective atom");
+        let effective_mode = effective_mode.expect("nonempty proof has an effective mode");
+        if request.atom() != effective_atom || !effective_mode.satisfies(request.required()) {
+            return Err(CapabilityProofError::RequestMismatch {
+                requested: request,
+                effective_atom,
+                effective_mode,
+            });
+        }
+        let leaf_claim = leaf_claim.expect("nonempty proof has a leaf claim");
         Ok(VerifiedCapability {
-            grant,
-            claim_handle,
-            credential,
+            bundle: self.clone(),
+            claim: leaf_claim,
+            claim_handle: previous_handle.expect("nonempty proof has a leaf handle"),
+            subject: actual_leaf,
+            effective_atom,
+            effective_mode,
             effective_validity: effective_validity
                 .map(|(lower, upper)| CapabilityValidity::from_bounds_ns(lower, upper)),
         })
     }
 }
 
-fn load_exact_blob<E>(
-    handle: CapabilityBlobHandle,
-    get_blob: &mut impl FnMut(CapabilityBlobHandle) -> Result<Option<Blob<SimpleArchive>>, E>,
-) -> Result<Blob<SimpleArchive>, CapabilityProofLoadError<E>> {
-    let blob = get_blob(handle)
-        .map_err(|source| CapabilityProofLoadError::Get { handle, source })?
-        .ok_or(CapabilityProofLoadError::Missing { handle })?;
-    let actual = content_handle(&blob);
-    if actual != handle {
-        return Err(CapabilityProofLoadError::HandleMismatch {
-            requested: handle,
-            actual,
-        });
-    }
-    Ok(blob)
-}
-
-/// Why exact-handle proof reconstruction failed before authorization.
-#[derive(Debug)]
-pub enum CapabilityProofLoadError<E> {
-    /// The caller's blob adapter failed while looking up one exact handle.
-    Get {
-        /// Requested content handle.
-        handle: CapabilityBlobHandle,
-        /// Adapter-specific retrieval error.
-        source: E,
+/// Structural failure in the bounded proof-bundle codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapabilityProofBundleError {
+    Version {
+        expected: u8,
+        actual: u8,
     },
-    /// The caller's blob adapter had no blob for an exact required handle.
-    Missing {
-        /// Missing content handle.
-        handle: CapabilityBlobHandle,
+    Empty,
+    Proof(CapabilityProofDecodeError),
+    ClaimCount {
+        expected: usize,
+        actual: usize,
     },
-    /// The adapter returned bytes whose recomputed identity was not requested.
-    HandleMismatch {
-        /// Requested content handle.
-        requested: CapabilityBlobHandle,
-        /// Identity recomputed from the returned bytes.
-        actual: CapabilityBlobHandle,
+    ClaimLength {
+        step: usize,
+        min: usize,
+        max: usize,
+        actual: usize,
     },
-    /// A required signature blob was not one closed canonical signature.
-    InvalidSignatureBlob {
-        /// Exact signature handle being followed.
-        handle: CapabilityBlobHandle,
-        /// Signature parsing failure.
-        source: CapabilitySignatureDecodeError,
+    FrameTooLarge,
+    Truncated {
+        offset: usize,
     },
-    /// A required claim blob was not one closed canonical claim.
-    InvalidClaim {
-        /// Exact claim handle named by its signature.
-        handle: CapabilityBlobHandle,
-        /// Claim parsing failure.
-        source: CapabilityGrantDecodeError,
-    },
-    /// Following parent edges encountered the same signature handle twice.
-    RepeatedSignature {
-        /// Repeated signature handle.
-        handle: CapabilityBlobHandle,
+    TrailingBytes {
+        bytes: usize,
     },
 }
 
-impl<E: fmt::Display> fmt::Display for CapabilityProofLoadError<E> {
+impl fmt::Display for CapabilityProofBundleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Get { source, .. } => {
+            Self::Version { expected, actual } => {
                 write!(
                     formatter,
-                    "capability proof blob retrieval failed: {source}"
+                    "capability bundle version is {actual}; expected {expected}"
                 )
             }
-            Self::Missing { .. } => formatter.write_str("capability proof requires a missing blob"),
-            Self::HandleMismatch { .. } => {
-                formatter.write_str("capability proof loader returned bytes under the wrong handle")
+            Self::Empty => formatter.write_str("capability bundle is empty"),
+            Self::Proof(error) => write!(formatter, "invalid capability proof: {error}"),
+            Self::ClaimCount { expected, actual } => write!(
+                formatter,
+                "capability bundle has {actual} claims; expected {expected}"
+            ),
+            Self::ClaimLength {
+                step,
+                min,
+                max,
+                actual,
+            } => write!(
+                formatter,
+                "capability claim {step} has {actual} bytes; expected {min}..={max} canonical bytes"
+            ),
+            Self::FrameTooLarge => formatter.write_str("capability bundle length overflow"),
+            Self::Truncated { offset } => {
+                write!(formatter, "capability bundle is truncated at byte {offset}")
             }
-            Self::InvalidSignatureBlob { source, .. } => {
+            Self::TrailingBytes { bytes } => {
                 write!(
                     formatter,
-                    "capability proof has an invalid signature blob: {source}"
+                    "capability bundle contains {bytes} trailing bytes"
                 )
-            }
-            Self::InvalidClaim { source, .. } => {
-                write!(
-                    formatter,
-                    "capability proof has an invalid claim blob: {source}"
-                )
-            }
-            Self::RepeatedSignature { .. } => {
-                formatter.write_str("capability proof parent walk repeated a signature handle")
             }
         }
     }
 }
 
-impl<E: Error + 'static> Error for CapabilityProofLoadError<E> {
+impl Error for CapabilityProofBundleError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Get { source, .. } => Some(source),
-            Self::InvalidSignatureBlob { source, .. } => Some(source),
-            Self::InvalidClaim { source, .. } => Some(source),
+            Self::Proof(error) => Some(error),
             _ => None,
         }
     }
 }
 
-/// The exact verified leaf and its content identities.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Exact authority established by one accepted proof bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedCapability {
-    grant: CapabilityGrant,
-    claim_handle: CapabilityBlobHandle,
-    credential: CapabilityBlobHandle,
+    bundle: CapabilityProofBundle,
+    claim: CapabilityClaim,
+    claim_handle: CapabilityClaimHandle,
+    subject: VerifyingKey,
+    effective_atom: CapabilityAtom,
+    effective_mode: CapabilityMode,
     effective_validity: Option<CapabilityValidity>,
 }
 
 impl VerifiedCapability {
-    /// Verified canonical leaf grant.
-    pub const fn grant(self) -> CapabilityGrant {
-        self.grant
+    /// Complete accepted proof and ordered claim closure.
+    pub const fn bundle(&self) -> &CapabilityProofBundle {
+        &self.bundle
     }
 
-    /// Recomputed content identity of the verified leaf claim blob.
-    pub const fn claim_handle(self) -> CapabilityBlobHandle {
+    /// Exact canonical leaf claim.
+    pub const fn claim(&self) -> CapabilityClaim {
+        self.claim
+    }
+
+    /// Exact content identity of the leaf claim.
+    pub const fn claim_handle(&self) -> CapabilityClaimHandle {
         self.claim_handle
     }
 
-    /// Recomputed content identity of the verified leaf signature blob.
-    pub const fn credential(self) -> CapabilityBlobHandle {
-        self.credential
+    /// Final principal established by the proof.
+    pub fn subject(&self) -> VerifyingKey {
+        self.subject
     }
 
-    /// Intersection of every bounded interval in the verified chain.
-    ///
-    /// `None` means every step was unbounded. The explicit verification
-    /// instant was inside both inclusive bounds of the returned interval.
-    pub const fn effective_validity(self) -> Option<CapabilityValidity> {
+    /// Exact identity of the accepted proof bytes.
+    pub fn proof_id(&self) -> CapabilityProofId {
+        self.bundle.proof.id()
+    }
+
+    /// Effective exact action/resource atom.
+    pub const fn effective_atom(&self) -> CapabilityAtom {
+        self.effective_atom
+    }
+
+    /// Meet of every mode restriction in the chain.
+    pub const fn effective_mode(&self) -> CapabilityMode {
+        self.effective_mode
+    }
+
+    /// Intersection of every bounded validity restriction.
+    pub const fn effective_validity(&self) -> Option<CapabilityValidity> {
         self.effective_validity
+    }
+
+    /// Extend this accepted proof by one directly signed restriction.
+    pub fn delegate(
+        &self,
+        issuer: &SigningKey,
+        child: CapabilityClaim,
+        delegate: VerifyingKey,
+    ) -> Result<CapabilityProofBundle, CapabilityIssueError> {
+        if issuer.verifying_key() != self.subject {
+            return Err(CapabilityIssueError::IssuerIsNotLeaf);
+        }
+        if !self.effective_mode.delegates() {
+            return Err(CapabilityIssueError::ParentCannotDelegate);
+        }
+        if child.parent() != Some(self.claim_handle) {
+            return Err(CapabilityIssueError::WrongParent {
+                expected: self.claim_handle,
+                actual: child.parent(),
+            });
+        }
+        if child.atom() != self.effective_atom {
+            return Err(CapabilityIssueError::AtomMismatch {
+                parent: self.effective_atom,
+                child: child.atom(),
+            });
+        }
+        if self.effective_mode.meet(child.mode()).is_none() {
+            return Err(CapabilityIssueError::EmptyMode);
+        }
+        if let (Some(parent), Some(child_validity)) = (self.effective_validity, child.validity()) {
+            let (parent_lower, parent_upper) = parent.bounds_ns();
+            let (child_lower, child_upper) = child_validity.bounds_ns();
+            if parent_lower.max(child_lower) > parent_upper.min(child_upper) {
+                return Err(CapabilityIssueError::EmptyValidity);
+            }
+        }
+
+        let child_blob = child.to_blob();
+        let child_handle = content_handle(&child_blob);
+        let proof = self.bundle.proof.extend(issuer, child_handle, delegate)?;
+        let mut claims = self.bundle.claims.clone();
+        claims.push(child_blob);
+        Ok(CapabilityProofBundle { proof, claims })
     }
 }
 
-/// Why standalone, claim-directed capability verification failed.
+/// Why a root issue or verified-proof extension was refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CapabilityProofError {
-    /// A proof must contain a root-issued occurrence.
-    Empty,
-    /// One claim was not a closed canonical capability grant.
-    InvalidClaim {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Claim parsing failure.
-        source: CapabilityGrantDecodeError,
-    },
-    /// One signature blob was not the exact closed canonical shape.
-    InvalidSignatureBlob {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Signature parsing failure.
-        source: CapabilitySignatureDecodeError,
-    },
-    /// A signature blob named a different claim handle than its adjacent blob.
-    SignatureNamesWrongClaim {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Recomputed adjacent claim identity.
-        expected: CapabilityBlobHandle,
-        /// Claim identity encoded in the signature blob.
-        actual: CapabilityBlobHandle,
-    },
-    /// Strict Ed25519 verification rejected one signature.
-    InvalidSignature {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-    },
-    /// The explicit instant precedes one claim's inclusive lower bound.
-    NotYetValid {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Inclusive lower bound in TAI nanoseconds.
-        lower: i128,
-    },
-    /// The explicit instant follows one claim's inclusive upper bound.
-    Expired {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Inclusive upper bound in TAI nanoseconds.
-        upper: i128,
-    },
-    /// The first claim unexpectedly named a parent, or a child did not name
-    /// the immediately preceding signature blob.
+pub enum CapabilityIssueError {
+    RootHasParent,
+    IssuerIsNotLeaf,
+    ParentCannotDelegate,
     WrongParent {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Required exact parent signature handle.
-        expected: Option<CapabilityBlobHandle>,
-        /// Parent handle encoded by the claim.
-        actual: Option<CapabilityBlobHandle>,
+        expected: CapabilityClaimHandle,
+        actual: Option<CapabilityClaimHandle>,
     },
-    /// The first valid signature was not made by the supplied trust root.
-    WrongRootSigner {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-    },
-    /// A child was not signed by its exact parent's subject.
-    IssuerIsNotParentSubject {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-    },
-    /// A child followed a parent that carried invocation only.
-    ParentCannotDelegate {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-    },
-    /// A child requested an invocation/delegation use absent from its parent.
-    ModeEscalation {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Mode carried by the exact parent occurrence.
-        parent: CapabilityMode,
-        /// Escalating mode carried by the child.
-        child: CapabilityMode,
-    },
-    /// A child changed its parent's exact action/resource atom.
-    AtomChanged {
-        /// Zero-based root-to-leaf step index.
-        step: usize,
-        /// Parent's exact atom.
+    AtomMismatch {
         parent: CapabilityAtom,
-        /// Child's exact atom.
         child: CapabilityAtom,
     },
-    /// The valid chain's leaf did not match the caller's exact subject, atom,
-    /// and minimum mode.
-    ClaimMismatch {
-        /// Exact authority requested by the caller.
-        expected: CapabilityClaim,
-        /// Canonical but unsuitable leaf grant.
-        actual: CapabilityGrant,
+    EmptyMode,
+    EmptyValidity,
+    TooManySteps {
+        limit: usize,
+    },
+}
+
+impl fmt::Display for CapabilityIssueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootHasParent => formatter.write_str("a root capability claim names a parent"),
+            Self::IssuerIsNotLeaf => {
+                formatter.write_str("capability issuer is not the verified proof leaf")
+            }
+            Self::ParentCannotDelegate => {
+                formatter.write_str("verified capability does not permit delegation")
+            }
+            Self::WrongParent { .. } => {
+                formatter.write_str("child claim does not name the verified leaf claim")
+            }
+            Self::AtomMismatch { .. } => {
+                formatter.write_str("child claim's exact atom does not meet its parent")
+            }
+            Self::EmptyMode => formatter.write_str("child mode has an empty meet with its parent"),
+            Self::EmptyValidity => {
+                formatter.write_str("child validity has an empty intersection with its parent")
+            }
+            Self::TooManySteps { limit } => {
+                write!(formatter, "capability proof exceeds its {limit}-step limit")
+            }
+        }
+    }
+}
+
+impl Error for CapabilityIssueError {}
+
+/// Why direct proof verification failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapabilityProofError {
+    WrongRoot {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    InvalidSignature {
+        step: usize,
+    },
+    ClaimCount {
+        expected: usize,
+        actual: usize,
+    },
+    ClaimHandleMismatch {
+        step: usize,
+        expected: CapabilityClaimHandle,
+        actual: CapabilityClaimHandle,
+    },
+    InvalidClaim {
+        step: usize,
+        source: CapabilityClaimDecodeError,
+    },
+    WrongParent {
+        step: usize,
+        expected: Option<CapabilityClaimHandle>,
+        actual: Option<CapabilityClaimHandle>,
+    },
+    ParentCannotDelegate {
+        step: usize,
+    },
+    AtomMismatch {
+        step: usize,
+        parent: CapabilityAtom,
+        child: CapabilityAtom,
+    },
+    EmptyMode {
+        step: usize,
+    },
+    EmptyValidity {
+        step: usize,
+    },
+    NotYetValid {
+        step: usize,
+        lower: i128,
+    },
+    Expired {
+        step: usize,
+        upper: i128,
+    },
+    WrongLeaf {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    RequestMismatch {
+        requested: CapabilityRequest,
+        effective_atom: CapabilityAtom,
+        effective_mode: CapabilityMode,
     },
 }
 
 impl fmt::Display for CapabilityProofError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => formatter.write_str("capability proof is empty"),
-            Self::InvalidClaim { step, source } => {
-                write!(
-                    formatter,
-                    "capability proof step {step} has an invalid claim: {source}"
-                )
+            Self::WrongRoot { .. } => {
+                formatter.write_str("capability proof starts at a different trust root")
             }
-            Self::InvalidSignatureBlob { step, source } => write!(
-                formatter,
-                "capability proof step {step} has an invalid signature blob: {source}"
-            ),
-            Self::SignatureNamesWrongClaim { step, .. } => write!(
-                formatter,
-                "capability proof step {step} signature names a different claim"
-            ),
             Self::InvalidSignature { step } => {
                 write!(
                     formatter,
-                    "capability proof step {step} has an invalid signature"
+                    "capability proof edge {step} has an invalid signature"
                 )
             }
+            Self::ClaimCount { expected, actual } => write!(
+                formatter,
+                "capability proof has {actual} claim blobs; expected {expected}"
+            ),
+            Self::ClaimHandleMismatch { step, .. } => write!(
+                formatter,
+                "capability proof edge {step} names different claim bytes"
+            ),
+            Self::InvalidClaim { step, source } => {
+                write!(
+                    formatter,
+                    "capability proof claim {step} is invalid: {source}"
+                )
+            }
+            Self::WrongParent { step, .. } => {
+                write!(
+                    formatter,
+                    "capability proof claim {step} names the wrong parent"
+                )
+            }
+            Self::ParentCannotDelegate { step } => write!(
+                formatter,
+                "capability proof edge {step} follows authority without delegation"
+            ),
+            Self::AtomMismatch { step, .. } => write!(
+                formatter,
+                "capability proof claim {step} has an empty atom meet"
+            ),
+            Self::EmptyMode { step } => write!(
+                formatter,
+                "capability proof claim {step} has an empty mode meet"
+            ),
+            Self::EmptyValidity { step } => write!(
+                formatter,
+                "capability proof claim {step} has an empty validity meet"
+            ),
             Self::NotYetValid { step, lower } => write!(
                 formatter,
-                "capability proof step {step} is not valid before TAI nanosecond {lower}"
+                "capability proof claim {step} is not valid before TAI nanosecond {lower}"
             ),
             Self::Expired { step, upper } => write!(
                 formatter,
-                "capability proof step {step} expired after TAI nanosecond {upper}"
+                "capability proof claim {step} expired after TAI nanosecond {upper}"
             ),
-            Self::WrongParent { step, .. } => write!(
-                formatter,
-                "capability proof step {step} does not name its exact predecessor"
-            ),
-            Self::WrongRootSigner { step } => write!(
-                formatter,
-                "capability proof step {step} was not signed by the supplied trust root"
-            ),
-            Self::IssuerIsNotParentSubject { step } => write!(
-                formatter,
-                "capability proof step {step} issuer is not its parent subject"
-            ),
-            Self::ParentCannotDelegate { step } => write!(
-                formatter,
-                "capability proof step {step} follows a non-delegating parent"
-            ),
-            Self::ModeEscalation { step, .. } => write!(
-                formatter,
-                "capability proof step {step} requests authority absent from its parent"
-            ),
-            Self::AtomChanged { step, .. } => write!(
-                formatter,
-                "capability proof step {step} changed its parent's exact atom"
-            ),
-            Self::ClaimMismatch { .. } => formatter.write_str(
-                "capability proof leaf does not satisfy the caller's exact subject, atom, and mode",
-            ),
+            Self::WrongLeaf { .. } => {
+                formatter.write_str("capability proof ends at a different principal")
+            }
+            Self::RequestMismatch { .. } => {
+                formatter.write_str("effective capability does not satisfy the exact request")
+            }
         }
     }
 }
@@ -1392,82 +1576,27 @@ impl Error for CapabilityProofError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidClaim { source, .. } => Some(source),
-            Self::InvalidSignatureBlob { source, .. } => Some(source),
             _ => None,
         }
     }
 }
 
-fn content_handle(blob: &Blob<SimpleArchive>) -> CapabilityBlobHandle {
+fn content_handle(blob: &Blob<SimpleArchive>) -> CapabilityClaimHandle {
     Inline::new(Blake3::digest(&blob.bytes))
-}
-
-fn exactly_one<T, E>(mut rows: impl Iterator<Item = T>, field: &'static str) -> Result<T, E>
-where
-    E: FieldDecodeError,
-{
-    let first = rows.next().ok_or_else(|| E::missing(field))?;
-    if rows.next().is_some() {
-        return Err(E::repeated(field));
-    }
-    Ok(first)
-}
-
-fn at_most_one<T, E>(mut rows: impl Iterator<Item = T>, field: &'static str) -> Result<Option<T>, E>
-where
-    E: FieldDecodeError,
-{
-    let first = rows.next();
-    if rows.next().is_some() {
-        return Err(E::repeated(field));
-    }
-    Ok(first)
-}
-
-trait FieldDecodeError {
-    fn missing(field: &'static str) -> Self;
-    fn repeated(field: &'static str) -> Self;
-}
-
-impl FieldDecodeError for CapabilityGrantDecodeError {
-    fn missing(field: &'static str) -> Self {
-        Self::MissingField(field)
-    }
-
-    fn repeated(field: &'static str) -> Self {
-        Self::RepeatedField(field)
-    }
-}
-
-impl FieldDecodeError for CapabilitySignatureDecodeError {
-    fn missing(field: &'static str) -> Self {
-        Self::MissingField(field)
-    }
-
-    fn repeated(field: &'static str) -> Self {
-        Self::RepeatedField(field)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inline::encodings::boolean::Boolean;
-    use anybytes::Bytes;
-    use std::collections::HashMap;
 
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
     }
 
-    fn action(byte: u8) -> CapabilityAction {
-        CapabilityAction::new(Id::new([byte; 16]).expect("nonzero test action"))
-    }
-
-    fn atom(action_byte: u8, resource_byte: u8) -> CapabilityAtom {
+    fn atom(action: u8, resource: u8) -> CapabilityAtom {
         CapabilityAtom::new(
-            action(action_byte),
-            CapabilityResource::new([resource_byte; 32]),
+            CapabilityAction::new(Id::new([action; 16]).expect("nonzero action")),
+            CapabilityResource::new([resource; 32]),
         )
     }
 
@@ -1476,698 +1605,500 @@ mod tests {
     }
 
     fn validity(lower: f64, upper: f64) -> CapabilityValidity {
-        CapabilityValidity::new(epoch(lower), epoch(upper)).expect("ordered test interval")
+        CapabilityValidity::new(epoch(lower), epoch(upper)).expect("ordered interval")
     }
 
-    fn root_step(
+    fn request(atom: CapabilityAtom, mode: CapabilityMode) -> CapabilityRequest {
+        CapabilityRequest::new(atom, mode)
+    }
+
+    fn root_bundle(
         root: &SigningKey,
-        subject: VerifyingKey,
+        leaf: &SigningKey,
         atom: CapabilityAtom,
         mode: CapabilityMode,
         validity: Option<CapabilityValidity>,
-    ) -> CapabilityProofStep {
-        CapabilityProofStep::issue(root, CapabilityGrant::root(subject, atom, mode, validity))
+    ) -> CapabilityProofBundle {
+        CapabilityProofBundle::issue_root(
+            root,
+            CapabilityClaim::root(atom, mode, validity),
+            leaf.verifying_key(),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn resource_wrapper_is_exactly_32_bytes_and_erases_inline_type() {
-        let typed = Inline::<Boolean>::new([0xA5; 32]);
-        let resource = CapabilityResource::from(typed);
-        assert_eq!(std::mem::size_of::<CapabilityResource>(), 32);
-        assert_eq!(resource.into_bytes(), [0xA5; 32]);
-    }
-
-    #[test]
-    fn root_claim_and_signature_round_trip() {
-        let root = key(1);
-        let subject = key(2);
-        let atom = atom(3, 4);
-        let step = root_step(
-            &root,
-            subject.verifying_key(),
-            atom,
-            CapabilityMode::Invoke,
-            None,
-        );
-        let proof = CapabilityProof::new(vec![step.clone()]);
-        let verified = proof
-            .verify_claim(
-                root.verifying_key(),
-                epoch(100.0),
-                CapabilityClaim::new(subject.verifying_key(), atom, CapabilityMode::Invoke),
-            )
-            .expect("root-issued proof verifies");
-
-        assert_eq!(verified.grant().subject(), subject.verifying_key());
-        assert_eq!(verified.claim_handle(), content_handle(step.claim()));
-        assert_eq!(verified.credential(), step.signature_handle());
-        assert_eq!(proof.credential(), Some(verified.credential()));
-        assert_eq!(verified.effective_validity(), None);
-        assert_eq!(
-            CapabilityGrant::from_blob(step.claim().clone()).expect("decode claim"),
-            verified.grant()
-        );
-        decode_signature(step.signature()).expect("decode signature");
-    }
-
-    #[test]
-    fn loader_walks_exact_blobs_from_leaf_handle_and_preserves_failures() {
-        let root = key(5);
-        let issuer = key(6);
-        let leaf = key(7);
-        let atom = atom(8, 9);
-        let parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
+    fn claim_is_key_free_canonical_and_round_trips() {
+        let claim = CapabilityClaim::root(
+            atom(1, 2),
             CapabilityMode::InvokeAndDelegate,
-            None,
+            Some(validity(10.0, 20.0)),
         );
-        let child = CapabilityProofStep::issue(
-            &issuer,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
-                leaf.verifying_key(),
-                atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
-        );
-        let proof = CapabilityProof::new(vec![parent, child]);
-        let credential = proof.credential().expect("nonempty proof");
-        let mut blobs = HashMap::new();
-        for step in proof.steps() {
-            blobs.insert(content_handle(step.claim()), step.claim().clone());
-            blobs.insert(step.signature_handle(), step.signature().clone());
-        }
-
-        let loaded = CapabilityProof::load(credential, |handle| {
-            Ok::<_, &'static str>(blobs.get(&handle).cloned())
-        })
-        .expect("exact-handle walk reconstructs root-to-leaf evidence");
-        assert_eq!(loaded, proof);
-        loaded
-            .verify_claim(
-                root.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(leaf.verifying_key(), atom, CapabilityMode::Invoke),
-            )
-            .expect("loaded evidence still requires and passes verification");
-
-        assert!(matches!(
-            CapabilityProof::load::<Infallible>(credential, |_| Ok(None)),
-            Err(CapabilityProofLoadError::Missing { handle }) if handle == credential
-        ));
-        assert!(matches!(
-            CapabilityProof::load(credential, |_| {
-                Err::<Option<Blob<SimpleArchive>>, _>("offline")
-            }),
-            Err(CapabilityProofLoadError::Get {
-                handle,
-                source: "offline",
-            }) if handle == credential
-        ));
-
-        let wrong_blob = proof.steps()[0].claim().clone();
-        assert!(matches!(
-            CapabilityProof::load::<Infallible>(credential, |_| Ok(Some(wrong_blob.clone()))),
-            Err(CapabilityProofLoadError::HandleMismatch { requested, .. })
-                if requested == credential
-        ));
+        let blob = claim.to_blob();
+        assert_eq!(CapabilityClaim::from_blob(blob.clone()), Ok(claim));
+        assert_eq!(content_handle(&blob), claim.handle());
+        assert_eq!(blob.bytes.len(), 5 * TRIBLE_LEN);
     }
 
     #[test]
-    fn delegated_chain_is_exact_and_combined_mode_satisfies_each_use() {
+    fn direct_proof_has_exact_k_s_c_k_stride_and_round_trips() {
+        let root = key(1);
+        let leaf = key(2);
+        let bundle = root_bundle(&root, &leaf, atom(3, 4), CapabilityMode::Invoke, None);
+        let proof = bundle.proof();
+        assert_eq!(proof.as_bytes().len(), MIN_PROOF_LEN);
+        assert_eq!(&proof.as_bytes()[..32], &root.verifying_key().to_bytes());
+        assert_eq!(
+            &proof.as_bytes()[32 + SIGNATURE_LEN..32 + SIGNATURE_LEN + CLAIM_HANDLE_LEN],
+            &bundle.claims()[0].get_handle().raw
+        );
+        assert_eq!(
+            &proof.as_bytes()[128..160],
+            &leaf.verifying_key().to_bytes()
+        );
+        assert_eq!(
+            CapabilityProof::from_bytes(proof.as_bytes()),
+            Ok(proof.clone())
+        );
+        assert_eq!(
+            proof.claim_handles().collect::<Vec<_>>(),
+            vec![proof.leaf_claim()]
+        );
+        assert_eq!(proof.leaf_issuer(), root.verifying_key());
+        assert_eq!(proof.leaf_key(), leaf.verifying_key());
+        proof.verify_signatures().unwrap();
+    }
+
+    #[test]
+    fn root_and_delegated_proof_verify_by_meet() {
         let root = key(10);
-        let delegate = key(11);
+        let issuer = key(11);
         let leaf = key(12);
         let atom = atom(13, 14);
-        let parent = root_step(
+        let parent_bundle = root_bundle(
             &root,
-            delegate.verifying_key(),
+            &issuer,
             atom,
             CapabilityMode::InvokeAndDelegate,
-            None,
+            Some(validity(10.0, 30.0)),
         );
-        let child = CapabilityProofStep::issue(
-            &delegate,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
-                leaf.verifying_key(),
-                atom,
-                CapabilityMode::InvokeAndDelegate,
-                None,
-            ),
-        );
-        let proof = CapabilityProof::new(vec![parent, child]);
-
-        for required in [CapabilityMode::Invoke, CapabilityMode::Delegate] {
-            proof
-                .verify_claim(
-                    root.verifying_key(),
-                    epoch(0.0),
-                    CapabilityClaim::new(leaf.verifying_key(), atom, required),
-                )
-                .expect("the combined mode contains each individual use");
-        }
-        let verified = proof
-            .verify_claim(
+        let parent = parent_bundle
+            .verify(
                 root.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(
-                    leaf.verifying_key(),
-                    atom,
-                    CapabilityMode::InvokeAndDelegate,
-                ),
+                epoch(20.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
             )
-            .expect("the combined mode satisfies the combined requirement");
-        assert_eq!(verified.grant().mode(), CapabilityMode::InvokeAndDelegate);
-        assert!(!CapabilityMode::Delegate.satisfies(CapabilityMode::Invoke));
-        assert!(!CapabilityMode::Invoke.satisfies(CapabilityMode::Delegate));
-        assert!(CapabilityMode::InvokeAndDelegate.satisfies(CapabilityMode::InvokeAndDelegate));
+            .unwrap();
+        let child_claim = CapabilityClaim::delegated(
+            parent.claim_handle(),
+            atom,
+            CapabilityMode::Invoke,
+            Some(validity(15.0, 40.0)),
+        );
+        let bundle = parent
+            .delegate(&issuer, child_claim, leaf.verifying_key())
+            .unwrap();
+        let verified = bundle
+            .verify(
+                root.verifying_key(),
+                epoch(20.0),
+                leaf.verifying_key(),
+                request(atom, CapabilityMode::Invoke),
+            )
+            .unwrap();
+        assert_eq!(verified.subject(), leaf.verifying_key());
+        assert_eq!(verified.effective_mode(), CapabilityMode::Invoke);
+        let (lower, upper) = verified.effective_validity().unwrap().bounds();
+        assert_eq!(lower, epoch(15.0));
+        assert_eq!(upper, epoch(30.0));
+        assert_eq!(bundle.proof().step_count(), 2);
+        assert_eq!(bundle.proof().leaf_issuer(), issuer.verifying_key());
+        assert_eq!(bundle.proof().leaf_key(), leaf.verifying_key());
+        assert_eq!(bundle.claims().len(), 2);
     }
 
     #[test]
-    fn invoke_only_parent_cannot_delegate() {
+    fn child_cannot_follow_effective_authority_without_delegate() {
         let root = key(20);
         let issuer = key(21);
         let leaf = key(22);
         let atom = atom(23, 24);
-        let parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::Invoke,
-            None,
-        );
-        let child = CapabilityProofStep::issue(
-            &issuer,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
-                leaf.verifying_key(),
-                atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
-        );
-        let error = CapabilityProof::new(vec![parent, child])
-            .verify_claim(
+        let parent = root_bundle(&root, &issuer, atom, CapabilityMode::Invoke, None);
+        let verified = parent
+            .verify(
                 root.verifying_key(),
                 epoch(0.0),
-                CapabilityClaim::new(leaf.verifying_key(), atom, CapabilityMode::Invoke),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Invoke),
             )
-            .expect_err("invoke-only parent cannot issue a child");
-        assert!(matches!(
-            error,
-            CapabilityProofError::ParentCannotDelegate { step: 1 }
-        ));
-    }
-
-    #[test]
-    fn child_mode_must_attenuate_parent_mode() {
-        let root = key(25);
-        let issuer = key(26);
-        let leaf = key(27);
-        let atom = atom(28, 29);
-
-        let delegate_only_parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::Delegate,
-            None,
-        );
-        for child_mode in [CapabilityMode::Invoke, CapabilityMode::InvokeAndDelegate] {
-            let child = CapabilityProofStep::issue(
+            .unwrap();
+        assert_eq!(
+            verified.delegate(
                 &issuer,
-                CapabilityGrant::delegated(
-                    delegate_only_parent.signature_handle(),
-                    leaf.verifying_key(),
+                CapabilityClaim::delegated(
+                    verified.claim_handle(),
                     atom,
-                    child_mode,
-                    None,
-                ),
-            );
-            assert!(matches!(
-                CapabilityProof::new(vec![delegate_only_parent.clone(), child]).verify_claim(
-                    root.verifying_key(),
-                    epoch(0.0),
-                    CapabilityClaim::new(leaf.verifying_key(), atom, child_mode),
-                ),
-                Err(CapabilityProofError::ModeEscalation {
-                    step: 1,
-                    parent: CapabilityMode::Delegate,
-                    child,
-                }) if child == child_mode
-            ));
-        }
-
-        let full_parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::InvokeAndDelegate,
-            None,
-        );
-        for child_mode in [
-            CapabilityMode::Invoke,
-            CapabilityMode::Delegate,
-            CapabilityMode::InvokeAndDelegate,
-        ] {
-            let child = CapabilityProofStep::issue(
-                &issuer,
-                CapabilityGrant::delegated(
-                    full_parent.signature_handle(),
-                    leaf.verifying_key(),
-                    atom,
-                    child_mode,
-                    None,
-                ),
-            );
-            CapabilityProof::new(vec![full_parent.clone(), child])
-                .verify_claim(
-                    root.verifying_key(),
-                    epoch(0.0),
-                    CapabilityClaim::new(leaf.verifying_key(), atom, child_mode),
-                )
-                .expect("the combined mode may attenuate to any nonempty subset");
-        }
-    }
-
-    #[test]
-    fn child_cannot_change_action_or_resource() {
-        let root = key(30);
-        let issuer = key(31);
-        let leaf = key(32);
-        let parent_atom = atom(33, 34);
-        let parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            parent_atom,
-            CapabilityMode::InvokeAndDelegate,
-            None,
-        );
-
-        for child_atom in [atom(35, 34), atom(33, 36)] {
-            let child = CapabilityProofStep::issue(
-                &issuer,
-                CapabilityGrant::delegated(
-                    parent.signature_handle(),
-                    leaf.verifying_key(),
-                    child_atom,
                     CapabilityMode::Invoke,
                     None,
                 ),
-            );
-            let error = CapabilityProof::new(vec![parent.clone(), child])
-                .verify_claim(
-                    root.verifying_key(),
-                    epoch(0.0),
-                    CapabilityClaim::new(leaf.verifying_key(), child_atom, CapabilityMode::Invoke),
-                )
-                .expect_err("atom changes fail closed");
-            assert!(matches!(
-                error,
-                CapabilityProofError::AtomChanged { step: 1, .. }
-            ));
+                leaf.verifying_key(),
+            ),
+            Err(CapabilityIssueError::ParentCannotDelegate)
+        );
+    }
+
+    #[test]
+    fn wider_child_is_a_noop_restriction_not_an_escalation() {
+        let root = key(30);
+        let issuer = key(31);
+        let leaf = key(32);
+        let atom = atom(33, 34);
+        let parent_bundle = root_bundle(&root, &issuer, atom, CapabilityMode::Delegate, None);
+        let parent = parent_bundle
+            .verify(
+                root.verifying_key(),
+                epoch(0.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        let child = CapabilityClaim::delegated(
+            parent.claim_handle(),
+            atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let bundle = parent
+            .delegate(&issuer, child, leaf.verifying_key())
+            .unwrap();
+        let delegated = bundle
+            .verify(
+                root.verifying_key(),
+                epoch(0.0),
+                leaf.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        assert_eq!(delegated.effective_mode(), CapabilityMode::Delegate);
+        assert!(matches!(
+            bundle.verify(
+                root.verifying_key(),
+                epoch(0.0),
+                leaf.verifying_key(),
+                request(atom, CapabilityMode::Invoke),
+            ),
+            Err(CapabilityProofError::RequestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn proof_binds_root_claim_and_every_delegate_key() {
+        let root = key(40);
+        let leaf = key(41);
+        let bundle = root_bundle(&root, &leaf, atom(42, 43), CapabilityMode::Invoke, None);
+        let original = bundle.proof().as_bytes();
+        for offset in [0, 32, 96, 128] {
+            let mut tampered = original.to_vec();
+            tampered[offset] ^= 1;
+            match CapabilityProof::from_bytes(&tampered) {
+                Ok(proof) => assert!(proof.verify_signatures().is_err()),
+                Err(CapabilityProofDecodeError::InvalidKey { .. }) => {}
+                Err(other) => panic!("unexpected decode error: {other}"),
+            }
         }
     }
 
     #[test]
-    fn child_names_the_exact_parent_signature_blob() {
-        let root = key(40);
-        let issuer = key(41);
-        let leaf = key(42);
-        let atom = atom(43, 44);
-        let actual_parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::InvokeAndDelegate,
-            None,
-        );
-        let other_parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::InvokeAndDelegate,
-            Some(validity(0.0, 200.0)),
-        );
-        let child = CapabilityProofStep::issue(
-            &issuer,
-            CapabilityGrant::delegated(
-                other_parent.signature_handle(),
-                leaf.verifying_key(),
-                atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
-        );
-        let error = CapabilityProof::new(vec![actual_parent, child])
-            .verify_claim(
-                root.verifying_key(),
-                epoch(100.0),
-                CapabilityClaim::new(leaf.verifying_key(), atom, CapabilityMode::Invoke),
-            )
-            .expect_err("a different valid parent occurrence is not interchangeable");
-        assert!(matches!(
-            error,
-            CapabilityProofError::WrongParent { step: 1, .. }
-        ));
-    }
-
-    #[test]
-    fn external_trust_root_and_parent_subject_are_enforced() {
+    fn expected_root_and_leaf_prevent_substitution_and_truncation() {
         let root = key(50);
-        let issuer = key(51);
-        let attacker = key(52);
-        let leaf = key(53);
-        let atom = atom(54, 55);
-        let parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::InvokeAndDelegate,
-            None,
-        );
-
-        let wrong_root_error = CapabilityProof::new(vec![parent.clone()])
-            .verify_claim(
-                attacker.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(issuer.verifying_key(), atom, CapabilityMode::Invoke),
-            )
-            .expect_err("trust root is supplied by the verifier");
+        let other = key(51);
+        let leaf = key(52);
+        let atom = atom(53, 54);
+        let bundle = root_bundle(&root, &leaf, atom, CapabilityMode::Invoke, None);
         assert!(matches!(
-            wrong_root_error,
-            CapabilityProofError::WrongRootSigner { step: 0 }
-        ));
-
-        let child = CapabilityProofStep::issue(
-            &attacker,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
+            bundle.verify(
+                other.verifying_key(),
+                epoch(0.0),
                 leaf.verifying_key(),
-                atom,
-                CapabilityMode::Invoke,
-                None,
+                request(atom, CapabilityMode::Invoke),
             ),
-        );
-        let error = CapabilityProof::new(vec![parent, child])
-            .verify_claim(
+            Err(CapabilityProofError::WrongRoot { .. })
+        ));
+        assert!(matches!(
+            bundle.verify(
                 root.verifying_key(),
                 epoch(0.0),
-                CapabilityClaim::new(leaf.verifying_key(), atom, CapabilityMode::Invoke),
-            )
-            .expect_err("public proof possession is not the parent's private key");
-        assert!(matches!(
-            error,
-            CapabilityProofError::IssuerIsNotParentSubject { step: 1 }
+                other.verifying_key(),
+                request(atom, CapabilityMode::Invoke),
+            ),
+            Err(CapabilityProofError::WrongLeaf { .. })
         ));
     }
 
     #[test]
-    fn both_inclusive_validity_bounds_are_enforced_on_every_step() {
+    fn exact_parent_claim_order_is_required() {
         let root = key(60);
         let issuer = key(61);
         let leaf = key(62);
         let atom = atom(63, 64);
-        let parent = root_step(
+        let parent_bundle = root_bundle(
             &root,
-            issuer.verifying_key(),
+            &issuer,
+            atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let parent = parent_bundle
+            .verify(
+                root.verifying_key(),
+                epoch(0.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        let child =
+            CapabilityClaim::delegated(parent.claim_handle(), atom, CapabilityMode::Invoke, None);
+        let mut bundle = parent
+            .delegate(&issuer, child, leaf.verifying_key())
+            .unwrap();
+        bundle.claims.swap(0, 1);
+        assert!(matches!(
+            bundle.verify(
+                root.verifying_key(),
+                epoch(0.0),
+                leaf.verifying_key(),
+                request(atom, CapabilityMode::Invoke),
+            ),
+            Err(CapabilityProofError::ClaimHandleMismatch { step: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn atom_and_mode_meets_can_be_empty() {
+        let root = key(70);
+        let issuer = key(71);
+        let leaf = key(72);
+        let parent_atom = atom(73, 74);
+        let parent_bundle = root_bundle(
+            &root,
+            &issuer,
+            parent_atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let parent = parent_bundle
+            .verify(
+                root.verifying_key(),
+                epoch(0.0),
+                issuer.verifying_key(),
+                request(parent_atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        assert!(matches!(
+            parent.delegate(
+                &issuer,
+                CapabilityClaim::delegated(
+                    parent.claim_handle(),
+                    atom(75, 74),
+                    CapabilityMode::Invoke,
+                    None,
+                ),
+                leaf.verifying_key(),
+            ),
+            Err(CapabilityIssueError::AtomMismatch { .. })
+        ));
+
+        let delegate_only =
+            root_bundle(&root, &issuer, parent_atom, CapabilityMode::Delegate, None)
+                .verify(
+                    root.verifying_key(),
+                    epoch(0.0),
+                    issuer.verifying_key(),
+                    request(parent_atom, CapabilityMode::Delegate),
+                )
+                .unwrap();
+        assert!(matches!(
+            delegate_only.delegate(
+                &issuer,
+                CapabilityClaim::delegated(
+                    delegate_only.claim_handle(),
+                    parent_atom,
+                    CapabilityMode::Invoke,
+                    None,
+                ),
+                leaf.verifying_key(),
+            ),
+            Err(CapabilityIssueError::EmptyMode)
+        ));
+    }
+
+    #[test]
+    fn validity_meet_is_inclusive_and_disjoint_intervals_fail() {
+        let root = key(80);
+        let issuer = key(81);
+        let leaf = key(82);
+        let atom = atom(83, 84);
+        let parent_bundle = root_bundle(
+            &root,
+            &issuer,
             atom,
             CapabilityMode::InvokeAndDelegate,
             Some(validity(10.0, 20.0)),
         );
-        let child = CapabilityProofStep::issue(
-            &issuer,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
-                leaf.verifying_key(),
-                atom,
-                CapabilityMode::Invoke,
-                Some(validity(5.0, 25.0)),
-            ),
-        );
-        let proof = CapabilityProof::new(vec![parent, child]);
-        let claim = CapabilityClaim::new(leaf.verifying_key(), atom, CapabilityMode::Invoke);
-
         for instant in [10.0, 20.0] {
-            let verified = proof
-                .verify_claim(root.verifying_key(), epoch(instant), claim)
-                .expect("both endpoints are inclusive");
-            let (lower, upper) = verified
-                .effective_validity()
-                .expect("bounded chain has an effective interval")
-                .bounds();
-            assert_eq!(
-                lower.to_tai_duration().total_nanoseconds(),
-                epoch(10.0).to_tai_duration().total_nanoseconds()
-            );
-            assert_eq!(
-                upper.to_tai_duration().total_nanoseconds(),
-                epoch(20.0).to_tai_duration().total_nanoseconds()
-            );
+            parent_bundle
+                .verify(
+                    root.verifying_key(),
+                    epoch(instant),
+                    issuer.verifying_key(),
+                    request(atom, CapabilityMode::Invoke),
+                )
+                .unwrap();
         }
         assert!(matches!(
-            proof.verify_claim(root.verifying_key(), epoch(9.0), claim),
+            parent_bundle.verify(
+                root.verifying_key(),
+                epoch(9.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Invoke),
+            ),
             Err(CapabilityProofError::NotYetValid { step: 0, .. })
         ));
+        let parent = parent_bundle
+            .verify(
+                root.verifying_key(),
+                epoch(15.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
         assert!(matches!(
-            proof.verify_claim(root.verifying_key(), epoch(21.0), claim),
-            Err(CapabilityProofError::Expired { step: 0, .. })
-        ));
-    }
-
-    #[test]
-    fn explicit_leaf_claim_prevents_truncated_prefix_substitution() {
-        let root = key(70);
-        let issuer = key(71);
-        let leaf = key(72);
-        let atom = atom(73, 74);
-        let parent = root_step(
-            &root,
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::InvokeAndDelegate,
-            None,
-        );
-        let child = CapabilityProofStep::issue(
-            &issuer,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
+            parent.delegate(
+                &issuer,
+                CapabilityClaim::delegated(
+                    parent.claim_handle(),
+                    atom,
+                    CapabilityMode::Invoke,
+                    Some(validity(30.0, 40.0)),
+                ),
                 leaf.verifying_key(),
-                atom,
-                CapabilityMode::Invoke,
-                None,
             ),
-        );
-        let full = CapabilityProof::new(vec![parent.clone(), child]);
-        full.verify_claim(
-            root.verifying_key(),
-            epoch(0.0),
-            CapabilityClaim::new(leaf.verifying_key(), atom, CapabilityMode::Invoke),
-        )
-        .expect("full proof verifies");
-
-        let truncated = CapabilityProof::new(vec![parent]);
-        let error = truncated
-            .verify_claim(
-                root.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(leaf.verifying_key(), atom, CapabilityMode::Invoke),
-            )
-            .expect_err("a valid prefix proves only its own subject");
-        assert!(matches!(error, CapabilityProofError::ClaimMismatch { .. }));
-    }
-
-    #[test]
-    fn signature_is_bound_to_exact_claim_bytes_and_strictly_verified() {
-        let root = key(80);
-        let subject = key(81);
-        let attacker = key(82);
-        let expected_atom = atom(83, 84);
-        let step = root_step(
-            &root,
-            subject.verifying_key(),
-            expected_atom,
-            CapabilityMode::Invoke,
-            None,
-        );
-
-        let wrong_claim = CapabilityGrant::root(
-            subject.verifying_key(),
-            atom(83, 85),
-            CapabilityMode::Invoke,
-            None,
-        )
-        .to_blob();
-        let wrong_claim_step = CapabilityProofStep::new(wrong_claim, step.signature.clone());
-        assert!(matches!(
-            CapabilityProof::new(vec![wrong_claim_step]).verify_claim(
-                root.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(
-                    subject.verifying_key(),
-                    expected_atom,
-                    CapabilityMode::Invoke,
-                ),
-            ),
-            Err(CapabilityProofError::SignatureNamesWrongClaim { step: 0, .. })
-        ));
-
-        let bad_signature = attacker.sign(&step.claim.bytes);
-        let parsed = decode_signature(&step.signature).expect("canonical signature");
-        let bad_signature_blob =
-            CapabilitySignature::new(parsed.claim, root.verifying_key(), bad_signature).to_blob();
-        assert!(matches!(
-            CapabilityProof::new(vec![CapabilityProofStep::new(
-                step.claim,
-                bad_signature_blob,
-            )])
-            .verify_claim(
-                root.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(
-                    subject.verifying_key(),
-                    expected_atom,
-                    CapabilityMode::Invoke,
-                ),
-            ),
-            Err(CapabilityProofError::InvalidSignature { step: 0 })
+            Err(CapabilityIssueError::EmptyValidity)
         ));
     }
 
     #[test]
-    fn cached_blob_handles_are_never_trusted() {
+    fn bundle_codec_is_exact_and_rejects_truncation_and_extras() {
         let root = key(90);
-        let subject = key(91);
+        let leaf = key(91);
         let atom = atom(92, 93);
-        let step = root_step(
-            &root,
-            subject.verifying_key(),
-            atom,
-            CapabilityMode::Invoke,
-            None,
+        let bundle = root_bundle(&root, &leaf, atom, CapabilityMode::Invoke, None);
+        let bytes = bundle.to_bytes().unwrap();
+        assert_eq!(
+            CapabilityProofBundle::from_bytes(&bytes),
+            Ok(bundle.clone())
         );
-        let bogus = Inline::new([0xFF; 32]);
-        let claim = Blob::with_handle(step.claim.bytes.clone(), bogus);
-        let signature = Blob::with_handle(step.signature.bytes.clone(), bogus);
-        let proof = CapabilityProof::new(vec![CapabilityProofStep::new(claim, signature)]);
-
-        let verified = proof
-            .verify_claim(
-                root.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(subject.verifying_key(), atom, CapabilityMode::Invoke),
-            )
-            .expect("raw bytes, not cached handles, define identity");
-        assert_ne!(verified.claim_handle(), bogus);
-        assert_ne!(verified.credential(), bogus);
+        for length in 0..bytes.len() {
+            assert!(CapabilityProofBundle::from_bytes(&bytes[..length]).is_err());
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            CapabilityProofBundle::from_bytes(&extra),
+            Err(CapabilityProofBundleError::TrailingBytes { bytes: 1 })
+        ));
+        let mut wrong_version = bytes;
+        wrong_version[0] += 1;
+        assert!(matches!(
+            CapabilityProofBundle::from_bytes(&wrong_version),
+            Err(CapabilityProofBundleError::Version { .. })
+        ));
     }
 
     #[test]
-    fn claim_and_signature_parsers_reject_open_shapes() {
-        let root = key(100);
-        let subject = key(101);
-        let atom = atom(102, 103);
-        let step = root_step(
-            &root,
-            subject.verifying_key(),
-            atom,
-            CapabilityMode::Invoke,
-            None,
-        );
-
-        let mut claim_facts: TribleSet =
-            TryFromBlob::try_from_blob(step.claim.clone()).expect("canonical claim");
-        let claim_entity = exactly_one::<_, CapabilityGrantDecodeError>(
-            find!(
-                (entity: Id),
-                pattern!(&claim_facts, [{ ?entity @ metadata::tag: KIND_CAPABILITY_CLAIM }])
-            )
-            .map(|(entity,)| entity),
-            "metadata::tag",
+    fn same_claim_can_support_distinct_key_paths() {
+        let root_a = key(100);
+        let root_b = key(101);
+        let leaf_a = key(102);
+        let leaf_b = key(103);
+        let atom = atom(104, 105);
+        let claim = CapabilityClaim::root(atom, CapabilityMode::Invoke, None);
+        let a = CapabilityProofBundle::issue_root(&root_a, claim, leaf_a.verifying_key()).unwrap();
+        let b = CapabilityProofBundle::issue_root(&root_b, claim, leaf_b.verifying_key()).unwrap();
+        assert_eq!(a.proof().leaf_claim(), b.proof().leaf_claim());
+        assert_ne!(a.proof().id(), b.proof().id());
+        a.verify(
+            root_a.verifying_key(),
+            epoch(0.0),
+            leaf_a.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
         )
         .unwrap();
-        claim_facts += entity! {
-            ExclusiveId::force_ref(&claim_entity) @
-            metadata::tag: metadata::KIND_MULTI,
-        };
-        assert!(matches!(
-            CapabilityGrant::from_blob(claim_facts.to_blob()),
-            Err(CapabilityGrantDecodeError::NonCanonicalShape)
-                | Err(CapabilityGrantDecodeError::InvalidLength { .. })
-        ));
-
-        let mut signature_facts: TribleSet =
-            TryFromBlob::try_from_blob(step.signature).expect("canonical signature");
-        let signature_entity = exactly_one::<_, CapabilitySignatureDecodeError>(
-            find!(
-                (entity: Id),
-                pattern!(&signature_facts, [{ ?entity @ metadata::tag: KIND_CAPABILITY_SIGNATURE }])
-            )
-            .map(|(entity,)| entity),
-            "metadata::tag",
+        b.verify(
+            root_b.verifying_key(),
+            epoch(0.0),
+            leaf_b.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
         )
         .unwrap();
-        signature_facts += entity! {
-            ExclusiveId::force_ref(&signature_entity) @
-            metadata::tag: metadata::KIND_MULTI,
+    }
+
+    #[test]
+    fn claim_parser_rejects_open_and_noncanonical_shapes() {
+        let claim = CapabilityClaim::root(atom(110, 111), CapabilityMode::Invoke, None).to_blob();
+        let mut facts: TribleSet = TryFromBlob::try_from_blob(claim).unwrap();
+        let entity = find!(
+            (entity: Id),
+            pattern!(&facts, [{ ?entity @ metadata::tag: KIND_CAPABILITY_CLAIM }])
+        )
+        .next()
+        .unwrap()
+        .0;
+        facts += entity! {
+            ExclusiveId::force_ref(&entity) @ metadata::tag: metadata::KIND_MULTI,
         };
         assert!(matches!(
-            decode_signature(&signature_facts.to_blob()),
-            Err(CapabilitySignatureDecodeError::InvalidLength { .. })
-                | Err(CapabilitySignatureDecodeError::NonCanonicalShape)
+            CapabilityClaim::from_blob(facts.to_blob()),
+            Err(CapabilityClaimDecodeError::InvalidLength { .. })
+                | Err(CapabilityClaimDecodeError::NonCanonicalShape)
         ));
     }
 
     #[test]
-    fn parser_rejects_noncanonical_archive_ordering_before_shape() {
-        let root = key(110);
-        let subject = key(111);
-        let step = root_step(
-            &root,
-            subject.verifying_key(),
-            atom(112, 113),
-            CapabilityMode::InvokeAndDelegate,
-            Some(validity(0.0, 1.0)),
+    fn proof_protocol_vector_is_byte_exact() {
+        let root = key(0x11);
+        let leaf = key(0x33);
+        let claim = Inline::new([0x22; 32]);
+        let transcript = proof_edge_transcript(root.verifying_key(), claim, leaf.verifying_key());
+        let proof = CapabilityProof::issue_root(&root, claim, leaf.verifying_key());
+
+        assert_eq!(
+            hex::encode(transcript),
+            "747269626c6573706163652e6361706162696c6974792e70726f6f662d656467650000000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737222222222222222222222222222222222222222222222222222222222222222217cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce"
         );
-        let mut rows: Vec<[u8; TRIBLE_LEN]> = step
-            .claim
-            .bytes
-            .chunks_exact(TRIBLE_LEN)
-            .map(|row| row.try_into().unwrap())
-            .collect();
-        rows.reverse();
-        let malformed = Blob::<SimpleArchive>::new(Bytes::from(rows));
-        assert!(matches!(
-            CapabilityGrant::from_blob(malformed),
-            Err(CapabilityGrantDecodeError::Archive(
-                UnarchiveError::BadCanonicalizationOrdering
-            ))
-        ));
+        assert_eq!(
+            hex::encode(proof.as_bytes()),
+            "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737952e28cdf5b0ce0185582336f4e7e57b7882b1e299440de86c52a6579c024635c03b71651e2a95c71954e55b476acf56a8a5b47e73f32f2300a797b2a973cb06222222222222222222222222222222222222222222222222222222222222222217cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce"
+        );
+        assert_eq!(
+            hex::encode(proof.id().raw),
+            "a774a63f4f40ec235e9eb73ed843647459a7af8b95540f05e7083da02f6b0959"
+        );
     }
 
     #[test]
-    fn validity_constructor_rejects_inversion() {
-        let error = CapabilityValidity::new(epoch(2.0), epoch(1.0))
-            .expect_err("inverted intervals are not constructible");
-        assert!(error.lower_ns() > error.upper_ns());
-    }
-
-    #[test]
-    fn empty_proof_is_rejected() {
-        let root = key(120);
-        let subject = key(121);
-        let atom = atom(122, 123);
+    fn malformed_proof_lengths_and_step_limit_fail_before_verification() {
+        for length in [0, 31, 32, 159, 161, 287] {
+            assert!(matches!(
+                CapabilityProof::from_bytes(&vec![0; length]),
+                Err(CapabilityProofDecodeError::InvalidLength { .. })
+            ));
+        }
+        let too_many = vec![0; PUBLIC_KEY_LEN + PROOF_EDGE_LEN * (MAX_CAPABILITY_PROOF_STEPS + 1)];
         assert!(matches!(
-            CapabilityProof::new(Vec::new()).verify_claim(
-                root.verifying_key(),
-                epoch(0.0),
-                CapabilityClaim::new(subject.verifying_key(), atom, CapabilityMode::Invoke),
-            ),
-            Err(CapabilityProofError::Empty)
+            CapabilityProof::from_bytes(&too_many),
+            Err(CapabilityProofDecodeError::TooManySteps { .. })
         ));
     }
 }

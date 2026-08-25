@@ -16,8 +16,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::Blob;
 use crate::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofError, CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProofBundle, CapabilityProofError,
+    CapabilityRequest, CapabilityResource,
 };
 use crate::clock;
 use crate::id::Id;
@@ -54,29 +54,32 @@ use super::{
 /// collection action/resource atom at operation time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityPresentation {
-    subject: VerifyingKey,
-    proof: CapabilityProof,
+    expected_leaf: VerifyingKey,
+    bundle: CapabilityProofBundle,
 }
 
 impl CapabilityPresentation {
-    /// Pair an expected leaf subject with one untrusted owned proof.
-    pub fn new(subject: VerifyingKey, proof: CapabilityProof) -> Self {
-        Self { subject, proof }
+    /// Pair an expected leaf subject with one untrusted owned proof bundle.
+    pub fn new(expected_leaf: VerifyingKey, bundle: CapabilityProofBundle) -> Self {
+        Self {
+            expected_leaf,
+            bundle,
+        }
     }
 
     /// Exact leaf subject this presentation is expected to authorize.
-    pub fn subject(&self) -> VerifyingKey {
-        self.subject
+    pub fn expected_leaf(&self) -> VerifyingKey {
+        self.expected_leaf
     }
 
-    /// Candidate root-to-leaf proof, verified afresh for each operation.
-    pub fn proof(&self) -> &CapabilityProof {
-        &self.proof
+    /// Candidate proof and its claim closure, verified afresh for each operation.
+    pub fn bundle(&self) -> &CapabilityProofBundle {
+        &self.bundle
     }
 
-    /// Consume the presentation into its expected subject and proof.
-    pub fn into_parts(self) -> (VerifyingKey, CapabilityProof) {
-        (self.subject, self.proof)
+    /// Consume the presentation into its expected leaf and proof bundle.
+    pub fn into_parts(self) -> (VerifyingKey, CapabilityProofBundle) {
+        (self.expected_leaf, self.bundle)
     }
 }
 
@@ -137,7 +140,7 @@ impl CollectionAdmission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionAdmissionError {
     presentation: usize,
-    subject: VerifyingKey,
+    expected_leaf: VerifyingKey,
     source: CapabilityProofError,
 }
 
@@ -148,8 +151,8 @@ impl CollectionAdmissionError {
     }
 
     /// Expected leaf subject paired with the invalid proof.
-    pub fn subject(&self) -> VerifyingKey {
-        self.subject
+    pub fn expected_leaf(&self) -> VerifyingKey {
+        self.expected_leaf
     }
 
     /// Exact proof-verification failure.
@@ -162,9 +165,9 @@ impl fmt::Display for CollectionAdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "capability presentation {} for subject {} is invalid: {}",
+            "capability presentation {} for expected leaf {} is invalid: {}",
             self.presentation,
-            hex::encode_upper(self.subject.to_bytes()),
+            hex::encode_upper(self.expected_leaf.to_bytes()),
             self.source,
         )
     }
@@ -758,18 +761,19 @@ impl<S> Collection<S> {
         let mut admitted = BTreeSet::new();
         for (presentation_index, presentation) in presentations.iter().enumerate() {
             presentation
-                .proof()
-                .verify_claim(
+                .bundle()
+                .verify(
                     *trust_root,
                     instant,
-                    CapabilityClaim::new(presentation.subject(), atom, CapabilityMode::Invoke),
+                    presentation.expected_leaf(),
+                    CapabilityRequest::new(atom, CapabilityMode::Invoke),
                 )
                 .map_err(|source| CollectionAdmissionError {
                     presentation: presentation_index,
-                    subject: presentation.subject(),
+                    expected_leaf: presentation.expected_leaf(),
                     source,
                 })?;
-            admitted.insert(Inline::new(presentation.subject().to_bytes()));
+            admitted.insert(Inline::new(presentation.expected_leaf().to_bytes()));
         }
         Ok(Some(admitted))
     }
@@ -1438,9 +1442,7 @@ mod tests {
 
     use crate::blob::encodings::{utf8string::UTF8String, UnknownBlob};
     use crate::blob::{BlobEncoding, Bytes, IntoBlob};
-    use crate::capability::{
-        CapabilityGrant, CapabilityProofStep, CapabilityValidity, KIND_CAPABILITY_CLAIM,
-    };
+    use crate::capability::{CapabilityClaim, CapabilityValidity};
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::{discover_collection_records, CollectionMerge, CollectionRecord};
     use crate::inline::encodings::hash::Handle;
@@ -1547,16 +1549,18 @@ mod tests {
 
     fn root_presentation(
         root: &SigningKey,
-        subject: VerifyingKey,
+        expected_leaf: VerifyingKey,
         collection: CollectionHandle,
         mode: CapabilityMode,
     ) -> CapabilityPresentation {
         CapabilityPresentation::new(
-            subject,
-            CapabilityProof::new(vec![CapabilityProofStep::issue(
+            expected_leaf,
+            CapabilityProofBundle::issue_root(
                 root,
-                CapabilityGrant::root(subject, write_atom(collection), mode, None),
-            )]),
+                CapabilityClaim::root(write_atom(collection), mode, None),
+                expected_leaf,
+            )
+            .unwrap(),
         )
     }
 
@@ -1963,30 +1967,37 @@ mod tests {
         let writer = SigningKey::from_bytes(&[7; 32]);
         let descriptor = capability_descriptor(&name, root.verifying_key());
         let target = identity_for_tests(&descriptor);
-        let parent = CapabilityProofStep::issue(
+        let parent_bundle = CapabilityProofBundle::issue_root(
             &root,
-            CapabilityGrant::root(
+            CapabilityClaim::root(write_atom(target), CapabilityMode::InvokeAndDelegate, None),
+            delegate.verifying_key(),
+        )
+        .unwrap();
+        let parent = parent_bundle
+            .verify(
+                root.verifying_key(),
+                clock::epoch_now(),
                 delegate.verifying_key(),
-                write_atom(target),
-                CapabilityMode::InvokeAndDelegate,
-                None,
-            ),
-        );
-        let child = CapabilityProofStep::issue(
-            &delegate,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
+                CapabilityRequest::new(write_atom(target), CapabilityMode::InvokeAndDelegate),
+            )
+            .unwrap();
+        let child_bundle = parent
+            .delegate(
+                &delegate,
+                CapabilityClaim::delegated(
+                    parent.claim_handle(),
+                    write_atom(target),
+                    CapabilityMode::Invoke,
+                    None,
+                ),
                 writer.verifying_key(),
-                write_atom(target),
-                CapabilityMode::Invoke,
-                None,
-            ),
-        );
+            )
+            .unwrap();
         let admission = CollectionAdmission::capability(
             root.verifying_key(),
             vec![CapabilityPresentation::new(
                 writer.verifying_key(),
-                CapabilityProof::new(vec![parent, child]),
+                child_bundle,
             )],
         );
 
@@ -2020,18 +2031,19 @@ mod tests {
             )),
         )
         .unwrap();
-        let proof = CapabilityProof::new(vec![CapabilityProofStep::issue(
+        let bundle = CapabilityProofBundle::issue_root(
             &root,
-            CapabilityGrant::root(
-                writer.verifying_key(),
+            CapabilityClaim::root(
                 write_atom(target),
                 CapabilityMode::InvokeAndDelegate,
                 Some(validity),
             ),
-        )]);
+            writer.verifying_key(),
+        )
+        .unwrap();
         let admission = CollectionAdmission::capability(
             root.verifying_key(),
-            vec![CapabilityPresentation::new(writer.verifying_key(), proof)],
+            vec![CapabilityPresentation::new(writer.verifying_key(), bundle)],
         );
         let expected = fragment(5, false);
         let mut collection = Collection::new(
@@ -2042,8 +2054,8 @@ mod tests {
             reach::private(),
             admission,
         );
-
         collection.commit(expected.clone()).unwrap();
+
         assert_eq!(collection.materialize().unwrap(), expected.into_facts());
     }
 
@@ -2057,41 +2069,41 @@ mod tests {
         let other = identity_for_tests(&capability_descriptor(&other_name(), root.verifying_key()));
 
         let cases = [
-            CapabilityGrant::root(
+            (
+                CapabilityClaim::root(write_atom(target), CapabilityMode::Delegate, None),
                 writer.verifying_key(),
-                write_atom(target),
-                CapabilityMode::Delegate,
-                None,
+                false,
             ),
-            CapabilityGrant::root(
-                writer.verifying_key(),
-                CapabilityAtom::new(
-                    CapabilityAction::new(KIND_CAPABILITY_CLAIM),
-                    CapabilityResource::from(target),
+            (
+                CapabilityClaim::root(
+                    CapabilityAtom::new(
+                        CapabilityAction::new(Id::new([42; 16]).unwrap()),
+                        CapabilityResource::from(target),
+                    ),
+                    CapabilityMode::Invoke,
+                    None,
                 ),
-                CapabilityMode::Invoke,
-                None,
-            ),
-            CapabilityGrant::root(
                 writer.verifying_key(),
-                write_atom(other),
-                CapabilityMode::Invoke,
-                None,
+                false,
             ),
-            CapabilityGrant::root(
+            (
+                CapabilityClaim::root(write_atom(other), CapabilityMode::Invoke, None),
+                writer.verifying_key(),
+                false,
+            ),
+            (
+                CapabilityClaim::root(write_atom(target), CapabilityMode::Invoke, None),
                 other_subject.verifying_key(),
-                write_atom(target),
-                CapabilityMode::Invoke,
-                None,
+                true,
             ),
         ];
 
-        for grant in cases {
+        for (claim, proof_leaf, wrong_leaf) in cases {
             let admission = CollectionAdmission::capability(
                 root.verifying_key(),
                 vec![CapabilityPresentation::new(
                     writer.verifying_key(),
-                    CapabilityProof::new(vec![CapabilityProofStep::issue(&root, grant)]),
+                    CapabilityProofBundle::issue_root(&root, claim, proof_leaf).unwrap(),
                 )],
             );
             let mut collection = Collection::new(
@@ -2110,13 +2122,21 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
 
-            assert!(matches!(
-                collection.commit(fragment(1, true)),
-                Err(CollectionCommitError::Admission(CollectionAdmissionError {
-                    source: CapabilityProofError::ClaimMismatch { .. },
-                    ..
-                }))
-            ));
+            let error = collection.commit(fragment(1, true)).unwrap_err();
+            let CollectionCommitError::Admission(error) = error else {
+                panic!("unexpected commit error: {error:?}");
+            };
+            if wrong_leaf {
+                assert!(matches!(
+                    error.proof_error(),
+                    CapabilityProofError::WrongLeaf { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    error.proof_error(),
+                    CapabilityProofError::RequestMismatch { .. }
+                ));
+            }
             assert_eq!(collection.storage().blobs.len(), before_blobs);
             assert_eq!(
                 collection
@@ -2144,15 +2164,12 @@ mod tests {
         );
         let invalid = CapabilityPresentation::new(
             writer.verifying_key(),
-            CapabilityProof::new(vec![CapabilityProofStep::issue(
+            CapabilityProofBundle::issue_root(
                 &root,
-                CapabilityGrant::root(
-                    writer.verifying_key(),
-                    write_atom(target),
-                    CapabilityMode::Delegate,
-                    None,
-                ),
-            )]),
+                CapabilityClaim::root(write_atom(target), CapabilityMode::Delegate, None),
+                writer.verifying_key(),
+            )
+            .unwrap(),
         );
         let mut collection = Collection::new(
             MemoryRepo::default(),

@@ -40,15 +40,15 @@ That separation is why a materialized index does not become ground truth merely
 because it is convenient, and why collecting an accelerator does not erase the
 committed facts from which it can be rebuilt.
 
-Who may make that signed assertion can be proven without making storage an
-ambient policy oracle. A capability-guarded descriptor names an external trust
-root, while the facade owns explicit root-to-leaf proofs naming one expected
-subject, exact collection resource, action, and invocation/delegation mode.
-Ordinary collection operations verify those presentations directly at one
-clock instant. Capability claims and signatures are ordinary blobs followed
-from one explicitly named leaf credential; there is no authority collection,
-store scan, or global membership registry. Holding a facade's signing key alone
-grants nothing in capability mode.
+Who may make that signed assertion can be proven without making storage a
+policy oracle. A capability-guarded descriptor names an external trust root,
+while the facade owns explicit presentations pairing an expected leaf key with
+a complete `K0 (S C K)+` proof bundle. The native proof binds each issuer,
+exact keyless claim handle, and delegate key; the ordered claim blobs carry the
+action/resource, mode, validity, and parent-claim restrictions. Ordinary
+collection operations verify the resulting meet directly at one clock
+instant. Holding a signing key or finding a proof in storage grants nothing by
+itself.
 
 ## Architectural layers
 
@@ -65,6 +65,7 @@ grants nothing in capability mode.
 ├──────────────────────────────────────────────────┤
 │ Storage                                          │
 │ CollectionStore · BlobStore · WantStore          │
+│ CapabilityProofStore                             │
 ├──────────────────────────────────────────────────┤
 │ Data and representations                         │
 │ TribleSet/PATCH · SimpleArchive · SuccinctArchive│
@@ -155,13 +156,13 @@ above it.
 key, and one explicit admission policy. Open admission accepts every strictly
 verified signer and omits the descriptor's capability trust-root fact.
 Capability admission writes that exact trust root and retains owned
-presentations in the facade. `Collection::commit(fragment)` observes the clock
-once, verifies every presentation for the expected subject and exact
-`ACTION_WRITE` atom, and requires its signing key among those subjects before
-storing the descriptor, attachments, canonical data archive, canonical
-metadata archive, and signed native commit record. It never enumerates storage
-for grants and does not flush implicitly; callers choose durability cadence
-with `Collection::flush` or the backend's explicit close operation.
+`CapabilityPresentation`s in the facade. `Collection::commit(fragment)`
+observes the clock once, verifies every presentation's bundle for its expected
+leaf and exact `ACTION_WRITE` atom, and requires its signing key among those
+leaves before storing the descriptor, attachments, canonical data archive,
+canonical metadata archive, and signed native commit record. It performs no
+ambient proof lookup and does not flush implicitly; callers choose durability
+cadence with `Collection::flush` or the backend's explicit close operation.
 
 Reads are exact about what they observed, not magical about global time:
 

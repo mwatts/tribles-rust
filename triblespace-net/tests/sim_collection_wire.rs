@@ -12,8 +12,8 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
 use triblespace_core::capability::{
-    CapabilityAtom, CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep,
-    CapabilityResource, CapabilityValidity,
+    CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle, CapabilityResource,
+    CapabilityValidity,
 };
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
@@ -219,13 +219,13 @@ fn sibling_members_bootstrap_without_resident_authority_state() {
 }
 
 #[test]
-fn connect_proof_subject_must_equal_the_tls_peer() {
+fn connect_proof_final_key_must_equal_the_tls_peer() {
     let _guard = common::sim_guard();
     run_paused(0xC011ED0, async {
         let root = key(0xE0);
         let server_key = key(0xA0);
         let client_key = key(0xB0);
-        let different_subject = key(0xC0);
+        let different_leaf = key(0xC0);
 
         let net = SimNet::new(0xC011ED0, SimConfig::default());
         let _server = bring_up(
@@ -241,7 +241,7 @@ fn connect_proof_subject_must_equal_the_tls_peer() {
             &client_key,
             empty_store(),
             root.verifying_key(),
-            connect_proof(&root, &different_subject),
+            connect_proof(&root, &different_leaf),
             false,
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
@@ -253,7 +253,10 @@ fn connect_proof_subject_must_equal_the_tls_peer() {
             collection_of(&descriptor),
         )
         .await;
-        assert!(result.is_err(), "a proof for another TLS peer was admitted");
+        assert!(
+            result.is_err(),
+            "a proof ending at another TLS peer was admitted"
+        );
     });
 }
 
@@ -264,15 +267,16 @@ fn connect_proof_resource_must_equal_the_configured_root_bytes() {
         let root = key(0xE2);
         let server_key = key(0xA2);
         let client_key = key(0xB2);
-        let wrong_resource_proof = CapabilityProof::new(vec![CapabilityProofStep::issue(
+        let wrong_resource_proof = CapabilityProofBundle::issue_root(
             &root,
-            CapabilityGrant::root(
-                client_key.verifying_key(),
+            CapabilityClaim::root(
                 CapabilityAtom::new(ACTION_CONNECT.into(), CapabilityResource::new([0xFF; 32])),
                 CapabilityMode::Invoke,
                 None,
             ),
-        )]);
+            client_key.verifying_key(),
+        )
+        .unwrap();
 
         let net = SimNet::new(0xC011ED2, SimConfig::default());
         let _server = bring_up(
@@ -302,7 +306,7 @@ fn connect_proof_resource_must_equal_the_configured_root_bytes() {
         .await;
         assert!(
             result.is_err(),
-            "a CONNECT proof for a different exact resource was admitted"
+            "a CONNECT proof bundle for a different exact resource was admitted"
         );
     });
 }

@@ -35,9 +35,7 @@ use iroh_base::{EndpointAddr, EndpointId, SecretKey};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::capability::{
-    CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep,
-};
+use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::BlobStore;
@@ -53,20 +51,21 @@ fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
 }
 
-fn connect_proof(root: &SigningKey, subject: &SigningKey) -> CapabilityProof {
-    CapabilityProof::new(vec![CapabilityProofStep::issue(
+fn connect_proof(root: &SigningKey, subject: &SigningKey) -> CapabilityProofBundle {
+    CapabilityProofBundle::issue_root(
         root,
-        CapabilityGrant::root(
-            subject.verifying_key(),
+        CapabilityClaim::root(
             connect_capability_atom(root.verifying_key()),
             CapabilityMode::Invoke,
             None,
         ),
-    )])
+        subject.verifying_key(),
+    )
+    .unwrap()
 }
 
-/// A fresh pile file. CONNECT proof bytes travel inline and are deliberately
-/// absent from the pile.
+/// A fresh pile file. CONNECT proof-bundle bytes travel inline and are
+/// deliberately absent from the pile.
 fn fresh_pile(dir: &std::path::Path, name: &str) -> Pile {
     let path = dir.join(name);
     std::fs::File::create(&path).expect("create pile file");
@@ -103,7 +102,7 @@ async fn bring_up(
     signing_key: &SigningKey,
     store: Pile,
     connect_root: ed25519_dalek::VerifyingKey,
-    connect_proof: CapabilityProof,
+    connect_proof: CapabilityProofBundle,
     bootstrap: Vec<EndpointAddr>,
 ) -> Peer<Pile> {
     let secret = triblespace_net::identity::iroh_secret(signing_key);
@@ -132,8 +131,8 @@ fn init_tracing() {
         .try_init();
 }
 
-/// The shared two-node bring-up: one trust root, two inline CONNECT proofs, and
-/// two piles that contain no authentication state.
+/// The shared two-node bring-up: one trust root, two inline CONNECT proof
+/// bundles, and two piles that contain no authentication state.
 struct TwoNodes {
     peer_a: Peer<Pile>,
     peer_b: Peer<Pile>,

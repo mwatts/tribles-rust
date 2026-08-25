@@ -38,11 +38,12 @@ let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
 peer.refresh();
 ```
 
-`connect_proof` is a complete root-to-leaf blob-native capability proof whose
-leaf invokes `ACTION_CONNECT` for `signing_key` on the exact 32 public-key
-bytes of `connect_root`. The caller selects and builds that proof; the
-transport sends exactly those bytes and never searches for authority
-implicitly. `gossip_topic` is a separate rendezvous choice.
+`connect_proof` is a complete `CapabilityProofBundle` whose leaf invokes
+`ACTION_CONNECT` for `signing_key` on the exact 32 public-key bytes of
+`connect_root`. The caller selects that proof explicitly; the transport sends
+the native `K0 (S C K)+` path and its ordered keyless claim blobs and never
+searches for authority implicitly. `gossip_topic` is a separate rendezvous
+choice.
 
 ## The synchronized object is evidence
 
@@ -95,9 +96,9 @@ Gossiping a `COMMIT` does not transfer any referenced blob. The receiver may
 learn exact handles for the descriptor, data, metadata, and attachments while
 possessing none of their bytes. Admission also does not manufacture a WANT.
 
-Capability claims and signatures are ordinary content-addressed blobs, but
-CONNECT carries the exact required ancestry inline. Authentication never
-enumerates a collection or relies on a pre-auth network fetch.
+Capability claims are ordinary content-addressed blobs and complete proofs are
+native set records, but CONNECT carries the exact required proof and claims
+inline. Authentication never performs a pre-auth proof lookup or blob fetch.
 
 Sparse discovery lets a node learn a large global frontier and then apply its
 own cache, trust, authority, and derivation policy. Evidence answers “what has
@@ -153,19 +154,23 @@ answered; partial answers remain useful evidence but temporary unreachability
 never becomes proof of absence. Obtaining a receipt's result bytes is a
 separate `Blob(result)` WANT.
 
-## Blob-native CONNECT authentication
+## Direct CONNECT authentication
 
 All direct point-to-point operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/7"`. The first stream on every
-connection must be `OP_AUTH`. Its request carries a length-prefixed canonical
-capability proof inline:
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/8"`. The first stream on every
+connection must be `OP_AUTH`. Its request carries one length-prefixed canonical
+proof bundle inline:
 
 ```text
 OP_AUTH
-proof_length:u32
-proof: version:u8, count:u8,
-       (claim_length:u16, signature_length:u16,
-        claim:bytes, signature:bytes)*
+bundle_length:u32be
+bundle:
+    version:u8 = 1
+    count:u8
+    proof: K0 (S C K){count}
+    repeat count times:
+        claim_length:u16be
+        claim:bytes
 ```
 
 The server obtains the caller's Ed25519 public key from the authenticated
@@ -178,15 +183,16 @@ resource = configured CONNECT trust-root public-key bytes
 mode     = Invoke
 ```
 
-The proof must start with a trust-root-signed occurrence, follow each exact
-parent in order, preserve action and resource, and end at the claimed peer.
-Every canonical claim and signature blob is verified directly from the stream
-at the explicit current epoch. Empty, truncated, oversized, reordered,
-malformed, expired, not-yet-valid, or claim-mismatched proofs are rejected. The
-response is `AUTH_OK` (`0x00`) or `AUTH_REJECTED` (`0x01`); a rejected
-connection is closed. A successful connection is also closed immediately after
-the proof chain's effective inclusive upper bound, including when it is idle in
-the shared connection pool.
+The proof root must equal the configured trust root and its final key must equal
+the transport peer. Every strict signature binds issuer key, exact claim
+handle, and delegate key. Ordered keyless claims must form one parent-claim
+path whose exact atom, mode intersection, and inclusive validity intersection
+satisfy the request at the explicit current epoch. Empty, truncated,
+oversized, reordered, malformed, expired, not-yet-valid, or claim-mismatched
+bundles are rejected. The response is `AUTH_OK` (`0x00`) or `AUTH_REJECTED`
+(`0x01`); a rejected connection is closed. A successful connection is also
+closed after the proof's effective inclusive upper bound, including while idle
+in the shared connection pool.
 
 There is no pre-auth exception, remote proof-fetch operation, ambient store
 lookup, or renewal exchange. After a successful first stream, later streams on
@@ -197,7 +203,7 @@ remains valid:
 |---|---:|---|---|
 | `GET_BLOB` | `0x02` | exact 32-byte content handle | bytes or missing |
 | `CHILDREN` | `0x03` | exact parent blob handle | resident referenced handles |
-| `OP_AUTH` | `0x05` | inline exact CONNECT proof | accept or reject; first stream only |
+| `OP_AUTH` | `0x05` | inline exact CONNECT proof bundle | accept or reject; first stream only |
 | `COLLECTION_EVIDENCE` | `0x06` | exact collection descriptor handle | relayable signed commits |
 | `COLLECTION_OPERATION_RECEIPTS` | `0x07` | exact merge/derive WANT key | matching native receipts |
 
@@ -240,11 +246,11 @@ The `trible` CLI makes team and proof selection explicit:
 trible pile net identity [--key PATH]
     Initialize the key if needed and print this node's iroh identity.
 
-trible pile net status <PILE> --team-root HEX --credential HANDLE [--key PATH]
-    Load the existing key and exact credential blobs, reconstruct and verify
-    the CONNECT proof at the current time, and report the proof step count.
+trible pile net status <PILE> --team-root HEX --proof ID [--key PATH]
+    Load the existing key, exact native proof, and its named claim blobs;
+    verify CONNECT at the current time; and report the proof step count.
 
-trible pile net sync <PILE> --team-root HEX --credential HANDLE
+trible pile net sync <PILE> --team-root HEX --proof ID
     --gossip-topic HEX
     [--peers ID_OR_TICKET,...] [--key PATH]
     Run collection-evidence gossip and durable WANT reconciliation.
@@ -252,13 +258,11 @@ trible pile net sync <PILE> --team-root HEX --credential HANDLE
     and fetching; --no-lazy disables WANT servicing.
 ```
 
-`status` and `sync` require the pile, CONNECT trust root, exact leaf credential,
-and existing signing key; `sync` additionally requires its independent gossip
-topic. Missing exact blobs, a different subject, invalid ancestry, wrong
-action/resource, non-invoking or currently invalid leaves, absent keys, and
-non-portable proofs are errors before networking starts. There is no
-environment-variable fallback, all-zero credential sentinel, inferred topic,
-implicit team-of-one credential, or automatic key creation on these two paths.
+`status` and `sync` require the pile, CONNECT trust root, exact proof ID, and
+existing signing key; `sync` additionally requires its independent gossip
+topic. A missing proof or claim, different leaf, invalid ancestry, wrong
+action/resource, non-invoking or currently invalid proof, or absent key is an
+error before networking starts.
 
 The mesh topic is an explicit application choice independent of the CONNECT
 root. `--duration` and `--quiescent-for` can bound a run, but quiescence means
@@ -272,7 +276,7 @@ a distributed proof that every peer has converged.
 - The gossip carrier is neither the commit author nor a presumed blob holder.
 - Observing a commit never creates hidden content demand.
 - Merge and derive receipts are evidence; their output blobs remain lazy.
-- Direct RPC starts with one inline, exact, claim-directed CONNECT proof.
+- Direct RPC starts with one inline, exact CONNECT proof bundle.
 - CONNECT authenticates the session and grants no other action or storage
   policy.
 - Every payload is strictly framed and content/signature checked before it can

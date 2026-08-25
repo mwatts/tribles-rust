@@ -8,9 +8,7 @@ use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::{TestNetwork, to_custom_addr};
 use iroh_base::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use rand::rngs::OsRng;
-use triblespace_core::capability::{
-    CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep,
-};
+use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
 
 use triblespace_net::host::{PeerConfig, SyncDirection};
 use triblespace_net::protocol::{PILE_SYNC_ALPN, connect_capability_atom};
@@ -38,16 +36,17 @@ fn direct_addr(id: EndpointId) -> EndpointAddr {
     )
 }
 
-fn connect_proof(key: &SigningKey) -> CapabilityProof {
-    CapabilityProof::new(vec![CapabilityProofStep::issue(
+fn connect_proof(key: &SigningKey) -> CapabilityProofBundle {
+    CapabilityProofBundle::issue_root(
         key,
-        CapabilityGrant::root(
-            key.verifying_key(),
+        CapabilityClaim::root(
             connect_capability_atom(key.verifying_key()),
             CapabilityMode::Invoke,
             None,
         ),
-    )])
+        key.verifying_key(),
+    )
+    .unwrap()
 }
 
 fn config(key: &SigningKey, peers: Vec<EndpointAddr>) -> PeerConfig {

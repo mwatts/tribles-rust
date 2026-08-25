@@ -149,6 +149,15 @@ reader can recompute.
   `book/src/query-language.md#recursive-traversal`.
 
 ## Desired Functionality
+- Bound aggregate unauthenticated inbound connection state. Protocol v8 now
+  gives every connection a single 10-second deadline covering the first stream
+  and complete `AUTH` exchange, but the host still spawns one task per accepted
+  connection. Measure iroh's own admission limits, then add the smallest
+  transport-independent concurrent-admission bound if a connection flood can
+  retain materially unbounded tasks or QUIC state within that deadline. Apply
+  the same measurement to post-auth request streams: an authorized peer can
+  currently open multiple partial operations whose per-stream tasks have no
+  independent deadline or concurrency budget.
 - Choose the oversized native Succinct shard policy. Exact-ticket Rank9
   acceleration now has an ABI-qualified, source-bound persisted fiber with
   transient fallback and cache-only retention semantics, but a single derived

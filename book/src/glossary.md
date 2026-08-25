@@ -35,30 +35,30 @@ back local piles, in-memory collections, or remote object stores while exposing
 small capability traits for insertion, retrieval, metadata, and enumeration.
 
 ### Capability Claim
-A closed canonical blob naming one direct Ed25519 subject, exact 32-byte
-resource, exact action, invoke/delegate mode, optional parent signature-blob
-handle, and optional inclusive validity interval. A root claim has no parent;
-each child names its exact predecessor.
-
-### Capability Credential
-The content handle of one capability leaf's signature blob. It is a precise
-entry point for reconstructing one proof by exact blob lookups, not an entry in
-a global registry.
-
-### Capability Wallet
-A private, signer-namespaced collection used only to retain locally selected
-capability credentials through conservative garbage collection. Its committed
-data element is the leaf signature archive, whose content links retain the
-claim and parent ancestry. A wallet does not grant authority, enumerate a
-team, resolve policy, or make its contents valid; callers still name and verify
-one exact credential against an external trust root.
+A closed canonical, keyless `SimpleArchive` naming one exact action/resource
+atom, invoke/delegate mode, optional parent **claim** handle, and optional
+inclusive validity interval. A root claim has no parent; each later claim names
+its exact semantic predecessor. Principal keys and signatures live in the
+native proof, not in the claim.
 
 ### Capability Proof
-A claim-directed root-to-leaf sequence of exact claim and signature blobs.
-Verification takes an external trust root, explicit instant, and expected leaf;
-checks every canonical shape, content identity, strict signature, parent,
-issuer, mode attenuation, atom, and validity bound; then requires the leaf to
-match the expected subject/action/resource/minimum mode.
+A canonical native `K0 (S C K)+` byte string. Each strict Ed25519 signature
+binds its issuer key, exact claim handle, and delegate key. Its BLAKE3 digest is
+the proof ID used for exact physical lookup. Verification also receives the
+ordered claim blobs, external trust root, expected leaf, explicit instant, and
+exact request; authority is the meet of the claims, never a consequence of
+proof presence.
+
+### Capability Proof Bundle
+A complete portable capability proof plus the exact claim blobs it names in
+root-to-leaf order. Invites and CONNECT carry this bounded self-contained form,
+so verification needs no pre-auth fetch or ambient lookup.
+
+### Capability Proof Store
+A grow-only native set of canonical capability proofs. It supports
+deterministic enumeration and exact lookup by proof ID, but no discovery by key
+or claim. Storing a proof preserves evidence and can root resident claim blobs;
+it does not make the proof authorized.
 
 ### Commit
 A signed native collection membership assertion. A `CollectionCommit` names
@@ -67,9 +67,9 @@ author. Its intrinsic record ID is derived from the canonical 192-byte payload.
 Commits are independent leaves rather than snapshots in a parent chain.
 
 ### Capability Presentation
-One owned blob-native `CapabilityProof` paired with the exact leaf subject the
-caller expects it to establish. The expectation prevents a valid proof for an
-unintended subject from silently becoming an admission decision.
+One owned `CapabilityProofBundle` paired with the exact leaf key the caller
+expects it to establish. The expectation prevents a valid prefix or proof for
+another principal from silently becoming an admission decision.
 
 ### Collection
 A self-describing grow-only join semilattice. Signed commits introduce members;
@@ -80,10 +80,9 @@ collection has no distinguished head.
 ### Collection Admission
 The explicit signer policy held by a high-level `Collection` facade. Open
 admission accepts every strictly verified signer. Capability admission accepts
-only expected subjects whose owned root-to-leaf proofs verify at one clock
-instant against its trust root and exact `ACTION_WRITE`/collection atom. It does
-not enumerate storage for grants; an empty capability presentation set admits
-nobody.
+only expected leaf keys whose owned proof bundles verify at one clock instant
+against its trust root and exact `ACTION_WRITE`/collection atom. An empty
+capability presentation set admits nobody.
 
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's root name and public-key
@@ -108,9 +107,9 @@ The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
 direct-RPC session. Its resource is the team's exact 32-byte trust-root public
 key, and its claimed subject must equal the transport peer key. CONNECT grants
 no WRITE, generic READ, gossip, collection reach, semantic trust, custody, or
-retention authority. Protocol v7 carries the complete blob-native capability
-proof inline on the connection's first `OP_AUTH` stream; the gossip topic is a
-separate application choice.
+retention authority. Protocol v8 carries the complete proof bundle inline on
+the connection's first `OP_AUTH` stream; the gossip topic is a separate
+application choice.
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
@@ -172,10 +171,11 @@ segments relevant to their bindings, further described in
 [the deep-dive chapter](deep-dive/patch.md).
 
 ### Pile
-An append-only collection of blobs, native collection records, and WANT records
-stored in one file. Piles are memory mapped, recoverable after interrupted
-appends, and mergeable by byte concatenation. Legacy pin records remain
-decodable only for conservative retention and explicit migration.
+An append-only collection of blobs, native collection records, native
+capability proofs, and WANT records stored in one file. Piles are memory
+mapped, recoverable after interrupted appends, and mergeable by byte
+concatenation. Legacy pin records remain decodable only for conservative
+retention and explicit migration.
 
 ### Encoding
 The byte-layout contract for a typed value. Encodings assign language-agnostic
@@ -187,14 +187,13 @@ referencing those blobs stay portable. The corresponding traits are
 `InlineEncoding` and `BlobEncoding`.
 
 ### Team Root
-The Ed25519 trust-root key used to anchor a team's blob-native capability
-proofs. A no-parent claim is grounded only when its signature comes from this
-root. For transport, the public key's exact 32 bytes are also the CONNECT
-resource. The root does not imply a membership registry or gossip rendezvous;
+The external Ed25519 key expected as `K0` in a team's direct capability proofs.
+For transport, the public key's exact 32 bytes are also the CONNECT resource.
+The root does not imply gossip rendezvous or proof availability;
 `PeerConfig.connect_root` and its independently chosen `gossip_topic` keep
 those concerns separate. Keeping the secret offline after bootstrap is
 operational practice, not a one-use rule: anyone holding it can issue another
-independent root credential.
+independent root proof.
 
 ### Trible
 A three-part tuple of entity, attribute, and value stored in a fixed 64-byte

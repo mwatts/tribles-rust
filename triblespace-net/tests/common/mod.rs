@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
 use triblespace_core::capability::{
-    CapabilityGrant, CapabilityMode, CapabilityProof, CapabilityProofStep, CapabilityValidity,
+    CapabilityClaim, CapabilityMode, CapabilityProofBundle, CapabilityValidity,
 };
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
@@ -51,26 +51,27 @@ pub fn pk(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
-/// Sign the one-step positive proof authorizing `subject` to CONNECT to the
-/// trust domain rooted at `root`.
-pub fn connect_proof(root: &SigningKey, subject: &SigningKey) -> CapabilityProof {
-    connect_proof_with_validity(root, subject, None)
+/// Sign the one-step positive proof authorizing `leaf` to CONNECT to the trust
+/// domain rooted at `root`.
+pub fn connect_proof(root: &SigningKey, leaf: &SigningKey) -> CapabilityProofBundle {
+    connect_proof_with_validity(root, leaf, None)
 }
 
 pub fn connect_proof_with_validity(
     root: &SigningKey,
-    subject: &SigningKey,
+    leaf: &SigningKey,
     validity: Option<CapabilityValidity>,
-) -> CapabilityProof {
-    CapabilityProof::new(vec![CapabilityProofStep::issue(
+) -> CapabilityProofBundle {
+    CapabilityProofBundle::issue_root(
         root,
-        CapabilityGrant::root(
-            subject.verifying_key(),
+        CapabilityClaim::root(
             connect_capability_atom(root.verifying_key()),
             CapabilityMode::Invoke,
             validity,
         ),
-    )])
+        leaf.verifying_key(),
+    )
+    .unwrap()
 }
 
 /// A paused, single-thread tokio runtime + LocalSet runner — the
@@ -100,14 +101,15 @@ where
 
 /// Bring one node up on `net`: join the sim mesh, wire the host loop
 /// as a local task, return the `Peer<MemoryRepo>`. `store` is the
-/// node's pre-seeded local store. The CONNECT proof is sent inline and need
+/// node's pre-seeded local store. The CONNECT proof bundle is sent inline and
+/// need
 /// not be resident in that store. `gossip` controls team-topic participation.
 pub fn bring_up(
     net: &SimNet,
     signing_key: &SigningKey,
     store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
-    connect_proof: CapabilityProof,
+    connect_proof: CapabilityProofBundle,
     gossip: bool,
 ) -> Peer<MemoryRepo> {
     bring_up_with_peers(
@@ -131,7 +133,7 @@ pub fn bring_up_with_peers(
     signing_key: &SigningKey,
     store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
-    connect_proof: CapabilityProof,
+    connect_proof: CapabilityProofBundle,
     gossip: bool,
     peers: Vec<[u8; 32]>,
 ) -> Peer<MemoryRepo> {
@@ -160,7 +162,7 @@ pub fn bring_up_with_peers(
     Peer::with_wiring(store, SyncDirection::Bidirectional, sender, receiver)
 }
 
-/// An empty store intentionally independent of CONNECT proof residency.
+/// An empty store intentionally independent of CONNECT proof-bundle residency.
 pub fn empty_store() -> MemoryRepo {
     MemoryRepo::default()
 }

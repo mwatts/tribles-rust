@@ -17,8 +17,8 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityBlobHandle, CapabilityClaim, CapabilityGrant,
-    CapabilityMode, CapabilityProof, CapabilityProofStep, CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+    CapabilityProofId, CapabilityRequest, CapabilityResource,
 };
 use triblespace_core::clock;
 use triblespace_core::collection::reach;
@@ -56,22 +56,19 @@ enum TargetAdmissionRequest {
     Open,
     Capability {
         trust_root: VerifyingKey,
-        credential: Option<CapabilityBlobHandle>,
+        proof: Option<CapabilityProofId>,
     },
 }
 
 impl TargetAdmissionRequest {
     fn from_options(
         authority: Option<VerifyingKey>,
-        credential: Option<CapabilityBlobHandle>,
+        proof: Option<CapabilityProofId>,
     ) -> Result<Self> {
-        match (authority, credential) {
+        match (authority, proof) {
             (None, None) => Ok(Self::Open),
-            (Some(trust_root), credential) => Ok(Self::Capability {
-                trust_root,
-                credential,
-            }),
-            (None, Some(_)) => bail!("--credential requires --authority"),
+            (Some(trust_root), proof) => Ok(Self::Capability { trust_root, proof }),
+            (None, Some(_)) => bail!("--proof requires --authority"),
         }
     }
 
@@ -86,7 +83,7 @@ impl TargetAdmissionRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AuthorizedTarget {
     admission: CollectionAdmission,
-    credential: Option<CapabilityBlobHandle>,
+    proof: Option<CapabilityProofId>,
 }
 
 pub(super) fn run(
@@ -95,7 +92,7 @@ pub(super) fn run(
     collection_name: String,
     namespace: String,
     authority: Option<String>,
-    credential: Option<String>,
+    proof: Option<String>,
     signing_key: PathBuf,
 ) -> Result<()> {
     let name = CollectionName::new(&collection_name)
@@ -105,11 +102,11 @@ pub(super) fn run(
         .as_deref()
         .map(|value| crate::cli::team::parse_public_key(value, "authority"))
         .transpose()?;
-    let credential = credential
+    let proof = proof
         .as_deref()
-        .map(crate::cli::team::parse_credential)
+        .map(crate::cli::team::parse_proof_id)
         .transpose()?;
-    let admission = TargetAdmissionRequest::from_options(authority, credential)?;
+    let admission = TargetAdmissionRequest::from_options(authority, proof)?;
     let signer = load_signing_key(&Some(signing_key))?;
 
     let mut pile = super::super::open_refreshed(&pile_path)?;
@@ -122,7 +119,7 @@ pub(super) fn run(
         &name,
         namespace,
         authorized.admission.trust_root(),
-        authorized.credential,
+        authorized.proof,
         signer.verifying_key(),
         report,
         &mappings,
@@ -207,14 +204,10 @@ fn authorize_target_writer(
     requested: TargetAdmissionRequest,
     signer: &SigningKey,
 ) -> Result<AuthorizedTarget> {
-    let TargetAdmissionRequest::Capability {
-        trust_root,
-        credential,
-    } = requested
-    else {
+    let TargetAdmissionRequest::Capability { trust_root, proof } = requested else {
         return Ok(AuthorizedTarget {
             admission: CollectionAdmission::Open,
-            credential: None,
+            proof: None,
         });
     };
 
@@ -225,17 +218,17 @@ fn authorize_target_writer(
         CapabilityAction::new(ACTION_WRITE),
         CapabilityResource::from(target),
     );
-    let proof = match credential {
-        Some(credential) => crate::cli::team::load_capability_proof(pile, credential)?,
-        None if signer.verifying_key() == trust_root => {
-            CapabilityProof::new(vec![CapabilityProofStep::issue(
-                signer,
-                CapabilityGrant::root(signer.verifying_key(), atom, CapabilityMode::Invoke, None),
-            )])
-        }
+    let bundle = match proof {
+        Some(proof) => crate::cli::team::load_capability_bundle(pile, proof)?,
+        None if signer.verifying_key() == trust_root => CapabilityProofBundle::issue_root(
+            signer,
+            CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+            signer.verifying_key(),
+        )
+        .map_err(|error| anyhow!("issue target WRITE proof: {error}"))?,
         None => {
             bail!(
-                "--authority without --credential can bootstrap only when the migration signer is the authority root"
+                "--authority without --proof can bootstrap only when the migration signer is the authority root"
             )
         }
     };
@@ -243,23 +236,22 @@ fn authorize_target_writer(
     // One clock observation governs the complete admission boundary. Nothing
     // in the target collection has been staged yet.
     let instant = clock::epoch_now();
-    proof
-        .verify_claim(
+    bundle
+        .verify(
             trust_root,
             instant,
-            CapabilityClaim::new(signer.verifying_key(), atom, CapabilityMode::Invoke),
+            signer.verifying_key(),
+            CapabilityRequest::new(atom, CapabilityMode::Invoke),
         )
-        .map_err(|error| anyhow!("target WRITE credential rejected: {error}"))?;
-    crate::cli::team::store_capability_proof(pile, signer, &proof)?;
-    let credential = proof
-        .credential()
-        .expect("a verified nonempty proof has a leaf credential");
+        .map_err(|error| anyhow!("target WRITE proof rejected: {error}"))?;
+    crate::cli::team::store_capability_bundle(pile, &bundle)?;
+    let proof = bundle.proof().id();
     Ok(AuthorizedTarget {
         admission: CollectionAdmission::capability(
             trust_root,
-            vec![CapabilityPresentation::new(signer.verifying_key(), proof)],
+            vec![CapabilityPresentation::new(signer.verifying_key(), bundle)],
         ),
-        credential: Some(credential),
+        proof: Some(proof),
     })
 }
 
@@ -504,7 +496,7 @@ fn print_report(
     name: &CollectionName,
     namespace: VerifyingKey,
     authority: Option<VerifyingKey>,
-    credential: Option<CapabilityBlobHandle>,
+    proof: Option<CapabilityProofId>,
     signer: VerifyingKey,
     report: MigrationReport,
     mappings: &[(CommitHandle, CollectionCommit)],
@@ -527,8 +519,8 @@ fn print_report(
             .unwrap_or_else(|| "<open>".to_owned())
     );
     println!(
-        "write credential: {}",
-        credential
+        "write proof: {}",
+        proof
             .map(|handle| hex::encode_upper(handle.raw))
             .unwrap_or_else(|| "<none>".to_owned())
     );
@@ -626,11 +618,9 @@ mod tests {
         subject: VerifyingKey,
         atom: CapabilityAtom,
         mode: CapabilityMode,
-    ) -> CapabilityProof {
-        CapabilityProof::new(vec![CapabilityProofStep::issue(
-            root,
-            CapabilityGrant::root(subject, atom, mode, None),
-        )])
+    ) -> CapabilityProofBundle {
+        CapabilityProofBundle::issue_root(root, CapabilityClaim::root(atom, mode, None), subject)
+            .unwrap()
     }
 
     fn delegated_proof(
@@ -638,36 +628,38 @@ mod tests {
         delegate: &SigningKey,
         subject: VerifyingKey,
         atom: CapabilityAtom,
-    ) -> CapabilityProof {
-        let parent = CapabilityProofStep::issue(
+    ) -> CapabilityProofBundle {
+        let parent = CapabilityProofBundle::issue_root(
             root,
-            CapabilityGrant::root(
+            CapabilityClaim::root(atom, CapabilityMode::InvokeAndDelegate, None),
+            delegate.verifying_key(),
+        )
+        .unwrap();
+        let verified = parent
+            .verify(
+                root.verifying_key(),
+                clock::epoch_now(),
                 delegate.verifying_key(),
-                atom,
-                CapabilityMode::InvokeAndDelegate,
-                None,
-            ),
-        );
-        let child = CapabilityProofStep::issue(
-            delegate,
-            CapabilityGrant::delegated(
-                parent.signature_handle(),
+                CapabilityRequest::new(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        verified
+            .delegate(
+                delegate,
+                CapabilityClaim::delegated(
+                    verified.claim_handle(),
+                    atom,
+                    CapabilityMode::Invoke,
+                    None,
+                ),
                 subject,
-                atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
-        );
-        CapabilityProof::new(vec![parent, child])
+            )
+            .unwrap()
     }
 
-    fn retain_proof(
-        pile: &mut Pile,
-        wallet_key: &SigningKey,
-        proof: &CapabilityProof,
-    ) -> CapabilityBlobHandle {
-        crate::cli::team::store_capability_proof(pile, wallet_key, proof).unwrap();
-        proof.credential().expect("test proof has a leaf")
+    fn retain_proof(pile: &mut Pile, proof: &CapabilityProofBundle) -> CapabilityProofId {
+        crate::cli::team::store_capability_bundle(pile, proof).unwrap();
+        proof.proof().id()
     }
 
     fn authored_wrapper(
@@ -708,7 +700,7 @@ mod tests {
             &signer,
         )?;
         assert_eq!(first_authorized.admission, CollectionAdmission::Open);
-        assert_eq!(first_authorized.credential, None);
+        assert_eq!(first_authorized.proof, None);
         assert_eq!(first.branch, branch);
         assert_eq!(first.reachable, 5);
         assert_eq!(first.authored, 4);
@@ -806,24 +798,21 @@ mod tests {
             namespace,
             TargetAdmissionRequest::Capability {
                 trust_root: authority,
-                credential: None,
+                proof: None,
             },
             &signer,
         )?;
 
         assert!(!mappings.is_empty());
         let target = target_handle(&name, namespace, Some(authority));
-        let credential = authorized.credential.expect("bootstrapped credential");
-        let retained = crate::cli::team::load_capability_proof(&mut pile, credential)?;
+        let proof = authorized.proof.expect("bootstrapped proof");
+        let retained = crate::cli::team::load_capability_bundle(&mut pile, proof)?;
         retained
-            .verify_claim(
+            .verify(
                 authority,
                 clock::epoch_now(),
-                CapabilityClaim::new(
-                    signer.verifying_key(),
-                    write_atom(target),
-                    CapabilityMode::Invoke,
-                ),
+                signer.verifying_key(),
+                CapabilityRequest::new(write_atom(target), CapabilityMode::Invoke),
             )
             .map_err(|error| anyhow!("verify retained bootstrap proof: {error}"))?;
         assert_eq!(
@@ -860,7 +849,7 @@ mod tests {
         let mut pile = super::super::super::open_refreshed(&path)?;
         let target = target_handle(&name, namespace, Some(root.verifying_key()));
         let proof = delegated_proof(&root, &delegate, signer.verifying_key(), write_atom(target));
-        let credential = retain_proof(&mut pile, &signer, &proof);
+        let proof_id = retain_proof(&mut pile, &proof);
 
         let (_, mappings, authorized) = migrate(
             &mut pile,
@@ -869,13 +858,13 @@ mod tests {
             namespace,
             TargetAdmissionRequest::Capability {
                 trust_root: root.verifying_key(),
-                credential: Some(credential),
+                proof: Some(proof_id),
             },
             &signer,
         )?;
 
         assert!(!mappings.is_empty());
-        assert_eq!(authorized.credential, Some(credential));
+        assert_eq!(authorized.proof, Some(proof_id));
         assert_eq!(
             Collection::new(
                 &mut pile,
@@ -955,7 +944,7 @@ mod tests {
             let proof = root_proof(proof_root, subject, atom, mode);
 
             let mut pile = super::super::super::open_refreshed(&path)?;
-            let credential = retain_proof(&mut pile, &signer, &proof);
+            let proof_id = retain_proof(&mut pile, &proof);
             let before = fs::metadata(&path)?.len();
             let error = migrate(
                 &mut pile,
@@ -964,16 +953,14 @@ mod tests {
                 namespace,
                 TargetAdmissionRequest::Capability {
                     trust_root: authority.verifying_key(),
-                    credential: Some(credential),
+                    proof: Some(proof_id),
                 },
                 &signer,
             )
             .expect_err("a mismatched proof must fail before publication");
 
             assert!(
-                error
-                    .to_string()
-                    .contains("target WRITE credential rejected"),
+                error.to_string().contains("target WRITE proof rejected"),
                 "{fault:?}: {error:#}"
             );
             assert_eq!(
@@ -994,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_authority_root_can_bootstrap_without_a_credential() -> Result<()> {
+    fn only_the_authority_root_can_bootstrap_without_a_proof() -> Result<()> {
         let (file, _) = frozen_fixture()?;
         let path = file.path().to_path_buf();
         let name = CollectionName::new("not-the-root")?;
@@ -1011,7 +998,7 @@ mod tests {
             namespace,
             TargetAdmissionRequest::Capability {
                 trust_root: authority,
-                credential: None,
+                proof: None,
             },
             &signer,
         )
@@ -1032,9 +1019,9 @@ mod tests {
     }
 
     #[test]
-    fn a_credential_without_an_authority_is_not_an_admission_policy() {
-        let credential = Inline::new([0xCC; 32]);
-        assert!(TargetAdmissionRequest::from_options(None, Some(credential)).is_err());
+    fn a_proof_without_an_authority_is_not_an_admission_policy() {
+        let proof = Inline::new([0xCC; 32]);
+        assert!(TargetAdmissionRequest::from_options(None, Some(proof)).is_err());
     }
 
     #[test]

@@ -9,25 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add top-level `capability`, a collection-free blob-native authorization
-  kernel. Canonical `SimpleArchive` claim/signature pairs bind one exact typed
-  action/resource atom, Ed25519 subject, attenuating invoke/delegate mode,
-  optional inclusive validity interval, and exact parent signature blob.
-  Claim-directed verification accepts an external trust root and explicit
-  instant, returns the chain's effective validity intersection, and never
-  enumerates storage; a closure-based exact-handle loader reconstructs portable
-  root-to-leaf proofs from a leaf credential without a depth cap.
-
-### Removed
-
-- Remove `repo::capability` and its expiring capability blobs, permission-scope
-  hierarchy, revocation/renewal model, and ambient chain lookup. Durable removal
-  now requires a successor team, collection, or key epoch outside the monotone
-  capability kernel.
-- Remove the intermediate enumerable `authority` collection and fixed-point
-  resolver. Authorization consumers now verify one exact blob-native
-  root-to-leaf capability proof against a caller-supplied trust root instead of
-  scanning ambient records.
+- Add top-level `capability`, a direct authorization kernel. Keyless canonical
+  `SimpleArchive` claims carry one exact action/resource atom, invoke/delegate
+  mode, optional inclusive validity interval, and optional parent claim handle.
+  Canonical native proofs use `K0 (S C K)+`; every strict Ed25519 signature
+  binds issuer key, exact claim handle, and delegate key, and BLAKE3 over the
+  complete proof is its stable identity. A bounded portable bundle carries the
+  exact ordered claims. Verification takes an external trust root, expected
+  leaf, explicit instant, and request, then computes the claims' atom, mode,
+  and validity meet without ambient lookup.
+- Add `CapabilityProofStore` to `MemoryRepo`, `Pile`, and `Yard` as a native
+  grow-only proof set with deterministic enumeration and exact proof-ID lookup.
+  Pile records use bounded canonical framing. Conservative collection preserves
+  proof records and treats every claim named by a signature-valid proof as an
+  exact direct root. It never scans opaque claim values as child handles, and
+  proof presence alone grants no authority.
 
 ## [0.41.4] - 2026-05-17
 

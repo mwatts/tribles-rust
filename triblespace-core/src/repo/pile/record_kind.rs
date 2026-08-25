@@ -156,6 +156,14 @@ record_kinds! {
         "pile-collection-derive-v5",
         "An unsigned DERIVE equation asserting that an input state of a derived collection's source maps to an output state of that collection. Envelope bytes 64..96 hold the target collection's descriptor handle, 96..128 the input digest, 128..160 the output digest, and 160..256 are zeros. The source is not named here because the target's descriptor already names it, and naming it twice only creates a way for the two to disagree.";
 
+    /// A complete direct capability proof.
+    ///
+    /// Kind id minted with `trible genid` on 2026-08-25.
+    CapabilityProofRecordV1 = KIND_ID_AUTH_PROOF "CD21D2250D6C7B3C6E2EC94817BD73C9",
+        KIND_AUTH_PROOF "29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053",
+        "pile-auth-proof-v1",
+        "A canonical complete capability proof in K(S,C,K)+ order. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with the 32-byte root Ed25519 public key, followed by one or more 128-byte edges: a 64-byte Ed25519 signature, a 32-byte SimpleArchive claim handle, and the next 32-byte public key. The declared length is exactly 32 + 128n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id.";
+
 }
 
 /// Every blob needed to resolve every known record kind.

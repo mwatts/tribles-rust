@@ -1,7 +1,7 @@
 # Pile Format
 
-The on-disk pile keeps blobs, native collection records, wants, and decodable
-legacy pin evidence in one
+The on-disk pile keeps blobs, native collection records, native capability
+proofs, wants, and decodable legacy pin evidence in one
 append-only file. The write-ahead log *is*
 the database: all indices are
 reconstructed from the bytes already stored on disk. This design avoids
@@ -19,15 +19,17 @@ memory map never exposes half-written records.
 
 ## Record model: one frame, uniform 256-byte records
 
-Every record the pile writes begins with the same fixed **256-byte header**, followed (for blobs) by the payload, padded so the whole
-record is a **256-byte multiple**:
+Every record the pile writes begins with the same **64-byte common prefix** and
+occupies a **256-byte multiple**. Fixed records fit in one 256-byte frame; blobs
+and longer capability proofs continue after it and are zero-padded to their
+declared span:
 
 | Offset | Width | Field |
 |---:|---:|---|
 | `0..28` | 28 | Framing magic `0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B` |
 | `28..32` | 4 | Total record span in 256-byte blocks, unsigned little-endian |
 | `32..64` | 32 | Record kind: the handle of a description of this record's layout |
-| `64..256` | 192 | Kind-specific body and zeroed reserved bytes |
+| `64..256` | 192 | First kind-specific body block; bounded variable records may continue |
 
 The magic was minted on 2026-08-20 as two `trible genid` calls,
 `0371B249F0626B2ABDDB80E23EA96905` and `9D9656A5EA5A497320351F3BE712CF82`,
@@ -61,14 +63,14 @@ own bytes. Content addressing makes the call idempotent, and the migration's
 census distinguishes "already resident" from "left to store" so a re-run
 reports honestly instead of repeating its worklist.
 
-The arithmetic works out exactly. A signed commit is the tightest record —
-six 32-byte fields — and `64 + 6 × 32 = 256`: one block, nothing wasted and
-nothing reserved. Every other kind has slack.
+The arithmetic works out exactly. A signed commit contains six 32-byte fields,
+so `64 + 6 × 32 = 256`: one block, nothing wasted. A one-edge direct capability
+proof also ends at byte 256. Longer proofs use more blocks without changing
+their canonical body.
 
-A collection descriptor itself remains an ordinary blob, not a fourth
-collection-record kind. Typed want assertions and retractions have their own
-kinds; historical weak-pin records remain readable as the blob-only predecessor
-of that model.
+A collection descriptor and every capability claim remain ordinary blobs.
+Typed WANT assertions and retractions have their own kinds; historical pin
+records remain readable for explicit migration and conservative retention.
 
 The span includes the header. Zero is invalid; decoders perform checked
 `span * 256` arithmetic and require that the complete record fit in the
@@ -109,8 +111,8 @@ cannot conservatively mean “no effect”—requires a new frame magic instead.
 Concatenation is associative ordered composition, not universally commutative:
 WANT assertions/retractions and decoded legacy pins are right-biased logs.
 Opaque filtering is sound because it leaves the relative order of every known
-record unchanged; native collection records additionally collapse to
-order-independent set union.
+record unchanged; native collection and capability-proof records additionally
+collapse to order-independent set union.
 
 ### Compatibility surface: v0.46.4, and a reframe for everything else
 
@@ -192,8 +194,8 @@ refreshing state.
    and `memmap2` mapping. It does not read any records yet (and it does not
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
-   `applied_length`, and rebuilds the blob, collection-record, WANT, and legacy
-   pin-snapshot indices
+   `applied_length`, and rebuilds the blob, collection-record, capability-proof,
+   WANT, and legacy pin-snapshot indices
    in memory. It **fails loud** on a corrupt or torn record
    (`ReadError::CorruptPile { valid_length }`). It skips bounded unknown
    envelope kinds as opaque records and distinguishes an unknown legacy marker
@@ -220,7 +222,8 @@ refreshing state.
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
    Blob records use a single `write_vectored` call; fixed-width collection and
-   WANT records use one append of their 256-byte envelope header.
+   WANT records use one append of their 256-byte frame, and native proof records
+   append their complete bounded frame once.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
    macOS and `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes
@@ -470,6 +473,42 @@ semantics for collection records: append order and duplicate copies do not
 change the discovered collection calculus. This order-independent behavior is
 specific to collection records; it does not reinterpret historical pin or
 operational WANT logs as sets.
+
+## Native Capability Proof Records
+
+`CapabilityProofStore` is a second grow-only native set. Each member is the
+canonical direct proof body `K0 (S C K)+`; its logical key is
+`CapabilityProofId = BLAKE3(body)`. The ID is reconstructed during replay and
+is not duplicated in the frame.
+
+| Offset | Width | Field |
+|---:|---:|---|
+| `0..28` | 28 | Framing magic |
+| `28..32` | 4 | Minimal total 256-byte-block span, little-endian |
+| `32..64` | 32 | Proof kind `29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053`, rooted at `CD21D2250D6C7B3C6E2EC94817BD73C9` |
+| `64..72` | 8 | Exact proof-body byte length, little-endian |
+| `72..96` | 24 | Reserved zeros |
+| `96..96+length` | variable | Canonical proof body |
+| remainder | variable | Zero padding to the declared span |
+
+The body length must be exactly `32 + 128n` for `1 <= n <= 255`. Replay parses
+every Ed25519 key, requires the declared span to be the smallest span containing
+the body, and rejects any nonzero reserved or padding byte as corruption. One
+edge is 160 body bytes and therefore fills exactly one 256-byte record;
+additional edges preserve 32-byte alignment.
+
+Insertion of identical bytes is idempotent. Different bytes reconstructing to
+the same proof ID are a collision and fail. Exact lookup is only by proof ID;
+the store does not discover proofs from keys or claim handles, and record
+presence grants no authority.
+
+Conservative rewrites preserve every canonical proof record. A proof whose
+direct signatures verify makes each resident claim handle in its body a
+direct blob root. The proof already names every ancestral claim, so opaque
+claim fields are not scanned recursively. A missing claim remains absent, and
+an invalidly signed proof roots nothing. Full semantic verification still
+needs the external trust root, expected leaf, instant, request, and exact
+ordered claim blobs.
 
 ## Retired: Collection Publication Grants
 
