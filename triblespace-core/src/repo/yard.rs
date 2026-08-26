@@ -35,11 +35,12 @@ use super::pile::{
 use super::proof::CapabilityProofStore;
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    RetentionRoots, StorageClose, TransferError, WantRequest, WantStore,
+    RetentionRoots, StorageClose, TransferError, WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
 type WantIndex = PATCH<INLINE_LEN, IdentitySchema, WantEntry>;
+type OperationWantIndex = PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>;
 
 #[derive(Debug, Clone, Copy)]
 struct WantEntry {
@@ -52,7 +53,7 @@ struct WantState {
     wants: WantIndex,
     /// Operation requests are durable questions, never blob-retention roots
     /// and never subject to the resident-blob cache budget.
-    operations: BTreeSet<WantRequest>,
+    operations: OperationWantIndex,
     clock: u64,
 }
 
@@ -70,7 +71,7 @@ impl WantState {
                 self.wants.replace(&entry);
             }
             WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
-                self.operations.insert(request);
+                self.operations.insert(&Entry::new(&request.to_bytes()));
             }
         }
     }
@@ -79,19 +80,23 @@ impl WantState {
         match request {
             WantRequest::Blob { handle } => self.wants.remove(&handle.raw),
             WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
-                self.operations.remove(&request);
+                self.operations.remove(&request.to_bytes());
             }
         }
     }
 
     fn requests(&self) -> Vec<WantRequest> {
-        let mut requests: Vec<_> = (&self.wants)
-            .into_iter()
+        // The canonical tags and field layout follow WantRequest's derived
+        // order, so concatenating the Blob and operation indexes in key order
+        // is the same sequence the former whole-vector sort produced.
+        self.wants
+            .iter_ordered()
             .map(|raw| WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(*raw)))
-            .chain(self.operations.iter().copied())
-            .collect();
-        requests.sort();
-        requests
+            .chain(self.operations.iter_ordered().map(|bytes| {
+                WantRequest::from_bytes(*bytes)
+                    .expect("operation WANT index contains canonical request bytes")
+            }))
+            .collect()
     }
 
     fn trim_to_present_budget(&mut self, present: &HandleSet, budget: usize) -> HandleSet {
@@ -1571,6 +1576,49 @@ mod tests {
 
     fn raw_blob(bytes: &'static [u8]) -> Bytes {
         Bytes::from_source(bytes.to_vec())
+    }
+
+    #[test]
+    fn want_state_enumerates_canonical_request_order_without_sorting() {
+        let blob_low = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([1; INLINE_LEN]));
+        let blob_high = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([2; INLINE_LEN]));
+        let merge_low = WantRequest::merge(
+            Inline::new([3; INLINE_LEN]),
+            Inline::new([5; INLINE_LEN]),
+            Inline::new([4; INLINE_LEN]),
+        );
+        let merge_high = WantRequest::merge(
+            Inline::new([4; INLINE_LEN]),
+            Inline::new([6; INLINE_LEN]),
+            Inline::new([5; INLINE_LEN]),
+        );
+        let derive_low =
+            WantRequest::derive(Inline::new([5; INLINE_LEN]), Inline::new([7; INLINE_LEN]));
+        let derive_high =
+            WantRequest::derive(Inline::new([6; INLINE_LEN]), Inline::new([8; INLINE_LEN]));
+        let expected = vec![
+            blob_low,
+            blob_high,
+            merge_low,
+            merge_high,
+            derive_low,
+            derive_high,
+        ];
+
+        let mut state = WantState::default();
+        for request in expected.iter().rev().copied() {
+            state.want(request);
+        }
+        state.want(merge_low);
+
+        let actual = state.requests();
+        assert_eq!(actual, expected);
+        assert!(actual
+            .windows(2)
+            .all(|pair| pair[0].to_bytes() < pair[1].to_bytes()));
+
+        state.unwant(merge_low);
+        assert!(!state.requests().contains(&merge_low));
     }
 
     fn pin_id(byte: u8) -> Id {

@@ -353,6 +353,7 @@ type PileBlobIndex = PATCH<32, IdentitySchema, IndexEntry, XorSip128>;
 type CollectionRecordIndex = PATCH<16, IdentitySchema, CollectionRecord, XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
 type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
+type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -2278,7 +2279,7 @@ pub struct Pile {
     /// Exact byte-distinct legacy V3 collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
-    legacy_collection_headers: BTreeSet<[u8; V3_HEADER_LEN]>,
+    legacy_collection_headers: LegacyCollectionHeaderIndex,
     /// Number of structurally valid records whose semantics this reader cannot
     /// safely interpret. This includes unknown generic-envelope kinds and
     /// retired local-cell encodings with former ownership semantics. Known
@@ -2797,7 +2798,7 @@ impl Pile {
             collection_records: CollectionRecordIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             peers: PeerEvidenceIndex::new(),
-            legacy_collection_headers: BTreeSet::new(),
+            legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
@@ -3011,10 +3012,9 @@ impl Pile {
                 Applied::Peer { evidence }
             }
             PileRecordContent::LegacyCollectionV3 { .. } => {
-                self.legacy_collection_headers.insert(
-                    legacy_collection_header
-                        .expect("legacy collection record must retain its physical header"),
-                );
+                let header = legacy_collection_header
+                    .expect("legacy collection record must retain its physical header");
+                self.legacy_collection_headers.insert(&Entry::new(&header));
                 Applied::LegacyCollectionV3
             }
             PileRecordContent::RetiredCollectionDeriveV4 => Applied::RetiredCollectionDeriveV4,
@@ -3406,7 +3406,7 @@ impl Pile {
     ) -> Result<(), CollectionInsertError> {
         self.refresh()?;
         let headers = self.legacy_collection_headers.clone();
-        for header in headers {
+        for header in headers.into_iter_ordered() {
             destination.preserve_legacy_collection_header(header)?;
         }
         Ok(())
@@ -3430,7 +3430,7 @@ impl Pile {
         let result = (|| {
             self.refresh_locked()?;
 
-            if self.legacy_collection_headers.contains(&header) {
+            if self.legacy_collection_headers.get(&header).is_some() {
                 return Ok(());
             }
 
@@ -4585,7 +4585,7 @@ impl Pile {
             }
         }
 
-        for header in legacy_collection_headers {
+        for header in legacy_collection_headers.into_iter_ordered() {
             destination
                 .preserve_legacy_collection_header(header)
                 .map_err(PileRewriteError::Collection)?;
@@ -5075,6 +5075,24 @@ mod tests {
     fn sorted_collection_records(mut records: Vec<CollectionRecord>) -> Vec<CollectionRecord> {
         records.sort_by_key(CollectionRecord::id);
         records
+    }
+
+    #[test]
+    fn legacy_collection_header_index_uses_the_full_256_byte_key() {
+        let low = [0u8; V3_HEADER_LEN];
+        let mut high = low;
+        high[V3_HEADER_LEN - 1] = 1;
+
+        let mut index = LegacyCollectionHeaderIndex::new();
+        index.insert(&Entry::new(&high));
+        index.insert(&Entry::new(&low));
+        index.insert(&Entry::new(&high));
+
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            index.iter_ordered().copied().collect::<Vec<_>>(),
+            vec![low, high]
+        );
     }
 
     fn invalidate_collection_commit(commit: CollectionCommit) -> CollectionCommit {

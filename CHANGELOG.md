@@ -75,6 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the remaining in-memory ordered sets for inert legacy V3 collection
+  headers and Yard operation WANTs with PATCH indexes. Canonical PATCH
+  traversal preserves their byte order, while Yard no longer sorts the full
+  request vector when enumerating already-canonical keys.
+
 - Replace the high-level `Collection` facade's ambient, store-enumerated
   authority resolution with explicit admission. `CollectionAdmission::Open`
   admits every strictly verified signer; capability admission accepts owned
