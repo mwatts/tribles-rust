@@ -10,7 +10,6 @@ repository = "https://github.com/triblespace/triblespace-net"
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
 iroh = { version = "1.0", features = ["platform-verifier"] }
 iroh-base = "1.0"
-iroh-blobs = { version = "0.103", default-features = false, features = ["rpc"] }
 # mDNS (LAN) address lookup — moved out of `iroh` core in 1.0. pkarr-DHT
 # address discovery was also removed in 1.0 and we deliberately do NOT
 # re-add it (N0 pkarr+DNS preset + mDNS cover our local/LAN use; staying
@@ -18,25 +17,15 @@ iroh-blobs = { version = "0.103", default-features = false, features = ["rpc"] }
 iroh-mdns-address-lookup = "0.4"
 url = "2"
 iroh-gossip = { version = "0.101", features = ["net"] }
-irpc = "0.17.0"
-irpc-iroh = "0.17.0"
 anyhow = "1"
 anybytes = { version = "0.20.2", features = ["zerocopy"] }
 memmap2 = "0.9"
 tempfile = "3.15.0"
-arrayvec = "0.7.6"
 blake3 = "1.8"
 ed25519-dalek = "2.2.0"
-futures-buffered = "0.2.12"
 getrandom = "0.4"
 hex = "0.4"
-indexmap = "2.10.0"
-n0-future = "0.3.0"
 rand = "0.8.5"
-serde = { version = "1", features = ["derive"] }
-serde-big-array = "0.5.1"
-snafu = "0.8.6"
-thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
