@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a monotone native store-scope assertion binding one physical repository
+  to exactly one Ed25519 team trust root. `MemoryRepo`, `Pile`, and `Yard`
+  expose explicit idempotent binding; pile concatenation preserves every
+  assertion so conflicting teams fail closed on observation. Reframing,
+  retained rewrites, and Yard reclamation preserve the assertion, while it is
+  deliberately excluded from network inventory and gossip. `Peer`
+  construction is now fallible and refuses unbound, conflicting, or
+  wrong-team stores before spawning or exposing a network snapshot. Every
+  later refresh revalidates the assertion around snapshot construction and
+  withdraws the serving view if an external append introduces disagreement.
+
 - Add one authorized four-component inventory synchronization protocol for a
   single-team store. Exact `SYNC_TEAM(team_public_key)` authority selects PEER,
   collection-record, capability-proof, and blob PATCH roots independently of

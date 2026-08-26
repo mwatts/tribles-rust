@@ -20,6 +20,7 @@
 //! Format](../../book/src/pile-format.md) chapter of the Tribles Book.
 
 use anybytes::Bytes;
+use ed25519_dalek::VerifyingKey;
 use hex_literal::hex;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
@@ -67,7 +68,7 @@ use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
-use crate::repo::{WantRequest, WANT_REQUEST_BYTES_LEN};
+use crate::repo::{StoreScope, StoreScopeError, WantRequest, WANT_REQUEST_BYTES_LEN};
 
 mod record_kind;
 pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
@@ -353,6 +354,7 @@ type PileBlobIndex = PATCH<32, IdentitySchema, IndexEntry, XorSip128>;
 type CollectionRecordIndex = PATCH<16, IdentitySchema, CollectionRecord, XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
 type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
+type StoreScopeIndex = PATCH<32, IdentitySchema, (), XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
@@ -903,6 +905,33 @@ impl PeerEvidenceRecordHeader {
     }
 }
 
+/// Monotone physical-store scope: `64..96` team trust-root key.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct StoreScopeRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    team_public_key: RawInline,
+    reserved: [u8; 160],
+}
+
+impl StoreScopeRecordHeader {
+    fn new(team: VerifyingKey) -> Self {
+        Self {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_STORE_SCOPE,
+            team_public_key: team.to_bytes(),
+            reserved: [0u8; 160],
+        }
+    }
+
+    fn team(&self) -> Result<VerifyingKey, ed25519_dalek::SignatureError> {
+        VerifyingKey::from_bytes(&self.team_public_key)
+    }
+}
+
 impl WantRecordHeader {
     /// Construct the physical envelope used only by collection-operation
     /// wants. Blob wants deliberately retain the blob-want kind so an older
@@ -1120,6 +1149,7 @@ const _: () = {
     assert!(std::mem::size_of::<BlobWantRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<WantRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<PeerEvidenceRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<StoreScopeRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionCommitRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
@@ -1271,6 +1301,11 @@ pub enum PileRecordContent {
     Peer {
         /// Exact validated team/peer association.
         evidence: PeerEvidence,
+    },
+    /// One monotone local assertion binding this physical store to a team.
+    StoreScope {
+        /// Exact validated team trust-root public key.
+        team: VerifyingKey,
     },
     /// One recognized legacy V3 collection header.
     ///
@@ -1477,6 +1512,20 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 offset,
                 len,
                 content: PileRecordContent::Peer { evidence },
+            })
+        }
+        record_kind::KIND_STORE_SCOPE => {
+            fixed_header()?;
+            let (header, _) =
+                StoreScopeRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if nonzero(&[&header.reserved[..]]) {
+                return Err(corrupt());
+            }
+            let team = header.team().map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::StoreScope { team },
             })
         }
         record_kind::KIND_COLLECTION_COMMIT => {
@@ -2244,6 +2293,7 @@ enum Applied {
     Collection { id: Id },
     CapabilityProof { id: CapabilityProofId },
     Peer { evidence: PeerEvidence },
+    StoreScope { team: VerifyingKey },
     LegacyCollectionV3,
     RetiredCollectionDeriveV4,
     Opaque,
@@ -2276,6 +2326,10 @@ pub struct Pile {
     capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
     peers: PeerEvidenceIndex,
+    /// Every monotone physical-store team-scope assertion observed on disk.
+    /// More than one distinct key is retained as a semantic conflict rather
+    /// than projected away by replay order.
+    store_scopes: StoreScopeIndex,
     /// Exact byte-distinct legacy V3 collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
@@ -2825,6 +2879,7 @@ impl Pile {
             collection_records: CollectionRecordIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             peers: PeerEvidenceIndex::new(),
+            store_scopes: StoreScopeIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
@@ -3038,6 +3093,10 @@ impl Pile {
                 self.peers.insert(&Entry::new(evidence.as_bytes()));
                 Applied::Peer { evidence }
             }
+            PileRecordContent::StoreScope { team } => {
+                self.store_scopes.insert(&Entry::new(team.as_bytes()));
+                Applied::StoreScope { team }
+            }
             PileRecordContent::LegacyCollectionV3 { .. } => {
                 let header = legacy_collection_header
                     .expect("legacy collection record must retain its physical header");
@@ -3172,6 +3231,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.collection_records);
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.peers);
+            std::ptr::drop_in_place(&mut this.store_scopes);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.wants);
         }
@@ -3709,6 +3769,90 @@ impl PeerStore for Pile {
     }
 }
 
+impl Pile {
+    fn observed_store_scope(
+        &self,
+    ) -> Result<Option<VerifyingKey>, StoreScopeError<PileWriteError>> {
+        let mut keys = self.store_scopes.iter_ordered();
+        let Some(first) = keys.next() else {
+            return Ok(None);
+        };
+        let first = VerifyingKey::from_bytes(first)
+            .expect("Pile only indexes structurally decoded store-scope keys");
+        let Some(second) = keys.next() else {
+            return Ok(Some(first));
+        };
+        let second = VerifyingKey::from_bytes(second)
+            .expect("Pile only indexes structurally decoded store-scope keys");
+        Err(StoreScopeError::conflict(first, second))
+    }
+}
+
+impl StoreScope for Pile {
+    type ScopeError = PileWriteError;
+
+    fn store_scope(&mut self) -> Result<Option<VerifyingKey>, StoreScopeError<Self::ScopeError>> {
+        self.refresh()
+            .map_err(PileWriteError::from)
+            .map_err(StoreScopeError::Backend)?;
+        self.observed_store_scope()
+    }
+
+    fn bind_store_scope(
+        &mut self,
+        team: VerifyingKey,
+    ) -> Result<(), StoreScopeError<Self::ScopeError>> {
+        self.file
+            .lock()
+            .map_err(PileWriteError::from)
+            .map_err(StoreScopeError::Backend)?;
+        let result = (|| {
+            self.refresh_locked()
+                .map_err(PileWriteError::from)
+                .map_err(StoreScopeError::Backend)?;
+            match self.observed_store_scope()? {
+                Some(bound) if bound == team => return Ok(()),
+                Some(bound) => return Err(StoreScopeError::conflict(bound, team)),
+                None => {}
+            }
+
+            self.dirty = true;
+            let written = self
+                .file
+                .write(StoreScopeRecordHeader::new(team).as_bytes())
+                .map_err(PileWriteError::from)
+                .map_err(StoreScopeError::Backend)?;
+            if written != ENVELOPE_HEADER_LEN {
+                return Err(StoreScopeError::Backend(PileWriteError::IoError(
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write complete store-scope record",
+                    ),
+                )));
+            }
+
+            match self
+                .apply_next()
+                .map_err(PileWriteError::from)
+                .map_err(StoreScopeError::Backend)?
+            {
+                Some(Applied::StoreScope { team: applied }) if applied == team => Ok(()),
+                Some(_) | None => Err(StoreScopeError::Backend(PileWriteError::IoError(
+                    std::io::Error::other("unexpected record after store-scope append"),
+                ))),
+            }
+        })();
+        let unlock = self
+            .file
+            .unlock()
+            .map_err(PileWriteError::from)
+            .map_err(StoreScopeError::Backend);
+        result?;
+        unlock?;
+        Ok(())
+    }
+}
+
 impl BlobStorePut for Pile {
     type PutError = InsertError;
 
@@ -3848,6 +3992,7 @@ impl Pile {
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::CapabilityProof { .. }) => {}
                     Some(Applied::Peer { .. }) => {}
+                    Some(Applied::StoreScope { .. }) => {}
                     Some(Applied::LegacyCollectionV3) => {}
                     Some(Applied::RetiredCollectionDeriveV4) => {}
                     Some(Applied::Opaque) => {}
@@ -4136,6 +4281,9 @@ pub struct PileReframeStats {
     pub capability_proofs: usize,
     /// Positive peer-routing facts re-encoded.
     pub peer_evidence: usize,
+    /// Store-scope assertions replayed. Duplicate equal assertions remain
+    /// idempotent at the destination.
+    pub store_scopes: usize,
     /// Records dropped because they never carried live state: inert legacy V3
     /// collection headers, retired local cells, and records of a kind this
     /// reader does not interpret.
@@ -4165,6 +4313,8 @@ pub enum PileReframeError {
     CapabilityProof(CapabilityProofInsertError),
     /// Positive peer-routing evidence could not be appended.
     Peer(PileWriteError),
+    /// A store-scope assertion could not be observed or replayed.
+    StoreScope(StoreScopeError<PileWriteError>),
     /// The destination was not empty, so the re-encode would have mixed
     /// framings instead of producing a clean file.
     DestinationNotEmpty {
@@ -4192,6 +4342,9 @@ impl std::fmt::Display for PileReframeError {
                 write!(f, "failed to re-encode a capability proof: {error}")
             }
             Self::Peer(error) => write!(f, "failed to re-encode peer evidence: {error}"),
+            Self::StoreScope(error) => {
+                write!(f, "failed to re-encode store scope: {error}")
+            }
             Self::DestinationNotEmpty { length } => write!(
                 f,
                 "destination already holds {length} byte(s); reframe requires an empty pile"
@@ -4207,6 +4360,7 @@ impl Error for PileReframeError {
             Self::Source(error) => Some(error),
             Self::Destination(error) => Some(error),
             Self::Pin(error) | Self::Want(error) | Self::Peer(error) => Some(error),
+            Self::StoreScope(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
@@ -4360,6 +4514,12 @@ pub fn reframe_into(
                     .map_err(PileReframeError::Peer)?;
                 stats.peer_evidence += 1;
             }
+            PileRecordContent::StoreScope { team } => {
+                destination
+                    .bind_store_scope(team)
+                    .map_err(PileReframeError::StoreScope)?;
+                stats.store_scopes += 1;
+            }
             _ => stats.dropped_inert += 1,
         }
     }
@@ -4381,6 +4541,8 @@ pub struct PileRewriteStats {
     pub capability_proofs: usize,
     /// Number of positive peer-routing facts preserved.
     pub peer_evidence: usize,
+    /// Whether the source's unique store scope was preserved.
+    pub store_scope: bool,
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -4414,6 +4576,8 @@ pub enum PileRewriteError {
     CapabilityProof(CapabilityProofInsertError),
     /// Positive peer-routing evidence could not be appended.
     Peer(PileWriteError),
+    /// The source scope conflicted or the destination rejected it.
+    StoreScope(StoreScopeError<PileWriteError>),
     /// The completed destination state could not be made durable.
     Flush(FlushError),
 }
@@ -4440,6 +4604,7 @@ impl std::fmt::Display for PileRewriteError {
                 write!(f, "failed to preserve a capability proof: {error}")
             }
             Self::Peer(error) => write!(f, "failed to preserve peer evidence: {error}"),
+            Self::StoreScope(error) => write!(f, "failed to preserve store scope: {error}"),
             Self::Flush(error) => write!(f, "failed to flush rewritten pile: {error}"),
         }
     }
@@ -4451,6 +4616,7 @@ impl Error for PileRewriteError {
             Self::Source(error) => Some(error),
             Self::Transfer(error) => Some(error),
             Self::StrongPin(error) | Self::Want(error) | Self::Peer(error) => Some(error),
+            Self::StoreScope(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
@@ -4496,11 +4662,17 @@ impl Pile {
         explicit: &super::RetentionRoots,
         wants: WantRewritePolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
+        let store_scope = self.store_scope().map_err(PileRewriteError::StoreScope)?;
         let reader = self.reader().map_err(PileRewriteError::Source)?;
         if self.opaque_records != 0 {
             return Err(PileRewriteError::OpaqueRecords {
                 count: self.opaque_records,
             });
+        }
+        if let Some(team) = store_scope {
+            destination
+                .bind_store_scope(team)
+                .map_err(PileRewriteError::StoreScope)?;
         }
         let strong_pins = self.branches.clone();
         let collection_records = self.collection_records.clone();
@@ -4665,6 +4837,7 @@ impl Pile {
             wants: preserved_wants,
             capability_proofs: capability_proof_count,
             peer_evidence: peer_evidence_count,
+            store_scope: store_scope.is_some(),
         })
     }
 }
@@ -4705,6 +4878,10 @@ mod tests {
             SigningKey::from_bytes(&[team_seed; 32]).verifying_key(),
             SigningKey::from_bytes(&[peer_seed; 32]).verifying_key(),
         )
+    }
+
+    fn team_key(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
     }
 
     fn capability_fixture(seed: u8, resource: [u8; 32]) -> (CapabilityProof, Blob<SimpleArchive>) {
@@ -5452,9 +5629,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "self-describing.pile");
         let mut pile = Pile::open(&path).unwrap();
-        // Twelve description archives plus the deduplicated name, layout, and
+        // Thirteen description archives plus the deduplicated name, layout, and
         // attribute-metafact blobs they reference.
-        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 43);
+        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 46);
 
         let branch_id = Id::new([3; 16]).unwrap();
         pile.append_legacy_pin_for_test(branch_id, None, Some(Inline::new([4; 32])))
@@ -5467,6 +5644,7 @@ mod tests {
             pile.insert(*record).unwrap();
         }
         pile.insert_peer(peer_evidence(6, 7)).unwrap();
+        pile.bind_store_scope(team_key(8)).unwrap();
         let reader = pile.reader().unwrap();
 
         let mut records = PileRecords::open(&path).unwrap();
@@ -5493,7 +5671,7 @@ mod tests {
             assert_eq!(named, 1, "a record kind describes exactly one record kind");
             resolved += 1;
         }
-        assert!(resolved >= 16);
+        assert!(resolved >= 17);
         drop(reader);
         pile.close().unwrap();
     }
@@ -6426,6 +6604,7 @@ mod tests {
                 wants: 1,
                 capability_proofs: 0,
                 peer_evidence: 0,
+                store_scope: false,
             }
         );
 
@@ -8414,6 +8593,152 @@ mod tests {
         expected.sort();
         assert_eq!(actual, expected);
         merged.close().unwrap();
+    }
+
+    #[test]
+    fn store_scope_binding_is_persistent_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "scope.pile");
+        let team = team_key(31);
+
+        let mut pile = Pile::open(&path).unwrap();
+        assert_eq!(pile.store_scope().unwrap(), None);
+        pile.bind_store_scope(team).unwrap();
+        let after_first = pile.file.metadata().unwrap().len();
+        pile.bind_store_scope(team).unwrap();
+        assert_eq!(pile.file.metadata().unwrap().len(), after_first);
+        pile.close().unwrap();
+
+        let scope_records = PileRecords::open(&path)
+            .unwrap()
+            .filter_map(|record| match record.unwrap().content {
+                PileRecordContent::StoreScope { team } => Some(team),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scope_records, vec![team]);
+
+        let mut reopened = Pile::open(&path).unwrap();
+        assert_eq!(reopened.store_scope().unwrap(), Some(team));
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn store_scope_rejects_a_conflicting_bind_without_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "scope-conflict.pile");
+        let first = team_key(32);
+        let second = team_key(33);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.bind_store_scope(first).unwrap();
+        let before = pile.file.metadata().unwrap().len();
+        assert!(matches!(
+            pile.bind_store_scope(second),
+            Err(StoreScopeError::Conflict { .. })
+        ));
+        assert_eq!(pile.file.metadata().unwrap().len(), before);
+        assert_eq!(pile.store_scope().unwrap(), Some(first));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn concatenating_different_store_scopes_fails_closed_on_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = fresh_empty_pile_path(&dir, "left-scope.pile");
+        let right_path = fresh_empty_pile_path(&dir, "right-scope.pile");
+        let left_team = team_key(34);
+        let right_team = team_key(35);
+
+        let mut left = Pile::open(&left_path).unwrap();
+        left.bind_store_scope(left_team).unwrap();
+        left.close().unwrap();
+        let mut right = Pile::open(&right_path).unwrap();
+        right.bind_store_scope(right_team).unwrap();
+        right.close().unwrap();
+
+        let right_bytes = std::fs::read(&right_path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&left_path)
+            .unwrap()
+            .write_all(&right_bytes)
+            .unwrap();
+
+        let mut merged = Pile::open(&left_path).unwrap();
+        assert!(matches!(
+            merged.store_scope(),
+            Err(StoreScopeError::Conflict { .. })
+        ));
+        assert_eq!(
+            PileRecords::open(&left_path)
+                .unwrap()
+                .filter(|record| matches!(
+                    record.as_ref().unwrap().content,
+                    PileRecordContent::StoreScope { .. }
+                ))
+                .count(),
+            2
+        );
+        merged.close().unwrap();
+    }
+
+    #[test]
+    fn reframe_and_retained_rewrite_preserve_store_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "scope-source.pile");
+        let reframe_path = fresh_empty_pile_path(&dir, "scope-reframed.pile");
+        let rewrite_path = fresh_empty_pile_path(&dir, "scope-rewritten.pile");
+        let team = team_key(36);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        source.bind_store_scope(team).unwrap();
+        source.close().unwrap();
+
+        let mut reframed = Pile::open(&reframe_path).unwrap();
+        let reframe_stats = reframe_into(&source_path, &mut reframed).unwrap();
+        assert_eq!(reframe_stats.store_scopes, 1);
+        assert_eq!(reframed.store_scope().unwrap(), Some(team));
+        reframed.close().unwrap();
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut rewritten = Pile::open(&rewrite_path).unwrap();
+        let rewrite_stats = source
+            .rewrite_retained_into(
+                &mut rewritten,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert!(rewrite_stats.store_scope);
+        assert_eq!(rewritten.store_scope().unwrap(), Some(team));
+        source.close().unwrap();
+        rewritten.close().unwrap();
+    }
+
+    #[test]
+    fn store_scope_record_rejects_noncanonical_header() {
+        let mut bytes = StoreScopeRecordHeader::new(team_key(37))
+            .as_bytes()
+            .to_vec();
+        bytes[96] = 1;
+        assert!(matches!(
+            decode_record(&bytes, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+
+        let invalid_key = (0u8..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|candidate| VerifyingKey::from_bytes(candidate).is_err())
+            .expect("at least one repeated byte string must not encode an Ed25519 point");
+        let mut bytes = StoreScopeRecordHeader::new(team_key(37))
+            .as_bytes()
+            .to_vec();
+        bytes[64..96].copy_from_slice(&invalid_key);
+        assert!(matches!(
+            decode_record(&bytes, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
     }
 
     #[test]

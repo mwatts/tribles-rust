@@ -326,6 +326,21 @@ impl InventorySnapshotCache {
 
 type InventorySnapshots = Arc<Mutex<InventorySnapshotCache>>;
 
+fn pinned_snapshot_if_serving(
+    current: &SnapshotSlot,
+    snapshots: &InventorySnapshots,
+    team: VerifyingKey,
+    component: InventoryComponent,
+    root: [u8; 32],
+) -> Option<SharedSnapshot> {
+    // Keep the current-slot lock through the cache lookup so clearing the
+    // serving view is the linearization point after which no old pinned root
+    // can begin another response.
+    let current = current.lock().unwrap();
+    current.as_ref()?;
+    snapshots.lock().unwrap().get(team, component, root)
+}
+
 const GOSSIP_INVENTORY_WAKE: u8 = 0x04;
 const GOSSIP_INVENTORY_WAKE_VERSION: u32 = 1;
 const GOSSIP_INVENTORY_WAKE_LEN: usize = 1 + 4 + 32 + 32;
@@ -494,21 +509,9 @@ impl NetSender {
         *self.installed_generation.lock().unwrap() = None;
     }
 
-    pub(crate) fn refresh_store_snapshot<S>(&self, store: &mut S, team: VerifyingKey) -> bool
-    where
-        S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
-    {
-        match StoreSnapshot::from_store(store, team) {
-            Ok(snapshot) => {
-                self.update_snapshot(snapshot);
-                true
-            }
-            Err(error) => {
-                warn!(%error, "store inventory snapshot unavailable; clearing serving view");
-                self.clear_snapshot();
-                false
-            }
-        }
+    #[cfg(test)]
+    pub(crate) fn snapshot_available(&self) -> bool {
+        self.snapshot.lock().unwrap().is_some()
     }
 
     async fn ready_capability(&self) -> anyhow::Result<Arc<dyn NetCapability>> {
@@ -1490,7 +1493,9 @@ impl SnapshotHandler {
                 }
                 let session = current_inventory_session(&authorization)?;
                 let request = recv_node_request(recv, session).await?;
-                let pinned = self.snapshots.lock().unwrap().get(
+                let pinned = pinned_snapshot_if_serving(
+                    &self.snapshot,
+                    &self.snapshots,
                     session.team(),
                     request.component,
                     request.root,
@@ -1507,7 +1512,9 @@ impl SnapshotHandler {
                 }
                 let session = current_inventory_session(&authorization)?;
                 let request = recv_blob_range_request(recv).await?;
-                let pinned = self.snapshots.lock().unwrap().get(
+                let pinned = pinned_snapshot_if_serving(
+                    &self.snapshot,
+                    &self.snapshots,
                     session.team(),
                     InventoryComponent::Blob,
                     request.root,
@@ -1681,5 +1688,33 @@ mod tests {
             routes.note([byte; 32]);
         }
         assert_eq!(routes.candidates([0; 32]).len(), 100);
+    }
+
+    #[test]
+    fn clearing_current_snapshot_also_gates_old_pinned_roots() {
+        let team = key(3);
+        let mut store = MemoryRepo::default();
+        store.insert_peer(PeerEvidence::new(team, key(4))).unwrap();
+        let snapshot = StoreSnapshot::from_store(&mut store, team).unwrap();
+        let manifest = snapshot.manifest();
+        let component = InventoryComponent::Peer;
+        let root = manifest
+            .component(component)
+            .root()
+            .expect("nonempty peer inventory has a root");
+        let snapshot = shared_snapshot(snapshot);
+        let current = Arc::new(Mutex::new(Some(snapshot.clone())));
+        let snapshots = Arc::new(Mutex::new(InventorySnapshotCache::default()));
+        snapshots
+            .lock()
+            .unwrap()
+            .pin_manifest(team, &manifest, snapshot);
+
+        assert!(pinned_snapshot_if_serving(&current, &snapshots, team, component, root).is_some());
+        *current.lock().unwrap() = None;
+        assert!(
+            pinned_snapshot_if_serving(&current, &snapshots, team, component, root).is_none(),
+            "withdrawal must gate immutable roots retained in the cache"
+        );
     }
 }

@@ -172,6 +172,14 @@ record_kinds! {
         "pile-peer-v1",
         "Positive routing evidence PEER(team_public_key, peer_public_key). Envelope bytes 64..96 hold the 32-byte Ed25519 team trust-root public key, 96..128 the 32-byte Ed25519 peer public key, and 128..256 are zeros. The record spans exactly one 256-byte block and has no payload. Presence grants no authority, liveness, reachability, residency, or retention semantics; no inverse or retraction record exists.";
 
+    /// Monotone local binding between this physical store and one team.
+    ///
+    /// Kind/schema id minted with `trible genid` on 2026-08-26.
+    StoreScopeRecordV1 = KIND_ID_STORE_SCOPE "EDDEDAF4E20AF86EC63A7F1F044E2D4A",
+        KIND_STORE_SCOPE "97C69C746D01741C8012A56F08D2C424E0291B5424EB9CD7637FD4A655C93DFB",
+        "pile-store-scope-v1",
+        "Monotone local safety assertion STORE_SCOPE(team_public_key). Envelope bytes 64..96 hold exactly one 32-byte Ed25519 team trust-root public key and 96..256 are zeros. The record spans exactly one 256-byte block and has no payload. Repeating the same assertion is idempotent; observing two distinct keys is a semantic conflict and network assembly must fail closed. This assertion is neither authorization nor peer, collection, proof, or blob inventory and is never gossiped.";
+
 }
 
 /// Every blob needed to resolve every known record kind.

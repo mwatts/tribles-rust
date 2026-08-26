@@ -13,6 +13,7 @@ use triblespace_net::peer::{
 };
 
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::StoreScope;
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
@@ -299,6 +300,7 @@ fn run_sync(
             return Err(error);
         }
     };
+    pile.bind_store_scope(team_root)?;
     let mut peer = Peer::new(
         pile,
         key.clone(),

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anybytes::Bytes;
+use ed25519_dalek::VerifyingKey;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
@@ -35,8 +36,8 @@ use super::pile::{
 use super::proof::CapabilityProofStore;
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    RetentionRoots, StorageClose, StoreRevision, TransferError, WantRequest, WantStore,
-    WANT_REQUEST_BYTES_LEN,
+    RetentionRoots, StorageClose, StoreRevision, StoreScope, StoreScopeError, TransferError,
+    WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -739,6 +740,41 @@ impl Yard {
     }
 }
 
+impl StoreScope for Yard {
+    type ScopeError = PileWriteError;
+
+    fn store_scope(&mut self) -> Result<Option<VerifyingKey>, StoreScopeError<Self::ScopeError>> {
+        let mut observed = None;
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                let Some(team) = segment.pile_mut().store_scope()? else {
+                    continue;
+                };
+                match observed {
+                    None => observed = Some(team),
+                    Some(bound) if bound == team => {}
+                    Some(bound) => return Err(StoreScopeError::conflict(bound, team)),
+                }
+            }
+        }
+        Ok(observed)
+    }
+
+    fn bind_store_scope(
+        &mut self,
+        team: VerifyingKey,
+    ) -> Result<(), StoreScopeError<Self::ScopeError>> {
+        match self.store_scope()? {
+            Some(bound) if bound == team => Ok(()),
+            Some(bound) => Err(StoreScopeError::conflict(bound, team)),
+            None => self.generations[0]
+                .active_mut()
+                .pile_mut()
+                .bind_store_scope(team),
+        }
+    }
+}
+
 /// Deterministic owned snapshot of the native collection records visible
 /// across all yard generations.
 pub struct YardCollectionRecordIter {
@@ -1295,6 +1331,9 @@ fn reclaim_generation(
     live: &HandleSet,
     mut old_pile: Pile,
 ) -> Result<Pile, YardReclaimError> {
+    let store_scope = old_pile
+        .store_scope()
+        .map_err(YardReclaimError::StoreScope)?;
     let opaque_records = old_pile
         .opaque_record_count()
         .map_err(YardReclaimError::Pile)?;
@@ -1323,6 +1362,11 @@ fn reclaim_generation(
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
+    if let Some(team) = store_scope {
+        new_pile
+            .bind_store_scope(team)
+            .map_err(YardReclaimError::StoreScope)?;
+    }
     let handles: Vec<_> = live
         .clone()
         .into_iter()
@@ -1521,6 +1565,8 @@ pub enum YardReclaimError {
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
     CapabilityProof(CapabilityProofInsertError),
+    /// The generation's local team scope conflicted or could not be copied.
+    StoreScope(StoreScopeError<PileWriteError>),
     Close(super::pile::FlushError),
     WantMarkers(std::io::Error),
     /// A generation rewrite failed (`primary`) and the subsequent
@@ -1552,6 +1598,7 @@ impl fmt::Display for YardReclaimError {
             Self::CapabilityProof(err) => {
                 write!(f, "failed to copy a yard capability proof: {err}")
             }
+            Self::StoreScope(err) => write!(f, "failed to copy yard store scope: {err}"),
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WantMarkers(err) => {
                 write!(f, "failed to re-record want markers: {err}")
@@ -1603,6 +1650,52 @@ mod tests {
 
     fn raw_blob(bytes: &'static [u8]) -> Bytes {
         Bytes::from_source(bytes.to_vec())
+    }
+
+    #[test]
+    fn yard_store_scope_is_idempotent_and_survives_reclaim_and_reopen() {
+        let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
+        let team = SigningKey::from_bytes(&[71; 32]).verifying_key();
+        let other = SigningKey::from_bytes(&[72; 32]).verifying_key();
+
+        assert_eq!(yard.store_scope().unwrap(), None);
+        yard.bind_store_scope(team).unwrap();
+        yard.bind_store_scope(team).unwrap();
+        assert_eq!(yard.store_scope().unwrap(), Some(team));
+        assert!(matches!(
+            yard.bind_store_scope(other),
+            Err(StoreScopeError::Conflict { .. })
+        ));
+
+        yard.reclaim().unwrap();
+        assert_eq!(yard.store_scope().unwrap(), Some(team));
+        yard.close().unwrap();
+
+        let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
+        assert_eq!(reopened.store_scope().unwrap(), Some(team));
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn yard_observation_rejects_different_generation_scopes() {
+        let (_dir, mut yard) = yard_with(2, YardConfig::default());
+        let first = SigningKey::from_bytes(&[73; 32]).verifying_key();
+        let second = SigningKey::from_bytes(&[74; 32]).verifying_key();
+        yard.generations[0]
+            .active_mut()
+            .pile_mut()
+            .bind_store_scope(first)
+            .unwrap();
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .bind_store_scope(second)
+            .unwrap();
+        assert!(matches!(
+            yard.store_scope(),
+            Err(StoreScopeError::Conflict { .. })
+        ));
+        yard.close().unwrap();
     }
 
     #[test]

@@ -28,6 +28,9 @@ pub use peer::PeerStore;
 /// Grow-only native storage for complete capability proofs.
 pub mod proof;
 pub use proof::CapabilityProofStore;
+/// Monotone local binding between one physical store and one network team.
+pub mod scope;
+pub use scope::{StoreScope, StoreScopeError};
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 

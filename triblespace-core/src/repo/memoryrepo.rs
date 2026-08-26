@@ -4,6 +4,8 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
+use ed25519_dalek::VerifyingKey;
+
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
@@ -17,7 +19,7 @@ use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::prelude::*;
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
-use crate::repo::{StoreRevision, WantRequest, WantStore};
+use crate::repo::{StoreRevision, StoreScope, StoreScopeError, WantRequest, WantStore};
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
@@ -45,6 +47,30 @@ pub struct MemoryRepo {
     capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
     peer_evidence: PeerEvidenceIndex,
+    /// Monotone local safety assertion binding this store to one team.
+    store_scope: Option<VerifyingKey>,
+}
+
+impl StoreScope for MemoryRepo {
+    type ScopeError = Infallible;
+
+    fn store_scope(&mut self) -> Result<Option<VerifyingKey>, StoreScopeError<Self::ScopeError>> {
+        Ok(self.store_scope)
+    }
+
+    fn bind_store_scope(
+        &mut self,
+        team: VerifyingKey,
+    ) -> Result<(), StoreScopeError<Self::ScopeError>> {
+        match self.store_scope {
+            None => {
+                self.store_scope = Some(team);
+                Ok(())
+            }
+            Some(bound) if bound == team => Ok(()),
+            Some(bound) => Err(StoreScopeError::conflict(bound, team)),
+        }
+    }
 }
 
 /// O(1)-clone invalidation token for a [`MemoryRepo`]'s sync-visible sets.

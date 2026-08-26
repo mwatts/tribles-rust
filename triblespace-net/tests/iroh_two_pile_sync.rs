@@ -38,7 +38,7 @@ use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, WantRequest, WantStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, StoreScope, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
@@ -99,12 +99,15 @@ async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
 async fn bring_up(
     network: &TestNetwork,
     signing_key: &SigningKey,
-    store: Pile,
+    mut store: Pile,
     connect_root: ed25519_dalek::VerifyingKey,
     connect_proof: CapabilityProofBundle,
     sync_proof: CapabilityProofBundle,
     bootstrap: Vec<EndpointAddr>,
 ) -> Peer<Pile> {
+    store
+        .bind_store_scope(connect_root)
+        .expect("test pile accepts its explicit team scope");
     let secret = triblespace_net::identity::iroh_secret(signing_key);
     let id: EndpointId = secret.public().into();
     let ep = test_endpoint(network, secret).await;
@@ -125,6 +128,7 @@ async fn bring_up(
         sender,
         receiver,
     )
+    .expect("test pile was explicitly bound to this team")
 }
 
 fn init_tracing() {

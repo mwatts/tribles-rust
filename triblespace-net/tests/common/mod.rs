@@ -14,6 +14,7 @@ use triblespace_core::capability::{
 };
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
+use triblespace_core::repo::StoreScope;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_net::host;
 use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
@@ -168,13 +169,16 @@ pub fn bring_up_with_peers(
 pub fn bring_up_with_qos(
     net: &SimNet,
     signing_key: &SigningKey,
-    store: MemoryRepo,
+    mut store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
     proofs: TeamProofs,
     gossip: bool,
     peers: Vec<[u8; 32]>,
     qos: ReconcileQos,
 ) -> Peer<MemoryRepo> {
+    store
+        .bind_store_scope(connect_root)
+        .expect("simulation store accepts its explicit team scope");
     let id = pk(signing_key);
     let gossip_topic = gossip.then_some(connect_root.to_bytes());
     let harness = net.join(id, gossip_topic);
@@ -198,6 +202,7 @@ pub fn bring_up_with_qos(
         wiring,
     ));
     Peer::with_wiring(store, connect_root, qos, sender, receiver)
+        .expect("simulation store was explicitly bound to this team")
 }
 
 /// An empty store intentionally independent of CONNECT proof-bundle residency.

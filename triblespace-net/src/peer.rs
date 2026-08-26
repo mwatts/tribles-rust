@@ -6,6 +6,8 @@
 //! replacement serving snapshot. Exact blob reads keep their durable-WANT
 //! semantics independently of broad inventory mirroring.
 
+use std::error::Error;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anybytes::Bytes;
@@ -20,15 +22,60 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    CapabilityProofStore, PeerStore, StorageFlush, StoreRevision, WantRequest, WantStore,
+    CapabilityProofStore, PeerStore, StorageFlush, StoreRevision, StoreScope, StoreScopeError,
+    WantRequest, WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
-use crate::host::{self, NetReceiver, NetSender};
+use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
+
+/// Failure while attaching a physical store to a team-scoped network host.
+#[derive(Debug)]
+pub enum PeerOpenError<E> {
+    /// The store's scope assertion could not be observed coherently.
+    Scope(StoreScopeError<E>),
+    /// The store has not yet been explicitly bound to any team.
+    Unbound,
+    /// The store is bound coherently, but to a different team.
+    TeamMismatch {
+        /// Team asserted by the physical store.
+        bound: VerifyingKey,
+        /// Team requested by the peer configuration.
+        requested: VerifyingKey,
+    },
+    /// The production network thread, runtime, or iroh endpoint could not start.
+    HostStartup(anyhow::Error),
+}
+
+impl<E: fmt::Display> fmt::Display for PeerOpenError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scope(error) => write!(f, "cannot observe network store scope: {error}"),
+            Self::Unbound => f.write_str("network store is not explicitly bound to a team"),
+            Self::TeamMismatch { bound, requested } => write!(
+                f,
+                "network store is bound to team {}, not requested team {}",
+                hex::encode_upper(bound.as_bytes()),
+                hex::encode_upper(requested.as_bytes()),
+            ),
+            Self::HostStartup(error) => write!(f, "cannot start network host: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for PeerOpenError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Scope(error) => Some(error),
+            Self::Unbound | Self::TeamMismatch { .. } => None,
+            Self::HostStartup(error) => Some(error.as_ref()),
+        }
+    }
+}
 
 /// A store attached to one team-scoped network host.
 pub struct Peer<S>
@@ -66,6 +113,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + StoreScope
         + WantStore
         + StorageFlush
         + StoreRevision
@@ -74,11 +122,16 @@ where
     S::Reader: BlobStoreMeta,
 {
     /// Spawn a production host and attach `store` to exactly `config.team`.
-    pub fn new(store: S, key: SigningKey, config: PeerConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        mut store: S,
+        key: SigningKey,
+        config: PeerConfig,
+    ) -> Result<Self, PeerOpenError<S::ScopeError>> {
         let team = config.team;
         let qos = config.qos;
-        let (sender, receiver) = host::spawn(key, config)?;
-        Ok(Self::assemble(store, team, qos, sender, receiver))
+        Self::validate_store_scope(&mut store, team)?;
+        let (sender, receiver) = host::spawn(key, config).map_err(PeerOpenError::HostStartup)?;
+        Self::assemble(store, team, qos, sender, receiver)
     }
 
     /// Attach a store to a caller-owned host, most commonly the deterministic
@@ -90,8 +143,21 @@ where
         qos: ReconcileQos,
         sender: NetSender,
         receiver: NetReceiver,
-    ) -> Self {
+    ) -> Result<Self, PeerOpenError<S::ScopeError>> {
+        let mut store = store;
+        Self::validate_store_scope(&mut store, team)?;
         Self::assemble(store, team, qos, sender, receiver)
+    }
+
+    fn validate_store_scope(
+        store: &mut S,
+        requested: VerifyingKey,
+    ) -> Result<(), PeerOpenError<S::ScopeError>> {
+        match store.store_scope().map_err(PeerOpenError::Scope)? {
+            None => Err(PeerOpenError::Unbound),
+            Some(bound) if bound == requested => Ok(()),
+            Some(bound) => Err(PeerOpenError::TeamMismatch { bound, requested }),
+        }
     }
 
     fn assemble(
@@ -100,7 +166,7 @@ where
         qos: ReconcileQos,
         sender: NetSender,
         receiver: NetReceiver,
-    ) -> Self {
+    ) -> Result<Self, PeerOpenError<S::ScopeError>> {
         let endpoint = VerifyingKey::from_bytes(sender.id().as_bytes())
             .expect("an endpoint id is an Ed25519 public key");
         let pending_network_flush = match store.insert_peer(
@@ -130,8 +196,8 @@ where
         };
         // Reobserve once after assembly so external pile appends that raced
         // construction are included before the first scheduler sweep.
-        peer.refresh();
-        peer
+        peer.refresh_checked()?;
+        Ok(peer)
     }
 
     pub fn id(&self) -> EndpointId {
@@ -171,6 +237,25 @@ where
     /// still meaningful: file-backed stores reobserve external appends before
     /// manifests and periodic sweeps use them.
     pub fn refresh(&mut self) {
+        if let Err(error) = self.refresh_checked() {
+            tracing::warn!(%error, "network store scope invalid; clearing serving view");
+            self.sender.clear_snapshot();
+            // A transient scope-observation failure must not strand the peer
+            // with no snapshot merely because the sync-visible revision did
+            // not change before the next successful refresh.
+            self.last_store_revision = None;
+        }
+    }
+
+    fn refresh_checked(&mut self) -> Result<(), PeerOpenError<S::ScopeError>> {
+        // Scope is physical-store state, not inventory. Reobserve it before
+        // accepting events so a conflicting external append fails closed on
+        // the next scheduler/reader refresh instead of extending that store.
+        {
+            let mut store = self.store.lock().expect("store mutex");
+            Self::validate_store_scope(&mut *store, self.team)?;
+        }
+
         let mut incoming = Vec::new();
         for _ in 0..MAX_ADMISSION_BRIDGE_BATCHES {
             let Some(event) = self.receiver.try_recv() else {
@@ -254,16 +339,43 @@ where
                         ?error,
                         "store revision unavailable; keeping prior inventory"
                     );
-                    return;
+                    return Ok(());
                 }
             };
+            // `store_revision` may itself reobserve an external append. Scope
+            // is intentionally absent from that sync-visible token, so check
+            // it again before an equality fast-path can retain a serving view.
+            Self::validate_store_scope(&mut *store, self.team)?;
             if self.last_store_revision.as_ref() == Some(&revision) {
-                return;
+                return Ok(());
             }
-            if self.sender.refresh_store_snapshot(&mut *store, self.team) {
+            if Self::install_validated_snapshot(&self.sender, &mut *store, self.team)? {
                 self.last_store_revision = Some(revision);
             }
         }
+        Ok(())
+    }
+
+    fn install_validated_snapshot(
+        sender: &NetSender,
+        store: &mut S,
+        team: VerifyingKey,
+    ) -> Result<bool, PeerOpenError<S::ScopeError>> {
+        Self::validate_store_scope(store, team)?;
+        let snapshot = match StoreSnapshot::from_store(store, team) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "store inventory snapshot unavailable; clearing serving view");
+                sender.clear_snapshot();
+                return Ok(false);
+            }
+        };
+        // Snapshot construction reobserves every externally appendable store
+        // component. Reobserve scope once more before publication so a scope
+        // record racing that construction cannot authorize a mixed snapshot.
+        Self::validate_store_scope(store, team)?;
+        sender.update_snapshot(snapshot);
+        Ok(true)
     }
 
     pub fn store(&self) -> MutexGuard<'_, S> {
@@ -323,6 +435,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + StoreScope
         + WantStore
         + StorageFlush
         + StoreRevision
@@ -349,6 +462,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + StoreScope
         + WantStore
         + StorageFlush
         + StoreRevision
@@ -557,7 +671,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    use triblespace_core::repo::StoreScope;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::pile::Pile;
 
     #[test]
     fn simulation_wiring_never_infers_team_from_endpoint_identity() {
@@ -566,14 +684,135 @@ mod tests {
         assert_ne!(endpoint, team);
         let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
         let (sender, receiver, _wiring) = host::wire(endpoint_id);
-        let peer = Peer::with_wiring(
+        let mut store = MemoryRepo::default();
+        store.bind_store_scope(team).unwrap();
+        let peer =
+            Peer::with_wiring(store, team, ReconcileQos::default(), sender, receiver).unwrap();
+        assert_eq!(peer.team(), team);
+        assert_eq!(peer.id(), endpoint_id);
+    }
+
+    #[test]
+    fn simulation_wiring_refuses_unbound_store() {
+        let endpoint = SigningKey::from_bytes(&[3; 32]).verifying_key();
+        let team = SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint_id);
+        let error = match Peer::with_wiring(
             MemoryRepo::default(),
             team,
             ReconcileQos::default(),
             sender,
             receiver,
+        ) {
+            Ok(_) => panic!("unbound store unexpectedly reached peer assembly"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, PeerOpenError::Unbound));
+    }
+
+    #[test]
+    fn simulation_wiring_refuses_store_bound_to_another_team() {
+        let endpoint = SigningKey::from_bytes(&[5; 32]).verifying_key();
+        let bound = SigningKey::from_bytes(&[6; 32]).verifying_key();
+        let requested = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint_id);
+        let mut store = MemoryRepo::default();
+        store.bind_store_scope(bound).unwrap();
+        let error =
+            match Peer::with_wiring(store, requested, ReconcileQos::default(), sender, receiver) {
+                Ok(_) => panic!("wrong-team store unexpectedly reached peer assembly"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            error,
+            PeerOpenError::TeamMismatch {
+                bound: actual_bound,
+                requested: actual_requested,
+            } if actual_bound == bound && actual_requested == requested
+        ));
+    }
+
+    #[test]
+    fn simulation_wiring_refuses_concatenated_conflicting_pile_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = dir.path().join("left.pile");
+        let right_path = dir.path().join("right.pile");
+        std::fs::File::create(&left_path).unwrap();
+        std::fs::File::create(&right_path).unwrap();
+        let left_team = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        let right_team = SigningKey::from_bytes(&[9; 32]).verifying_key();
+
+        let mut left = Pile::open(&left_path).unwrap();
+        left.bind_store_scope(left_team).unwrap();
+        left.close().unwrap();
+        let mut right = Pile::open(&right_path).unwrap();
+        right.bind_store_scope(right_team).unwrap();
+        right.close().unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&left_path)
+            .unwrap()
+            .write_all(&std::fs::read(&right_path).unwrap())
+            .unwrap();
+
+        let endpoint = SigningKey::from_bytes(&[10; 32]).verifying_key();
+        let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint_id);
+        let store = Pile::open(&left_path).unwrap();
+        let error =
+            match Peer::with_wiring(store, left_team, ReconcileQos::default(), sender, receiver) {
+                Ok(_) => panic!("conflicting pile scopes unexpectedly reached peer assembly"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            error,
+            PeerOpenError::Scope(StoreScopeError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn refresh_withdraws_snapshot_after_external_scope_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let serving_path = dir.path().join("serving.pile");
+        let conflicting_path = dir.path().join("conflicting.pile");
+        std::fs::File::create(&serving_path).unwrap();
+        std::fs::File::create(&conflicting_path).unwrap();
+        let serving_team = SigningKey::from_bytes(&[11; 32]).verifying_key();
+        let conflicting_team = SigningKey::from_bytes(&[12; 32]).verifying_key();
+
+        let mut serving = Pile::open(&serving_path).unwrap();
+        serving.bind_store_scope(serving_team).unwrap();
+        let mut conflicting = Pile::open(&conflicting_path).unwrap();
+        conflicting.bind_store_scope(conflicting_team).unwrap();
+        conflicting.close().unwrap();
+
+        let endpoint = SigningKey::from_bytes(&[13; 32]).verifying_key();
+        let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint_id);
+        let snapshot_probe = sender.clone();
+        let mut peer = Peer::with_wiring(
+            serving,
+            serving_team,
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        )
+        .unwrap();
+        assert!(snapshot_probe.snapshot_available());
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&serving_path)
+            .unwrap()
+            .write_all(&std::fs::read(&conflicting_path).unwrap())
+            .unwrap();
+        peer.refresh();
+
+        assert!(
+            !snapshot_probe.snapshot_available(),
+            "a peer must stop serving after reobserving conflicting store scopes"
         );
-        assert_eq!(peer.team(), team);
-        assert_eq!(peer.id(), endpoint_id);
     }
 }
