@@ -121,14 +121,20 @@ impl InventoryBasePrefix {
 /// Server-side policy for inventory authorization.
 ///
 /// The team key is both the external capability trust root and the exact
-/// full-team capability resource. There is no ambient replica-set identifier.
+/// full-team capability resource. The configured backing store is the
+/// single-team boundary: PEER keys are intrinsically team-prefixed, while
+/// collection-record, capability-proof, and blob identities carry no team
+/// field and therefore expose the store's complete sets after authorization.
+/// A host must never attach a multi-team store to this configuration. There is
+/// no ambient replica-set identifier or separately selectable sync scope.
 #[derive(Clone, Copy, Debug)]
 pub struct InventoryServerConfig {
     team: ed25519_dalek::VerifyingKey,
 }
 
 impl InventoryServerConfig {
-    /// Serve the complete structurally canonical inventory for `team`.
+    /// Serve the complete structurally canonical inventory for `team` from a
+    /// backing store dedicated to that team.
     pub const fn full_team(team: ed25519_dalek::VerifyingKey) -> Self {
         Self { team }
     }
@@ -517,7 +523,11 @@ pub struct InventorySnapshot<R> {
 }
 
 impl InventorySnapshot<()> {
-    /// Observe a store and construct the fixed full-team inventory for `team`.
+    /// Observe a single-team store and construct its fixed full inventory.
+    ///
+    /// The caller must dedicate `store` to `team`. Records, proofs, and blobs
+    /// have content identities but no intrinsic team label, so authorizing this
+    /// snapshot intentionally discloses their complete sets.
     pub fn from_store<S>(
         store: &mut S,
         team: ed25519_dalek::VerifyingKey,
@@ -678,6 +688,75 @@ where
 
     pub(crate) const fn blobs(&self) -> &BlobInventory {
         &self.blobs
+    }
+}
+
+impl<R> InventorySnapshot<R> {
+    /// Exact local node summary for one protocol-relative locator.
+    ///
+    /// This is the only safe subtree-skip predicate for reconciliation: both
+    /// the canonical digest and leaf count must equal the remote pending node.
+    pub(crate) fn node_summary(
+        &self,
+        component: InventoryComponent,
+        relative_prefix: &[u8],
+    ) -> Option<([u8; 32], u64)> {
+        fn summary<const KEY_LEN: usize>(
+            inventory: &PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle>,
+            prefix: &[u8],
+        ) -> Option<([u8; 32], u64)> {
+            inventory
+                .merkle_node(prefix)
+                .map(|node| (node.digest(), node.leaf_count()))
+        }
+
+        let base = component.base_prefix(self.team);
+        if relative_prefix.len() > component.relative_key_len(base) {
+            return None;
+        }
+        let mut absolute = Vec::with_capacity(base.as_bytes().len() + relative_prefix.len());
+        absolute.extend_from_slice(base.as_bytes());
+        absolute.extend_from_slice(relative_prefix);
+        match component {
+            InventoryComponent::Peer => summary(&self.peers, &absolute),
+            InventoryComponent::CollectionRecord => summary(&self.records, &absolute),
+            InventoryComponent::CapabilityProof => summary(&self.proofs, &absolute),
+            InventoryComponent::Blob => summary(&self.blobs, &absolute),
+        }
+    }
+
+    /// Whether one complete protocol-relative leaf belongs to this snapshot.
+    pub(crate) fn contains_relative_key(
+        &self,
+        component: InventoryComponent,
+        relative_key: &[u8],
+    ) -> bool {
+        let base = component.base_prefix(self.team);
+        let Ok(absolute) = base.absolute_key(component, relative_key) else {
+            return false;
+        };
+        match component {
+            InventoryComponent::Peer => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| self.peers.get(key).is_some()),
+            InventoryComponent::CollectionRecord => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| self.records.get(key).is_some()),
+            InventoryComponent::CapabilityProof => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| self.proofs.get(key).is_some()),
+            InventoryComponent::Blob => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| self.blobs.get(key).is_some()),
+        }
     }
 }
 
