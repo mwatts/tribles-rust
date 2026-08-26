@@ -222,6 +222,61 @@ an explicit caller authorization phase and admits the complete accepted batch
 only after transport and validation finish. Neither operation fetches
 referenced content.
 
+## Private custody replicas
+
+Sparse public synchronization is deliberately not a backup protocol. A
+separate custody lane converges the complete **resident semantic store** between
+an explicitly configured set of private peers:
+
+```text
+BlobStore × CollectionStore × CapabilityProofStore
+```
+
+The join is componentwise set union. Custody therefore copies every valid
+resident blob, every canonical native collection record, and every canonical
+native capability proof. It does not copy WANTs, historical pins, append
+timestamps, framing padding, routing state, or retry state. Unknown opaque pile
+records stop startup rather than being silently discarded; recognized retired
+V4 `DERIVE` records are known inert computation and may be omitted.
+
+Custody binds one restart-stable private-fabric socket and accepts only exact
+static `EndpointTicket`s. Its endpoint has no relay, port mapping, mDNS, DHT,
+gossip topic, or ambient address discovery. The ordinary CONNECT proof still
+authenticates the transport, but it grants no custody access. Every summary,
+page, and blob-range request additionally carries a complete proof for the
+exact action
+`ACTION_REPLICATE_STORE = D8453B974E15F5DF17B1B67A338B3EBD`, the exact
+256-bit replica-set resource, the transport peer as leaf, and exact Invoke
+mode. A node not present in the static peer set is rejected before CONNECT.
+
+The bounded anti-entropy protocol adds three operations:
+
+| Operation | Byte | Question | Response |
+|---|---:|---|---|
+| `REPLICA_SUMMARY` | `0x08` | all 256 first-byte buckets of all three components | count, byte total, and BLAKE3 digest per bucket |
+| `REPLICA_PAGE` | `0x09` | one component, bucket, and exclusive cursor | one sorted bounded page plus a final marker |
+| `REPLICA_BLOB` | `0x0A` | exact handle, expected length, offset, and bounded maximum | at most one 1 MiB range or missing |
+
+Collection-record IDs are extended with a zero suffix only for page ordering;
+their canonical dense record bytes remain the transferred representation.
+Proofs likewise travel in their canonical native body. Blob ranges land in an
+anonymous file in a caller-selected pile-adjacent directory, are hashed once as
+they arrive, and become a read-only mapping whose verified handle is retained
+through destination admission.
+
+Each sweep obtains immutable remote summaries, validates every completed page
+stream against its advertised bucket digest, and admits all blobs from every
+healthy peer before admitting any of their collection or proof evidence. Blob
+writes cross durability barriers in bounded 64 MiB batches; record and proof
+pages cross a barrier per page. A stale pooled connection is evicted and
+redialed once within the same sweep; a still-failed peer remains incomplete and
+retries on the next sweep while independent peers continue. Receive-file,
+allocation, write, metadata, and mapping failures are local storage failures
+and abort the sweep rather than masquerading as peer unavailability.
+Cancellation can abandon only network/page work: store mutations are
+synchronous, temporary receive files close on drop, the transport shuts down
+gracefully, and the pile is explicitly closed before the command exits.
+
 ## Direction policy
 
 `PeerConfig::direction` controls local participation without changing evidence
@@ -256,6 +311,18 @@ trible pile net sync <PILE> --team-root HEX --proof ID
     Run collection-evidence gossip and durable WANT reconciliation.
     --read-only suppresses publication; --write-only suppresses admission
     and fetching; --no-lazy disables WANT servicing.
+
+trible team replica create|issue|join ...
+    Provision and import invoke-only proofs under an independent offline
+    replica root and exact replica-set resource.
+
+trible pile net custody status <PILE> ...
+    Validate static tickets, both exact proofs, the fixed bind, receive
+    directory, opaque-record fence, and complete local inventory without
+    opening a socket.
+
+trible pile net custody run <PILE> ...
+    Run foreground private-custody anti-entropy until SIGINT or SIGTERM.
 ```
 
 `status` and `sync` require the pile, CONNECT trust root, exact proof ID, and
@@ -279,6 +346,8 @@ a distributed proof that every peer has converged.
 - Direct RPC starts with one inline, exact CONNECT proof bundle.
 - CONNECT authenticates the session and grants no other action or storage
   policy.
+- Full custody is a separately authorized product union over fixed peers; it
+  never follows gossip or creates WANTs.
 - Every payload is strictly framed and content/signature checked before it can
   affect local resolution.
 - Temporary unreachability remains “unknown,” never “absent.”

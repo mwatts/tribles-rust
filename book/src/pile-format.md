@@ -359,6 +359,14 @@ compaction, and reclaim refuse before mutation when any opaque record is
 present. An older reader cannot know whether the unknown kind owns a known
 blob, so silently omitting it—or collecting its dependencies—would be unsafe.
 
+The retired V4 collection DERIVE kind is deliberately not opaque. Its former
+fields and semantics are known, and a derivation carried neither ownership nor
+authoritative state: it is a computation whose artifact is rebuilt under the
+current recipe. Replay exposes it as `RetiredCollectionDeriveV4`, projects no
+collection record, and semantic rewrites may discard it. This distinction lets
+the unknown-kind fence stay strict without letting known inert computations
+block custody replication or compaction forever.
+
 ## Blob Records
 
 | Offset | Width | Field |

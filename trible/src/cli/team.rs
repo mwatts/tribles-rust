@@ -27,6 +27,7 @@ use triblespace_core::repo::proof::CapabilityProofStore;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 
 use triblespace_net::protocol::{connect_capability_atom, ACTION_CONNECT};
+use triblespace_net::replica::{replicate_capability_atom, ReplicaSetId, ACTION_REPLICATE_STORE};
 
 const MAX_INVITE_BYTES: usize = MAX_CAPABILITY_PROOF_BUNDLE_BYTES;
 
@@ -107,6 +108,75 @@ pub enum Command {
         #[arg(long)]
         proof: String,
     },
+    /// Provision invoke-only private-custody replica proofs.
+    Replica {
+        #[command(subcommand)]
+        cmd: ReplicaCommand,
+    },
+}
+
+#[derive(Parser)]
+pub enum ReplicaCommand {
+    /// Create an offline replica root and one direct node invite.
+    Create {
+        /// Durable offline replica-root key file.
+        #[arg(long)]
+        root_key: PathBuf,
+        /// Exact 32-byte replica-set identity. Generated randomly if absent.
+        #[arg(long)]
+        replica_set: Option<String>,
+        /// Node network public key authorized to replicate (32-byte hex).
+        #[arg(long)]
+        subject: String,
+        /// Inclusive RFC 3339 lower validity bound (requires --valid-until).
+        #[arg(long, value_parser = parse_epoch, requires = "valid_until")]
+        valid_from: Option<Epoch>,
+        /// Inclusive RFC 3339 upper validity bound (requires --valid-from).
+        #[arg(long, value_parser = parse_epoch, requires = "valid_from")]
+        valid_until: Option<Epoch>,
+        /// Portable direct proof bundle to write.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Issue another direct node invite from an existing offline root.
+    Issue {
+        /// Existing durable offline replica-root key file.
+        #[arg(long)]
+        root_key: PathBuf,
+        /// Exact 32-byte replica-set identity.
+        #[arg(long)]
+        replica_set: String,
+        /// Node network public key authorized to replicate (32-byte hex).
+        #[arg(long)]
+        subject: String,
+        /// Inclusive RFC 3339 lower validity bound (requires --valid-until).
+        #[arg(long, value_parser = parse_epoch, requires = "valid_until")]
+        valid_from: Option<Epoch>,
+        /// Inclusive RFC 3339 upper validity bound (requires --valid-from).
+        #[arg(long, value_parser = parse_epoch, requires = "valid_from")]
+        valid_until: Option<Epoch>,
+        /// Portable direct proof bundle to write.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Validate and import one replica invite into a local pile.
+    Join {
+        /// Path to the receiving pile file.
+        #[arg(long)]
+        pile: PathBuf,
+        /// Node's existing, distinct network key.
+        #[arg(long)]
+        network_key: PathBuf,
+        /// Expected offline replica-root public key (32-byte hex).
+        #[arg(long)]
+        replica_root: String,
+        /// Expected exact 32-byte replica-set identity.
+        #[arg(long)]
+        replica_set: String,
+        /// Portable bundle produced by `team replica create` or `issue`.
+        #[arg(long)]
+        invite: PathBuf,
+    },
 }
 
 pub fn run(command: Command) -> Result<()> {
@@ -150,6 +220,7 @@ pub fn run(command: Command) -> Result<()> {
             team_root,
             proof,
         } => run_show(pile, team_root, proof),
+        Command::Replica { cmd } => run_replica(cmd),
     }
 }
 
@@ -240,6 +311,15 @@ fn validity(
 
 fn connect_atom(team_root: VerifyingKey) -> CapabilityAtom {
     connect_capability_atom(team_root)
+}
+
+pub(crate) fn parse_replica_set(text: &str) -> Result<ReplicaSetId> {
+    let bytes = hex::decode(text).map_err(|error| anyhow!("decode replica set hex: {error}"))?;
+    let raw: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("replica set must be 32 bytes"))?;
+    Ok(ReplicaSetId::new(raw))
 }
 
 fn format_proof_id(id: CapabilityProofId) -> String {
@@ -334,6 +414,45 @@ pub(crate) fn resolve_connect_bundle(
         .to_bytes()
         .map_err(|error| anyhow!("CONNECT proof is not transport-portable: {error}"))?;
     Ok(bundle)
+}
+
+/// Load and verify one exact REPLICATE proof whose effective leaf mode is Invoke.
+pub(crate) fn resolve_replica_bundle(
+    pile: &mut Pile,
+    replica_root: VerifyingKey,
+    replica_set: ReplicaSetId,
+    proof_id: CapabilityProofId,
+    expected_subject: VerifyingKey,
+) -> Result<CapabilityProofBundle> {
+    let bundle = load_capability_bundle(pile, proof_id)?;
+    verify_replica_bundle(&bundle, replica_root, replica_set, expected_subject)?;
+    bundle
+        .to_bytes()
+        .map_err(|error| anyhow!("REPLICATE proof is not transport-portable: {error}"))?;
+    Ok(bundle)
+}
+
+fn verify_replica_bundle(
+    bundle: &CapabilityProofBundle,
+    replica_root: VerifyingKey,
+    replica_set: ReplicaSetId,
+    expected_subject: VerifyingKey,
+) -> Result<()> {
+    let verified = bundle
+        .verify(
+            replica_root,
+            triblespace_core::clock::epoch_now(),
+            expected_subject,
+            CapabilityRequest::new(
+                replicate_capability_atom(replica_set),
+                CapabilityMode::Invoke,
+            ),
+        )
+        .map_err(|error| anyhow!("REPLICATE proof rejected: {error}"))?;
+    if verified.effective_mode() != CapabilityMode::Invoke {
+        bail!("replica proof must grant invoke-only authority");
+    }
+    Ok(())
 }
 
 fn write_invite(path: &Path, bundle: &CapabilityProofBundle) -> Result<()> {
@@ -470,9 +589,148 @@ fn run_join(
     Ok(())
 }
 
+fn run_replica(command: ReplicaCommand) -> Result<()> {
+    match command {
+        ReplicaCommand::Create {
+            root_key,
+            replica_set,
+            subject,
+            valid_from,
+            valid_until,
+            out,
+        } => {
+            let root = triblespace_core::signing_key_file::init(&root_key)?;
+            let replica_set = match replica_set {
+                Some(replica_set) => parse_replica_set(&replica_set)?,
+                None => {
+                    let mut raw = [0; 32];
+                    getrandom::fill(&mut raw)?;
+                    ReplicaSetId::new(raw)
+                }
+            };
+            let subject = parse_public_key(&subject, "replica subject")?;
+            let bundle = issue_replica_invite(
+                &root,
+                replica_set,
+                subject,
+                validity(valid_from, valid_until)?,
+            )?;
+            write_invite(&out, &bundle)?;
+
+            println!(
+                "replica root pubkey: {}",
+                hex::encode(root.verifying_key().to_bytes())
+            );
+            print_replica_root_key_warning();
+            println!("replica root key:    {}", root_key.display());
+            print_replica_invite(replica_set, &bundle, &out);
+            Ok(())
+        }
+        ReplicaCommand::Issue {
+            root_key,
+            replica_set,
+            subject,
+            valid_from,
+            valid_until,
+            out,
+        } => {
+            let root = triblespace_core::signing_key_file::load_existing(&root_key)?;
+            let replica_set = parse_replica_set(&replica_set)?;
+            let subject = parse_public_key(&subject, "replica subject")?;
+            let bundle = issue_replica_invite(
+                &root,
+                replica_set,
+                subject,
+                validity(valid_from, valid_until)?,
+            )?;
+            write_invite(&out, &bundle)?;
+
+            println!(
+                "replica root pubkey: {}",
+                hex::encode(root.verifying_key().to_bytes())
+            );
+            print_replica_invite(replica_set, &bundle, &out);
+            Ok(())
+        }
+        ReplicaCommand::Join {
+            pile,
+            network_key,
+            replica_root,
+            replica_set,
+            invite,
+        } => {
+            let local_key = triblespace_core::signing_key_file::load_existing(&network_key)?;
+            let replica_root = parse_public_key(&replica_root, "replica root")?;
+            let replica_set = parse_replica_set(&replica_set)?;
+            let bundle = read_invite(&invite)?;
+            verify_replica_bundle(
+                &bundle,
+                replica_root,
+                replica_set,
+                local_key.verifying_key(),
+            )
+            .map_err(|error| anyhow!("replica invite rejected: {error:#}"))?;
+            with_pile(&pile, |pile| store_capability_bundle(pile, &bundle))?;
+
+            println!(
+                "replica root:      {}",
+                hex::encode(replica_root.to_bytes())
+            );
+            println!(
+                "replica set:       {}",
+                hex::encode(replica_set.into_bytes())
+            );
+            println!(
+                "accepted proof:    {}",
+                format_proof_id(bundle.proof().id())
+            );
+            println!("proof steps:      {}", bundle.proof().step_count());
+            Ok(())
+        }
+    }
+}
+
+fn issue_replica_invite(
+    root: &SigningKey,
+    replica_set: ReplicaSetId,
+    subject: VerifyingKey,
+    validity: Option<CapabilityValidity>,
+) -> Result<CapabilityProofBundle> {
+    CapabilityProofBundle::issue_root(
+        root,
+        CapabilityClaim::root(
+            replicate_capability_atom(replica_set),
+            CapabilityMode::Invoke,
+            validity,
+        ),
+        subject,
+    )
+    .map_err(|error| anyhow!("issue direct replica proof: {error}"))
+}
+
+fn print_replica_invite(replica_set: ReplicaSetId, bundle: &CapabilityProofBundle, out: &Path) {
+    println!(
+        "replica set:         {}",
+        hex::encode(replica_set.into_bytes())
+    );
+    println!(
+        "issued proof id:     {}",
+        format_proof_id(bundle.proof().id())
+    );
+    println!("invite bundle:       {}", out.display());
+    println!("proof steps:         {}", bundle.proof().step_count());
+}
+
+fn print_replica_root_key_warning() {
+    eprintln!("REPLICA ROOT KEY -- STORE OFFLINE");
+    eprintln!("Anyone holding it can authorize custody of this replica set.");
+}
+
 fn action_label(action: CapabilityAction) -> String {
     if action.id() == ACTION_CONNECT {
         "CONNECT".to_owned()
+    } else if action.id() == ACTION_REPLICATE_STORE {
+        "REPLICATE_STORE".to_owned()
     } else {
         format!("{:X}", action.id())
     }

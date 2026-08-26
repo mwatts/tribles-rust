@@ -12,6 +12,8 @@ use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 
 use triblespace_core::repo::pile::Pile;
 
+mod custody;
+
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
 }
@@ -126,6 +128,11 @@ pub enum Command {
         #[arg(long, value_name = "SECS", default_value_t = 1)]
         reconcile_interval: u64,
     },
+    /// Proof-gated full-residency replication over a fixed private fabric.
+    Custody {
+        #[command(subcommand)]
+        cmd: custody::Command,
+    },
 }
 
 pub fn run(cmd: Command) -> Result<()> {
@@ -172,6 +179,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 reconcile_interval,
             )
         }
+        Command::Custody { cmd } => custody::run(cmd),
     }
 }
 

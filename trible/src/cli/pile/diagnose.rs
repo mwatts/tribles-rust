@@ -51,6 +51,9 @@ struct RecordEvidence {
     opaque_count: usize,
     opaque_first: Option<usize>,
     opaque_last: Option<usize>,
+    retired_derive_count: usize,
+    retired_derive_first: Option<usize>,
+    retired_derive_last: Option<usize>,
     legacy_collection_count: usize,
     legacy_collection_first: Option<usize>,
     legacy_collection_last: Option<usize>,
@@ -86,6 +89,12 @@ fn scan_record_evidence(pile_path: &Path) -> Result<RecordEvidence> {
                 &mut evidence.legacy_collection_count,
                 &mut evidence.legacy_collection_first,
                 &mut evidence.legacy_collection_last,
+                record.offset,
+            ),
+            PileRecordContent::RetiredCollectionDeriveV4 => observe_offset(
+                &mut evidence.retired_derive_count,
+                &mut evidence.retired_derive_first,
+                &mut evidence.retired_derive_last,
                 record.offset,
             ),
             _ => {}
@@ -163,6 +172,18 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                             .expect("nonzero evidence has a first offset"),
                         evidence
                             .legacy_collection_last
+                            .expect("nonzero evidence has a last offset"),
+                    );
+                }
+                if evidence.retired_derive_count != 0 {
+                    println!(
+                        "Recognized {} retired V4 collection derive record(s) (first byte {}, last byte {}); omitted from current state",
+                        evidence.retired_derive_count,
+                        evidence
+                            .retired_derive_first
+                            .expect("nonzero evidence has a first offset"),
+                        evidence
+                            .retired_derive_last
                             .expect("nonzero evidence has a last offset"),
                     );
                 }
@@ -569,6 +590,9 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  recipe: {}", hex::encode_upper(&raw[48..64]));
             }
         }
+        PileRecordContent::RetiredCollectionDeriveV4 => {
+            println!("  classification: retired-v4-collection-derive (inert)");
+        }
         PileRecordContent::Opaque { kind } => {
             println!("  classification: opaque (semantically skipped)");
             println!("  record_kind: {}", hex::encode_upper(kind));
@@ -695,7 +719,9 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                     );
                 }
             }
-            PileRecordContent::Collection { .. } | PileRecordContent::LegacyCollectionV3 { .. } => {
+            PileRecordContent::Collection { .. }
+            | PileRecordContent::LegacyCollectionV3 { .. }
+            | PileRecordContent::RetiredCollectionDeriveV4 => {
                 let raw = &bytes[record.offset..record.offset + record.len];
                 for pos in finder.find_iter(raw) {
                     collection_record_matches += 1;

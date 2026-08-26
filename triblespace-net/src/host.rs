@@ -29,6 +29,14 @@ use crate::collection_wire::{
 };
 use crate::identity::iroh_secret;
 use crate::protocol::*;
+use crate::replica::{
+    ReplicaBlobFetchError, ReplicaComponent, ReplicaItem, ReplicaItemId, ReplicaServerConfig,
+    ReplicaSummary,
+};
+use crate::replica_wire::{
+    OP_REPLICA_BLOB, OP_REPLICA_PAGE, OP_REPLICA_SUMMARY, recv_blob_request, recv_page_request,
+    recv_request_prefix, send_blob_range, send_page, send_summary,
+};
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -75,6 +83,9 @@ fn op_name(op: u8) -> &'static str {
         OP_CHILDREN => "CHILDREN",
         OP_COLLECTION_EVIDENCE => "COLLECTION_EVIDENCE",
         OP_COLLECTION_OPERATION_RECEIPTS => "COLLECTION_OPERATION_RECEIPTS",
+        OP_REPLICA_SUMMARY => "REPLICA_SUMMARY",
+        OP_REPLICA_PAGE => "REPLICA_PAGE",
+        OP_REPLICA_BLOB => "REPLICA_BLOB",
         _ => "UNKNOWN",
     }
 }
@@ -237,6 +248,22 @@ pub trait AnySnapshot: Send + 'static {
     fn collection_operation_receipts(&self, request: WantRequest) -> Vec<CollectionRecord>;
 }
 
+/// Type-erased immutable view used only by explicit custody replication.
+///
+/// This is deliberately separate from [`AnySnapshot`]: constructing the full
+/// resident inventory is expensive and must never become part of ordinary
+/// [`Peer`](crate::peer::Peer) refreshes.
+pub(crate) trait AnyReplicaSnapshot: Send + 'static {
+    fn summary(&self) -> ReplicaSummary;
+    fn page(
+        &self,
+        component: ReplicaComponent,
+        prefix: u8,
+        after: Option<ReplicaItemId>,
+    ) -> (Vec<ReplicaItem>, bool);
+    fn blob_bytes(&self, id: ReplicaItemId) -> Option<anybytes::Bytes>;
+}
+
 impl<R> StoreSnapshot<R>
 where
     R: triblespace_core::repo::BlobStoreGet,
@@ -315,6 +342,34 @@ pub(crate) trait NetCapability: Send + Sync {
         &self,
         request: WantRequest,
     ) -> FuturesUnordered<futures::future::BoxFuture<'static, CollectionOperationPeerProbe>>;
+    /// Fetch one exact private-custody summary from one configured peer.
+    fn replica_summary(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<ReplicaSummary>>;
+    /// Fetch one bounded private-custody inventory page from one configured
+    /// peer. This path never consults gossip neighbors or the DHT.
+    fn replica_page(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+        component: ReplicaComponent,
+        prefix: u8,
+        after: Option<ReplicaItemId>,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<(Vec<ReplicaItem>, bool)>>;
+    /// Fetch one exact private-custody blob through resumable bounded ranges.
+    fn replica_blob(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+        id: ReplicaItemId,
+        expected_len: u64,
+        receive_temp_dir: std::path::PathBuf,
+    ) -> futures::future::BoxFuture<'static, Result<Option<anybytes::Bytes>, ReplicaBlobFetchError>>;
 }
 
 pub enum CollectionOperationPeerProbe {
@@ -488,6 +543,235 @@ impl<T: Transport> NetCapability for NetCap<T> {
             })
             .collect()
     }
+
+    fn replica_summary(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<ReplicaSummary>> {
+        let transport = self.transport.clone();
+        let pool = self.pool.clone();
+        let connect_proof = self.connect_proof.clone();
+        let configured = self.configured_peers.contains(&peer) && peer != self.my_id;
+        Box::pin(async move {
+            if !configured {
+                anyhow::bail!("custody peer is not in the static configured set");
+            }
+            let mut last_error = None;
+            for _ in 0..2 {
+                let Some(connection) = pool_get(&transport, &pool, peer, &connect_proof).await
+                else {
+                    last_error = Some(anyhow::anyhow!("custody peer is unavailable"));
+                    continue;
+                };
+                match tokio::time::timeout(
+                    OP_DEADLINE,
+                    crate::replica_wire::op_replica_summary(&connection, replica_set, &proof),
+                )
+                .await
+                {
+                    Ok(Ok(summary)) => return Ok(summary),
+                    Ok(Err(error)) => last_error = Some(error),
+                    Err(_) => {
+                        last_error = Some(anyhow::anyhow!("custody summary deadline exceeded"));
+                    }
+                }
+                pool_evict(&pool, peer).await;
+            }
+            Err(last_error.unwrap_or_else(|| anyhow::anyhow!("custody summary failed")))
+        })
+    }
+
+    fn replica_page(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+        component: ReplicaComponent,
+        prefix: u8,
+        after: Option<ReplicaItemId>,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<(Vec<ReplicaItem>, bool)>> {
+        let transport = self.transport.clone();
+        let pool = self.pool.clone();
+        let connect_proof = self.connect_proof.clone();
+        let configured = self.configured_peers.contains(&peer) && peer != self.my_id;
+        Box::pin(async move {
+            if !configured {
+                anyhow::bail!("custody peer is not in the static configured set");
+            }
+            let mut last_error = None;
+            for _ in 0..2 {
+                let Some(connection) = pool_get(&transport, &pool, peer, &connect_proof).await
+                else {
+                    last_error = Some(anyhow::anyhow!("custody peer is unavailable"));
+                    continue;
+                };
+                match tokio::time::timeout(
+                    OP_DEADLINE,
+                    crate::replica_wire::op_replica_page(
+                        &connection,
+                        replica_set,
+                        &proof,
+                        component,
+                        prefix,
+                        after,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(page)) => return Ok(page),
+                    Ok(Err(error)) => last_error = Some(error),
+                    Err(_) => {
+                        last_error = Some(anyhow::anyhow!("custody page deadline exceeded"));
+                    }
+                }
+                pool_evict(&pool, peer).await;
+            }
+            Err(last_error.unwrap_or_else(|| anyhow::anyhow!("custody page failed")))
+        })
+    }
+
+    fn replica_blob(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+        id: ReplicaItemId,
+        expected_len: u64,
+        receive_temp_dir: std::path::PathBuf,
+    ) -> futures::future::BoxFuture<'static, Result<Option<anybytes::Bytes>, ReplicaBlobFetchError>>
+    {
+        const RANGE_ATTEMPTS: usize = 3;
+
+        let transport = self.transport.clone();
+        let pool = self.pool.clone();
+        let connect_proof = self.connect_proof.clone();
+        let configured = self.configured_peers.contains(&peer) && peer != self.my_id;
+        Box::pin(async move {
+            if !configured {
+                return Err(ReplicaBlobFetchError::local(anyhow::anyhow!(
+                    "custody peer is not in the static configured set"
+                )));
+            }
+            let len = usize::try_from(expected_len).map_err(|_| {
+                ReplicaBlobFetchError::local(anyhow::anyhow!(
+                    "replica blob does not fit this address space"
+                ))
+            })?;
+            if len == 0 {
+                let bytes = anybytes::Bytes::empty();
+                if blake3::hash(&bytes).as_bytes() != &id.0 {
+                    return Err(ReplicaBlobFetchError::remote(anyhow::anyhow!(
+                        "empty blob inventory carries a nonempty content hash"
+                    )));
+                }
+                return Ok(Some(bytes));
+            }
+
+            let mut temporary = tempfile::tempfile_in(&receive_temp_dir).map_err(|error| {
+                ReplicaBlobFetchError::local(anyhow::anyhow!(
+                    "create replica receive file in {}: {error}",
+                    receive_temp_dir.display()
+                ))
+            })?;
+            let mut hasher = blake3::Hasher::new();
+            let mut offset = 0usize;
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(crate::replica_wire::BLOB_TRANSFER_CHUNK_BYTES)
+                .map_err(|error| {
+                    ReplicaBlobFetchError::local(anyhow::anyhow!(
+                        "allocate replica range buffer: {error}"
+                    ))
+                })?;
+            chunk.resize(crate::replica_wire::BLOB_TRANSFER_CHUNK_BYTES, 0);
+            while offset < len {
+                let chunk_len = (len - offset).min(crate::replica_wire::BLOB_TRANSFER_CHUNK_BYTES);
+                let target = &mut chunk[..chunk_len];
+                let mut received = None;
+                let mut last_error = None;
+                for _ in 0..RANGE_ATTEMPTS {
+                    let Some(connection) = pool_get(&transport, &pool, peer, &connect_proof).await
+                    else {
+                        last_error = Some(anyhow::anyhow!("custody peer is unavailable"));
+                        continue;
+                    };
+                    let operation = crate::replica_wire::op_replica_blob_range(
+                        &connection,
+                        replica_set,
+                        &proof,
+                        id,
+                        expected_len,
+                        offset as u64,
+                        target,
+                    );
+                    match tokio::time::timeout(OP_DEADLINE, operation).await {
+                        Ok(Ok(Some(count))) => {
+                            received = Some(count);
+                            break;
+                        }
+                        Ok(Ok(None)) => return Ok(None),
+                        Ok(Err(error)) => last_error = Some(error),
+                        Err(_) => {
+                            last_error =
+                                Some(anyhow::anyhow!("custody blob range deadline exceeded"));
+                        }
+                    }
+                    pool_evict(&pool, peer).await;
+                }
+                let count = received
+                    .ok_or_else(|| {
+                        last_error.unwrap_or_else(|| anyhow::anyhow!("custody blob range failed"))
+                    })
+                    .map_err(ReplicaBlobFetchError::remote)?;
+                if count != chunk_len {
+                    return Err(ReplicaBlobFetchError::remote(anyhow::anyhow!(
+                        "custody blob range returned a short chunk"
+                    )));
+                }
+                hasher.update(target);
+                std::io::Write::write_all(&mut temporary, target).map_err(|error| {
+                    ReplicaBlobFetchError::local(anyhow::anyhow!(
+                        "write replica receive file: {error}"
+                    ))
+                })?;
+                offset += count;
+            }
+            if hasher.finalize().as_bytes() != &id.0 {
+                return Err(ReplicaBlobFetchError::remote(anyhow::anyhow!(
+                    "replica blob content does not match requested handle"
+                )));
+            }
+            let file = temporary;
+            let actual_len = file
+                .metadata()
+                .map_err(|error| {
+                    ReplicaBlobFetchError::local(anyhow::anyhow!(
+                        "inspect replica receive file: {error}"
+                    ))
+                })?
+                .len();
+            if actual_len != expected_len {
+                return Err(ReplicaBlobFetchError::local(anyhow::anyhow!(
+                    "replica receive file length is {actual_len}; expected {expected_len}"
+                )));
+            }
+            // Mapping does not make data durable; durability remains the
+            // destination store's explicit flush policy after insertion.
+            let mapping = unsafe {
+                memmap2::MmapOptions::new()
+                    .len(len)
+                    .map(&file)
+                    .map_err(|error| {
+                        ReplicaBlobFetchError::local(anyhow::anyhow!(
+                            "map replica receive file: {error}"
+                        ))
+                    })?
+            };
+            Ok(Some(anybytes::Bytes::from_source(mapping)))
+        })
+    }
 }
 
 // ── Outgoing half ────────────────────────────────────────────────────
@@ -510,6 +794,7 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
     /// Readiness slot for the inline fetch capability, published by the
     /// host once its transport binds. `None` until then.
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
@@ -538,6 +823,15 @@ impl NetSender {
     pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
         let boxed: Box<dyn AnySnapshot> = Box::new(snapshot);
         *self.snapshot.lock().unwrap() = Some(boxed);
+    }
+
+    /// Replace the last explicitly built custody inventory.
+    ///
+    /// Ordinary Peer refreshes never call this path. A custody driver retains
+    /// the last complete immutable view until a later explicit rebuild
+    /// succeeds.
+    pub(crate) fn update_replica_snapshot(&self, snapshot: impl AnyReplicaSnapshot) {
+        *self.replica_snapshot.lock().unwrap() = Some(Box::new(snapshot));
     }
 
     /// Remove the serving view immediately. Every authenticated data operation
@@ -694,6 +988,62 @@ impl NetSender {
             None => None,
         }
     }
+
+    async fn ready_capability(&self) -> anyhow::Result<Arc<dyn NetCapability>> {
+        let mut receiver = self.cap.clone();
+        let guard = receiver
+            .wait_for(|capability| capability.is_some())
+            .await
+            .map_err(|_| anyhow::anyhow!("network host stopped before becoming ready"))?;
+        guard
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("network host did not publish its capability"))
+    }
+
+    pub(crate) async fn replica_summary(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+    ) -> anyhow::Result<ReplicaSummary> {
+        self.ready_capability()
+            .await?
+            .replica_summary(peer, replica_set, proof)
+            .await
+    }
+
+    pub(crate) async fn replica_page(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+        component: ReplicaComponent,
+        prefix: u8,
+        after: Option<ReplicaItemId>,
+    ) -> anyhow::Result<(Vec<ReplicaItem>, bool)> {
+        self.ready_capability()
+            .await?
+            .replica_page(peer, replica_set, proof, component, prefix, after)
+            .await
+    }
+
+    pub(crate) async fn replica_blob(
+        &self,
+        peer: PeerId,
+        replica_set: crate::replica::ReplicaSetId,
+        proof: triblespace_core::capability::CapabilityProofBundle,
+        id: ReplicaItemId,
+        expected_len: u64,
+        receive_temp_dir: std::path::PathBuf,
+    ) -> Result<Option<anybytes::Bytes>, ReplicaBlobFetchError> {
+        let capability = self
+            .ready_capability()
+            .await
+            .map_err(ReplicaBlobFetchError::local)?;
+        capability
+            .replica_blob(peer, replica_set, proof, id, expected_len, receive_temp_dir)
+            .await
+    }
 }
 
 // ── Incoming half ────────────────────────────────────────────────────
@@ -721,6 +1071,7 @@ pub struct HostWiring {
     pub(crate) cmd_rx: mpsc::Receiver<NetCommand>,
     pub(crate) evt_tx: mpsc::Sender<NetEvent>,
     pub(crate) snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    pub(crate) replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
     /// Publish half of the inline-fetch capability slot; the host fills
     /// it once its transport binds.
     pub(crate) cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
@@ -733,11 +1084,14 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<NetCommand>();
     let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
     let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
+    let replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>> =
+        Arc::new(Mutex::new(None));
     let (cap_tx, cap_rx) = tokio::sync::watch::channel::<Option<Arc<dyn NetCapability>>>(None);
 
     let sender = NetSender {
         cmd_tx,
         snapshot: snapshot.clone(),
+        replica_snapshot: replica_snapshot.clone(),
         cap: cap_rx,
         id,
     };
@@ -746,6 +1100,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
         cmd_rx,
         evt_tx,
         snapshot,
+        replica_snapshot,
         cap_tx,
     };
     (sender, receiver, wiring)
@@ -756,20 +1111,75 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
 /// a dedicated thread ([`spawn`]); the simulator spawns it as a local
 /// task per node on one shared deterministic runtime.
 pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
+    run_host_with_replica(harness, config, wiring, None).await;
+}
+
+/// Run the ordinary host with an additional, independently authorized custody
+/// service. Passing `None` is exactly the public-gossip host behavior.
+pub(crate) async fn run_host_with_replica<T: Transport>(
+    harness: Harness<T>,
+    config: PeerConfig,
+    wiring: HostWiring,
+    replica_server: Option<ReplicaServerConfig>,
+) {
     host_loop(
         harness,
         config,
         wiring.cmd_rx,
         wiring.evt_tx,
         wiring.snapshot,
+        wiring.replica_snapshot,
         wiring.cap_tx,
+        replica_server,
     )
     .await;
+}
+
+/// Run the proof-gated custody service over a caller-supplied deterministic
+/// transport harness.
+///
+/// This exists only with the `sim` feature; production uses the fixed-address
+/// binder owned by [`crate::replica::CustodyReplica::new`].
+#[cfg(feature = "sim")]
+pub async fn run_custody_host<T: Transport>(
+    harness: Harness<T>,
+    config: PeerConfig,
+    wiring: HostWiring,
+    replica_server: ReplicaServerConfig,
+) {
+    run_host_with_replica(harness, config, wiring, Some(replica_server)).await;
 }
 
 /// Spawn the network thread. Returns the outgoing/incoming channel halves
 /// — used internally by [`Peer::new`](crate::peer::Peer::new).
 pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
+    spawn_with_replica(key, config, None)
+}
+
+/// Owned production host thread for a custody replica.
+///
+/// The custody facade retains this handle so it can stop serving immutable
+/// readers and join the runtime before returning the underlying store.
+pub(crate) struct CustodyHostThread {
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl CustodyHostThread {
+    pub(crate) fn join(mut self) -> anyhow::Result<()> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.join()
+            .map_err(|_| anyhow::anyhow!("custody host thread panicked"))
+    }
+}
+
+/// Spawn a host whose custody operations are gated by a second exact action.
+pub(crate) fn spawn_with_replica(
+    key: SigningKey,
+    config: PeerConfig,
+    replica_server: Option<ReplicaServerConfig>,
+) -> (NetSender, NetReceiver) {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
 
@@ -782,11 +1192,74 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
                 // bind already logged the failure; net thread exits.
                 return;
             };
-            run_host(harness, config, wiring).await;
+            run_host_with_replica(harness, config, wiring, replica_server).await;
         });
     });
 
     (sender, receiver)
+}
+
+/// Spawn the explicit-only custody transport on one fixed socket.
+pub(crate) fn spawn_custody(
+    key: SigningKey,
+    config: PeerConfig,
+    replica_server: ReplicaServerConfig,
+    bind_addr: std::net::SocketAddr,
+) -> anyhow::Result<(NetSender, NetReceiver, CustodyHostThread)> {
+    let secret = iroh_secret(&key);
+    let id: EndpointId = secret.public().into();
+    let (sender, receiver, wiring) = wire(id);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<()>>(1);
+    let join = thread::Builder::new()
+        .name("triblespace-custody".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            let harness = match runtime.block_on(crate::transport::iroh::bind_custody(
+                secret, &config, bind_addr,
+            )) {
+                Ok(harness) => harness,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            // bind_custody returns only after the fixed socket is bound and the
+            // pile-sync protocol router is installed. A CLI may now truthfully
+            // print the exact direct ticket.
+            if ready_tx.send(Ok(())).is_err() {
+                return;
+            }
+            runtime.block_on(run_host_with_replica(
+                harness,
+                config,
+                wiring,
+                Some(replica_server),
+            ));
+        })
+        .map_err(|error| anyhow::anyhow!("spawn custody host thread: {error}"))?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((sender, receiver, CustodyHostThread { join: Some(join) })),
+        Ok(Err(error)) => {
+            let _ = join.join();
+            Err(error)
+        }
+        Err(error) => {
+            let _ = join.join();
+            Err(anyhow::anyhow!(
+                "custody host exited before startup acknowledgement: {error}"
+            ))
+        }
+    }
 }
 
 // ── Network thread event loop ────────────────────────────────────────
@@ -804,6 +1277,23 @@ const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// the whole OP_AUTH exchange. This bounds unauthenticated connection state
 /// even when a peer opens no stream or dribbles an incomplete proof bundle.
 const INBOUND_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Total accepted connections whose authentication/serve loop may exist at
+/// once. Admission happens before production spawns a connection task.
+pub(crate) const MAX_INBOUND_CONNECTIONS_GLOBAL: usize = 64;
+/// An authenticated connection that opens no new request stream for this long
+/// is closed. This is independent of transport keepalive.
+const INBOUND_CONNECTION_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Maximum post-CONNECT request streams one connection may execute at once.
+/// A peer exceeding it is disconnected rather than accumulating application
+/// tasks behind transport-level stream queues.
+pub(crate) const MAX_INBOUND_REQUESTS_PER_CONNECTION: usize = 16;
+/// Node-wide post-CONNECT request bound, shared by every connection handler.
+/// The per-connection limit prevents one authorized key from monopolizing it.
+const MAX_INBOUND_REQUESTS_GLOBAL: usize = 64;
+/// End-to-end inbound request budget: operation byte, complete request/proof,
+/// snapshot work, response body, and response shutdown.
+const INBOUND_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Deadline for a single protocol op (OP_CHILDREN / OP_GET_BLOB request + full
 /// response) on an established connection. On expiry the op reports an error
@@ -842,7 +1332,9 @@ async fn host_loop<T: Transport>(
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
+    replica_server: Option<ReplicaServerConfig>,
 ) {
     let Harness {
         transport,
@@ -891,14 +1383,36 @@ async fn host_loop<T: Transport>(
     // accepts sequential bi-streams until the peer closes.
     let snapshot_handler = SnapshotHandler {
         snapshot: snapshot.clone(),
+        replica_snapshot,
         connect_root: config.connect_root,
+        replica_server,
+        inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CONNECTIONS_GLOBAL)),
+        inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_REQUESTS_GLOBAL)),
     };
+    let custody_only = replica_server.is_some();
+    let configured_for_inbound = configured_peer_set.clone();
     let mut incoming = incoming;
     tokio::spawn(async move {
         while let Some(inc) = incoming.recv().await {
             if inc.alpn == PILE_SYNC_ALPN {
+                if custody_only && !configured_for_inbound.contains(&inc.conn.remote_id()) {
+                    warn!(
+                        peer = %hex::encode(&inc.conn.remote_id()[..4]),
+                        "unconfigured custody peer rejected before admission"
+                    );
+                    inc.conn.close(1, b"peer is not in the custody replica set");
+                    continue;
+                }
                 let h = snapshot_handler.clone();
-                tokio::spawn(async move { h.handle::<T>(inc.conn).await });
+                let Some(permit) = h.try_admit_connection() else {
+                    warn!(
+                        limit = MAX_INBOUND_CONNECTIONS_GLOBAL,
+                        "inbound connection limit exceeded; rejecting connection"
+                    );
+                    inc.conn.close(1, b"inbound connection limit exceeded");
+                    continue;
+                };
+                tokio::spawn(async move { h.handle_admitted::<T>(inc.conn, permit).await });
             } else {
                 debug!(alpn = %String::from_utf8_lossy(inc.alpn), "incoming conn on unknown alpn; dropping");
             }
@@ -958,7 +1472,12 @@ async fn host_loop<T: Transport>(
 
     // Command loop.
     loop {
-        while let Ok(cmd) = commands.try_recv() {
+        let commands_disconnected = loop {
+            let cmd = match commands.try_recv() {
+                Ok(cmd) => cmd,
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            };
             match cmd {
                 NetCommand::Announce(hash) => {
                     let t = transport.clone();
@@ -1017,6 +1536,13 @@ async fn host_loop<T: Transport>(
                     });
                 }
             }
+        };
+        if commands_disconnected {
+            // All owning senders are gone. Production custody shutdown joins
+            // this loop before closing the store, so no serving snapshot can
+            // outlive its storage owner.
+            let _ = cap_tx.send(None);
+            break;
         }
 
         if crate::clock::mono_now().duration_since(last_rebroadcast) >= rebroadcast_period {
@@ -1043,6 +1569,8 @@ async fn host_loop<T: Transport>(
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    transport.shutdown().await;
 }
 
 /// Resolve providers for a hash. When `preferred_peer` is not self, use it as
@@ -1084,9 +1612,8 @@ async fn providers_for<T: Transport>(t: &T, hash: &RawHash, preferred_peer: Peer
 /// dial-storm when several reads target the same peer concurrently.
 ///
 /// iroh QUIC multiplexes streams cheaply on a single connection; our
-/// `serve_stream` accepts unbounded sequential bi-streams per
-/// connection. The handler admits request streams only after the first
-/// OP_AUTH stream succeeds. So one connection per peer is enough.
+/// The handler admits a bounded number of request streams only after the
+/// first OP_AUTH stream succeeds. So one connection per peer is enough.
 pub(crate) type SharedPool<C> =
     Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::OnceCell<C>>>>>;
 
@@ -1246,13 +1773,56 @@ async fn wait_until_after(expires: Option<hifitime::Epoch>) {
 #[derive(Clone)]
 struct SnapshotHandler {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
     connect_root: ed25519_dalek::VerifyingKey,
+    replica_server: Option<ReplicaServerConfig>,
+    /// Shared before-spawn connection admission budget for this node.
+    inbound_connections: Arc<tokio::sync::Semaphore>,
+    /// Shared across every cloned connection handler for this node.
+    inbound_requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl SnapshotHandler {
+    fn try_admit_connection(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.inbound_connections.clone().try_acquire_owned().ok()
+    }
+
+    fn try_admit_request(
+        &self,
+        connection_requests: &Arc<tokio::sync::Semaphore>,
+    ) -> Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    )> {
+        let connection = connection_requests.clone().try_acquire_owned().ok()?;
+        let global = match self.inbound_requests.clone().try_acquire_owned() {
+            Ok(global) => global,
+            Err(_) => {
+                drop(connection);
+                return None;
+            }
+        };
+        Some((connection, global))
+    }
+
+    #[cfg(all(test, feature = "sim"))]
     async fn handle<T: Transport>(&self, connection: T::Conn) {
+        let Some(permit) = self.try_admit_connection() else {
+            connection.close(1, b"inbound connection limit exceeded");
+            return;
+        };
+        self.handle_admitted::<T>(connection, permit).await;
+    }
+
+    async fn handle_admitted<T: Transport>(
+        &self,
+        connection: T::Conn,
+        _connection_permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let snapshot = self.snapshot.clone();
+        let replica_snapshot = self.replica_snapshot.clone();
         let connect_root = self.connect_root;
+        let replica_server = self.replica_server;
         let peer_id = connection.remote_id();
         let span = info_span!(
             "connection",
@@ -1316,13 +1886,26 @@ impl SnapshotHandler {
 
             let expiry = wait_until_after(expires);
             tokio::pin!(expiry);
+            let connection_requests = Arc::new(tokio::sync::Semaphore::new(
+                MAX_INBOUND_REQUESTS_PER_CONNECTION,
+            ));
 
             loop {
+                let idle = tokio::time::sleep(INBOUND_CONNECTION_IDLE_DEADLINE);
+                tokio::pin!(idle);
                 let stream = tokio::select! {
                     stream = connection.accept_bi() => stream,
                     () = &mut expiry => {
                         info!("CONNECT capability expired; closing connection");
                         connection.close(1, b"CONNECT capability expired");
+                        return;
+                    }
+                    () = &mut idle => {
+                        info!(
+                            deadline = ?INBOUND_CONNECTION_IDLE_DEADLINE,
+                            "authenticated connection idle deadline exceeded"
+                        );
+                        connection.close(0, b"authenticated connection idle timeout");
                         return;
                     }
                 };
@@ -1337,15 +1920,46 @@ impl SnapshotHandler {
                     connection.close(1, b"CONNECT capability expired");
                     return;
                 }
+                let Some((_connection_permit, _global_permit)) =
+                    self.try_admit_request(&connection_requests)
+                else {
+                    warn!(
+                        per_connection = MAX_INBOUND_REQUESTS_PER_CONNECTION,
+                        global = MAX_INBOUND_REQUESTS_GLOBAL,
+                        "inbound request concurrency limit exceeded; closing connection"
+                    );
+                    connection.close(1, b"inbound request concurrency limit exceeded");
+                    return;
+                };
                 let snapshot = snapshot.clone();
+                let replica_snapshot = replica_snapshot.clone();
                 tokio::spawn(
                     async move {
-                        if let Err(error) =
-                            serve_stream::<T::Conn>(&snapshot, &mut send, &mut recv).await
-                        {
-                            debug!(%error, "direct RPC stream failed");
+                        let operation = tokio::time::timeout(INBOUND_REQUEST_DEADLINE, async {
+                            let result = serve_stream::<T::Conn>(
+                                &snapshot,
+                                &replica_snapshot,
+                                replica_server,
+                                peer,
+                                &mut send,
+                                &mut recv,
+                            )
+                            .await;
+                            let shutdown = send.shutdown().await.map_err(|error| {
+                                anyhow::anyhow!("finish response stream: {error}")
+                            });
+                            result.and(shutdown)
+                        })
+                        .await;
+                        match operation {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => debug!(%error, "direct RPC stream failed"),
+                            Err(_) => warn!(
+                                deadline = ?INBOUND_REQUEST_DEADLINE,
+                                "inbound request deadline exceeded"
+                            ),
                         }
-                        let _ = send.shutdown().await;
+                        drop((_connection_permit, _global_permit));
                     }
                     .in_current_span(),
                 );
@@ -1406,10 +2020,21 @@ async fn authenticate_connection<C: Conn>(
 
 async fn serve_stream<C: Conn>(
     snapshot: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    replica_snapshot: &Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
+    replica_server: Option<ReplicaServerConfig>,
+    peer: ed25519_dalek::VerifyingKey,
     send: &mut C::SendHalf,
     recv: &mut C::RecvHalf,
 ) -> anyhow::Result<()> {
     let op = recv_u8(recv).await?;
+    if replica_server.is_some()
+        && !matches!(op, OP_REPLICA_SUMMARY | OP_REPLICA_PAGE | OP_REPLICA_BLOB)
+    {
+        anyhow::bail!(
+            "ordinary {} is disabled on a custody-only endpoint",
+            op_name(op)
+        );
+    }
     let span = debug_span!("stream", op = op_name(op));
     let _enter = span.enter();
 
@@ -1521,8 +2146,70 @@ async fn serve_stream<C: Conn>(
                 "OP_COLLECTION_OPERATION_RECEIPTS served"
             );
         }
+        OP_REPLICA_SUMMARY => {
+            let (replica_set, proof) = recv_request_prefix(recv).await?;
+            authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
+            crate::replica_wire::require_eof(recv).await?;
+            let summary = replica_snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|snapshot| snapshot.summary())
+                .ok_or_else(|| anyhow::anyhow!("custody snapshot is unavailable"))?;
+            send_summary(send, &summary).await?;
+        }
+        OP_REPLICA_PAGE => {
+            let (replica_set, proof) = recv_request_prefix(recv).await?;
+            authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
+            let (component, prefix, after) = recv_page_request(recv).await?;
+            let (page, done) = replica_snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|snapshot| snapshot.page(component, prefix, after))
+                .ok_or_else(|| anyhow::anyhow!("custody snapshot is unavailable"))?;
+            send_page(send, component, &page, done).await?;
+        }
+        OP_REPLICA_BLOB => {
+            let (replica_set, proof) = recv_request_prefix(recv).await?;
+            authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
+            let (id, offset, maximum) = recv_blob_request(recv).await?;
+            let bytes = replica_snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|snapshot| snapshot.blob_bytes(id));
+            send_blob_range(send, bytes.as_ref(), offset, maximum).await?;
+        }
         OP_AUTH => anyhow::bail!("OP_AUTH may only appear on the first stream"),
         _ => anyhow::bail!("unknown direct RPC operation {op:#x}"),
+    }
+    Ok(())
+}
+
+fn authorize_replica_operation(
+    server: Option<ReplicaServerConfig>,
+    requested_set: crate::replica::ReplicaSetId,
+    proof: &triblespace_core::capability::CapabilityProofBundle,
+    peer: ed25519_dalek::VerifyingKey,
+) -> anyhow::Result<()> {
+    use triblespace_core::capability::{CapabilityMode, CapabilityRequest};
+
+    let server = server.ok_or_else(|| anyhow::anyhow!("custody replication is disabled"))?;
+    if requested_set != server.replica_set {
+        anyhow::bail!("custody replica-set resource does not match this endpoint");
+    }
+    let verified = proof.verify(
+        server.trust_root,
+        crate::clock::epoch_now(),
+        peer,
+        CapabilityRequest::new(
+            crate::replica::replicate_capability_atom(requested_set),
+            CapabilityMode::Invoke,
+        ),
+    )?;
+    if verified.effective_mode() != CapabilityMode::Invoke {
+        anyhow::bail!("custody operation proof must end in exact invoke-only authority");
     }
     Ok(())
 }
@@ -1688,11 +2375,49 @@ mod inbound_auth_deadline_tests {
     use std::time::Duration;
 
     use ed25519_dalek::SigningKey;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
 
-    use super::{AnySnapshot, INBOUND_AUTH_DEADLINE, SnapshotHandler};
-    use crate::protocol::PILE_SYNC_ALPN;
+    use super::{
+        AnyReplicaSnapshot, AnySnapshot, INBOUND_AUTH_DEADLINE, INBOUND_CONNECTION_IDLE_DEADLINE,
+        INBOUND_REQUEST_DEADLINE, MAX_INBOUND_CONNECTIONS_GLOBAL, MAX_INBOUND_REQUESTS_GLOBAL,
+        MAX_INBOUND_REQUESTS_PER_CONNECTION, SnapshotHandler,
+    };
+    use crate::protocol::{
+        OP_GET_BLOB, PILE_SYNC_ALPN, connect_capability_atom, op_auth, op_get_blob, send_u8,
+    };
+    use crate::replica::{ReplicaServerConfig, ReplicaSetId};
     use crate::transport::sim::{SimConfig, SimNet, SimTransport};
     use crate::transport::{Conn, Transport};
+
+    fn connect_proof(root: &SigningKey, leaf: &SigningKey) -> CapabilityProofBundle {
+        CapabilityProofBundle::issue_root(
+            root,
+            CapabilityClaim::root(
+                connect_capability_atom(root.verifying_key()),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            leaf.verifying_key(),
+        )
+        .unwrap()
+    }
+
+    fn handler(root: &SigningKey) -> SnapshotHandler {
+        let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
+        let replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>> =
+            Arc::new(Mutex::new(None));
+        SnapshotHandler {
+            snapshot,
+            replica_snapshot,
+            connect_root: root.verifying_key(),
+            replica_server: None,
+            inbound_connections: Arc::new(tokio::sync::Semaphore::new(
+                MAX_INBOUND_CONNECTIONS_GLOBAL,
+            )),
+            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_REQUESTS_GLOBAL)),
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn inbound_connection_that_opens_no_auth_stream_hits_deadline() {
@@ -1717,11 +2442,7 @@ mod inbound_auth_deadline_tests {
         let incoming = server.incoming.recv().await.unwrap();
         assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
 
-        let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
-        let handler = SnapshotHandler {
-            snapshot,
-            connect_root: root_key.verifying_key(),
-        };
+        let handler = handler(&root_key);
         let task = tokio::spawn(async move {
             handler.handle::<SimTransport>(incoming.conn).await;
         });
@@ -1740,5 +2461,239 @@ mod inbound_auth_deadline_tests {
             client_connection.open_bi().await.is_err(),
             "the auth deadline closes the unauthenticated connection"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_post_connect_request_is_dropped_at_end_to_end_deadline() {
+        let net = SimNet::new(
+            0xA118,
+            SimConfig {
+                latency: Duration::ZERO..Duration::from_nanos(1),
+                ..SimConfig::default()
+            },
+        );
+        let server_key = SigningKey::from_bytes(&[0xB1; 32]);
+        let client_key = SigningKey::from_bytes(&[0xB2; 32]);
+        let root_key = SigningKey::from_bytes(&[0xB3; 32]);
+        let server_id = server_key.verifying_key().to_bytes();
+        let client_id = client_key.verifying_key().to_bytes();
+        let mut server = net.join(server_id, None);
+        let client = net.join(client_id, None);
+        let connection = client
+            .transport
+            .dial(server_id, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let incoming = server.incoming.recv().await.unwrap();
+        let server_handler = handler(&root_key);
+        let task = tokio::spawn(async move {
+            server_handler.handle::<SimTransport>(incoming.conn).await;
+        });
+        op_auth(&connection, &connect_proof(&root_key, &client_key))
+            .await
+            .unwrap();
+
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send_u8(&mut send, OP_GET_BLOB).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(INBOUND_REQUEST_DEADLINE - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        let mut byte = [0u8; 1];
+        let mut read = Box::pin(recv.read(&mut byte));
+        assert!(
+            matches!(futures::poll!(read.as_mut()), std::task::Poll::Pending),
+            "partial request ended before its deadline"
+        );
+        drop(read);
+
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(recv.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(
+            op_get_blob(&connection, &[0x77; 32]).await.unwrap(),
+            None,
+            "timing out one stream must release its permits without killing the connection"
+        );
+        connection.close(0, b"test complete");
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn per_connection_request_cap_closes_an_overcommitting_peer() {
+        let net = SimNet::new(
+            0xA119,
+            SimConfig {
+                latency: Duration::ZERO..Duration::from_nanos(1),
+                ..SimConfig::default()
+            },
+        );
+        let server_key = SigningKey::from_bytes(&[0xC1; 32]);
+        let client_key = SigningKey::from_bytes(&[0xC2; 32]);
+        let root_key = SigningKey::from_bytes(&[0xC3; 32]);
+        let server_id = server_key.verifying_key().to_bytes();
+        let client_id = client_key.verifying_key().to_bytes();
+        let mut server = net.join(server_id, None);
+        let client = net.join(client_id, None);
+        let connection = client
+            .transport
+            .dial(server_id, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let incoming = server.incoming.recv().await.unwrap();
+        let server_handler = handler(&root_key);
+        let task = tokio::spawn(async move {
+            server_handler.handle::<SimTransport>(incoming.conn).await;
+        });
+        op_auth(&connection, &connect_proof(&root_key, &client_key))
+            .await
+            .unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_INBOUND_REQUESTS_PER_CONNECTION {
+            let (mut send, recv) = connection.open_bi().await.unwrap();
+            send_u8(&mut send, OP_GET_BLOB).await.unwrap();
+            held.push((send, recv));
+            tokio::task::yield_now().await;
+        }
+        let (mut excess_send, mut excess_recv) = connection.open_bi().await.unwrap();
+        send_u8(&mut excess_send, OP_GET_BLOB).await.unwrap();
+        excess_send.write_all(&[0x55; 32]).await.unwrap();
+        excess_send.shutdown().await.unwrap();
+        tokio::task::yield_now().await;
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            excess_recv.read(&mut byte).await.unwrap(),
+            0,
+            "an overcommitting connection was not closed"
+        );
+        assert!(connection.open_bi().await.is_err());
+        drop(held);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_idle_connection_is_closed_and_releases_its_slot() {
+        let net = SimNet::new(
+            0xA11A,
+            SimConfig {
+                latency: Duration::ZERO..Duration::from_nanos(1),
+                ..SimConfig::default()
+            },
+        );
+        let server_key = SigningKey::from_bytes(&[0xD1; 32]);
+        let client_key = SigningKey::from_bytes(&[0xD2; 32]);
+        let root_key = SigningKey::from_bytes(&[0xD3; 32]);
+        let server_id = server_key.verifying_key().to_bytes();
+        let client_id = client_key.verifying_key().to_bytes();
+        let mut server = net.join(server_id, None);
+        let client = net.join(client_id, None);
+        let connection = client
+            .transport
+            .dial(server_id, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let incoming = server.incoming.recv().await.unwrap();
+        let server_handler = handler(&root_key);
+        let task = tokio::spawn(async move {
+            server_handler.handle::<SimTransport>(incoming.conn).await;
+        });
+        op_auth(&connection, &connect_proof(&root_key, &client_key))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(INBOUND_CONNECTION_IDLE_DEADLINE - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "an authenticated connection ended before its idle deadline"
+        );
+
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        task.await.unwrap();
+        assert!(
+            connection.open_bi().await.is_err(),
+            "the authenticated idle deadline did not close the connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn custody_endpoint_rejects_ordinary_blob_rpc_after_connect() {
+        let net = SimNet::new(
+            0xA11B,
+            SimConfig {
+                latency: Duration::ZERO..Duration::from_nanos(1),
+                ..SimConfig::default()
+            },
+        );
+        let server_key = SigningKey::from_bytes(&[0xE1; 32]);
+        let client_key = SigningKey::from_bytes(&[0xE2; 32]);
+        let connect_root = SigningKey::from_bytes(&[0xE3; 32]);
+        let replica_root = SigningKey::from_bytes(&[0xE4; 32]);
+        let server_id = server_key.verifying_key().to_bytes();
+        let client_id = client_key.verifying_key().to_bytes();
+        let mut server = net.join(server_id, None);
+        let client = net.join(client_id, None);
+        let connection = client
+            .transport
+            .dial(server_id, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let incoming = server.incoming.recv().await.unwrap();
+        let mut server_handler = handler(&connect_root);
+        server_handler.replica_server = Some(ReplicaServerConfig {
+            trust_root: replica_root.verifying_key(),
+            replica_set: ReplicaSetId::new([0xE5; 32]),
+        });
+        let task = tokio::spawn(async move {
+            server_handler.handle::<SimTransport>(incoming.conn).await;
+        });
+        op_auth(&connection, &connect_proof(&connect_root, &client_key))
+            .await
+            .unwrap();
+
+        let error = op_get_blob(&connection, &[0xE6; 32]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("eof"),
+            "custody endpoint unexpectedly served an ordinary RPC: {error}"
+        );
+        connection.close(0, b"test complete");
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn node_global_connection_budget_is_shared_across_handler_clones() {
+        let root = SigningKey::from_bytes(&[0xF3; 32]);
+        let mut handler = handler(&root);
+        handler.inbound_connections = Arc::new(tokio::sync::Semaphore::new(2));
+        let clone = handler.clone();
+        let first = handler.try_admit_connection().unwrap();
+        let second = clone.try_admit_connection().unwrap();
+        assert!(
+            handler.try_admit_connection().is_none(),
+            "a clone escaped the node-global connection budget"
+        );
+        drop(first);
+        assert!(clone.try_admit_connection().is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn node_global_request_budget_is_shared_across_handler_clones() {
+        let root = SigningKey::from_bytes(&[0xD3; 32]);
+        let mut handler = handler(&root);
+        handler.inbound_requests = Arc::new(tokio::sync::Semaphore::new(2));
+        let clone = handler.clone();
+        let connection_a = Arc::new(tokio::sync::Semaphore::new(2));
+        let connection_b = Arc::new(tokio::sync::Semaphore::new(2));
+        let first = handler.try_admit_request(&connection_a).unwrap();
+        let second = clone.try_admit_request(&connection_b).unwrap();
+        assert!(
+            handler.try_admit_request(&connection_a).is_none(),
+            "a clone escaped the node-global request budget"
+        );
+        drop(first);
+        assert!(handler.try_admit_request(&connection_a).is_some());
+        drop(second);
     }
 }

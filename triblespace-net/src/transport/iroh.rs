@@ -17,8 +17,8 @@ use super::{Alpn, Conn, GossipEvent, GossipSink, Harness, Incoming, PeerId, Tran
 use crate::host::PeerConfig;
 
 /// Capacity for the inbound-connection and gossip-event channels.
-/// Backpressure past this point slows the QUIC accept loop, which is
-/// the desired failure mode (better than unbounded buffering).
+/// Inbound connection forwarding fails closed when this queue is full so
+/// router handler tasks cannot accumulate behind an awaited send.
 const CHANNEL_CAP: usize = 64;
 
 /// The protocol ALPN forwarded into the host loop. The DHT and
@@ -50,6 +50,10 @@ pub struct IrohTransport {
 struct Anchors {
     _router: iroh::protocol::Router,
     _dht_rpc: Option<crate::dht::rpc::RpcClient>,
+    /// Runtime that owns the endpoint and router. Outbound handshakes are
+    /// spawned here so cancelling a caller does not drop iroh's `Connecting`
+    /// future before endpoint shutdown has observed and closed it.
+    _runtime: tokio::runtime::Handle,
 }
 
 #[derive(Clone)]
@@ -106,10 +110,14 @@ impl Transport for IrohTransport {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| EndpointAddr::from(id));
-        let conn = self
-            .ep
-            .connect(addr, alpn)
+        let ep = self.ep.clone();
+        let connect = self
+            ._alive
+            ._runtime
+            .spawn(async move { ep.connect(addr, alpn).await });
+        let conn = connect
             .await
+            .map_err(|e| anyhow::anyhow!("connect task: {e}"))?
             .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
         Ok(IrohConn(conn))
     }
@@ -129,6 +137,16 @@ impl Transport for IrohTransport {
         match api.find_providers(blake3_hash).await {
             Ok(ids) => ids.into_iter().map(|id| *id.as_bytes()).collect(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    async fn shutdown(&self) {
+        // The router owns the endpoint accept loop and performs the required
+        // ordering: stop protocol handlers, cancel accepts, then await
+        // Endpoint::close. Closing the endpoint directly while the router is
+        // still accepting can deadlock shutdown.
+        if let Err(error) = self._alive._router.shutdown().await {
+            warn!(%error, "iroh router shutdown failed");
         }
     }
 }
@@ -158,13 +176,24 @@ impl iroh::protocol::ProtocolHandler for ForwardHandler {
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
-        let _ = self
-            .tx
-            .send(Incoming {
-                alpn: self.alpn,
-                conn: IrohConn(connection),
-            })
-            .await;
+        let incoming = Incoming {
+            alpn: self.alpn,
+            conn: IrohConn(connection),
+        };
+        match self.tx.try_send(incoming) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(incoming)) => {
+                warn!("inbound connection queue full; rejecting connection");
+                incoming
+                    .conn
+                    .close(1, b"inbound connection queue capacity exceeded");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(incoming)) => {
+                incoming
+                    .conn
+                    .close(1, b"inbound connection handler stopped");
+            }
+        }
         Ok(())
     }
 }
@@ -229,6 +258,92 @@ pub async fn bind(
     ep.online().await;
 
     Some(bind_with_endpoint(ep, config).await)
+}
+
+/// Bind an explicit-only custody endpoint on one restart-stable socket.
+///
+/// Unlike [`bind`], this configures no relay, port mapping, external address
+/// lookup, mDNS, gossip, or DHT protocol. Application routing contains only
+/// the exact endpoint addresses in `config`, and the only accepted protocol
+/// is pile sync. Iroh's `Minimal` preset still retains endpoint-internal QUIC
+/// transport extensions that its public builder does not permit disabling.
+pub(crate) async fn bind_custody(
+    secret: iroh_base::SecretKey,
+    config: &PeerConfig,
+    bind_addr: std::net::SocketAddr,
+) -> anyhow::Result<Harness<IrohTransport>> {
+    use iroh::address_lookup::{EndpointInfo, MemoryLookup};
+    use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
+    use iroh::protocol::Router;
+    use iroh::{Endpoint, RelayMode};
+
+    let transport_config = QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(VarInt::from_u32(
+            crate::host::MAX_INBOUND_REQUESTS_PER_CONNECTION as u32,
+        ))
+        .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .send_observed_address_reports(false)
+        .receive_observed_address_reports(false)
+        .build();
+
+    let builder = Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .transport_config(transport_config)
+        .relay_mode(RelayMode::Disabled)
+        .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+        .net_report_config(iroh::endpoint::NetReportConfig::minimal())
+        .clear_ip_transports()
+        .bind_addr(bind_addr)
+        .map_err(|error| anyhow::anyhow!("invalid custody bind address {bind_addr}: {error}"))?;
+    let ep = builder
+        .bind()
+        .await
+        .map_err(|error| anyhow::anyhow!("custody endpoint bind {bind_addr}: {error}"))?;
+
+    if !config.peers.is_empty() {
+        let lookup =
+            MemoryLookup::from_endpoint_info(config.peers.iter().cloned().map(EndpointInfo::from));
+        match ep.address_lookup() {
+            Ok(services) => services.add(lookup),
+            Err(error) => warn!(%error, "static custody peer routes unavailable"),
+        }
+    }
+
+    let (incoming_tx, incoming_rx) = mpsc::channel::<Incoming<IrohConn>>(CHANNEL_CAP);
+    let mut router = Router::builder(ep.clone());
+    for alpn in FORWARDED_ALPNS {
+        router = router.accept(
+            alpn,
+            ForwardHandler {
+                alpn,
+                tx: incoming_tx.clone(),
+            },
+        );
+    }
+    let router = router.spawn();
+    let peers = Arc::new(
+        config
+            .peers
+            .iter()
+            .cloned()
+            .map(|address| (address.id, address))
+            .collect(),
+    );
+    let transport = IrohTransport {
+        ep,
+        dht: None,
+        peers,
+        _alive: Arc::new(Anchors {
+            _router: router,
+            _dht_rpc: None,
+            _runtime: tokio::runtime::Handle::current(),
+        }),
+    };
+    Ok(Harness {
+        transport,
+        incoming: incoming_rx,
+        gossip: None,
+    })
 }
 
 /// Wire the full transport stack (DHT node, protocol-forwarding
@@ -362,6 +477,7 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
         _alive: Arc::new(Anchors {
             _router: router,
             _dht_rpc: Some(rpc),
+            _runtime: tokio::runtime::Handle::current(),
         }),
     };
 

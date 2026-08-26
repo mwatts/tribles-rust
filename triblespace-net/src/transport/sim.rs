@@ -472,6 +472,8 @@ impl Transport for SimTransport {
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
     }
+
+    async fn shutdown(&self) {}
 }
 
 /// Broadcast half of the sim gossip topic.

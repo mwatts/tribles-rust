@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add proof-gated custody replication for complete private pile replicas.
+  `trible team replica {create,issue,join}` provisions an exact independent
+  `REPLICATE` capability, while `trible pile net custody {status,run}`
+  reconciles the resident product of blob bytes, native collection records,
+  and native capability proofs over static Iroh endpoint tickets. Peers compare
+  256 deterministic first-byte buckets and transfer bounded pages and blob
+  ranges; operational WANTs, historical pins, timestamps, padding, and opaque
+  future records remain local. Every operation requires both the connection
+  proof and its own exact replica proof, and graceful shutdown keeps in-flight
+  Iroh handshakes alive on the endpoint runtime until router closure releases
+  transport accounting. Stale pooled connections redial within the same sweep,
+  while local receive-storage failures remain fatal local errors rather than
+  being reported as unavailable peers.
+
+- Recognize the retired V4 collection `DERIVE` record as known inert
+  computation rather than an opaque future record. Replay projects no current
+  collection evidence from it, and semantic retention or custody rewrites may
+  omit it; genuinely unknown kinds continue to stop destructive rewriting.
+
 - Expose `FrontierStats::peak_region()` as the largest proposal region one
   query level materialised at once. This is the proposal-memory high-water
   mark that cumulative proposal count and widest frontier rows cannot recover;

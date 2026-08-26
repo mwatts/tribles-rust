@@ -29,4 +29,6 @@ pub mod identity;
 pub mod peer;
 pub mod protocol;
 pub mod reconcile;
+pub mod replica;
+pub(crate) mod replica_wire;
 pub mod transport;

@@ -183,9 +183,11 @@ const MAGIC_MARKER_COLLECTION_COMMIT_V4: RawId = hex!("CBF2CF97D52A3486E16C12D70
 const MAGIC_MARKER_COLLECTION_MERGE_V4: RawId = hex!("9F5D028D4C423620D6957A5F726FA727");
 const MAGIC_MARKER_COLLECTION_DERIVE_V4: RawId = hex!("ECFB2EE90ED8042244F7BAC704454BB9");
 /// V5 derive: the source field is gone, because the target's descriptor names
-/// it. Records under the V4 marker are no longer decoded — a derivation is a
-/// computation with a checkable artifact, so a stale one is recomputed rather
-/// than migrated, and the envelope skips it as opaque in the meantime.
+/// it. Records under the V4 marker no longer project a collection record — a
+/// derivation is a computation with a checkable artifact, so a stale one is
+/// recomputed rather than migrated. The decoder recognizes V4 as specifically
+/// retired rather than unknown, allowing semantic rewrites to discard it while
+/// continuing to fail closed on genuinely unknown record kinds.
 ///
 /// Minted with `trible genid` on 2026-08-20.
 const MAGIC_MARKER_COLLECTION_DERIVE_V5: RawId = hex!("ED6B46F7286D4556B076C17B79FD8315");
@@ -670,6 +672,21 @@ struct CollectionDeriveHeaderEnvelopeV1 {
     input: RawInline,
     output: RawInline,
     reserved: [u8; 124],
+}
+
+/// Retired V4 derive in the legacy V1 envelope. V4 redundantly named the
+/// source descriptor; V5 removed that field and minted a new kind.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionDeriveHeaderEnvelopeV1V4 {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    source: RawInline,
+    target: RawInline,
+    input: RawInline,
+    output: RawInline,
+    reserved: [u8; 92],
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,11 +1231,19 @@ pub enum PileRecordContent {
         /// The historical physical record kind.
         kind: LegacyCollectionRecordKindV3,
     },
-    /// A record whose semantic kind is not active in this reader. This covers
-    /// structurally valid unknown generic envelopes and the two retired,
-    /// fixed-width unenveloped local-cell markers. Replay deliberately
-    /// projects it away, while [`PileRecords`] exposes its exact offset and
-    /// length so raw migration tooling can preserve the bytes.
+    /// A retired V4 collection derivation.
+    ///
+    /// V4 redundantly named a source collection that the target descriptor now
+    /// determines. It never carried ownership or authoritative application
+    /// state, so current replay projects it away and retained rewrites may drop
+    /// it. Raw bytes remain available through [`PileRecords`] for forensics.
+    RetiredCollectionDeriveV4,
+    /// A record whose semantic kind this reader cannot interpret. This covers
+    /// structurally valid unknown generic envelopes and the retired local-cell
+    /// encodings whose former ownership semantics still require conservative
+    /// treatment. Replay deliberately projects it away, while [`PileRecords`]
+    /// exposes its exact offset and length so raw migration tooling can
+    /// preserve the bytes.
     Opaque {
         /// Inert record kind, in whichever width its framing used.
         kind: OpaqueKind,
@@ -1642,6 +1667,19 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
                 },
             })
         }
+        MAGIC_MARKER_COLLECTION_DERIVE_V4 => {
+            fixed_header()?;
+            let (header, _) = CollectionDeriveHeaderEnvelopeV1V4::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::RetiredCollectionDeriveV4,
+            })
+        }
         MAGIC_MARKER_COLLECTION_DERIVE_V5 => {
             fixed_header()?;
             let (header, _) = CollectionDeriveHeaderEnvelopeV1::try_read_from_prefix(bytes)
@@ -1960,13 +1998,7 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             Ok(PileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Derive(CollectionDerive::new(
-                        Inline::new(header.target),
-                        Inline::new(header.input),
-                        Inline::new(header.output),
-                    )),
-                },
+                content: PileRecordContent::RetiredCollectionDeriveV4,
             })
         }
         _ => Err(ReadError::UnsupportedRecord {
@@ -2149,6 +2181,7 @@ enum Applied {
     Collection { id: Id },
     CapabilityProof { id: CapabilityProofId },
     LegacyCollectionV3,
+    RetiredCollectionDeriveV4,
     Opaque,
 }
 
@@ -2181,9 +2214,12 @@ pub struct Pile {
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
     legacy_collection_headers: BTreeSet<[u8; V3_HEADER_LEN]>,
-    /// Number of structurally valid records projected as opaque. This includes
-    /// unknown generic-envelope kinds and retired local-cell encodings.
-    /// Destructive physical rewrites refuse while this is nonzero.
+    /// Number of structurally valid records whose semantics this reader cannot
+    /// safely interpret. This includes unknown generic-envelope kinds and
+    /// retired local-cell encodings with former ownership semantics. Known
+    /// retired V4 derives are not opaque because they carried no ownership or
+    /// authoritative state. Destructive physical rewrites refuse while this is
+    /// nonzero.
     opaque_records: usize,
     /// LWW-resolved typed request set. Legacy weak-pin records project to blob
     /// requests; current records carry the complete 97-byte canonical key.
@@ -2909,6 +2945,7 @@ impl Pile {
                 );
                 Applied::LegacyCollectionV3
             }
+            PileRecordContent::RetiredCollectionDeriveV4 => Applied::RetiredCollectionDeriveV4,
             PileRecordContent::Opaque { .. } => {
                 self.opaque_records = self
                     .opaque_records
@@ -3614,6 +3651,7 @@ impl Pile {
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::CapabilityProof { .. }) => {}
                     Some(Applied::LegacyCollectionV3) => {}
+                    Some(Applied::RetiredCollectionDeriveV4) => {}
                     Some(Applied::Opaque) => {}
                     None => {
                         return Err(InsertError::IoError(std::io::Error::other(
@@ -4928,17 +4966,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "mixed.pile");
 
-        // A legacy-enveloped record of a kind this reader no longer decodes,
-        // and a retired unenveloped local cell: both inert, both must be
-        // dropped rather than carried into a clean file.
-        append_test_bytes(
-            &source_path,
-            &test_envelope_v1_bytes(
-                MAGIC_MARKER_COLLECTION_DERIVE_V4,
-                ENVELOPE_HEADER_BLOCKS,
-                ENVELOPE_HEADER_LEN,
-            ),
-        );
+        // A retired V4 derivation and an unenveloped local cell: both inert,
+        // both must be dropped rather than carried into a clean file.
+        let retired_derive = CollectionDeriveHeaderEnvelopeV1V4 {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V4,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            source: [1; 32],
+            target: [2; 32],
+            input: [3; 32],
+            output: [4; 32],
+            reserved: [0; 92],
+        };
+        append_test_bytes(&source_path, retired_derive.as_bytes());
         let mut retired_cell = [0u8; V3_HEADER_LEN];
         retired_cell[..16].copy_from_slice(&MAGIC_MARKER_LOCAL_CELL_V3);
         append_test_bytes(&source_path, &retired_cell);
@@ -5176,9 +5216,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v4_collection_headers_remain_readable_byte_exact() {
+    fn legacy_v4_commit_and_merge_remain_readable_while_derive_is_retired() {
         for record in collection_test_records() {
             let mut header = [0u8; V3_HEADER_LEN];
+            let retired = matches!(record, CollectionRecord::Derive(_));
             match record {
                 CollectionRecord::Commit(commit) => {
                     let (signature_r, signature_s) = commit.signature();
@@ -5230,10 +5271,17 @@ mod tests {
             let original = header;
             let decoded = decode_record(&header, 0).unwrap();
             assert_eq!(decoded.len, V3_HEADER_LEN);
-            assert!(matches!(
-                decoded.content,
-                PileRecordContent::Collection { record: decoded } if decoded == record
-            ));
+            if retired {
+                assert!(matches!(
+                    decoded.content,
+                    PileRecordContent::RetiredCollectionDeriveV4
+                ));
+            } else {
+                assert!(matches!(
+                    decoded.content,
+                    PileRecordContent::Collection { record: decoded } if decoded == record
+                ));
+            }
             assert_eq!(header, original);
         }
     }
@@ -5346,6 +5394,48 @@ mod tests {
         pile.refresh().unwrap();
         assert_eq!(pile.opaque_record_count().unwrap(), 2);
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn retired_v4_derive_is_known_inert_and_does_not_block_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "retired-v4-derive.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "retired-v4-destination.pile");
+        let header = CollectionDeriveHeaderEnvelopeV1V4 {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V4,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            source: [1; 32],
+            target: [2; 32],
+            input: [3; 32],
+            output: [4; 32],
+            reserved: [0; 92],
+        };
+        append_test_bytes(&source_path, header.as_bytes());
+
+        let mut records = PileRecords::open(&source_path).unwrap();
+        let decoded = records.next().unwrap().unwrap();
+        assert_eq!(decoded.len, ENVELOPE_HEADER_LEN);
+        assert!(matches!(
+            decoded.content,
+            PileRecordContent::RetiredCollectionDeriveV4
+        ));
+        assert!(records.next().is_none());
+
+        let mut source = Pile::open(&source_path).unwrap();
+        assert_eq!(source.opaque_record_count().unwrap(), 0);
+        assert!(source.records().unwrap().next().is_none());
+        let mut destination = Pile::open(&destination_path).unwrap();
+        source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        destination.close().unwrap();
+        source.close().unwrap();
+        assert_eq!(std::fs::metadata(destination_path).unwrap().len(), 0);
     }
 
     #[test]

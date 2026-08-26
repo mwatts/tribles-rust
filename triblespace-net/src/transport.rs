@@ -135,6 +135,11 @@ pub trait Transport: Clone + Send + Sync + 'static {
         &self,
         hash: [u8; 32],
     ) -> impl std::future::Future<Output = Vec<PeerId>> + Send;
+
+    /// Gracefully stop the underlying endpoint after the host command loop
+    /// loses every owner. Production QUIC needs an awaited close so peers do
+    /// not mistake a clean daemon stop for a failed connection.
+    fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// An accepted inbound connection, tagged with the ALPN it arrived on.
