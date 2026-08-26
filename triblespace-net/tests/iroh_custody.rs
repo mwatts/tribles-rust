@@ -12,7 +12,7 @@ use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
-use iroh::test_utils::test_transport::TestNetwork;
+use iroh::test_utils::{run_relay_server, test_transport::TestNetwork};
 use iroh_base::{EndpointAddr, EndpointId, SecretKey};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
@@ -75,6 +75,24 @@ async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
         .expect("bind test endpoint")
 }
 
+/// Bind an endpoint whose only possible data path is the supplied relay.
+/// Address lookup and direct IP transports are both absent by construction.
+async fn relay_only_endpoint(relay_map: iroh::RelayMap, secret: SecretKey) -> Endpoint {
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .relay_mode(iroh::RelayMode::Custom(relay_map))
+        .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify())
+        .clear_ip_transports()
+        .clear_address_lookup()
+        .bind()
+        .await
+        .expect("bind relay-only endpoint");
+    tokio::time::timeout(Duration::from_secs(10), endpoint.online())
+        .await
+        .expect("relay-only endpoint did not become reachable");
+    endpoint
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn bring_up(
     network: &TestNetwork,
@@ -87,8 +105,32 @@ async fn bring_up(
     receive_dir: &Path,
 ) -> CustodyReplica<MemoryRepo> {
     let secret = triblespace_net::identity::iroh_secret(signing_key);
-    let id: EndpointId = secret.public().into();
     let endpoint = test_endpoint(network, secret).await;
+    bring_up_with_endpoint(
+        endpoint,
+        signing_key,
+        store,
+        connect_root,
+        replica_root,
+        replica_set,
+        bootstrap,
+        receive_dir,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bring_up_with_endpoint(
+    endpoint: Endpoint,
+    signing_key: &SigningKey,
+    store: MemoryRepo,
+    connect_root: &SigningKey,
+    replica_root: &SigningKey,
+    replica_set: ReplicaSetId,
+    bootstrap: Vec<EndpointAddr>,
+    receive_dir: &Path,
+) -> CustodyReplica<MemoryRepo> {
+    let id: EndpointId = endpoint.id();
     let connect = connect_proof(connect_root, signing_key);
     let replicate = replica_proof(replica_root, signing_key, replica_set);
     let peer_config = PeerConfig {
@@ -204,5 +246,75 @@ async fn authenticated_inbound_summary_enables_reverse_pull_over_iroh() {
     let received: Bytes = reader
         .get::<Bytes, UnknownBlob>(handle)
         .expect("B received A's payload through the learned reverse route");
+    assert_eq!(received, payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_reverse_pull_uses_the_local_relay_only() {
+    init_tracing();
+    let (relay_map, relay_url, _relay_server) =
+        run_relay_server().await.expect("start local relay server");
+    let connect_root = key(0xF3);
+    let replica_root = key(0xF4);
+    let ka = key(0xA3);
+    let kb = key(0xB3);
+    let replica_set = ReplicaSetId::new([0xC3; 32]);
+    let receive = tempfile::tempdir().expect("custody receive directory");
+    let payload = Bytes::from(vec![0x6B; 128 * 1024 + 17]);
+    let mut store_a = MemoryRepo::default();
+    let handle = store_a
+        .put::<UnknownBlob, _>(payload.clone())
+        .expect("seed relay payload");
+
+    let b_endpoint = relay_only_endpoint(
+        relay_map.clone(),
+        triblespace_net::identity::iroh_secret(&kb),
+    )
+    .await;
+    let mut b = bring_up_with_endpoint(
+        b_endpoint,
+        &kb,
+        MemoryRepo::default(),
+        &connect_root,
+        &replica_root,
+        replica_set,
+        Vec::new(),
+        receive.path(),
+    )
+    .await;
+
+    let a_endpoint =
+        relay_only_endpoint(relay_map, triblespace_net::identity::iroh_secret(&ka)).await;
+    let b_relay_addr = EndpointAddr::new(b.id()).with_relay_url(relay_url);
+    let mut a = bring_up_with_endpoint(
+        a_endpoint,
+        &ka,
+        store_a,
+        &connect_root,
+        &replica_root,
+        replica_set,
+        vec![b_relay_addr],
+        receive.path(),
+    )
+    .await;
+
+    assert_eq!(reconcile(&mut b).await.peers_attempted, 0);
+    let introduction = reconcile(&mut a).await;
+    assert_eq!(introduction.peers_attempted, 1);
+    assert_eq!(introduction.peers_completed, 1);
+
+    // B has no configured peers or address lookup. Its learned A route came
+    // from the valid inbound summary; with both endpoints' IP transports
+    // disabled, this pull and payload transfer can only traverse the relay.
+    let reverse_pull = reconcile(&mut b).await;
+    assert_eq!(reverse_pull.peers_attempted, 1);
+    assert_eq!(reverse_pull.peers_completed, 1);
+    assert_eq!(reverse_pull.blobs_added, 1);
+    assert_eq!(reverse_pull.blob_bytes_added, payload.len() as u64);
+
+    let reader = b.store_mut().reader().expect("relay recipient reader");
+    let received: Bytes = reader
+        .get::<Bytes, UnknownBlob>(handle)
+        .expect("B received A's payload over the local relay");
     assert_eq!(received, payload);
 }
