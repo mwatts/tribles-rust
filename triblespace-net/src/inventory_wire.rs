@@ -11,15 +11,13 @@
 //! returns an explicit unavailable response; it never serves bytes from its
 //! current snapshot as a fallback.
 
-use std::collections::BTreeSet;
-
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{
     CapabilityProof, CapabilityProofBundle, CapabilityProofId, MAX_CAPABILITY_PROOF_STEPS,
 };
 use triblespace_core::collection::{
-    COLLECTION_COMMIT_BYTES_LEN, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    COLLECTION_COMMIT_BYTES_LEN, CollectionRecord, CollectionStore,
 };
 use triblespace_core::id::Id;
 use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH, PatchHash};
@@ -520,17 +518,10 @@ where
             |key| {
                 let id = Id::new(key)
                     .ok_or_else(|| anyhow!("inventory contains the reserved nil record id"))?;
-                let records = source
-                    .select_records(&BTreeSet::from([CollectionRecordSelector::Id(id)]))
-                    .map_err(anyhow::Error::new)?;
-                let mut records = records.into_iter();
-                let Some(record) = records.next() else {
-                    return Ok(None);
-                };
-                if records.next().is_some() || record.id() != id {
-                    bail!("exact collection-record selector returned non-canonical results");
-                }
-                Ok(Some(InventoryLeafValue::CollectionRecord(record)))
+                source
+                    .record(id)
+                    .map(|record| record.map(InventoryLeafValue::CollectionRecord))
+                    .map_err(anyhow::Error::new)
             },
         ),
         InventoryComponent::CapabilityProof => key_node_response(

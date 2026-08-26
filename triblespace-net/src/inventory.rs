@@ -26,7 +26,7 @@ use triblespace_core::collection::{CollectionRecord, CollectionStore};
 use triblespace_core::id::{Id, id_hex};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
+use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
 use triblespace_core::repo::{
     BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, PeerStore,
@@ -493,17 +493,12 @@ pub type BlobInventory = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 
 /// Build one key-only BLAKE3 inventory.
 ///
-/// Keeping construction behind this helper makes the current incremental
-/// builder replaceable by PATCH's bulk constructor without changing store
-/// observation or protocol code.
+/// Keeping construction behind this helper isolates store observation from
+/// PATCH's canonical bottom-up snapshot construction.
 fn build_key_inventory<const KEY_LEN: usize>(
     keys: impl IntoIterator<Item = [u8; KEY_LEN]>,
 ) -> PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle> {
-    let mut inventory = PATCH::new();
-    for key in keys {
-        inventory.insert(&Entry::new(&key));
-    }
-    inventory
+    PATCH::from_keys(keys)
 }
 
 /// Immutable authorized observation of all four inventory components.
