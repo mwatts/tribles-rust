@@ -484,12 +484,27 @@ impl Default for ReconcileQos {
 
 /// Merkle inventory for canonical peer-routing evidence.
 pub type PeerInventory = PATCH<64, IdentitySchema, (), Blake3Merkle>;
-/// Merkle inventory for canonical collection records.
-pub type CollectionRecordInventory = PATCH<16, IdentitySchema, CollectionRecord, Blake3Merkle>;
-/// Merkle inventory for canonical complete capability proofs.
-pub type CapabilityProofInventory = PATCH<32, IdentitySchema, CapabilityProof, Blake3Merkle>;
-/// Merkle inventory for resident blob handles, valued by untrusted length hint.
-pub type BlobInventory = PATCH<32, IdentitySchema, u64, Blake3Merkle>;
+/// Merkle inventory for canonical collection-record ids.
+pub type CollectionRecordInventory = PATCH<16, IdentitySchema, (), Blake3Merkle>;
+/// Merkle inventory for canonical complete capability-proof ids.
+pub type CapabilityProofInventory = PATCH<32, IdentitySchema, (), Blake3Merkle>;
+/// Merkle inventory for resident blob handles.
+pub type BlobInventory = PATCH<32, IdentitySchema, (), Blake3Merkle>;
+
+/// Build one key-only BLAKE3 inventory.
+///
+/// Keeping construction behind this helper makes the current incremental
+/// builder replaceable by PATCH's bulk constructor without changing store
+/// observation or protocol code.
+fn build_key_inventory<const KEY_LEN: usize>(
+    keys: impl IntoIterator<Item = [u8; KEY_LEN]>,
+) -> PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle> {
+    let mut inventory = PATCH::new();
+    for key in keys {
+        inventory.insert(&Entry::new(&key));
+    }
+    inventory
+}
 
 /// Immutable authorized observation of all four inventory components.
 ///
@@ -515,39 +530,54 @@ impl InventorySnapshot<()> {
     where
         S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
     {
-        let peers = {
+        let peer_keys = {
             let iterator = store.peers().map_err(anyhow::Error::new)?;
             iterator
+                .map(|evidence| evidence.map(|evidence| *evidence.as_bytes()))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
-        let records = {
+        let record_keys = {
             let iterator = store.records().map_err(anyhow::Error::new)?;
             iterator
+                .map(|record| record.map(|record| record.id().raw()))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
-        let proofs = {
+        let proof_keys = {
             let iterator = store.proofs().map_err(anyhow::Error::new)?;
             iterator
+                .map(|proof| proof.map(|proof| proof.id().raw))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
         let reader = store.reader().map_err(anyhow::Error::new)?;
-        InventorySnapshot::from_observation(team, reader, peers, records, proofs)
+        let blob_keys = reader
+            .blobs()
+            .map(|info| info.map(|info| info.handle.raw))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)?;
+        Ok(InventorySnapshot::from_key_observation(
+            team,
+            reader,
+            peer_keys,
+            record_keys,
+            proof_keys,
+            blob_keys,
+        ))
     }
 }
 
 impl<R> InventorySnapshot<R>
 where
-    R: BlobStoreGet + BlobStoreList,
+    R: BlobStoreList,
 {
     /// Build an inventory from already-observed component values.
     ///
-    /// Backend ordering is ignored, duplicate identities collapse, and a body
-    /// conflict under one intrinsic key is rejected. Blob listing metadata is
-    /// not authoritative: only handles whose bytes can be retrieved and whose
-    /// observed length matches are advertised.
+    /// Backend ordering is ignored and duplicate identities collapse. Merkle
+    /// trees carry only authenticated keys; record/proof bodies are resolved
+    /// by exact store lookup when their leaf is served, and blob bytes are
+    /// retrieved by content handle only when requested.
     pub fn from_observation(
         team: ed25519_dalek::VerifyingKey,
         reader: R,
@@ -555,72 +585,45 @@ where
         records: impl IntoIterator<Item = CollectionRecord>,
         proofs: impl IntoIterator<Item = CapabilityProof>,
     ) -> Result<Self> {
-        let mut peer_inventory = PeerInventory::new();
-        for evidence in peers {
-            if evidence.team() == team {
-                peer_inventory.insert(&Entry::new(evidence.as_bytes()));
-            }
-        }
+        let peer_keys = peers.into_iter().map(|evidence| *evidence.as_bytes());
+        let record_keys = records.into_iter().map(|record| record.id().raw());
+        let proof_keys = proofs.into_iter().map(|proof| proof.id().raw);
+        let blob_keys = reader
+            .blobs()
+            .map(|info| info.map(|info| info.handle.raw))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)?;
 
-        let mut record_inventory = CollectionRecordInventory::new();
-        for record in records {
-            let key = record.id().raw();
-            if let Some(existing) = record_inventory.get(&key) {
-                if existing != &record {
-                    bail!(
-                        "collection record id {} names conflicting canonical bytes",
-                        hex::encode(key)
-                    );
-                }
-                continue;
-            }
-            record_inventory.insert(&Entry::with_value(&key, record));
-        }
+        Ok(Self::from_key_observation(
+            team,
+            reader,
+            peer_keys,
+            record_keys,
+            proof_keys,
+            blob_keys,
+        ))
+    }
 
-        let mut proof_inventory = CapabilityProofInventory::new();
-        for proof in proofs {
-            let key = proof.id().raw;
-            if let Some(existing) = proof_inventory.get(&key) {
-                if existing != &proof {
-                    bail!(
-                        "capability proof id {} names conflicting canonical bytes",
-                        hex::encode(key)
-                    );
-                }
-                continue;
-            }
-            proof_inventory.insert(&Entry::with_value(&key, proof));
-        }
+    fn from_key_observation(
+        team: ed25519_dalek::VerifyingKey,
+        reader: R,
+        peer_keys: impl IntoIterator<Item = [u8; 64]>,
+        record_keys: impl IntoIterator<Item = [u8; 16]>,
+        proof_keys: impl IntoIterator<Item = [u8; 32]>,
+        blob_keys: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Self {
+        let peer_inventory = build_key_inventory(peer_keys);
+        let record_inventory = build_key_inventory(record_keys);
+        let proof_inventory = build_key_inventory(proof_keys);
+        let blob_inventory = build_key_inventory(blob_keys);
 
-        let mut blob_inventory = BlobInventory::new();
-        for info in reader.blobs() {
-            let info = info.map_err(anyhow::Error::new)?;
-            let Ok(bytes) = reader.get::<anybytes::Bytes, UnknownBlob>(info.handle) else {
-                continue;
-            };
-            if bytes.len() as u64 != info.length {
-                continue;
-            }
-            let key = info.handle.raw;
-            if let Some(existing) = blob_inventory.get(&key) {
-                if *existing != info.length {
-                    bail!(
-                        "blob {} has conflicting resident lengths {} and {}",
-                        hex::encode(key),
-                        existing,
-                        info.length
-                    );
-                }
-                continue;
-            }
-            blob_inventory.insert(&Entry::with_value(&key, info.length));
-        }
+        let peer_root = peer_inventory.merkle_node(team.as_bytes());
 
         let components = [
             ComponentManifest::new(
                 InventoryComponent::Peer,
-                peer_inventory.len(),
-                peer_inventory.merkle_root(),
+                peer_root.map_or(0, |node| node.leaf_count()),
+                peer_root.map(|node| node.digest()),
             ),
             ComponentManifest::new(
                 InventoryComponent::CollectionRecord,
@@ -640,7 +643,7 @@ where
         ];
         let manifest = InventoryManifest::new(team, components);
 
-        Ok(Self {
+        Self {
             team,
             reader,
             peers: peer_inventory,
@@ -648,7 +651,7 @@ where
             proofs: proof_inventory,
             blobs: blob_inventory,
             manifest,
-        })
+        }
     }
 
     /// Exact team scope captured by this snapshot.
@@ -681,7 +684,12 @@ where
     pub(crate) const fn blobs(&self) -> &BlobInventory {
         &self.blobs
     }
+}
 
+impl<R> InventorySnapshot<R>
+where
+    R: BlobStoreGet,
+{
     /// Read one exact blob only if it belongs to this pinned inventory.
     pub fn blob_bytes(&self, hash: [u8; 32]) -> Option<anybytes::Bytes> {
         if self.blobs.get(&hash).is_none() {
@@ -804,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn full_team_snapshot_filters_peer_scope_but_preserves_inert_evidence() {
+    fn full_team_manifest_scopes_global_peer_tree_and_preserves_inert_evidence() {
         let team = key(1);
         let other_team = key(2);
         let peer = key(3);
@@ -842,7 +850,15 @@ mod tests {
         CollectionStore::insert(&mut store, invalid).unwrap();
 
         let snapshot = InventorySnapshot::from_store(&mut store, team.verifying_key()).unwrap();
-        assert_eq!(snapshot.peers().len(), 2);
+        assert_eq!(snapshot.peers().len(), 3);
+        assert_eq!(
+            snapshot
+                .peers()
+                .merkle_node(team.verifying_key().as_bytes())
+                .unwrap()
+                .leaf_count(),
+            2
+        );
         assert_eq!(snapshot.records().len(), 1);
         assert_eq!(
             snapshot

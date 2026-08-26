@@ -14,10 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority selects the one full-team inventory independently of CONNECT.
   Manifests bind the team to four ordered PEER, collection-record,
   capability-proof, and blob PATCH roots; PEER locators are relative to the
-  authenticated team prefix. Expected-digest node and bounded blob-range
-  frames pin an exact component root and reject unavailable snapshots instead
-  of falling back to current state. Demand versus Mirror and read/write
-  direction remain local policy; evidence presence never grants authority.
+  authenticated team prefix, and the PEER root is the matching subtree of the
+  existing global `team || peer` index. PATCH inventories carry keys only;
+  collection-record and capability-proof bodies are resolved by exact id only
+  when a leaf is served. Expected-digest node and bounded blob-range frames pin
+  an exact component root and reject unavailable snapshots instead of falling
+  back to current state. Demand versus Mirror and read/write direction remain
+  local policy; evidence presence never grants authority.
 
 - Add native monotone `PEER(team_public_key, peer_public_key)` routing
   evidence. `PeerStore`, `MemoryRepo`, and `Pile` expose one canonical

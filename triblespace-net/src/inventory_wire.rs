@@ -11,18 +11,24 @@
 //! returns an explicit unavailable response; it never serves bytes from its
 //! current snapshot as a fallback.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{
-    CapabilityProof, CapabilityProofBundle, MAX_CAPABILITY_PROOF_STEPS,
+    CapabilityProof, CapabilityProofBundle, CapabilityProofId, MAX_CAPABILITY_PROOF_STEPS,
 };
-use triblespace_core::collection::{COLLECTION_COMMIT_BYTES_LEN, CollectionRecord};
-use triblespace_core::patch::{Blake3Merkle, PatchHash};
+use triblespace_core::collection::{
+    COLLECTION_COMMIT_BYTES_LEN, CollectionRecord, CollectionRecordSelector, CollectionStore,
+};
+use triblespace_core::id::Id;
+use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH, PatchHash};
+use triblespace_core::repo::CapabilityProofStore;
 use triblespace_core::repo::peer::{PEER_EVIDENCE_BYTES_LEN, PeerEvidence};
 
 use crate::inventory::{
     AuthorizedInventorySession, ComponentManifest, InventoryComponent, InventoryGeneration,
-    InventoryManifest,
+    InventoryManifest, InventorySnapshot,
 };
 use crate::protocol::{
     recv_capability_proof_bundle, recv_hash, recv_u8, recv_u32_be, recv_u64_be,
@@ -340,9 +346,9 @@ pub(crate) enum InventoryLeafValue {
     Peer,
     CollectionRecord(CollectionRecord),
     CapabilityProof(CapabilityProof),
-    /// Storage-observed length hint. Full bytes and BLAKE3 are still verified
-    /// before admission.
-    BlobLength(u64),
+    /// The blob handle is the complete authenticated leaf value. Bytes are
+    /// fetched and BLAKE3-verified only through a range request.
+    Blob,
 }
 
 impl InventoryLeafValue {
@@ -351,7 +357,7 @@ impl InventoryLeafValue {
             Self::Peer => InventoryComponent::Peer,
             Self::CollectionRecord(_) => InventoryComponent::CollectionRecord,
             Self::CapabilityProof(_) => InventoryComponent::CapabilityProof,
-            Self::BlobLength(_) => InventoryComponent::Blob,
+            Self::Blob => InventoryComponent::Blob,
         }
     }
 }
@@ -420,6 +426,135 @@ pub(crate) enum InventoryNodeResponse {
     PrefixAbsent,
 }
 
+fn key_node_response<const KEY_LEN: usize>(
+    inventory: &PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle>,
+    team: ed25519_dalek::VerifyingKey,
+    component: InventoryComponent,
+    relative_prefix: &[u8],
+    resolve: impl FnOnce([u8; KEY_LEN]) -> Result<Option<InventoryLeafValue>>,
+) -> Result<InventoryNodeResponse> {
+    let base = component.base_prefix(team);
+    let mut absolute_prefix = Vec::with_capacity(base.as_bytes().len() + relative_prefix.len());
+    absolute_prefix.extend_from_slice(base.as_bytes());
+    absolute_prefix.extend_from_slice(relative_prefix);
+    let Some(node) = inventory.merkle_node(&absolute_prefix) else {
+        return Ok(InventoryNodeResponse::PrefixAbsent);
+    };
+
+    let digest = node.digest();
+    if node.is_leaf() {
+        let absolute = *node.representative();
+        let Some(value) = resolve(absolute)? else {
+            return Ok(InventoryNodeResponse::SnapshotUnavailable);
+        };
+        let key = base.relative_key(component, &absolute)?.to_vec();
+        return Ok(InventoryNodeResponse::Found(InventoryNode::Leaf {
+            digest,
+            leaf: InventoryLeaf { key, value },
+        }));
+    }
+
+    let representative = base
+        .relative_key(component, node.representative())?
+        .to_vec();
+    let end_depth = node
+        .end_depth()
+        .checked_sub(base.as_bytes().len())
+        .ok_or_else(|| anyhow!("inventory Merkle node precedes its component base"))?;
+    let end_depth = u8::try_from(end_depth)
+        .map_err(|_| anyhow!("inventory Merkle depth does not fit the wire frame"))?;
+    let children = node
+        .children()
+        .map(|(edge, child)| InventoryChild {
+            edge,
+            digest: child.digest(),
+            leaf_count: child.leaf_count(),
+        })
+        .collect();
+    Ok(InventoryNodeResponse::Found(InventoryNode::Branch {
+        digest,
+        leaf_count: node.leaf_count(),
+        branch: InventoryBranch {
+            representative,
+            end_depth,
+            children,
+        },
+    }))
+}
+
+/// Resolve one authenticated node from an exact immutable inventory snapshot.
+///
+/// PATCHes carry keys only. Collection and proof bodies are selected by the
+/// authenticated leaf key when needed; their grow-only stores may have gained
+/// unrelated evidence since this snapshot. Failure to resolve an advertised
+/// body makes the pinned snapshot unavailable instead of substituting current
+/// state.
+pub(crate) fn snapshot_node<R, S>(
+    snapshot: &InventorySnapshot<R>,
+    source: &mut S,
+    request: &InventoryNodeRequest,
+) -> Result<InventoryNodeResponse>
+where
+    R: triblespace_core::repo::BlobStoreList,
+    S: CollectionStore + CapabilityProofStore,
+{
+    let advertised = snapshot.manifest().component(request.component);
+    if advertised.root() != Some(request.root) || advertised.leaf_count() != request.leaf_count {
+        return Ok(InventoryNodeResponse::SnapshotUnavailable);
+    }
+
+    let team = snapshot.team();
+    match request.component {
+        InventoryComponent::Peer => key_node_response(
+            snapshot.peers(),
+            team,
+            request.component,
+            &request.prefix,
+            |_| Ok(Some(InventoryLeafValue::Peer)),
+        ),
+        InventoryComponent::CollectionRecord => key_node_response(
+            snapshot.records(),
+            team,
+            request.component,
+            &request.prefix,
+            |key| {
+                let id = Id::new(key)
+                    .ok_or_else(|| anyhow!("inventory contains the reserved nil record id"))?;
+                let records = source
+                    .select_records(&BTreeSet::from([CollectionRecordSelector::Id(id)]))
+                    .map_err(anyhow::Error::new)?;
+                let mut records = records.into_iter();
+                let Some(record) = records.next() else {
+                    return Ok(None);
+                };
+                if records.next().is_some() || record.id() != id {
+                    bail!("exact collection-record selector returned non-canonical results");
+                }
+                Ok(Some(InventoryLeafValue::CollectionRecord(record)))
+            },
+        ),
+        InventoryComponent::CapabilityProof => key_node_response(
+            snapshot.proofs(),
+            team,
+            request.component,
+            &request.prefix,
+            |key| {
+                source
+                    .proof(CapabilityProofId::new(key))
+                    .map(|proof| proof.map(InventoryLeafValue::CapabilityProof))
+                    .map_err(anyhow::Error::new)
+            },
+        ),
+        InventoryComponent::Blob => key_node_response(
+            snapshot.blobs(),
+            team,
+            request.component,
+            &request.prefix,
+            |_| Ok(Some(InventoryLeafValue::Blob)),
+        ),
+    }
+}
+
 fn validate_node(
     team: ed25519_dalek::VerifyingKey,
     request: &InventoryNodeRequest,
@@ -467,7 +602,7 @@ fn validate_node(
                         bail!("capability proof body does not match its inventory key");
                     }
                 }
-                InventoryLeafValue::BlobLength(_) => {}
+                InventoryLeafValue::Blob => {}
             }
         }
         InventoryNode::Branch {
@@ -554,7 +689,7 @@ async fn send_leaf_value<W: AsyncWrite + Unpin>(
                 .await
                 .map_err(|error| anyhow!("send capability proof: {error}"))
         }
-        InventoryLeafValue::BlobLength(length) => send_u64_be(send, *length).await,
+        InventoryLeafValue::Blob => Ok(()),
     }
 }
 
@@ -582,7 +717,7 @@ async fn recv_leaf_value<R: AsyncRead + Unpin>(
             }
             Ok(InventoryLeafValue::CapabilityProof(proof))
         }
-        InventoryComponent::Blob => Ok(InventoryLeafValue::BlobLength(recv_u64_be(recv).await?)),
+        InventoryComponent::Blob => Ok(InventoryLeafValue::Blob),
     }
 }
 
@@ -893,11 +1028,67 @@ pub(crate) async fn op_inventory_blob_range<C: Conn>(
 mod tests {
     use ed25519_dalek::SigningKey;
     use tokio::io::{AsyncWriteExt, duplex};
+    use triblespace_core::collection::{CollectionCommit, CollectionData};
+    use triblespace_core::inline::Inline;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
 
     use super::*;
 
     fn team() -> ed25519_dalek::VerifyingKey {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
+    }
+
+    fn commit(author: &SigningKey, byte: u8) -> CollectionRecord {
+        CollectionRecord::Commit(CollectionCommit::sign(
+            author,
+            Inline::new([0x31; 32]),
+            CollectionData::new([byte; 32]),
+            Inline::new([0x32; 32]),
+        ))
+    }
+
+    #[test]
+    fn key_only_snapshot_resolves_record_body_at_leaf_service_time() {
+        let team = team();
+        let record = commit(&SigningKey::from_bytes(&[3; 32]), 7);
+        let mut store = MemoryRepo::default();
+        CollectionStore::insert(&mut store, record).unwrap();
+        let snapshot = InventorySnapshot::from_store(&mut store, team).unwrap();
+        assert_eq!(snapshot.records().get(&record.id().raw()), Some(&()));
+
+        let component = snapshot
+            .manifest()
+            .component(InventoryComponent::CollectionRecord);
+        let root = component.root().unwrap();
+        let request = InventoryNodeRequest::new(
+            team,
+            InventoryComponent::CollectionRecord,
+            root,
+            component.leaf_count(),
+            Vec::new(),
+            root,
+        )
+        .unwrap();
+        let response = snapshot_node(&snapshot, &mut store, &request).unwrap();
+        let InventoryNodeResponse::Found(InventoryNode::Leaf { leaf, .. }) = response else {
+            panic!("single record inventory must resolve to one leaf")
+        };
+        assert_eq!(leaf.key, record.id().raw());
+        assert_eq!(leaf.value, InventoryLeafValue::CollectionRecord(record));
+
+        let unavailable = InventoryNodeRequest::new(
+            team,
+            InventoryComponent::CollectionRecord,
+            [9; 32],
+            component.leaf_count(),
+            Vec::new(),
+            [9; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_node(&snapshot, &mut store, &unavailable).unwrap(),
+            InventoryNodeResponse::SnapshotUnavailable
+        );
     }
 
     #[tokio::test]
