@@ -241,7 +241,8 @@ const GENERATION_VERSION: u32 = 1;
 /// barriers. One oversized blob is flushed immediately after admission.
 const BLOB_DURABILITY_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Immutable, sorted serving inventory for one observed store prefix.
+/// Immutable, canonically ordered serving inventory for one observed semantic
+/// store state. Physical append order and byte offsets do not participate.
 pub(crate) struct ReplicaSnapshotData {
     blobs: [Vec<BlobInfo>; 256],
     records: [Vec<CollectionRecord>; 256],
@@ -1399,8 +1400,8 @@ mod tests {
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::capability::{CapabilityClaim, CapabilityMode};
     use triblespace_core::collection::{CollectionData, CollectionMerge, empty_metadata_handle};
-    use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{BlobStorePut, pile::Pile};
 
     use super::*;
 
@@ -1454,6 +1455,103 @@ mod tests {
             snapshot.page(ReplicaComponent::CollectionRecords, prefix, Some(cursor));
         assert!(done);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn snapshot_generation_is_independent_of_pile_append_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let forward_path = directory.path().join("forward.pile");
+        let reverse_path = directory.path().join("reverse.pile");
+        std::fs::File::create(&forward_path).unwrap();
+        std::fs::File::create(&reverse_path).unwrap();
+        let mut forward = Pile::open(&forward_path).unwrap();
+        let mut reverse = Pile::open(&reverse_path).unwrap();
+
+        let payloads = [vec![0x21; 3], vec![0x22; 17], vec![0x23; 65]];
+        let records = [
+            CollectionRecord::Merge(CollectionMerge::new(
+                triblespace_core::inline::Inline::new([0x31; 32]),
+                CollectionData::new([0x32; 32]),
+                CollectionData::new([0x33; 32]),
+                CollectionData::new([0x34; 32]),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(
+                triblespace_core::inline::Inline::new([0x35; 32]),
+                CollectionData::new([0x36; 32]),
+                CollectionData::new([0x37; 32]),
+                CollectionData::new([0x38; 32]),
+            )),
+        ];
+        let proof = |signer_byte, set_byte| {
+            let signer = SigningKey::from_bytes(&[signer_byte; 32]);
+            let claim = CapabilityClaim::root(
+                replicate_capability_atom(ReplicaSetId::new([set_byte; 32])),
+                CapabilityMode::Invoke,
+                None,
+            );
+            CapabilityProofBundle::issue_root(&signer, claim, signer.verifying_key())
+                .unwrap()
+                .proof()
+                .clone()
+        };
+        let proofs = [proof(0x41, 0x42), proof(0x43, 0x44)];
+
+        for payload in &payloads {
+            forward
+                .put::<UnknownBlob, _>(Bytes::from(payload.clone()))
+                .unwrap();
+        }
+        for record in records {
+            forward.insert(record).unwrap();
+        }
+        for proof in &proofs {
+            forward.insert_proof(proof.clone()).unwrap();
+        }
+
+        for proof in proofs.iter().rev() {
+            reverse.insert_proof(proof.clone()).unwrap();
+        }
+        for record in records.into_iter().rev() {
+            reverse.insert(record).unwrap();
+        }
+        for payload in payloads.iter().rev() {
+            reverse
+                .put::<UnknownBlob, _>(Bytes::from(payload.clone()))
+                .unwrap();
+        }
+        forward.flush().unwrap();
+        reverse.flush().unwrap();
+        assert_ne!(
+            std::fs::read(&forward_path).unwrap(),
+            std::fs::read(&reverse_path).unwrap(),
+            "fixture piles unexpectedly have identical physical byte order"
+        );
+
+        let forward_snapshot = snapshot_from_store(&mut forward).unwrap();
+        let reverse_snapshot = snapshot_from_store(&mut reverse).unwrap();
+        assert_eq!(
+            forward_snapshot.inventory.blobs,
+            reverse_snapshot.inventory.blobs
+        );
+        assert_eq!(
+            forward_snapshot.inventory.records,
+            reverse_snapshot.inventory.records
+        );
+        assert_eq!(
+            forward_snapshot.inventory.proofs,
+            reverse_snapshot.inventory.proofs
+        );
+        assert_eq!(
+            forward_snapshot.summary_clone(),
+            reverse_snapshot.summary_clone()
+        );
+        assert_eq!(
+            forward_snapshot.summary_clone().generation(),
+            reverse_snapshot.summary_clone().generation()
+        );
+        drop((forward_snapshot, reverse_snapshot));
+        forward.close().unwrap();
+        reverse.close().unwrap();
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //! commits are discovered through the configured gossip mesh; content and exact
 //! receipts remain explicitly fetched through this read-only protocol.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/8";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/9";
 
 use triblespace_core::capability::{CapabilityProofBundle, MAX_CAPABILITY_PROOF_BUNDLE_BYTES};
 use triblespace_core::id::{Id, id_hex};

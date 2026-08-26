@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Move pile sync to ALPN `/triblespace/pile-sync/8` and carry one bounded
+- Move pile sync to ALPN `/triblespace/pile-sync/9` and carry one bounded
   `CapabilityProofBundle` in the first `OP_AUTH` stream. The native
   `K0 (S C K)+` body binds each issuer, exact keyless claim handle, and delegate
   key; the bundle carries the ordered claim blobs. The verified leaf must
@@ -30,7 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upper bound, so a pooled connection cannot outlive authority. One 10-second
   inbound deadline covers the first stream and complete AUTH frame, including
   trailing-byte validation, so silent or partial peers cannot retain one
-  unauthenticated connection indefinitely.
+  unauthenticated connection indefinitely. Version 9 also adds the exact
+  summary-generation token to custody page and blob request frames, so a
+  version-8 peer is rejected during protocol negotiation instead of
+  misinterpreting either request body.
 - Separate `PeerConfig::connect_root` from
   `PeerConfig::gossip_topic: Option<[u8; 32]>`. Gossip topology is selected
   explicitly and is never inferred from authorization identity; production

@@ -157,7 +157,7 @@ separate `Blob(result)` WANT.
 ## Direct CONNECT authentication
 
 All direct point-to-point operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/8"`. The first stream on every
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/9"`. The first stream on every
 connection must be `OP_AUTH`. Its request carries one length-prefixed canonical
 proof bundle inline:
 
@@ -238,6 +238,13 @@ native capability proof. It does not copy WANTs, historical pins, append
 timestamps, framing padding, routing state, or retry state. Unknown opaque pile
 records stop startup rather than being silently discarded; recognized retired
 V4 `DERIVE` records are known inert computation and may be omitted.
+
+This product is semantic, not a comparison of pile byte streams. Bucket
+prefixes are the first byte of canonical blob, record, or proof identities;
+they are not file prefixes, offsets, or append epochs. Snapshot construction
+deduplicates and orders those identities canonically, so piles containing the
+same three sets have the same inventory summary and generation even when their
+records were appended, concatenated, or padded in different orders.
 
 Custody binds one restart-stable private-fabric socket and accepts only exact
 static `EndpointTicket`s. Its endpoint has no relay, port mapping, mDNS, DHT,

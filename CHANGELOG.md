@@ -104,10 +104,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every edge and is addressed by BLAKE3 over its exact bytes. Verification
   takes an external trust root, expected leaf, explicit epoch, and request, and
   computes the claims' meet without storage discovery. Pile-sync moves to ALPN
-  v8 and carries one self-contained proof bundle in the first `OP_AUTH` stream.
-  Proof records are a native grow-only set with exact lookup and direct claim
-  rooting; their presence grants no authority and creates no implicit gossip or
-  WANT. `PeerConfig::gossip_topic` remains an independent rendezvous choice.
+  v9, carries one self-contained proof bundle in the first `OP_AUTH` stream,
+  and binds custody page and blob request frames to the content-derived summary
+  generation; mixed v8/v9 endpoints fail protocol negotiation. Proof records
+  are a native grow-only set with exact lookup and direct claim rooting; their
+  presence grants no authority and creates no implicit gossip or WANT.
+  `PeerConfig::gossip_topic` remains an independent rendezvous choice.
 
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.
