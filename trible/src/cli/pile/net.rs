@@ -309,7 +309,7 @@ fn run_sync(
             sync_proof,
             qos,
         },
-    );
+    )?;
     eprintln!("node: {}", peer.id());
     eprintln!("team_root: {}", hex::encode(team_root.to_bytes()));
     eprintln!(

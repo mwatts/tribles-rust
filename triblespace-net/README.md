@@ -36,7 +36,7 @@ let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
         direction: ReconcileDirection::Bidirectional,
         blobs: BlobReconcileMode::Demand,
     },
-});
+})?;
 
 peer.refresh();
 ```

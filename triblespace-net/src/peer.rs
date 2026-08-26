@@ -74,11 +74,11 @@ where
     S::Reader: BlobStoreMeta,
 {
     /// Spawn a production host and attach `store` to exactly `config.team`.
-    pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Self {
+    pub fn new(store: S, key: SigningKey, config: PeerConfig) -> anyhow::Result<Self> {
         let team = config.team;
         let qos = config.qos;
-        let (sender, receiver) = host::spawn(key, config);
-        Self::assemble(store, team, qos, sender, receiver)
+        let (sender, receiver) = host::spawn(key, config)?;
+        Ok(Self::assemble(store, team, qos, sender, receiver))
     }
 
     /// Attach a store to a caller-owned host, most commonly the deterministic

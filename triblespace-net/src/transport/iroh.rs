@@ -259,21 +259,14 @@ fn n0_endpoint_builder(secret: iroh_base::SecretKey) -> iroh::endpoint::Builder 
 /// the protocol-forwarding handler, join the team-derived gossip topic when
 /// configured, and spawn the router.
 ///
-/// Returns `None` if the endpoint fails to bind (already logged) —
-/// the caller's net thread exits, mirroring the old inline behavior.
+/// Binding failure is returned to the caller so constructing a production
+/// peer can never appear to succeed with an already-dead network thread.
 pub async fn bind(
     secret: iroh_base::SecretKey,
     config: &PeerConfig,
-) -> Option<Harness<IrohTransport>> {
-    let ep = match bind_n0_endpoint(n0_endpoint_builder(secret)).await {
-        Ok(ep) => ep,
-        Err(error) => {
-            tracing::error!(%error, "iroh endpoint bind failed; net thread exiting");
-            return None;
-        }
-    };
-
-    Some(bind_with_endpoint(ep, config).await)
+) -> anyhow::Result<Harness<IrohTransport>> {
+    let ep = bind_n0_endpoint(n0_endpoint_builder(secret)).await?;
+    Ok(bind_with_endpoint(ep, config).await)
 }
 
 /// Wire the full transport stack (protocol forwarding, gossip topic, router)

@@ -585,23 +585,47 @@ pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wir
     host_loop(harness, config, wiring).await;
 }
 
-/// Spawn the production iroh host thread.
-pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
+/// Spawn the production iroh host thread and wait until its endpoint is bound.
+///
+/// The startup rendezvous is deliberately synchronous: returning a sender for
+/// a thread that already failed would make a dead peer indistinguishable from
+/// a temporarily quiet one.
+pub fn spawn(key: SigningKey, config: PeerConfig) -> anyhow::Result<(NetSender, NetReceiver)> {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
     let (sender, receiver, wiring) = wire(id);
+    let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     let _thread = thread::Builder::new()
         .name("triblespace-net".to_owned())
         .spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-            runtime.block_on(async move {
-                let Some(harness) = crate::transport::iroh::bind(secret, &config).await else {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = startup_tx
+                        .send(Err(anyhow::Error::new(error)
+                            .context("create triblespace-net tokio runtime")));
                     return;
+                }
+            };
+            runtime.block_on(async move {
+                let harness = match crate::transport::iroh::bind(secret, &config).await {
+                    Ok(harness) => harness,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error.context("bind iroh network host")));
+                        return;
+                    }
                 };
+                if startup_tx.send(Ok(())).is_err() {
+                    return;
+                }
                 run_host(harness, config, wiring).await;
             });
-        });
-    (sender, receiver)
+        })
+        .map_err(|error| anyhow::Error::new(error).context("spawn triblespace-net thread"))?;
+    startup_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("network host stopped during startup"))??;
+    Ok((sender, receiver))
 }
 
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
