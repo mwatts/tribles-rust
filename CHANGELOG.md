@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local policy; evidence presence never grants authority. Team-derived gossip
   carries only generation wake hints, while periodic authenticated sweeps
   remain the correctness path.
+- Add deterministic simulation coverage for unified authorized inventory
+  synchronization: direction and Demand/Mirror QoS, durable exact WANTs,
+  non-serving ReadOnly peers, root/leaf/expiry/mode authorization failures,
+  periodic recovery under total gossip loss, and authenticated PEER-based
+  route expansion all exercise the production host and wire path.
 
 - Add native monotone `PEER(team_public_key, peer_public_key)` routing
   evidence. `PeerStore`, `MemoryRepo`, and `Pile` expose one canonical
