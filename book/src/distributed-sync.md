@@ -359,6 +359,10 @@ trible pile net custody run <PILE> ...
     SIGINT or SIGTERM, and print the live endpoint ticket.
 ```
 
+Set `RUST_LOG=triblespace_net=info` when operating a custody node to record
+both the initially selected Iroh path and any later direct/relay path
+migration without changing route selection.
+
 `status` and `sync` require the pile, CONNECT trust root, exact proof ID, and
 existing signing key; `sync` additionally requires its independent gossip
 topic. A missing proof or claim, different leaf, invalid ancestry, wrong
