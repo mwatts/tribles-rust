@@ -9,7 +9,7 @@ use triblespace_core::collection::{CollectionMerge, CollectionRecord, Collection
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_net::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
-use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
+use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 use common::*;
 
@@ -38,13 +38,7 @@ fn one_store_drain_admits_more_than_the_old_per_leaf_bridge_capacity() {
         let publisher_key = key(0xA7);
         let consumer_key = key(0xB7);
         let team = root.verifying_key();
-        let net = SimNet::new(
-            0x1A11_BA7C,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x1A11_BA7C, SimConfig::default());
 
         let mut publisher_store = MemoryRepo::default();
         for index in 0..RECORD_COUNT {
