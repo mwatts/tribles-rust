@@ -830,17 +830,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
     pub(crate) unsafe fn recompute_hash(branch_nn: &mut NonNull<Self>) {
         let branch = branch_nn.as_ptr();
         let mut edges = ByteSet::new_empty();
+        let mut representative = None;
         for child in (*branch).child_table.iter().flatten() {
             edges.insert(child.key());
+            representative.get_or_insert_with(|| child.childleaf_key());
         }
         let empty_representative = [0; KEY_LEN];
-        let representative = (*branch)
-            .child_table
-            .iter()
-            .flatten()
-            .next()
-            .map(Head::childleaf_key)
-            .unwrap_or(&empty_representative);
+        let representative = representative.unwrap_or(&empty_representative);
         let mut state = H::begin_branch(
             representative,
             &O::TREE_TO_KEY,
@@ -908,6 +904,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         let mut agg_leaf_count: u64 = 0;
         let mut agg_segment_count: u64 = 0;
         let mut match_found = false;
+        let mut representative = None;
 
         let mut edges = ByteSet::new_empty();
 
@@ -915,6 +912,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
             agg_leaf_count = agg_leaf_count.saturating_add(child.count());
             agg_segment_count = agg_segment_count.saturating_add(child.count_segment(end_depth));
             edges.insert(child.key());
+            representative.get_or_insert_with(|| child.childleaf_key());
             if child.childleaf_ptr() == self.childleaf {
                 match_found = true;
             }
@@ -929,13 +927,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
             "branch.segment_count mismatch"
         );
         let empty_representative = [0; KEY_LEN];
-        let representative = self
-            .child_table
-            .iter()
-            .flatten()
-            .next()
-            .map(Head::childleaf_key)
-            .unwrap_or(&empty_representative);
+        let representative = representative.unwrap_or(&empty_representative);
         let mut state = H::begin_branch(
             representative,
             &O::TREE_TO_KEY,
