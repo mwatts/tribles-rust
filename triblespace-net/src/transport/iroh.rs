@@ -190,16 +190,6 @@ impl Transport for IrohTransport {
     }
 }
 
-impl IrohTransport {
-    /// The endpoint's currently advertised routes.
-    ///
-    /// Unlike the endpoint identity, these hints may grow or change as relay
-    /// selection, address discovery, and NAT traversal progress.
-    pub(crate) fn endpoint_addr(&self) -> EndpointAddr {
-        self.ep.addr()
-    }
-}
-
 /// Thin `ProtocolHandler` that forwards accepted connections (tagged
 /// with their ALPN) into the harness channel. The host loop owns the
 /// conversation from there.
@@ -308,89 +298,6 @@ pub async fn bind(
     Some(bind_with_endpoint(ep, config).await)
 }
 
-/// Bind custody's pile-sync-only router over ordinary iroh reachability.
-///
-/// Custody deliberately does not start collection gossip or the blob-provider
-/// DHT. It nevertheless uses the same direct, relay, NAT-traversal, pkarr/DNS,
-/// and mDNS path selection as ordinary peers. Reachability is not authority:
-/// CONNECT and REPLICATE proofs still gate every operation above this layer.
-pub(crate) async fn bind_custody(
-    secret: iroh_base::SecretKey,
-    config: &PeerConfig,
-) -> anyhow::Result<Harness<IrohTransport>> {
-    use iroh::endpoint::{QuicTransportConfig, VarInt};
-
-    let transport_config = QuicTransportConfig::builder()
-        .max_concurrent_bidi_streams(VarInt::from_u32(
-            crate::host::MAX_INBOUND_REQUESTS_PER_CONNECTION as u32,
-        ))
-        .max_concurrent_uni_streams(VarInt::from_u32(0))
-        .build();
-    let ep = bind_n0_endpoint(n0_endpoint_builder(secret).transport_config(transport_config))
-        .await
-        .map_err(|error| anyhow::anyhow!("bind custody iroh endpoint: {error:#}"))?;
-
-    Ok(bind_custody_with_endpoint(ep, config).await)
-}
-
-/// Wire custody's pile-sync-only router over an already-bound iroh endpoint.
-///
-/// This is the real-transport test seam corresponding to
-/// [`bind_with_endpoint`]. The caller chooses reachability while custody keeps
-/// its protocol surface independent of collection gossip and the provider DHT.
-pub async fn bind_custody_with_endpoint(
-    ep: iroh::Endpoint,
-    config: &PeerConfig,
-) -> Harness<IrohTransport> {
-    use iroh::address_lookup::{EndpointInfo, MemoryLookup};
-    use iroh::protocol::Router;
-
-    if !config.peers.is_empty() {
-        let lookup =
-            MemoryLookup::from_endpoint_info(config.peers.iter().cloned().map(EndpointInfo::from));
-        match ep.address_lookup() {
-            Ok(services) => services.add(lookup),
-            Err(error) => warn!(%error, "custody bootstrap routes unavailable"),
-        }
-    }
-
-    let (incoming_tx, incoming_rx) = mpsc::channel::<Incoming<IrohConn>>(CHANNEL_CAP);
-    let mut router = Router::builder(ep.clone());
-    for alpn in FORWARDED_ALPNS {
-        router = router.accept(
-            alpn,
-            ForwardHandler {
-                alpn,
-                tx: incoming_tx.clone(),
-            },
-        );
-    }
-    let router = router.spawn();
-    let peers = Arc::new(
-        config
-            .peers
-            .iter()
-            .cloned()
-            .map(|address| (address.id, address))
-            .collect(),
-    );
-    let transport = IrohTransport {
-        ep,
-        dht: None,
-        peers,
-        _alive: Arc::new(Anchors {
-            _router: router,
-            _dht_rpc: None,
-            _runtime: tokio::runtime::Handle::current(),
-        }),
-    };
-    Harness {
-        transport,
-        incoming: incoming_rx,
-        gossip: None,
-    }
-}
-
 /// Wire the full transport stack (DHT node, protocol-forwarding
 /// handlers, gossip topic, router) over an already-bound endpoint, and
 /// return the [`Harness`] the host loop runs against.
@@ -466,52 +373,51 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
         );
     }
 
-    // Gossip: join the explicitly configured topic and translate
+    // Gossip: join the team-derived topic and translate
     // iroh-gossip events into the transport-agnostic GossipEvent stream.
     // Authorization never chooses rendezvous topology. Always `subscribe`
     // (non-blocking): the join completes in the background as peers
     // come online; `subscribe_and_join` would hang nodes that start
     // at different times.
-    let mut gossip = None;
-    if let Some(gossip_topic) = config.gossip_topic {
-        let g = Gossip::builder().spawn(ep.clone());
-        router_builder = router_builder.accept(iroh_gossip::ALPN, g.clone());
-        let topic_id = iroh_gossip::TopicId::from_bytes(gossip_topic);
-        match g.subscribe(topic_id, bootstrap_ids.clone()).await {
-            Ok(topic) => {
-                let (sender, receiver) = topic.split();
-                let (gev_tx, gev_rx) = mpsc::channel::<GossipEvent>(CHANNEL_CAP);
-                tokio::spawn(async move {
-                    use futures::TryStreamExt;
-                    let mut receiver = receiver;
-                    while let Ok(Some(event)) = receiver.try_next().await {
-                        let mapped = match event {
-                            iroh_gossip::api::Event::Received(msg) => Some(GossipEvent::Received {
-                                bytes: msg.content.to_vec(),
-                                delivered_from: *msg.delivered_from.as_bytes(),
-                            }),
-                            iroh_gossip::api::Event::NeighborUp(peer) => {
-                                Some(GossipEvent::NeighborUp(*peer.as_bytes()))
-                            }
-                            iroh_gossip::api::Event::NeighborDown(peer) => {
-                                Some(GossipEvent::NeighborDown(*peer.as_bytes()))
-                            }
-                            _ => None,
-                        };
-                        if let Some(ev) = mapped {
-                            if gev_tx.send(ev).await.is_err() {
-                                break;
-                            }
+    let gossip_topic = crate::host::team_gossip_topic(config.team);
+    let g = Gossip::builder().spawn(ep.clone());
+    router_builder = router_builder.accept(iroh_gossip::ALPN, g.clone());
+    let topic_id = iroh_gossip::TopicId::from_bytes(gossip_topic);
+    let gossip = match g.subscribe(topic_id, bootstrap_ids.clone()).await {
+        Ok(topic) => {
+            let (sender, receiver) = topic.split();
+            let (gev_tx, gev_rx) = mpsc::channel::<GossipEvent>(CHANNEL_CAP);
+            tokio::spawn(async move {
+                use futures::TryStreamExt;
+                let mut receiver = receiver;
+                while let Ok(Some(event)) = receiver.try_next().await {
+                    let mapped = match event {
+                        iroh_gossip::api::Event::Received(msg) => Some(GossipEvent::Received {
+                            bytes: msg.content.to_vec(),
+                            delivered_from: *msg.delivered_from.as_bytes(),
+                        }),
+                        iroh_gossip::api::Event::NeighborUp(peer) => {
+                            Some(GossipEvent::NeighborUp(*peer.as_bytes()))
+                        }
+                        iroh_gossip::api::Event::NeighborDown(peer) => {
+                            Some(GossipEvent::NeighborDown(*peer.as_bytes()))
+                        }
+                        _ => None,
+                    };
+                    if let Some(ev) = mapped {
+                        if gev_tx.send(ev).await.is_err() {
+                            break;
                         }
                     }
-                });
-                gossip = Some((IrohGossip(sender), gev_rx));
-            }
-            Err(e) => {
-                warn!(error = %e, "gossip subscribe failed; running without gossip");
-            }
+                }
+            });
+            Some((IrohGossip(sender), gev_rx))
         }
-    }
+        Err(e) => {
+            warn!(error = %e, "gossip subscribe failed; running without gossip");
+            None
+        }
+    };
 
     let router = router_builder.spawn();
 

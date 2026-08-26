@@ -516,10 +516,11 @@ mod tests {
         );
         assert!(wrong_digest.finish().is_err());
 
-        // The root hash commits its total and child digests, but not each
-        // advertised child count. Redistribute the real 3/1 counts to 2/2;
-        // the root response remains superficially root-valid, then the first
-        // child's exact response count must fail against its pending count.
+        // Blake3Merkle v2 makes this redistribution fail immediately in the
+        // wire validator. This direct state-machine test deliberately bypasses
+        // that boundary to retain defense in depth: even an internally forged
+        // 3/1 -> 2/2 response cannot make the walk complete because the first
+        // exact child response disagrees with its pending count.
         let mut wrong_count = InventoryWalker::new(team(), manifest(&remote)).unwrap();
         let root = wrong_count.next_request(|_, _| None).unwrap().unwrap();
         let InventoryNodeResponse::Found(InventoryNode::Branch {

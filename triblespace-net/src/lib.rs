@@ -1,12 +1,10 @@
-//! Distributed sync for triblespace.
+//! Authorized team-inventory synchronization for triblespace.
 //!
-//! The main type is [`Peer<S>`](peer::Peer): a store wrapper that owns an
-//! iroh network thread internally and exposes the standard storage traits.
-//! Reads auto-drain immutable collection evidence; writes announce blobs to
-//! the DHT and publish commits whose collection descriptor declares that the
-//! collection travels. A blob-native CONNECT capability proof admits direct RPC;
-//! collection descriptors and WANTs govern what evidence travels and which
-//! content a node retains.
+//! [`Peer<S>`](peer::Peer) wraps one single-team store. Periodic authenticated
+//! PATCH walks converge peer-routing evidence, collection records, complete
+//! capability proofs, and optionally resident blobs; gossip carries only
+//! untrusted generation wakes. Exact content reads retain durable-WANT and DHT
+//! discovery semantics independently of broad inventory mirroring.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
@@ -21,8 +19,6 @@ pub(crate) const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::
 /// Upper bound the exponential retry backoff saturates at.
 pub(crate) const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 pub mod clock;
-pub mod collection_sync;
-pub mod collection_wire;
 pub mod dht;
 pub mod host;
 pub mod identity;
@@ -32,6 +28,4 @@ pub(crate) mod inventory_wire;
 pub mod peer;
 pub mod protocol;
 pub mod reconcile;
-pub mod replica;
-pub(crate) mod replica_wire;
 pub mod transport;

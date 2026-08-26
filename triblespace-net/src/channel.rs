@@ -1,54 +1,43 @@
-//! Channel types bridging the async network thread and the sync store layer.
+//! Messages crossing the synchronous store / asynchronous host boundary.
 //!
-//! `NetCommand`: outgoing effects sent from a [`Peer`](crate::peer::Peer)
-//! into the network thread. Collection discovery is gossip-driven; exact
-//! reconciliation requests use one bounded reply channel.
-//! `NetEvent`: incoming data sent back from the network thread to be
-//! applied into the wrapped store.
-//!
-use std::sync::mpsc;
-use triblespace_core::collection::CollectionHandle;
+//! Inventory admission is monotone. The host streams authenticated leaves to
+//! the store side, where one refresh drain inserts the whole available batch
+//! and crosses a single durability barrier. Gossip never carries semantic
+//! records; it only wakes the authenticated anti-entropy scheduler.
 
+use anybytes::Bytes;
+use triblespace_core::capability::CapabilityProof;
+use triblespace_core::collection::CollectionRecord;
+use triblespace_core::repo::peer::PeerEvidence;
+
+use crate::inventory::InventoryGeneration;
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
-use triblespace_core::collection::CollectionCommit;
 
-/// Commands sent to the network thread.
+/// A newly installed immutable local observation.
 ///
-/// The surface is minimal by design. Immutable collection evidence floods the
-/// configured topic, while content remains independently addressable through the
-/// DHT-routed `OP_GET_BLOB` path or exact collection RPCs.
-pub enum NetCommand {
-    /// Announce a blob hash to the DHT (fire-and-forget). Local
-    /// puts trigger this; new providers improve the swarm's
-    /// content-distribution fan-out.
-    Announce(RawHash),
-    /// Gossip one strictly verified collection commit.
-    ///
-    /// This is immutable ledger evidence, not an admission decision. The
-    /// receiving side must not treat the mesh carrier as the commit author or
-    /// infer local author trust from transport delivery.
-    GossipCollectionEvidence { evidence: CollectionCommit },
-    /// Fetch one exact collection's signed sparse evidence from a
-    /// specific authenticated peer. The host runtime executes the async
-    /// transport work; the synchronous `Peer` side owns admission policy.
-    FetchCollectionEvidence {
-        peer: PeerId,
-        collection: CollectionHandle,
-        reply: mpsc::Sender<anyhow::Result<Vec<CollectionCommit>>>,
-    },
-    // The swarm-addressed read-miss fetch is no longer a command: it
-    // runs inline via `NetSender::fetch_blob` / `host::NetCapability`,
-    // so there is no `FetchBlob` round-trip through this loop.
+/// The snapshot slot is replaced before this command is sent. Consequently a
+/// generation wake or DHT announcement can never race ahead of the bytes that
+/// the direct protocol will serve.
+pub(crate) struct SnapshotNotice {
+    pub(crate) generation: InventoryGeneration,
+    pub(crate) peers: Vec<PeerId>,
+    pub(crate) blobs: Vec<RawHash>,
 }
 
-/// Events received from the network thread.
+/// Commands sent from [`crate::peer::Peer`] to the host runtime.
+pub(crate) enum NetCommand {
+    SnapshotInstalled(SnapshotNotice),
+}
+
+/// Authenticated, structurally canonical inventory items returned by a walk.
+///
+/// These values remain inert evidence. In particular, a proof is not used as
+/// ambient authority and PEER is only a routing hint.
 #[derive(Debug)]
-pub enum NetEvent {
-    /// Strictly verified immutable collection evidence learned via gossip.
-    ///
-    /// Deliberately carries no transport publisher: the relaying neighbor is
-    /// not necessarily the author, and author identity is already signed into
-    /// the record. Admission remains a synchronous store-side policy.
-    CollectionEvidence(CollectionCommit),
+pub(crate) enum NetEvent {
+    Peer(PeerEvidence),
+    CollectionRecord(CollectionRecord),
+    CapabilityProof(CapabilityProof),
+    Blob { hash: RawHash, bytes: Bytes },
 }

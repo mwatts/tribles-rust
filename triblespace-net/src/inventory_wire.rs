@@ -633,15 +633,27 @@ fn validate_node(
             if summed_count != *leaf_count {
                 bail!("inventory branch child counts do not match its leaf count");
             }
+            let absolute = base.absolute_key(component, &branch.representative)?;
             let absolute_end_depth = base.as_bytes().len() + end_depth;
+            // Every inventory PATCH uses IdentitySchema, so trie depth and
+            // key-byte depth are identical. Reconstruct that mapping here to
+            // recompute the complete authenticated branch descriptor from the
+            // wire shape.
+            let tree_to_key: Vec<usize> = (0..absolute.len()).collect();
             let mut state = <Blake3Merkle as PatchHash>::begin_branch(
-                component.key_len(),
+                &absolute,
+                &tree_to_key,
                 absolute_end_depth,
                 branch.children.len(),
                 *leaf_count,
             );
             for child in &branch.children {
-                <Blake3Merkle as PatchHash>::push_child(&mut state, child.edge, child.digest);
+                <Blake3Merkle as PatchHash>::push_child(
+                    &mut state,
+                    child.edge,
+                    child.leaf_count,
+                    child.digest,
+                );
             }
             let expected = <Blake3Merkle as PatchHash>::finish_branch(state);
             if digest != &expected {
@@ -1151,9 +1163,16 @@ mod tests {
                 leaf_count: 1,
             },
         ];
-        let mut state = <Blake3Merkle as PatchHash>::begin_branch(32, 0, 2, 2);
+        let tree_to_key: Vec<usize> = (0..first_key.len()).collect();
+        let mut state =
+            <Blake3Merkle as PatchHash>::begin_branch(&first_key, &tree_to_key, 0, 2, 2);
         for child in &children {
-            <Blake3Merkle as PatchHash>::push_child(&mut state, child.edge, child.digest);
+            <Blake3Merkle as PatchHash>::push_child(
+                &mut state,
+                child.edge,
+                child.leaf_count,
+                child.digest,
+            );
         }
         let digest = <Blake3Merkle as PatchHash>::finish_branch(state);
         let request = InventoryNodeRequest::new(
@@ -1222,6 +1241,68 @@ mod tests {
         let (mut writer, _reader) = duplex(4096);
         assert!(
             send_node_response(&mut writer, team, &request, &response)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn redistributed_child_counts_break_the_authenticated_descriptor() {
+        let team = team();
+        let representative = [0x10; 32];
+        let mut children = vec![
+            InventoryChild {
+                edge: 0x10,
+                digest: [1; 32],
+                leaf_count: 3,
+            },
+            InventoryChild {
+                edge: 0x20,
+                digest: [2; 32],
+                leaf_count: 1,
+            },
+        ];
+        let tree_to_key: Vec<usize> = (0..representative.len()).collect();
+        let mut state = <Blake3Merkle as PatchHash>::begin_branch(
+            &representative,
+            &tree_to_key,
+            0,
+            children.len(),
+            4,
+        );
+        for child in &children {
+            <Blake3Merkle as PatchHash>::push_child(
+                &mut state,
+                child.edge,
+                child.leaf_count,
+                child.digest,
+            );
+        }
+        let digest = <Blake3Merkle as PatchHash>::finish_branch(state);
+        let request = InventoryNodeRequest::new(
+            team,
+            InventoryComponent::Blob,
+            digest,
+            4,
+            Vec::new(),
+            digest,
+        )
+        .unwrap();
+
+        children[0].leaf_count = 2;
+        children[1].leaf_count = 2;
+        let forged = InventoryNodeResponse::Found(InventoryNode::Branch {
+            digest,
+            leaf_count: 4,
+            branch: InventoryBranch {
+                representative: representative.to_vec(),
+                end_depth: 0,
+                children,
+            },
+        });
+        let (mut writer, _reader) = duplex(4096);
+        assert!(
+            send_node_response(&mut writer, team, &request, &forged)
                 .await
                 .is_err()
         );
