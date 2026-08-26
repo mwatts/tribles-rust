@@ -2787,6 +2787,249 @@ pub struct PATCHBoundedInfixes<
     count: u64,
 }
 
+/// Opaque borrow of one logical node in a canonical BLAKE3 PATCH trie.
+///
+/// The view exposes reconciliation data, never PATCH's tagged pointers,
+/// branches, or physical cuckoo-table layout. It is available only for
+/// [`IdentitySchema`], so [`Self::prefix`] and [`Self::representative`] are
+/// canonical raw-key bytes rather than a schema-specific tree permutation.
+/// Values do not participate in PATCH identity and are intentionally absent.
+pub struct PATCHMerkleNode<'a, const KEY_LEN: usize, V> {
+    head: &'a Head<KEY_LEN, IdentitySchema, V, Blake3Merkle>,
+}
+
+impl<const KEY_LEN: usize, V> Copy for PATCHMerkleNode<'_, KEY_LEN, V> {}
+
+impl<const KEY_LEN: usize, V> Clone for PATCHMerkleNode<'_, KEY_LEN, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, const KEY_LEN: usize, V> PATCHMerkleNode<'a, KEY_LEN, V> {
+    fn new(head: &'a Head<KEY_LEN, IdentitySchema, V, Blake3Merkle>) -> Self {
+        Self { head }
+    }
+
+    /// Canonical digest of this logical subtree.
+    pub fn digest(&self) -> [u8; 32] {
+        self.head.hash()
+    }
+
+    /// Exact number of leaves below this node.
+    ///
+    /// Branch digests commit to this count. A leaf digest canonically denotes
+    /// one complete key, so its count is necessarily one.
+    pub fn leaf_count(&self) -> u64 {
+        self.head.count()
+    }
+
+    /// First raw-key depth not shared by every key below this node.
+    ///
+    /// Leaves return `KEY_LEN`. For branches, the byte at `end_depth` selects
+    /// one of [`Self::children`].
+    pub fn end_depth(&self) -> usize {
+        self.head.end_depth()
+    }
+
+    /// Lexicographically first complete raw key below this node.
+    ///
+    /// PATCH's internal representative pointer is merely a routing witness
+    /// and may depend on construction history. This accessor instead follows
+    /// the smallest logical edge at each branch, making the public result
+    /// canonical without exposing or changing that hot-path field.
+    pub fn representative(&self) -> &'a [u8; KEY_LEN] {
+        let mut node = self.head;
+        loop {
+            match node.body_ref() {
+                BodyRef::Leaf(leaf) => return &leaf.key,
+                BodyRef::LocalLeaf(key) => return key,
+                BodyRef::Branch(branch) => {
+                    node = branch
+                        .child_table
+                        .iter()
+                        .flatten()
+                        .min_by_key(|child| child.key())
+                        .expect("a PATCH branch has at least two children");
+                }
+            }
+        }
+    }
+
+    /// Canonical raw-key prefix naming this logical node.
+    ///
+    /// A lookup prefix may end inside a compressed path. In that case the
+    /// returned node's canonical prefix is longer than the requested prefix.
+    pub fn prefix(&self) -> &'a [u8] {
+        &self.representative()[..self.end_depth()]
+    }
+
+    /// Whether this node is a single complete key.
+    pub fn is_leaf(&self) -> bool {
+        self.end_depth() == KEY_LEN
+    }
+
+    /// Iterate over logical children in ascending edge-byte order.
+    pub fn children(&self) -> PATCHMerkleChildren<'a, KEY_LEN, V> {
+        PATCHMerkleChildren::new(*self)
+    }
+
+    /// Iterate over at most `limit` keys in this subtree, strictly after
+    /// `after`, in canonical raw-key order.
+    ///
+    /// The cursor is a complete key, not an implementation node token. It
+    /// need not exist in the PATCH. Keys are copied out so neither associated
+    /// values nor archive-backed leaf lifetimes escape this borrow. A zero
+    /// limit is explicitly empty and performs no traversal.
+    pub fn items_after(
+        &self,
+        after: Option<&[u8; KEY_LEN]>,
+        limit: usize,
+    ) -> PATCHMerkleItems<'a, KEY_LEN, V> {
+        PATCHMerkleItems::new(*self, after.copied(), limit)
+    }
+
+    fn may_contain_after(&self, after: &[u8; KEY_LEN]) -> bool {
+        let end_depth = self.end_depth();
+        self.representative()[..end_depth] >= after[..end_depth]
+    }
+}
+
+impl<const KEY_LEN: usize, V> core::fmt::Debug for PATCHMerkleNode<'_, KEY_LEN, V> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PATCHMerkleNode")
+            .field("prefix", &self.prefix())
+            .field("digest", &self.digest())
+            .field("leaf_count", &self.leaf_count())
+            .field("end_depth", &self.end_depth())
+            .field("representative", self.representative())
+            .finish()
+    }
+}
+
+/// Ascending logical children of a [`PATCHMerkleNode`].
+///
+/// The iterator contains at most 256 edges regardless of the physical branch
+/// allocation. Its fields are private so the cuckoo representation remains an
+/// implementation detail.
+pub struct PATCHMerkleChildren<'a, const KEY_LEN: usize, V> {
+    node: Option<PATCHMerkleNode<'a, KEY_LEN, V>>,
+    edges: ByteSet,
+}
+
+impl<'a, const KEY_LEN: usize, V> PATCHMerkleChildren<'a, KEY_LEN, V> {
+    fn new(node: PATCHMerkleNode<'a, KEY_LEN, V>) -> Self {
+        let mut edges = ByteSet::new_empty();
+        if let BodyRef::Branch(branch) = node.head.body_ref() {
+            for child in branch.child_table.iter().flatten() {
+                edges.insert(child.key());
+            }
+        }
+        Self {
+            node: (!node.is_leaf()).then_some(node),
+            edges,
+        }
+    }
+}
+
+impl<'a, const KEY_LEN: usize, V> Iterator for PATCHMerkleChildren<'a, KEY_LEN, V> {
+    type Item = (u8, PATCHMerkleNode<'a, KEY_LEN, V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let edge = self.edges.drain_next_ascending()?;
+        let node = self.node.expect("a child edge requires a branch node");
+        let BodyRef::Branch(branch) = node.head.body_ref() else {
+            unreachable!("a leaf cannot carry child edges");
+        };
+        let child = branch
+            .child_table
+            .table_get(edge)
+            .expect("an enumerated PATCH child remains present");
+        Some((edge, PATCHMerkleNode::new(child)))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.edges.popcount() as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<const KEY_LEN: usize, V> ExactSizeIterator for PATCHMerkleChildren<'_, KEY_LEN, V> {}
+impl<const KEY_LEN: usize, V> std::iter::FusedIterator for PATCHMerkleChildren<'_, KEY_LEN, V> {}
+
+/// Bounded canonical key page below one [`PATCHMerkleNode`].
+///
+/// Earlier subtrees are rejected from their compressed raw-key prefix rather
+/// than scanned leaf-by-leaf. The traversal stack grows only with trie depth;
+/// each frame contains a fixed 256-bit edge set.
+pub struct PATCHMerkleItems<'a, const KEY_LEN: usize, V> {
+    pending: Option<PATCHMerkleNode<'a, KEY_LEN, V>>,
+    stack: Vec<PATCHMerkleChildren<'a, KEY_LEN, V>>,
+    after: Option<[u8; KEY_LEN]>,
+    remaining: usize,
+}
+
+impl<'a, const KEY_LEN: usize, V> PATCHMerkleItems<'a, KEY_LEN, V> {
+    fn new(
+        node: PATCHMerkleNode<'a, KEY_LEN, V>,
+        after: Option<[u8; KEY_LEN]>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            pending: (limit != 0).then_some(node),
+            stack: Vec::new(),
+            after,
+            remaining: limit,
+        }
+    }
+
+    fn next_node(&mut self) -> Option<PATCHMerkleNode<'a, KEY_LEN, V>> {
+        if let Some(node) = self.pending.take() {
+            return Some(node);
+        }
+        loop {
+            let children = self.stack.last_mut()?;
+            if let Some((_, node)) = children.next() {
+                return Some(node);
+            }
+            self.stack.pop();
+        }
+    }
+}
+
+impl<'a, const KEY_LEN: usize, V> Iterator for PATCHMerkleItems<'a, KEY_LEN, V> {
+    type Item = [u8; KEY_LEN];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.remaining != 0 {
+            let node = self.next_node()?;
+            if self
+                .after
+                .as_ref()
+                .is_some_and(|after| !node.may_contain_after(after))
+            {
+                continue;
+            }
+            if node.is_leaf() {
+                let key = *node.representative();
+                if self.after.as_ref().is_some_and(|after| key <= *after) {
+                    continue;
+                }
+                self.remaining -= 1;
+                return Some(key);
+            }
+            self.stack.push(node.children());
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.remaining))
+    }
+}
+
+impl<const KEY_LEN: usize, V> std::iter::FusedIterator for PATCHMerkleItems<'_, KEY_LEN, V> {}
+
 impl<
         'a,
         const KEY_LEN: usize,
@@ -3515,6 +3758,41 @@ where
     /// that protocol boundary rather than changing PATCH's canonical identity.
     pub fn merkle_root(&self) -> Option<[u8; 32]> {
         self.root_hash()
+    }
+}
+
+impl<const KEY_LEN: usize, V> PATCH<KEY_LEN, IdentitySchema, V, Blake3Merkle> {
+    /// Locate the shallowest logical Merkle node whose compressed path covers
+    /// `prefix`.
+    ///
+    /// Lookup walks raw key bytes from the root; PATCH maintains no
+    /// digest-to-node side map. If `prefix` ends inside a compressed path, the
+    /// returned node's [`PATCHMerkleNode::prefix`] extends beyond the request
+    /// to that node's canonical `end_depth`. A prefix longer than `KEY_LEN`, a
+    /// mismatching compressed path, or a missing child returns `None`.
+    pub fn merkle_node(&self, prefix: &[u8]) -> Option<PATCHMerkleNode<'_, KEY_LEN, V>> {
+        if prefix.len() > KEY_LEN {
+            return None;
+        }
+
+        let mut node = self.root.as_ref()?;
+        let mut at_depth = 0;
+        loop {
+            let end_depth = node.end_depth();
+            let limit = prefix.len().min(end_depth);
+            if node.childleaf_key()[at_depth..limit] != prefix[at_depth..limit] {
+                return None;
+            }
+            if prefix.len() <= end_depth {
+                return Some(PATCHMerkleNode::new(node));
+            }
+
+            let BodyRef::Branch(branch) = node.body_ref() else {
+                unreachable!("a leaf covers every raw-key byte");
+            };
+            node = branch.child_table.table_get(prefix[end_depth])?;
+            at_depth = end_depth;
+        }
     }
 }
 
@@ -4589,6 +4867,188 @@ mod tests {
         patch
     }
 
+    fn merkle_inventory<const KEY_LEN: usize, V>(
+        node: PATCHMerkleNode<'_, KEY_LEN, V>,
+        out: &mut Vec<(Vec<u8>, [u8; 32], u64, usize, [u8; KEY_LEN], Vec<u8>)>,
+    ) {
+        let child_edges = node.children().map(|(edge, _)| edge).collect::<Vec<_>>();
+        out.push((
+            node.prefix().to_vec(),
+            node.digest(),
+            node.leaf_count(),
+            node.end_depth(),
+            *node.representative(),
+            child_edges,
+        ));
+        for (_, child) in node.children() {
+            merkle_inventory(child, out);
+        }
+    }
+
+    #[test]
+    fn merkle_prefix_lookup_canonicalizes_compressed_paths_and_orders_children() {
+        let patch = blake_patch(&[[1, 2, 3, 255], [1, 2, 3, 0]]);
+        let root = patch.merkle_node(&[]).expect("nonempty PATCH");
+        assert_eq!(root.end_depth(), 3);
+        assert_eq!(root.prefix(), &[1, 2, 3]);
+        assert_eq!(root.leaf_count(), 2);
+        assert!(!root.is_leaf());
+
+        for request in [&[][..], &[1][..], &[1, 2][..], &[1, 2, 3][..]] {
+            let located = patch.merkle_node(request).expect("compressed prefix");
+            assert_eq!(located.digest(), root.digest());
+            assert_eq!(located.prefix(), &[1, 2, 3]);
+        }
+        assert!(patch.merkle_node(&[1, 2, 4]).is_none());
+        assert!(patch.merkle_node(&[1, 2, 3, 0, 0]).is_none());
+
+        let children = root.children().collect::<Vec<_>>();
+        assert_eq!(
+            children.iter().map(|(edge, _)| *edge).collect::<Vec<_>>(),
+            [0, 255]
+        );
+        for (edge, child) in children {
+            assert!(child.is_leaf());
+            assert_eq!(child.leaf_count(), 1);
+            assert_eq!(child.end_depth(), 4);
+            assert_eq!(child.representative()[3], edge);
+            assert_eq!(child.prefix(), child.representative());
+            assert_eq!(child.children().len(), 0);
+        }
+
+        let debug = format!("{root:?}");
+        assert!(debug.contains("PATCHMerkleNode"));
+        assert!(!debug.contains("child_table"));
+        assert!(!debug.contains("Branch"));
+    }
+
+    #[test]
+    fn merkle_prefix_lookup_reports_compressed_shape_mismatches_without_aliasing_nodes() {
+        let compressed = blake_patch(&[[1, 2, 3, 0], [1, 2, 3, 255]]);
+        let split_earlier = blake_patch(&[[1, 2, 3, 0], [1, 2, 4, 0]]);
+
+        let compressed_root = compressed.merkle_node(&[]).expect("root");
+        assert_eq!(compressed_root.prefix(), &[1, 2, 3]);
+        let corresponding = split_earlier
+            .merkle_node(compressed_root.prefix())
+            .expect("the shared key still exists");
+        assert!(corresponding.is_leaf());
+        assert_eq!(corresponding.prefix(), &[1, 2, 3, 0]);
+        assert_ne!(corresponding.digest(), compressed_root.digest());
+        assert_ne!(corresponding.leaf_count(), compressed_root.leaf_count());
+
+        let earlier_root = split_earlier.merkle_node(&[]).expect("root");
+        assert_eq!(earlier_root.prefix(), &[1, 2]);
+        let covered = compressed
+            .merkle_node(earlier_root.prefix())
+            .expect("request ends inside compressed path");
+        assert_eq!(covered.prefix(), &[1, 2, 3]);
+        assert_eq!(covered.digest(), compressed_root.digest());
+    }
+
+    #[test]
+    fn merkle_traversal_is_history_independent() {
+        let keys: Vec<[u8; 4]> = (0u8..64)
+            .map(|i| [i.wrapping_mul(73), i / 4, i.wrapping_mul(11), 255 - i])
+            .collect();
+        let forward = blake_patch(&keys);
+        let mut reversed_keys = keys.clone();
+        reversed_keys.reverse();
+        let reversed = blake_patch(&reversed_keys);
+        let mut edited = reversed.clone();
+        for key in keys.iter().step_by(3) {
+            edited.remove(key);
+        }
+        for key in keys.iter().step_by(3).rev() {
+            edited.insert(&Entry::<4, (), Blake3Merkle>::new(key));
+        }
+
+        let inventory = |patch: &PATCH<4, IdentitySchema, (), Blake3Merkle>| {
+            let mut out = Vec::new();
+            merkle_inventory(patch.merkle_node(&[]).expect("root"), &mut out);
+            out
+        };
+        assert_eq!(inventory(&forward), inventory(&reversed));
+        assert_eq!(inventory(&forward), inventory(&edited));
+
+        let mut expected = keys.clone();
+        expected.sort_unstable();
+        for patch in [&forward, &reversed, &edited] {
+            let root = patch.merkle_node(&[]).expect("root");
+            let mut paged = Vec::new();
+            let mut after = None;
+            loop {
+                let page = root.items_after(after.as_ref(), 7).collect::<Vec<_>>();
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().copied();
+                paged.extend(page);
+            }
+            assert_eq!(paged, expected);
+        }
+    }
+
+    #[test]
+    fn merkle_items_are_prefix_scoped_exclusive_and_hard_bounded() {
+        let mut keys = Vec::new();
+        for i in 0u8..32 {
+            keys.push([7, i, i.wrapping_mul(17), 255 - i]);
+            keys.push([8, i, 0, 0]);
+        }
+        let patch = blake_patch(&keys);
+        let node = patch.merkle_node(&[7]).expect("prefix seven");
+
+        let mut empty = node.items_after(None, 0);
+        assert_eq!(empty.size_hint(), (0, Some(0)));
+        assert_eq!(empty.next(), None);
+        assert_eq!(empty.next(), None);
+
+        let first_five = node.items_after(None, 5).collect::<Vec<_>>();
+        assert_eq!(first_five.len(), 5);
+        assert!(first_five.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(first_five.iter().all(|key| key[0] == 7));
+
+        let cursor = [7, 4, 128, 0];
+        let after = node.items_after(Some(&cursor), 3).collect::<Vec<_>>();
+        assert_eq!(after.len(), 3);
+        assert!(after.iter().all(|key| key > &cursor && key[0] == 7));
+
+        let exact = keys
+            .iter()
+            .copied()
+            .filter(|key| key[0] == 7)
+            .nth(12)
+            .unwrap();
+        let exclusive = node
+            .items_after(Some(&exact), usize::MAX)
+            .collect::<Vec<_>>();
+        assert!(exclusive.iter().all(|key| key > &exact && key[0] == 7));
+        assert!(!exclusive.contains(&exact));
+        assert_eq!(exclusive.len(), 19);
+
+        assert_eq!(node.items_after(Some(&[255; 4]), 10).next(), None);
+        let mut one = node.items_after(None, 1);
+        assert_eq!(one.size_hint(), (0, Some(1)));
+        assert!(one.next().is_some());
+        assert_eq!(one.size_hint(), (0, Some(0)));
+        assert_eq!(one.next(), None);
+    }
+
+    #[test]
+    fn merkle_views_do_not_require_or_expose_values() {
+        struct NotDebug(u8);
+
+        let key = [9, 8, 7, 6];
+        let entry = Entry::<4, NotDebug, Blake3Merkle>::with_value(&key, NotDebug(42));
+        let mut patch = PATCH::<4, IdentitySchema, NotDebug, Blake3Merkle>::new();
+        patch.insert(&entry);
+        let node = patch.merkle_node(&[]).expect("root");
+        assert_eq!(node.items_after(None, 1).collect::<Vec<_>>(), [key]);
+        assert!(format!("{node:?}").contains("PATCHMerkleNode"));
+        assert_eq!(entry.value().0, 42);
+    }
+
     #[test]
     fn blake3_merkle_authenticates_subtree_leaf_count() {
         fn framed(leaf_count: u64) -> [u8; 32] {
@@ -4667,6 +5127,14 @@ mod tests {
 
         assert_eq!(archive.merkle_root(), heap.merkle_root());
         assert_eq!(archive, heap);
+        let archive_root = archive.merkle_node(&[]).expect("archive root");
+        assert_eq!(archive_root.leaf_count(), 6);
+        assert_eq!(
+            archive_root
+                .items_after(None, usize::MAX)
+                .collect::<Vec<_>>(),
+            storage.0
+        );
     }
 
     crate::key_segmentation!(PermutedInfixSegments, 12, [4, 4, 4]);
