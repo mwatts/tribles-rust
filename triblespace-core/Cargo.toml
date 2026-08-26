@@ -102,6 +102,10 @@ name = "patch_bucket"
 harness = false
 
 [[bench]]
+name = "patch_bulk"
+harness = false
+
+[[bench]]
 name = "memory_absolute"
 harness = false
 

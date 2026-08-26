@@ -158,6 +158,18 @@ an edited branch is marked dirty and summarized once, in canonical order, when
 its branch editor closes. Only branches on the copy-on-write edit path pay that
 cost.
 
+For a complete owned key inventory, use
+`PATCH::<N, IdentitySchema, (), Blake3Merkle>::from_keys`. It canonicalizes
+order and duplicates, then constructs the compressed trie bottom-up so every
+retained leaf and every final branch is hashed once in the construction pass.
+Debug builds additionally recompute branch hashes to audit the invariants.
+Sorted unique input takes a linear fast path; other input first pays for
+sorting and deduplication.
+Repeated `insert` remains the right operation for a small edit to an existing
+snapshot. The `patch_bulk` benchmark compares those two construction paths on
+deterministically shuffled distinct 16-, 32-, and 64-byte keys at 10,000 and
+100,000 keys; source-buffer cloning is excluded from both timings.
+
 BLAKE3's native chunk tree is not PATCH's tree. It represents fixed-size chunks
 of one byte stream, while PATCH is a sparse radix trie with path compression
 and changing fanout. Reusing BLAKE3 chaining values would require PATCH to cache

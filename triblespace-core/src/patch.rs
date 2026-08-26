@@ -3796,6 +3796,122 @@ impl<const KEY_LEN: usize, V> PATCH<KEY_LEN, IdentitySchema, V, Blake3Merkle> {
     }
 }
 
+impl<const KEY_LEN: usize> PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle> {
+    /// Build an immutable key-only PATCH bottom-up.
+    ///
+    /// Input order and duplicates are ignored. Already sorted, unique input
+    /// takes a linear fast path; all other input is sorted and deduplicated
+    /// before construction. Every retained key becomes one owned leaf, and
+    /// every final Merkle node is hashed exactly once during construction
+    /// while recursion carries child digests upward. Debug builds additionally
+    /// recompute branch digests as an invariant audit.
+    ///
+    /// This is the construction path for canonical inventory snapshots. Use
+    /// [`Self::insert`] instead when preserving an existing PATCH and editing
+    /// only a small number of keys is more important than whole-set build
+    /// throughput.
+    pub fn from_keys(keys: impl IntoIterator<Item = [u8; KEY_LEN]>) -> Self {
+        Self::from_owned_keys(keys.into_iter().collect())
+    }
+}
+
+impl<const KEY_LEN: usize, H: PatchHash> PATCH<KEY_LEN, IdentitySchema, (), H> {
+    fn from_owned_keys(mut keys: Vec<[u8; KEY_LEN]>) -> Self {
+        H::init();
+        if !keys.windows(2).all(|pair| pair[0] < pair[1]) {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                keys.par_sort_unstable();
+            }
+            #[cfg(not(feature = "parallel"))]
+            keys.sort_unstable();
+            keys.dedup();
+        }
+
+        let root = (!keys.is_empty()).then(|| Self::build_owned_sorted_head(&keys, 0).0);
+        let result = Self { root, owners: None };
+        result.debug_check_owner_invariant();
+        result
+    }
+
+    /// Build one logical node from a nonempty sorted, duplicate-free key run.
+    /// The returned digest is carried by the returned Head and is returned
+    /// separately so its parent never has to re-read or recompute it.
+    fn build_owned_sorted_head(
+        keys: &[[u8; KEY_LEN]],
+        depth: usize,
+    ) -> (Head<KEY_LEN, IdentitySchema, (), H>, H::Digest) {
+        debug_assert!(!keys.is_empty());
+        if keys.len() == 1 {
+            // SAFETY: Leaf::new returns one initialized, 16-byte-aligned,
+            // refcount-one allocation. This Head becomes its sole owner.
+            let leaf = unsafe { Leaf::<KEY_LEN, (), H>::new(&keys[0], ()) };
+            let digest = unsafe { leaf.as_ref().hash };
+            return (Head::new(0, leaf), digest);
+        }
+
+        // Lexicographic ordering means the first and last keys determine the
+        // common prefix of the entire run.
+        let first = &keys[0];
+        let last = &keys[keys.len() - 1];
+        let mut end_depth = depth;
+        while end_depth < KEY_LEN && first[end_depth] == last[end_depth] {
+            end_depth += 1;
+        }
+        debug_assert!(
+            end_depth < KEY_LEN,
+            "deduplicated keys must diverge before their end"
+        );
+
+        let mut groups = Vec::with_capacity(256.min(keys.len()));
+        let mut start = 0;
+        while start < keys.len() {
+            let edge = keys[start][end_depth];
+            let width = keys[start..].partition_point(|key| key[end_depth] == edge);
+            let end = start + width;
+            groups.push((edge, &keys[start..end]));
+            start = end;
+        }
+        debug_assert!(groups.len() >= 2);
+        let initial_slots = if groups.len() == 2 {
+            2
+        } else {
+            groups.len().next_power_of_two()
+        };
+
+        #[cfg(feature = "parallel")]
+        let children = if keys.len() >= Self::PARALLEL_PARTITION_THRESHOLD {
+            use rayon::prelude::*;
+            groups
+                .into_par_iter()
+                .map(|(edge, child_keys)| {
+                    let (head, digest) = Self::build_owned_sorted_head(child_keys, end_depth + 1);
+                    (edge, head, digest)
+                })
+                .collect()
+        } else {
+            groups
+                .into_iter()
+                .map(|(edge, child_keys)| {
+                    let (head, digest) = Self::build_owned_sorted_head(child_keys, end_depth + 1);
+                    (edge, head, digest)
+                })
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let children = groups
+            .into_iter()
+            .map(|(edge, child_keys)| {
+                let (head, digest) = Self::build_owned_sorted_head(child_keys, end_depth + 1);
+                (edge, head, digest)
+            })
+            .collect();
+
+        Self::assemble_partition_branch(end_depth, initial_slots, children)
+    }
+}
+
 /// Archive-backed insertion path, available only for `V = ()` because
 /// [`ArchiveEntry`] does not carry a value. Newly inserted archive keys remain
 /// LocalLeaves while the PATCH's deduplicated root cover retains their
@@ -4105,7 +4221,7 @@ where
             })
             .collect();
 
-        Self::assemble_archive_partition_branch(end_depth, plan.initial_slots, children)
+        Self::assemble_partition_branch(end_depth, plan.initial_slots, children)
     }
 
     /// Out-of-place counting-sort twin of [`Self::partition_archive_rows`].
@@ -4252,11 +4368,11 @@ where
     /// Install already-built children, in ascending key order, under one
     /// branch at `end_depth`.
     ///
-    /// Splitting this out is what lets the concurrent fan-out reuse the
-    /// ordered path's node construction: the children arrive as values, so
-    /// whether they were built in order or in parallel is invisible here.
-    #[cfg(feature = "parallel")]
-    fn assemble_archive_partition_branch(
+    /// Children arrive as values, so whether they came from archive
+    /// partitioning, a sorted owned-key build, or parallel recursion is
+    /// invisible here. The final digest is computed before allocation and
+    /// installed directly, so no temporary two-child BLAKE node is hashed.
+    fn assemble_partition_branch(
         end_depth: usize,
         initial_slots: usize,
         children: Vec<(u8, Head<KEY_LEN, O, (), H>, H::Digest)>,
@@ -4265,41 +4381,40 @@ where
         debug_assert!(children.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let child_count = children.len();
         let leaf_count = children.iter().map(|(_, child, _)| child.count()).sum();
+        let mut hash_state = H::begin_branch(KEY_LEN, end_depth, child_count, leaf_count);
+        for &(edge, _, digest) in &children {
+            H::push_child(&mut hash_state, edge, digest);
+        }
+        let hash = H::finish_branch(hash_state);
+
         let mut drain = children.into_iter();
-        let (first_bucket, first_head, first_hash) = drain.next().expect("two children");
-        let (second_bucket, second_head, second_hash) = drain.next().expect("two children");
+        let (first_bucket, first_head, _) = drain.next().expect("two children");
+        let (second_bucket, second_head, _) = drain.next().expect("two children");
         let body = if initial_slots == 2 {
-            Branch::new_with_child_hashes(
+            Branch::new_with_known_hash(
                 end_depth,
                 first_head.with_key(first_bucket),
                 second_head.with_key(second_bucket),
-                first_hash,
-                second_hash,
+                hash,
             )
         } else {
-            Branch::new_with_child_hashes_capacity(
+            Branch::new_with_known_hash_capacity(
                 end_depth,
                 first_head.with_key(first_bucket),
                 second_head.with_key(second_bucket),
-                first_hash,
-                second_hash,
+                hash,
                 initial_slots,
             )
         };
         let mut root = Head::new(0, body);
-        let mut hash_state = H::begin_branch(KEY_LEN, end_depth, child_count, leaf_count);
-        H::push_child(&mut hash_state, first_bucket, first_hash);
-        H::push_child(&mut hash_state, second_bucket, second_hash);
         let mut extra = drain.peekable();
         if extra.peek().is_none() {
-            return (root, H::finish_branch(hash_state));
+            return (root, hash);
         }
         let mut editor = BranchMut::from_head(&mut root);
-        for (byte, child, child_hash) in extra {
-            H::push_child(&mut hash_state, byte, child_hash);
+        for (byte, child, _) in extra {
             editor.install_child_growing(child.with_key(byte));
         }
-        let hash = H::finish_branch(hash_state);
         editor.finish_bulk_aggregates(hash);
         drop(editor);
         (root, hash)
@@ -4865,6 +4980,198 @@ mod tests {
             patch.insert(&Entry::<KEY_LEN, (), Blake3Merkle>::new(key));
         }
         patch
+    }
+
+    fn inventory_keys<const KEY_LEN: usize>(len: usize) -> Vec<[u8; KEY_LEN]> {
+        assert!(KEY_LEN >= 8);
+        (0..len)
+            .map(|index| {
+                let mut key = [0u8; KEY_LEN];
+                key[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                let mut state = (index as u64) ^ 0x243f_6a88_85a3_08d3;
+                for byte in &mut key[8..] {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    *byte = state.wrapping_mul(0x2545_f491_4f6c_dd1d) as u8;
+                }
+                key
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bulk_owned_build_canonicalizes_order_duplicates_and_edit_history() {
+        let keys = inventory_keys::<16>(4_097);
+        let mut noisy = keys.clone();
+        noisy.reverse();
+        noisy.extend(keys.iter().step_by(7).copied());
+        noisy.rotate_left(997);
+
+        let bulk = PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_keys(noisy.clone());
+        let bulk_reversed =
+            PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_keys(noisy.into_iter().rev());
+        let inserted = blake_patch(&keys);
+        let mut edited = blake_patch(&keys.iter().rev().copied().collect::<Vec<_>>());
+        for key in keys.iter().step_by(5) {
+            edited.remove(key);
+        }
+        for key in keys.iter().step_by(5).rev() {
+            edited.insert(&Entry::new(key));
+        }
+
+        let expected_root = inserted.merkle_root();
+        assert_eq!(bulk.len(), keys.len() as u64);
+        assert_eq!(bulk.merkle_root(), expected_root);
+        assert_eq!(bulk_reversed.merkle_root(), expected_root);
+        assert_eq!(edited.merkle_root(), expected_root);
+        assert_eq!(bulk, inserted);
+        assert_eq!(
+            bulk.merkle_node(&[])
+                .unwrap()
+                .items_after(None, usize::MAX)
+                .collect::<Vec<_>>(),
+            keys
+        );
+    }
+
+    #[test]
+    fn bulk_owned_build_handles_empty_singleton_and_already_canonical_input() {
+        let empty = PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_keys([]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.merkle_root(), None);
+
+        let key = [42; 16];
+        let singleton = PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_keys([key]);
+        assert_eq!(singleton.len(), 1);
+        assert_eq!(singleton.merkle_node(&[]).unwrap().representative(), &key);
+
+        let canonical = inventory_keys::<16>(1_024);
+        let bulk = PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_keys(canonical.clone());
+        assert_eq!(
+            bulk.merkle_node(&[])
+                .unwrap()
+                .items_after(None, usize::MAX)
+                .collect::<Vec<_>>(),
+            canonical
+        );
+    }
+
+    static BULK_LEAF_HASHES: AtomicUsize = AtomicUsize::new(0);
+    static BULK_BRANCH_HASHES: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingBlake3;
+    impl sealed::Sealed for CountingBlake3 {}
+    impl PatchHash for CountingBlake3 {
+        type Digest = [u8; 32];
+        type BranchState = blake3::Hasher;
+        const COMMUTATIVE_BRANCH: bool = false;
+        const INCREMENTAL_BRANCH: bool = false;
+
+        fn init() {
+            Blake3Merkle::init();
+        }
+
+        fn leaf(bytes: &[u8]) -> Self::Digest {
+            BULK_LEAF_HASHES.fetch_add(1, Ordering::Relaxed);
+            Blake3Merkle::leaf(bytes)
+        }
+
+        fn begin_branch(
+            key_len: usize,
+            end_depth: usize,
+            child_count: usize,
+            leaf_count: u64,
+        ) -> Self::BranchState {
+            Blake3Merkle::begin_branch(key_len, end_depth, child_count, leaf_count)
+        }
+
+        fn push_child(state: &mut Self::BranchState, edge: u8, digest: Self::Digest) {
+            Blake3Merkle::push_child(state, edge, digest);
+        }
+
+        fn finish_branch(state: Self::BranchState) -> Self::Digest {
+            BULK_BRANCH_HASHES.fetch_add(1, Ordering::Relaxed);
+            Blake3Merkle::finish_branch(state)
+        }
+
+        fn edit_branch(
+            _current: Self::Digest,
+            _edge: u8,
+            _old: Option<Self::Digest>,
+            _new: Option<Self::Digest>,
+        ) -> Self::Digest {
+            unreachable!("the counting Merkle policy is not incremental")
+        }
+    }
+
+    #[test]
+    fn bulk_owned_build_hashes_each_final_node_once_plus_debug_audit() {
+        BULK_LEAF_HASHES.store(0, Ordering::Relaxed);
+        BULK_BRANCH_HASHES.store(0, Ordering::Relaxed);
+        let keys = inventory_keys::<16>(10_000);
+        let patch = PATCH::<16, IdentitySchema, (), CountingBlake3>::from_owned_keys(keys.clone());
+        let (branches, _, heap_leaves, archive_leaves) = patch.node_stats();
+
+        assert_eq!(patch.len(), keys.len() as u64);
+        assert_eq!(heap_leaves, keys.len() as u64);
+        assert_eq!(archive_leaves, 0);
+        assert_eq!(BULK_LEAF_HASHES.load(Ordering::Relaxed), keys.len());
+        // The build itself finishes each branch once. Debug builds then
+        // deliberately recompute it once inside Branch's invariant audit;
+        // optimized production builds compile that verification away.
+        let expected_branch_hashes = branches as usize * if cfg!(debug_assertions) { 2 } else { 1 };
+        assert_eq!(
+            BULK_BRANCH_HASHES.load(Ordering::Relaxed),
+            expected_branch_hashes
+        );
+    }
+
+    struct BulkUnwindProbe(Arc<AtomicUsize>);
+
+    impl Drop for BulkUnwindProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn wider_known_hash_branch_owns_every_child_during_unwind() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let keys = [[1, 0], [2, 0], [3, 0]];
+        let digests = keys.map(|key| Blake3Merkle::leaf(&key));
+        let mut state = Blake3Merkle::begin_branch(2, 0, keys.len(), keys.len() as u64);
+        for (edge, digest) in [1, 2, 3].into_iter().zip(digests) {
+            Blake3Merkle::push_child(&mut state, edge, digest);
+        }
+        let final_hash = Blake3Merkle::finish_branch(state);
+
+        let leaf = |key: &[u8; 2]| {
+            // SAFETY: every returned allocation is immediately transferred
+            // into exactly one owning Head.
+            unsafe {
+                Leaf::<2, BulkUnwindProbe, Blake3Merkle>::new(key, BulkUnwindProbe(drops.clone()))
+            }
+        };
+        type ProbeHead = Head<2, IdentitySchema, BulkUnwindProbe, Blake3Merkle>;
+        let first = ProbeHead::new(0, leaf(&keys[0])).with_key(1);
+        let second = ProbeHead::new(0, leaf(&keys[1])).with_key(2);
+        let third = ProbeHead::new(0, leaf(&keys[2])).with_key(3);
+        let body = Branch::new_with_known_hash_capacity(0, first, second, final_hash, 4);
+        let mut root = Head::new(0, body);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut editor = BranchMut::from_head(&mut root);
+            editor.install_child_growing(third);
+            // This is the only interval where the branch contains every
+            // child but its structural counts still describe the initial
+            // pair. BranchMut's Drop must nevertheless return the current
+            // allocation to `root`, whose ordinary destructor owns all three.
+            panic!("interrupt wider bottom-up assembly");
+        }));
+        assert!(panic.is_err());
+        drop(root);
+        assert_eq!(drops.load(Ordering::Relaxed), keys.len());
     }
 
     fn merkle_inventory<const KEY_LEN: usize, V>(

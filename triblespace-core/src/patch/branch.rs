@@ -120,7 +120,6 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
     /// already hashes each row once and carries the exact branch summary
     /// through its recursion, so re-reading direct `LocalLeaf` children here
     /// would repeat that work for every index.
-    #[cfg(any(test, feature = "parallel"))]
     pub fn finish_bulk_aggregates(&mut self, known_hash: H::Digest) {
         unsafe {
             Branch::finish_bulk_aggregates(&mut self.branch_nn, known_hash);
@@ -331,6 +330,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         lchild_hash: H::Digest,
         rchild_hash: H::Digest,
     ) -> NonNull<Self> {
+        let hash = Self::hash_two_children(end_depth, &lchild, lchild_hash, &rchild, rchild_hash);
+        Self::new_with_known_hash(end_depth, lchild, rchild, hash)
+    }
+
+    /// Allocate a binary Branch whose complete canonical digest is already
+    /// known. Bottom-up builders use this to avoid hashing a temporary
+    /// two-child node before installing the rest of a wider fanout.
+    ///
+    /// `hash` MUST summarize exactly `lchild` and `rchild` at `end_depth`.
+    pub(super) fn new_with_known_hash(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V, H>,
+        rchild: Head<KEY_LEN, O, V, H>,
+        hash: H::Digest,
+    ) -> NonNull<Self> {
         unsafe {
             let size = 2;
             let layout = Self::allocation_layout(size);
@@ -346,13 +360,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(Self::hash_two_children(
-                end_depth,
-                &lchild,
-                lchild_hash,
-                &rchild,
-                rchild_hash,
-            ));
+            addr_of_mut!((*ptr.as_ptr()).hash).write(hash);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
 
@@ -374,6 +382,23 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         rchild_hash: H::Digest,
         size: usize,
     ) -> NonNull<Self> {
+        let hash = Self::hash_two_children(end_depth, &lchild, lchild_hash, &rchild, rchild_hash);
+        Self::new_with_known_hash_capacity(end_depth, lchild, rchild, hash, size)
+    }
+
+    /// Direct-capacity twin of [`Self::new_with_known_hash`] for a wider
+    /// bottom-up node whose final fanout and digest are already known.
+    ///
+    /// `hash` may summarize children not installed yet. The constructor is
+    /// private and callers must finish installing the complete child set and
+    /// rebuild structural aggregates before the Branch can escape.
+    pub(super) fn new_with_known_hash_capacity(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V, H>,
+        rchild: Head<KEY_LEN, O, V, H>,
+        hash: H::Digest,
+        size: usize,
+    ) -> NonNull<Self> {
         assert!(
             size > 2 && size <= 256 && size.is_power_of_two(),
             "direct Branch capacity must be a power of two in 4..=256",
@@ -393,13 +418,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(Self::hash_two_children(
-                end_depth,
-                &lchild,
-                lchild_hash,
-                &rchild,
-                rchild_hash,
-            ));
+            addr_of_mut!((*ptr.as_ptr()).hash).write(hash);
 
             if let Some(displaced) = (*ptr.as_ptr()).child_table.table_insert(lchild) {
                 Self::rc_dec(ptr);
@@ -826,7 +845,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
 
     /// Rebuild structural aggregates after a batch of child installations and
     /// install a caller-proven exact hash without traversing child hashes.
-    #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn finish_bulk_aggregates(
         branch_nn: &mut NonNull<Self>,
         known_hash: H::Digest,
