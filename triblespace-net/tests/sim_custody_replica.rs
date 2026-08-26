@@ -12,7 +12,7 @@ use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::{
-    CapabilityClaim, CapabilityMode, CapabilityProof, CapabilityProofBundle,
+    CapabilityClaim, CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityValidity,
 };
 use triblespace_core::collection::{
     CollectionCommit, CollectionData, CollectionMerge, CollectionRecord, CollectionStore,
@@ -37,12 +37,21 @@ fn replica_proof(
     leaf: &SigningKey,
     replica_set: ReplicaSetId,
 ) -> CapabilityProofBundle {
+    replica_proof_with_validity(root, leaf, replica_set, None)
+}
+
+fn replica_proof_with_validity(
+    root: &SigningKey,
+    leaf: &SigningKey,
+    replica_set: ReplicaSetId,
+    validity: Option<CapabilityValidity>,
+) -> CapabilityProofBundle {
     CapabilityProofBundle::issue_root(
         root,
         CapabilityClaim::root(
             replicate_capability_atom(replica_set),
             CapabilityMode::Invoke,
-            None,
+            validity,
         ),
         leaf.verifying_key(),
     )
@@ -97,10 +106,6 @@ fn bring_up(
             replica_root: replica_root.verifying_key(),
             replica_set,
             replica_proof: presented_replica_proof,
-            // The simulator ignores production sockets; with_wiring validates
-            // capability semantics but deliberately does not apply the iroh
-            // fixed-route preflight.
-            bind_addr: "127.0.0.1:49152".parse().unwrap(),
             receive_temp_dir: receive_dir.to_owned(),
         },
     )
@@ -261,6 +266,167 @@ async fn fetch_public_blob(
         SimNet::step(&vclock(), Duration::from_millis(10)).await;
     }
     panic!("public blob probe exceeded deterministic step budget")
+}
+
+#[test]
+fn one_way_bootstrap_edges_learn_reverse_neighbors_and_converge_transitively() {
+    let _guard = common::sim_guard();
+    run_paused(0xC057_0D1E, async {
+        let connect_root = key(0xEC);
+        let replica_root = key(0xED);
+        let ka = key(0xAC);
+        let kb = key(0xBC);
+        let kc = key(0xCC);
+        let replica_set = ReplicaSetId::new([0xAA; 32]);
+        let proof_a = replica_proof(&replica_root, &ka, replica_set);
+        let proof_b = replica_proof(&replica_root, &kb, replica_set);
+        let proof_c = replica_proof(&replica_root, &kc, replica_set);
+        let mut store_a = seeded_store(0x61, proof_a.clone(), false);
+        let mut store_b = seeded_store(0x62, proof_b.clone(), false);
+        let mut store_c = seeded_store(0x63, proof_c.clone(), false);
+        let expected = fingerprint(&mut store_a)
+            .union(fingerprint(&mut store_b))
+            .union(fingerprint(&mut store_c));
+        let receive = tempfile::tempdir().unwrap();
+        let net = SimNet::new(
+            0xC057_0D1E,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+
+        // Only one direction of each edge is configured: A -> B -> C. A's
+        // authorized summary request introduces A to B; B's request likewise
+        // introduces B to C. Reverse pulls can then carry the semantic union
+        // through the chain without a global member roster.
+        let mut a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            &connect_root,
+            &replica_root,
+            replica_set,
+            proof_a,
+            vec![pk(&kb)],
+            receive.path(),
+        );
+        let mut b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            &connect_root,
+            &replica_root,
+            replica_set,
+            proof_b,
+            vec![pk(&kc)],
+            receive.path(),
+        );
+        let mut c = bring_up(
+            &net,
+            &kc,
+            store_c,
+            &connect_root,
+            &replica_root,
+            replica_set,
+            proof_c,
+            Vec::new(),
+            receive.path(),
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let a_first = reconcile(&mut a).await;
+        assert_eq!(a_first.peers_attempted, 1);
+        assert_eq!(a_first.peers_completed, 1);
+
+        let b_first = reconcile(&mut b).await;
+        assert_eq!(
+            b_first.peers_attempted, 2,
+            "B should pull its bootstrap C and the newly learned caller A"
+        );
+        assert_eq!(b_first.peers_completed, 2);
+
+        let c_first = reconcile(&mut c).await;
+        assert_eq!(
+            c_first.peers_attempted, 1,
+            "C had no bootstrap peers, so its only route must be learned from B"
+        );
+        assert_eq!(c_first.peers_completed, 1);
+
+        let a_second = reconcile(&mut a).await;
+        assert_eq!(a_second.peers_completed, 1);
+        assert_eq!(fingerprint(a.store_mut()), expected);
+        assert_eq!(fingerprint(b.store_mut()), expected);
+        assert_eq!(fingerprint(c.store_mut()), expected);
+        assert_eq!(a_second.generation, b_first.generation);
+        assert_eq!(a_second.generation, c_first.generation);
+    });
+}
+
+#[test]
+fn learned_neighbor_expires_with_the_replication_proof() {
+    let _guard = common::sim_guard();
+    run_paused(0xC057_0D1F, async {
+        let connect_root = key(0xEE);
+        let replica_root = key(0xEF);
+        let server_key = key(0xAD);
+        let client_key = key(0xBD);
+        let replica_set = ReplicaSetId::new([0xAB; 32]);
+        let server_proof = replica_proof(&replica_root, &server_key, replica_set);
+        let start = triblespace_core::clock::epoch_now();
+        let upper = start + hifitime::Duration::from_total_nanoseconds(1_000_000_000);
+        let client_proof = replica_proof_with_validity(
+            &replica_root,
+            &client_key,
+            replica_set,
+            Some(CapabilityValidity::new(start, upper).unwrap()),
+        );
+        let receive = tempfile::tempdir().unwrap();
+        let net = SimNet::new(
+            0xC057_0D1F,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let mut server = bring_up(
+            &net,
+            &server_key,
+            MemoryRepo::default(),
+            &connect_root,
+            &replica_root,
+            replica_set,
+            server_proof,
+            Vec::new(),
+            receive.path(),
+        );
+        let mut client = bring_up(
+            &net,
+            &client_key,
+            MemoryRepo::default(),
+            &connect_root,
+            &replica_root,
+            replica_set,
+            client_proof,
+            vec![pk(&server_key)],
+            receive.path(),
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        assert_eq!(reconcile(&mut client).await.peers_completed, 1);
+        let learned = reconcile(&mut server).await;
+        assert_eq!(learned.peers_attempted, 1);
+        assert_eq!(learned.peers_completed, 1);
+
+        // Capability bounds are inclusive, so step strictly beyond `upper`.
+        SimNet::step(&vclock(), Duration::from_millis(1_001)).await;
+        let expired = reconcile(&mut server).await;
+        assert_eq!(
+            expired.peers_attempted, 0,
+            "a learned route must not outlive the proof that introduced it"
+        );
+        assert!(expired.peer_errors.is_empty());
+    });
 }
 
 #[test]
@@ -517,7 +683,7 @@ fn connect_only_wrong_replica_authority_leaks_no_inventory() {
                 ..SimConfig::default()
             },
         );
-        let _server = bring_up(
+        let mut server = bring_up(
             &net,
             &server_key,
             server_store,
@@ -525,7 +691,7 @@ fn connect_only_wrong_replica_authority_leaks_no_inventory() {
             &replica_root,
             replica_set,
             server_proof,
-            vec![pk(&client_key)],
+            Vec::new(),
             receive.path(),
         );
         let mut client = bring_up(
@@ -549,10 +715,15 @@ fn connect_only_wrong_replica_authority_leaks_no_inventory() {
         assert_eq!(outcome.collection_records_added, 0);
         assert_eq!(outcome.capability_proofs_added, 0);
         assert_eq!(fingerprint(client.store_mut()), Fingerprint::default());
+        let server_outcome = reconcile(&mut server).await;
+        assert_eq!(
+            server_outcome.peers_attempted, 0,
+            "a rejected REPLICATE proof must not promote its presenter"
+        );
 
-        // A custody endpoint rejects an unconfigured peer before CONNECT and
-        // independently rejects ordinary known-hash RPCs after CONNECT. Even
-        // with the exact secret hash, no resident custody bytes are disclosed.
+        // A custody endpoint independently rejects ordinary known-hash RPCs
+        // after CONNECT. Even with the exact secret hash, no resident custody
+        // bytes are disclosed.
         let probe_key = key(0xC4);
         let probe = common::bring_up_with_peers(
             &net,
