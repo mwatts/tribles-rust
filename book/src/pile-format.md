@@ -368,7 +368,7 @@ authoritative state: it is a computation whose artifact is rebuilt under the
 current recipe. Replay exposes it as `RetiredCollectionDeriveV4`, projects no
 collection record, and semantic rewrites may discard it. This distinction lets
 the unknown-kind fence stay strict without letting known inert computations
-block custody replication or compaction forever.
+block semantic compaction forever.
 
 ## Blob Records
 
@@ -557,12 +557,14 @@ rather than the scan's.
 
 Reach now lives in the collection descriptor, as the optional
 `collection_reach` attribute naming a reach law. That makes publication part of
-a collection's *identity*: a collection that stays put and one that travels
-hash differently, so a grant could no longer contradict a descriptor, and
-committing into a collection whose name says it travels is itself the consent.
-An absent declaration is a refusal, so every descriptor written before the
-attribute existed stays put, and — because the attribute is optional — keeps
-byte-for-byte the handle it already had.
+a collection's *identity*: a collection that refuses permissionless relay and
+one that permits it hash differently, so a grant could no longer contradict a
+descriptor, and committing into a collection whose name permits relay is
+itself the consent. An absent declaration is a refusal, so every descriptor
+written before the attribute existed keeps that policy and — because the
+attribute is optional — keeps byte-for-byte the handle it already had. This
+law is orthogonal to an explicitly authorized full-team inventory: SYNC_TEAM
+access is granted for a dedicated store, not inferred from collection reach.
 
 The semantic kind ID `9BB5B1F4D6FD8FB850B494C2CF51B5CA` (minted 2026-08-12,
 retired 2026-08-21) and its record kind

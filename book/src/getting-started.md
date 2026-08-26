@@ -72,9 +72,11 @@ let mut library = Collection::new(
 );
 ```
 
-`reach::private()` means that network peers do not proactively gossip this
-collection. Use `reach::public()` only when the collection's identity should
-state that any holder may relay its verified commits.
+`reach::private()` declares no permissionless relay. Use `reach::public()` only
+when the collection's identity should state that any holder may relay its
+verified commits. Reach does not partition an explicitly authorized team
+inventory: a store attached to `triblespace-net` is dedicated to one team, and
+SYNC_TEAM reconciliation includes every resident collection record.
 
 This introductory collection is deliberately open: every commit must still
 carry a valid strict self-signature for this exact descriptor, but no signer

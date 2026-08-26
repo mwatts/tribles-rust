@@ -110,16 +110,22 @@ descriptions.
 
 ### Distributed pile sync
 
-Built on `triblespace-net` (iroh QUIC + DHT + gossip). Every connection
-authenticates with an exact CONNECT capability proof rooted at the team's
-public key; see *Team capabilities* below. Runtime configuration is explicit:
-the local pile must contain the native proof selected by `--proof` and every
-claim blob it names. Authentication identity and gossip rendezvous are
-independent inputs.
+Built on `triblespace-net` (iroh QUIC + DHT + gossip). A node presents two
+independent exact proofs rooted at the team public key: CONNECT admits the
+transport connection and SYNC_TEAM authorizes disclosure and reconciliation of
+that team's inventory. The local pile must contain both selected native proofs
+and every claim blob they name. The team root also deterministically selects
+the gossip topic; gossip carries only lossy generation wake hints.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
-- `pile net status <PILE> --team-root HEX --proof ID [--key PATH]` — load the exact native proof and its named claims, verify CONNECT for the local key at the current time, and print the authentication configuration.
-- `pile net sync <PILE> --team-root HEX --proof ID --gossip-topic HEX [--peers ID,...] [--key PATH]` — long-running collection-evidence sync. `--team-root` selects the CONNECT trust root and exact resource; the separately required `--gossip-topic` selects rendezvous without inference or fallback. The proof must invoke CONNECT for the local key. Collection records converge by set union, while referenced blobs and operation receipts stay lazy until requested by durable wants. Use `--read-only` or `--write-only` for directional operation and `--no-lazy` to suppress want reconciliation.
+- `pile net status <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--key PATH]` — load both exact native bundles, verify CONNECT and SYNC_TEAM for the local key at the current time, and print their IDs and step counts.
+- `pile net sync <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only] [--blobs demand|mirror]` — run authorized periodic anti-entropy. PEER evidence, native collection records, and capability proofs converge by set union. `demand` (the default) fetches blobs only for durable WANTs; `mirror` also walks the complete blob inventory. `read-only` pulls but does not advertise or serve local data, while `write-only` advertises and serves but never pulls or demand-fetches. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+
+The pile is one team-scoped store: records, proofs, and blobs do not carry a
+separate team label. Configured peers are bootstrap routes, and successful
+authorized synchronization carries monotone `PEER(team, peer)` routing
+evidence. Lost gossip does not prevent convergence because periodic direct
+sweeps remain the correctness path.
 
 ### Team capabilities
 

@@ -1,20 +1,21 @@
 # Distributed Sync
 
 The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
-crate synchronizes TribleSpace's native collection algebra over
-[iroh](https://www.iroh.computer/). Its three transport mechanisms have
-separate jobs:
+crate synchronizes one team's TribleSpace store over
+[iroh](https://www.iroh.computer/). It has one data protocol and three
+deliberately narrow discovery mechanisms:
 
-- an explicitly selected gossip mesh discovers immutable signed collection
-  evidence;
-- a DHT discovers providers for content-addressed blobs; and
-- CONNECT-authenticated QUIC answers exact blob, collection, and
-  operation-receipt questions.
+- authenticated QUIC performs authorized inventory walks and exact blob reads;
+- a team-derived gossip topic carries lossy generation wake hints; and
+- the DHT discovers candidate providers for a specifically wanted blob.
 
-The user-visible surface is `Peer<S>`. It wraps a local store, owns the async
-network host, and continues to expose synchronous storage traits. Network
-activity does not introduce a remote mutable head, a distributed
-compare-and-swap operation, or a second authorization database.
+Gossip neighbors, DHT advertisements, and stored routing evidence grant no
+authority. Periodic authenticated inventory sweeps are the correctness path,
+so dropped or duplicated wake frames affect latency rather than convergence.
+
+The user-visible surface is `Peer<S>`. It wraps a synchronous local store and
+owns the asynchronous host. There is no remote mutable head, receipt RPC,
+replica roster, or second authorization database.
 
 Enable it through the facade crate's `net` feature:
 
@@ -24,384 +25,251 @@ triblespace = { version = "x.y.z", features = ["net"] }
 ```
 
 ```rust,ignore
-use triblespace::net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace::net::peer::{
+    BlobReconcileMode, Peer, PeerConfig, ReconcileDirection, ReconcileQos,
+};
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint],
-    gossip_topic: Some(shared_topic),
-    connect_root,
+    team: team_root,
     connect_proof,
-    direction: SyncDirection::Bidirectional,
+    sync_proof,
+    qos: ReconcileQos {
+        direction: ReconcileDirection::Bidirectional,
+        blobs: BlobReconcileMode::Demand,
+    },
 });
 
 peer.refresh();
 ```
 
-`connect_proof` is a complete `CapabilityProofBundle` whose leaf invokes
-`ACTION_CONNECT` for `signing_key` on the exact 32 public-key bytes of
-`connect_root`. The caller selects that proof explicitly; the transport sends
-the native `K0 (S C K)+` path and its ordered keyless claim blobs and never
-searches for authority implicitly. `gossip_topic` is a separate rendezvous
-choice.
+`team` is simultaneously the external capability trust root, inventory scope,
+and deterministic gossip topic. The backing store must be dedicated to this
+one team. Only PEER evidence contains a team key intrinsically; collection
+records, proofs, and blobs are content-addressed global forms. Attaching a
+mixed-team store would therefore disclose all of those resident sets to any
+caller authorized for the configured team.
 
-## The synchronized object is evidence
+## One four-component inventory
 
-A native collection is a grow-only algebra of signed `COMMIT` assertions and
-reproducible `MERGE` and `DERIVE` equations. There is no distinguished head.
-Concatenating two stores unions their evidence, so synchronization uses that
-same operation rather than reconstructing a Git-like branch protocol.
+Synchronization is componentwise set union over four canonical inventories:
 
-One `COMMIT` is a 192-byte signed assertion containing:
+| Component | Canonical key | Meaning |
+|---|---|---|
+| PEER | `team_public_key || peer_public_key` | monotone routing-candidate evidence |
+| Collection record | 16-byte intrinsic record ID | native `COMMIT`, `MERGE`, or `DERIVE` evidence |
+| Capability proof | 32-byte proof identity | one complete native `K0 (S C K)+` proof |
+| Blob | 32-byte BLAKE3 handle | resident content bytes |
 
-- the canonical collection descriptor handle;
-- the data identity;
-- the metadata archive handle;
-- the author's public key; and
-- the author's Ed25519 signature.
+The PEER walk is rooted at the configured team's subtree and carries only the
+32-byte peer suffix on the wire. The other three components expose the complete
+sets in the dedicated store. Collection and proof leaves carry their exact
+canonical bodies; blob leaves carry keys and are transferred separately.
 
-The signature proves who authored the assertion. It does not force a receiver
-to treat that author as ground truth. Author trust belongs to the resolver that
-selects a collection view, where the relevant application policy and positive
-authority observation are available.
+This inventory is structural evidence, not ambient authorization. A resident
+proof does not become active merely because it synchronized. A collection
+record may be structurally canonical while remaining semantically unusable to
+a particular resolver. A PEER fact says only that an endpoint is a routing
+candidate for the team: it proves no liveness, reachability, residency,
+retention, or capability.
 
-Publication permission is part of the collection descriptor. Its optional
-`collection_reach` attribute names a reach law, and because a collection
-handle is the hash of its descriptor, a collection that travels and one that
-stays put are different collections. An author who commits into a collection
-whose identity declares public reach has published that occurrence; a commit
-into a descriptor with no declared reach remains local unless some other
-explicit law says otherwise.
+`Peer::refresh` is the mutable-store boundary. It drains verified network
+events, inserts them monotonically, crosses one storage durability barrier,
+and only then replaces the immutable snapshot served by the host. Thus remote
+readers never observe a newly admitted batch before that batch is durable.
+External appends to a file-backed pile are reobserved at this same boundary.
 
-A peer may relay a commit only when it can resolve that commit's exact
-descriptor and the descriptor declares a reach law the peer implements. A
-missing descriptor is a refusal, as is an unrecognized law. `Collection::commit`
-writes the descriptor before the commit, so a publisher's own store contains
-the permission it needs to interpret.
+## Two independent capabilities
 
-The receiving side does not require the descriptor before admitting sparse
-evidence. Admission leaks no local data and requiring descriptor residency
-would defeat sparse discovery. If that receiver later wants to relay the
-commit, it must resolve and apply reach at that later boundary.
-
-The gossip frame contains one strictly verified signed `CollectionCommit`, one
-kind byte, and an eight-byte anti-deduplication nonce. The nonce gives periodic
-replays a fresh transport identity but is not signed and has no semantic
-meaning. Duplicate semantic delivery collapses by intrinsic commit ID, and one
-drained batch crosses one storage flush barrier.
-
-## Gossip is sparse and untrusted
-
-Gossiping a `COMMIT` does not transfer any referenced blob. The receiver may
-learn exact handles for the descriptor, data, metadata, and attachments while
-possessing none of their bytes. Admission also does not manufacture a WANT.
-
-Capability claims are ordinary content-addressed blobs and complete proofs are
-native set records, but CONNECT carries the exact required proof and claims
-inline. Authentication never performs a pre-auth proof lookup or blob fetch.
-
-Sparse discovery lets a node learn a large global frontier and then apply its
-own cache, trust, authority, and derivation policy. Evidence answers “what has
-been asserted?” A WANT answers “what content or computation should this node
-obtain?” Treating the first as the second would turn observation into
-involuntary full replication.
-
-The application selects the gossip topic explicitly. It need not equal the
-CONNECT trust root, and knowing or joining it is not authority. In particular,
-a CONNECT capability does not grant gossip membership or make a gossip carrier
-trusted. Safety comes from strict verification of each signed commit plus reach
-checks at relay time, not from trusting the mesh participant that forwarded it.
-
-`Peer::refresh` performs both sides of local sparse synchronization:
-
-1. drain pending gossip frames, strictly verify, canonicalize, and admit them;
-2. refresh the immutable snapshot served by direct RPC;
-3. announce newly added blobs to the DHT; and
-4. gossip newly visible commits whose descriptors permit relay.
-
-Construction drives one initial refresh, so resident blobs and existing
-evidence are published without a separate startup ritual. The host later
-reads the current durable snapshot every 30 seconds and replays the relayable
-commit frontier with fresh nonces. It does not retain a second unbounded ledger
-mirror.
-
-## Durable peer evidence
-
-Core storage exposes one monotone topology primitive:
-`PEER(team_public_key, peer_public_key)`. It is an unsigned, canonical
-two-key fact stored through `PeerStore`; concatenating piles unions the set.
-There is deliberately no inverse record. Its presence says only “this peer is
-a routing candidate associated with this team.” It grants no capability,
-proves no liveness or reachability, promises no resident data, and retains no
-blob.
-
-The current network host does not consume this set yet: configured endpoint
-tickets and process-local successful custody neighbors remain its operational
-inputs. Keeping the storage fact narrower than that behavior makes it a clean
-foundation for a later unified transport with quality-of-service policies,
-rather than silently introducing a second peer protocol in this change.
-
-## Durable WANTs
-
-`WantStore` records local operational interest. Its canonical request key has
-three variants:
-
-- `Blob(handle)` asks to obtain exact content;
-- `Merge(collection, low, high)` asks whether a matching native `MERGE`
-  receipt exists; and
-- `Derive(target, input)` asks whether a matching native `DERIVE` receipt
-  exists. The target descriptor already names the source collection and
-  recipe.
-
-The long-running `Reconciler` services these questions without deleting them.
-An unavailable answer is normal: the WANT remains durable and retries with
-bounded exponential backoff.
-
-Blob fulfillment first tries configured or recently live team peers as routing
-candidates, then falls back to DHT provider discovery. A candidate is not
-presumed to hold the blob, and every returned payload must still hash to the
-requested BLAKE3 handle.
-
-Merge and derive questions have no result hash to feed into the DHT. They are
-therefore probed against explicitly configured authenticated peers. Every exact
-native receipt returned before the deadline is unioned into the local
-`CollectionStore`. A sweep is complete only when every configured peer
-answered; partial answers remain useful evidence but temporary unreachability
-never becomes proof of absence. Obtaining a receipt's result bytes is a
-separate `Blob(result)` WANT.
-
-## Direct CONNECT authentication
-
-All direct point-to-point operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/9"`. The first stream on every
-connection must be `OP_AUTH`. Its request carries one length-prefixed canonical
-proof bundle inline:
+Every useful connection proves two exact actions rooted at the same team key:
 
 ```text
-OP_AUTH
-bundle_length:u32be
-bundle:
-    version:u8 = 1
-    count:u8
-    proof: K0 (S C K){count}
-    repeat count times:
-        claim_length:u16be
-        claim:bytes
-```
-
-The server obtains the caller's Ed25519 public key from the authenticated
-transport and verifies this exact claim:
-
-```text
-subject  = transport peer key
+CONNECT
+subject  = authenticated transport peer key
 action   = ACTION_CONNECT
-resource = configured CONNECT trust-root public-key bytes
+resource = team public-key bytes
+mode     = Invoke
+
+SYNC_TEAM
+subject  = authenticated transport peer key
+action   = ACTION_SYNC_TEAM
+resource = team public-key bytes
 mode     = Invoke
 ```
 
-The proof root must equal the configured trust root and its final key must equal
-the transport peer. Every strict signature binds issuer key, exact claim
-handle, and delegate key. Ordered keyless claims must form one parent-claim
-path whose exact atom, mode intersection, and inclusive validity intersection
-satisfy the request at the explicit current epoch. Empty, truncated,
-oversized, reordered, malformed, expired, not-yet-valid, or claim-mismatched
-bundles are rejected. The response is `AUTH_OK` (`0x00`) or `AUTH_REJECTED`
-(`0x01`); a rejected connection is closed. A successful connection is also
-closed after the proof's effective inclusive upper bound, including while idle
-in the shared connection pool.
+The proofs are independent. They may have different ancestry and validity
+bounds, and possession of one never implies the other. Invoke-and-delegate
+authority satisfies an Invoke request; Delegate-only authority does not.
 
-There is no pre-auth exception, remote proof-fetch operation, ambient store
-lookup, or renewal exchange. After a successful first stream, later streams on
-that connection may use the read-only direct RPC surface while its proof
-remains valid:
+The first stream of every connection is `OP_AUTH` with the complete CONNECT
+`CapabilityProofBundle`. Verification uses the externally configured team
+root, the transport-authenticated caller key, and the current time. A rejected
+connection closes. A bounded accepted connection also closes when the
+effective inclusive CONNECT validity interval expires.
 
-| Operation | Byte | Question | Response |
-|---|---:|---|---|
-| `GET_BLOB` | `0x02` | exact 32-byte content handle | bytes or missing |
-| `CHILDREN` | `0x03` | exact parent blob handle | resident referenced handles |
-| `OP_AUTH` | `0x05` | inline exact CONNECT proof bundle | accept or reject; first stream only |
-| `COLLECTION_EVIDENCE` | `0x06` | exact collection descriptor handle | relayable signed commits |
-| `COLLECTION_OPERATION_RECEIPTS` | `0x07` | exact merge/derive WANT key | matching native receipts |
+After CONNECT, `INVENTORY_AUTH` presents the complete SYNC_TEAM bundle once
+for that connection. Successful verification installs one team-selected,
+validity-bounded session. The client cannot nominate another scope, and a
+second authorization attempt on the same connection is rejected. Manifest,
+node, blob-range, and known-hash `GET_BLOB` requests all require this live
+session. Knowing a content hash is not disclosure authority.
 
-The direct protocol has no remote write operation.
+Neither handshake searches the store for a proof or fetches missing claims.
+Each selected bundle contains its exact ordered proof and claim closure inline.
+Stored proof presence remains evidence only.
 
-CONNECT is transport admission, not a permission hierarchy. It grants no
-`ACTION_WRITE`, generic `READ`, gossip, collection reach, semantic author
-trust, custody, or retention. The host's current serving snapshot determines
-which read-only answers exist; content hashes, commit signatures, collection
-reach, application author selection, and local retention policy retain their
-own independent boundaries.
+## Merkle reconciliation
 
-`fetch_collection_evidence_from` returns strictly verified but inert sparse
-evidence from one named authenticated peer. `reconcile_collection_from` adds
-an explicit caller authorization phase and admits the complete accepted batch
-only after transport and validation finish. Neither operation fetches
-referenced content.
+Each component is an ordered PATCH inventory with a canonical BLAKE3 Merkle
+summary. A manifest contains the four component tags, leaf counts, and roots in
+fixed order. Its generation hash binds the version, team key, and all four
+entries. The generation is useful as a wake value and cache key, but it is not
+an authorization token or evidence of global completeness.
 
-## Custody replicas
+A puller compares remote summaries with its local trees and descends only
+differing prefixes. Every node request states the expected component root,
+prefix, count, and digest. Responses are bounded and checked against that
+expectation. Collection and proof bodies are resolved by exact ID only when a
+missing leaf is served.
 
-Sparse public synchronization is deliberately not a backup protocol. A
-separate custody lane converges the complete **resident semantic store** across
-a proof-authorized neighbor graph:
+The manifest pins immutable component snapshots in a bounded server cache.
+Later node and blob-range requests repeat the exact root. If that snapshot has
+expired or been evicted, the server returns `snapshot unavailable`; it never
+splices bytes from its current state into the older walk. The client obtains a
+fresh manifest and restarts that component. Mirror blob transfers use bounded
+ranges and verify the complete BLAKE3 handle before admission.
 
-```text
-BlobStore × CollectionStore × CapabilityProofStore
-```
+Periodic sweeps compare every eligible route even if gossip is silent. A
+gossip frame contains only a version, the exact team key, and a manifest
+generation. It schedules an earlier authenticated check; the delivering mesh
+neighbor is not presumed to be the publisher and is never inserted as a route.
 
-The join is componentwise set union. Custody therefore copies every valid
-resident blob, every canonical native collection record, and every canonical
-native capability proof. It does not copy WANTs, historical pins, append
-timestamps, framing padding, routing state, or retry state. Unknown opaque pile
-records stop startup rather than being silently discarded; recognized retired
-V4 `DERIVE` records are known inert computation and may be omitted.
+## Routing and discovery
 
-This product is semantic, not a comparison of pile byte streams. Bucket
-prefixes are the first byte of canonical blob, record, or proof identities;
-they are not file prefixes, offsets, or append epochs. Snapshot construction
-deduplicates and orders those identities canonically, so piles containing the
-same three sets have the same inventory summary and generation even when their
-records were appended, concatenated, or padded in different orders.
+`PeerConfig.peers` contains bootstrap endpoint IDs or tickets. A successful
+authorized synchronization session and synchronized
+`PEER(team, peer_public_key)` evidence can add routing candidates. PEER set
+union carries those candidates transitively without creating a mutable roster.
 
-Custody uses ordinary Iroh reachability: explicit addresses when supplied,
-direct and NAT-traversed paths when available, and encrypted relays when they
-are not. An operator may bootstrap a node with either a bare endpoint identity
-or an `EndpointTicket` carrying one or more route hints. Custody still exposes
-only the pile-sync protocol: it does not join collection gossip or start the
-blob-provider DHT. Reachability is not authority. The ordinary CONNECT proof
-authenticates the transport, but it grants no custody access. Every summary,
-page, and blob-range request additionally carries a complete proof for the
-exact action
-`ACTION_REPLICATE_STORE = D8453B974E15F5DF17B1B67A338B3EBD`, the exact
-256-bit replica-set resource, the transport peer as leaf, and exact Invoke
-mode.
+An endpoint remains only a candidate until the two proof handshakes succeed.
+Likewise, DHT provider discovery is used only for an exact blob demand. A
+provider advertisement neither proves that bytes are still resident nor
+bypasses CONNECT and SYNC_TEAM. Every returned payload is checked against its
+requested BLAKE3 handle.
 
-Configured peers are bootstrap neighbors, not a global roster. After an
-unknown peer completes CONNECT and one strictly framed summary request with a
-valid REPLICATE proof, the server remembers that identity as a process-local
-neighbor for the intersection of both proofs' validity intervals. It can then
-pull the joiner's resident state on its next sweep. Consequently a joining
-node needs to know only one reachable member of a connected replica graph;
-ordinary componentwise union carries state transitively through the graph.
-There is no durable peer list, membership enumeration, or peer-list gossip.
+The team key derives the production gossip topic, preventing an authorized
+store from accidentally rendezvousing on another team's mesh. Joining that
+topic, observing a generation, or appearing as a gossip neighbor still grants
+no transport or inventory authority.
 
-The bounded anti-entropy protocol adds three operations:
+## Local quality of service
 
-| Operation | Byte | Question | Response |
-|---|---:|---|---|
-| `REPLICA_SUMMARY` | `0x08` | all 256 first-byte buckets of all three components | count, byte total, and BLAKE3 digest per bucket; these derive the inventory-generation token |
-| `REPLICA_PAGE` | `0x09` | summary generation, component, bucket, and exclusive cursor | one sorted bounded page plus a final marker |
-| `REPLICA_BLOB` | `0x0A` | summary generation, exact handle, expected length, offset, and bounded maximum | at most one 1 MiB range or missing |
+Direction controls which work this node performs; it is never sent as an
+authorization claim:
 
-Collection-record IDs are extended with a zero suffix only for page ordering;
-their canonical dense record bytes remain the transferred representation.
-Proofs likewise travel in their canonical native body. Blob ranges land in an
-anonymous file in a caller-selected pile-adjacent directory, are hashed once as
-they arrive, and become a read-only mapping whose verified handle is retained
-through destination admission.
+- `Bidirectional` pulls remote inventories, publishes wake hints, serves local
+  inventory and blobs, and may retain an authenticated inbound peer as PEER
+  routing evidence.
+- `ReadOnly` pulls and services local WANTs, but neither publishes nor serves
+  local inventory or blobs.
+- `WriteOnly` publishes and serves local data, but never pulls,
+  demand-fetches, or records inbound readers as pull routes.
 
-Each sweep obtains immutable remote summaries, validates every completed page
-stream against its advertised bucket digest, and admits all blobs from every
-healthy peer before admitting any of their collection or proof evidence. Blob
-writes cross durability barriers in bounded 64 MiB batches; record and proof
-pages cross a barrier per page. A stale pooled connection is evicted and
-redialed once within the same sweep; a still-failed peer remains incomplete and
-retries on the next sweep while independent peers continue. Receive-file,
-allocation, write, metadata, and mapping failures are local storage failures
-and abort the sweep rather than masquerading as peer unavailability.
-Each accepted summary derives a content identity from the complete summary and
-places that exact immutable serving generation in a bounded process-local
-cache. Every subsequent page and blob request must echo the generation.
-Publishing a newer local snapshot therefore cannot splice its items into an
-older advertised walk, while reconnecting peers and peers that observed the
-same generation share one cached snapshot. A missing or evicted generation is
-rejected and the client restarts from a fresh summary. The cache uses the
-service's global connection-capacity bound for its number of indexed
-generations. Eviction removes lookup eligibility, not necessarily the final
-allocation immediately: up to the global in-flight-request limit may already
-hold a clone or response bytes backed by an evicted snapshot, and those live
-only until their existing request deadlines. The generation token is a
-retry/cache key, never an authorization capability: every request still
-verifies current REPLICATE authority independently.
-Cancellation can abandon only network/page work: store mutations are
-synchronous, temporary receive files close on drop, the transport shuts down
-gracefully, and the pile is explicitly closed before the command exits.
+The blob mode is independent:
 
-## Direction policy
+- `Demand` skips the broad Blob inventory. A durable exact blob WANT first
+  tries configured and learned routes, then authorized DHT provider candidates.
+- `Mirror` also walks the complete authorized Blob inventory and fetches every
+  missing resident blob in bounded ranges.
 
-`PeerConfig::direction` controls local participation without changing evidence
-or authority semantics:
+Mirror describes synchronization work, not a retention promise. An evicting
+store may discard mirrored bytes later; a durable mirror requires a
+non-evicting sink or another explicit retention contract. Direction and blob
+mode cannot widen the server-selected inventory or either capability.
 
-- `Bidirectional` admits incoming evidence, publishes local evidence and blob
-  announcements, and may service WANTs;
-- `ReadOnly` admits incoming evidence and may service WANTs, but publishes no
-  local evidence or blob announcements; and
-- `WriteOnly` publishes but discards incoming evidence and does not fetch.
+## Durable WANTs
 
-These are runtime bandwidth policies, not grants, durable retractions, or
-alternate collection modes. Every direct connection still presents the exact
-configured CONNECT proof. Selecting `gossip_topic: None` similarly disables
-topic participation without changing direct-RPC authority.
+`WantStore` records local operational interest. Its canonical keys ask for an
+exact blob, a matching native `MERGE`, or a matching native `DERIVE` record.
+WANTs remain durable and are retried with bounded backoff; temporary
+unreachability means “not obtained yet,” never “absent.”
+
+Blob WANTs use exact authenticated `GET_BLOB` and DHT-assisted candidate
+discovery in Demand mode. The received bytes are content-checked, landed, and
+flushed before the WANT is counted as fulfilled.
+
+Collection-operation WANTs need no network operation. The full team inventory
+already converges all collection records, including conflicting valid
+answers. The reconciler refreshes the peer and asks the local indexed store for
+matching records. No local match leaves the WANT pending while periodic
+inventory sweeps continue. Obtaining a receipt's result content is a separate
+blob WANT.
+
+## Wire surface
+
+All direct operations use
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/10"`. One QUIC stream carries one
+strictly framed operation:
+
+| Operation | Byte | Purpose |
+|---|---:|---|
+| `GET_BLOB` | `0x02` | read one exact current blob after both authorizations |
+| `OP_AUTH` | `0x05` | present CONNECT bundle; mandatory first stream only |
+| `INVENTORY_AUTH` | `0x08` | install the one connection-local SYNC_TEAM session |
+| `INVENTORY_MANIFEST` | `0x09` | read the four ordered component roots and generation |
+| `INVENTORY_NODE` | `0x0A` | read one expected-digest node from a pinned component |
+| `INVENTORY_BLOB_RANGE` | `0x0B` | read at most one bounded range from a pinned Blob root |
+
+There is no remote write, collection-evidence, operation-receipt, blob-child,
+custody, or replica operation. Receivers admit strictly checked results through
+their own local store boundary.
 
 ## CLI
 
-The `trible` CLI makes team and proof selection explicit:
+The `trible` CLI selects both resident proofs explicitly:
 
 ```text
 trible pile net identity [--key PATH]
     Initialize the key if needed and print this node's iroh identity.
 
-trible pile net status <PILE> --team-root HEX --proof ID [--key PATH]
-    Load the existing key, exact native proof, and its named claim blobs;
-    verify CONNECT at the current time; and report the proof step count.
+trible pile net status <PILE>
+    --team-root HEX --connect-proof ID --sync-proof ID [--key PATH]
+    Resolve both exact native bundles and verify their roots, actions,
+    resources, leaves, Invoke authority, and current validity.
 
-trible pile net sync <PILE> --team-root HEX --proof ID
-    --gossip-topic HEX
+trible pile net sync <PILE>
+    --team-root HEX --connect-proof ID --sync-proof ID
     [--peers ID_OR_TICKET,...] [--key PATH]
-    Run collection-evidence gossip and durable WANT reconciliation.
-    --read-only suppresses publication; --write-only suppresses admission
-    and fetching; --no-lazy disables WANT servicing.
-
-trible team replica create|issue|join ...
-    Provision and import invoke-only proofs under an independent offline
-    replica root and exact replica-set resource.
-
-trible pile net custody status <PILE> ...
-    Validate bootstrap peer ids or tickets, both exact proofs, the receive
-    directory, opaque-record fence, and complete local inventory without
-    opening a socket.
-
-trible pile net custody run <PILE> ...
-    Run foreground custody anti-entropy over ordinary Iroh routing until
-    SIGINT or SIGTERM, and print the live endpoint ticket.
+    [--direction bidirectional|read-only|write-only]
+    [--blobs demand|mirror]
+    [--duration SECS] [--quiescent-for SECS]
+    Run foreground periodic team-inventory reconciliation.
 ```
 
-Set `RUST_LOG=triblespace_net=info` when operating a custody node to record
-both the initially selected Iroh path and any later direct/relay path
-migration without changing route selection.
+`team create` issues founder CONNECT and SYNC_TEAM proofs and reports both
+IDs. `team invite` extends two explicitly selected parent paths and writes one
+versioned portable artifact. `team join` verifies both bundles against the
+separately supplied team root and invitee key before one idempotent store
+write. See [Capability Authorization](capability-auth.md) for the proof model.
 
-`status` and `sync` require the pile, CONNECT trust root, exact proof ID, and
-existing signing key; `sync` additionally requires its independent gossip
-topic. A missing proof or claim, different leaf, invalid ancestry, wrong
-action/resource, non-invoking or currently invalid proof, or absent key is an
-error before networking starts.
-
-The mesh topic is an explicit application choice independent of the CONNECT
-root. `--duration` and `--quiescent-for` can bound a run, but quiescence means
-only that no recent network event or WANT fulfillment was observed. It is not
-a distributed proof that every peer has converged.
+Without a lifecycle flag, `sync` runs until interrupted. `--duration` provides
+a wall-clock bound. `--quiescent-for` is only a local observation that no
+recent inventory admission or WANT fulfillment occurred; it is not a
+distributed proof of convergence.
 
 ## Invariants worth retaining
 
-- Network discovery is set union, not last-writer-wins state.
-- A collection's declared reach authorizes relay, not semantic trust.
-- The gossip carrier is neither the commit author nor a presumed blob holder.
-- Observing a commit never creates hidden content demand.
-- Merge and derive receipts are evidence; their output blobs remain lazy.
-- Direct RPC starts with one inline, exact CONNECT proof bundle.
-- CONNECT authenticates the session and grants no other action or storage
-  policy.
-- Full custody is a separately authorized product union over an authenticated,
-  process-local neighbor graph; it never follows gossip or creates WANTs.
-- Every payload is strictly framed and content/signature checked before it can
-  affect local resolution.
-- Temporary unreachability remains “unknown,” never “absent.”
+- Synchronization is componentwise set union, never last-writer-wins state.
+- The backing store is a single-team security boundary.
+- CONNECT admits transport; SYNC_TEAM separately authorizes every disclosure.
+- Proof presence, PEER evidence, gossip, and DHT discovery grant no authority.
+- Gossip wakes reconciliation; periodic authenticated sweeps establish
+  eventual progress.
+- Every Merkle walk pins exact roots and fails closed when a snapshot is gone.
+- Demand is explicit local interest; inventory observation creates no hidden
+  WANT.
+- Mirror residency is not retention.
+- Operation answers are ordinary converged collection evidence, including
+  conflicts.
+- Temporary unreachability remains unknown, never absent.

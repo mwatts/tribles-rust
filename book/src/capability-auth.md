@@ -140,28 +140,35 @@ mode     = Invoke
 leaf     = authenticated transport peer key
 ```
 
-Protocol v8 carries one length-prefixed `CapabilityProofBundle` in the first
-`OP_AUTH` stream. The server supplies its configured trust root, current TAI
+Protocol v10 carries one length-prefixed `CapabilityProofBundle` in the first
+`OP_AUTH` stream. The server supplies its configured team root, current TAI
 instant, and transport peer key to verification. Rejection closes the
 connection; a bounded accepted session closes after the effective inclusive
 upper validity bound.
 
-CONNECT authorizes only the direct-RPC surface. It grants no collection
-`ACTION_WRITE`, generic read policy, gossip participation, relay reach,
-semantic trust, custody, retention, or blob availability. `gossip_topic` is a
-separate application choice.
+CONNECT admits only the transport connection. It grants no collection
+`ACTION_WRITE`, generic read policy, inventory disclosure, semantic trust,
+retention, or blob availability. A second exact atom,
+`ACTION_SYNC_TEAM(team_root)` in Invoke mode for the same transport key, must
+be presented once through `INVENTORY_AUTH` before manifests, nodes, blob
+ranges, or even a known-hash `GET_BLOB` may be served. These two proofs may
+have different delegation paths and validity bounds. The team root also
+derives the gossip topic, but receiving a wake frame grants neither CONNECT nor
+SYNC_TEAM authority.
 
-There is no pre-auth fetch. The presenter sends the complete bundle inline.
-After authentication, collection records may still converge sparsely: a
-`COMMIT` does not pull its referenced blobs, and an observed handle does not
-create a WANT.
+There is no pre-auth fetch. The presenter sends each complete bundle inline.
+After both authorizations, collection records converge independently of blob
+policy: a `COMMIT` does not pull its referenced blobs in Demand mode, and an
+observed handle does not create a WANT.
 
 ## WANT and gossip boundaries
 
 Capability proof records are durable local set evidence, but the capability
-layer does not automatically gossip them and defines no proof-specific WANT.
-Portable bundles are transferred explicitly, such as in an invite or the
-CONNECT handshake. Claim blobs use the ordinary blob transport and may be
+layer defines no proof-specific gossip or WANT. Authorized team inventory may
+union resident proofs like any other inert evidence; that still does not make
+them active authority. Portable bundles are transferred explicitly when they
+must authorize an operation, such as in an invite or one of the two connection
+handshakes. Claim blobs use the ordinary authorized blob transport and may be
 requested by their exact handles when local policy wants them.
 
 This separation is intentional:
@@ -173,19 +180,21 @@ This separation is intentional:
 
 ## Team bootstrap
 
-A team is named by its Ed25519 trust-root public key. `team create` issues one
-root claim for the founder's key with CONNECT invoke-and-delegate authority,
-stores its claim and proof, and reports the proof ID. The root key is created
-as a private durable file (or loaded from `--root-key`) so it can remain
-offline without depending on terminal output for recovery.
+A team is named by its Ed25519 trust-root public key. `team create` issues two
+root claims for the founder's key—CONNECT and SYNC_TEAM, both initially in
+invoke-and-delegate mode—stores their claims and proofs, and reports both proof
+IDs. The root key is created as a private durable file (or loaded from
+`--root-key`) so it can remain offline without depending on terminal output for
+recovery.
 
-`team invite` loads one exact parent proof by ID, verifies current delegation,
-extends it for the invitee, and writes a portable bundle. `team join` requires
-the expected team-root public key separately, verifies the bundle against that
-external trust root and the invitee key, then inserts its claims and native
-proof. The portable bundle therefore never gets to nominate its own authority.
-`team show` loads one exact proof ID and its named claims; it never scans for a
-roster or chooses among paths implicitly.
+`team invite` loads one exact parent proof for each action, verifies current
+delegation, extends both paths for the invitee, and writes one versioned
+portable artifact. `team join` requires the expected team-root public key
+separately, verifies both bundles against that external root and the invitee
+key, then inserts all claims and both native proofs in one idempotent operation.
+The artifact therefore never gets to nominate its own authority. `team show`
+loads one exact proof ID and its named claims; it never scans for a roster or
+chooses among paths implicitly.
 
 Validity bounds are optional monotone restrictions, not mutable revocation.
 Ending an unexpired grant requires changing the served trust root or another

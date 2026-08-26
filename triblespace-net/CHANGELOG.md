@@ -7,37 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add one SYNC_TEAM-authorized, four-component inventory for a dedicated team
+  store. Canonical BLAKE3 PATCH roots cover `PEER(team, peer)` evidence,
+  collection records, capability proofs, and resident blobs. Root-pinned node
+  requests and bounded blob ranges fail closed when an immutable snapshot is
+  unavailable; key-only record and proof inventories resolve bodies by exact ID
+  only when a missing leaf is served.
+- Add semantic reconciliation QoS. PEER, collection-record, and proof
+  inventories always participate in pulls; `BlobReconcileMode::Demand` leaves
+  broad blobs out while durable WANTs use exact authenticated reads, and
+  `Mirror` also traverses and fetches the complete blob inventory.
+
 ### Fixed
 
-- Bind each private-custody page and blob walk to the exact immutable snapshot
-  that answered that peer's summary. Page and blob requests echo the summary's
-  content-derived generation token; missing or superseded tokens fail closed.
-  A concurrent local append can publish the next serving generation without
-  splicing extra items into an older bucket walk and tripping strict
-  advertised-summary validation. One replaceable persistent pin per configured
-  peer, together with existing request limits, keeps retained generations
-  bounded.
+- Reobserve externally appended pile bytes before enumerating any inventory
+  component, and expose a replacement serving snapshot only after one batched
+  admission flush succeeds. A bounded event queue applies backpressure between
+  network walks and the synchronous store.
+- Accept normal `InvokeAndDelegate` SYNC_TEAM proofs wherever Invoke is
+  requested, while still rejecting delegate-only authority. Exact blob reads
+  now require the same connection-local SYNC_TEAM session as inventory reads;
+  CONNECT alone discloses nothing.
+- Schedule immediate and periodic direct sweeps independently of lossy gossip,
+  isolate failures per peer, bound dial and operation deadlines, evict failed
+  pooled sessions, and retain a fair pending queue beyond the concurrent-sweep
+  limit. Provider-lease renewal remains active for write-only publishers and
+  silent for read-only consumers.
+- Enforce direction policy at the data boundary: read-only peers neither
+  advertise nor serve local inventory or blobs; write-only peers never pull,
+  demand-fetch, or admit inbound readers as durable PEER evidence.
 
 ### Changed
 
-- Move pile sync to ALPN `/triblespace/pile-sync/9` and carry one bounded
-  `CapabilityProofBundle` in the first `OP_AUTH` stream. The native
-  `K0 (S C K)+` body binds each issuer, exact keyless claim handle, and delegate
-  key; the bundle carries the ordered claim blobs. The verified leaf must
-  invoke exact `ACTION_CONNECT` for the transport peer on the configured trust
-  root's 32 public-key bytes at the explicit current epoch. The effective
-  validity intersection closes an authenticated connection after its inclusive
-  upper bound, so a pooled connection cannot outlive authority. One 10-second
-  inbound deadline covers the first stream and complete AUTH frame, including
-  trailing-byte validation, so silent or partial peers cannot retain one
-  unauthenticated connection indefinitely. Version 9 also adds the exact
-  summary-generation token to custody page and blob request frames, so a
-  version-8 peer is rejected during protocol negotiation instead of
-  misinterpreting either request body.
-- Separate `PeerConfig::connect_root` from
-  `PeerConfig::gossip_topic: Option<[u8; 32]>`. Gossip topology is selected
-  explicitly and is never inferred from authorization identity; production
-  iroh and the deterministic simulator both enforce the separation.
+- Replace collection-evidence gossip, exact receipt RPCs, and the separate
+  custody replica protocol with one periodic inventory anti-entropy path.
+  Gossip now carries only a versioned `(team, generation)` wake hint; periodic
+  direct sweeps are the correctness mechanism. Operation WANTs observe matching
+  receipts through the local indexed collection-record union after refresh.
+- Replace the split peer configuration with `PeerConfig { peers, team,
+  connect_proof, sync_proof, qos }`. The team trust root also derives the gossip
+  topic. CONNECT admits the transport, then exactly one SYNC_TEAM exchange
+  selects disclosure authority for that connection.
+- Move pile sync to ALPN `/triblespace/pile-sync/10`. Remove the unused
+  CHILDREN and collection-specific operations; retain exact `GET_BLOB` and add
+  bounded inventory authorization, manifest, node, and blob-range operations.
+- Use configured endpoint addresses only as bootstrap routes. Authorized
+  sessions and synchronized monotone PEER evidence add routing candidates but
+  never authority, liveness, residency, or retention claims. Gossip neighbors
+  are not routes.
 
 ## [0.41.4] - 2026-05-17
 

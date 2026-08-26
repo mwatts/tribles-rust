@@ -87,9 +87,12 @@ empty presentation set is a valid policy that admits nobody.
 strictly verified signer.
 
 The reach argument is explicit because it participates in collection identity.
-`reach::private()` declares nothing and keeps commits local; `reach::public()`
-states that any holder may relay verified commits. A derived collection states
-its own reach independently of its source.
+`reach::private()` declares no permissionless relay; `reach::public()` states
+that any holder may relay verified commits. A derived collection states its
+own reach independently of its source. Reach is distinct from explicit
+team-store synchronization: SYNC_TEAM authority admits the complete inventory
+of a store already dedicated to that team, including records for private
+descriptors.
 
 ### What publication writes
 

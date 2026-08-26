@@ -123,7 +123,7 @@ normally states:
 - an optional capability trust root;
 - the element representation;
 - the join recipe; and
-- a reach law governing proactive relay.
+- a reach law governing permissionless relay.
 
 A derived descriptor names its source collection, the homomorphism recipe, and
 its own optional capability trust root. Trust never inherits from the source.
@@ -205,9 +205,10 @@ authors, retain all referenced data, or force another node to perform work.
 They are durable coordination-free questions which a reconciler may satisfy by
 fetching content or unioning a matching native equation into the local store.
 
-Keeping WANT orthogonal prevents sparse gossip from becoming involuntary full
-replication. A peer can learn the global commit frontier cheaply, then decide
-which blobs and derived representations are useful locally.
+Keeping WANT orthogonal prevents metadata convergence from becoming
+involuntary blob mirroring. A peer can learn its authorized team's collection
+record frontier, then decide which blobs and derived representations are
+useful locally.
 
 ## Peer evidence is topology, not authority
 
@@ -223,10 +224,12 @@ union without coupling transport policy to capability verification.
 `Pile` stores blobs, native collection records, capability proofs, peer
 evidence, and WANT records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
-content-derived object keys. The network layer gossips sparse signed commits,
-uses a DHT and authenticated QUIC for blob lookup, and services exact
-merge/derive questions. In every case convergence means unioning evidence; it
-does not mean electing a winner.
+content-derived object keys. The network layer uses authenticated Merkle walks
+to union one team's PEER evidence, collection records, proofs, and optionally
+blobs. Team-derived gossip carries wake hints, the DHT finds candidates for
+exact blob demand, and merge/derive questions are answered from the converged
+local record index. In every case convergence means unioning evidence; it does
+not mean electing a winner.
 
 Legacy branch and pin records remain decodable only so old piles can be
 inspected, conservatively retained, and explicitly migrated. They are not part

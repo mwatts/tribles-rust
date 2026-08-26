@@ -2,9 +2,9 @@
 //!
 //! [`SimNet`] is a process-local network: nodes join it, get a
 //! [`Harness<SimTransport>`] back, and from there the *entire*
-//! production protocol stack — host loop, CONNECT-authenticated reads and
-//! collection-evidence gossip — runs unmodified over in-memory pipes instead
-//! of iroh QUIC.
+//! production protocol stack — host loop, CONNECT/SYNC_TEAM-authorized
+//! inventory reads, and generation-wake gossip — runs unmodified over
+//! in-memory pipes instead of iroh QUIC.
 //!
 //! # Determinism contract
 //!
@@ -50,9 +50,8 @@ use tokio::sync::mpsc;
 
 use super::{Alpn, Conn, GossipEvent, GossipSink, Harness, Incoming, PeerId, Transport};
 
-/// Capacity of each in-memory stream pipe. Generous enough that
-/// protocol frames never deadlock on backpressure (max blob size is
-/// enforced above the seam at 1 MiB; chain blobs are tiny).
+/// Capacity of each in-memory stream pipe. Bounded inventory blob ranges are
+/// at most 1 MiB; larger exact reads rely on normal concurrent backpressure.
 const PIPE_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Tunables for the simulated network.
@@ -169,8 +168,8 @@ impl SimNet {
     }
 
     /// Join the network as `id`. Returns the transport harness for the node's
-    /// host loop. `gossip_topic` independently selects the gossip mesh; `None`
-    /// disables gossip (mirrors `PeerConfig::gossip_topic`).
+    /// host loop. Production always passes the team-derived topic; the optional
+    /// value is a simulator seam for testing gossip loss and topic isolation.
     ///
     /// Joining emits `NeighborUp` both ways between the new node and
     /// every existing gossip participant — the sim mesh is fully

@@ -51,8 +51,9 @@ proof presence.
 
 ### Capability Proof Bundle
 A complete portable capability proof plus the exact claim blobs it names in
-root-to-leaf order. Invites and CONNECT carry this bounded self-contained form,
-so verification needs no pre-auth fetch or ambient lookup.
+root-to-leaf order. Invites, CONNECT, and SYNC_TEAM authorization carry this
+bounded self-contained form, so verification needs no pre-auth fetch or
+ambient lookup.
 
 ### Capability Proof Store
 A grow-only native set of canonical capability proofs. It supports
@@ -106,10 +107,10 @@ their dependencies.
 The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
 direct-RPC session. Its resource is the team's exact 32-byte trust-root public
 key, and its claimed subject must equal the transport peer key. CONNECT grants
-no WRITE, generic READ, gossip, collection reach, semantic trust, custody, or
-retention authority. Protocol v8 carries the complete proof bundle inline on
-the connection's first `OP_AUTH` stream; the gossip topic is a separate
-application choice.
+no WRITE, generic READ, inventory disclosure, collection reach, semantic
+trust, or retention authority. Protocol v10 carries the complete proof bundle
+inline on the connection's first `OP_AUTH` stream. A separate SYNC_TEAM proof
+for the same team and endpoint must authorize inventory and blob reads.
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
@@ -189,12 +190,20 @@ referencing those blobs stay portable. The corresponding traits are
 
 ### Team Root
 The external Ed25519 key expected as `K0` in a team's direct capability proofs.
-For transport, the public key's exact 32 bytes are also the CONNECT resource.
-The root does not imply gossip rendezvous or proof availability;
-`PeerConfig.connect_root` and its independently chosen `gossip_topic` keep
-those concerns separate. Keeping the secret offline after bootstrap is
-operational practice, not a one-use rule: anyone holding it can issue another
-independent root proof.
+Its exact 32 public bytes are the resource for both CONNECT and SYNC_TEAM, the
+scope prefix for the four-component inventory, and the deterministic gossip
+topic. These shared bytes do not conflate authority: receiving team gossip or
+holding one proof never implies the other proof or any data access. Keeping
+the secret offline after bootstrap is operational practice, not a one-use
+rule: anyone holding it can issue another independent root proof.
+
+### SYNC_TEAM
+The exact `ACTION_SYNC_TEAM` atom used by `triblespace-net` to authorize one
+team inventory session after CONNECT. Invoke authority for the authenticated
+transport key permits disclosure of that team's PEER, collection-record,
+capability-proof, and blob inventory. It is connection-local, validity-bounded,
+and independent of routing evidence, gossip participation, and local
+Demand/Mirror or direction policy.
 
 ### Trible
 A three-part tuple of entity, attribute, and value stored in a fixed 64-byte

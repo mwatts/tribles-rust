@@ -9,18 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add the authorization and framing foundation for one four-component
-  inventory synchronization protocol. Exact `SYNC_TEAM(team_public_key)`
-  authority selects the one full-team inventory independently of CONNECT.
-  Manifests bind the team to four ordered PEER, collection-record,
-  capability-proof, and blob PATCH roots; PEER locators are relative to the
-  authenticated team prefix, and the PEER root is the matching subtree of the
-  existing global `team || peer` index. PATCH inventories carry keys only;
-  collection-record and capability-proof bodies are resolved by exact id only
-  when a leaf is served. Expected-digest node and bounded blob-range frames pin
-  an exact component root and reject unavailable snapshots instead of falling
-  back to current state. Demand versus Mirror and read/write direction remain
-  local policy; evidence presence never grants authority.
+- Add one authorized four-component inventory synchronization protocol for a
+  single-team store. Exact `SYNC_TEAM(team_public_key)` authority selects PEER,
+  collection-record, capability-proof, and blob PATCH roots independently of
+  CONNECT. Expected-digest node and bounded blob-range frames pin exact roots
+  and reject unavailable snapshots instead of falling back to current state.
+  Demand versus Mirror and bidirectional/read-only/write-only direction are
+  local policy; evidence presence never grants authority. Team-derived gossip
+  carries only generation wake hints, while periodic authenticated sweeps
+  remain the correctness path.
 
 - Add native monotone `PEER(team_public_key, peer_public_key)` routing
   evidence. `PeerStore`, `MemoryRepo`, and `Pile` expose one canonical
@@ -28,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   self-describing fixed frame and indexes it with `PATCH<64>`. Concatenation,
   reopen, reframe, and retained rewrites preserve union semantics, while the
   fact deliberately grants no authority and implies no liveness,
-  reachability, residency, or retention. Network behavior is unchanged.
+  reachability, residency, or retention. Authorized inventory sessions
+  synchronize this evidence and use it as routing candidates; unauthenticated
+  gossip neighbors never become routes.
 
 - Make PATCH's subtree summary a sealed policy parameter while preserving
   `XorSip128` as the zero-overhead default. Add `Blake3Merkle`, a canonical
@@ -37,24 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   total count, and each child edge/count/digest tuple; archive-backed and heap
   construction share the same policy-generic path and root.
 
-- Add proof-gated custody replication for complete private pile replicas.
-  `trible team replica {create,issue,join}` provisions an exact independent
-  `REPLICATE` capability, while `trible pile net custody {status,run}`
-  reconciles the resident product of blob bytes, native collection records,
-  and native capability proofs over static Iroh endpoint tickets. Peers compare
-  256 deterministic first-byte buckets and transfer bounded pages and blob
-  ranges; operational WANTs, historical pins, timestamps, padding, and opaque
-  future records remain local. Every operation requires both the connection
-  proof and its own exact replica proof, and graceful shutdown keeps in-flight
-  Iroh handshakes alive on the endpoint runtime until router closure releases
-  transport accounting. Stale pooled connections redial within the same sweep,
-  while local receive-storage failures remain fatal local errors rather than
-  being reported as unavailable peers.
-
 - Recognize the retired V4 collection `DERIVE` record as known inert
   computation rather than an opaque future record. Replay projects no current
-  collection evidence from it, and semantic retention or custody rewrites may
-  omit it; genuinely unknown kinds continue to stop destructive rewriting.
+  collection evidence from it, and semantic retention rewrites may omit it;
+  genuinely unknown kinds continue to stop destructive rewriting.
 
 - Expose `FrontierStats::peak_region()` as the largest proposal region one
   query level materialised at once. This is the proposal-memory high-water
@@ -76,15 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source-to-target mapping, including deterministic many-to-one collapse and
   idempotent replays.
 
-- Add direct team proofs to `trible team`. `create` stores a keyless founder
-  CONNECT claim and native `K0 (S C K)+` proof; `invite` loads one exact parent
-  proof ID and exports the extended portable bundle; `join` verifies the root,
-  expected leaf, CONNECT atom, mode meet, and explicit current time against a
-  separately supplied trust root before storing its claims and proof; and
-  `show` selects one proof by ID. Optional
-  paired RFC 3339 bounds map to inclusive validity intervals. `pile net`
-  likewise selects an exact `--proof`, while `sync` requires a separate
-  explicit `--gossip-topic`.
+- Add paired direct team proofs to `trible team`. `create` stores keyless
+  founder CONNECT and SYNC_TEAM claims with native `K0 (S C K)+` proofs;
+  `invite` loads both exact parent proof IDs and exports one versioned portable
+  artifact; `join` verifies both roots, expected leaves, exact atoms, mode
+  meets, and current time against the separately supplied team root before one
+  idempotent store write; and `show` selects one proof by ID. Optional paired
+  RFC 3339 bounds map to inclusive validity intervals. `pile net` selects exact
+  `--connect-proof` and `--sync-proof` IDs, and derives gossip rendezvous from
+  the team root.
 
 ### Changed
 
@@ -137,12 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every edge and is addressed by BLAKE3 over its exact bytes. Verification
   takes an external trust root, expected leaf, explicit epoch, and request, and
   computes the claims' meet without storage discovery. Pile-sync moves to ALPN
-  v9, carries one self-contained proof bundle in the first `OP_AUTH` stream,
-  and binds custody page and blob request frames to the content-derived summary
-  generation; mixed v8/v9 endpoints fail protocol negotiation. Proof records
-  are a native grow-only set with exact lookup and direct claim rooting; their
+  v10. The first `OP_AUTH` stream carries one self-contained CONNECT bundle;
+  one later connection-local `INVENTORY_AUTH` installs the independent
+  SYNC_TEAM session required by manifest, node, blob-range, and exact blob
+  reads. Mixed older endpoints fail protocol negotiation. Proof records are a
+  native grow-only set with exact lookup and direct claim rooting; their
   presence grants no authority and creates no implicit gossip or WANT.
-  `PeerConfig::gossip_topic` remains an independent rendezvous choice.
+  `PeerConfig` now takes one team root, both proof bundles, bootstrap routes,
+  and local reconciliation QoS; its gossip topic is derived from the team
+  root.
 
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.
@@ -811,46 +799,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical request key.** `WantRequest` has a fixed 97-byte codec: a one-byte
   versioned kind followed by three 32-byte fields. `Blob` uses one handle and
   zero padding, `Merge` uses a collection plus canonically ordered inputs, and
-  `Derive` uses source collection, target collection, and input. Pile assertions
+  `Derive` uses a target collection, input, and zero padding because the target
+  descriptor already names its source. Pile assertions
   and retractions use new one-block envelope kinds
   `9A06797600FA90B8A8259B0ED029EC21` and
   `2D957A780A52E474F58A06D44D6FE46C`, minted with `trible genid` on
   2026-08-13. Legacy weak-pin records still replay into the same set as `Blob`
   requests. Blob writes retain the historical weak-pin envelope kinds so an
   older reader's forgetful projection remains sound; the new kinds are used
-  only for operation wants. Only blob wants participate in fetch and bounded
-  cache retention; merge and derive wants are durable questions whose answers
-  are existing collection receipts. Reconciliation recognizes locally present
-  exact receipts, probes every configured authenticated peer for unanswered
-  operation questions, unions full 128-byte answers by intrinsic record ID,
-  preserves conflicting outputs, and admits each completed batch before one
-  durability flush. Partial answers from healthy peers are retained when
-  another configured peer stalls, while the question remains pending and is
-  retried until a complete sweep succeeds; restart deliberately performs a
-  fresh sweep so a partially persisted conflict set cannot masquerade as
-  complete. Inputs—not unknown result hashes—are the discovery key, so this
-  path deliberately does not use the blob DHT. Blob fulfillment now crosses
-  the same explicit durability barrier before quiescing.
+  only for operation wants. Only blob wants participate in exact fetch and
+  bounded cache retention; merge and derive wants are durable questions whose
+  answers are ordinary collection records. The authorized team inventory
+  converges all such records, including conflicting answers, and reconciliation
+  checks the local indexed union after refresh instead of issuing a second
+  receipt RPC. Inputs—not unknown result hashes—remain the discovery key, so
+  this path deliberately does not use the blob DHT. Blob fulfillment crosses
+  an explicit durability barrier before quiescing.
 - **Native collection records now use one dense typed representation.**
   `COMMIT`, `MERGE`, and `DERIVE` no longer masquerade as queryable
-  `SimpleArchive` entities: their exact payloads are fixed at 192, 128, and
-  128 bytes, respectively, with structural `to_bytes`/`from_bytes` codecs.
+  `SimpleArchive` entities: their exact payloads are fixed at 192, 128, and 96
+  bytes, respectively, with structural `to_bytes`/`from_bytes` codecs.
   Generic record stores use one stable versioned variant tag around those
   payloads. Record IDs are derived directly from a domain, semantic kind,
   codec version, and every dense payload byte; merge decoding rejects
   noncanonical input order. Collection descriptors remain self-describing
   `SimpleArchive` blobs whose handles are the collection identity.
-- **Authenticated peers can reconcile one exact native collection without
-  reviving branch or tracking-pin semantics.** A new read-only operation
-  enumerates deterministic, strictly verified grant/commit evidence for an
-  exact descriptor handle and requires an unrestricted read capability.
-  The wire carries only a 128-byte redistribution grant followed by the exact
-  192-byte dense commit. Destination admission remains a separate policy
-  boundary: it completes every decision before mutation, inserts the accepted
-  grow-only evidence, and flushes once. Descriptor, data, metadata, and
-  attachments remain independent lazy blobs resolved through ordinary wants;
-  missing residency neither invalidates nor delays the signed evidence.
-  Existing blob and branch operations are unchanged.
 - **Pile diagnostics can decode one exact physical record boundary.**
   `trible pile diagnose record-at <pile> <offset>` walks the canonical replay
   decoder without modifying the pile, reports the marker, classification,
@@ -860,17 +833,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or torn known records mention the opt-in destructive repair. `diagnose check`
   also reports the count and boundary offsets of inert legacy V3 collection
   evidence and opaque records.
-- **Collection publication is an orthogonal grow-only store capability.**
-  `CollectionGossipStore` holds fixed 128-byte Ed25519 grants authorizing
-  redistribution of one author's strictly verified commits in an exact
-  descriptor-identified collection. There is intentionally no `ungossip`:
-  observed publication cannot be revoked by later local state. Grants are not
-  collection-calculus records, admission proofs, access control, delivery
-  requests, or GC roots. Memory, hybrid, lazy, Pile, Yard, sync/async adapters,
-  and object-store backends preserve deterministic set union. Pile kind
-  `9BB5B1F4D6FD8FB850B494C2CF51B5CA` was minted with `trible genid` on
-  2026-08-12; its envelope stores collection, author, R, and S directly and
-  remains valid before the named descriptor or commits arrive.
 - **Ordinary collections now expose coherent authority-aware known-prefix
   snapshots.** `Collection::snapshot()` resolves the team's positive authority
   DAG, discovers every exact commit whose signer may invoke `ACTION_WRITE` on
@@ -909,15 +871,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit, retries are intrinsic-idempotent, and a union of independently
   modified piles exposes concurrent heads as a fail-closed conflict instead of
   selecting an order-dependent winner. Explicit successors can converge those
-  forks. Policy collection membership is not
-  gossiped by default and `Peer` deliberately exposes no `CollectionStore`
-  adapter. The public `LocalCellStore`/`AsyncLocalCellStore` footgun and every
-  backend writer were removed. Existing enveloped and unenveloped cell records
-  remain raw-visible as opaque migration evidence; semantic rewrite and Yard
-  reclaim refuse them rather than silently discarding private state. The
-  former legacy-policy pin gossip guard disappeared with mutable HEAD gossip
-  itself; old pins remain raw-visible migration evidence but are never
-  replicated as semantic state.
+  forks. `Peer` deliberately exposes no direct `CollectionStore` adapter;
+  native records already present in its dedicated team store participate in
+  the authorized inventory like every other collection record. The public
+  `LocalCellStore`/`AsyncLocalCellStore` footgun and every backend writer were
+  removed. Existing enveloped and unenveloped cell records remain raw-visible
+  as opaque migration evidence; semantic rewrite and Yard reclaim refuse them
+  rather than silently discarding private state. Old policy pins remain
+  raw-visible migration evidence but are not current semantic state.
 - **Signed records now use neutral metadata and attestation namespaces.** The
   generic metadata-archive link and Ed25519 signer/signature attributes moved
   out of the legacy repository module without changing their stable IDs or
@@ -1170,15 +1131,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Callers may batch publications behind an explicit `StorageFlush::flush()` or
   rely on storage close, matching Pile's append-only visibility model and
   removing two `sync_all` calls from every collection commit.
-
-- **The collection-native pile-sync protocol now fails fast against legacy
-  peers through ALPN `/triblespace/pile-sync/5`.** Protocol v4 still exposed
-  branch operations and used a different collection-evidence frame width;
-  advertising that same ALPN after removing those operations made mixed peers
-  negotiate successfully and then disagree on the wire. There is deliberately
-  no compatibility shim. Direction policy applies only to replication data;
-  capability requests, deliveries, and acknowledgements remain live for every
-  direction.
 
 - **Durable demand/cache interest is now a standalone `WantStore`.** The
   public `want`, `unwant`, and `wants` surface no longer inherits named
@@ -2781,20 +2733,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Implemented by the `object_store` backend (`ObjectStoreReader`),
   `Lazy<S>`/`LazyReader` (the waiting read), and `triblespace-net`'s
   `PeerReader` (the transparent local-then-swarm async get).
-- **Live two-pile sync proven over the real iroh transport** (the v0.47.0
+- **Exact Demand fetch proven over the real iroh transport** (the v0.47.0
   release gate). `tests/iroh_two_pile_sync.rs` runs two `Peer<Pile>`s over
-  real iroh endpoints (`iroh::test_utils` `TestNetwork` packet layer;
-  everything above it — DHT node, protocol router, OP_AUTH, gossip topic,
-  host loop — is the production stack via
-  `transport::iroh::bind_with_endpoint`): a commit on pile A gossips its
-  HEAD and B's "main" converges to A's head commit (eager), and a
-  never-committed blob held only by A is fetched by B's `Reconciler` from
-  a durable weak-pin want (lazy). `examples/two_pile_sync_demo.rs` proves
-  the same two properties as two OS processes over real UDP/QUIC on
-  loopback (relay-free, `MemoryLookup` direct addressing). To enable the
-  composition, the host wiring (`host::wire` / `host::run_host`) is now
-  public unconditionally rather than behind the `sim` feature —
-  `bind_with_endpoint` was already public for exactly this use.
+  real iroh endpoints on the `iroh::test_utils` `TestNetwork` packet layer;
+  everything above it—DHT node, protocol router, CONNECT and SYNC_TEAM
+  authorization, team-derived gossip, and host loop—is the production stack
+  via `transport::iroh::bind_with_endpoint`. A never-committed blob held only
+  by A is exact-fetched and content-verified when B's `Reconciler` services a
+  durable WANT over its configured route. Host wiring remains public so the
+  real adapter can be composed with the controlled packet transport.
 
 - **`Lazy<S>` — the no-network-by-construction lazy reader.**
   New `triblespace_core::repo::lazy` module (exported from the prelude):
@@ -2835,19 +2782,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   async get) previously had per-stage deadlines only (3s DHT lookup, 10s
   dial + 30s op per provider) and could stack them to 40s+ of caller hang
   across a provider list. The whole resolution is now bounded: interactive
-  reads get a 5s overall budget (`host::INTERACTIVE_FETCH_DEADLINE`),
+  reads get a 10s overall budget (`host::INTERACTIVE_FETCH_DEADLINE`),
   `Peer::fetch_blob_with_deadline` exposes the knob, and the background
   want-reconciler keeps a generous 30s default
   (`reconcile::RECONCILE_FETCH_DEADLINE`, tunable via
   `Reconciler::with_fetch_budget`). Expiry is plain Unavailable — a recorded
   want stays recorded, so an expired budget defers the fetch, never loses
   the demand.
-- **Publisher-first shortcut for read-miss fetches.** The host keeps a small
-  gossip-known publisher registry (most-recent-first, capped at 8), noted on
-  every HEAD frame arrival; on-demand fetches try those publishers directly
-  before falling back to the DHT lookup. Previously the on-demand path always
-  paid the DHT round-trip — and on a dark DHT failed outright even with a
-  reachable publisher one gossip hop away.
+- **Route-first shortcut for read-miss fetches.** On-demand fetches try
+  configured bootstrap routes and synchronized PEER routing candidates before
+  falling back to DHT provider lookup. Gossip neighbors are never routes, and
+  every candidate must pass both CONNECT and SYNC_TEAM authorization.
 
 - **Durable weak pins.** Two new V3 pile record kinds — weak-pin and
   weak-unpin markers (fixed 256-byte headers, keyed by blob handle, no branch
@@ -2868,23 +2813,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from before this change treat the new markers as unknown records — they
   fail loud on such piles (and never truncate, per the explicit-amputate
   posture above).
-- **Lazy content sync — the want-reconcile loop.** `trible pile net sync` now
-  services durable weak-pin **wants** (fetch-on-want): each pass re-reads the
-  pile (weak-pin records appended by other processes — faculties writing "I
-  would like X" — become visible), diffs the LWW-resolved weak-pin set against
-  the blobs actually present, and swarm-fetches the missing ones, landing them
-  under their existing weak pin. A want nobody serves stays pending — normal,
-  never an error, never dropped — and is retried with per-want exponential
-  backoff (1s doubling to a 60s cap), logged once per state change rather than
-  per retry. Strong pins/branches are untouched. Enabled by default
-  (content-lazy is the doctrine), including under `--read-only` (a leecher
-  that only services wants is a legit workflow); `--no-lazy` disables it,
-  `--reconcile-interval <secs>` tunes the cadence (default 1s). The sync
-  output gains want counters (seen / fetched / still-pending) and
-  `--quiescent-for` counts a serviced want as activity (pending wants do NOT
-  hold quiescence off). The mechanism lives in the library as
-  `triblespace_net::reconcile::Reconciler` — an async, deterministic-sim-tested
-  `tick(&mut Peer<S>) -> ReconcileStats` — and the CLI is just the wiring.
+- **Demand content sync — the want-reconcile loop.** `trible pile net sync`
+  services durable blob WANTs whenever its direction permits pulling. Each
+  pass reobserves externally appended requests, compares them with resident
+  blobs, and exact-fetches missing content through authorized routes and then
+  DHT candidates. A want nobody serves stays pending—normal, never an error or
+  proof of absence—and retries with exponential backoff from 1s to a 60s cap.
+  Write-only mode suppresses all fetches; read-only and bidirectional modes
+  service WANTs intrinsically, with no separate enable/disable flag. Sync
+  reports seen, fulfilled, and pending counts, and `--quiescent-for` counts a
+  serviced want as activity while a persistently pending want does not prevent
+  local quiescence. The library mechanism remains
+  `triblespace_net::reconcile::Reconciler::tick`.
 - **`trible pile amputate <path>`.** Explicit, opt-in, DESTRUCTIVE repair for a
   pile with a partial or corrupt (torn) tail: loads every valid record and, if the
   tail is torn, truncates the file back to the last known-good offset — destroying

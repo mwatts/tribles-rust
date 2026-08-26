@@ -1,13 +1,12 @@
 //! Two-pile sync over the REAL iroh transport stack — the v0.47.0
 //! release-gate integration test.
 //!
-//! The deterministic-simulation suite (`sim_lazy`,
-//! `sim_collection_gossip`) proves the protocol *logic*; this test proves the
-//! *transport*: two
+//! The deterministic-simulation suite proves the protocol *logic*; this test
+//! proves the *transport*: two
 //! `Peer<Pile>`s — real pile files on disk — run the full production
 //! stack (`transport::iroh::bind_with_endpoint`: protocol router,
-//! iroh-gossip topic mesh, OP_AUTH with an inline CONNECT
-//! proof) over real iroh QUIC endpoints wired through
+//! team-derived iroh-gossip mesh, and inline CONNECT/SYNC_TEAM
+//! authorization) over real iroh QUIC endpoints wired through
 //! `iroh::test_utils` `TestNetwork` (an in-memory packet transport —
 //! no relays, no DNS, no OS sockets — everything above the packet
 //! layer is the production code path).
@@ -15,9 +14,8 @@
 //! A content blob lives only in pile A. B durably records a want for its hash;
 //! a `Reconciler::tick` services the want over B's explicitly configured route
 //! to A and lands the verified bytes in pile B under the still-recorded want.
-//! This preserves real-transport, pile persistence, CONNECT authentication,
-//! content verification, and durable-want coverage without depending on the
-//! retired mutable-HEAD/tracking protocol.
+//! This preserves real-transport, pile persistence, both authorization
+//! boundaries, content verification, and durable-WANT coverage.
 //!
 //! Piles are created under `std::env::temp_dir()` — set `TMPDIR` to
 //! redirect.
@@ -65,8 +63,8 @@ fn proof(
     .unwrap()
 }
 
-/// A fresh pile file. CONNECT proof-bundle bytes travel inline and are
-/// deliberately absent from the pile.
+/// A fresh pile file. Both proof-bundle bytes travel inline and are
+/// deliberately absent from the pile in this transport-focused test.
 fn fresh_pile(dir: &std::path::Path, name: &str) -> Pile {
     let path = dir.join(name);
     std::fs::File::create(&path).expect("create pile file");
@@ -96,7 +94,7 @@ async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
 
 /// Bring one node up over the TestNetwork: bind the endpoint, wire the
 /// full production transport stack (`bind_with_endpoint`: protocol router
-/// and gossip topic), spawn the host loop as a tokio
+/// and team-derived gossip topic), spawn the host loop as a tokio
 /// task, and wrap the pile in a `Peer`.
 async fn bring_up(
     network: &TestNetwork,
@@ -139,8 +137,8 @@ fn init_tracing() {
         .try_init();
 }
 
-/// The shared two-node bring-up: one trust root, two inline CONNECT proof
-/// bundles, and two piles that contain no authentication state.
+/// The shared two-node bring-up: one trust root, paired inline proof bundles
+/// for each node, and two piles that contain no authentication state.
 struct TwoNodes {
     peer_a: Peer<Pile>,
     peer_b: Peer<Pile>,

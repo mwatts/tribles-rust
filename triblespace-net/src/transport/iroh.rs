@@ -245,7 +245,7 @@ async fn bind_n0_endpoint(builder: iroh::endpoint::Builder) -> anyhow::Result<ir
 
 /// Start from the same ordinary iroh/N0 reachability policy everywhere.
 ///
-/// Authorization and replication semantics are layered above this builder;
+/// Authorization and inventory-reconciliation semantics are layered above this builder;
 /// neither a direct address nor relay reachability grants an operation.
 fn n0_endpoint_builder(secret: iroh_base::SecretKey) -> iroh::endpoint::Builder {
     let relay_map = crate::host::dot_stripped_default_relay_map();
@@ -256,8 +256,8 @@ fn n0_endpoint_builder(secret: iroh_base::SecretKey) -> iroh::endpoint::Builder 
 }
 
 /// Build the production transport: bind the ordinary iroh endpoint, register
-/// the protocol-forwarding handler, join the team
-/// gossip topic when configured, and spawn the router.
+/// the protocol-forwarding handler, join the team-derived gossip topic when
+/// configured, and spawn the router.
 ///
 /// Returns `None` if the endpoint fails to bind (already logged) —
 /// the caller's net thread exits, mirroring the old inline behavior.

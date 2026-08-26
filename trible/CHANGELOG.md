@@ -27,10 +27,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   durable key files instead of depending on secret material printed once to a
   terminal. `team join` takes the expected team root separately from the
   bundle, so an invitation can never nominate its own trust root.
-- `pile net status` and `pile net sync` now require an explicit CONNECT trust
-  root and local proof ID, load that exact proof and its claims from the pile,
-  and pass a complete bundle to transport authentication. Gossip uses a
-  separate explicit topic and is never inferred from authorization identity.
+- `pile net status` and `pile net sync` now require explicit
+  `--connect-proof` and `--sync-proof` IDs under one `--team-root`, load both
+  exact claim closures, and verify them for the local endpoint before
+  networking. The team root derives the gossip topic. `sync` exposes only
+  semantic policy—`--direction bidirectional|read-only|write-only` and
+  `--blobs demand|mirror`—plus bootstrap routes and lifecycle bounds.
+- Remove the separate `pile net custody` and `team replica` command families.
+  The single team inventory now reconciles PEER evidence, collection records,
+  capability proofs, and optionally blobs; durable operation WANTs observe the
+  local record union and Demand blob WANTs remain exact authenticated fetches.
 
 ## [0.41.4] - 2026-05-17
 

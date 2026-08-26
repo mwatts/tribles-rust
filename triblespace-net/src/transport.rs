@@ -2,8 +2,8 @@
 //! network, as traits.
 //!
 //! This module exists so the *entire* protocol stack above it — the
-//! host loop, authenticated blob/collection reads, CONNECT verification, and
-//! collection-evidence gossip — can run
+//! host loop, CONNECT/SYNC_TEAM authorization, Merkle inventory reads, and
+//! generation-wake gossip — can run
 //! unmodified against either:
 //!
 //! - [`crate::transport::iroh`]: the production adapter (iroh QUIC and
@@ -74,12 +74,12 @@ pub trait Conn: Clone + Send + Sync + 'static {
     fn close(&self, code: u32, reason: &[u8]);
 }
 
-/// Events surfaced by the explicitly selected gossip topic.
+/// Events surfaced by the team-derived gossip topic.
 #[derive(Debug, Clone)]
 pub enum GossipEvent {
     /// A broadcast frame arrived. `delivered_from` is the mesh
-    /// neighbor that relayed it (NOT necessarily the original
-    /// publisher — the publisher's id rides inside the frame).
+    /// neighbor that relayed it, not an authenticated publisher or a
+    /// routing candidate. Inventory wake frames carry no publisher identity.
     Received {
         bytes: Vec<u8>,
         delivered_from: PeerId,

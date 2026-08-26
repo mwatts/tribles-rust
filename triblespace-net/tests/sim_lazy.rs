@@ -1331,8 +1331,8 @@ fn lazy_fetch_succeeds_across_many_seeds() {
 /// durable want-marker". A faculty (another process) appends a want
 /// record for a blob the node doesn't hold; the sync daemon's reconcile
 /// tick notices the want, fetches the blob from whoever holds it, and
-/// lands it under the existing want. B runs WITHOUT gossip, keeping the test focused on the
-/// reconcile-driven content fetch rather than collection-evidence exchange.
+/// lands it under the existing want. B runs without gossip, keeping the test
+/// focused on exact Demand fetch rather than inventory wake-up.
 #[test]
 fn reconcile_tick_services_out_of_band_want() {
     use triblespace_net::reconcile::Reconciler;
@@ -1501,9 +1501,8 @@ fn reconcile_unsatisfiable_want_stays_pending() {
 /// The content layer is decoupled from the gossip layer. Under **total
 /// gossip loss** the collection-evidence mesh is dark — but the lazy
 /// read uses an explicit authenticated route, which is independent of
-/// gossip, so it must still succeed. A
-/// regression that accidentally routed content discovery through gossip
-/// would fail here.
+/// gossip, so it must still succeed. A regression that accidentally routed
+/// exact content discovery through gossip would fail here.
 #[test]
 fn lazy_fetch_is_independent_of_gossip_liveness() {
     let _g = sim_guard();
