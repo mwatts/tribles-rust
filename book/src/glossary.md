@@ -172,7 +172,8 @@ segments relevant to their bindings, further described in
 
 ### Pile
 An append-only collection of blobs, native collection records, native
-capability proofs, and WANT records stored in one file. Piles are memory
+capability proofs, positive peer-routing evidence, and WANT records stored in
+one file. Piles are memory
 mapped, recoverable after interrupted appends, and mergeable by byte
 concatenation. Legacy pin records remain decodable only for conservative
 retention and explicit migration.

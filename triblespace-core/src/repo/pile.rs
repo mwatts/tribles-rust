@@ -1,6 +1,7 @@
-//! A Pile is an append-only collection of blobs, complete capability proofs,
-//! and legacy branches stored in a single file. It is designed as a durable
-//! local repository storage that can be safely shared between threads.
+//! A Pile is an append-only collection of blobs, collection records, complete
+//! capability proofs, positive peer-routing evidence, wants, and legacy
+//! branches stored in a single file. It is designed as a durable local
+//! repository storage that can be safely shared between threads.
 //!
 //! The pile operates as a **WAL-as-a-DB**: the write-ahead log _is_ the database.
 //! All indices and metadata are reconstructed from the log on startup and no
@@ -66,6 +67,7 @@ use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
+use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
 use crate::repo::{WantRequest, WANT_REQUEST_BYTES_LEN};
 
@@ -860,6 +862,43 @@ struct WantRecordHeader {
     reserved: [u8; 64],
 }
 
+/// Positive peer-routing evidence: `64..96` team key, `96..128` peer key.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct PeerEvidenceRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    team_public_key: RawInline,
+    peer_public_key: RawInline,
+    reserved: [u8; 128],
+}
+
+impl PeerEvidenceRecordHeader {
+    fn new(evidence: PeerEvidence) -> Self {
+        let bytes = evidence.to_bytes();
+        let mut team_public_key = [0u8; 32];
+        let mut peer_public_key = [0u8; 32];
+        team_public_key.copy_from_slice(&bytes[..32]);
+        peer_public_key.copy_from_slice(&bytes[32..]);
+        Self {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_PEER_EVIDENCE,
+            team_public_key,
+            peer_public_key,
+            reserved: [0u8; 128],
+        }
+    }
+
+    fn evidence(&self) -> Result<PeerEvidence, crate::repo::peer::PeerEvidenceDecodeError> {
+        let mut bytes = [0u8; PEER_EVIDENCE_BYTES_LEN];
+        bytes[..32].copy_from_slice(&self.team_public_key);
+        bytes[32..].copy_from_slice(&self.peer_public_key);
+        PeerEvidence::from_bytes(bytes)
+    }
+}
+
 impl WantRecordHeader {
     /// Construct the physical envelope used only by collection-operation
     /// wants. Blob wants deliberately retain the blob-want kind so an older
@@ -1076,6 +1115,7 @@ const _: () = {
     assert!(std::mem::size_of::<PinTombstoneRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<BlobWantRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<WantRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<PeerEvidenceRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionCommitRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
@@ -1222,6 +1262,11 @@ pub enum PileRecordContent {
         data_offset: usize,
         /// Exact proof-body length, excluding zero padding.
         data_len: usize,
+    },
+    /// One positive, monotone peer-routing fact.
+    Peer {
+        /// Exact validated team/peer association.
+        evidence: PeerEvidence,
     },
     /// One recognized legacy V3 collection header.
     ///
@@ -1414,6 +1459,20 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                     data_offset,
                     data_len,
                 },
+            })
+        }
+        record_kind::KIND_PEER_EVIDENCE => {
+            fixed_header()?;
+            let (header, _) =
+                PeerEvidenceRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if nonzero(&[&header.reserved[..]]) {
+                return Err(corrupt());
+            }
+            let evidence = header.evidence().map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Peer { evidence },
             })
         }
         record_kind::KIND_COLLECTION_COMMIT => {
@@ -2180,14 +2239,16 @@ enum Applied {
     WantRetract { request: WantRequest },
     Collection { id: Id },
     CapabilityProof { id: CapabilityProofId },
+    Peer { evidence: PeerEvidence },
     LegacyCollectionV3,
     RetiredCollectionDeriveV4,
     Opaque,
 }
 
 #[derive(Debug)]
-/// A grow-only collection of blobs, complete proofs, and pin heads backed by a
-/// single file on disk.
+/// A grow-only collection of blobs, collection records, complete proofs,
+/// positive peer-routing evidence, wants, and pin heads backed by a single
+/// file on disk.
 ///
 /// Branch updates do not verify that referenced blobs exist in the pile, allowing the
 /// pile to operate as a head-only store when blob data lives elsewhere.
@@ -2210,6 +2271,8 @@ pub struct Pile {
     collection_records: BTreeMap<Id, CollectionRecord>,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     capability_proofs: BTreeMap<RawInline, CapabilityProofIndexEntry>,
+    /// Positive peer-routing evidence keyed by its complete canonical body.
+    peers: PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema>,
     /// Exact byte-distinct legacy V3 collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
@@ -2731,6 +2794,7 @@ impl Pile {
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: BTreeMap::new(),
             capability_proofs: BTreeMap::new(),
+            peers: PATCH::<PEER_EVIDENCE_BYTES_LEN, IdentitySchema>::new(),
             legacy_collection_headers: BTreeSet::new(),
             opaque_records: 0,
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
@@ -2937,6 +3001,10 @@ impl Pile {
                     self.capability_proofs.insert(id.raw, candidate);
                 }
                 Applied::CapabilityProof { id }
+            }
+            PileRecordContent::Peer { evidence } => {
+                self.peers.insert(&Entry::new(evidence.as_bytes()));
+                Applied::Peer { evidence }
             }
             PileRecordContent::LegacyCollectionV3 { .. } => {
                 self.legacy_collection_headers.insert(
@@ -3218,6 +3286,22 @@ pub struct PileCollectionRecordIter {
 /// Deterministic owned snapshot of the pile's complete capability proofs.
 pub struct PileCapabilityProofIter {
     inner: std::vec::IntoIter<Result<CapabilityProof, ReadError>>,
+}
+
+/// Deterministic owned snapshot of positive peer-routing evidence.
+pub struct PilePeerIter {
+    inner: crate::patch::PATCHIntoOrderedIterator<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, ()>,
+}
+
+impl Iterator for PilePeerIter {
+    type Item = Result<PeerEvidence, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|bytes| {
+            Ok(PeerEvidence::from_bytes(bytes)
+                .expect("Pile only indexes structurally decoded peer evidence"))
+        })
+    }
 }
 
 impl Iterator for PileCapabilityProofIter {
@@ -3512,6 +3596,52 @@ impl CapabilityProofStore for Pile {
     }
 }
 
+impl PeerStore for Pile {
+    type PeersError = ReadError;
+    type InsertError = PileWriteError;
+    type PeerIter<'a> = PilePeerIter;
+
+    fn peers<'a>(&'a mut self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+        self.refresh()?;
+        Ok(PilePeerIter {
+            inner: self.peers.clone().into_iter_ordered(),
+        })
+    }
+
+    fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked().map_err(PileWriteError::from)?;
+
+            if self.peers.get(evidence.as_bytes()).is_some() {
+                return Ok(());
+            }
+
+            self.dirty = true;
+            let written = self
+                .file
+                .write(PeerEvidenceRecordHeader::new(evidence).as_bytes())?;
+            if written != ENVELOPE_HEADER_LEN {
+                return Err(PileWriteError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write complete peer-evidence record",
+                )));
+            }
+
+            match self.apply_next().map_err(PileWriteError::from)? {
+                Some(Applied::Peer { evidence: applied }) if applied == evidence => Ok(()),
+                Some(_) | None => Err(PileWriteError::IoError(std::io::Error::other(
+                    "unexpected record after peer-evidence append",
+                ))),
+            }
+        })();
+        let unlock = self.file.unlock();
+        result?;
+        unlock?;
+        Ok(())
+    }
+}
+
 impl BlobStorePut for Pile {
     type PutError = InsertError;
 
@@ -3650,6 +3780,7 @@ impl Pile {
                     Some(Applied::WantRetract { .. }) => {}
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::CapabilityProof { .. }) => {}
+                    Some(Applied::Peer { .. }) => {}
                     Some(Applied::LegacyCollectionV3) => {}
                     Some(Applied::RetiredCollectionDeriveV4) => {}
                     Some(Applied::Opaque) => {}
@@ -3936,6 +4067,8 @@ pub struct PileReframeStats {
     pub collection_records: usize,
     /// Complete capability proofs re-encoded.
     pub capability_proofs: usize,
+    /// Positive peer-routing facts re-encoded.
+    pub peer_evidence: usize,
     /// Records dropped because they never carried live state: inert legacy V3
     /// collection headers, retired local cells, and records of a kind this
     /// reader does not interpret.
@@ -3963,6 +4096,8 @@ pub enum PileReframeError {
     Collection(CollectionInsertError),
     /// A complete capability proof could not be appended.
     CapabilityProof(CapabilityProofInsertError),
+    /// Positive peer-routing evidence could not be appended.
+    Peer(PileWriteError),
     /// The destination was not empty, so the re-encode would have mixed
     /// framings instead of producing a clean file.
     DestinationNotEmpty {
@@ -3989,6 +4124,7 @@ impl std::fmt::Display for PileReframeError {
             Self::CapabilityProof(error) => {
                 write!(f, "failed to re-encode a capability proof: {error}")
             }
+            Self::Peer(error) => write!(f, "failed to re-encode peer evidence: {error}"),
             Self::DestinationNotEmpty { length } => write!(
                 f,
                 "destination already holds {length} byte(s); reframe requires an empty pile"
@@ -4003,7 +4139,7 @@ impl Error for PileReframeError {
         match self {
             Self::Source(error) => Some(error),
             Self::Destination(error) => Some(error),
-            Self::Pin(error) | Self::Want(error) => Some(error),
+            Self::Pin(error) | Self::Want(error) | Self::Peer(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
@@ -4040,6 +4176,8 @@ impl Error for PileReframeError {
 /// * Complete capability proofs are another grow-only content-addressed set.
 ///   Their exact canonical bodies survive reframing; proof ids are physical
 ///   selectors and do not stand in for verification.
+/// * Positive peer-routing evidence is a grow-only set whose canonical dense
+///   bodies survive reframing. It contributes no blob-retention roots.
 /// * Records that never carried live state are dropped and counted: inert
 ///   legacy V3 collection headers, retired local cells, and kinds this reader
 ///   does not interpret. Derived collections are in the same category by
@@ -4149,6 +4287,12 @@ pub fn reframe_into(
                     .map_err(PileReframeError::CapabilityProof)?;
                 stats.capability_proofs += 1;
             }
+            PileRecordContent::Peer { evidence } => {
+                destination
+                    .insert_peer(evidence)
+                    .map_err(PileReframeError::Peer)?;
+                stats.peer_evidence += 1;
+            }
             _ => stats.dropped_inert += 1,
         }
     }
@@ -4168,6 +4312,8 @@ pub struct PileRewriteStats {
     pub wants: usize,
     /// Number of complete capability proofs preserved.
     pub capability_proofs: usize,
+    /// Number of positive peer-routing facts preserved.
+    pub peer_evidence: usize,
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -4199,6 +4345,8 @@ pub enum PileRewriteError {
     Collection(CollectionInsertError),
     /// A complete capability proof could not be appended.
     CapabilityProof(CapabilityProofInsertError),
+    /// Positive peer-routing evidence could not be appended.
+    Peer(PileWriteError),
     /// The completed destination state could not be made durable.
     Flush(FlushError),
 }
@@ -4224,6 +4372,7 @@ impl std::fmt::Display for PileRewriteError {
             Self::CapabilityProof(error) => {
                 write!(f, "failed to preserve a capability proof: {error}")
             }
+            Self::Peer(error) => write!(f, "failed to preserve peer evidence: {error}"),
             Self::Flush(error) => write!(f, "failed to flush rewritten pile: {error}"),
         }
     }
@@ -4234,7 +4383,7 @@ impl Error for PileRewriteError {
         match self {
             Self::Source(error) => Some(error),
             Self::Transfer(error) => Some(error),
-            Self::StrongPin(error) | Self::Want(error) => Some(error),
+            Self::StrongPin(error) | Self::Want(error) | Self::Peer(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
@@ -4255,8 +4404,9 @@ impl Pile {
     /// and branch models to coexist during migration.
     ///
     /// The source is refreshed once; blobs, strong pins, collection records,
-    /// complete proofs, inert legacy collection headers, and wants are then
-    /// taken from that coherent applied-prefix snapshot. Strictly verified V4
+    /// complete proofs, positive peer evidence, inert legacy collection
+    /// headers, and wants are then taken from that coherent applied-prefix
+    /// snapshot. Strictly verified V4
     /// commits retain their resident descriptor, data, and metadata recursively;
     /// an invalid commit authenticates none of its fields. A valid commit whose
     /// dependency is not resident is still copied as durable ground truth, but
@@ -4267,9 +4417,9 @@ impl Pile {
     /// nothing. Merge and derive records are algebraic evidence rather than
     /// ownership edges. Byte-distinct legacy V3 collection headers are copied
     /// exactly but remain semantically inert. The destination may already
-    /// contain identical blobs, records, proofs, headers, and strong-pin
-    /// mappings, making retries idempotent, but a differently mapped pin or
-    /// intrinsic-record collision is an error. Missing or invalid explicitly
+    /// contain identical blobs, records, proofs, peer evidence, headers, and
+    /// strong-pin mappings, making retries idempotent, but a differently mapped
+    /// pin or intrinsic-record collision is an error. Missing or invalid explicitly
     /// selected blobs still fail the rewrite rather than silently weakening the
     /// caller's retention policy. One final flush makes blobs and records durable
     /// in append order.
@@ -4304,6 +4454,7 @@ impl Pile {
         }
         let legacy_collection_headers = self.legacy_collection_headers.clone();
         let source_wants = self.wants.clone();
+        let peer_evidence = self.peers.clone();
 
         let mut roots = explicit.clone();
         for raw in &strong_pins {
@@ -4405,6 +4556,16 @@ impl Pile {
                 .map_err(PileRewriteError::CapabilityProof)?;
         }
 
+        let peer_evidence_count = peer_evidence.len() as usize;
+        for bytes in peer_evidence.into_iter_ordered() {
+            destination
+                .insert_peer(
+                    PeerEvidence::from_bytes(bytes)
+                        .expect("Pile only indexes structurally decoded peer evidence"),
+                )
+                .map_err(PileRewriteError::Peer)?;
+        }
+
         let mut preserved_wants = 0usize;
         if wants == WantRewritePolicy::Preserve {
             for bytes in source_wants.into_iter_ordered() {
@@ -4425,6 +4586,7 @@ impl Pile {
             strong_pins: strong_pins.len() as usize,
             wants: preserved_wants,
             capability_proofs: capability_proof_count,
+            peer_evidence: peer_evidence_count,
         })
     }
 }
@@ -4458,6 +4620,13 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::File::create(&path).unwrap();
         path
+    }
+
+    fn peer_evidence(team_seed: u8, peer_seed: u8) -> PeerEvidence {
+        PeerEvidence::new(
+            SigningKey::from_bytes(&[team_seed; 32]).verifying_key(),
+            SigningKey::from_bytes(&[peer_seed; 32]).verifying_key(),
+        )
     }
 
     fn capability_fixture(seed: u8, resource: [u8; 32]) -> (CapabilityProof, Blob<SimpleArchive>) {
@@ -5144,9 +5313,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "self-describing.pile");
         let mut pile = Pile::open(&path).unwrap();
-        // Eleven description archives plus the deduplicated name, layout, and
+        // Twelve description archives plus the deduplicated name, layout, and
         // attribute-metafact blobs they reference.
-        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 40);
+        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 43);
 
         let branch_id = Id::new([3; 16]).unwrap();
         pile.append_legacy_pin_for_test(branch_id, None, Some(Inline::new([4; 32])))
@@ -5158,6 +5327,7 @@ mod tests {
         for record in &collection_test_records() {
             pile.insert(*record).unwrap();
         }
+        pile.insert_peer(peer_evidence(6, 7)).unwrap();
         let reader = pile.reader().unwrap();
 
         let mut records = PileRecords::open(&path).unwrap();
@@ -6111,6 +6281,7 @@ mod tests {
                 strong_pins: 1,
                 wants: 1,
                 capability_proofs: 0,
+                peer_evidence: 0,
             }
         );
 
@@ -8029,6 +8200,133 @@ mod tests {
             other => panic!("expected UnsupportedRecord, got {other:?}"),
         }
         assert!(records.next().is_none(), "iterator must end after an error");
+    }
+
+    #[test]
+    fn peer_evidence_reopens_and_cat_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = fresh_empty_pile_path(&dir, "left.pile");
+        let right_path = fresh_empty_pile_path(&dir, "right.pile");
+        let first = peer_evidence(1, 2);
+        let shared = peer_evidence(1, 3);
+        let last = peer_evidence(4, 5);
+
+        let mut left = Pile::open(&left_path).unwrap();
+        left.insert_peer(shared).unwrap();
+        left.insert_peer(first).unwrap();
+        let before_duplicate = left.file.metadata().unwrap().len();
+        left.insert_peer(shared).unwrap();
+        assert_eq!(left.file.metadata().unwrap().len(), before_duplicate);
+        left.close().unwrap();
+
+        let mut right = Pile::open(&right_path).unwrap();
+        right.insert_peer(last).unwrap();
+        right.insert_peer(shared).unwrap();
+        right.close().unwrap();
+
+        let right_bytes = std::fs::read(&right_path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&left_path)
+            .unwrap()
+            .write_all(&right_bytes)
+            .unwrap();
+
+        let mut merged = Pile::open(&left_path).unwrap();
+        let actual = merged
+            .peers()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut expected = vec![first, shared, last];
+        expected.sort();
+        assert_eq!(actual, expected);
+        merged.close().unwrap();
+    }
+
+    #[test]
+    fn peer_record_rejects_noncanonical_header() {
+        let evidence = peer_evidence(1, 2);
+        let mut bytes = PeerEvidenceRecordHeader::new(evidence).as_bytes().to_vec();
+        bytes[128] = 1;
+        assert!(matches!(
+            decode_record(&bytes, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+
+        let mut bytes = PeerEvidenceRecordHeader::new(evidence).as_bytes().to_vec();
+        let invalid_key = (0u8..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|candidate| ed25519_dalek::VerifyingKey::from_bytes(candidate).is_err())
+            .expect("at least one repeated byte string must not encode an Ed25519 point");
+        bytes[64..96].copy_from_slice(&invalid_key);
+        assert!(matches!(
+            decode_record(&bytes, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+    }
+
+    #[test]
+    fn reframe_preserves_peer_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "destination.pile");
+        let evidence = peer_evidence(6, 7);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        source.insert_peer(evidence).unwrap();
+        source.close().unwrap();
+
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = reframe_into(&source_path, &mut destination).unwrap();
+        assert_eq!(stats.peer_evidence, 1);
+        assert_eq!(stats.dropped_inert, 0);
+        assert_eq!(
+            destination
+                .peers()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![evidence]
+        );
+        destination.close().unwrap();
+    }
+
+    #[test]
+    fn retained_rewrite_preserves_peer_evidence_without_retaining_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "destination.pile");
+        let evidence = peer_evidence(8, 9);
+        let mut source = Pile::open(&source_path).unwrap();
+        source
+            .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(Bytes::from_source(
+                b"unowned".to_vec(),
+            )))
+            .unwrap();
+        source.insert_peer(evidence).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+
+        assert_eq!(stats.retained_blobs, 0);
+        assert_eq!(stats.peer_evidence, 1);
+        assert_eq!(
+            destination
+                .peers()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![evidence]
+        );
+        source.close().unwrap();
+        destination.close().unwrap();
     }
 
     // recover_grow test removed as growth strategy no longer exists

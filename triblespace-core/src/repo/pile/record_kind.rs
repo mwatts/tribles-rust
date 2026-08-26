@@ -164,6 +164,14 @@ record_kinds! {
         "pile-auth-proof-v1",
         "A canonical complete capability proof in K(S,C,K)+ order. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with the 32-byte root Ed25519 public key, followed by one or more 128-byte edges: a 64-byte Ed25519 signature, a 32-byte SimpleArchive claim handle, and the next 32-byte public key. The declared length is exactly 32 + 128n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id.";
 
+    /// Positive peer-routing evidence.
+    ///
+    /// Kind/schema id minted with `trible genid` on 2026-08-26.
+    PeerEvidenceRecordV1 = KIND_ID_PEER_EVIDENCE "E25B4427F30DCE7B36F3F80BB38E375A",
+        KIND_PEER_EVIDENCE "327FFCAAA3F5A10424DC2059E3A7A3517F837E7E56A3C850979EFA9F5E3A1ED7",
+        "pile-peer-v1",
+        "Positive routing evidence PEER(team_public_key, peer_public_key). Envelope bytes 64..96 hold the 32-byte Ed25519 team trust-root public key, 96..128 the 32-byte Ed25519 peer public key, and 128..256 are zeros. The record spans exactly one 256-byte block and has no payload. Presence grants no authority, liveness, reachability, residency, or retention semantics; no inverse or retraction record exists.";
+
 }
 
 /// Every blob needed to resolve every known record kind.
@@ -218,5 +226,10 @@ mod tests {
                     .collect::<String>()
             );
         }
+        assert_eq!(
+            KIND_ID_PEER_EVIDENCE,
+            crate::repo::peer::KIND_PEER_EVIDENCE,
+            "PEER's dense semantic kind and pile description root must stay identical"
+        );
     }
 }

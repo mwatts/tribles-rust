@@ -125,6 +125,22 @@ reads the current durable snapshot every 30 seconds and replays the relayable
 commit frontier with fresh nonces. It does not retain a second unbounded ledger
 mirror.
 
+## Durable peer evidence
+
+Core storage exposes one monotone topology primitive:
+`PEER(team_public_key, peer_public_key)`. It is an unsigned, canonical
+two-key fact stored through `PeerStore`; concatenating piles unions the set.
+There is deliberately no inverse record. Its presence says only “this peer is
+a routing candidate associated with this team.” It grants no capability,
+proves no liveness or reachability, promises no resident data, and retains no
+blob.
+
+The current network host does not consume this set yet: configured endpoint
+tickets and process-local successful custody neighbors remain its operational
+inputs. Keeping the storage fact narrower than that behavior makes it a clean
+foundation for a later unified transport with quality-of-service policies,
+rather than silently introducing a second peer protocol in this change.
+
 ## Durable WANTs
 
 `WantStore` records local operational interest. Its canonical request key has

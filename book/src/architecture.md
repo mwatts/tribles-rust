@@ -65,7 +65,7 @@ itself.
 ├──────────────────────────────────────────────────┤
 │ Storage                                          │
 │ CollectionStore · BlobStore · WantStore          │
-│ CapabilityProofStore                             │
+│ CapabilityProofStore · PeerStore                  │
 ├──────────────────────────────────────────────────┤
 │ Data and representations                         │
 │ TribleSet/PATCH · SimpleArchive · SuccinctArchive│
@@ -209,9 +209,19 @@ Keeping WANT orthogonal prevents sparse gossip from becoming involuntary full
 replication. A peer can learn the global commit frontier cheaply, then decide
 which blobs and derived representations are useful locally.
 
+## Peer evidence is topology, not authority
+
+`PeerStore` holds positive `PEER(team_public_key, peer_public_key)` routing
+facts as another grow-only set. A fact is only a candidate edge for discovery:
+it does not authorize the peer, prove that it is live or reachable, promise
+that it stores any content, or retain a blob. There is no retraction record.
+That weak monotone meaning lets independently learned topology converge by
+union without coupling transport policy to capability verification.
+
 ## Storage and synchronization compose by union
 
-`Pile` stores blobs, native collection records, and WANT records in one
+`Pile` stores blobs, native collection records, capability proofs, peer
+evidence, and WANT records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
 content-derived object keys. The network layer gossips sparse signed commits,
 uses a DHT and authenticated QUIC for blob lookup, and services exact

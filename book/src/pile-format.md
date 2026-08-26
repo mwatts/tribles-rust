@@ -1,7 +1,8 @@
 # Pile Format
 
 The on-disk pile keeps blobs, native collection records, native capability
-proofs, wants, and decodable legacy pin evidence in one
+proofs, positive peer-routing evidence, wants, and decodable legacy pin
+evidence in one
 append-only file. The write-ahead log *is*
 the database: all indices are
 reconstructed from the bytes already stored on disk. This design avoids
@@ -69,6 +70,7 @@ proof also ends at byte 256. Longer proofs use more blocks without changing
 their canonical body.
 
 A collection descriptor and every capability claim remain ordinary blobs.
+Peer-routing evidence is a separate native grow-only set.
 Typed WANT assertions and retractions have their own kinds; historical pin
 records remain readable for explicit migration and conservative retention.
 
@@ -111,8 +113,8 @@ cannot conservatively mean “no effect”—requires a new frame magic instead.
 Concatenation is associative ordered composition, not universally commutative:
 WANT assertions/retractions and decoded legacy pins are right-biased logs.
 Opaque filtering is sound because it leaves the relative order of every known
-record unchanged; native collection and capability-proof records additionally
-collapse to order-independent set union.
+record unchanged; native collection, capability-proof, and peer-evidence
+records additionally collapse to order-independent set union.
 
 ### Compatibility surface: v0.46.4, and a reframe for everything else
 
@@ -137,8 +139,8 @@ The re-encode is semantic and in source order, which is what makes it faithful:
   the moment of a rewrite is not a fact about when a blob arrived.
 - Legacy pins and WANT state are replayed in order, so the result's immutable
   compatibility snapshot and operational request projection equal the source's.
-- Collection records are a grow-only set, so order is irrelevant and
-  re-insertion is idempotent.
+- Collection records, capability proofs, and peer-routing evidence are
+  grow-only sets, so order is irrelevant and re-insertion is idempotent.
 - Records that never carried live state are dropped and counted: inert legacy
   V3 collection headers, retired local cells, and kinds no longer interpreted.
   Derived collections fall in the same category by design — a derivation is a
@@ -195,7 +197,7 @@ refreshing state.
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
    `applied_length`, and rebuilds the blob, collection-record, capability-proof,
-   WANT, and legacy pin-snapshot indices
+   peer-evidence, WANT, and legacy pin-snapshot indices
    in memory. It **fails loud** on a corrupt or torn record
    (`ReadError::CorruptPile { valid_length }`). It skips bounded unknown
    envelope kinds as opaque records and distinguishes an unknown legacy marker
@@ -218,11 +220,12 @@ refreshing state.
    exclusive file lock, so an intervening repair cannot move the boundary
    between validation and mutation.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
-   `CollectionStore::insert`, and `WantStore` operations extend the file. Each
+   `CollectionStore::insert`, `PeerStore::insert_peer`, and `WantStore`
+   operations extend the file. Each
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
-   Blob records use a single `write_vectored` call; fixed-width collection and
-   WANT records use one append of their 256-byte frame, and native proof records
+   Blob records use a single `write_vectored` call; fixed-width collection,
+   WANT, and peer records use one append of their 256-byte frame, and native proof records
    append their complete bounded frame once.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
@@ -517,6 +520,31 @@ claim fields are not scanned recursively. A missing claim remains absent, and
 an invalidly signed proof roots nothing. Full semantic verification still
 needs the external trust root, expected leaf, instant, request, and exact
 ordered claim blobs.
+
+## Native Peer Evidence Records
+
+`PeerStore` is a grow-only set of routing hints. Each member is exactly
+`PEER(team_public_key, peer_public_key)`, where both fields are validated
+Ed25519 public keys. The canonical dense body is the 64-byte concatenation
+`team || peer`; its optional physical selector is a domain-separated BLAKE3
+identity over that body. Neither key is inferred from append position,
+transport state, or another registry.
+
+| Offset | Width | Field |
+|---:|---:|---|
+| `0..28` | 28 | Framing magic |
+| `28..32` | 4 | Span `1`, little-endian |
+| `32..64` | 32 | Peer kind `327FFCAAA3F5A10424DC2059E3A7A3517F837E7E56A3C850979EFA9F5E3A1ED7`, rooted at `E25B4427F30DCE7B36F3F80BB38E375A` (minted with `trible genid` on 2026-08-26) |
+| `64..96` | 32 | Team trust-root public key |
+| `96..128` | 32 | Peer public key |
+| `128..256` | 128 | Reserved zeros |
+
+There is no `UNPEER` record. Duplicate insertion is a no-op, concatenating
+piles unions their peer evidence, and replay enumerates the set in canonical
+body order through a PATCH index. Presence is deliberately weak: it grants no
+authority and proves no liveness, reachability, content residency, retention,
+or current membership. Conservative rewrites preserve the evidence record but
+do not turn either key into a blob root.
 
 ## Retired: Collection Publication Grants
 

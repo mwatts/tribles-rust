@@ -12,7 +12,9 @@ use crate::blob::MemoryBlobStore;
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::selectors_match_record;
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::patch::{Entry, IdentitySchema, PATCH};
 use crate::prelude::*;
+use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
 use crate::repo::{WantRequest, WantStore};
 
@@ -36,6 +38,41 @@ pub struct MemoryRepo {
     collection_records: BTreeMap<Id, CollectionRecord>,
     /// Canonical complete capability proofs keyed by exact-body content id.
     capability_proofs: BTreeMap<CapabilityProofId, CapabilityProof>,
+    /// Positive peer-routing evidence keyed by its complete canonical body.
+    peer_evidence: PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema>,
+}
+
+/// Deterministic persistent snapshot of in-memory peer evidence.
+pub struct MemoryPeerIter {
+    inner: crate::patch::PATCHIntoOrderedIterator<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, ()>,
+}
+
+impl Iterator for MemoryPeerIter {
+    type Item = Result<PeerEvidence, Infallible>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|bytes| {
+            Ok(PeerEvidence::from_bytes(bytes)
+                .expect("MemoryRepo only indexes validated peer evidence"))
+        })
+    }
+}
+
+impl PeerStore for MemoryRepo {
+    type PeersError = Infallible;
+    type InsertError = Infallible;
+    type PeerIter<'a> = MemoryPeerIter;
+
+    fn peers<'a>(&'a mut self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+        Ok(MemoryPeerIter {
+            inner: self.peer_evidence.clone().into_iter_ordered(),
+        })
+    }
+
+    fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
+        self.peer_evidence.insert(&Entry::new(evidence.as_bytes()));
+        Ok(())
+    }
 }
 
 /// Failure while admitting a proof to [`MemoryRepo`].

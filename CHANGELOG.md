@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add native monotone `PEER(team_public_key, peer_public_key)` routing
+  evidence. `PeerStore`, `MemoryRepo`, and `Pile` expose one canonical
+  validated 64-byte positive fact as a grow-only set; Pile writes it in a
+  self-describing fixed frame and indexes it with `PATCH<64>`. Concatenation,
+  reopen, reframe, and retained rewrites preserve union semantics, while the
+  fact deliberately grants no authority and implies no liveness,
+  reachability, residency, or retention. Network behavior is unchanged.
+
 - Add proof-gated custody replication for complete private pile replicas.
   `trible team replica {create,issue,join}` provisions an exact independent
   `REPLICATE` capability, while `trible pile net custody {status,run}`
