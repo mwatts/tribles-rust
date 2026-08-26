@@ -150,8 +150,10 @@ or proof of equality.
 
 The `Blake3Merkle` policy provides a stable 256-bit root for durable indexes and
 anti-entropy. Leaves and branches have separate domains. A branch commits to
-the key width, compressed-path end depth, fanout, subtree leaf count, and each
-`(edge, child)` pair in ascending edge order, so insertion order and the cuckoo
+the key width, canonical compressed-prefix bytes, fanout, subtree leaf count,
+and each `(edge, child leaf count, child digest)` tuple in ascending edge order.
+The count and routing metadata used by a reconciliation proof is therefore
+authenticated at the branch that advertises it; insertion order and the cuckoo
 table's random physical placement cannot affect the root. BLAKE3 has no inverse
 update law:
 an edited branch is marked dirty and summarized once, in canonical order, when

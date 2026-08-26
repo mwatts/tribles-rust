@@ -273,16 +273,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         rchild_hash: H::Digest,
     ) -> H::Digest {
         let leaf_count = lchild.count() + rchild.count();
-        let mut state = H::begin_branch(KEY_LEN, end_depth, 2, leaf_count);
+        let mut state = H::begin_branch(
+            lchild.childleaf_key(),
+            &O::TREE_TO_KEY,
+            end_depth,
+            2,
+            leaf_count,
+        );
         if H::COMMUTATIVE_BRANCH {
-            H::push_child(&mut state, 0, lchild_hash);
-            H::push_child(&mut state, 0, rchild_hash);
+            H::push_child(&mut state, 0, lchild.count(), lchild_hash);
+            H::push_child(&mut state, 0, rchild.count(), rchild_hash);
         } else if lchild.key() <= rchild.key() {
-            H::push_child(&mut state, lchild.key(), lchild_hash);
-            H::push_child(&mut state, rchild.key(), rchild_hash);
+            H::push_child(&mut state, lchild.key(), lchild.count(), lchild_hash);
+            H::push_child(&mut state, rchild.key(), rchild.count(), rchild_hash);
         } else {
-            H::push_child(&mut state, rchild.key(), rchild_hash);
-            H::push_child(&mut state, lchild.key(), lchild_hash);
+            H::push_child(&mut state, rchild.key(), rchild.count(), rchild_hash);
+            H::push_child(&mut state, lchild.key(), lchild.count(), lchild_hash);
         }
         H::finish_branch(state)
     }
@@ -827,8 +833,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         for child in (*branch).child_table.iter().flatten() {
             edges.insert(child.key());
         }
+        let empty_representative = [0; KEY_LEN];
+        let representative = (*branch)
+            .child_table
+            .iter()
+            .flatten()
+            .next()
+            .map(Head::childleaf_key)
+            .unwrap_or(&empty_representative);
         let mut state = H::begin_branch(
-            KEY_LEN,
+            representative,
+            &O::TREE_TO_KEY,
             (*branch).end_depth as usize,
             edges.popcount() as usize,
             (*branch).leaf_count,
@@ -838,7 +853,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
                 .child_table
                 .table_get(edge)
                 .expect("enumerated PATCH child must remain present");
-            H::push_child(&mut state, edge, child.hash());
+            H::push_child(&mut state, edge, child.count(), child.hash());
         }
         (*branch).hash = H::finish_branch(state);
     }
@@ -913,8 +928,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
             agg_segment_count, self.segment_count,
             "branch.segment_count mismatch"
         );
+        let empty_representative = [0; KEY_LEN];
+        let representative = self
+            .child_table
+            .iter()
+            .flatten()
+            .next()
+            .map(Head::childleaf_key)
+            .unwrap_or(&empty_representative);
         let mut state = H::begin_branch(
-            KEY_LEN,
+            representative,
+            &O::TREE_TO_KEY,
             end_depth,
             edges.popcount() as usize,
             self.leaf_count,
@@ -924,7 +948,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
                 .child_table
                 .table_get(edge)
                 .expect("enumerated PATCH child must remain present");
-            H::push_child(&mut state, edge, child.hash());
+            H::push_child(&mut state, edge, child.count(), child.hash());
         }
         debug_assert_eq!(H::finish_branch(state), self.hash, "branch.hash mismatch");
 

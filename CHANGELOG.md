@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make PATCH's subtree summary a sealed policy parameter while preserving
   `XorSip128` as the zero-overhead default. Add `Blake3Merkle`, a canonical
   256-bit digest over path-compressed branches in ascending edge order, for
-  durable indexes and anti-entropy; archive-backed and heap construction now
-  share the same policy-generic path and root.
+  durable indexes and anti-entropy. Every branch binds its compressed prefix,
+  total count, and each child edge/count/digest tuple; archive-backed and heap
+  construction share the same policy-generic path and root.
 
 - Add proof-gated custody replication for complete private pile replicas.
   `trible team replica {create,issue,join}` provisions an exact independent

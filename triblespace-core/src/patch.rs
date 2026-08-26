@@ -409,15 +409,20 @@ pub trait PatchHash: sealed::Sealed + Send + Sync + 'static {
     fn leaf(bytes: &[u8]) -> Self::Digest;
 
     /// Begin summarizing a canonical branch.
+    ///
+    /// `representative` is any descendant key. `tree_to_key` identifies the
+    /// first `end_depth` bytes that form the branch's canonical compressed
+    /// prefix; bytes after that prefix must not affect the summary.
     fn begin_branch(
-        key_len: usize,
+        representative: &[u8],
+        tree_to_key: &[usize],
         end_depth: usize,
         child_count: usize,
         leaf_count: u64,
     ) -> Self::BranchState;
 
     /// Add one child in ascending edge-byte order.
-    fn push_child(state: &mut Self::BranchState, edge: u8, digest: Self::Digest);
+    fn push_child(state: &mut Self::BranchState, edge: u8, leaf_count: u64, digest: Self::Digest);
 
     /// Finish one branch summary.
     fn finish_branch(state: Self::BranchState) -> Self::Digest;
@@ -462,7 +467,8 @@ impl PatchHash for XorSip128 {
 
     #[inline]
     fn begin_branch(
-        _key_len: usize,
+        _representative: &[u8],
+        _tree_to_key: &[usize],
         _end_depth: usize,
         _child_count: usize,
         _leaf_count: u64,
@@ -471,7 +477,12 @@ impl PatchHash for XorSip128 {
     }
 
     #[inline]
-    fn push_child(state: &mut Self::BranchState, _edge: u8, digest: Self::Digest) {
+    fn push_child(
+        state: &mut Self::BranchState,
+        _edge: u8,
+        _leaf_count: u64,
+        digest: Self::Digest,
+    ) {
         *state ^= digest;
     }
 
@@ -501,10 +512,10 @@ impl PatchHash for XorSip128 {
 ///
 /// Unlike [`XorSip128`], this policy commits to the canonical Patricia-trie
 /// structure: leaf keys are domain-separated from branches, and every branch
-/// commits to its key width, compressed-path end depth, fanout, subtree leaf
-/// count, ascending edge bytes, and child digests. PATCH's trie shape is a
-/// function of its key set, so insertion order and cuckoo-table placement do
-/// not affect the result.
+/// commits to its key width, compressed-path bytes, fanout, subtree leaf
+/// count, and each ascending `(edge, child leaf count, child digest)` tuple.
+/// PATCH's trie shape is a function of its key set, so insertion order and
+/// cuckoo-table placement do not affect the result.
 ///
 /// BLAKE3's native chunk tree is intentionally not reused here. Its tree
 /// describes fixed-size chunks of one byte stream, whereas PATCH is a sparse
@@ -536,23 +547,30 @@ impl PatchHash for Blake3Merkle {
     }
 
     fn begin_branch(
-        key_len: usize,
+        representative: &[u8],
+        tree_to_key: &[usize],
         end_depth: usize,
         child_count: usize,
         leaf_count: u64,
     ) -> Self::BranchState {
+        debug_assert_eq!(representative.len(), tree_to_key.len());
+        debug_assert!(end_depth <= representative.len());
         let mut state = blake3::Hasher::new();
-        state.update(b"triblespace.patch.branch.v1\0");
-        state.update(&(key_len as u64).to_le_bytes());
+        state.update(b"triblespace.patch.branch.v2\0");
+        state.update(&(representative.len() as u64).to_le_bytes());
         state.update(&(end_depth as u64).to_le_bytes());
+        for &key_index in &tree_to_key[..end_depth] {
+            state.update(&[representative[key_index]]);
+        }
         state.update(&(child_count as u64).to_le_bytes());
         state.update(&leaf_count.to_le_bytes());
         state
     }
 
     #[inline]
-    fn push_child(state: &mut Self::BranchState, edge: u8, digest: Self::Digest) {
+    fn push_child(state: &mut Self::BranchState, edge: u8, leaf_count: u64, digest: Self::Digest) {
         state.update(&[edge]);
+        state.update(&leaf_count.to_le_bytes());
         state.update(&digest);
     }
 
@@ -4121,6 +4139,8 @@ where
                 end_depth + 1,
             )
         };
+        let first_count = first_head.count();
+        let second_count = second_head.count();
 
         let body = if plan.initial_slots == 2 {
             Branch::new_with_child_hashes(
@@ -4141,9 +4161,16 @@ where
             )
         };
         let mut root = Head::new(0, body);
-        let mut hash_state = H::begin_branch(KEY_LEN, end_depth, plan.fanout, rows.len() as u64);
-        H::push_child(&mut hash_state, first_bucket, first_hash);
-        H::push_child(&mut hash_state, second_bucket, second_hash);
+        let representative = &keys[rows[0] as usize];
+        let mut hash_state = H::begin_branch(
+            representative,
+            &O::TREE_TO_KEY,
+            end_depth,
+            plan.fanout,
+            rows.len() as u64,
+        );
+        H::push_child(&mut hash_state, first_bucket, first_count, first_hash);
+        H::push_child(&mut hash_state, second_bucket, second_count, second_hash);
         if plan.fanout == 2 {
             debug_assert_eq!(second_end, rows.len());
             return (root, H::finish_branch(hash_state));
@@ -4161,7 +4188,8 @@ where
                     end_depth + 1,
                 )
             };
-            H::push_child(&mut hash_state, byte, child_hash);
+            let child_count = child.count();
+            H::push_child(&mut hash_state, byte, child_count, child_hash);
             editor.install_child_growing(child.with_key(byte));
             range_start = range_end;
         }
@@ -4381,9 +4409,15 @@ where
         debug_assert!(children.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let child_count = children.len();
         let leaf_count = children.iter().map(|(_, child, _)| child.count()).sum();
-        let mut hash_state = H::begin_branch(KEY_LEN, end_depth, child_count, leaf_count);
-        for &(edge, _, digest) in &children {
-            H::push_child(&mut hash_state, edge, digest);
+        let mut hash_state = H::begin_branch(
+            children[0].1.childleaf_key(),
+            &O::TREE_TO_KEY,
+            end_depth,
+            child_count,
+            leaf_count,
+        );
+        for &(edge, ref child, digest) in &children {
+            H::push_child(&mut hash_state, edge, child.count(), digest);
         }
         let hash = H::finish_branch(hash_state);
 
@@ -5078,16 +5112,28 @@ mod tests {
         }
 
         fn begin_branch(
-            key_len: usize,
+            representative: &[u8],
+            tree_to_key: &[usize],
             end_depth: usize,
             child_count: usize,
             leaf_count: u64,
         ) -> Self::BranchState {
-            Blake3Merkle::begin_branch(key_len, end_depth, child_count, leaf_count)
+            Blake3Merkle::begin_branch(
+                representative,
+                tree_to_key,
+                end_depth,
+                child_count,
+                leaf_count,
+            )
         }
 
-        fn push_child(state: &mut Self::BranchState, edge: u8, digest: Self::Digest) {
-            Blake3Merkle::push_child(state, edge, digest);
+        fn push_child(
+            state: &mut Self::BranchState,
+            edge: u8,
+            leaf_count: u64,
+            digest: Self::Digest,
+        ) {
+            Blake3Merkle::push_child(state, edge, leaf_count, digest);
         }
 
         fn finish_branch(state: Self::BranchState) -> Self::Digest {
@@ -5140,9 +5186,15 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let keys = [[1, 0], [2, 0], [3, 0]];
         let digests = keys.map(|key| Blake3Merkle::leaf(&key));
-        let mut state = Blake3Merkle::begin_branch(2, 0, keys.len(), keys.len() as u64);
+        let mut state = Blake3Merkle::begin_branch(
+            &keys[0],
+            &<IdentitySchema as KeySchema<2>>::TREE_TO_KEY,
+            0,
+            keys.len(),
+            keys.len() as u64,
+        );
         for (edge, digest) in [1, 2, 3].into_iter().zip(digests) {
-            Blake3Merkle::push_child(&mut state, edge, digest);
+            Blake3Merkle::push_child(&mut state, edge, 1, digest);
         }
         let final_hash = Blake3Merkle::finish_branch(state);
 
@@ -5357,15 +5409,32 @@ mod tests {
     }
 
     #[test]
-    fn blake3_merkle_authenticates_subtree_leaf_count() {
-        fn framed(leaf_count: u64) -> [u8; 32] {
-            let mut state = Blake3Merkle::begin_branch(16, 4, 2, leaf_count);
-            Blake3Merkle::push_child(&mut state, 3, [7; 32]);
-            Blake3Merkle::push_child(&mut state, 9, [11; 32]);
+    fn blake3_merkle_authenticates_reconciliation_descriptor() {
+        fn framed(representative: [u8; 16], leaf_count: u64, child_counts: [u64; 2]) -> [u8; 32] {
+            let mut state = Blake3Merkle::begin_branch(
+                &representative,
+                &<IdentitySchema as KeySchema<16>>::TREE_TO_KEY,
+                4,
+                2,
+                leaf_count,
+            );
+            Blake3Merkle::push_child(&mut state, 3, child_counts[0], [7; 32]);
+            Blake3Merkle::push_child(&mut state, 9, child_counts[1], [11; 32]);
             Blake3Merkle::finish_branch(state)
         }
 
-        assert_ne!(framed(2), framed(3));
+        let representative = [5; 16];
+        let canonical = framed(representative, 4, [1, 3]);
+        assert_ne!(canonical, framed(representative, 5, [1, 3]));
+        assert_ne!(canonical, framed(representative, 4, [2, 2]));
+
+        let mut different_prefix = representative;
+        different_prefix[2] ^= 1;
+        assert_ne!(canonical, framed(different_prefix, 4, [1, 3]));
+
+        let mut different_suffix = representative;
+        different_suffix[7] ^= 1;
+        assert_eq!(canonical, framed(different_suffix, 4, [1, 3]));
     }
 
     #[test]
