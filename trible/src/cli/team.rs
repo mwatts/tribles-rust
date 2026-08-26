@@ -1,9 +1,10 @@
 //! `trible team` -- direct, exact team capability proofs.
 //!
-//! A team is identified by one Ed25519 trust-root public key. CONNECT uses
-//! those exact 32 bytes as its capability resource. A portable proof is the
-//! canonical `K (S C K)+` body together with the exact ordered claim blobs it
-//! names. Piles retain accepted proofs natively; there is no authority
+//! A team is identified by one Ed25519 trust-root public key. CONNECT and
+//! SYNC_TEAM use those exact 32 bytes as distinct capability resources. A
+//! portable team invite packages both independent proof bundles so joining
+//! remains one human action without conflating transport and disclosure
+//! authority. Piles retain accepted proofs natively; there is no authority
 //! collection, credential wallet, membership scan, or ambient registry.
 
 use std::fs;
@@ -22,18 +23,36 @@ use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
     CapabilityProofId, CapabilityRequest, CapabilityValidity, MAX_CAPABILITY_PROOF_BUNDLE_BYTES,
 };
+use triblespace_core::id::{id_hex, Id};
 use triblespace_core::repo::pile::{GetBlobError, Pile};
 use triblespace_core::repo::proof::CapabilityProofStore;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 
+use triblespace_net::inventory::{sync_team_capability_atom, ACTION_SYNC_TEAM};
 use triblespace_net::protocol::{connect_capability_atom, ACTION_CONNECT};
 use triblespace_net::replica::{replicate_capability_atom, ReplicaSetId, ACTION_REPLICATE_STORE};
 
 const MAX_INVITE_BYTES: usize = MAX_CAPABILITY_PROOF_BUNDLE_BYTES;
 
+/// Stable marker for a complete two-capability team invite artifact.
+///
+/// Minted on 2026-08-26 CEST with the exact command `trible genid`, whose
+/// output was `888807EA9891D3187A83408578CDD21B`.
+const TEAM_INVITE_FORMAT: Id = id_hex!("888807EA9891D3187A83408578CDD21B");
+const TEAM_INVITE_VERSION: u8 = 1;
+const TEAM_INVITE_HEADER_BYTES: usize = 16 + 1 + 4 + 4;
+const MAX_TEAM_INVITE_BYTES: usize =
+    TEAM_INVITE_HEADER_BYTES + 2 * MAX_CAPABILITY_PROOF_BUNDLE_BYTES;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TeamInvite {
+    connect: CapabilityProofBundle,
+    sync: CapabilityProofBundle,
+}
+
 #[derive(Parser)]
 pub enum Command {
-    /// Create a team and issue the founder a direct CONNECT proof.
+    /// Create a team and issue the founder direct CONNECT and SYNC_TEAM proofs.
     Create {
         /// Path to the local pile file.
         #[arg(long)]
@@ -51,7 +70,7 @@ pub enum Command {
         #[arg(long, value_parser = parse_epoch, requires = "valid_from")]
         valid_until: Option<Epoch>,
     },
-    /// Issue one portable CONNECT invite from an exact parent proof.
+    /// Issue one portable team invite from exact CONNECT and SYNC_TEAM parents.
     Invite {
         /// Path to the issuer's pile file.
         #[arg(long)]
@@ -59,16 +78,19 @@ pub enum Command {
         /// Team trust-root public key (32-byte hex).
         #[arg(long)]
         team_root: String,
-        /// Exact parent proof id (BLAKE3 of canonical proof bytes).
+        /// Exact CONNECT parent proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        parent_proof: String,
+        connect_parent_proof: String,
+        /// Exact SYNC_TEAM parent proof id (BLAKE3 of canonical proof bytes).
+        #[arg(long)]
+        sync_parent_proof: String,
         /// Issuer's existing signing key.
         #[arg(long)]
         key: Option<PathBuf>,
         /// Invitee's Ed25519 public key (32-byte hex).
         #[arg(long)]
         invitee: String,
-        /// Let the invitee issue child CONNECT proofs too.
+        /// Let the invitee issue child CONNECT and SYNC_TEAM proofs too.
         #[arg(long)]
         delegate: bool,
         /// Inclusive RFC 3339 lower validity bound (requires --valid-until).
@@ -191,7 +213,8 @@ pub fn run(command: Command) -> Result<()> {
         Command::Invite {
             pile,
             team_root,
-            parent_proof,
+            connect_parent_proof,
+            sync_parent_proof,
             key,
             invitee,
             delegate,
@@ -201,7 +224,8 @@ pub fn run(command: Command) -> Result<()> {
         } => run_invite(
             pile,
             team_root,
-            parent_proof,
+            connect_parent_proof,
+            sync_parent_proof,
             key,
             invitee,
             delegate,
@@ -311,6 +335,10 @@ fn validity(
 
 fn connect_atom(team_root: VerifyingKey) -> CapabilityAtom {
     connect_capability_atom(team_root)
+}
+
+fn sync_atom(team_root: VerifyingKey) -> CapabilityAtom {
+    sync_team_capability_atom(team_root)
 }
 
 pub(crate) fn parse_replica_set(text: &str) -> Result<ReplicaSetId> {
@@ -455,6 +483,92 @@ fn verify_replica_bundle(
     Ok(())
 }
 
+impl TeamInvite {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        let connect = self
+            .connect
+            .to_bytes()
+            .map_err(|error| anyhow!("encode CONNECT proof bundle: {error}"))?;
+        let sync = self
+            .sync
+            .to_bytes()
+            .map_err(|error| anyhow!("encode SYNC_TEAM proof bundle: {error}"))?;
+        let mut bytes = Vec::with_capacity(TEAM_INVITE_HEADER_BYTES + connect.len() + sync.len());
+        bytes.extend_from_slice(&TEAM_INVITE_FORMAT.raw());
+        bytes.push(TEAM_INVITE_VERSION);
+        for bundle in [&connect, &sync] {
+            bytes.extend_from_slice(
+                &u32::try_from(bundle.len())
+                    .expect("a bounded capability bundle fits u32")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(bundle);
+        }
+        debug_assert!(bytes.len() <= MAX_TEAM_INVITE_BYTES);
+        Ok(bytes)
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_TEAM_INVITE_BYTES {
+            bail!("team invite exceeds the {MAX_TEAM_INVITE_BYTES}-byte limit");
+        }
+
+        fn take<'a>(input: &mut &'a [u8], length: usize, what: &str) -> Result<&'a [u8]> {
+            if input.len() < length {
+                bail!("truncated team invite {what}");
+            }
+            let (taken, rest) = input.split_at(length);
+            *input = rest;
+            Ok(taken)
+        }
+
+        fn bundle(input: &mut &[u8], label: &str) -> Result<CapabilityProofBundle> {
+            let length = u32::from_be_bytes(
+                take(input, 4, "bundle length")?
+                    .try_into()
+                    .expect("exact four-byte length"),
+            ) as usize;
+            if length > MAX_CAPABILITY_PROOF_BUNDLE_BYTES {
+                bail!(
+                    "{label} proof bundle is {length} bytes; limit is {MAX_CAPABILITY_PROOF_BUNDLE_BYTES}"
+                );
+            }
+            CapabilityProofBundle::from_bytes(take(input, length, label)?)
+                .map_err(|error| anyhow!("decode {label} proof bundle: {error}"))
+        }
+
+        let mut input = bytes;
+        if take(&mut input, 16, "format marker")? != TEAM_INVITE_FORMAT.raw() {
+            bail!("unknown team invite format marker");
+        }
+        let version = take(&mut input, 1, "version")?[0];
+        if version != TEAM_INVITE_VERSION {
+            bail!("unsupported team invite version {version}; expected {TEAM_INVITE_VERSION}");
+        }
+        let connect = bundle(&mut input, "CONNECT")?;
+        let sync = bundle(&mut input, "SYNC_TEAM")?;
+        if !input.is_empty() {
+            bail!("team invite contains trailing bytes");
+        }
+        Ok(Self { connect, sync })
+    }
+}
+
+fn write_team_invite(path: &Path, invite: &TeamInvite) -> Result<()> {
+    let encoded = invite.to_bytes()?;
+    fs::write(path, encoded).map_err(|error| anyhow!("write invite {}: {error}", path.display()))
+}
+
+fn read_team_invite(path: &Path) -> Result<TeamInvite> {
+    let file =
+        fs::File::open(path).map_err(|error| anyhow!("open invite {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(MAX_TEAM_INVITE_BYTES + 1);
+    file.take((MAX_TEAM_INVITE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow!("read invite {}: {error}", path.display()))?;
+    TeamInvite::from_bytes(&bytes)
+}
+
 fn write_invite(path: &Path, bundle: &CapabilityProofBundle) -> Result<()> {
     let encoded = bundle
         .to_bytes()
@@ -492,19 +606,43 @@ fn run_create(
     let founder = load_or_generate_signing_key(key_path, &pile_path)?;
     let (root_key_path, team_root_key) = load_or_generate_root_key(root_key_path, &pile_path)?;
     let team_root = team_root_key.verifying_key();
-    let claim = CapabilityClaim::root(
-        connect_atom(team_root),
-        CapabilityMode::InvokeAndDelegate,
-        validity(valid_from, valid_until)?,
-    );
-    let bundle = CapabilityProofBundle::issue_root(&team_root_key, claim, founder.verifying_key())
-        .map_err(|error| anyhow!("issue founder proof: {error}"))?;
-    with_pile(&pile_path, |pile| store_capability_bundle(pile, &bundle))?;
+    let validity = validity(valid_from, valid_until)?;
+    let connect = CapabilityProofBundle::issue_root(
+        &team_root_key,
+        CapabilityClaim::root(
+            connect_atom(team_root),
+            CapabilityMode::InvokeAndDelegate,
+            validity,
+        ),
+        founder.verifying_key(),
+    )
+    .map_err(|error| anyhow!("issue founder CONNECT proof: {error}"))?;
+    let sync = CapabilityProofBundle::issue_root(
+        &team_root_key,
+        CapabilityClaim::root(
+            sync_atom(team_root),
+            CapabilityMode::InvokeAndDelegate,
+            validity,
+        ),
+        founder.verifying_key(),
+    )
+    .map_err(|error| anyhow!("issue founder SYNC_TEAM proof: {error}"))?;
+    with_pile(&pile_path, |pile| {
+        store_capability_bundle(pile, &connect)?;
+        store_capability_bundle(pile, &sync)
+    })?;
 
     println!("team root pubkey: {}", hex::encode(team_root.to_bytes()));
     print_root_key_warning();
-    println!("team root key:    {}", root_key_path.display());
-    println!("founder proof id: {}", format_proof_id(bundle.proof().id()));
+    println!("team root key:         {}", root_key_path.display());
+    println!(
+        "founder connect proof: {}",
+        format_proof_id(connect.proof().id())
+    );
+    println!(
+        "founder sync proof:    {}",
+        format_proof_id(sync.proof().id())
+    );
     Ok(())
 }
 
@@ -512,7 +650,8 @@ fn run_create(
 fn run_invite(
     pile_path: PathBuf,
     team_root_text: String,
-    parent_text: String,
+    connect_parent_text: String,
+    sync_parent_text: String,
     key_path: Option<PathBuf>,
     invitee_text: String,
     delegate: bool,
@@ -521,46 +660,81 @@ fn run_invite(
     out: PathBuf,
 ) -> Result<()> {
     let team_root = parse_team_root(&team_root_text)?;
-    let parent_id = parse_proof_id(&parent_text)?;
+    let connect_parent_id = parse_proof_id(&connect_parent_text)?;
+    let sync_parent_id = parse_proof_id(&sync_parent_text)?;
     let issuer_key = load_existing_signing_key(key_path, &pile_path)?;
     let issuer = issuer_key.verifying_key();
     let invitee = parse_public_key(&invitee_text, "invitee public key")?;
     let child_validity = validity(valid_from, valid_until)?;
     let instant = triblespace_core::clock::epoch_now();
 
-    let bundle = with_pile(&pile_path, |pile| {
-        let parent_bundle = load_capability_bundle(pile, parent_id)?;
-        let parent = parent_bundle
+    let invite = with_pile(&pile_path, |pile| {
+        let connect_parent_bundle = load_capability_bundle(pile, connect_parent_id)?;
+        let sync_parent_bundle = load_capability_bundle(pile, sync_parent_id)?;
+        let connect_parent = connect_parent_bundle
             .verify(
                 team_root,
                 instant,
                 issuer,
                 CapabilityRequest::new(connect_atom(team_root), CapabilityMode::Delegate),
             )
-            .map_err(|error| anyhow!("parent proof rejected: {error}"))?;
+            .map_err(|error| anyhow!("CONNECT parent proof rejected: {error}"))?;
+        let sync_parent = sync_parent_bundle
+            .verify(
+                team_root,
+                instant,
+                issuer,
+                CapabilityRequest::new(sync_atom(team_root), CapabilityMode::Delegate),
+            )
+            .map_err(|error| anyhow!("SYNC_TEAM parent proof rejected: {error}"))?;
 
         let child_mode = if delegate {
             CapabilityMode::InvokeAndDelegate
         } else {
             CapabilityMode::Invoke
         };
-        let child = CapabilityClaim::delegated(
-            parent.claim_handle(),
+        let connect_child = CapabilityClaim::delegated(
+            connect_parent.claim_handle(),
             connect_atom(team_root),
             child_mode,
             child_validity,
         );
-        let bundle = parent
-            .delegate(&issuer_key, child, invitee)
-            .map_err(|error| anyhow!("issue child proof: {error}"))?;
-        store_capability_bundle(pile, &bundle)?;
-        Ok(bundle)
+        let sync_child = CapabilityClaim::delegated(
+            sync_parent.claim_handle(),
+            sync_atom(team_root),
+            child_mode,
+            child_validity,
+        );
+        let connect = connect_parent
+            .delegate(&issuer_key, connect_child, invitee)
+            .map_err(|error| anyhow!("issue child CONNECT proof: {error}"))?;
+        let sync = sync_parent
+            .delegate(&issuer_key, sync_child, invitee)
+            .map_err(|error| anyhow!("issue child SYNC_TEAM proof: {error}"))?;
+
+        // Both independent chains are fully verified and issued before the
+        // first append-only store write. A retry completes any storage-level
+        // partial write idempotently.
+        store_capability_bundle(pile, &connect)?;
+        store_capability_bundle(pile, &sync)?;
+        Ok(TeamInvite { connect, sync })
     })?;
 
-    write_invite(&out, &bundle)?;
-    println!("issued proof id: {}", format_proof_id(bundle.proof().id()));
-    println!("invite bundle:   {}", out.display());
-    println!("proof steps:     {}", bundle.proof().step_count());
+    write_team_invite(&out, &invite)?;
+    println!(
+        "issued connect proof: {}",
+        format_proof_id(invite.connect.proof().id())
+    );
+    println!(
+        "issued sync proof:    {}",
+        format_proof_id(invite.sync.proof().id())
+    );
+    println!("invite artifact:      {}", out.display());
+    println!(
+        "connect proof steps:  {}",
+        invite.connect.proof().step_count()
+    );
+    println!("sync proof steps:     {}", invite.sync.proof().step_count());
     Ok(())
 }
 
@@ -572,20 +746,48 @@ fn run_join(
 ) -> Result<()> {
     let local_key = load_existing_signing_key(key_path, &pile_path)?;
     let team_root = parse_team_root(&team_root_text)?;
-    let bundle = read_invite(&invite_path)?;
-    bundle
+    let invite = read_team_invite(&invite_path)?;
+    let now = triblespace_core::clock::epoch_now();
+    invite
+        .connect
         .verify(
             team_root,
-            triblespace_core::clock::epoch_now(),
+            now,
             local_key.verifying_key(),
             CapabilityRequest::new(connect_atom(team_root), CapabilityMode::Invoke),
         )
-        .map_err(|error| anyhow!("invite proof rejected: {error}"))?;
-    with_pile(&pile_path, |pile| store_capability_bundle(pile, &bundle))?;
+        .map_err(|error| anyhow!("CONNECT invite proof rejected: {error}"))?;
+    invite
+        .sync
+        .verify(
+            team_root,
+            now,
+            local_key.verifying_key(),
+            CapabilityRequest::new(sync_atom(team_root), CapabilityMode::Invoke),
+        )
+        .map_err(|error| anyhow!("SYNC_TEAM invite proof rejected: {error}"))?;
+    with_pile(&pile_path, |pile| {
+        store_capability_bundle(pile, &invite.connect)?;
+        store_capability_bundle(pile, &invite.sync)
+    })?;
 
     println!("team root:        {}", hex::encode(team_root.to_bytes()));
-    println!("accepted proof:   {}", format_proof_id(bundle.proof().id()));
-    println!("proof steps:      {}", bundle.proof().step_count());
+    println!(
+        "accepted connect proof: {}",
+        format_proof_id(invite.connect.proof().id())
+    );
+    println!(
+        "accepted sync proof:    {}",
+        format_proof_id(invite.sync.proof().id())
+    );
+    println!(
+        "connect proof steps:    {}",
+        invite.connect.proof().step_count()
+    );
+    println!(
+        "sync proof steps:       {}",
+        invite.sync.proof().step_count()
+    );
     Ok(())
 }
 
@@ -729,6 +931,8 @@ fn print_replica_root_key_warning() {
 fn action_label(action: CapabilityAction) -> String {
     if action.id() == ACTION_CONNECT {
         "CONNECT".to_owned()
+    } else if action.id() == ACTION_SYNC_TEAM {
+        "SYNC_TEAM".to_owned()
     } else if action.id() == ACTION_REPLICATE_STORE {
         "REPLICATE_STORE".to_owned()
     } else {
@@ -799,12 +1003,19 @@ fn run_show(pile_path: PathBuf, team_root_text: String, proof_text: String) -> R
         } else {
             CapabilityMode::Delegate
         };
+        let exact_atom = if first.atom().action().id() == ACTION_CONNECT {
+            connect_atom(team_root)
+        } else if first.atom().action().id() == ACTION_SYNC_TEAM {
+            sync_atom(team_root)
+        } else {
+            bail!("team proof does not grant exact CONNECT or SYNC_TEAM authority");
+        };
         let verified = bundle
             .verify(
                 team_root,
                 triblespace_core::clock::epoch_now(),
                 bundle.proof().leaf_key(),
-                CapabilityRequest::new(connect_atom(team_root), required),
+                CapabilityRequest::new(exact_atom, required),
             )
             .map_err(|error| anyhow!("capability proof rejected: {error}"))?;
 
@@ -837,6 +1048,55 @@ mod tests {
 
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
+    }
+
+    #[test]
+    fn team_invite_envelope_is_fixed_order_bounded_and_strict() {
+        let root = key(1);
+        let member = key(2).verifying_key();
+        let connect = CapabilityProofBundle::issue_root(
+            &root,
+            CapabilityClaim::root(
+                connect_atom(root.verifying_key()),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            member,
+        )
+        .unwrap();
+        let sync = CapabilityProofBundle::issue_root(
+            &root,
+            CapabilityClaim::root(
+                sync_atom(root.verifying_key()),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            member,
+        )
+        .unwrap();
+        let invite = TeamInvite { connect, sync };
+        let bytes = invite.to_bytes().unwrap();
+        assert_eq!(&bytes[..16], &TEAM_INVITE_FORMAT.raw());
+        assert_eq!(bytes[16], TEAM_INVITE_VERSION);
+        assert_eq!(TeamInvite::from_bytes(&bytes).unwrap(), invite);
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(TeamInvite::from_bytes(&trailing)
+            .unwrap_err()
+            .to_string()
+            .contains("trailing"));
+
+        let mut oversized_bundle = bytes;
+        oversized_bundle[17..21].copy_from_slice(
+            &u32::try_from(MAX_CAPABILITY_PROOF_BUNDLE_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert!(TeamInvite::from_bytes(&oversized_bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("CONNECT proof bundle"));
     }
 
     #[test]

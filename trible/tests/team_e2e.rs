@@ -1,15 +1,12 @@
 //! End-to-end tests for native direct team capability proofs.
 
 use assert_cmd::Command;
-use ed25519_dalek::VerifyingKey;
-use hifitime::Epoch;
 use tempfile::tempdir;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
 use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-    CapabilityProofId, CapabilityRequest, CapabilityResource, CapabilityValidity,
-    MAX_CAPABILITY_PROOF_BUNDLE_BYTES,
+    CapabilityProofId, CapabilityResource, MAX_CAPABILITY_PROOF_BUNDLE_BYTES,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
@@ -20,7 +17,13 @@ use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 struct CreatedTeam {
     root: String,
     root_key: String,
-    founder_proof: String,
+    founder_connect_proof: String,
+    founder_sync_proof: String,
+}
+
+struct PortableTeamInvite {
+    connect: CapabilityProofBundle,
+    sync: CapabilityProofBundle,
 }
 
 fn output_field(stdout: &[u8], label: &str) -> String {
@@ -51,7 +54,8 @@ fn create_team(pile: &std::path::Path, key: &std::path::Path) -> CreatedTeam {
     CreatedTeam {
         root: output_field(&output, "team root pubkey:"),
         root_key: output_field(&output, "team root key:"),
-        founder_proof: output_field(&output, "founder proof id:"),
+        founder_connect_proof: output_field(&output, "founder connect proof:"),
+        founder_sync_proof: output_field(&output, "founder sync proof:"),
     }
 }
 
@@ -73,15 +77,24 @@ fn parse_proof_id(text: &str) -> CapabilityProofId {
     Inline::new(raw)
 }
 
-fn parse_public_key(text: &str) -> VerifyingKey {
-    let bytes = hex::decode(text).expect("public key hex");
-    let raw: [u8; 32] = bytes.try_into().expect("32-byte public key");
-    VerifyingKey::from_bytes(&raw).expect("valid public key")
-}
-
-fn read_invite(path: &std::path::Path) -> CapabilityProofBundle {
+fn read_invite(path: &std::path::Path) -> PortableTeamInvite {
     let bytes = std::fs::read(path).expect("read invite");
-    CapabilityProofBundle::from_bytes(&bytes).expect("canonical capability proof bundle")
+    let marker = hex::decode("888807EA9891D3187A83408578CDD21B").unwrap();
+    assert_eq!(&bytes[..16], marker);
+    assert_eq!(bytes[16], 1);
+    let mut offset = 17;
+    let mut bundle = || {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let bundle = CapabilityProofBundle::from_bytes(&bytes[offset..offset + length])
+            .expect("canonical capability proof bundle");
+        offset += length;
+        bundle
+    };
+    let connect = bundle();
+    let sync = bundle();
+    assert_eq!(offset, bytes.len());
+    PortableTeamInvite { connect, sync }
 }
 
 fn stored_bundle(
@@ -159,14 +172,18 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
             .to_string()
     );
     assert!(std::path::Path::new(&team.root_key).is_file());
-    assert_eq!(team.founder_proof.len(), 64);
+    assert_eq!(team.founder_connect_proof.len(), 64);
+    assert_eq!(team.founder_sync_proof.len(), 64);
 
-    let founder_proof_id = parse_proof_id(&team.founder_proof);
-    let (founder_proof_count, founder_bundle) = stored_bundle(&founder_pile, founder_proof_id);
-    assert_eq!(founder_proof_count, 1);
-    let founder_bundle = founder_bundle.expect("founder proof is stored natively");
-    assert_eq!(founder_bundle.proof().id(), founder_proof_id);
-    assert_exact_claim_closure(&founder_bundle);
+    let founder_connect_id = parse_proof_id(&team.founder_connect_proof);
+    let founder_sync_id = parse_proof_id(&team.founder_sync_proof);
+    let (founder_proof_count, founder_connect) = stored_bundle(&founder_pile, founder_connect_id);
+    assert_eq!(founder_proof_count, 2);
+    let founder_connect = founder_connect.expect("founder CONNECT proof is stored natively");
+    let (_, founder_sync) = stored_bundle(&founder_pile, founder_sync_id);
+    let founder_sync = founder_sync.expect("founder SYNC_TEAM proof is stored natively");
+    assert_exact_claim_closure(&founder_connect);
+    assert_exact_claim_closure(&founder_sync);
 
     let founder_show = Command::cargo_bin("trible")
         .unwrap()
@@ -178,7 +195,7 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
             "--team-root",
             &team.root,
             "--proof",
-            &team.founder_proof,
+            &team.founder_connect_proof,
         ])
         .assert()
         .success()
@@ -191,6 +208,27 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
     assert!(founder_show.contains("mode:       invoke+delegate"));
     assert!(founder_show.contains(&format!("resource:   {}", team.root)));
 
+    let founder_sync_show = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "show",
+            "--pile",
+            founder_pile.to_str().unwrap(),
+            "--team-root",
+            &team.root,
+            "--proof",
+            &team.founder_sync_proof,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(String::from_utf8(founder_sync_show)
+        .unwrap()
+        .contains("action:     SYNC_TEAM"));
+
     let invitee = identity(&invitee_key);
     let invite_output = Command::cargo_bin("trible")
         .unwrap()
@@ -201,8 +239,10 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
             founder_pile.to_str().unwrap(),
             "--team-root",
             &team.root,
-            "--parent-proof",
-            &team.founder_proof,
+            "--connect-parent-proof",
+            &team.founder_connect_proof,
+            "--sync-parent-proof",
+            &team.founder_sync_proof,
             "--key",
             founder_key.to_str().unwrap(),
             "--invitee",
@@ -216,18 +256,24 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
         .get_output()
         .stdout
         .clone();
-    let invitee_proof = output_field(&invite_output, "issued proof id:");
-    assert_eq!(invitee_proof.len(), 64);
-    assert_eq!(output_field(&invite_output, "proof steps:"), "2");
+    let invitee_connect = output_field(&invite_output, "issued connect proof:");
+    let invitee_sync = output_field(&invite_output, "issued sync proof:");
+    assert_eq!(invitee_connect.len(), 64);
+    assert_eq!(invitee_sync.len(), 64);
+    assert_eq!(output_field(&invite_output, "connect proof steps:"), "2");
+    assert_eq!(output_field(&invite_output, "sync proof steps:"), "2");
 
-    let invitee_proof_id = parse_proof_id(&invitee_proof);
-    let invitee_portable_bundle = read_invite(&invitee_bundle);
+    let invitee_connect_id = parse_proof_id(&invitee_connect);
+    let invitee_sync_id = parse_proof_id(&invitee_sync);
+    let invitee_portable = read_invite(&invitee_bundle);
     assert_eq!(
-        hex::encode(invitee_portable_bundle.proof().root_key().to_bytes()),
+        hex::encode(invitee_portable.connect.proof().root_key().to_bytes()),
         team.root
     );
-    assert_eq!(invitee_portable_bundle.proof().id(), invitee_proof_id);
-    assert_exact_claim_closure(&invitee_portable_bundle);
+    assert_eq!(invitee_portable.connect.proof().id(), invitee_connect_id);
+    assert_eq!(invitee_portable.sync.proof().id(), invitee_sync_id);
+    assert_exact_claim_closure(&invitee_portable.connect);
+    assert_exact_claim_closure(&invitee_portable.sync);
 
     let join_output = Command::cargo_bin("trible")
         .unwrap()
@@ -249,15 +295,28 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
         .stdout
         .clone();
     assert_eq!(output_field(&join_output, "team root:"), team.root);
-    assert_eq!(output_field(&join_output, "accepted proof:"), invitee_proof);
-    assert_eq!(output_field(&join_output, "proof steps:"), "2");
-
-    let (invitee_proof_count, invitee_stored_bundle) =
-        stored_bundle(&invitee_pile, invitee_proof_id);
-    assert_eq!(invitee_proof_count, 1);
     assert_eq!(
-        invitee_stored_bundle.expect("joined proof is stored natively"),
-        invitee_portable_bundle
+        output_field(&join_output, "accepted connect proof:"),
+        invitee_connect
+    );
+    assert_eq!(
+        output_field(&join_output, "accepted sync proof:"),
+        invitee_sync
+    );
+    assert_eq!(output_field(&join_output, "connect proof steps:"), "2");
+    assert_eq!(output_field(&join_output, "sync proof steps:"), "2");
+
+    let (invitee_proof_count, invitee_stored_connect) =
+        stored_bundle(&invitee_pile, invitee_connect_id);
+    assert_eq!(invitee_proof_count, 2);
+    assert_eq!(
+        invitee_stored_connect.expect("joined CONNECT proof is stored natively"),
+        invitee_portable.connect
+    );
+    let (_, invitee_stored_sync) = stored_bundle(&invitee_pile, invitee_sync_id);
+    assert_eq!(
+        invitee_stored_sync.expect("joined SYNC_TEAM proof is stored natively"),
+        invitee_portable.sync
     );
 
     // Importing the same exact claim closure and proof is idempotent.
@@ -277,12 +336,12 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
         ])
         .assert()
         .success();
-    let (invitee_proof_count, invitee_stored_bundle) =
-        stored_bundle(&invitee_pile, invitee_proof_id);
-    assert_eq!(invitee_proof_count, 1);
+    let (invitee_proof_count, invitee_stored_connect) =
+        stored_bundle(&invitee_pile, invitee_connect_id);
+    assert_eq!(invitee_proof_count, 2);
     assert_eq!(
-        invitee_stored_bundle.expect("idempotent join retains the proof"),
-        invitee_portable_bundle
+        invitee_stored_connect.expect("idempotent join retains the CONNECT proof"),
+        invitee_portable.connect
     );
 
     let third = identity(&third_key);
@@ -295,8 +354,10 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
             invitee_pile.to_str().unwrap(),
             "--team-root",
             &team.root,
-            "--parent-proof",
-            &invitee_proof,
+            "--connect-parent-proof",
+            &invitee_connect,
+            "--sync-parent-proof",
+            &invitee_sync,
             "--key",
             invitee_key.to_str().unwrap(),
             "--invitee",
@@ -309,18 +370,24 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
         .get_output()
         .stdout
         .clone();
-    let third_proof = output_field(&third_invite, "issued proof id:");
-    assert_eq!(third_proof.len(), 64);
-    assert_eq!(output_field(&third_invite, "proof steps:"), "3");
+    let third_connect = output_field(&third_invite, "issued connect proof:");
+    let third_sync = output_field(&third_invite, "issued sync proof:");
+    assert_eq!(third_connect.len(), 64);
+    assert_eq!(third_sync.len(), 64);
+    assert_eq!(output_field(&third_invite, "connect proof steps:"), "3");
+    assert_eq!(output_field(&third_invite, "sync proof steps:"), "3");
 
-    let third_proof_id = parse_proof_id(&third_proof);
-    let third_portable_bundle = read_invite(&third_bundle);
+    let third_connect_id = parse_proof_id(&third_connect);
+    let third_sync_id = parse_proof_id(&third_sync);
+    let third_portable = read_invite(&third_bundle);
     assert_eq!(
-        third_portable_bundle.proof().root_key(),
-        invitee_portable_bundle.proof().root_key()
+        third_portable.connect.proof().root_key(),
+        invitee_portable.connect.proof().root_key()
     );
-    assert_eq!(third_portable_bundle.proof().id(), third_proof_id);
-    assert_exact_claim_closure(&third_portable_bundle);
+    assert_eq!(third_portable.connect.proof().id(), third_connect_id);
+    assert_eq!(third_portable.sync.proof().id(), third_sync_id);
+    assert_exact_claim_closure(&third_portable.connect);
+    assert_exact_claim_closure(&third_portable.sync);
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -339,11 +406,16 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
         .assert()
         .success();
 
-    let (third_proof_count, third_stored_bundle) = stored_bundle(&third_pile, third_proof_id);
-    assert_eq!(third_proof_count, 1);
+    let (third_proof_count, third_stored_connect) = stored_bundle(&third_pile, third_connect_id);
+    assert_eq!(third_proof_count, 2);
     assert_eq!(
-        third_stored_bundle.expect("delegated proof is stored natively"),
-        third_portable_bundle
+        third_stored_connect.expect("delegated CONNECT proof is stored natively"),
+        third_portable.connect
+    );
+    let (_, third_stored_sync) = stored_bundle(&third_pile, third_sync_id);
+    assert_eq!(
+        third_stored_sync.expect("delegated SYNC_TEAM proof is stored natively"),
+        third_portable.sync
     );
 
     let show = Command::cargo_bin("trible")
@@ -356,7 +428,7 @@ fn create_invite_join_and_delegate_compose_by_exact_handles() {
             "--team-root",
             &team.root,
             "--proof",
-            &third_proof,
+            &third_connect,
         ])
         .assert()
         .success()
@@ -395,8 +467,10 @@ fn join_rejects_a_bundle_for_another_key_without_importing_it() {
             founder_pile.to_str().unwrap(),
             "--team-root",
             &team.root,
-            "--parent-proof",
-            &team.founder_proof,
+            "--connect-parent-proof",
+            &team.founder_connect_proof,
+            "--sync-parent-proof",
+            &team.founder_sync_proof,
             "--key",
             founder_key.to_str().unwrap(),
             "--invitee",
@@ -409,8 +483,9 @@ fn join_rejects_a_bundle_for_another_key_without_importing_it() {
         .get_output()
         .stdout
         .clone();
-    let proof = output_field(&invite, "issued proof id:");
-    let proof_id = parse_proof_id(&proof);
+    let connect_proof = output_field(&invite, "issued connect proof:");
+    let connect_id = parse_proof_id(&connect_proof);
+    let sync_id = parse_proof_id(&output_field(&invite, "issued sync proof:"));
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -428,11 +503,12 @@ fn join_rejects_a_bundle_for_another_key_without_importing_it() {
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("invite proof rejected"));
+        .stderr(predicates::str::contains("CONNECT invite proof rejected"));
 
-    let (proof_count, stored) = stored_bundle(&receiver_pile, proof_id);
+    let (proof_count, stored) = stored_bundle(&receiver_pile, connect_id);
     assert_eq!(proof_count, 0);
     assert!(stored.is_none());
+    assert!(stored_bundle(&receiver_pile, sync_id).1.is_none());
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -444,7 +520,7 @@ fn join_rejects_a_bundle_for_another_key_without_importing_it() {
             "--team-root",
             &team.root,
             "--proof",
-            &proof,
+            &connect_proof,
         ])
         .assert()
         .failure()
@@ -471,8 +547,10 @@ fn invite_requires_the_exact_resident_delegating_parent_handle() {
             pile.to_str().unwrap(),
             "--team-root",
             &team.root,
-            "--parent-proof",
+            "--connect-parent-proof",
             &"11".repeat(32),
+            "--sync-parent-proof",
+            &team.founder_sync_proof,
             "--key",
             founder_key.to_str().unwrap(),
             "--invitee",
@@ -498,33 +576,37 @@ fn join_rejects_an_expired_child_at_the_explicit_current_time() {
     let bundle = dir.path().join("expired.team");
     let team = create_team(&founder_pile, &founder_key);
     let receiver = identity(&receiver_key);
-    let team_root = parse_public_key(&team.root);
-    let receiver = parse_public_key(&receiver);
-    let founder = triblespace_core::signing_key_file::load_existing(&founder_key).unwrap();
-    let (_, founder_bundle) = stored_bundle(&founder_pile, parse_proof_id(&team.founder_proof));
-    let founder_bundle = founder_bundle.expect("resident founder proof");
-    let root_claim = CapabilityClaim::from_blob(founder_bundle.claims()[0].clone()).unwrap();
-    let valid_from = Epoch::maybe_from_gregorian_utc(2000, 1, 1, 0, 0, 0, 0).unwrap();
-    let valid_until = Epoch::maybe_from_gregorian_utc(2001, 1, 1, 0, 0, 0, 0).unwrap();
-    let issued_then = founder_bundle
-        .verify(
-            team_root,
-            valid_from,
-            founder.verifying_key(),
-            CapabilityRequest::new(root_claim.atom(), CapabilityMode::Delegate),
-        )
-        .unwrap();
-    let expired_claim = CapabilityClaim::delegated(
-        issued_then.claim_handle(),
-        root_claim.atom(),
-        CapabilityMode::Invoke,
-        Some(CapabilityValidity::new(valid_from, valid_until).unwrap()),
-    );
-    let expired_bundle = issued_then
-        .delegate(&founder, expired_claim, receiver)
-        .unwrap();
-    let expired_id = expired_bundle.proof().id();
-    std::fs::write(&bundle, expired_bundle.to_bytes().unwrap()).unwrap();
+    let invite = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "invite",
+            "--pile",
+            founder_pile.to_str().unwrap(),
+            "--team-root",
+            &team.root,
+            "--connect-parent-proof",
+            &team.founder_connect_proof,
+            "--sync-parent-proof",
+            &team.founder_sync_proof,
+            "--key",
+            founder_key.to_str().unwrap(),
+            "--invitee",
+            &receiver,
+            "--valid-from",
+            "2000-01-01T00:00:00Z",
+            "--valid-until",
+            "2001-01-01T00:00:00Z",
+            "--out",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let expired_connect_id = parse_proof_id(&output_field(&invite, "issued connect proof:"));
+    let expired_sync_id = parse_proof_id(&output_field(&invite, "issued sync proof:"));
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -544,9 +626,10 @@ fn join_rejects_an_expired_child_at_the_explicit_current_time() {
         .failure()
         .stderr(predicates::str::contains("expired"));
 
-    let (proof_count, stored) = stored_bundle(&receiver_pile, expired_id);
+    let (proof_count, stored) = stored_bundle(&receiver_pile, expired_connect_id);
     assert_eq!(proof_count, 0);
     assert!(stored.is_none());
+    assert!(stored_bundle(&receiver_pile, expired_sync_id).1.is_none());
 }
 
 #[test]
@@ -566,8 +649,10 @@ fn invite_rejects_inverted_or_half_specified_validity() {
         pile.to_str().unwrap(),
         "--team-root",
         &team.root,
-        "--parent-proof",
-        &team.founder_proof,
+        "--connect-parent-proof",
+        &team.founder_connect_proof,
+        "--sync-parent-proof",
+        &team.founder_sync_proof,
         "--key",
         founder_key.to_str().unwrap(),
         "--invitee",
@@ -624,7 +709,7 @@ fn show_rejects_the_right_proof_under_a_different_team_root() {
             "--team-root",
             &second.root,
             "--proof",
-            &first.founder_proof,
+            &first.founder_connect_proof,
         ])
         .assert()
         .failure()
@@ -671,11 +756,11 @@ fn show_requires_the_exact_connect_atom_even_under_the_right_root() {
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("exact request"));
+        .stderr(predicates::str::contains("exact CONNECT or SYNC_TEAM"));
 }
 
 #[test]
-fn join_rejects_a_tampered_direct_signature_without_importing_it() {
+fn join_verifies_sync_before_importing_valid_connect() {
     let dir = tempdir().unwrap();
     let founder_pile = dir.path().join("founder.pile");
     let receiver_pile = dir.path().join("receiver.pile");
@@ -696,8 +781,10 @@ fn join_rejects_a_tampered_direct_signature_without_importing_it() {
             founder_pile.to_str().unwrap(),
             "--team-root",
             &team.root,
-            "--parent-proof",
-            &team.founder_proof,
+            "--connect-parent-proof",
+            &team.founder_connect_proof,
+            "--sync-parent-proof",
+            &team.founder_sync_proof,
             "--key",
             founder_key.to_str().unwrap(),
             "--invitee",
@@ -710,15 +797,19 @@ fn join_rejects_a_tampered_direct_signature_without_importing_it() {
 
     let original = read_invite(&invite);
     let mut bytes = std::fs::read(&invite).unwrap();
-    // bundle(version, count) || proof(K0, S0, C0, K1, ...)
-    let first_signature = 2 + 32;
-    bytes[first_signature] ^= 1;
+    let connect_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap()) as usize;
+    // team(marker, version, connect_len, connect, sync_len) ||
+    // sync_bundle(version, count) || sync_proof(K0, S0, C0, K1, ...)
+    let first_sync_signature = 16 + 1 + 4 + connect_len + 4 + 2 + 32;
+    bytes[first_sync_signature] ^= 1;
     std::fs::write(&invite, bytes).unwrap();
 
     let tampered = read_invite(&invite);
-    assert_ne!(tampered.proof().id(), original.proof().id());
-    assert_exact_claim_closure(&tampered);
-    let tampered_id = tampered.proof().id();
+    assert_eq!(tampered.connect, original.connect);
+    assert_ne!(tampered.sync.proof().id(), original.sync.proof().id());
+    assert_exact_claim_closure(&tampered.sync);
+    let connect_id = original.connect.proof().id();
+    let tampered_sync_id = tampered.sync.proof().id();
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -738,9 +829,11 @@ fn join_rejects_a_tampered_direct_signature_without_importing_it() {
         .failure()
         .stderr(predicates::str::contains("invalid signature"));
 
-    let (proof_count, stored) = stored_bundle(&receiver_pile, tampered_id);
+    let (proof_count, stored_connect) = stored_bundle(&receiver_pile, connect_id);
     assert_eq!(proof_count, 0);
-    assert!(stored.is_none());
+    assert!(stored_connect.is_none());
+    let (_, stored_sync) = stored_bundle(&receiver_pile, tampered_sync_id);
+    assert!(stored_sync.is_none());
 }
 
 #[test]
@@ -756,7 +849,8 @@ fn join_rejects_an_oversized_bundle_before_decoding() {
             .verifying_key()
             .to_bytes(),
     );
-    std::fs::write(&bundle, vec![0; MAX_CAPABILITY_PROOF_BUNDLE_BYTES + 1]).unwrap();
+    let maximum = 16 + 1 + 4 + 4 + 2 * MAX_CAPABILITY_PROOF_BUNDLE_BYTES;
+    std::fs::write(&bundle, vec![0; maximum + 1]).unwrap();
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -774,7 +868,7 @@ fn join_rejects_an_oversized_bundle_before_decoding() {
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("invite bundle exceeds"));
+        .stderr(predicates::str::contains("team invite exceeds"));
 }
 
 #[test]
@@ -803,10 +897,12 @@ fn issuance_can_describe_future_authority_without_observing_the_clock() {
         .get_output()
         .stdout
         .clone();
-    let proof_id = parse_proof_id(&output_field(&output, "founder proof id:"));
-    let (proof_count, stored) = stored_bundle(&pile, proof_id);
-    assert_eq!(proof_count, 1);
+    let connect_id = parse_proof_id(&output_field(&output, "founder connect proof:"));
+    let sync_id = parse_proof_id(&output_field(&output, "founder sync proof:"));
+    let (proof_count, stored) = stored_bundle(&pile, connect_id);
+    assert_eq!(proof_count, 2);
     assert!(stored.is_some());
+    assert!(stored_bundle(&pile, sync_id).1.is_some());
 }
 
 #[test]

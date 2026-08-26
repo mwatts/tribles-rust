@@ -124,17 +124,18 @@ independent inputs.
 ### Team capabilities
 
 A team is identified by an Ed25519 trust-root public key, whose exact 32 bytes
-are also its CONNECT resource. Semantic restrictions are keyless canonical
-claim blobs linked by parent claim handles. Principal delegation is one native
-`K0 (S C K)+` proof whose signatures bind issuer key, exact claim handle, and
-delegate key. Its BLAKE3 digest is the proof ID used for exact lookup. An invite
-carries the complete proof and ordered claims required for standalone
-verification.
+are the resource for two distinct capabilities: CONNECT admits transport and
+SYNC_TEAM permits inventory disclosure and reconciliation. Semantic
+restrictions are keyless canonical claim blobs linked by parent claim handles.
+Each independent `K0 (S C K)+` proof binds issuer key, exact claim handle, and
+delegate key; its BLAKE3 digest is the exact lookup id. One versioned invite
+artifact packages the bounded CONNECT and SYNC_TEAM proof bundles in fixed
+order so joining remains one operation without conflating their authority.
 
-- `team create --pile PATH [--key KEY_PATH] [--root-key ROOT_KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — initialize a durable offline team-root key, issue the founder CONNECT in `invoke+delegate` mode, store its claim and native proof, and print the root public key, root-key path, and founder proof ID.
-- `team invite --pile PATH --team-root HEX --parent-proof ID --key ISSUER --invitee HEX [--delegate] [--valid-from RFC3339 --valid-until RFC3339] --out FILE` — load one exact resident proof, verify its current delegation capability, extend it for the invitee, and write a portable proof bundle. Without `--delegate`, the child may connect but cannot invite.
-- `team join --pile PATH --team-root HEX --key INVITEE --invite FILE` — verify the bundle against the externally supplied team root, expected leaf, exact CONNECT atom, minimum invoke mode, and current validity before storing its claims and native proof idempotently. It prints the accepted proof ID.
-- `team show --pile PATH --team-root HEX --proof ID` — load, verify, and print one exact proof and its claim ancestry.
+- `team create --pile PATH [--key KEY_PATH] [--root-key ROOT_KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — initialize a durable offline team-root key, issue and store founder CONNECT and SYNC_TEAM proofs in `invoke+delegate` mode, and print both exact proof IDs.
+- `team invite --pile PATH --team-root HEX --connect-parent-proof ID --sync-parent-proof ID --key ISSUER --invitee HEX [--delegate] [--valid-from RFC3339 --valid-until RFC3339] --out FILE` — verify and extend both exact resident delegation chains, then write one portable invite artifact. Without `--delegate`, the child may connect and synchronize but cannot invite.
+- `team join --pile PATH --team-root HEX --key INVITEE --invite FILE` — validate both bundles against the externally supplied root, expected leaf, exact action, minimum invoke mode, and current validity before the first idempotent store write. It prints both accepted proof IDs.
+- `team show --pile PATH --team-root HEX --proof ID` — load, verify, and print one exact CONNECT or SYNC_TEAM proof and its claim ancestry.
 
 ### Work with remote stores
 

@@ -186,7 +186,7 @@ fn join_accepts_delegated_ancestry_with_an_invoke_only_leaf() {
         .stdout
         .clone();
     let connect_root = field(&connect, "team root pubkey:");
-    let connect_proof = field(&connect, "founder proof id:");
+    let connect_proof = field(&connect, "founder connect proof:");
     let network_key = triblespace_core::signing_key_file::load_existing(&network_key_path).unwrap();
     let root = SigningKey::from_bytes(&[71; 32]);
     let delegate = SigningKey::from_bytes(&[72; 32]);

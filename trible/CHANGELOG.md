@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Keep team bootstrap one-step while separating transport from synchronization
+  authority. `team create` now issues distinct CONNECT and SYNC_TEAM founder
+  proofs; `team invite` delegates from two explicitly named parents and writes
+  one strictly bounded, versioned artifact containing both bundles in fixed
+  order; and `team join` verifies both completely before its first append-only
+  store write. The artifact marker was minted with `trible genid` as
+  `888807EA9891D3187A83408578CDD21B`.
 - Split legacy branch migration naming from admission: `--namespace` now only
   names the target, omission of `--authority` selects explicit open admission,
   and controlled targets consume one exact native WRITE proof plus its named

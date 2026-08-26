@@ -35,7 +35,7 @@ fn status_loads_the_exact_local_connect_proof() {
         .stdout
         .clone();
     let root = field(&create, "team root pubkey:");
-    let proof = field(&create, "founder proof id:");
+    let proof = field(&create, "founder connect proof:");
 
     let status = Command::cargo_bin("trible")
         .unwrap()

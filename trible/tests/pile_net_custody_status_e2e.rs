@@ -44,7 +44,7 @@ fn status_validates_both_exact_proofs_and_run_prints_live_ticket() {
         .stdout
         .clone();
     let connect_root = field(&connect, "team root pubkey:");
-    let connect_proof = field(&connect, "founder proof id:");
+    let connect_proof = field(&connect, "founder connect proof:");
 
     let key = triblespace_core::signing_key_file::load_existing(&network_key).unwrap();
     let subject = hex::encode(key.verifying_key().to_bytes());
@@ -150,7 +150,7 @@ fn status_validates_both_exact_proofs_and_run_prints_live_ticket() {
             > 0
     );
     assert_eq!(field(&status, "inventory_records:"), "0");
-    assert_eq!(field(&status, "inventory_proofs:"), "2");
+    assert_eq!(field(&status, "inventory_proofs:"), "3");
     let generation = field(&status, "inventory_generation:");
     assert_eq!(generation.len(), 64);
     assert!(generation
