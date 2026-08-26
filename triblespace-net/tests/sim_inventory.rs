@@ -28,7 +28,7 @@ use triblespace_net::inventory::{
 use triblespace_net::peer::Peer;
 use triblespace_net::protocol::connect_capability_atom;
 use triblespace_net::reconcile::Reconciler;
-use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
+use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 use common::*;
 
@@ -177,13 +177,7 @@ fn component_and_blob_qos_share_one_authenticated_protocol() {
 fn durable_exact_want_fetches_over_the_authenticated_demand_path() {
     let _guard = sim_guard();
     run_paused(0x1A11_0002, async {
-        let net = SimNet::new(
-            0x1A11_0002,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x1A11_0002, SimConfig::default());
         let root = key(0xF2);
         let publisher_key = key(0xA2);
         let consumer_key = key(0xB2);
@@ -242,13 +236,7 @@ fn durable_exact_want_fetches_over_the_authenticated_demand_path() {
 fn read_only_peer_discloses_neither_inventory_nor_blob_bytes() {
     let _guard = sim_guard();
     run_paused(0x1A11_0003, async {
-        let net = SimNet::new(
-            0x1A11_0003,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x1A11_0003, SimConfig::default());
         let root = key(0xF3);
         let source_key = key(0xA3);
         let reader_key = key(0xB3);
@@ -483,7 +471,6 @@ fn periodic_reconciliation_recovers_total_wake_loss() {
             0x1A11_0005,
             SimConfig {
                 gossip_drop_prob: 1.0,
-                dht: DhtMode::Blackhole,
                 ..SimConfig::default()
             },
         );
@@ -535,13 +522,7 @@ fn periodic_reconciliation_recovers_total_wake_loss() {
 fn authenticated_peer_inventory_expands_the_route_set() {
     let _guard = sim_guard();
     run_paused(0x1A11_0006, async {
-        let net = SimNet::new(
-            0x1A11_0006,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x1A11_0006, SimConfig::default());
         let root = key(0xF6);
         let bootstrap_key = key(0xA6);
         let discovered_key = key(0xB6);
