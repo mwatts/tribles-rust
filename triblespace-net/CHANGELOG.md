@@ -33,8 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Schedule immediate and periodic direct sweeps independently of lossy gossip,
   isolate failures per peer, bound dial and operation deadlines, evict failed
   pooled sessions, and retain a fair pending queue beyond the concurrent-sweep
-  limit. Provider-lease renewal remains active for write-only publishers and
-  silent for read-only consumers.
+  limit.
 - Enforce direction policy at the data boundary: read-only peers neither
   advertise nor serve local inventory or blobs; write-only peers never pull,
   demand-fetch, or admit inbound readers as durable PEER evidence.
@@ -57,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions and synchronized monotone PEER evidence add routing candidates but
   never authority, liveness, residency, or retention claims. Gossip neighbors
   are not routes.
+- Remove per-blob DHT publication and lookup from synchronization. Exact
+  Demand reads use the same authenticated configured/PEER route set as
+  inventory reconciliation, avoiding a second mutable discovery system.
 
 ## [0.41.4] - 2026-05-17
 

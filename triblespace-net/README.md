@@ -4,8 +4,7 @@ Authorized team inventory synchronization for TribleSpace over
 [iroh](https://www.iroh.computer). A peer periodically reconciles four
 monotone store components—PEER routing evidence, collection records,
 capability proofs, and optionally blobs—through authenticated Merkle walks.
-Gossip is only a lossy wake hint, the DHT only discovers blob providers, and
-neither grants authority.
+Gossip is only a lossy wake hint and never grants authority.
 
 The user-facing surface is `Peer<S>`, a synchronous store wrapper backed by an
 async host. `Peer::refresh` drains verified network events, crosses one storage
@@ -59,8 +58,7 @@ PEER, collection-record, and capability-proof inventories always converge when
 pulling is enabled. Blob behavior is local policy:
 
 - `Demand` skips the broad blob inventory. Durable blob WANTs use an exact,
-  SYNC_TEAM-authorized `GET_BLOB` through configured/learned routes and then
-  DHT providers.
+  SYNC_TEAM-authorized `GET_BLOB` through configured and learned routes.
 - `Mirror` also walks the complete authorized blob inventory and fetches
   missing bytes in bounded ranges. Mirroring is a synchronization policy, not
   a retention promise; an evicting store may discard bytes later.

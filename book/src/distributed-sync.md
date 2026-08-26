@@ -2,16 +2,15 @@
 
 The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
 crate synchronizes one team's TribleSpace store over
-[iroh](https://www.iroh.computer/). It has one data protocol and three
+[iroh](https://www.iroh.computer/). It has one data protocol and two
 deliberately narrow discovery mechanisms:
 
 - authenticated QUIC performs authorized inventory walks and exact blob reads;
-- a team-derived gossip topic carries lossy generation wake hints; and
-- the DHT discovers candidate providers for a specifically wanted blob.
+- a team-derived gossip topic carries lossy generation wake hints.
 
-Gossip neighbors, DHT advertisements, and stored routing evidence grant no
-authority. Periodic authenticated inventory sweeps are the correctness path,
-so dropped or duplicated wake frames affect latency rather than convergence.
+Gossip neighbors and stored routing evidence grant no authority. Periodic
+authenticated inventory sweeps are the correctness path, so dropped or
+duplicated wake frames affect latency rather than convergence.
 
 The user-visible surface is `Peer<S>`. It wraps a synchronous local store and
 owns the asynchronous host. There is no remote mutable head, receipt RPC,
@@ -153,10 +152,7 @@ authorized synchronization session and synchronized
 union carries those candidates transitively without creating a mutable roster.
 
 An endpoint remains only a candidate until the two proof handshakes succeed.
-Likewise, DHT provider discovery is used only for an exact blob demand. A
-provider advertisement neither proves that bytes are still resident nor
-bypasses CONNECT and SYNC_TEAM. Every returned payload is checked against its
-requested BLAKE3 handle.
+Every returned payload is checked against its requested BLAKE3 handle.
 
 The team key derives the production gossip topic, preventing an authorized
 store from accidentally rendezvousing on another team's mesh. Joining that
@@ -178,8 +174,8 @@ authorization claim:
 
 The blob mode is independent:
 
-- `Demand` skips the broad Blob inventory. A durable exact blob WANT first
-  tries configured and learned routes, then authorized DHT provider candidates.
+- `Demand` skips the broad Blob inventory. A durable exact blob WANT tries the
+  configured and learned authenticated routes.
 - `Mirror` also walks the complete authorized Blob inventory and fetches every
   missing resident blob in bounded ranges.
 
@@ -195,9 +191,9 @@ exact blob, a matching native `MERGE`, or a matching native `DERIVE` record.
 WANTs remain durable and are retried with bounded backoff; temporary
 unreachability means “not obtained yet,” never “absent.”
 
-Blob WANTs use exact authenticated `GET_BLOB` and DHT-assisted candidate
-discovery in Demand mode. The received bytes are content-checked, landed, and
-flushed before the WANT is counted as fulfilled.
+Blob WANTs use exact authenticated `GET_BLOB` over known team routes in Demand
+mode. The received bytes are content-checked, landed, and flushed before the
+WANT is counted as fulfilled.
 
 Collection-operation WANTs need no network operation. The full team inventory
 already converges all collection records, including conflicting valid
@@ -263,7 +259,7 @@ distributed proof of convergence.
 - Synchronization is componentwise set union, never last-writer-wins state.
 - The backing store is a single-team security boundary.
 - CONNECT admits transport; SYNC_TEAM separately authorizes every disclosure.
-- Proof presence, PEER evidence, gossip, and DHT discovery grant no authority.
+- Proof presence, PEER evidence, and gossip grant no authority.
 - Gossip wakes reconciliation; periodic authenticated sweeps establish
   eventual progress.
 - Every Merkle walk pins exact roots and fails closed when a snapshot is gone.

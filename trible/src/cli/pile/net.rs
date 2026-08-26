@@ -346,8 +346,8 @@ fn run_sync(
     // per-want retry bookkeeping (exponential backoff, capped at 60s);
     // the wants themselves live durably in the pile's WantStore. The
     // tick is async (the swarm fetch awaits the host), so we drive it
-    // on a small current-thread runtime — the fetch's internal DHT
-    // deadline uses tokio timers, which need a runtime context.
+    // on a small current-thread runtime; dial and operation deadlines
+    // use tokio timers and therefore need a runtime context.
     let mut reconciler = triblespace_net::reconcile::Reconciler::new();
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();

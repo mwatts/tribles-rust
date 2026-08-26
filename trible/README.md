@@ -110,7 +110,7 @@ descriptions.
 
 ### Distributed pile sync
 
-Built on `triblespace-net` (iroh QUIC + DHT + gossip). A node presents two
+Built on `triblespace-net` (authenticated iroh QUIC plus gossip wake hints). A node presents two
 independent exact proofs rooted at the team public key: CONNECT admits the
 transport connection and SYNC_TEAM authorizes disclosure and reconciliation of
 that team's inventory. The local pile must contain both selected native proofs
