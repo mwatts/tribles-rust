@@ -163,6 +163,11 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
     );
     assert_eq!(field(&status, "inventory_records:"), "0");
     assert_eq!(field(&status, "inventory_proofs:"), "2");
+    let generation = field(&status, "inventory_generation:");
+    assert_eq!(generation.len(), 64);
+    assert!(generation
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     assert!(!field(&status, "inventory_build:").is_empty());
     assert!(status_text.contains("authorization:  CONNECT accepted"));
     assert!(status_text.contains("authorization:  REPLICATE_STORE accepted"));

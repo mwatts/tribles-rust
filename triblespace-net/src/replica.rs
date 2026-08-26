@@ -646,6 +646,8 @@ pub struct CustodyReconcileOutcome {
     pub capability_proofs_added: u64,
     /// Remote inventory pages consumed.
     pub pages_read: u64,
+    /// Content-derived identity of the final local semantic inventory.
+    pub generation: [u8; 32],
 }
 
 /// Exact local inventory observed during a no-bind custody preflight.
@@ -656,6 +658,8 @@ pub struct CustodyInventoryStats {
     pub collection_records: u64,
     pub capability_proofs: u64,
     pub build_elapsed: std::time::Duration,
+    /// Content-derived identity of this local semantic inventory.
+    pub generation: [u8; 32],
 }
 
 impl ReplicaSummary {
@@ -679,6 +683,7 @@ impl ReplicaSummary {
             collection_records,
             capability_proofs,
             build_elapsed,
+            generation: self.generation().into_bytes(),
         }
     }
 }
@@ -997,6 +1002,7 @@ where
         let (local_summary, mut known) = self.publish_current_snapshot()?;
         let mut outcome = CustodyReconcileOutcome {
             peers_attempted: self.peers.len(),
+            generation: local_summary.generation().into_bytes(),
             ..CustodyReconcileOutcome::default()
         };
         let mut remotes = Vec::new();
@@ -1093,7 +1099,8 @@ where
             // Every component method has already crossed its final durability
             // barrier. Rebuild only the immutable serving view; an idle sweep
             // is entirely read-only and never calls flush.
-            self.publish_current_snapshot()?;
+            let (final_summary, _) = self.publish_current_snapshot()?;
+            outcome.generation = final_summary.generation().into_bytes();
         }
         outcome.peers_completed = remotes
             .iter()
@@ -1545,13 +1552,15 @@ mod tests {
             forward_snapshot.inventory.proofs,
             reverse_snapshot.inventory.proofs
         );
+        let forward_summary = forward_snapshot.summary_clone();
+        let reverse_summary = reverse_snapshot.summary_clone();
+        assert_eq!(forward_summary, reverse_summary);
+        let forward_stats = forward_summary.inventory_stats(std::time::Duration::ZERO);
+        let reverse_stats = reverse_summary.inventory_stats(std::time::Duration::ZERO);
+        assert_eq!(forward_stats, reverse_stats);
         assert_eq!(
-            forward_snapshot.summary_clone(),
-            reverse_snapshot.summary_clone()
-        );
-        assert_eq!(
-            forward_snapshot.summary_clone().generation(),
-            reverse_snapshot.summary_clone().generation()
+            forward_stats.generation,
+            forward_summary.generation().into_bytes()
         );
         drop((forward_snapshot, reverse_snapshot));
         forward.close().unwrap();

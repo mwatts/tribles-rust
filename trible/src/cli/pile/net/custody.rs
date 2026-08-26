@@ -249,6 +249,10 @@ fn print_configuration(state: &str, prepared: &Prepared, inventory: &CustodyInve
     println!("inventory_blob_bytes:  {}", inventory.blob_bytes);
     println!("inventory_records:     {}", inventory.collection_records);
     println!("inventory_proofs:      {}", inventory.capability_proofs);
+    println!(
+        "inventory_generation:  {}",
+        hex::encode(inventory.generation)
+    );
     println!("inventory_build:       {:?}", inventory.build_elapsed);
     println!("authorization:  CONNECT accepted");
     println!("authorization:  REPLICATE_STORE accepted");
@@ -367,7 +371,7 @@ async fn service_loop(
 
 fn print_outcome(outcome: &CustodyReconcileOutcome) {
     eprintln!(
-        "custody sweep: {}/{} peers; +{} blobs ({} bytes), +{} collection records, +{} proofs; {} pages",
+        "custody sweep: {}/{} peers; +{} blobs ({} bytes), +{} collection records, +{} proofs; {} pages; generation {}",
         outcome.peers_completed,
         outcome.peers_attempted,
         outcome.blobs_added,
@@ -375,6 +379,7 @@ fn print_outcome(outcome: &CustodyReconcileOutcome) {
         outcome.collection_records_added,
         outcome.capability_proofs_added,
         outcome.pages_read,
+        hex::encode(outcome.generation),
     );
     for error in &outcome.peer_errors {
         eprintln!("  peer unavailable: {error}");

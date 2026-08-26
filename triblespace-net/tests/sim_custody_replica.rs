@@ -342,6 +342,10 @@ fn healthy_pair_progresses_during_partition_then_restart_and_heal_converge() {
         assert_eq!(c_outcome.peers_completed, 1);
         assert_eq!(fingerprint(c.store_mut()), expected_ac);
         assert_eq!(wants(c.store_mut()), wants_c, "WANTs crossed custody union");
+        assert_eq!(
+            a_outcome.generation, c_outcome.generation,
+            "equal semantic inventories produced different generations"
+        );
 
         // Preserve B's store across a process-style network restart.
         net.crash(pk(&kb));
@@ -362,9 +366,10 @@ fn healthy_pair_progresses_during_partition_then_restart_and_heal_converge() {
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
 
-        assert_eq!(reconcile(&mut b).await.peers_completed, 2);
-        reconcile(&mut a).await;
-        reconcile(&mut c).await;
+        let b_outcome = reconcile(&mut b).await;
+        assert_eq!(b_outcome.peers_completed, 2);
+        let a_outcome = reconcile(&mut a).await;
+        let c_outcome = reconcile(&mut c).await;
         assert_eq!(fingerprint(a.store_mut()), expected_all);
         assert_eq!(fingerprint(b.store_mut()), expected_all);
         assert_eq!(fingerprint(c.store_mut()), expected_all);
@@ -374,12 +379,15 @@ fn healthy_pair_progresses_during_partition_then_restart_and_heal_converge() {
         assert_eq!(wants(a.store_mut()), wants_a);
         assert_eq!(wants(b.store_mut()), wants_b);
         assert_eq!(wants(c.store_mut()), wants_c);
+        assert_eq!(a_outcome.generation, b_outcome.generation);
+        assert_eq!(a_outcome.generation, c_outcome.generation);
 
         let idle = reconcile(&mut a).await;
         assert_eq!(idle.blobs_added, 0);
         assert_eq!(idle.collection_records_added, 0);
         assert_eq!(idle.capability_proofs_added, 0);
         assert_eq!(idle.pages_read, 0, "equal inventories still paged");
+        assert_eq!(idle.generation, a_outcome.generation);
     });
 }
 
