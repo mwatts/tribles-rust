@@ -299,9 +299,12 @@ Publishing a newer local snapshot therefore cannot splice its items into an
 older advertised walk, while reconnecting peers and peers that observed the
 same generation share one cached snapshot. A missing or evicted generation is
 rejected and the client restarts from a fresh summary. The cache uses the
-service's global connection-capacity bound; in-flight responses retain only
-their cloned snapshot until their existing deadline. The generation token is
-a retry/cache key, never an authorization capability: every request still
+service's global connection-capacity bound for its number of indexed
+generations. Eviction removes lookup eligibility, not necessarily the final
+allocation immediately: up to the global in-flight-request limit may already
+hold a clone or response bytes backed by an evicted snapshot, and those live
+only until their existing request deadlines. The generation token is a
+retry/cache key, never an authorization capability: every request still
 verifies current REPLICATE authority independently.
 Cancellation can abandon only network/page work: store mutations are
 synchronous, temporary receive files close on drop, the transport shuts down

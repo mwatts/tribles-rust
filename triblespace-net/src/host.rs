@@ -3031,19 +3031,34 @@ mod inbound_auth_deadline_tests {
         let client = net.join(client_id, None);
 
         let mut payloads =
-            blob_payloads_with_prefix(0x42, ReplicaComponent::Blobs.page_limit() + 2, 0);
+            blob_payloads_with_prefix(0x42, ReplicaComponent::Blobs.page_limit() + 3, 0);
         // Make the concurrent append sort after generation A's first-page
         // cursor, so serving generation B's final page necessarily reproduces
-        // the production count-overrun failure.
+        // the production count-overrun failure. The stale payload is A's only
+        // item after that cursor and is absent from B, which also exercises
+        // page-to-blob consistency in both directions.
         payloads.sort_unstable_by_key(|payload| *blake3::hash(payload).as_bytes());
         let added_payload = payloads.pop().unwrap();
+        let second_added_payload = payloads.pop().unwrap();
+        let stale_payload = payloads.pop().unwrap();
         let mut generation_a = MemoryRepo::default();
+        let mut generation_b = MemoryRepo::default();
         for payload in payloads {
             generation_a
+                .put::<UnknownBlob, _>(Bytes::from(payload.clone()))
+                .unwrap();
+            generation_b
                 .put::<UnknownBlob, _>(Bytes::from(payload))
                 .unwrap();
         }
-        let mut generation_b = generation_a.clone();
+        let stale_len = stale_payload.len() as u64;
+        let stale_handle = generation_a
+            .put::<UnknownBlob, _>(Bytes::from(stale_payload.clone()))
+            .unwrap();
+        let stale_id = ReplicaItemId(stale_handle.raw);
+        generation_b
+            .put::<UnknownBlob, _>(Bytes::from(second_added_payload))
+            .unwrap();
         let added_len = added_payload.len() as u64;
         let added_handle = generation_b
             .put::<UnknownBlob, _>(Bytes::from(added_payload.clone()))
@@ -3156,6 +3171,23 @@ mod inbound_auth_deadline_tests {
             .unwrap(),
             None
         );
+        let mut stale_generation_a_target = vec![0; stale_payload.len()];
+        assert_eq!(
+            op_replica_blob_range(
+                &connection,
+                replica_set,
+                &proof,
+                generation_a_token,
+                stale_id,
+                stale_len,
+                0,
+                &mut stale_generation_a_target,
+            )
+            .await
+            .unwrap(),
+            Some(stale_payload.len())
+        );
+        assert_eq!(stale_generation_a_target, stale_payload);
 
         // The generation cache is host-wide, not connection-local: a pooled-
         // connection eviction and redial can resume the same immutable walk.
@@ -3187,6 +3219,7 @@ mod inbound_auth_deadline_tests {
         .unwrap();
         assert!(done);
         assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id(), stale_id);
         assert_eq!(
             first_page.len() + page.len(),
             summary.bucket(ReplicaComponent::Blobs, 0x42).count as usize
@@ -3253,6 +3286,22 @@ mod inbound_auth_deadline_tests {
         .await
         .unwrap();
         assert!(!done);
+        let mut stale_generation_b_target = vec![0; stale_payload.len()];
+        assert_eq!(
+            op_replica_blob_range(
+                &connection,
+                replica_set,
+                &proof,
+                generation_b_token,
+                stale_id,
+                stale_len,
+                0,
+                &mut stale_generation_b_target,
+            )
+            .await
+            .unwrap(),
+            None
+        );
         let (next_final_page, done) = op_replica_page(
             &connection,
             replica_set,
