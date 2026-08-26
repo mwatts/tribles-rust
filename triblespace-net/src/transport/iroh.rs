@@ -9,6 +9,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use futures::StreamExt;
 use iroh_base::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -119,6 +120,9 @@ impl Transport for IrohTransport {
             .await
             .map_err(|e| anyhow::anyhow!("connect task: {e}"))?
             .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        // Subscribe before taking the snapshot so a selection change between
+        // the two operations is observed rather than silently lost.
+        let mut path_events = conn.path_events();
         let paths = conn.paths();
         if let Some(path) = paths.iter().find(|path| path.is_selected()) {
             tracing::info!(
@@ -128,6 +132,32 @@ impl Transport for IrohTransport {
                 "iroh connection selected path"
             );
         }
+        let remote_id = conn.remote_id();
+        tokio::spawn(async move {
+            while let Some(event) = path_events.next().await {
+                match event {
+                    iroh::endpoint::PathEvent::Selected {
+                        id,
+                        remote_addr,
+                        local_addr,
+                        ..
+                    } => tracing::info!(
+                        peer = %remote_id,
+                        ?id,
+                        remote = ?remote_addr,
+                        local = ?local_addr,
+                        direct = remote_addr.is_ip(),
+                        "iroh connection selected path changed"
+                    ),
+                    iroh::endpoint::PathEvent::Lagged { missed, .. } => tracing::warn!(
+                        peer = %remote_id,
+                        missed,
+                        "iroh connection path observer lagged"
+                    ),
+                    _ => {}
+                }
+            }
+        });
         Ok(IrohConn(conn))
     }
 
