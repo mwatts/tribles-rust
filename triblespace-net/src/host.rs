@@ -7,7 +7,7 @@
 //!
 //! Async is jailed inside the spawned thread.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -265,17 +265,56 @@ pub(crate) trait AnyReplicaSnapshot: Send + 'static {
 }
 
 /// One immutable custody generation shared by the current serving slot and
-/// any peer walks that already observed its summary.
+/// any walks that already observed its summary.
 type SharedReplicaSnapshot = Arc<Mutex<Box<dyn AnyReplicaSnapshot>>>;
 type ReplicaSnapshotSlot = Arc<Mutex<Option<SharedReplicaSnapshot>>>;
 
-#[derive(Clone)]
-struct ReplicaSnapshotPin {
-    generation: ReplicaGeneration,
-    snapshot: SharedReplicaSnapshot,
+/// Bounded reconnect cache for immutable custody generations.
+///
+/// A generation token is content-derived, and current REPLICATE authority
+/// grants the whole replica set. It therefore identifies a cached snapshot
+/// without being bound to the peer that first received its summary. Sharing
+/// by generation collapses identical concurrent walks onto one allocation.
+#[derive(Default)]
+struct ReplicaSnapshotCache {
+    snapshots: HashMap<ReplicaGeneration, SharedReplicaSnapshot>,
+    least_to_most_recent: VecDeque<ReplicaGeneration>,
 }
 
-type ReplicaSnapshotPins = Arc<Mutex<HashMap<PeerId, ReplicaSnapshotPin>>>;
+impl ReplicaSnapshotCache {
+    fn insert(&mut self, generation: ReplicaGeneration, snapshot: SharedReplicaSnapshot) {
+        if !self.snapshots.contains_key(&generation) {
+            self.snapshots.insert(generation, snapshot);
+        }
+        self.touch(generation);
+        while self.snapshots.len() > MAX_INBOUND_CONNECTIONS_GLOBAL {
+            let oldest = self
+                .least_to_most_recent
+                .pop_front()
+                .expect("nonempty generation cache has an LRU entry");
+            self.snapshots.remove(&oldest);
+        }
+    }
+
+    fn get(&mut self, generation: ReplicaGeneration) -> Option<SharedReplicaSnapshot> {
+        let snapshot = self.snapshots.get(&generation)?.clone();
+        self.touch(generation);
+        Some(snapshot)
+    }
+
+    fn touch(&mut self, generation: ReplicaGeneration) {
+        if let Some(position) = self
+            .least_to_most_recent
+            .iter()
+            .position(|candidate| *candidate == generation)
+        {
+            self.least_to_most_recent.remove(position);
+        }
+        self.least_to_most_recent.push_back(generation);
+    }
+}
+
+type ReplicaSnapshotGenerations = Arc<Mutex<ReplicaSnapshotCache>>;
 
 fn shared_replica_snapshot(snapshot: impl AnyReplicaSnapshot) -> SharedReplicaSnapshot {
     Arc::new(Mutex::new(Box::new(snapshot)))
@@ -359,15 +398,23 @@ pub(crate) trait NetCapability: Send + Sync {
         &self,
         request: WantRequest,
     ) -> FuturesUnordered<futures::future::BoxFuture<'static, CollectionOperationPeerProbe>>;
-    /// Fetch one exact private-custody summary from one configured peer.
+    /// Current process-local custody neighbors.
+    ///
+    /// Explicit bootstrap peers seed this set. A remote identity joins it only
+    /// after presenting a valid REPLICATE proof for this node's exact replica
+    /// set, so one bootstrap edge is enough for a connected team to converge
+    /// without publishing a global roster.
+    fn replica_peers(&self) -> Vec<PeerId>;
+    /// Fetch one exact custody summary from one known process-local neighbor.
     fn replica_summary(
         &self,
         peer: PeerId,
         replica_set: crate::replica::ReplicaSetId,
         proof: triblespace_core::capability::CapabilityProofBundle,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<ReplicaSummary>>;
-    /// Fetch one bounded private-custody inventory page from one configured
-    /// peer. This path never consults gossip neighbors or the DHT.
+    /// Fetch one bounded custody inventory page from a known process-local
+    /// neighbor. Reachability uses normal iroh route selection; custody never
+    /// consults collection gossip or the content-provider DHT.
     fn replica_page(
         &self,
         peer: PeerId,
@@ -378,7 +425,7 @@ pub(crate) trait NetCapability: Send + Sync {
         prefix: u8,
         after: Option<ReplicaItemId>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<(Vec<ReplicaItem>, bool)>>;
-    /// Fetch one exact private-custody blob through resumable bounded ranges.
+    /// Fetch one exact custody blob through resumable bounded ranges.
     fn replica_blob(
         &self,
         peer: PeerId,
@@ -413,6 +460,98 @@ pub struct CollectionOperationProbe {
 /// routing candidates, not claims that a peer holds any particular blob.
 /// `Vec` preserves deterministic simulation replay order.
 type RoutingCandidates = Arc<Mutex<Vec<PeerId>>>;
+
+/// Why one identity is currently a custody routing neighbor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CustodyPeerAuthority {
+    /// Explicit operator-selected bootstrap route.
+    Bootstrap,
+    /// Learned from an inbound REPLICATE proof. `None` is an unbounded proof;
+    /// otherwise the TAI nanosecond is the inclusive effective upper bound.
+    Learned(Option<i128>),
+}
+
+/// Process-local custody topology. This is routing state, not a durable roster:
+/// configured bootstrap peers seed it and successful inbound REPLICATE
+/// authorization adds the presenter only for the proof's effective lifetime.
+type CustodyPeers = Arc<Mutex<BTreeMap<PeerId, CustodyPeerAuthority>>>;
+
+fn epoch_tai_nanoseconds() -> i128 {
+    crate::clock::epoch_now()
+        .to_tai_duration()
+        .total_nanoseconds()
+}
+
+fn custody_peer_is_current(authority: CustodyPeerAuthority, now: i128) -> bool {
+    match authority {
+        CustodyPeerAuthority::Bootstrap | CustodyPeerAuthority::Learned(None) => true,
+        CustodyPeerAuthority::Learned(Some(upper)) => now <= upper,
+    }
+}
+
+fn custody_peer_is_known(peers: &CustodyPeers, peer: PeerId) -> bool {
+    let now = epoch_tai_nanoseconds();
+    peers
+        .lock()
+        .unwrap()
+        .get(&peer)
+        .copied()
+        .is_some_and(|authority| custody_peer_is_current(authority, now))
+}
+
+fn custody_peer_snapshot(peers: &CustodyPeers) -> Vec<PeerId> {
+    let now = epoch_tai_nanoseconds();
+    let mut peers = peers.lock().unwrap();
+    peers.retain(|_, authority| custody_peer_is_current(*authority, now));
+    peers.keys().copied().collect()
+}
+
+/// Intersect inclusive upper bounds. `None` denotes an unbounded interval.
+fn intersect_upper_bounds(left: Option<i128>, right: Option<i128>) -> Option<i128> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(upper), None) | (None, Some(upper)) => Some(upper),
+        (Some(left), Some(right)) => Some(left.min(right)),
+    }
+}
+
+/// Union already-valid authority intervals. Successful introductions happen
+/// at the current instant, so their intervals overlap there and maxing their
+/// inclusive upper bounds is an exact union. `None` denotes unbounded.
+fn union_upper_bounds(left: Option<i128>, right: Option<i128>) -> Option<i128> {
+    match (left, right) {
+        (None, _) | (_, None) => None,
+        (Some(left), Some(right)) => Some(left.max(right)),
+    }
+}
+
+fn note_authorized_custody_peer(
+    peers: &CustodyPeers,
+    peer: PeerId,
+    connect_upper: Option<hifitime::Epoch>,
+    replicate: &triblespace_core::capability::VerifiedCapability,
+) {
+    let connect_upper = connect_upper.map(|upper| upper.to_tai_duration().total_nanoseconds());
+    let replicate_upper = replicate
+        .effective_validity()
+        .map(|validity| validity.bounds().1.to_tai_duration().total_nanoseconds());
+    // The introduction is authorized only by the intersection of the
+    // connection and operation grants. `None` means unbounded on that side.
+    let learned = intersect_upper_bounds(connect_upper, replicate_upper);
+    let mut peers = peers.lock().unwrap();
+    match peers.entry(peer) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(CustodyPeerAuthority::Learned(learned));
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => match *entry.get() {
+            CustodyPeerAuthority::Bootstrap => {}
+            CustodyPeerAuthority::Learned(existing) => {
+                let union = union_upper_bounds(existing, learned);
+                entry.insert(CustodyPeerAuthority::Learned(union));
+            }
+        },
+    }
+}
 
 /// Cap on the remembered routing list. Gossip meshes are expected to be small;
 /// eight recent
@@ -479,6 +618,9 @@ struct NetCap<T: Transport> {
     /// Explicit peers are the discovery boundary for input-only operation
     /// questions: their unknown result hashes cannot be looked up in the DHT.
     configured_peers: Vec<PeerId>,
+    /// Bootstrap peers plus identities that authenticated for this exact
+    /// custody replica set during this process lifetime.
+    custody_peers: CustodyPeers,
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
@@ -563,6 +705,10 @@ impl<T: Transport> NetCapability for NetCap<T> {
             .collect()
     }
 
+    fn replica_peers(&self) -> Vec<PeerId> {
+        custody_peer_snapshot(&self.custody_peers)
+    }
+
     fn replica_summary(
         &self,
         peer: PeerId,
@@ -572,10 +718,10 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let transport = self.transport.clone();
         let pool = self.pool.clone();
         let connect_proof = self.connect_proof.clone();
-        let configured = self.configured_peers.contains(&peer) && peer != self.my_id;
+        let known = custody_peer_is_known(&self.custody_peers, peer) && peer != self.my_id;
         Box::pin(async move {
-            if !configured {
-                anyhow::bail!("custody peer is not in the static configured set");
+            if !known {
+                anyhow::bail!("custody peer is not a known replication neighbor");
             }
             let mut last_error = None;
             for _ in 0..2 {
@@ -615,10 +761,10 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let transport = self.transport.clone();
         let pool = self.pool.clone();
         let connect_proof = self.connect_proof.clone();
-        let configured = self.configured_peers.contains(&peer) && peer != self.my_id;
+        let known = custody_peer_is_known(&self.custody_peers, peer) && peer != self.my_id;
         Box::pin(async move {
-            if !configured {
-                anyhow::bail!("custody peer is not in the static configured set");
+            if !known {
+                anyhow::bail!("custody peer is not a known replication neighbor");
             }
             let mut last_error = None;
             for _ in 0..2 {
@@ -669,11 +815,11 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let transport = self.transport.clone();
         let pool = self.pool.clone();
         let connect_proof = self.connect_proof.clone();
-        let configured = self.configured_peers.contains(&peer) && peer != self.my_id;
+        let known = custody_peer_is_known(&self.custody_peers, peer) && peer != self.my_id;
         Box::pin(async move {
-            if !configured {
+            if !known {
                 return Err(ReplicaBlobFetchError::local(anyhow::anyhow!(
-                    "custody peer is not in the static configured set"
+                    "custody peer is not a known replication neighbor"
                 )));
             }
             let len = usize::try_from(expected_len).map_err(|_| {
@@ -1024,6 +1170,11 @@ impl NetSender {
             .ok_or_else(|| anyhow::anyhow!("network host did not publish its capability"))
     }
 
+    /// Snapshot the currently known custody neighbors in deterministic order.
+    pub(crate) async fn replica_peers(&self) -> anyhow::Result<Vec<PeerId>> {
+        Ok(self.ready_capability().await?.replica_peers())
+    }
+
     pub(crate) async fn replica_summary(
         &self,
         peer: PeerId,
@@ -1179,8 +1330,8 @@ pub(crate) async fn run_host_with_replica<T: Transport>(
 /// Run the proof-gated custody service over a caller-supplied deterministic
 /// transport harness.
 ///
-/// This exists only with the `sim` feature; production uses the fixed-address
-/// binder owned by [`crate::replica::CustodyReplica::new`].
+/// This exists only with the `sim` feature; production uses the ordinary iroh
+/// reachability binder owned by [`crate::replica::CustodyReplica::new`].
 #[cfg(feature = "sim")]
 pub async fn run_custody_host<T: Transport>(
     harness: Harness<T>,
@@ -1240,17 +1391,16 @@ pub(crate) fn spawn_with_replica(
     (sender, receiver)
 }
 
-/// Spawn the explicit-only custody transport on one fixed socket.
+/// Spawn custody's pile-sync-only protocol over ordinary iroh reachability.
 pub(crate) fn spawn_custody(
     key: SigningKey,
     config: PeerConfig,
     replica_server: ReplicaServerConfig,
-    bind_addr: std::net::SocketAddr,
-) -> anyhow::Result<(NetSender, NetReceiver, CustodyHostThread)> {
+) -> anyhow::Result<(NetSender, NetReceiver, CustodyHostThread, EndpointAddr)> {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
     let (sender, receiver, wiring) = wire(id);
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<()>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<EndpointAddr>>(1);
     let join = thread::Builder::new()
         .name("triblespace-custody".to_owned())
         .spawn(move || {
@@ -1264,19 +1414,19 @@ pub(crate) fn spawn_custody(
                     return;
                 }
             };
-            let harness = match runtime.block_on(crate::transport::iroh::bind_custody(
-                secret, &config, bind_addr,
-            )) {
-                Ok(harness) => harness,
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                    return;
-                }
-            };
-            // bind_custody returns only after the fixed socket is bound and the
-            // pile-sync protocol router is installed. A CLI may now truthfully
-            // print the exact direct ticket.
-            if ready_tx.send(Ok(())).is_err() {
+            let harness =
+                match runtime.block_on(crate::transport::iroh::bind_custody(secret, &config)) {
+                    Ok(harness) => harness,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+            // bind_custody returns after the endpoint and pile-sync router are
+            // installed. Relay selection and address discovery may continue to
+            // enrich these route hints after startup.
+            let endpoint_addr = harness.transport.endpoint_addr();
+            if ready_tx.send(Ok(endpoint_addr)).is_err() {
                 return;
             }
             runtime.block_on(run_host_with_replica(
@@ -1289,7 +1439,12 @@ pub(crate) fn spawn_custody(
         .map_err(|error| anyhow::anyhow!("spawn custody host thread: {error}"))?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok((sender, receiver, CustodyHostThread { join: Some(join) })),
+        Ok(Ok(endpoint_addr)) => Ok((
+            sender,
+            receiver,
+            CustodyHostThread { join: Some(join) },
+            endpoint_addr,
+        )),
         Ok(Err(error)) => {
             let _ = join.join();
             Err(error)
@@ -1406,6 +1561,13 @@ async fn host_loop<T: Transport>(
     let routing_candidates: RoutingCandidates = Arc::new(Mutex::new(configured_peers.clone()));
     let configured_peer_set: Arc<HashSet<PeerId>> =
         Arc::new(configured_peers.iter().copied().collect());
+    let custody_peers: CustodyPeers = Arc::new(Mutex::new(
+        configured_peers
+            .iter()
+            .copied()
+            .map(|peer| (peer, CustodyPeerAuthority::Bootstrap))
+            .collect(),
+    ));
 
     // Publish the inline-fetch capability now that the transport exists.
     // `Peer::fetch_blob` parks on this slot until it's filled, which is
@@ -1418,6 +1580,7 @@ async fn host_loop<T: Transport>(
         my_id,
         candidates: routing_candidates.clone(),
         configured_peers,
+        custody_peers: custody_peers.clone(),
     }) as Arc<dyn NetCapability>));
 
     // ── Inbound connections. Each connection gets its own task and
@@ -1425,26 +1588,17 @@ async fn host_loop<T: Transport>(
     let snapshot_handler = SnapshotHandler {
         snapshot: snapshot.clone(),
         replica_snapshot,
-        replica_snapshot_pins: Arc::new(Mutex::new(HashMap::new())),
+        replica_snapshot_generations: Arc::new(Mutex::new(ReplicaSnapshotCache::default())),
+        custody_peers,
         connect_root: config.connect_root,
         replica_server,
         inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CONNECTIONS_GLOBAL)),
         inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_REQUESTS_GLOBAL)),
     };
-    let custody_only = replica_server.is_some();
-    let configured_for_inbound = configured_peer_set.clone();
     let mut incoming = incoming;
     tokio::spawn(async move {
         while let Some(inc) = incoming.recv().await {
             if inc.alpn == PILE_SYNC_ALPN {
-                if custody_only && !configured_for_inbound.contains(&inc.conn.remote_id()) {
-                    warn!(
-                        peer = %hex::encode(&inc.conn.remote_id()[..4]),
-                        "unconfigured custody peer rejected before admission"
-                    );
-                    inc.conn.close(1, b"peer is not in the custody replica set");
-                    continue;
-                }
                 let h = snapshot_handler.clone();
                 let Some(permit) = h.try_admit_connection() else {
                     warn!(
@@ -1816,10 +1970,13 @@ async fn wait_until_after(expires: Option<hifitime::Epoch>) {
 struct SnapshotHandler {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     replica_snapshot: ReplicaSnapshotSlot,
-    /// The most recent immutable generation summarized to each authenticated
-    /// static peer. The configured peer set bounds this map, and a peer's next
-    /// summary replaces its prior pin.
-    replica_snapshot_pins: ReplicaSnapshotPins,
+    /// Recently summarized immutable generations. This is a bounded retry
+    /// cache: eviction makes a walker request a fresh summary, never splice
+    /// two snapshots together.
+    replica_snapshot_generations: ReplicaSnapshotGenerations,
+    /// Process-local bootstrap graph, extended only after an exact REPLICATE
+    /// operation has been authorized and completely framed.
+    custody_peers: CustodyPeers,
     connect_root: ed25519_dalek::VerifyingKey,
     replica_server: Option<ReplicaServerConfig>,
     /// Shared before-spawn connection admission budget for this node.
@@ -1867,7 +2024,8 @@ impl SnapshotHandler {
     ) {
         let snapshot = self.snapshot.clone();
         let replica_snapshot = self.replica_snapshot.clone();
-        let replica_snapshot_pins = self.replica_snapshot_pins.clone();
+        let replica_snapshot_generations = self.replica_snapshot_generations.clone();
+        let custody_peers = self.custody_peers.clone();
         let connect_root = self.connect_root;
         let replica_server = self.replica_server;
         let peer_id = connection.remote_id();
@@ -1980,15 +2138,18 @@ impl SnapshotHandler {
                 };
                 let snapshot = snapshot.clone();
                 let replica_snapshot = replica_snapshot.clone();
-                let replica_snapshot_pins = replica_snapshot_pins.clone();
+                let replica_snapshot_generations = replica_snapshot_generations.clone();
+                let custody_peers = custody_peers.clone();
                 tokio::spawn(
                     async move {
                         let operation = tokio::time::timeout(INBOUND_REQUEST_DEADLINE, async {
                             let result = serve_stream::<T::Conn>(
                                 &snapshot,
                                 &replica_snapshot,
-                                &replica_snapshot_pins,
+                                &replica_snapshot_generations,
+                                &custody_peers,
                                 replica_server,
+                                expires,
                                 peer,
                                 &mut send,
                                 &mut recv,
@@ -2070,8 +2231,10 @@ async fn authenticate_connection<C: Conn>(
 async fn serve_stream<C: Conn>(
     snapshot: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     replica_snapshot: &ReplicaSnapshotSlot,
-    replica_snapshot_pins: &ReplicaSnapshotPins,
+    replica_snapshot_generations: &ReplicaSnapshotGenerations,
+    custody_peers: &CustodyPeers,
     replica_server: Option<ReplicaServerConfig>,
+    connect_upper: Option<hifitime::Epoch>,
     peer: ed25519_dalek::VerifyingKey,
     send: &mut C::SendHalf,
     recv: &mut C::RecvHalf,
@@ -2198,8 +2361,12 @@ async fn serve_stream<C: Conn>(
         }
         OP_REPLICA_SUMMARY => {
             let (replica_set, proof) = recv_request_prefix(recv).await?;
-            authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
+            let verified = authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
             crate::replica_wire::require_eof(recv).await?;
+            // A valid summary request is the authenticated introduction. This
+            // routing hint is deliberately process-local: authority stays in
+            // the proof and no globally enumerable membership ledger appears.
+            note_authorized_custody_peer(custody_peers, peer.to_bytes(), connect_upper, &verified);
             let pinned = replica_snapshot
                 .lock()
                 .unwrap()
@@ -2208,24 +2375,17 @@ async fn serve_stream<C: Conn>(
                 .ok_or_else(|| anyhow::anyhow!("custody snapshot is unavailable"))?;
             let summary = pinned.lock().unwrap().summary();
             let generation = summary.generation();
-            replica_snapshot_pins.lock().unwrap().insert(
-                peer.to_bytes(),
-                ReplicaSnapshotPin {
-                    generation,
-                    snapshot: pinned,
-                },
-            );
+            replica_snapshot_generations
+                .lock()
+                .unwrap()
+                .insert(generation, pinned);
             send_summary(send, &summary).await?;
         }
         OP_REPLICA_PAGE => {
             let (replica_set, proof) = recv_request_prefix(recv).await?;
             authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
             let (generation, component, prefix, after) = recv_page_request(recv).await?;
-            let pinned = replica_snapshot_for_generation(
-                replica_snapshot_pins,
-                peer.to_bytes(),
-                generation,
-            )?;
+            let pinned = replica_snapshot_for_generation(replica_snapshot_generations, generation)?;
             let (page, done) = pinned.lock().unwrap().page(component, prefix, after);
             drop(pinned);
             send_page(send, component, &page, done).await?;
@@ -2234,11 +2394,7 @@ async fn serve_stream<C: Conn>(
             let (replica_set, proof) = recv_request_prefix(recv).await?;
             authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
             let (generation, id, offset, maximum) = recv_blob_request(recv).await?;
-            let pinned = replica_snapshot_for_generation(
-                replica_snapshot_pins,
-                peer.to_bytes(),
-                generation,
-            )?;
+            let pinned = replica_snapshot_for_generation(replica_snapshot_generations, generation)?;
             let bytes = pinned.lock().unwrap().blob_bytes(id);
             drop(pinned);
             send_blob_range(send, bytes.as_ref(), offset, maximum).await?;
@@ -2250,20 +2406,14 @@ async fn serve_stream<C: Conn>(
 }
 
 fn replica_snapshot_for_generation(
-    pins: &ReplicaSnapshotPins,
-    peer: PeerId,
+    generations: &ReplicaSnapshotGenerations,
     requested: ReplicaGeneration,
 ) -> anyhow::Result<SharedReplicaSnapshot> {
-    let pin = pins
-        .lock()
-        .unwrap()
-        .get(&peer)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("custody summary is required before data requests"))?;
-    if pin.generation != requested {
-        anyhow::bail!("custody snapshot generation is stale; request a new summary");
-    }
-    Ok(pin.snapshot)
+    generations.lock().unwrap().get(requested).ok_or_else(|| {
+        anyhow::anyhow!(
+            "custody snapshot generation is stale or unavailable; request a new summary"
+        )
+    })
 }
 
 fn authorize_replica_operation(
@@ -2271,7 +2421,7 @@ fn authorize_replica_operation(
     requested_set: crate::replica::ReplicaSetId,
     proof: &triblespace_core::capability::CapabilityProofBundle,
     peer: ed25519_dalek::VerifyingKey,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<triblespace_core::capability::VerifiedCapability> {
     use triblespace_core::capability::{CapabilityMode, CapabilityRequest};
 
     let server = server.ok_or_else(|| anyhow::anyhow!("custody replication is disabled"))?;
@@ -2290,8 +2440,89 @@ fn authorize_replica_operation(
     if verified.effective_mode() != CapabilityMode::Invoke {
         anyhow::bail!("custody operation proof must end in exact invoke-only authority");
     }
-    Ok(())
+    Ok(verified)
 }
+
+#[cfg(test)]
+mod custody_state_tests {
+    use super::{
+        AnyReplicaSnapshot, MAX_INBOUND_CONNECTIONS_GLOBAL, ReplicaComponent, ReplicaGeneration,
+        ReplicaItem, ReplicaItemId, ReplicaSnapshotCache, ReplicaSummary, intersect_upper_bounds,
+        shared_replica_snapshot, union_upper_bounds,
+    };
+
+    struct EmptyReplicaSnapshot;
+
+    impl AnyReplicaSnapshot for EmptyReplicaSnapshot {
+        fn summary(&self) -> ReplicaSummary {
+            ReplicaSummary::from_buckets([[Default::default(); 256]; 3])
+        }
+
+        fn page(
+            &self,
+            _component: ReplicaComponent,
+            _prefix: u8,
+            _after: Option<ReplicaItemId>,
+        ) -> (Vec<ReplicaItem>, bool) {
+            (Vec::new(), true)
+        }
+
+        fn blob_bytes(&self, _id: ReplicaItemId) -> Option<anybytes::Bytes> {
+            None
+        }
+    }
+
+    fn generation(byte: u8) -> ReplicaGeneration {
+        ReplicaGeneration::new([byte; 32])
+    }
+
+    #[test]
+    fn custody_authority_bounds_intersect_then_union() {
+        assert_eq!(intersect_upper_bounds(None, None), None);
+        assert_eq!(intersect_upper_bounds(Some(7), None), Some(7));
+        assert_eq!(intersect_upper_bounds(None, Some(9)), Some(9));
+        assert_eq!(intersect_upper_bounds(Some(7), Some(9)), Some(7));
+
+        assert_eq!(union_upper_bounds(Some(7), Some(9)), Some(9));
+        assert_eq!(union_upper_bounds(None, Some(9)), None);
+        assert_eq!(union_upper_bounds(Some(7), None), None);
+    }
+
+    #[test]
+    fn generation_cache_deduplicates_and_evicts_least_recently_used() {
+        assert!(MAX_INBOUND_CONNECTIONS_GLOBAL < u8::MAX as usize);
+        let snapshot = shared_replica_snapshot(EmptyReplicaSnapshot);
+        let mut cache = ReplicaSnapshotCache::default();
+        for index in 0..MAX_INBOUND_CONNECTIONS_GLOBAL {
+            cache.insert(generation(index as u8), snapshot.clone());
+        }
+        assert_eq!(cache.snapshots.len(), MAX_INBOUND_CONNECTIONS_GLOBAL);
+
+        // Touch the oldest generation, making generation 1 the eviction
+        // candidate, then introduce one distinct generation beyond the cap.
+        assert!(cache.get(generation(0)).is_some());
+        let newest = generation(MAX_INBOUND_CONNECTIONS_GLOBAL as u8);
+        cache.insert(newest, snapshot.clone());
+        assert_eq!(cache.snapshots.len(), MAX_INBOUND_CONNECTIONS_GLOBAL);
+        assert!(cache.snapshots.contains_key(&generation(0)));
+        assert!(!cache.snapshots.contains_key(&generation(1)));
+        assert!(cache.snapshots.contains_key(&newest));
+
+        // Re-summarizing one generation refreshes it without retaining a
+        // second allocation or consuming another cache slot.
+        cache.insert(newest, snapshot);
+        assert_eq!(cache.snapshots.len(), MAX_INBOUND_CONNECTIONS_GLOBAL);
+        assert_eq!(
+            cache
+                .least_to_most_recent
+                .iter()
+                .filter(|candidate| **candidate == newest)
+                .count(),
+            1
+        );
+    }
+}
+
 #[cfg(test)]
 mod collection_evidence_gossip_tests {
     use std::collections::HashSet;
@@ -2526,7 +2757,8 @@ mod inbound_auth_deadline_tests {
         SnapshotHandler {
             snapshot,
             replica_snapshot,
-            replica_snapshot_pins: Arc::new(Mutex::new(Default::default())),
+            replica_snapshot_generations: Arc::new(Mutex::new(Default::default())),
+            custody_peers: Arc::new(Mutex::new(Default::default())),
             connect_root: root.verifying_key(),
             replica_server: None,
             inbound_connections: Arc::new(tokio::sync::Semaphore::new(
@@ -2823,7 +3055,7 @@ mod inbound_auth_deadline_tests {
         *server_handler.replica_snapshot.lock().unwrap() =
             Some(shared_replica_snapshot(snapshot_a));
         let serving_snapshot = server_handler.replica_snapshot.clone();
-        let snapshot_pins = server_handler.replica_snapshot_pins.clone();
+        let snapshot_generations = server_handler.replica_snapshot_generations.clone();
         server_handler.replica_server = Some(ReplicaServerConfig {
             trust_root: replica_root.verifying_key(),
             replica_set,
@@ -2845,7 +3077,7 @@ mod inbound_auth_deadline_tests {
         let proof = replica_proof(&replica_root, &client_key, replica_set);
 
         // Data requests cannot select the mutable current snapshot directly:
-        // a successful summary must first establish this peer's generation.
+        // a successful summary must first cache the exact generation token.
         let unknown_generation = ReplicaGeneration::new([0xF6; 32]);
         assert!(
             op_replica_page(
@@ -2924,8 +3156,8 @@ mod inbound_auth_deadline_tests {
             None
         );
 
-        // Pins are host-wide, not connection-local: a pooled-connection
-        // eviction and redial can resume the same immutable walk.
+        // The generation cache is host-wide, not connection-local: a pooled-
+        // connection eviction and redial can resume the same immutable walk.
         connection.close(0, b"exercise custody reconnect");
         first_task.await.unwrap();
         let connection = client
@@ -2959,9 +3191,10 @@ mod inbound_auth_deadline_tests {
             summary.bucket(ReplicaComponent::Blobs, 0x42).count as usize
         );
 
-        // The peer's next summary is the explicit generation boundary. It
-        // replaces, rather than accumulates beside, that peer's old pin and
-        // exposes the concurrently published item on the next walk.
+        // The next summary exposes the concurrently published item on a new
+        // walk. The bounded cache retains A as an independent generation, so
+        // another in-flight or reconnecting walker is not invalidated merely
+        // because this identity also observed B.
         let next_summary = op_replica_summary(&connection, replica_set, &proof)
             .await
             .unwrap();
@@ -2972,24 +3205,27 @@ mod inbound_auth_deadline_tests {
             (ReplicaComponent::Blobs.page_limit() + 2) as u64
         );
 
-        // A second summary from the same authenticated identity explicitly
-        // supersedes its old pin. An older concurrent walk fails closed
-        // instead of being silently spliced onto B.
-        assert!(
-            op_replica_page(
-                &connection,
-                replica_set,
-                &proof,
-                generation_a_token,
-                ReplicaComponent::Blobs,
-                0x42,
-                None,
-            )
-            .await
-            .is_err()
+        let (old_first_page, old_done) = op_replica_page(
+            &connection,
+            replica_set,
+            &proof,
+            generation_a_token,
+            ReplicaComponent::Blobs,
+            0x42,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!old_done);
+        assert_eq!(
+            old_first_page
+                .iter()
+                .map(|item| item.id())
+                .collect::<Vec<_>>(),
+            first_page.iter().map(|item| item.id()).collect::<Vec<_>>()
         );
-        let mut stale_blob_target = vec![0; added_payload.len()];
-        assert!(
+        let mut old_blob_target = vec![0; added_payload.len()];
+        assert_eq!(
             op_replica_blob_range(
                 &connection,
                 replica_set,
@@ -2998,10 +3234,11 @@ mod inbound_auth_deadline_tests {
                 added_id,
                 added_len,
                 0,
-                &mut stale_blob_target,
+                &mut old_blob_target,
             )
             .await
-            .is_err()
+            .unwrap(),
+            None
         );
         let (next_first_page, done) = op_replica_page(
             &connection,
@@ -3046,10 +3283,11 @@ mod inbound_auth_deadline_tests {
             Some(added_payload.len())
         );
         assert_eq!(generation_b_target, added_payload);
-        let pins = snapshot_pins.lock().unwrap();
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins.get(&client_id).unwrap().generation, generation_b_token);
-        drop(pins);
+        let generations = snapshot_generations.lock().unwrap();
+        assert_eq!(generations.snapshots.len(), 2);
+        assert!(generations.snapshots.contains_key(&generation_a_token));
+        assert!(generations.snapshots.contains_key(&generation_b_token));
+        drop(generations);
 
         connection.close(0, b"test complete");
         second_task.await.unwrap();
