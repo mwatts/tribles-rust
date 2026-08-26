@@ -119,6 +119,15 @@ impl Transport for IrohTransport {
             .await
             .map_err(|e| anyhow::anyhow!("connect task: {e}"))?
             .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let paths = conn.paths();
+        if let Some(path) = paths.iter().find(|path| path.is_selected()) {
+            tracing::info!(
+                peer = %conn.remote_id(),
+                remote = ?path.remote_addr(),
+                direct = path.is_ip(),
+                "iroh connection selected path"
+            );
+        }
         Ok(IrohConn(conn))
     }
 
@@ -148,6 +157,16 @@ impl Transport for IrohTransport {
         if let Err(error) = self._alive._router.shutdown().await {
             warn!(%error, "iroh router shutdown failed");
         }
+    }
+}
+
+impl IrohTransport {
+    /// The endpoint's currently advertised routes.
+    ///
+    /// Unlike the endpoint identity, these hints may grow or change as relay
+    /// selection, address discovery, and NAT traversal progress.
+    pub(crate) fn endpoint_addr(&self) -> EndpointAddr {
+        self.ep.addr()
     }
 }
 
@@ -198,11 +217,49 @@ impl iroh::protocol::ProtocolHandler for ForwardHandler {
     }
 }
 
-/// Build the production transport: bind the iroh endpoint (OS trust
-/// store, dot-stripped default relays, N0 pkarr+DNS + mDNS address
-/// lookup), spawn the embedded DHT node, register the protocol-
-/// forwarding handlers, join the team gossip topic when configured,
-/// and spawn the router.
+/// Build one ordinary internet-capable iroh endpoint.
+///
+/// Binding is deliberately not gated on [`iroh::Endpoint::online`]. A relay
+/// outage must not prevent a node with a usable direct route from starting;
+/// relay selection and address publication continue in iroh's background
+/// tasks after this function returns.
+async fn bind_n0_endpoint(builder: iroh::endpoint::Builder) -> anyhow::Result<iroh::Endpoint> {
+    let ep = builder
+        .bind()
+        .await
+        .map_err(|error| anyhow::anyhow!("iroh endpoint bind: {error}"))?;
+
+    // mDNS is best-effort — add it post-bind so a failure (e.g. no multicast
+    // on the interface) degrades to N0 discovery rather than failing the
+    // endpoint.
+    match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(ep.id()) {
+        Ok(mdns) => {
+            if let Ok(lookups) = ep.address_lookup() {
+                lookups.add(mdns);
+            }
+        }
+        Err(error) => {
+            warn!(%error, "mDNS discovery init failed; continuing without LAN discovery")
+        }
+    }
+    Ok(ep)
+}
+
+/// Start from the same ordinary iroh/N0 reachability policy everywhere.
+///
+/// Authorization and replication semantics are layered above this builder;
+/// neither a direct address nor relay reachability grants an operation.
+fn n0_endpoint_builder(secret: iroh_base::SecretKey) -> iroh::endpoint::Builder {
+    let relay_map = crate::host::dot_stripped_default_relay_map();
+    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret)
+        .ca_tls_config(iroh::tls::CaTlsConfig::system())
+        .relay_mode(iroh::RelayMode::Custom(relay_map))
+}
+
+/// Build the production transport: bind the ordinary iroh endpoint, spawn the
+/// embedded DHT node, register the protocol-forwarding handlers, join the team
+/// gossip topic when configured, and spawn the router.
 ///
 /// Returns `None` if the endpoint fails to bind (already logged) —
 /// the caller's net thread exits, mirroring the old inline behavior.
@@ -210,102 +267,60 @@ pub async fn bind(
     secret: iroh_base::SecretKey,
     config: &PeerConfig,
 ) -> Option<Harness<IrohTransport>> {
-    use iroh::Endpoint;
-    use iroh::endpoint::presets;
-
-    // Use the OS trust store (via rustls-platform-verifier) rather
-    // than the compiled-in Mozilla webpki-roots bundle. The default
-    // (webpki-roots) breaks when running inside corporate-proxy /
-    // sandbox environments that present a custom CA at egress: iroh's
-    // relay HTTPS probes and pkarr publish/lookup over HTTPS get
-    // `invalid peer certificate: UnknownIssuer`, discovery dies
-    // silently, and the QUIC handshake never starts. Reading the OS
-    // store at runtime lets the sandbox CA (or any admin-installed
-    // root) participate. Relay hostnames get their FQDN trailing dot
-    // stripped — see `dot_stripped_default_relay_map` for the WAF
-    // story.
-    let relay_map = crate::host::dot_stripped_default_relay_map();
-
-    // Discovery: `presets::N0` gives pkarr publish + DNS lookup via
-    // n0.computer. On top of that we add mDNS for local-network
-    // discovery (zero-conf, no internet needed). pkarr-DHT address
-    // discovery was removed from iroh core in 1.0; we deliberately stay
-    // on the well-supported N0 + mDNS path rather than re-add it.
-    let builder = Endpoint::builder(presets::N0)
-        .secret_key(secret.clone())
-        .ca_tls_config(iroh::tls::CaTlsConfig::system())
-        .relay_mode(iroh::RelayMode::Custom(relay_map));
-    let ep = match builder.bind().await {
+    let ep = match bind_n0_endpoint(n0_endpoint_builder(secret)).await {
         Ok(ep) => ep,
-        Err(e) => {
-            tracing::error!(error = %e, "iroh endpoint bind failed; net thread exiting");
+        Err(error) => {
+            tracing::error!(%error, "iroh endpoint bind failed; net thread exiting");
             return None;
         }
     };
-    // mDNS is best-effort — add it post-bind so a failure (e.g. no
-    // multicast on the interface) degrades to N0-only rather than
-    // failing the whole endpoint.
-    match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(ep.id()) {
-        Ok(mdns) => {
-            if let Ok(al) = ep.address_lookup() {
-                al.add(mdns);
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "mDNS discovery init failed; continuing without LAN discovery")
-        }
-    }
-    ep.online().await;
 
     Some(bind_with_endpoint(ep, config).await)
 }
 
-/// Bind an explicit-only custody endpoint on one restart-stable socket.
+/// Bind custody's pile-sync-only router over ordinary iroh reachability.
 ///
-/// Unlike [`bind`], this configures no relay, port mapping, external address
-/// lookup, mDNS, gossip, or DHT protocol. Application routing contains only
-/// the exact endpoint addresses in `config`, and the only accepted protocol
-/// is pile sync. Iroh's `Minimal` preset still retains endpoint-internal QUIC
-/// transport extensions that its public builder does not permit disabling.
+/// Custody deliberately does not start collection gossip or the blob-provider
+/// DHT. It nevertheless uses the same direct, relay, NAT-traversal, pkarr/DNS,
+/// and mDNS path selection as ordinary peers. Reachability is not authority:
+/// CONNECT and REPLICATE proofs still gate every operation above this layer.
 pub(crate) async fn bind_custody(
     secret: iroh_base::SecretKey,
     config: &PeerConfig,
-    bind_addr: std::net::SocketAddr,
 ) -> anyhow::Result<Harness<IrohTransport>> {
-    use iroh::address_lookup::{EndpointInfo, MemoryLookup};
-    use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
-    use iroh::protocol::Router;
-    use iroh::{Endpoint, RelayMode};
+    use iroh::endpoint::{QuicTransportConfig, VarInt};
 
     let transport_config = QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(VarInt::from_u32(
             crate::host::MAX_INBOUND_REQUESTS_PER_CONNECTION as u32,
         ))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
-        .send_observed_address_reports(false)
-        .receive_observed_address_reports(false)
         .build();
-
-    let builder = Endpoint::builder(presets::Minimal)
-        .secret_key(secret)
-        .transport_config(transport_config)
-        .relay_mode(RelayMode::Disabled)
-        .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
-        .net_report_config(iroh::endpoint::NetReportConfig::minimal())
-        .clear_ip_transports()
-        .bind_addr(bind_addr)
-        .map_err(|error| anyhow::anyhow!("invalid custody bind address {bind_addr}: {error}"))?;
-    let ep = builder
-        .bind()
+    let ep = bind_n0_endpoint(n0_endpoint_builder(secret).transport_config(transport_config))
         .await
-        .map_err(|error| anyhow::anyhow!("custody endpoint bind {bind_addr}: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("bind custody iroh endpoint: {error:#}"))?;
+
+    Ok(bind_custody_with_endpoint(ep, config).await)
+}
+
+/// Wire custody's pile-sync-only router over an already-bound iroh endpoint.
+///
+/// This is the real-transport test seam corresponding to
+/// [`bind_with_endpoint`]. The caller chooses reachability while custody keeps
+/// its protocol surface independent of collection gossip and the provider DHT.
+pub async fn bind_custody_with_endpoint(
+    ep: iroh::Endpoint,
+    config: &PeerConfig,
+) -> Harness<IrohTransport> {
+    use iroh::address_lookup::{EndpointInfo, MemoryLookup};
+    use iroh::protocol::Router;
 
     if !config.peers.is_empty() {
         let lookup =
             MemoryLookup::from_endpoint_info(config.peers.iter().cloned().map(EndpointInfo::from));
         match ep.address_lookup() {
             Ok(services) => services.add(lookup),
-            Err(error) => warn!(%error, "static custody peer routes unavailable"),
+            Err(error) => warn!(%error, "custody bootstrap routes unavailable"),
         }
     }
 
@@ -339,11 +354,11 @@ pub(crate) async fn bind_custody(
             _runtime: tokio::runtime::Handle::current(),
         }),
     };
-    Ok(Harness {
+    Harness {
         transport,
         incoming: incoming_rx,
         gossip: None,
-    })
+    }
 }
 
 /// Wire the full transport stack (DHT node, protocol-forwarding

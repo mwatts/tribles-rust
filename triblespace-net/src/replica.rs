@@ -9,7 +9,8 @@
 //! by componentwise set union. It deliberately does not copy WANTs, legacy
 //! pins, append timestamps, padding, routing state, or opaque future records.
 //! Public collection gossip remains sparse and reach-governed; this module is
-//! a separate, explicitly authorized full-residency path between static peers.
+//! a separate, explicitly authorized full-residency path between authenticated
+//! neighbors.
 
 use std::array;
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,14 +78,16 @@ pub struct ReplicaServerConfig {
     pub replica_set: ReplicaSetId,
 }
 
-/// Complete client and server configuration for a private custody node.
+/// Complete client and server configuration for a custody node.
 #[derive(Clone)]
 pub struct CustodyReplicaConfig {
-    /// Static peers. Custody never expands this set from gossip or the DHT.
+    /// Bootstrap peers. A valid inbound REPLICATE request introduces its
+    /// presenter as a process-local neighbor, so a joining node needs only one
+    /// reachable member of a connected replica graph.
     pub peers: Vec<iroh_base::EndpointAddr>,
     /// External trust root for the ordinary CONNECT handshake.
     pub connect_root: ed25519_dalek::VerifyingKey,
-    /// Exact CONNECT proof presented when dialing a configured peer.
+    /// Exact CONNECT proof presented when dialing a bootstrap or learned peer.
     pub connect_proof: CapabilityProofBundle,
     /// External trust root for the independent REPLICATE action.
     pub replica_root: ed25519_dalek::VerifyingKey,
@@ -92,9 +95,6 @@ pub struct CustodyReplicaConfig {
     pub replica_set: ReplicaSetId,
     /// Invoke-only proof presented afresh on every custody operation.
     pub replica_proof: CapabilityProofBundle,
-    /// Restart-stable socket bound only on the private fabric (for example a
-    /// ZeroTier `10.242.x.y` address).
-    pub bind_addr: std::net::SocketAddr,
     /// Directory for incomplete large-blob receive files. Production callers
     /// should place this beside the destination pile, not in the OS temp dir.
     pub receive_temp_dir: std::path::PathBuf,
@@ -180,8 +180,8 @@ pub(crate) struct ReplicaBucketSummary {
 
 /// Content-derived identity of one complete immutable custody inventory.
 ///
-/// Page and blob requests echo this value so a server can reject a walk whose
-/// per-peer pin was superseded instead of silently switching generations.
+/// Page and blob requests echo this value so a server can resume the exact
+/// cached walk or reject it instead of silently switching generations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ReplicaGeneration([u8; 32]);
 
@@ -804,19 +804,21 @@ impl<S> std::fmt::Display for CustodyReplicaShutdownError<S> {
 
 impl<S> std::error::Error for CustodyReplicaShutdownError<S> {}
 
-/// Explicit, proof-gated full-residency replica over static private peers.
+/// Explicit, proof-gated full-residency replica over authenticated peers.
 ///
 /// Unlike [`Peer`](crate::peer::Peer), this type never joins public gossip,
-/// announces content, records wants, or performs DHT discovery. The owned store
+/// announces content, records wants, or uses the content-provider DHT. Iroh's
+/// endpoint layer may still resolve configured or authenticated peer identities
+/// through direct routes, NAT traversal, or an encrypted relay. The owned store
 /// grows by componentwise union of all resident blobs, all native collection
 /// records, and all native capability proofs.
 pub struct CustodyReplica<S> {
     sender: crate::host::NetSender,
     _receiver: crate::host::NetReceiver,
     host: Option<crate::host::CustodyHostThread>,
+    endpoint_addr: iroh_base::EndpointAddr,
     store: S,
     config: CustodyReplicaConfig,
-    peers: Vec<crate::transport::PeerId>,
 }
 
 impl<S> CustodyReplica<S>
@@ -843,7 +845,7 @@ where
             .inventory_stats(started.elapsed()))
     }
 
-    /// Start a production custody node on its fixed private-fabric socket.
+    /// Start a production custody node over ordinary iroh reachability.
     pub fn new(
         mut store: S,
         key: ed25519_dalek::SigningKey,
@@ -870,8 +872,8 @@ where
             trust_root: config.replica_root,
             replica_set: config.replica_set,
         };
-        let (sender, receiver, host) =
-            match crate::host::spawn_custody(key, peer_config, server, config.bind_addr) {
+        let (sender, receiver, host, endpoint_addr) =
+            match crate::host::spawn_custody(key, peer_config, server) {
                 Ok(host) => host,
                 Err(error) => {
                     drop(snapshot);
@@ -883,6 +885,7 @@ where
             sender,
             receiver,
             Some(host),
+            endpoint_addr,
             config,
             snapshot,
         ))
@@ -891,7 +894,7 @@ where
     /// Assemble a custody node over caller-provided transport wiring.
     ///
     /// This is the deterministic simulation seam. Production callers use
-    /// [`Self::new`], whose binder is fixed-address and explicit-only.
+    /// [`Self::new`], whose endpoint uses normal iroh route selection.
     pub fn with_wiring(
         mut store: S,
         presenter: ed25519_dalek::VerifyingKey,
@@ -906,8 +909,15 @@ where
             Ok(snapshot) => snapshot,
             Err(error) => return Err(CustodyReplicaStartError::new(store, error)),
         };
+        let endpoint_addr = iroh_base::EndpointAddr::from(sender.id());
         Ok(Self::assemble(
-            store, sender, receiver, None, config, snapshot,
+            store,
+            sender,
+            receiver,
+            None,
+            endpoint_addr,
+            config,
+            snapshot,
         ))
     }
 
@@ -916,26 +926,18 @@ where
         sender: crate::host::NetSender,
         receiver: crate::host::NetReceiver,
         host: Option<crate::host::CustodyHostThread>,
+        endpoint_addr: iroh_base::EndpointAddr,
         config: CustodyReplicaConfig,
         snapshot: CustodyStoreSnapshot<S::Reader>,
     ) -> Self {
-        let mut peers: Vec<_> = config
-            .peers
-            .iter()
-            .map(|address| *address.id.as_bytes())
-            .filter(|peer| *peer != *sender.id().as_bytes())
-            .collect();
-        peers.sort_unstable();
-        peers.dedup();
-
         sender.update_replica_snapshot(snapshot);
         Self {
             sender,
             _receiver: receiver,
             host,
+            endpoint_addr,
             store,
             config,
-            peers,
         }
     }
 
@@ -944,12 +946,14 @@ where
         self.sender.id()
     }
 
-    /// Exact fixed direct address published after production bind succeeds.
+    /// Snapshot of route hints observed when the production endpoint finished
+    /// binding.
+    ///
+    /// The stable identity is [`Self::id`]. Iroh's internal relay and direct
+    /// hints may continue changing as background discovery converges; this
+    /// startup snapshot is informational rather than a routing constraint.
     pub fn endpoint_addr(&self) -> iroh_base::EndpointAddr {
-        iroh_base::EndpointAddr::from_parts(
-            self.id(),
-            [iroh_base::TransportAddr::Ip(self.config.bind_addr)],
-        )
+        self.endpoint_addr.clone()
     }
 
     /// Borrow the underlying semantic store.
@@ -999,15 +1003,19 @@ where
     /// phases, while other peers continue; a later sweep repairs it after the
     /// partition heals.
     pub async fn reconcile_once(&mut self) -> anyhow::Result<CustodyReconcileOutcome> {
+        // The host owns process-local topology because it observes successful
+        // inbound authorization. Snapshot once per sweep: peers introduced
+        // during this pass participate in the next, keeping the walk stable.
+        let peers = self.sender.replica_peers().await?;
         let (local_summary, mut known) = self.publish_current_snapshot()?;
         let mut outcome = CustodyReconcileOutcome {
-            peers_attempted: self.peers.len(),
+            peers_attempted: peers.len(),
             generation: local_summary.generation().into_bytes(),
             ..CustodyReconcileOutcome::default()
         };
         let mut remotes = Vec::new();
         let mut failed = BTreeSet::new();
-        for peer in self.peers.iter().copied() {
+        for peer in peers {
             match self
                 .sender
                 .replica_summary(
@@ -1313,7 +1321,6 @@ fn validate_transport_config(
     presenter: ed25519_dalek::VerifyingKey,
     config: &CustodyReplicaConfig,
 ) -> anyhow::Result<()> {
-    validate_direct_socket(config.bind_addr, "custody bind")?;
     let metadata = std::fs::metadata(&config.receive_temp_dir).map_err(|error| {
         anyhow::anyhow!(
             "inspect custody receive directory {}: {error}",
@@ -1343,32 +1350,6 @@ fn validate_transport_config(
         if !peer_ids.insert(*peer.id.as_bytes()) {
             anyhow::bail!("custody peer list repeats one endpoint id");
         }
-        if peer.addrs.len() != 1 {
-            anyhow::bail!(
-                "custody peer {} must name exactly one explicit private-fabric IP socket",
-                peer.id,
-            );
-        }
-        let Some(iroh_base::TransportAddr::Ip(socket)) = peer.addrs.first() else {
-            anyhow::bail!(
-                "custody peer {} contains a non-IP route; relay/custom discovery is forbidden",
-                peer.id
-            );
-        };
-        validate_direct_socket(*socket, "custody peer")?;
-    }
-    Ok(())
-}
-
-fn validate_direct_socket(socket: std::net::SocketAddr, label: &str) -> anyhow::Result<()> {
-    if socket.port() == 0 {
-        anyhow::bail!("{label} port must be restart-stable and nonzero");
-    }
-    if socket.ip().is_unspecified() || socket.ip().is_multicast() {
-        anyhow::bail!("{label} address {socket} is not one explicit unicast interface");
-    }
-    if matches!(socket.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast()) {
-        anyhow::bail!("{label} address {socket} is broadcast");
     }
     Ok(())
 }

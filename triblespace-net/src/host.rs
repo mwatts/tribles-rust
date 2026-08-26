@@ -998,8 +998,9 @@ impl NetSender {
     ///
     /// Ordinary Peer refreshes never call this path. A custody driver retains
     /// the last complete immutable view until a later explicit rebuild
-    /// succeeds. Peers that already fetched a summary remain pinned to the
-    /// older immutable generation until their next summary request.
+    /// succeeds. Walkers that already fetched a summary retain access to the
+    /// immutable generation they observed while it remains in the bounded
+    /// generation cache.
     pub(crate) fn update_replica_snapshot(&self, snapshot: impl AnyReplicaSnapshot) {
         *self.replica_snapshot.lock().unwrap() = Some(shared_replica_snapshot(snapshot));
     }

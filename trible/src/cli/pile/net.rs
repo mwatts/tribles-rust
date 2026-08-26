@@ -128,7 +128,7 @@ pub enum Command {
         #[arg(long, value_name = "SECS", default_value_t = 1)]
         reconcile_interval: u64,
     },
-    /// Proof-gated full-residency replication over a fixed private fabric.
+    /// Proof-gated full-residency replication over ordinary Iroh routing.
     Custody {
         #[command(subcommand)]
         cmd: custody::Command,

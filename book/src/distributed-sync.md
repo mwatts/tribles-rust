@@ -222,11 +222,11 @@ an explicit caller authorization phase and admits the complete accepted batch
 only after transport and validation finish. Neither operation fetches
 referenced content.
 
-## Private custody replicas
+## Custody replicas
 
 Sparse public synchronization is deliberately not a backup protocol. A
-separate custody lane converges the complete **resident semantic store** between
-an explicitly configured set of private peers:
+separate custody lane converges the complete **resident semantic store** across
+a proof-authorized neighbor graph:
 
 ```text
 BlobStore × CollectionStore × CapabilityProofStore
@@ -246,15 +246,27 @@ deduplicates and orders those identities canonically, so piles containing the
 same three sets have the same inventory summary and generation even when their
 records were appended, concatenated, or padded in different orders.
 
-Custody binds one restart-stable private-fabric socket and accepts only exact
-static `EndpointTicket`s. Its endpoint has no relay, port mapping, mDNS, DHT,
-gossip topic, or ambient address discovery. The ordinary CONNECT proof still
+Custody uses ordinary Iroh reachability: explicit addresses when supplied,
+direct and NAT-traversed paths when available, and encrypted relays when they
+are not. An operator may bootstrap a node with either a bare endpoint identity
+or an `EndpointTicket` carrying one or more route hints. Custody still exposes
+only the pile-sync protocol: it does not join collection gossip or start the
+blob-provider DHT. Reachability is not authority. The ordinary CONNECT proof
 authenticates the transport, but it grants no custody access. Every summary,
 page, and blob-range request additionally carries a complete proof for the
 exact action
 `ACTION_REPLICATE_STORE = D8453B974E15F5DF17B1B67A338B3EBD`, the exact
 256-bit replica-set resource, the transport peer as leaf, and exact Invoke
-mode. A node not present in the static peer set is rejected before CONNECT.
+mode.
+
+Configured peers are bootstrap neighbors, not a global roster. After an
+unknown peer completes CONNECT and one strictly framed summary request with a
+valid REPLICATE proof, the server remembers that identity as a process-local
+neighbor for the intersection of both proofs' validity intervals. It can then
+pull the joiner's resident state on its next sweep. Consequently a joining
+node needs to know only one reachable member of a connected replica graph;
+ordinary componentwise union carries state transitively through the graph.
+There is no durable peer list, membership enumeration, or peer-list gossip.
 
 The bounded anti-entropy protocol adds three operations:
 
@@ -281,17 +293,16 @@ retries on the next sweep while independent peers continue. Receive-file,
 allocation, write, metadata, and mapping failures are local storage failures
 and abort the sweep rather than masquerading as peer unavailability.
 Each accepted summary derives a content identity from the complete summary and
-pins that exact immutable serving generation for the authenticated peer. Every
-subsequent page and blob request must echo that generation. Publishing a newer
-local snapshot therefore cannot splice its items into an older advertised
-walk. A later summary from the same authenticated identity replaces its one
-pin; a missing or superseded token is rejected, so concurrent walks restart
-from a fresh summary instead of crossing generations. The server retains the
-current snapshot plus at most one persistent pin per statically configured
-peer; the fixed global request limit also bounds pins held transiently by
-in-flight responses. Retained snapshot generations are therefore bounded by
-the configured peer and request limits, not by the number of publications or
-connections.
+places that exact immutable serving generation in a bounded process-local
+cache. Every subsequent page and blob request must echo the generation.
+Publishing a newer local snapshot therefore cannot splice its items into an
+older advertised walk, while reconnecting peers and peers that observed the
+same generation share one cached snapshot. A missing or evicted generation is
+rejected and the client restarts from a fresh summary. The cache uses the
+service's global connection-capacity bound; in-flight responses retain only
+their cloned snapshot until their existing deadline. The generation token is
+a retry/cache key, never an authorization capability: every request still
+verifies current REPLICATE authority independently.
 Cancellation can abandon only network/page work: store mutations are
 synchronous, temporary receive files close on drop, the transport shuts down
 gracefully, and the pile is explicitly closed before the command exits.
@@ -336,12 +347,13 @@ trible team replica create|issue|join ...
     replica root and exact replica-set resource.
 
 trible pile net custody status <PILE> ...
-    Validate static tickets, both exact proofs, the fixed bind, receive
+    Validate bootstrap peer ids or tickets, both exact proofs, the receive
     directory, opaque-record fence, and complete local inventory without
     opening a socket.
 
 trible pile net custody run <PILE> ...
-    Run foreground private-custody anti-entropy until SIGINT or SIGTERM.
+    Run foreground custody anti-entropy over ordinary Iroh routing until
+    SIGINT or SIGTERM, and print the live endpoint ticket.
 ```
 
 `status` and `sync` require the pile, CONNECT trust root, exact proof ID, and
@@ -365,8 +377,8 @@ a distributed proof that every peer has converged.
 - Direct RPC starts with one inline, exact CONNECT proof bundle.
 - CONNECT authenticates the session and grants no other action or storage
   policy.
-- Full custody is a separately authorized product union over fixed peers; it
-  never follows gossip or creates WANTs.
+- Full custody is a separately authorized product union over an authenticated,
+  process-local neighbor graph; it never follows gossip or creates WANTs.
 - Every payload is strictly framed and content/signature checked before it can
   affect local resolution.
 - Temporary unreachability remains “unknown,” never “absent.”

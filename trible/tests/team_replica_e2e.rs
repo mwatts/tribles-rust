@@ -256,8 +256,6 @@ fn join_accepts_delegated_ancestry_with_an_invoke_only_leaf() {
             pile_path.to_str().unwrap(),
             "--network-key",
             network_key_path.to_str().unwrap(),
-            "--bind",
-            "10.242.0.1:49152",
             "--connect-root",
             &connect_root,
             "--connect-proof",

@@ -1,4 +1,4 @@
-//! End-to-end coverage for explicit private-custody configuration.
+//! End-to-end coverage for proof-gated custody configuration.
 
 use assert_cmd::Command;
 use iroh_base::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
@@ -15,7 +15,7 @@ fn field(stdout: &[u8], label: &str) -> String {
 }
 
 #[test]
-fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
+fn status_validates_both_exact_proofs_and_run_prints_live_ticket() {
     let dir = tempdir().unwrap();
     let pile = dir.path().join("custody.pile");
     let network_key = dir.path().join("network.key");
@@ -92,9 +92,8 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
         .assert()
         .success();
 
-    // Deliberately unreachable from the loopback-only runtime below. This
-    // covers cancellation while iroh/noq still owns a pre-handshake
-    // connection, including its EADDRNOTAVAIL path.
+    // Deliberately unreachable. This covers cancellation while iroh/noq still
+    // owns a pre-handshake connection, including its EADDRNOTAVAIL path.
     let remote = EndpointId::from(SecretKey::from_bytes(&[93; 32]).public());
     let remote_addr = EndpointAddr::from_parts(
         remote,
@@ -111,8 +110,6 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
             pile.to_str().unwrap(),
             "--network-key",
             network_key.to_str().unwrap(),
-            "--bind",
-            "10.242.0.1:49152",
             "--peer",
             &remote_ticket,
             "--connect-root",
@@ -135,24 +132,15 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
         .clone();
     let status_text = String::from_utf8(status.clone()).unwrap();
     assert_eq!(field(&status, "state:"), "configured");
-    assert_eq!(field(&status, "bind:"), "10.242.0.1:49152");
     assert_eq!(field(&status, "connect_root:"), connect_root);
     assert_eq!(field(&status, "connect_proof:"), connect_proof);
     assert_eq!(field(&status, "replica_root:"), replica_root);
     assert_eq!(field(&status, "replica_set:"), replica_set);
     assert_eq!(field(&status, "replica_proof:"), replica_proof);
-    assert_eq!(field(&status, "peers:"), "1");
+    assert_eq!(field(&status, "bootstrap_peers:"), "1");
     assert_eq!(
         field(&status, "temp_dir:"),
         receive_temp.display().to_string()
-    );
-    let local_address: EndpointAddr = field(&status, "ticket:")
-        .parse::<EndpointTicket>()
-        .unwrap()
-        .into();
-    assert_eq!(
-        local_address.ip_addrs().copied().collect::<Vec<_>>(),
-        vec!["10.242.0.1:49152".parse::<std::net::SocketAddr>().unwrap()]
     );
     assert!(field(&status, "inventory_blobs:").parse::<u64>().unwrap() >= 2);
     assert!(
@@ -174,9 +162,6 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
 
     #[cfg(unix)]
     {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let bind = socket.local_addr().unwrap().to_string();
-        drop(socket);
         let child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("trible"))
             .args([
                 "pile",
@@ -186,8 +171,6 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
                 pile.to_str().unwrap(),
                 "--network-key",
                 network_key.to_str().unwrap(),
-                "--bind",
-                &bind,
                 "--peer",
                 &remote_ticket,
                 "--connect-root",
@@ -230,8 +213,13 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stdout.contains("state:          listening"));
-        assert!(stdout.contains(&format!("bind:           {bind}")));
-        assert!(stdout.contains("ticket:"));
+        let live_address: EndpointAddr = field(stdout.as_bytes(), "ticket:")
+            .parse::<EndpointTicket>()
+            .unwrap()
+            .into();
+        let local_id = EndpointId::from(triblespace_net::identity::iroh_secret(&key).public());
+        assert_eq!(live_address.id, local_id);
+        assert!(stdout.contains("route_hints:"));
         assert!(stderr.contains("shutdown requested"));
         assert!(!stderr.contains("Pile dropped without close"));
         assert!(!stderr.contains("Endpoint dropped without calling `Endpoint::close`"));
@@ -239,13 +227,12 @@ fn status_validates_both_exact_proofs_and_prints_the_static_ticket() {
 }
 
 #[test]
-fn custody_rejects_discovery_ids_and_non_unicast_binds_before_opening_a_pile() {
+fn custody_rejects_malformed_bootstrap_peers_before_opening_a_pile() {
     let dir = tempdir().unwrap();
     let key_path = dir.path().join("network.key");
     let receive_temp = dir.path().join("receive-temp");
     std::fs::create_dir(&receive_temp).unwrap();
     triblespace_core::signing_key_file::init(&key_path).unwrap();
-    let remote = EndpointId::from(SecretKey::from_bytes(&[94; 32]).public());
     let exact = "00".repeat(32);
 
     Command::cargo_bin("trible")
@@ -258,39 +245,8 @@ fn custody_rejects_discovery_ids_and_non_unicast_binds_before_opening_a_pile() {
             "unused.pile",
             "--network-key",
             key_path.to_str().unwrap(),
-            "--bind",
-            "10.242.0.1:49152",
             "--peer",
-            &remote.to_string(),
-            "--connect-root",
-            &exact,
-            "--connect-proof",
-            &exact,
-            "--replica-root",
-            &exact,
-            "--replica-set",
-            &exact,
-            "--replica-proof",
-            &exact,
-            "--temp-dir",
-            receive_temp.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("expected an EndpointTicket"));
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "pile",
-            "net",
-            "custody",
-            "status",
-            "unused.pile",
-            "--network-key",
-            key_path.to_str().unwrap(),
-            "--bind",
-            "0.0.0.0:49152",
+            "not-a-peer",
             "--connect-root",
             &exact,
             "--connect-proof",
@@ -307,12 +263,12 @@ fn custody_rejects_discovery_ids_and_non_unicast_binds_before_opening_a_pile() {
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "not one explicit unicast interface",
+            "expected an iroh endpoint ticket",
         ));
 }
 
 #[test]
-fn custody_help_exposes_only_explicit_static_configuration() {
+fn custody_help_exposes_bootstrap_peers_without_a_fixed_bind() {
     let status = Command::cargo_bin("trible")
         .unwrap()
         .args(["pile", "net", "custody", "status", "--help"])
@@ -324,7 +280,6 @@ fn custody_help_exposes_only_explicit_static_configuration() {
     let status = String::from_utf8(status).unwrap();
     for flag in [
         "--network-key",
-        "--bind",
         "--peer",
         "--connect-root",
         "--connect-proof",
@@ -336,8 +291,9 @@ fn custody_help_exposes_only_explicit_static_configuration() {
         assert!(status.contains(flag), "missing {flag} in {status}");
     }
     assert!(status.contains("EndpointTicket"));
+    assert!(status.contains("Bootstrap"));
+    assert!(!status.contains("--bind"));
     assert!(!status.contains("gossip"));
-    assert!(!status.contains("discovery"));
 
     let run = Command::cargo_bin("trible")
         .unwrap()
