@@ -26,7 +26,7 @@ use triblespace_core::collection::{CollectionRecord, CollectionStore};
 use triblespace_core::id::{Id, id_hex};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
+use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
 use triblespace_core::repo::{
     BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, PeerStore,
@@ -260,7 +260,7 @@ impl InventoryComponent {
         }
     }
 
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self as usize - 1
     }
 }
@@ -498,10 +498,19 @@ impl Default for ReconcileQos {
 
 /// Merkle inventory for canonical peer-routing evidence.
 pub type PeerInventory = PATCH<64, IdentitySchema, (), Blake3Merkle>;
-/// Merkle inventory for canonical collection-record ids.
-pub type CollectionRecordInventory = PATCH<16, IdentitySchema, (), Blake3Merkle>;
-/// Merkle inventory for canonical complete capability-proof ids.
-pub type CapabilityProofInventory = PATCH<32, IdentitySchema, (), Blake3Merkle>;
+/// Merkle inventory for canonical collection records.
+///
+/// Values do not participate in PATCH hashing: the portable Merkle identity
+/// remains exactly the set of intrinsic record ids. Keeping the canonical
+/// body in the same immutable leaf lets a pinned walk resolve it without a
+/// second snapshot or lookup structure.
+pub type CollectionRecordInventory = PATCH<16, IdentitySchema, CollectionRecord, Blake3Merkle>;
+/// Merkle inventory for canonical complete capability proofs.
+///
+/// As with records, the authenticated digest commits only to proof ids. The
+/// value is frozen local serving state and is checked against its key during
+/// construction and leaf resolution.
+pub type CapabilityProofInventory = PATCH<32, IdentitySchema, CapabilityProof, Blake3Merkle>;
 /// Merkle inventory for resident blob handles.
 pub type BlobInventory = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 
@@ -513,6 +522,53 @@ fn build_key_inventory<const KEY_LEN: usize>(
     keys: impl IntoIterator<Item = [u8; KEY_LEN]>,
 ) -> PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle> {
     PATCH::from_keys(keys)
+}
+
+fn build_record_inventory(
+    records: impl IntoIterator<Item = CollectionRecord>,
+) -> Result<CollectionRecordInventory> {
+    let mut records: Vec<_> = records
+        .into_iter()
+        .map(|record| (record.id().raw(), record))
+        .collect();
+    records.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut inventory = CollectionRecordInventory::new();
+    for (key, record) in records {
+        if let Some(existing) = inventory.get(&key) {
+            if existing != &record {
+                bail!("collection record id collision while freezing inventory");
+            }
+            continue;
+        }
+        inventory.insert(&PatchEntry::with_value(&key, record));
+    }
+    Ok(inventory)
+}
+
+fn build_proof_inventory(
+    proofs: impl IntoIterator<Item = CapabilityProof>,
+) -> Result<CapabilityProofInventory> {
+    // CapabilityProof::id() hashes the complete proof body. Cache it once;
+    // asking the sort comparator to recompute it would make freezing cost
+    // O(total proof bytes * log n).
+    let mut proofs: Vec<_> = proofs
+        .into_iter()
+        .map(|proof| (proof.id().raw, proof))
+        .collect();
+    proofs.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut inventory = CapabilityProofInventory::new();
+    for (key, proof) in proofs {
+        if let Some(existing) = inventory.get(&key) {
+            if existing != &proof {
+                bail!("capability proof id collision while freezing inventory");
+            }
+            continue;
+        }
+        inventory.insert(&PatchEntry::with_value(&key, proof));
+    }
+    Ok(inventory)
 }
 
 /// Immutable authorized observation of all four inventory components.
@@ -554,17 +610,15 @@ impl InventorySnapshot<()> {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
-        let record_keys = {
+        let records = {
             let iterator = store.records().map_err(anyhow::Error::new)?;
             iterator
-                .map(|record| record.map(|record| record.id().raw()))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
-        let proof_keys = {
+        let proofs = {
             let iterator = store.proofs().map_err(anyhow::Error::new)?;
             iterator
-                .map(|proof| proof.map(|proof| proof.id().raw))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
@@ -573,14 +627,9 @@ impl InventorySnapshot<()> {
             .map(|info| info.map(|info| info.handle.raw))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(anyhow::Error::new)?;
-        Ok(InventorySnapshot::from_key_observation(
-            team,
-            reader,
-            peer_keys,
-            record_keys,
-            proof_keys,
-            blob_keys,
-        ))
+        InventorySnapshot::from_observation_parts(
+            team, reader, peer_keys, records, proofs, blob_keys,
+        )
     }
 }
 
@@ -591,9 +640,9 @@ where
     /// Build an inventory from already-observed component values.
     ///
     /// Backend ordering is ignored and duplicate identities collapse. Merkle
-    /// trees carry only authenticated keys; record/proof bodies are resolved
-    /// by exact store lookup when their leaf is served, and blob bytes are
-    /// retrieved by content handle only when requested.
+    /// digests authenticate keys only; record/proof bodies are frozen as
+    /// associated PATCH values and checked against those keys, while blob
+    /// bytes are retrieved from the pinned reader only when requested.
     pub fn from_observation(
         team: ed25519_dalek::VerifyingKey,
         reader: R,
@@ -602,35 +651,26 @@ where
         proofs: impl IntoIterator<Item = CapabilityProof>,
     ) -> Result<Self> {
         let peer_keys = peers.into_iter().map(|evidence| *evidence.as_bytes());
-        let record_keys = records.into_iter().map(|record| record.id().raw());
-        let proof_keys = proofs.into_iter().map(|proof| proof.id().raw);
         let blob_keys = reader
             .blobs()
             .map(|info| info.map(|info| info.handle.raw))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(anyhow::Error::new)?;
 
-        Ok(Self::from_key_observation(
-            team,
-            reader,
-            peer_keys,
-            record_keys,
-            proof_keys,
-            blob_keys,
-        ))
+        Self::from_observation_parts(team, reader, peer_keys, records, proofs, blob_keys)
     }
 
-    fn from_key_observation(
+    fn from_observation_parts(
         team: ed25519_dalek::VerifyingKey,
         reader: R,
         peer_keys: impl IntoIterator<Item = [u8; 64]>,
-        record_keys: impl IntoIterator<Item = [u8; 16]>,
-        proof_keys: impl IntoIterator<Item = [u8; 32]>,
+        records: impl IntoIterator<Item = CollectionRecord>,
+        proofs: impl IntoIterator<Item = CapabilityProof>,
         blob_keys: impl IntoIterator<Item = [u8; 32]>,
-    ) -> Self {
+    ) -> Result<Self> {
         let peer_inventory = build_key_inventory(peer_keys);
-        let record_inventory = build_key_inventory(record_keys);
-        let proof_inventory = build_key_inventory(proof_keys);
+        let record_inventory = build_record_inventory(records)?;
+        let proof_inventory = build_proof_inventory(proofs)?;
         let blob_inventory = build_key_inventory(blob_keys);
 
         let peer_root = peer_inventory.merkle_node(team.as_bytes());
@@ -659,7 +699,7 @@ where
         ];
         let manifest = InventoryManifest::new(team, components);
 
-        Self {
+        Ok(Self {
             team,
             reader,
             peers: peer_inventory,
@@ -667,7 +707,7 @@ where
             proofs: proof_inventory,
             blobs: blob_inventory,
             manifest,
-        }
+        })
     }
 
     /// Exact team scope captured by this snapshot.
@@ -699,75 +739,6 @@ where
 
     pub(crate) const fn blobs(&self) -> &BlobInventory {
         &self.blobs
-    }
-}
-
-impl<R> InventorySnapshot<R> {
-    /// Exact local node summary for one protocol-relative locator.
-    ///
-    /// This is the only safe subtree-skip predicate for reconciliation: both
-    /// the canonical digest and leaf count must equal the remote pending node.
-    pub(crate) fn node_summary(
-        &self,
-        component: InventoryComponent,
-        relative_prefix: &[u8],
-    ) -> Option<([u8; 32], u64)> {
-        fn summary<const KEY_LEN: usize>(
-            inventory: &PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle>,
-            prefix: &[u8],
-        ) -> Option<([u8; 32], u64)> {
-            inventory
-                .merkle_node(prefix)
-                .map(|node| (node.digest(), node.leaf_count()))
-        }
-
-        let base = component.base_prefix(self.team);
-        if relative_prefix.len() > component.relative_key_len(base) {
-            return None;
-        }
-        let mut absolute = Vec::with_capacity(base.as_bytes().len() + relative_prefix.len());
-        absolute.extend_from_slice(base.as_bytes());
-        absolute.extend_from_slice(relative_prefix);
-        match component {
-            InventoryComponent::Peer => summary(&self.peers, &absolute),
-            InventoryComponent::CollectionRecord => summary(&self.records, &absolute),
-            InventoryComponent::CapabilityProof => summary(&self.proofs, &absolute),
-            InventoryComponent::Blob => summary(&self.blobs, &absolute),
-        }
-    }
-
-    /// Whether one complete protocol-relative leaf belongs to this snapshot.
-    pub(crate) fn contains_relative_key(
-        &self,
-        component: InventoryComponent,
-        relative_key: &[u8],
-    ) -> bool {
-        let base = component.base_prefix(self.team);
-        let Ok(absolute) = base.absolute_key(component, relative_key) else {
-            return false;
-        };
-        match component {
-            InventoryComponent::Peer => absolute
-                .as_slice()
-                .try_into()
-                .ok()
-                .is_some_and(|key| self.peers.get(key).is_some()),
-            InventoryComponent::CollectionRecord => absolute
-                .as_slice()
-                .try_into()
-                .ok()
-                .is_some_and(|key| self.records.get(key).is_some()),
-            InventoryComponent::CapabilityProof => absolute
-                .as_slice()
-                .try_into()
-                .ok()
-                .is_some_and(|key| self.proofs.get(key).is_some()),
-            InventoryComponent::Blob => absolute
-                .as_slice()
-                .try_into()
-                .ok()
-                .is_some_and(|key| self.blobs.get(key).is_some()),
-        }
     }
 }
 

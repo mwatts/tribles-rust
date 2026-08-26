@@ -148,6 +148,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and local reconciliation QoS; its gossip topic is derived from the team
   root.
 
+- Pin inventory history per component rather than retaining whole store
+  snapshots for every changed root. Unchanged roots reuse their immutable
+  trees; Blob reader wrappers still refresh so obsolete backend generations
+  can retire. Record and proof PATCHes carry their key-validated bodies
+  as values while preserving key-only Merkle identities; and concurrent node
+  or exact-blob reads no longer serialize through a global snapshot mutex.
+
 - Fix the telemetry facade's explicit private-reach construction after the
   collection reach API became fragment-based.
 

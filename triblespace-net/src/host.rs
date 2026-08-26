@@ -19,35 +19,33 @@ use iroh_base::{EndpointAddr, EndpointId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{Instrument, debug, debug_span, info_span, instrument, trace, warn};
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::capability::CapabilityProofBundle;
+use triblespace_core::capability::{CapabilityProofBundle, CapabilityProofId};
 use triblespace_core::collection::CollectionStore;
+use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
-use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::peer::PeerEvidence;
-use triblespace_core::repo::{
-    BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, PeerStore,
-};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, CapabilityProofStore, PeerStore};
 
 use crate::channel::{
     MAX_ADMISSION_BRIDGE_BATCHES, NetCommand, NetEvent, NetEventBatch, SnapshotNotice,
 };
 use crate::identity::iroh_secret;
 use crate::inventory::{
-    AuthorizedInventorySession, InventoryComponent, InventoryGeneration, InventoryManifest,
-    InventoryServerConfig, InventorySnapshot, ReconcileQos,
+    AuthorizedInventorySession, BlobInventory, CapabilityProofInventory, CollectionRecordInventory,
+    InventoryComponent, InventoryGeneration, InventoryManifest, InventoryServerConfig,
+    InventorySnapshot, PeerInventory, ReconcileQos,
 };
 use crate::inventory_reconcile::InventoryWalker;
 use crate::inventory_wire::{
     BLOB_TRANSFER_CHUNK_BYTES, InventoryBlobRangeRequest, InventoryBlobRangeResponse,
     InventoryLeaf, InventoryLeafValue, InventoryNodeRequest, InventoryNodeResponse,
     OP_INVENTORY_AUTH, OP_INVENTORY_BLOB_RANGE, OP_INVENTORY_MANIFEST, OP_INVENTORY_NODE,
-    op_inventory_auth, op_inventory_blob_range, op_inventory_manifest, op_inventory_node,
-    recv_blob_range_request, recv_inventory_auth_request, recv_manifest_request, recv_node_request,
-    send_blob_not_in_snapshot, send_blob_range, send_blob_snapshot_unavailable,
+    key_node_response, op_inventory_auth, op_inventory_blob_range, op_inventory_manifest,
+    op_inventory_node, recv_blob_range_request, recv_inventory_auth_request, recv_manifest_request,
+    recv_node_request, send_blob_not_in_snapshot, send_blob_range, send_blob_snapshot_unavailable,
     send_inventory_auth_ok, send_inventory_auth_rejected, send_manifest, send_node_response,
-    snapshot_node,
 };
 use crate::protocol::*;
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
@@ -81,18 +79,227 @@ pub fn team_gossip_topic(team: VerifyingKey) -> [u8; 32] {
     team.to_bytes()
 }
 
+trait BlobSnapshotReader: Send + Sync + 'static {
+    fn get_blob(&self, hash: RawHash) -> Option<Bytes>;
+}
+
+struct CloneableBlobSnapshotReader<R>(Mutex<R>);
+
+impl<R> BlobSnapshotReader for CloneableBlobSnapshotReader<R>
+where
+    R: BlobStoreGet + Clone + Send + 'static,
+{
+    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
+        // BlobStore's public Reader contract promises Clone + Send but not
+        // Sync. Clone the immutable handle under this narrow lock and perform
+        // payload lookup and validation after releasing it.
+        let reader = self.0.lock().unwrap().clone();
+        reader
+            .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(hash))
+            .ok()
+    }
+}
+
+enum InventoryComponentData {
+    Peer(PeerInventory),
+    CollectionRecord(CollectionRecordInventory),
+    CapabilityProof(CapabilityProofInventory),
+    Blob {
+        inventory: Arc<BlobInventory>,
+        reader: Arc<dyn BlobSnapshotReader>,
+    },
+}
+
+/// One immutable component of a store observation.
+///
+/// Historical root pinning retains this object, never the aggregate store
+/// snapshot. A record-only change can therefore keep exactly one old record
+/// tree without also retaining old blob readers and the other three trees.
+struct InventoryComponentSnapshot {
+    team: VerifyingKey,
+    manifest: crate::inventory::ComponentManifest,
+    data: InventoryComponentData,
+}
+
+impl InventoryComponentSnapshot {
+    fn node_summary(&self, relative_prefix: &[u8]) -> Option<([u8; 32], u64)> {
+        fn summary<const KEY_LEN: usize, V>(
+            inventory: &PATCH<KEY_LEN, IdentitySchema, V, triblespace_core::patch::Blake3Merkle>,
+            prefix: &[u8],
+        ) -> Option<([u8; 32], u64)> {
+            inventory
+                .merkle_node(prefix)
+                .map(|node| (node.digest(), node.leaf_count()))
+        }
+
+        let component = self.manifest.component();
+        let base = component.base_prefix(self.team);
+        if relative_prefix.len() > component.relative_key_len(base) {
+            return None;
+        }
+        let mut absolute = Vec::with_capacity(base.as_bytes().len() + relative_prefix.len());
+        absolute.extend_from_slice(base.as_bytes());
+        absolute.extend_from_slice(relative_prefix);
+        match &self.data {
+            InventoryComponentData::Peer(inventory) => summary(inventory, &absolute),
+            InventoryComponentData::CollectionRecord(inventory) => summary(inventory, &absolute),
+            InventoryComponentData::CapabilityProof(inventory) => summary(inventory, &absolute),
+            InventoryComponentData::Blob { inventory, .. } => summary(inventory, &absolute),
+        }
+    }
+
+    fn contains_relative_key(&self, relative_key: &[u8]) -> bool {
+        let component = self.manifest.component();
+        let base = component.base_prefix(self.team);
+        let Ok(absolute) = base.absolute_key(component, relative_key) else {
+            return false;
+        };
+        match &self.data {
+            InventoryComponentData::Peer(inventory) => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| inventory.get(key).is_some()),
+            InventoryComponentData::CollectionRecord(inventory) => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| inventory.get(key).is_some()),
+            InventoryComponentData::CapabilityProof(inventory) => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| inventory.get(key).is_some()),
+            InventoryComponentData::Blob { inventory, .. } => absolute
+                .as_slice()
+                .try_into()
+                .ok()
+                .is_some_and(|key| inventory.get(key).is_some()),
+        }
+    }
+
+    fn inventory_node(
+        &self,
+        request: &InventoryNodeRequest,
+    ) -> anyhow::Result<InventoryNodeResponse> {
+        if request.component != self.manifest.component()
+            || self.manifest.root() != Some(request.root)
+            || self.manifest.leaf_count() != request.leaf_count
+        {
+            return Ok(InventoryNodeResponse::SnapshotUnavailable);
+        }
+        let component = self.manifest.component();
+        match &self.data {
+            InventoryComponentData::Peer(inventory) => {
+                key_node_response(inventory, self.team, component, &request.prefix, |_, ()| {
+                    Ok(InventoryLeafValue::Peer)
+                })
+            }
+            InventoryComponentData::CollectionRecord(inventory) => key_node_response(
+                inventory,
+                self.team,
+                component,
+                &request.prefix,
+                |key, record| {
+                    let id = Id::new(key).ok_or_else(|| {
+                        anyhow::anyhow!("inventory contains the reserved nil record id")
+                    })?;
+                    if record.id() != id {
+                        anyhow::bail!(
+                            "inventory record body does not match its authenticated leaf key"
+                        );
+                    }
+                    Ok(InventoryLeafValue::CollectionRecord(*record))
+                },
+            ),
+            InventoryComponentData::CapabilityProof(inventory) => key_node_response(
+                inventory,
+                self.team,
+                component,
+                &request.prefix,
+                |key, proof| {
+                    if proof.id() != CapabilityProofId::new(key) {
+                        anyhow::bail!(
+                            "inventory proof body does not match its authenticated leaf key"
+                        );
+                    }
+                    Ok(InventoryLeafValue::CapabilityProof(proof.clone()))
+                },
+            ),
+            InventoryComponentData::Blob { inventory, .. } => {
+                key_node_response(inventory, self.team, component, &request.prefix, |_, ()| {
+                    Ok(InventoryLeafValue::Blob)
+                })
+            }
+        }
+    }
+
+    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
+        match &self.data {
+            InventoryComponentData::Blob { reader, .. } => reader.get_blob(hash),
+            _ => None,
+        }
+    }
+
+    fn inventory_blob(&self, request: InventoryBlobRangeRequest) -> PinnedBlob {
+        let InventoryComponentData::Blob { inventory, reader } = &self.data else {
+            return PinnedBlob::SnapshotUnavailable;
+        };
+        if self.manifest.root() != Some(request.root)
+            || self.manifest.leaf_count() != request.leaf_count
+        {
+            return PinnedBlob::SnapshotUnavailable;
+        }
+        if inventory.get(&request.hash).is_none() {
+            return PinnedBlob::NotInSnapshot;
+        }
+        reader
+            .get_blob(request.hash)
+            .map(PinnedBlob::Found)
+            .unwrap_or(PinnedBlob::SnapshotUnavailable)
+    }
+
+    fn reusable_with(&self, other: &Self) -> bool {
+        self.team == other.team && self.manifest == other.manifest
+    }
+
+    fn refreshed_blob_with_tree_from(&self, previous: &Self) -> Self {
+        let (
+            InventoryComponentData::Blob {
+                reader,
+                inventory: _,
+            },
+            InventoryComponentData::Blob {
+                inventory: previous_inventory,
+                reader: _,
+            },
+        ) = (&self.data, &previous.data)
+        else {
+            unreachable!("the Blob component slot always contains blob snapshots");
+        };
+        Self {
+            team: self.team,
+            manifest: self.manifest,
+            data: InventoryComponentData::Blob {
+                inventory: previous_inventory.clone(),
+                reader: reader.clone(),
+            },
+        }
+    }
+}
+
+type SharedComponentSnapshot = Arc<InventoryComponentSnapshot>;
+
 /// Snapshot of the complete single-team store observation served by the host.
-pub(crate) struct StoreSnapshot<R> {
-    inventory: InventorySnapshot<R>,
-    inventory_bodies: MemoryRepo,
+pub(crate) struct StoreSnapshot {
+    team: VerifyingKey,
+    manifest: InventoryManifest,
+    components: [SharedComponentSnapshot; 4],
     routing_peers: Vec<PeerId>,
 }
 
-impl StoreSnapshot<()> {
-    pub(crate) fn from_store<S>(
-        store: &mut S,
-        team: VerifyingKey,
-    ) -> anyhow::Result<StoreSnapshot<S::Reader>>
+impl StoreSnapshot {
+    pub(crate) fn from_store<S>(store: &mut S, team: VerifyingKey) -> anyhow::Result<Self>
     where
         S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
     {
@@ -114,40 +321,108 @@ impl StoreSnapshot<()> {
             .map_err(anyhow::Error::new)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(anyhow::Error::new)?;
-        let inventory = InventorySnapshot::from_observation(
-            team,
-            reader,
-            peers.iter().copied(),
-            records.iter().copied(),
-            proofs.iter().cloned(),
-        )?;
-
-        // Record/proof bodies are frozen beside their key-only PATCHes. A
-        // later store mutation can therefore never splice a body into an old
-        // root walk.
-        let mut inventory_bodies = MemoryRepo::default();
-        for record in records {
-            inventory_bodies
-                .insert(record)
-                .map_err(anyhow::Error::new)?;
-        }
-        for proof in proofs {
-            inventory_bodies
-                .insert_proof(proof)
-                .map_err(anyhow::Error::new)?;
-        }
         let mut routing_peers: Vec<_> = peers
-            .into_iter()
+            .iter()
             .filter(|evidence| evidence.team() == team)
             .map(|evidence| evidence.peer().to_bytes())
             .collect();
         routing_peers.sort_unstable();
         routing_peers.dedup();
+
+        let inventory = InventorySnapshot::from_observation(team, reader, peers, records, proofs)?;
+        let components = [
+            Arc::new(InventoryComponentSnapshot {
+                team,
+                manifest: inventory.manifest().component(InventoryComponent::Peer),
+                data: InventoryComponentData::Peer(inventory.peers().clone()),
+            }),
+            Arc::new(InventoryComponentSnapshot {
+                team,
+                manifest: inventory
+                    .manifest()
+                    .component(InventoryComponent::CollectionRecord),
+                data: InventoryComponentData::CollectionRecord(inventory.records().clone()),
+            }),
+            Arc::new(InventoryComponentSnapshot {
+                team,
+                manifest: inventory
+                    .manifest()
+                    .component(InventoryComponent::CapabilityProof),
+                data: InventoryComponentData::CapabilityProof(inventory.proofs().clone()),
+            }),
+            Arc::new(InventoryComponentSnapshot {
+                team,
+                manifest: inventory.manifest().component(InventoryComponent::Blob),
+                data: InventoryComponentData::Blob {
+                    inventory: Arc::new(inventory.blobs().clone()),
+                    reader: Arc::new(CloneableBlobSnapshotReader(Mutex::new(
+                        inventory.reader().clone(),
+                    ))),
+                },
+            }),
+        ];
+
         Ok(StoreSnapshot {
-            inventory,
-            inventory_bodies,
+            team,
+            manifest: inventory.manifest().clone(),
+            components,
             routing_peers,
         })
+    }
+
+    fn component(&self, component: InventoryComponent) -> &SharedComponentSnapshot {
+        &self.components[component.index()]
+    }
+
+    /// Reuse immutable component structures and return superseded trees so
+    /// their potentially large recursive drops can happen outside pointer
+    /// locks held by the caller.
+    fn reuse_unchanged_components(&mut self, previous: &Self) -> Vec<SharedComponentSnapshot> {
+        let mut retired = Vec::new();
+        for component in InventoryComponent::ALL {
+            let index = component.index();
+            if self.components[index].reusable_with(&previous.components[index]) {
+                let replacement = if component == InventoryComponent::Blob {
+                    Arc::new(
+                        self.components[index]
+                            .refreshed_blob_with_tree_from(&previous.components[index]),
+                    )
+                } else {
+                    previous.components[index].clone()
+                };
+                retired.push(std::mem::replace(&mut self.components[index], replacement));
+            }
+        }
+        retired
+    }
+
+    fn team(&self) -> VerifyingKey {
+        self.team
+    }
+
+    fn manifest(&self) -> InventoryManifest {
+        self.manifest.clone()
+    }
+
+    fn routing_peers(&self) -> Vec<PeerId> {
+        self.routing_peers.clone()
+    }
+
+    fn get_blob(&self, hash: &RawHash) -> Option<Bytes> {
+        self.component(InventoryComponent::Blob).get_blob(*hash)
+    }
+
+    fn node_summary(
+        &self,
+        component: InventoryComponent,
+        relative_prefix: &[u8],
+    ) -> Option<([u8; 32], u64)> {
+        self.component(component).node_summary(relative_prefix)
+    }
+
+    fn contains_relative_key(&self, component: InventoryComponent, relative_key: &[u8]) -> bool {
+        self.component(component)
+            .contains_relative_key(relative_key)
     }
 }
 
@@ -157,97 +432,8 @@ pub(crate) enum PinnedBlob {
     Found(Bytes),
 }
 
-/// Type-erased immutable view shared between the store and async host.
-pub(crate) trait AnySnapshot: Send + 'static {
-    fn team(&self) -> VerifyingKey;
-    fn manifest(&self) -> InventoryManifest;
-    fn routing_peers(&self) -> Vec<PeerId>;
-    fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
-    fn node_summary(
-        &self,
-        component: InventoryComponent,
-        relative_prefix: &[u8],
-    ) -> Option<([u8; 32], u64)>;
-    fn contains_relative_key(&self, component: InventoryComponent, relative_key: &[u8]) -> bool;
-    fn inventory_node(
-        &mut self,
-        request: &InventoryNodeRequest,
-    ) -> anyhow::Result<InventoryNodeResponse>;
-    fn inventory_blob(&self, request: InventoryBlobRangeRequest) -> PinnedBlob;
-}
-
-impl<R> AnySnapshot for StoreSnapshot<R>
-where
-    R: BlobStoreGet + BlobStoreList + Send + 'static,
-{
-    fn team(&self) -> VerifyingKey {
-        self.inventory.team()
-    }
-
-    fn manifest(&self) -> InventoryManifest {
-        self.inventory.manifest().clone()
-    }
-
-    fn routing_peers(&self) -> Vec<PeerId> {
-        self.routing_peers.clone()
-    }
-
-    fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
-        self.inventory
-            .reader()
-            .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(*hash))
-            .ok()
-            .map(|bytes| bytes.to_vec())
-    }
-
-    fn node_summary(
-        &self,
-        component: InventoryComponent,
-        relative_prefix: &[u8],
-    ) -> Option<([u8; 32], u64)> {
-        self.inventory.node_summary(component, relative_prefix)
-    }
-
-    fn contains_relative_key(&self, component: InventoryComponent, relative_key: &[u8]) -> bool {
-        self.inventory
-            .contains_relative_key(component, relative_key)
-    }
-
-    fn inventory_node(
-        &mut self,
-        request: &InventoryNodeRequest,
-    ) -> anyhow::Result<InventoryNodeResponse> {
-        snapshot_node(&self.inventory, &mut self.inventory_bodies, request)
-    }
-
-    fn inventory_blob(&self, request: InventoryBlobRangeRequest) -> PinnedBlob {
-        let advertised = self
-            .inventory
-            .manifest()
-            .component(InventoryComponent::Blob);
-        if advertised.root() != Some(request.root) || advertised.leaf_count() != request.leaf_count
-        {
-            return PinnedBlob::SnapshotUnavailable;
-        }
-        if !self
-            .inventory
-            .contains_relative_key(InventoryComponent::Blob, &request.hash)
-        {
-            return PinnedBlob::NotInSnapshot;
-        }
-        self.inventory
-            .blob_bytes(request.hash)
-            .map(PinnedBlob::Found)
-            .unwrap_or(PinnedBlob::SnapshotUnavailable)
-    }
-}
-
-type SharedSnapshot = Arc<Mutex<Box<dyn AnySnapshot>>>;
+type SharedSnapshot = Arc<StoreSnapshot>;
 type SnapshotSlot = Arc<Mutex<Option<SharedSnapshot>>>;
-
-fn shared_snapshot(snapshot: impl AnySnapshot) -> SharedSnapshot {
-    Arc::new(Mutex::new(Box::new(snapshot)))
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct InventoryCacheKey {
@@ -256,23 +442,53 @@ struct InventoryCacheKey {
     root: [u8; 32],
 }
 
-/// A manifest pins at most four entries, so this retains at least eight
-/// complete recent manifests globally while bounding churn-driven memory use.
-const MAX_PINNED_INVENTORY_ROOTS: usize = 32;
+/// Bound history independently for each component. A hot Blob inventory may
+/// therefore retain at most eight reader/tree generations instead of
+/// consuming 29 of a global 32-slot cache while three cold roots remain.
+/// Active requests own an Arc lease and safely outlive LRU eviction.
+const MAX_PINNED_ROOTS_PER_COMPONENT: usize = 8;
 
 #[derive(Default)]
 struct InventorySnapshotCache {
-    snapshots: HashMap<InventoryCacheKey, SharedSnapshot>,
+    snapshots: HashMap<InventoryCacheKey, SharedComponentSnapshot>,
     least_to_most_recent: VecDeque<InventoryCacheKey>,
 }
 
 impl InventorySnapshotCache {
+    /// Refresh the backend lease of an already-pinned Blob root without
+    /// implicitly pinning a root that no client requested.
+    ///
+    /// The Blob key set can remain stable across backend compaction. Updating
+    /// the current store snapshot must still retire the old mmap/generation;
+    /// waiting for another manifest request could otherwise retain it forever.
+    fn refresh_pinned_blob_reader(
+        &mut self,
+        snapshot: &StoreSnapshot,
+    ) -> Option<SharedComponentSnapshot> {
+        let component = InventoryComponent::Blob;
+        let current = snapshot.component(component);
+        let Some(root) = current.manifest.root() else {
+            return None;
+        };
+        let key = InventoryCacheKey {
+            team: snapshot.team().to_bytes(),
+            component,
+            root,
+        };
+        let Some(pinned) = self.snapshots.get_mut(&key) else {
+            return None;
+        };
+        debug_assert!(current.reusable_with(pinned));
+        Some(std::mem::replace(pinned, current.clone()))
+    }
+
     fn pin_manifest(
         &mut self,
         team: VerifyingKey,
         manifest: &InventoryManifest,
-        snapshot: SharedSnapshot,
-    ) {
+        snapshot: &StoreSnapshot,
+    ) -> Vec<SharedComponentSnapshot> {
+        let mut retired = Vec::new();
         for entry in manifest.components() {
             let Some(root) = entry.root() else {
                 continue;
@@ -282,18 +498,46 @@ impl InventorySnapshotCache {
                 component: entry.component(),
                 root,
             };
-            self.snapshots
-                .entry(key)
-                .or_insert_with(|| snapshot.clone());
+            let current = snapshot.component(entry.component());
+            match self.snapshots.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(current.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    debug_assert!(current.reusable_with(slot.get()));
+                    // A blob component also owns one backend reader lease.
+                    // Replace that lease with the newest equivalent snapshot
+                    // instead of keeping a compacted mmap/generation alive
+                    // forever while the blob key set stays unchanged. Active
+                    // requests hold their own Arc and finish safely.
+                    if entry.component() == InventoryComponent::Blob {
+                        retired.push(slot.insert(current.clone()));
+                    }
+                }
+            }
             self.touch(key);
+            while self
+                .snapshots
+                .keys()
+                .filter(|candidate| candidate.component == entry.component())
+                .count()
+                > MAX_PINNED_ROOTS_PER_COMPONENT
+            {
+                let position = self
+                    .least_to_most_recent
+                    .iter()
+                    .position(|candidate| candidate.component == entry.component())
+                    .expect("an overfull component cache has an LRU entry");
+                let oldest = self
+                    .least_to_most_recent
+                    .remove(position)
+                    .expect("located component LRU entry remains present");
+                if let Some(snapshot) = self.snapshots.remove(&oldest) {
+                    retired.push(snapshot);
+                }
+            }
         }
-        while self.snapshots.len() > MAX_PINNED_INVENTORY_ROOTS {
-            let oldest = self
-                .least_to_most_recent
-                .pop_front()
-                .expect("nonempty inventory cache has an LRU entry");
-            self.snapshots.remove(&oldest);
-        }
+        retired
     }
 
     fn get(
@@ -301,7 +545,7 @@ impl InventorySnapshotCache {
         team: VerifyingKey,
         component: InventoryComponent,
         root: [u8; 32],
-    ) -> Option<SharedSnapshot> {
+    ) -> Option<SharedComponentSnapshot> {
         let key = InventoryCacheKey {
             team: team.to_bytes(),
             component,
@@ -332,7 +576,7 @@ fn pinned_snapshot_if_serving(
     team: VerifyingKey,
     component: InventoryComponent,
     root: [u8; 32],
-) -> Option<SharedSnapshot> {
+) -> Option<SharedComponentSnapshot> {
     // Keep the current-slot lock through the cache lookup so clearing the
     // serving view is the linearization point after which no old pinned root
     // can begin another response.
@@ -479,6 +723,7 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: SnapshotSlot,
+    snapshots: InventorySnapshots,
     installed_generation: Arc<Mutex<Option<InventoryGeneration>>>,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
     id: EndpointId,
@@ -489,13 +734,27 @@ impl NetSender {
         self.id
     }
 
-    pub(crate) fn update_snapshot(&self, snapshot: impl AnySnapshot) {
+    pub(crate) fn update_snapshot(&self, mut snapshot: StoreSnapshot) {
+        let mut slot = self.snapshot.lock().unwrap();
+        let retired_components = slot.as_ref().map_or_else(Vec::new, |previous| {
+            snapshot.reuse_unchanged_components(previous)
+        });
         let manifest = snapshot.manifest();
         let notice = SnapshotNotice {
             generation: manifest.generation(),
             peers: snapshot.routing_peers(),
         };
-        *self.snapshot.lock().unwrap() = Some(shared_snapshot(snapshot));
+        let snapshot = Arc::new(snapshot);
+        let retired_blob_reader = self
+            .snapshots
+            .lock()
+            .unwrap()
+            .refresh_pinned_blob_reader(&snapshot);
+        let retired_snapshot = slot.replace(snapshot);
+        drop(slot);
+        drop(retired_blob_reader);
+        drop(retired_snapshot);
+        drop(retired_components);
 
         let mut installed = self.installed_generation.lock().unwrap();
         if *installed != Some(notice.generation) {
@@ -505,7 +764,8 @@ impl NetSender {
     }
 
     pub fn clear_snapshot(&self) {
-        *self.snapshot.lock().unwrap() = None;
+        let retired = self.snapshot.lock().unwrap().take();
+        drop(retired);
         *self.installed_generation.lock().unwrap() = None;
     }
 
@@ -552,6 +812,7 @@ pub struct HostWiring {
     cmd_rx: mpsc::Receiver<NetCommand>,
     evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
+    snapshots: InventorySnapshots,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
 }
 
@@ -563,12 +824,14 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     // without turning this bridge into an unbounded second store.
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(MAX_ADMISSION_BRIDGE_BATCHES);
     let snapshot = Arc::new(Mutex::new(None));
+    let snapshots = Arc::new(Mutex::new(InventorySnapshotCache::default()));
     let installed_generation = Arc::new(Mutex::new(None));
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
     (
         NetSender {
             cmd_tx,
             snapshot: snapshot.clone(),
+            snapshots: snapshots.clone(),
             installed_generation,
             cap: cap_rx,
             id,
@@ -578,6 +841,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
             cmd_rx,
             evt_tx,
             snapshot,
+            snapshots,
             cap_tx,
         },
     )
@@ -662,6 +926,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         commands,
         events,
         snapshot,
+        snapshots,
         cap_tx,
     } = HostWiringParts::from(wiring);
     let my_id = transport.local_id();
@@ -687,7 +952,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
 
     let handler = SnapshotHandler {
         snapshot: snapshot.clone(),
-        snapshots: Arc::new(Mutex::new(InventorySnapshotCache::default())),
+        snapshots,
         server: InventoryServerConfig::full_team(config.team),
         events: events.clone(),
         candidates: candidates.clone(),
@@ -896,6 +1161,7 @@ struct HostWiringParts {
     commands: mpsc::Receiver<NetCommand>,
     events: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
+    snapshots: InventorySnapshots,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
 }
 
@@ -905,6 +1171,7 @@ impl From<HostWiring> for HostWiringParts {
             commands: wiring.cmd_rx,
             events: wiring.evt_tx,
             snapshot: wiring.snapshot,
+            snapshots: wiring.snapshots,
             cap_tx: wiring.cap_tx,
         }
     }
@@ -985,9 +1252,8 @@ async fn reconcile_inventory_peer<T: Transport>(
         let mut in_flight = FuturesUnordered::new();
         loop {
             while in_flight.len() < INVENTORY_NODE_WINDOW {
-                let request = walker.next_request(|component, prefix| {
-                    local.lock().unwrap().node_summary(component, prefix)
-                })?;
+                let request = walker
+                    .next_request(|component, prefix| local.node_summary(component, prefix))?;
                 let Some(request) = request else {
                     break;
                 };
@@ -1007,7 +1273,7 @@ async fn reconcile_inventory_peer<T: Transport>(
             };
             let (request, response) = result?;
             let missing = walker.accept(&request, response, |component, key| {
-                local.lock().unwrap().contains_relative_key(component, key)
+                local.contains_relative_key(component, key)
             })?;
             if let Some(leaf) = missing {
                 let event = remote_leaf_event(&connection, team, advertised, leaf).await?;
@@ -1409,7 +1675,7 @@ impl SnapshotHandler {
                 let hash = recv_hash(recv).await?;
                 require_stream_eof(recv).await?;
                 let current = self.snapshot.lock().unwrap().as_ref().cloned();
-                let bytes = current.and_then(|snapshot| snapshot.lock().unwrap().get_blob(&hash));
+                let bytes = current.and_then(|snapshot| snapshot.get_blob(&hash));
                 if let Some(bytes) = bytes {
                     send_u64_be(send, bytes.len() as u64).await?;
                     send.write_all(&bytes).await?;
@@ -1474,17 +1740,15 @@ impl SnapshotHandler {
                     .as_ref()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("inventory snapshot unavailable"))?;
-                let manifest = {
-                    let snapshot = pinned.lock().unwrap();
-                    if snapshot.team() != session.team() {
-                        anyhow::bail!("current snapshot belongs to another team");
-                    }
-                    snapshot.manifest()
+                if pinned.team() != session.team() {
+                    anyhow::bail!("current snapshot belongs to another team");
+                }
+                let manifest = pinned.manifest();
+                let retired = {
+                    let mut snapshots = self.snapshots.lock().unwrap();
+                    snapshots.pin_manifest(session.team(), &manifest, &pinned)
                 };
-                self.snapshots
-                    .lock()
-                    .unwrap()
-                    .pin_manifest(session.team(), &manifest, pinned);
+                drop(retired);
                 send_manifest(send, &manifest).await?;
             }
             OP_INVENTORY_NODE => {
@@ -1502,7 +1766,7 @@ impl SnapshotHandler {
                 );
                 let response = match pinned {
                     None => InventoryNodeResponse::SnapshotUnavailable,
-                    Some(pinned) => pinned.lock().unwrap().inventory_node(&request)?,
+                    Some(pinned) => pinned.inventory_node(&request)?,
                 };
                 send_node_response(send, session.team(), &request, &response).await?;
             }
@@ -1521,7 +1785,7 @@ impl SnapshotHandler {
                 );
                 let response = match pinned {
                     None => PinnedBlob::SnapshotUnavailable,
-                    Some(pinned) => pinned.lock().unwrap().inventory_blob(request),
+                    Some(pinned) => pinned.inventory_blob(request),
                 };
                 match response {
                     PinnedBlob::SnapshotUnavailable => send_blob_snapshot_unavailable(send).await?,
@@ -1654,6 +1918,17 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Condvar;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Duration;
+
+    use triblespace_core::collection::{
+        CollectionCommit, CollectionData, CollectionRecord, CollectionStore,
+    };
+    use triblespace_core::inline::Inline;
+    use triblespace_core::repo::BlobStorePut;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+
     use super::*;
 
     fn key(byte: u8) -> VerifyingKey {
@@ -1695,20 +1970,21 @@ mod tests {
         let team = key(3);
         let mut store = MemoryRepo::default();
         store.insert_peer(PeerEvidence::new(team, key(4))).unwrap();
-        let snapshot = StoreSnapshot::from_store(&mut store, team).unwrap();
+        let snapshot = Arc::new(StoreSnapshot::from_store(&mut store, team).unwrap());
         let manifest = snapshot.manifest();
         let component = InventoryComponent::Peer;
         let root = manifest
             .component(component)
             .root()
             .expect("nonempty peer inventory has a root");
-        let snapshot = shared_snapshot(snapshot);
         let current = Arc::new(Mutex::new(Some(snapshot.clone())));
         let snapshots = Arc::new(Mutex::new(InventorySnapshotCache::default()));
-        snapshots
-            .lock()
-            .unwrap()
-            .pin_manifest(team, &manifest, snapshot);
+        drop(
+            snapshots
+                .lock()
+                .unwrap()
+                .pin_manifest(team, &manifest, &snapshot),
+        );
 
         assert!(pinned_snapshot_if_serving(&current, &snapshots, team, component, root).is_some());
         *current.lock().unwrap() = None;
@@ -1716,5 +1992,333 @@ mod tests {
             pinned_snapshot_if_serving(&current, &snapshots, team, component, root).is_none(),
             "withdrawal must gate immutable roots retained in the cache"
         );
+    }
+
+    fn commit(author: &SigningKey, byte: u8) -> CollectionRecord {
+        CollectionRecord::Commit(CollectionCommit::sign(
+            author,
+            Inline::new([0x31; 32]),
+            CollectionData::new([byte; 32]),
+            Inline::new([0x32; 32]),
+        ))
+    }
+
+    #[test]
+    fn production_component_serves_the_body_frozen_with_its_value_leaf() {
+        let team = key(1);
+        let record = commit(&SigningKey::from_bytes(&[3; 32]), 7);
+        let mut store = MemoryRepo::default();
+        CollectionStore::insert(&mut store, record).unwrap();
+        let snapshot = StoreSnapshot::from_store(&mut store, team).unwrap();
+        let component = snapshot
+            .manifest()
+            .component(InventoryComponent::CollectionRecord);
+        let root = component.root().unwrap();
+        let request = InventoryNodeRequest::new(
+            team,
+            InventoryComponent::CollectionRecord,
+            root,
+            component.leaf_count(),
+            Vec::new(),
+            root,
+        )
+        .unwrap();
+
+        let response = snapshot
+            .component(InventoryComponent::CollectionRecord)
+            .inventory_node(&request)
+            .unwrap();
+        let InventoryNodeResponse::Found(crate::inventory_wire::InventoryNode::Leaf {
+            leaf, ..
+        }) = response
+        else {
+            panic!("single-record production component must resolve to one leaf")
+        };
+        assert_eq!(leaf.key, record.id().raw());
+        assert_eq!(leaf.value, InventoryLeafValue::CollectionRecord(record));
+
+        let unavailable = InventoryNodeRequest::new(
+            team,
+            InventoryComponent::CollectionRecord,
+            [9; 32],
+            component.leaf_count(),
+            Vec::new(),
+            [9; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .component(InventoryComponent::CollectionRecord)
+                .inventory_node(&unavailable)
+                .unwrap(),
+            InventoryNodeResponse::SnapshotUnavailable
+        );
+    }
+
+    #[test]
+    fn record_churn_reuses_the_blob_tree_but_refreshes_its_reader_component() {
+        let team = key(1);
+        let author = SigningKey::from_bytes(&[2; 32]);
+        let mut store = MemoryRepo::default();
+        store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![7; 1024]))
+            .unwrap();
+
+        let first = StoreSnapshot::from_store(&mut store, team).unwrap();
+        let first_blob = first.component(InventoryComponent::Blob).clone();
+        let InventoryComponentData::Blob {
+            inventory: first_blob_tree,
+            ..
+        } = &first_blob.data
+        else {
+            unreachable!()
+        };
+        let first_blob_tree = first_blob_tree.clone();
+        let first_records = first
+            .component(InventoryComponent::CollectionRecord)
+            .clone();
+        let first_peers = first.component(InventoryComponent::Peer).clone();
+        let first_proofs = first.component(InventoryComponent::CapabilityProof).clone();
+
+        CollectionStore::insert(&mut store, commit(&author, 1)).unwrap();
+        let mut second = StoreSnapshot::from_store(&mut store, team).unwrap();
+        drop(second.reuse_unchanged_components(&first));
+
+        assert!(!Arc::ptr_eq(
+            &first_blob,
+            second.component(InventoryComponent::Blob)
+        ));
+        let InventoryComponentData::Blob {
+            inventory: second_blob_tree,
+            ..
+        } = &second.component(InventoryComponent::Blob).data
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&first_blob_tree, second_blob_tree));
+        assert!(!Arc::ptr_eq(
+            &first_records,
+            second.component(InventoryComponent::CollectionRecord)
+        ));
+        assert!(Arc::ptr_eq(
+            &first_peers,
+            second.component(InventoryComponent::Peer)
+        ));
+        assert!(Arc::ptr_eq(
+            &first_proofs,
+            second.component(InventoryComponent::CapabilityProof)
+        ));
+    }
+
+    #[test]
+    fn pinned_components_do_not_retain_the_aggregate_snapshot() {
+        let team = key(1);
+        let author = SigningKey::from_bytes(&[2; 32]);
+        let mut store = MemoryRepo::default();
+        CollectionStore::insert(&mut store, commit(&author, 1)).unwrap();
+        let snapshot = Arc::new(StoreSnapshot::from_store(&mut store, team).unwrap());
+        let weak = Arc::downgrade(&snapshot);
+        let manifest = snapshot.manifest();
+        let record_root = manifest
+            .component(InventoryComponent::CollectionRecord)
+            .root()
+            .unwrap();
+        let mut cache = InventorySnapshotCache::default();
+        drop(cache.pin_manifest(team, &manifest, &snapshot));
+
+        drop(snapshot);
+        assert!(weak.upgrade().is_none());
+        assert!(
+            cache
+                .get(team, InventoryComponent::CollectionRecord, record_root)
+                .is_some()
+        );
+    }
+
+    struct DropBlobProbe {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropBlobProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    impl BlobSnapshotReader for DropBlobProbe {
+        fn get_blob(&self, _hash: RawHash) -> Option<Bytes> {
+            None
+        }
+    }
+
+    fn replace_blob_reader(snapshot: &mut StoreSnapshot, reader: Arc<dyn BlobSnapshotReader>) {
+        let index = InventoryComponent::Blob.index();
+        let previous = &snapshot.components[index];
+        let InventoryComponentData::Blob { inventory, .. } = &previous.data else {
+            unreachable!()
+        };
+        snapshot.components[index] = Arc::new(InventoryComponentSnapshot {
+            team: previous.team,
+            manifest: previous.manifest,
+            data: InventoryComponentData::Blob {
+                inventory: inventory.clone(),
+                reader,
+            },
+        });
+    }
+
+    #[test]
+    fn installing_same_root_snapshot_refreshes_an_already_pinned_blob_reader() {
+        let team = key(1);
+        let endpoint = EndpointId::from_bytes(team.as_bytes()).unwrap();
+        let (sender, _receiver, wiring) = wire(endpoint);
+        let mut store = MemoryRepo::default();
+        store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![7; 1024]))
+            .unwrap();
+        let old_drops = Arc::new(AtomicUsize::new(0));
+        let new_drops = Arc::new(AtomicUsize::new(0));
+
+        let mut old = StoreSnapshot::from_store(&mut store, team).unwrap();
+        replace_blob_reader(
+            &mut old,
+            Arc::new(DropBlobProbe {
+                drops: old_drops.clone(),
+            }),
+        );
+        let old_blob = Arc::downgrade(old.component(InventoryComponent::Blob));
+        let manifest = old.manifest();
+        let blob_root = manifest.component(InventoryComponent::Blob).root().unwrap();
+        sender.update_snapshot(old);
+        {
+            let current = sender.snapshot.lock().unwrap().as_ref().unwrap().clone();
+            let retired = {
+                let mut snapshots = wiring.snapshots.lock().unwrap();
+                snapshots.pin_manifest(team, &manifest, &current)
+            };
+            drop(retired);
+        }
+
+        let mut new = StoreSnapshot::from_store(&mut store, team).unwrap();
+        replace_blob_reader(
+            &mut new,
+            Arc::new(DropBlobProbe {
+                drops: new_drops.clone(),
+            }),
+        );
+        // No second manifest request occurs. Installing the equivalent Blob
+        // root itself must update the cache's backend reader lease.
+        sender.update_snapshot(new);
+
+        assert!(old_blob.upgrade().is_none());
+        assert_eq!(old_drops.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(new_drops.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            wiring
+                .snapshots
+                .lock()
+                .unwrap()
+                .get(team, InventoryComponent::Blob, blob_root)
+                .is_some()
+        );
+
+        sender.clear_snapshot();
+        drop(sender);
+        drop(wiring);
+        assert_eq!(new_drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn blob_only_churn_retains_at_most_eight_component_generations() {
+        let team = key(1);
+        let mut store = MemoryRepo::default();
+        let mut cache = InventorySnapshotCache::default();
+        let mut generations = Vec::new();
+
+        for byte in 0..12 {
+            store
+                .put::<UnknownBlob, _>(Bytes::from_source(vec![byte; 257]))
+                .unwrap();
+            let snapshot = Arc::new(StoreSnapshot::from_store(&mut store, team).unwrap());
+            drop(cache.pin_manifest(team, &snapshot.manifest(), &snapshot));
+            generations.push(Arc::downgrade(snapshot.component(InventoryComponent::Blob)));
+        }
+
+        let retained = cache
+            .snapshots
+            .keys()
+            .filter(|key| key.component == InventoryComponent::Blob)
+            .count();
+        assert_eq!(retained, MAX_PINNED_ROOTS_PER_COMPONENT);
+        assert!(generations[..4].iter().all(|weak| weak.upgrade().is_none()));
+        assert!(generations[4..].iter().all(|weak| weak.upgrade().is_some()));
+    }
+
+    struct ConcurrentBlobState {
+        entered: AtomicUsize,
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+        gate: Mutex<()>,
+        wake: Condvar,
+    }
+
+    struct ConcurrentBlobProbe(Arc<ConcurrentBlobState>);
+
+    impl BlobSnapshotReader for ConcurrentBlobProbe {
+        fn get_blob(&self, _hash: RawHash) -> Option<Bytes> {
+            let active = self.0.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.0.maximum.fetch_max(active, AtomicOrdering::SeqCst);
+            self.0.entered.fetch_add(1, AtomicOrdering::SeqCst);
+            self.0.wake.notify_all();
+            let gate = self.0.gate.lock().unwrap();
+            let _ = self
+                .0
+                .wake
+                .wait_timeout_while(gate, Duration::from_secs(1), |_| {
+                    self.0.entered.load(AtomicOrdering::SeqCst) < 2
+                })
+                .unwrap();
+            self.0.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            Some(Bytes::from_source(vec![1]))
+        }
+    }
+
+    #[test]
+    fn immutable_component_reads_are_not_serialized_by_a_snapshot_mutex() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StoreSnapshot>();
+
+        let team = key(1);
+        let hash = [9; 32];
+        let inventory = BlobInventory::from_keys([hash]);
+        let state = Arc::new(ConcurrentBlobState {
+            entered: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            gate: Mutex::new(()),
+            wake: Condvar::new(),
+        });
+        let component = Arc::new(InventoryComponentSnapshot {
+            team,
+            manifest: crate::inventory::ComponentManifest::new(
+                InventoryComponent::Blob,
+                1,
+                inventory.merkle_root(),
+            ),
+            data: InventoryComponentData::Blob {
+                inventory: Arc::new(inventory),
+                reader: Arc::new(ConcurrentBlobProbe(state.clone())),
+            },
+        });
+
+        let left = component.clone();
+        let right = component.clone();
+        let left = std::thread::spawn(move || left.get_blob(hash).unwrap());
+        let right = std::thread::spawn(move || right.get_blob(hash).unwrap());
+        let _ = left.join().unwrap();
+        let _ = right.join().unwrap();
+
+        // The probe can only release both readers if their calls overlap.
+        assert_eq!(state.maximum.load(AtomicOrdering::SeqCst), 2);
     }
 }

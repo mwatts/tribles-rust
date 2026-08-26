@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store. Canonical BLAKE3 PATCH roots cover `PEER(team, peer)` evidence,
   collection records, capability proofs, and resident blobs. Root-pinned node
   requests and bounded blob ranges fail closed when an immutable snapshot is
-  unavailable; key-only record and proof inventories resolve bodies by exact ID
-  only when a missing leaf is served.
+  unavailable. Record and proof PATCHes authenticate their key sets while
+  retaining key-validated canonical bodies as immutable leaf values.
 - Add semantic reconciliation QoS. PEER, collection-record, and proof
   inventories always participate in pulls; `BlobReconcileMode::Demand` leaves
   broad blobs out while durable WANTs use exact authenticated reads, and
@@ -65,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window rather than paying one network round trip per node, while one
   synchronous store drain retains one durability barrier and strict
   pinned-root/count checks.
+- Cache pinned inventory roots as independent component snapshots and reuse
+  unchanged non-blob component `Arc`s plus the Blob component's BLAKE tree.
+  Its reader-bearing wrapper is refreshed even when the root is unchanged, so
+  compacted mmap/Yard generations can retire immediately on snapshot install,
+  without waiting for another manifest request. Partial churn no longer retains
+  up to 32 whole store snapshots or duplicate blob readers. History is bounded
+  independently to eight roots per component, so one hot inventory cannot
+  consume nearly the entire cache. Immutable reads no longer cross a global
+  snapshot mutex; exact blob service returns `Bytes`, cloning a
+  generic non-`Sync` reader only under a narrow component-local lock before
+  payload lookup and validation. Superseded trees and backend leases are also
+  carried outside pointer/cache locks before their potentially recursive drop.
 
 ## [0.41.4] - 2026-05-17
 

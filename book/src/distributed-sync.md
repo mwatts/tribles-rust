@@ -129,10 +129,20 @@ an authorization token or evidence of global completeness.
 A puller compares remote summaries with its local trees and descends only
 differing prefixes. Every node request states the expected component root,
 prefix, count, and digest. Responses are bounded and checked against that
-expectation. Collection and proof bodies are resolved by exact ID only when a
-missing leaf is served.
+expectation. Collection and proof PATCHes retain canonical bodies as immutable
+leaf values, but values do not participate in their Merkle digest: the
+authenticated identity remains the exact key set. Construction and leaf
+service both require every body to match its intrinsic key.
 
-The manifest pins immutable component snapshots in a bounded server cache.
+The manifest pins immutable **component** snapshots in a server cache bounded
+to eight historical roots per component.
+Unchanged non-blob roots reuse the same component `Arc`. The Blob tree is also
+reused, but its small reader-bearing wrapper is refreshed so an unchanged key
+set cannot pin an obsolete mmap or Yard generation indefinitely. Snapshot
+installation refreshes an already-pinned matching Blob root without implicitly
+pinning an unrequested one. Record-only
+churn therefore neither retains old blob readers nor duplicates the other
+inventory trees.
 Later node and blob-range requests repeat the exact root. If that snapshot has
 expired or been evicted, the server returns `snapshot unavailable`; it never
 splices bytes from its current state into the older walk. The client obtains a
