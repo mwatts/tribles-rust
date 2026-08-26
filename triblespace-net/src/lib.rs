@@ -26,6 +26,8 @@ pub mod collection_wire;
 pub mod dht;
 pub mod host;
 pub mod identity;
+pub mod inventory;
+pub(crate) mod inventory_wire;
 pub mod peer;
 pub mod protocol;
 pub mod reconcile;

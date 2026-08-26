@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the authorization and framing foundation for one four-component
+  inventory synchronization protocol. Exact `SYNC_TEAM(team_public_key)`
+  authority selects a server-derived full-team view independently of CONNECT;
+  PEER, collection-record, capability-proof, and blob PATCH roots receive
+  view-scoped immutable tokens, while PEER locators are relative to the
+  authenticated team prefix. Manifest, expected-digest node, and bounded blob
+  range frames reject stale snapshots instead of falling back to current
+  state. Demand versus Mirror and read/write direction remain local policy;
+  evidence presence never grants authority.
+
 - Add native monotone `PEER(team_public_key, peer_public_key)` routing
   evidence. `PeerStore`, `MemoryRepo`, and `Pile` expose one canonical
   validated 64-byte positive fact as a grow-only set; Pile writes it in a
