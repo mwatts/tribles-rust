@@ -166,9 +166,6 @@ impl InventoryServerConfig {
                 ),
             )
             .context("verify inventory reconciliation capability")?;
-        if verified.effective_mode() != CapabilityMode::Invoke {
-            bail!("inventory reconciliation proof must end in exact invoke-only authority");
-        }
         Ok(AuthorizedInventorySession {
             team: self.team,
             validity: verified.effective_validity(),
@@ -421,12 +418,12 @@ impl InventoryManifest {
 /// Local direction policy for periodic reconciliation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReconcileDirection {
-    /// Pull remote inventories and publish local wake hints.
+    /// Pull remote inventories and publish/serve the local inventory.
     #[default]
     Bidirectional,
-    /// Pull remote inventories but suppress local wake publication.
+    /// Pull remote inventories without advertising or serving local data.
     ReadOnly,
-    /// Publish local wake hints but do not pull remote inventories.
+    /// Publish and serve local data without pulling or exact-WANT fetching.
     WriteOnly,
 }
 
@@ -439,6 +436,17 @@ impl ReconcileDirection {
     /// Whether the local scheduler should publish wake hints.
     pub const fn publishes(self) -> bool {
         !matches!(self, Self::ReadOnly)
+    }
+
+    /// Whether authenticated peers may read the local inventory and blobs.
+    pub const fn serves(self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+
+    /// Whether an inbound reader becomes durable routing evidence locally.
+    /// A write-only publisher has no reason to learn clients as pull routes.
+    pub const fn admits_inbound_peer(self) -> bool {
+        matches!(self, Self::Bidirectional)
     }
 }
 
@@ -535,6 +543,10 @@ impl InventorySnapshot<()> {
     where
         S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
     {
+        // Pile::reader performs external-append reobservation. Refresh before
+        // enumerating every native component so this is one coherent store
+        // observation rather than three stale indexes plus fresh blobs.
+        let reader = store.reader().map_err(anyhow::Error::new)?;
         let peer_keys = {
             let iterator = store.peers().map_err(anyhow::Error::new)?;
             iterator
@@ -556,7 +568,6 @@ impl InventorySnapshot<()> {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
-        let reader = store.reader().map_err(anyhow::Error::new)?;
         let blob_keys = reader
             .blobs()
             .map(|info| info.map(|info| info.handle.raw))
@@ -836,6 +847,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session.team(), team.verifying_key());
+
+        // A principal allowed to invoke and delegate remains an invoker. Team
+        // founders and delegating invitees use this mode in normal operation.
+        let delegating_reconcile = proof(
+            &team,
+            &peer,
+            sync_team_capability_atom(team.verifying_key()),
+            CapabilityMode::InvokeAndDelegate,
+        );
+        server
+            .authorize(
+                peer.verifying_key(),
+                &delegating_reconcile,
+                Epoch::from_tai_seconds(0.0),
+            )
+            .unwrap();
+
+        let delegate_only = proof(
+            &team,
+            &peer,
+            sync_team_capability_atom(team.verifying_key()),
+            CapabilityMode::Delegate,
+        );
+        assert!(
+            server
+                .authorize(
+                    peer.verifying_key(),
+                    &delegate_only,
+                    Epoch::from_tai_seconds(0.0),
+                )
+                .is_err()
+        );
 
         let connect = proof(
             &team,

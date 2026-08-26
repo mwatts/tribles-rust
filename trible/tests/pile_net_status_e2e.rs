@@ -13,7 +13,7 @@ fn field(stdout: &[u8], label: &str) -> String {
 }
 
 #[test]
-fn status_loads_the_exact_local_connect_proof() {
+fn status_loads_both_exact_local_team_proofs() {
     let dir = tempdir().unwrap();
     let pile = dir.path().join("team.pile");
     let key = dir.path().join("node.key");
@@ -35,7 +35,8 @@ fn status_loads_the_exact_local_connect_proof() {
         .stdout
         .clone();
     let root = field(&create, "team root pubkey:");
-    let proof = field(&create, "founder connect proof:");
+    let connect_proof = field(&create, "founder connect proof:");
+    let sync_proof = field(&create, "founder sync proof:");
 
     let status = Command::cargo_bin("trible")
         .unwrap()
@@ -48,8 +49,10 @@ fn status_loads_the_exact_local_connect_proof() {
             key.to_str().unwrap(),
             "--team-root",
             &root,
-            "--proof",
-            &proof,
+            "--connect-proof",
+            &connect_proof,
+            "--sync-proof",
+            &sync_proof,
         ])
         .assert()
         .success()
@@ -57,10 +60,12 @@ fn status_loads_the_exact_local_connect_proof() {
         .stdout
         .clone();
     let status = String::from_utf8(status).unwrap();
-    assert!(status.contains(&format!("team_root:   {root}")));
-    assert!(status.contains(&format!("proof_id:    {proof}")));
-    assert!(status.contains("proof_steps: 1"));
-    assert!(status.contains("authorization: CONNECT accepted"));
+    assert!(status.contains(&format!("team_root:           {root}")));
+    assert!(status.contains(&format!("connect_proof_id:     {connect_proof}")));
+    assert!(status.contains(&format!("sync_proof_id:        {sync_proof}")));
+    assert!(status.contains("connect_proof_steps:  1"));
+    assert!(status.contains("sync_proof_steps:     1"));
+    assert!(status.contains("authorization:       CONNECT + SYNC_TEAM accepted"));
 }
 
 #[test]
@@ -75,7 +80,8 @@ fn status_has_no_ambient_or_sentinel_configuration() {
         .clone();
     let help = String::from_utf8(help).unwrap();
     assert!(help.contains("--team-root"));
-    assert!(help.contains("--proof"));
+    assert!(help.contains("--connect-proof"));
+    assert!(help.contains("--sync-proof"));
     assert!(!help.contains("--grant"));
     assert!(!help.contains("TRIBLE_TEAM_ROOT"));
     assert!(!help.contains("TRIBLE_TEAM_CAP"));
@@ -83,7 +89,7 @@ fn status_has_no_ambient_or_sentinel_configuration() {
 }
 
 #[test]
-fn sync_requires_a_separate_explicit_gossip_topic() {
+fn sync_derives_team_gossip_and_exposes_only_semantic_qos() {
     let help = Command::cargo_bin("trible")
         .unwrap()
         .args(["pile", "net", "sync", "--help"])
@@ -94,8 +100,13 @@ fn sync_requires_a_separate_explicit_gossip_topic() {
         .clone();
     let help = String::from_utf8(help).unwrap();
     assert!(help.contains("--team-root"));
-    assert!(help.contains("--proof"));
-    assert!(help.contains("--gossip-topic"));
+    assert!(help.contains("--connect-proof"));
+    assert!(help.contains("--sync-proof"));
+    assert!(help.contains("--direction"));
+    assert!(help.contains("--blobs"));
+    assert!(!help.contains("--gossip-topic"));
+    assert!(!help.contains("--no-lazy"));
+    assert!(!help.contains("--reconcile-interval"));
     assert!(!help.contains("--grant"));
 
     let handle = "00".repeat(32);
@@ -108,10 +119,10 @@ fn sync_requires_a_separate_explicit_gossip_topic() {
             "unused.pile",
             "--team-root",
             &handle,
-            "--proof",
+            "--connect-proof",
             &handle,
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("--gossip-topic"));
+        .stderr(predicates::str::contains("--sync-proof"));
 }

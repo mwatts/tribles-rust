@@ -16,7 +16,8 @@ use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_net::host;
-use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
+use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::protocol::connect_capability_atom;
 use triblespace_net::transport::sim::SimNet;
 
@@ -51,18 +52,23 @@ pub fn pk(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
-/// Sign the one-step positive proof authorizing `leaf` to CONNECT to the trust
-/// domain rooted at `root`.
-pub fn connect_proof(root: &SigningKey, leaf: &SigningKey) -> CapabilityProofBundle {
-    connect_proof_with_validity(root, leaf, None)
+#[derive(Clone)]
+pub struct TeamProofs {
+    pub connect: CapabilityProofBundle,
+    pub sync: CapabilityProofBundle,
 }
 
-pub fn connect_proof_with_validity(
+/// Sign the independent one-step CONNECT and SYNC_TEAM proofs used by a node.
+pub fn team_proofs(root: &SigningKey, leaf: &SigningKey) -> TeamProofs {
+    team_proofs_with_validity(root, leaf, None)
+}
+
+pub fn team_proofs_with_validity(
     root: &SigningKey,
     leaf: &SigningKey,
     validity: Option<CapabilityValidity>,
-) -> CapabilityProofBundle {
-    CapabilityProofBundle::issue_root(
+) -> TeamProofs {
+    let connect = CapabilityProofBundle::issue_root(
         root,
         CapabilityClaim::root(
             connect_capability_atom(root.verifying_key()),
@@ -71,7 +77,18 @@ pub fn connect_proof_with_validity(
         ),
         leaf.verifying_key(),
     )
-    .unwrap()
+    .unwrap();
+    let sync = CapabilityProofBundle::issue_root(
+        root,
+        CapabilityClaim::root(
+            sync_team_capability_atom(root.verifying_key()),
+            CapabilityMode::Invoke,
+            validity,
+        ),
+        leaf.verifying_key(),
+    )
+    .unwrap();
+    TeamProofs { connect, sync }
 }
 
 /// A paused, single-thread tokio runtime + LocalSet runner — the
@@ -101,15 +118,14 @@ where
 
 /// Bring one node up on `net`: join the sim mesh, wire the host loop
 /// as a local task, return the `Peer<MemoryRepo>`. `store` is the
-/// node's pre-seeded local store. The CONNECT proof bundle is sent inline and
-/// need
-/// not be resident in that store. `gossip` controls team-topic participation.
+/// node's pre-seeded local store. Both proofs are sent inline and need not be
+/// resident in that store. `gossip` controls team-topic participation.
 pub fn bring_up(
     net: &SimNet,
     signing_key: &SigningKey,
     store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
-    connect_proof: CapabilityProofBundle,
+    proofs: TeamProofs,
     gossip: bool,
 ) -> Peer<MemoryRepo> {
     bring_up_with_peers(
@@ -117,7 +133,7 @@ pub fn bring_up(
         signing_key,
         store,
         connect_root,
-        connect_proof,
+        proofs,
         gossip,
         Vec::new(),
     )
@@ -133,9 +149,31 @@ pub fn bring_up_with_peers(
     signing_key: &SigningKey,
     store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
-    connect_proof: CapabilityProofBundle,
+    proofs: TeamProofs,
     gossip: bool,
     peers: Vec<[u8; 32]>,
+) -> Peer<MemoryRepo> {
+    bring_up_with_qos(
+        net,
+        signing_key,
+        store,
+        connect_root,
+        proofs,
+        gossip,
+        peers,
+        ReconcileQos::default(),
+    )
+}
+
+pub fn bring_up_with_qos(
+    net: &SimNet,
+    signing_key: &SigningKey,
+    store: MemoryRepo,
+    connect_root: ed25519_dalek::VerifyingKey,
+    proofs: TeamProofs,
+    gossip: bool,
+    peers: Vec<[u8; 32]>,
+    qos: ReconcileQos,
 ) -> Peer<MemoryRepo> {
     let id = pk(signing_key);
     let gossip_topic = gossip.then_some(connect_root.to_bytes());
@@ -152,14 +190,14 @@ pub fn bring_up_with_peers(
                     )
                 })
                 .collect(),
-            gossip_topic,
-            connect_root,
-            connect_proof,
-            direction: SyncDirection::Bidirectional,
+            team: connect_root,
+            connect_proof: proofs.connect,
+            sync_proof: proofs.sync,
+            qos,
         },
         wiring,
     ));
-    Peer::with_wiring(store, SyncDirection::Bidirectional, sender, receiver)
+    Peer::with_wiring(store, connect_root, qos, sender, receiver)
 }
 
 /// An empty store intentionally independent of CONNECT proof-bundle residency.

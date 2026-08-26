@@ -3,16 +3,16 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 
-use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::peer::{
+    BlobReconcileMode, Peer, PeerConfig, ReconcileDirection, ReconcileQos,
+};
 
 use triblespace_core::repo::pile::Pile;
-
-mod custody;
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
@@ -40,17 +40,41 @@ fn parse_peers(strs: &[String]) -> Result<Vec<EndpointAddr>> {
         .collect()
 }
 
-fn parse_gossip_topic(text: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(text).map_err(|error| anyhow!("decode gossip topic hex: {error}"))?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("gossip topic must be 32 bytes"))
-}
-
 fn load_existing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
     let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
     triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum DirectionArg {
+    Bidirectional,
+    ReadOnly,
+    WriteOnly,
+}
+
+impl From<DirectionArg> for ReconcileDirection {
+    fn from(direction: DirectionArg) -> Self {
+        match direction {
+            DirectionArg::Bidirectional => Self::Bidirectional,
+            DirectionArg::ReadOnly => Self::ReadOnly,
+            DirectionArg::WriteOnly => Self::WriteOnly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum BlobsArg {
+    Demand,
+    Mirror,
+}
+
+impl From<BlobsArg> for BlobReconcileMode {
+    fn from(blobs: BlobsArg) -> Self {
+        match blobs {
+            BlobsArg::Demand => Self::Demand,
+            BlobsArg::Mirror => Self::Mirror,
+        }
+    }
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -63,7 +87,7 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Resolve and show the exact CONNECT proof this node would present.
+    /// Resolve and show the exact CONNECT and SYNC_TEAM proofs this node would present.
     Status {
         /// Pile containing the native proof and its exact claim closure.
         pile: PathBuf,
@@ -75,9 +99,12 @@ pub enum Command {
         team_root: String,
         /// Exact CONNECT proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        proof: String,
+        connect_proof: String,
+        /// Exact SYNC_TEAM proof id (BLAKE3 of canonical proof bytes).
+        #[arg(long)]
+        sync_proof: String,
     },
-    /// Sync with peers using explicit authentication and gossip identities.
+    /// Reconcile one authorized team inventory with peers.
     Sync {
         pile: PathBuf,
         #[arg(long, value_delimiter = ',')]
@@ -89,49 +116,29 @@ pub enum Command {
         team_root: String,
         /// Exact CONNECT proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        proof: String,
-        /// Exact collection-evidence gossip topic (32-byte hex).
+        connect_proof: String,
+        /// Exact SYNC_TEAM proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
-        gossip_topic: String,
-        /// Don't publish our own collection evidence — receive only. Useful
-        /// for follower / leecher workflows where we're catching up.
-        #[arg(long, conflicts_with = "write_only")]
-        read_only: bool,
-        /// Don't admit incoming collection evidence — publish only. Useful
-        /// for pure-publisher workflows (importers, archives) where the local
-        /// pile has nothing to learn from the swarm.
-        #[arg(long, conflicts_with = "read_only")]
-        write_only: bool,
+        sync_proof: String,
+        /// Whether to pull inventories, publish wake hints, or both.
+        #[arg(long, value_enum, default_value = "bidirectional")]
+        direction: DirectionArg,
+        /// Fetch blobs only for durable WANTs, or mirror the complete blob inventory.
+        #[arg(long, value_enum, default_value = "demand")]
+        blobs: BlobsArg,
         /// Stop after at most N seconds. Without this flag (and without
         /// `--quiescent-for`), sync runs until interrupted with Ctrl-C —
         /// "done" isn't a knowable state in a team swarm (two-generals).
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
-        /// Stop after N seconds without any network event (no incoming
-        /// collection evidence or blob) and without any want being serviced
-        /// by the lazy reconcile. Best-effort "we appear to have
+        /// Stop after N seconds without any admitted inventory event or
+        /// durable WANT being serviced. Best-effort "we appear to have
         /// caught up" signal — useful for bounded sync in scripts where
         /// you accept the two-generals caveat. Wants that stay pending
         /// (nobody reachable holds them) do NOT hold off quiescence —
         /// a pending want is normal, not unfinished work.
         #[arg(long, value_name = "SECS")]
         quiescent_for: Option<u64>,
-        /// Disable the lazy want-reconcile tick. By default sync also
-        /// services durable *wants*: want records appended
-        /// to the pile (by faculties or any other process) are noticed
-        /// each tick and missing blobs or collection receipts are obtained
-        /// from peers (fetch-on-want). Content-lazy is the doctrine; this flag
-        /// is the escape hatch.
-        #[arg(long)]
-        no_lazy: bool,
-        /// Seconds between want-reconcile passes.
-        #[arg(long, value_name = "SECS", default_value_t = 1)]
-        reconcile_interval: u64,
-    },
-    /// Proof-gated full-residency replication over ordinary Iroh routing.
-    Custody {
-        #[command(subcommand)]
-        cmd: custody::Command,
     },
 }
 
@@ -142,44 +149,34 @@ pub fn run(cmd: Command) -> Result<()> {
             pile,
             key,
             team_root,
-            proof,
-        } => run_status(pile, key, team_root, proof),
+            connect_proof,
+            sync_proof,
+        } => run_status(pile, key, team_root, connect_proof, sync_proof),
         Command::Sync {
             pile,
             peers,
             key,
             team_root,
-            proof,
-            gossip_topic,
-            read_only,
-            write_only,
+            connect_proof,
+            sync_proof,
+            direction,
+            blobs,
             duration,
             quiescent_for,
-            no_lazy,
-            reconcile_interval,
-        } => {
-            let direction = if read_only {
-                SyncDirection::ReadOnly
-            } else if write_only {
-                SyncDirection::WriteOnly
-            } else {
-                SyncDirection::Bidirectional
-            };
-            run_sync(
-                pile,
-                peers,
-                key,
-                team_root,
-                proof,
-                gossip_topic,
-                direction,
-                duration,
-                quiescent_for,
-                no_lazy,
-                reconcile_interval,
-            )
-        }
-        Command::Custody { cmd } => custody::run(cmd),
+        } => run_sync(
+            pile,
+            peers,
+            key,
+            team_root,
+            connect_proof,
+            sync_proof,
+            ReconcileQos {
+                direction: direction.into(),
+                blobs: blobs.into(),
+            },
+            duration,
+            quiescent_for,
+        ),
     }
 }
 
@@ -201,17 +198,31 @@ fn run_status(
     pile_path: PathBuf,
     key_path: Option<PathBuf>,
     team_root_text: String,
-    proof_text: String,
+    connect_proof_text: String,
+    sync_proof_text: String,
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
     let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
-    let proof_id = crate::cli::team::parse_proof_id(&proof_text)?;
+    let connect_proof_id = crate::cli::team::parse_proof_id(&connect_proof_text)?;
+    let sync_proof_id = crate::cli::team::parse_proof_id(&sync_proof_text)?;
     let mut pile = open_pile(&pile_path)?;
-    let bundle = match crate::cli::team::resolve_connect_bundle(
+    let connect_bundle = match crate::cli::team::resolve_connect_bundle(
         &mut pile,
         team_root,
-        proof_id,
+        connect_proof_id,
+        key.verifying_key(),
+    ) {
+        Ok(proof) => proof,
+        Err(error) => {
+            let _ = pile.close();
+            return Err(error);
+        }
+    };
+    let sync_bundle = match crate::cli::team::resolve_sync_bundle(
+        &mut pile,
+        team_root,
+        sync_proof_id,
         key.verifying_key(),
     ) {
         Ok(proof) => proof,
@@ -223,11 +234,19 @@ fn run_status(
     pile.close()
         .map_err(|error| anyhow!("close pile: {error:?}"))?;
 
-    println!("node:        {public}");
-    println!("team_root:   {}", hex::encode(team_root.to_bytes()));
-    println!("proof_id:    {}", hex::encode(proof_id.raw));
-    println!("proof_steps: {}", bundle.proof().step_count());
-    println!("authorization: CONNECT accepted");
+    println!("node:                {public}");
+    println!("team_root:           {}", hex::encode(team_root.to_bytes()));
+    println!(
+        "connect_proof_id:     {}",
+        hex::encode(connect_proof_id.raw)
+    );
+    println!(
+        "connect_proof_steps:  {}",
+        connect_bundle.proof().step_count()
+    );
+    println!("sync_proof_id:        {}", hex::encode(sync_proof_id.raw));
+    println!("sync_proof_steps:     {}", sync_bundle.proof().step_count());
+    println!("authorization:       CONNECT + SYNC_TEAM accepted");
     Ok(())
 }
 
@@ -239,30 +258,39 @@ fn run_sync(
     peer_strs: Vec<String>,
     key_path: Option<PathBuf>,
     team_root_text: String,
-    proof_text: String,
-    gossip_topic_text: String,
-    direction: SyncDirection,
+    connect_proof_text: String,
+    sync_proof_text: String,
+    qos: ReconcileQos,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
-    no_lazy: bool,
-    reconcile_interval: u64,
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
     // Endpoint tickets retain caller-selected direct/fabric routes; bare
     // endpoint ids intentionally use iroh's discovery layer.
     let peers = parse_peers(&peer_strs)?;
 
-    // One pile handle wrapped directly in a Peer. Collection synchronization
-    // is a union of immutable signed evidence, so the daemon needs neither a
-    // Repository workspace nor mutable branch mirrors.
+    // One pile handle wrapped directly in a Peer. Inventory reconciliation is
+    // a monotone union, so no mutable branch mirror is involved.
     let mut pile = open_pile(&pile_path)?;
     let team_root = crate::cli::team::parse_team_root(&team_root_text)?;
-    let proof_id = crate::cli::team::parse_proof_id(&proof_text)?;
-    let gossip_topic = parse_gossip_topic(&gossip_topic_text)?;
+    let connect_proof_id = crate::cli::team::parse_proof_id(&connect_proof_text)?;
+    let sync_proof_id = crate::cli::team::parse_proof_id(&sync_proof_text)?;
     let connect_proof = match crate::cli::team::resolve_connect_bundle(
         &mut pile,
         team_root,
-        proof_id,
+        connect_proof_id,
+        key.verifying_key(),
+    ) {
+        Ok(proof) => proof,
+        Err(error) => {
+            let _ = pile.close();
+            return Err(error);
+        }
+    };
+    let sync_proof = match crate::cli::team::resolve_sync_bundle(
+        &mut pile,
+        team_root,
+        sync_proof_id,
         key.verifying_key(),
     ) {
         Ok(proof) => proof,
@@ -276,43 +304,38 @@ fn run_sync(
         key.clone(),
         PeerConfig {
             peers,
-            gossip_topic: Some(gossip_topic),
-            connect_root: team_root,
+            team: team_root,
             connect_proof,
-            direction,
+            sync_proof,
+            qos,
         },
     );
     eprintln!("node: {}", peer.id());
+    eprintln!("team_root: {}", hex::encode(team_root.to_bytes()));
     eprintln!(
-        "team_root: {}  (CONNECT trust root)",
-        hex::encode(team_root.to_bytes())
+        "gossip_topic: {}  (derived from team root)",
+        hex::encode(triblespace_net::host::team_gossip_topic(team_root))
     );
-    eprintln!("gossip_topic: {}", hex::encode(gossip_topic));
-    let dir_label = match direction {
-        SyncDirection::Bidirectional => "bidirectional",
-        SyncDirection::ReadOnly => "read-only (no publish)",
-        SyncDirection::WriteOnly => "write-only (no fetch)",
+    let dir_label = match qos.direction {
+        ReconcileDirection::Bidirectional => "bidirectional",
+        ReconcileDirection::ReadOnly => "read-only (no publish)",
+        ReconcileDirection::WriteOnly => "write-only (no fetch)",
     };
     eprintln!("direction: {dir_label}");
+    let blob_label = match qos.blobs {
+        BlobReconcileMode::Demand => "demand (durable WANTs only)",
+        BlobReconcileMode::Mirror => "mirror (complete authorized blob inventory)",
+    };
+    eprintln!("blobs: {blob_label}");
     if let Some(d) = duration {
         eprintln!("stop after: {d}s");
     }
     if let Some(q) = quiescent_for {
         eprintln!("quiescent stop: {q}s without events");
     }
-    // Lazy content sync: service durable wants. Fetching is a
-    // read, so WriteOnly ("no fetch") suppresses it; it stays on under
-    // ReadOnly — a leecher that only services wants is a legit workflow.
-    let lazy = !no_lazy && direction != SyncDirection::WriteOnly;
-    if lazy {
-        eprintln!("lazy: servicing wants every {reconcile_interval}s (--no-lazy to disable)");
-    } else if no_lazy {
-        eprintln!("lazy: disabled (--no-lazy)");
-    } else {
-        eprintln!(
-            "lazy: disabled under --write-only (servicing wants fetches; write-only never fetches)"
-        );
-    }
+    // Demand reconciliation is intrinsic: readable nodes always service
+    // durable WANTs. Write-only suppresses every fetch by definition.
+    let services_wants = qos.direction != ReconcileDirection::WriteOnly;
     eprintln!("live sync active. (Ctrl-C to stop)\n");
 
     let started = std::time::Instant::now();
@@ -326,7 +349,7 @@ fn run_sync(
     // on a small current-thread runtime — the fetch's internal DHT
     // deadline uses tokio timers, which need a runtime context.
     let mut reconciler = triblespace_net::reconcile::Reconciler::new();
-    let reconcile_every = std::time::Duration::from_secs(reconcile_interval);
+    let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
     let mut wants_fulfilled_total: u64 = 0;
     let mut wants_pending: usize = 0;
@@ -367,8 +390,8 @@ fn run_sync(
             }
         }
 
-        // Drain immutable collection evidence and publish any records appended
-        // by another process. Direction policy lives inside Peer::refresh.
+        // Drain authenticated inventory and publish any externally appended
+        // local evidence through one durability barrier.
         peer.refresh();
 
         // Want-reconcile tick: a want IS a durable want-marker —
@@ -382,7 +405,7 @@ fn run_sync(
         // inside the Reconciler; a want nobody serves stays pending —
         // normal, never an error, never dropped. Strong pins/branches
         // are untouched.
-        if lazy && next_reconcile <= std::time::Instant::now() {
+        if services_wants && next_reconcile <= std::time::Instant::now() {
             let stats = reconcile_rt.block_on(reconciler.tick(&mut peer));
             next_reconcile = std::time::Instant::now() + reconcile_every;
             wants_fulfilled_total += stats.fulfilled as u64;
@@ -404,7 +427,7 @@ fn run_sync(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    if lazy {
+    if services_wants {
         eprintln!(
             "wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending \
              (pending is normal — the wants stay in the pile's WantStore \
@@ -433,12 +456,5 @@ mod tests {
         assert_eq!(parse_peers(&[id.to_string()]).unwrap(), vec![id.into()]);
         assert_eq!(parse_peers(&[ticket]).unwrap(), vec![direct]);
         assert!(parse_peers(&["not-a-peer".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn gossip_topics_are_exact_32_byte_hex_values() {
-        assert_eq!(parse_gossip_topic(&"ab".repeat(32)).unwrap(), [0xab; 32]);
-        assert!(parse_gossip_topic(&"ab".repeat(31)).is_err());
-        assert!(parse_gossip_topic("not-hex").is_err());
     }
 }

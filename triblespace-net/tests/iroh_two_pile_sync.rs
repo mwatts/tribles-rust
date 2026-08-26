@@ -43,7 +43,8 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
-use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
+use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::protocol::connect_capability_atom;
 use triblespace_net::reconcile::Reconciler;
 
@@ -51,14 +52,14 @@ fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
 }
 
-fn connect_proof(root: &SigningKey, subject: &SigningKey) -> CapabilityProofBundle {
+fn proof(
+    root: &SigningKey,
+    subject: &SigningKey,
+    atom: triblespace_core::capability::CapabilityAtom,
+) -> CapabilityProofBundle {
     CapabilityProofBundle::issue_root(
         root,
-        CapabilityClaim::root(
-            connect_capability_atom(root.verifying_key()),
-            CapabilityMode::Invoke,
-            None,
-        ),
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
         subject.verifying_key(),
     )
     .unwrap()
@@ -103,6 +104,7 @@ async fn bring_up(
     store: Pile,
     connect_root: ed25519_dalek::VerifyingKey,
     connect_proof: CapabilityProofBundle,
+    sync_proof: CapabilityProofBundle,
     bootstrap: Vec<EndpointAddr>,
 ) -> Peer<Pile> {
     let secret = triblespace_net::identity::iroh_secret(signing_key);
@@ -110,15 +112,21 @@ async fn bring_up(
     let ep = test_endpoint(network, secret).await;
     let config = PeerConfig {
         peers: bootstrap,
-        gossip_topic: Some(connect_root.to_bytes()),
-        connect_root,
+        team: connect_root,
         connect_proof,
-        direction: SyncDirection::Bidirectional,
+        sync_proof,
+        qos: ReconcileQos::default(),
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(ep, &config).await;
     let (sender, receiver, wiring) = host::wire(id);
     tokio::spawn(host::run_host(harness, config, wiring));
-    Peer::with_wiring(store, SyncDirection::Bidirectional, sender, receiver)
+    Peer::with_wiring(
+        store,
+        connect_root,
+        ReconcileQos::default(),
+        sender,
+        receiver,
+    )
 }
 
 fn init_tracing() {
@@ -147,17 +155,37 @@ async fn two_nodes(
 ) -> TwoNodes {
     let root = key(0xF0);
     let team_root = root.verifying_key();
-    let proof_a = connect_proof(&root, ka);
-    let proof_b = connect_proof(&root, kb);
+    let connect_a = proof(&root, ka, connect_capability_atom(team_root));
+    let sync_a = proof(&root, ka, sync_team_capability_atom(team_root));
+    let connect_b = proof(&root, kb, connect_capability_atom(team_root));
+    let sync_b = proof(&root, kb, sync_team_capability_atom(team_root));
 
     let dir = tempfile::tempdir().expect("temp dir for piles");
     let mut pile_a = fresh_pile(dir.path(), "a.pile");
     seed_a(&mut pile_a);
     let pile_b = fresh_pile(dir.path(), "b.pile");
 
-    let peer_a = bring_up(network, ka, pile_a, team_root, proof_a, Vec::new()).await;
+    let peer_a = bring_up(
+        network,
+        ka,
+        pile_a,
+        team_root,
+        connect_a,
+        sync_a,
+        Vec::new(),
+    )
+    .await;
     let a_id: EndpointAddr = peer_a.id().into();
-    let peer_b = bring_up(network, kb, pile_b, team_root, proof_b, vec![a_id]).await;
+    let peer_b = bring_up(
+        network,
+        kb,
+        pile_b,
+        team_root,
+        connect_b,
+        sync_b,
+        vec![a_id],
+    )
+    .await;
 
     TwoNodes {
         peer_a,

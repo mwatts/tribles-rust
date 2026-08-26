@@ -10,24 +10,17 @@
 //! verified entirely from the bytes on that stream; authentication never
 //! fetches or persists ambient state.
 //!
-//! Nil sentinels: nil id ([0u8; 16]) and nil hash ([0u8; 32]) terminate
-//! sequences. P(collision) = 2^(-128) / 2^(-256). Content-addressed systems
-//! already assume hash uniqueness — nil sentinels are the same assumption.
-//!
 //! Operations:
 //!   AUTH       bundle_len:u32 bundle:bytes → resp:u8  (0x00 = OK, 0x01 = REJECTED)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
-//!   CHILDREN   parent:32 → hash* nil                  (nil = end)
-//!   COLLECTION_EVIDENCE collection:32 → count:u32 evidence[count]
-//!   COLLECTION_OPERATION_RECEIPTS request:97 → count:u32 receipt[count]
-//!                  (each receipt is 128 bytes)
-//!   (protocol is read-only — no remote writes)
+//!   INVENTORY_AUTH, MANIFEST, NODE, and BLOB_RANGE are defined by
+//!   `inventory_wire`; they form the bounded SYNC_TEAM-authorized Merkle walk.
 //!
-//! Branch-state operations are retired. Immutable signed collection
-//! commits are discovered through the configured gossip mesh; content and exact
-//! receipts remain explicitly fetched through this read-only protocol.
+//! The protocol is read-only: it discloses bytes only after CONNECT followed by
+//! a successful connection-local SYNC_TEAM authorization. Remote evidence is
+//! admitted through the authenticated inventory walk, never a write RPC.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/9";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/10";
 
 use triblespace_core::capability::{CapabilityProofBundle, MAX_CAPABILITY_PROOF_BUNDLE_BYTES};
 use triblespace_core::id::{Id, id_hex};
@@ -37,16 +30,11 @@ use triblespace_core::id::{Id, id_hex};
 /// Minted on 2026-08-23 CEST with the exact command `trible genid`, whose
 /// output was `9685583C6ADD2A5F5309F9504F46ABC3`.
 ///
-/// Its resource is the exact 32-byte identity selected by the application
-/// (for teams, the trust-root public key bytes). It grants no collection write
-/// admission, disclosure, gossip, custody, or retention authority.
+/// Its resource is the exact team trust-root public key bytes. It admits the
+/// transport connection only; disclosure additionally requires SYNC_TEAM.
 pub const ACTION_CONNECT: Id = id_hex!("9685583C6ADD2A5F5309F9504F46ABC3");
 
 /// Exact capability atom required for direct RPC under `connect_root`.
-///
-/// Authorization and gossip rendezvous are deliberately independent: this
-/// resource is always the trust-root public key bytes, regardless of which
-/// (if any) gossip topic a peer joins.
 pub fn connect_capability_atom(
     connect_root: ed25519_dalek::VerifyingKey,
 ) -> triblespace_core::capability::CapabilityAtom {
@@ -59,22 +47,12 @@ pub fn connect_capability_atom(
 // Operation types — first byte on each stream.
 // 0x01 was the retired branch-list operation.
 pub const OP_GET_BLOB: u8 = 0x02;
-pub const OP_CHILDREN: u8 = 0x03;
+// 0x03 was the retired blob-children operation.
 // 0x04 was the retired branch-head operation.
 /// First stream on every connection. Body: one length-prefixed canonical
 /// capability proof. Response: u8 status (`AUTH_OK` or `AUTH_REJECTED`).
 pub const OP_AUTH: u8 = 0x05;
-/// Enumerate signed commits for one exact 32-byte collection
-/// descriptor handle. The response framing and strict evidence codec live in
-/// [`crate::collection_wire`].
-pub const OP_COLLECTION_EVIDENCE: u8 = 0x06;
-/// Ask for every locally known exact `MERGE` or `DERIVE` receipt answering one
-/// canonical 97-byte [`triblespace_core::repo::WantRequest`]. Responses carry
-/// full untagged 128-byte records; the request kind supplies their type.
-pub const OP_COLLECTION_OPERATION_RECEIPTS: u8 = 0x07;
-// CAS_PUSH removed: the data model is monotonic (set union), and immutable
-// collection records travel as evidence rather than remote mutable-head
-// writes. The request/response protocol is read-only.
+// 0x06 and 0x07 were the retired collection-evidence operations.
 
 /// Auth response: CONNECT capability verified. Subsequent direct RPCs on this
 /// connection may proceed.
@@ -82,8 +60,6 @@ pub const AUTH_OK: u8 = 0x00;
 /// Auth response: the inline proof was malformed or did not authorize the TLS
 /// peer to CONNECT. The connection should be closed by the client.
 pub const AUTH_REJECTED: u8 = 0x01;
-
-pub const NIL_HASH: RawHash = [0u8; 32];
 
 pub type RawHash = [u8; 32];
 
@@ -211,7 +187,7 @@ pub async fn op_auth<C: Conn>(conn: &C, bundle: &CapabilityProofBundle) -> Resul
     }
 }
 
-/// GET_BLOB: fetch a single blob by hash.
+/// GET_BLOB: fetch a single blob by hash after connection-local SYNC_TEAM auth.
 /// Response: len:u64 + data. len=u64::MAX means missing.
 /// Supports empty blobs (len=0) and every blob representable in this process's
 /// address space. Receive storage grows fallibly in transferred-size chunks;
@@ -249,31 +225,6 @@ async fn recv_blob_response<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option
             .map_err(|e| anyhow!("recv: {e}"))?;
     }
     Ok(Some(data))
-}
-
-/// CHILDREN: get child hashes of a parent blob. Nil hash terminates.
-pub async fn op_children<C: Conn>(conn: &C, parent: &RawHash) -> Result<Vec<RawHash>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_CHILDREN).await?;
-    send_hash(&mut send, parent).await?;
-    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
-
-    recv_children_response(&mut recv).await
-}
-
-async fn recv_children_response<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<RawHash>> {
-    let mut children = Vec::new();
-    loop {
-        let hash = recv_hash(recv).await?;
-        if hash == NIL_HASH {
-            break;
-        }
-        children
-            .try_reserve(1)
-            .map_err(|error| anyhow!("cannot allocate child response: {error}"))?;
-        children.push(hash);
-    }
-    Ok(children)
 }
 
 #[cfg(test)]

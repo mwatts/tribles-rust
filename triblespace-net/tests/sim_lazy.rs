@@ -92,7 +92,7 @@ fn want_count(peer: &triblespace_net::peer::Peer<MemoryRepo>) -> usize {
 }
 
 #[test]
-fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
+fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
     use triblespace_net::reconcile::Reconciler;
 
     let _guard = sim_guard();
@@ -100,8 +100,8 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
         let root = key(0xE1);
         let server_key = key(0xA1);
         let client_key = key(0xB1);
-        let server_proof = connect_proof(&root, &server_key);
-        let client_proof = connect_proof(&root, &client_key);
+        let server_proof = team_proofs(&root, &server_key);
+        let client_proof = team_proofs(&root, &client_key);
         let mut server_store = empty_store();
         let mut client_store = empty_store();
 
@@ -147,16 +147,24 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
             false,
             vec![pk(&server_key)],
         );
-        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+        let mut converged = false;
+        for _ in 0..200 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            server.refresh();
+            client.refresh();
+            if client.store().record(receipt.id()).unwrap().is_some() {
+                converged = true;
+                break;
+            }
+        }
+        assert!(converged, "periodic inventory admits the matching receipt");
 
         let mut reconciler = Reconciler::new();
-        let stats = drive_future(reconciler.tick(&mut client), || server.refresh(), 200)
-            .await
-            .expect("operation reconciliation completes");
+        let stats = reconciler.tick(&mut client).await;
         assert_eq!(stats.wants, 1);
-        assert_eq!(stats.missing, 1);
-        assert_eq!(stats.attempted, 1);
-        assert_eq!(stats.fulfilled, 1);
+        assert_eq!(stats.missing, 0);
+        assert_eq!(stats.attempted, 0);
+        assert_eq!(stats.fulfilled, 0);
         assert_eq!(stats.pending, 0);
         assert_eq!(
             client
@@ -187,18 +195,14 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
         assert_eq!(again.fulfilled, 0);
         assert_eq!(again.pending, 0);
 
-        // The process-local completion cache is deliberately not durable. A
-        // restarted reconciler sees the local receipt but performs one fresh
-        // configured-peer sweep before quiescing, so a partially persisted
-        // conflict batch can never masquerade as complete after a crash.
+        // Operation answers are native inventory state, not process-local
+        // completion cache. A restarted reconciler remains entirely local.
         let mut restarted = Reconciler::new();
-        let after_restart = drive_future(restarted.tick(&mut client), || server.refresh(), 200)
-            .await
-            .expect("post-restart operation sweep completes");
+        let after_restart = restarted.tick(&mut client).await;
         assert_eq!(after_restart.wants, 1);
         assert_eq!(after_restart.missing, 0);
-        assert_eq!(after_restart.attempted, 1);
-        assert_eq!(after_restart.fulfilled, 1);
+        assert_eq!(after_restart.attempted, 0);
+        assert_eq!(after_restart.fulfilled, 0);
         assert_eq!(after_restart.pending, 0);
     });
 }
@@ -214,8 +218,8 @@ fn fetch_blob_pulls_from_the_holder() {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0x42);
         let mut store_a = empty_store();
@@ -264,8 +268,8 @@ fn lazy_read_lands_wanted_in_store() {
         let ka = key(0xA2);
         let kb = key(0xB2);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0x55);
         let mut store_a = empty_store();
@@ -340,8 +344,8 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         let ka = key(0xA3);
         let kb = key(0xB3);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         // A holds three content blobs; B holds none.
         let blobs: Vec<(Blob<SimpleArchive>, [u8; 32])> =
@@ -437,8 +441,8 @@ fn async_lazy_read_awaits_swarm_and_lands_wanted() {
         let ka = key(0xA4);
         let kb = key(0xB4);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0x77);
         let mut store_a = empty_store();
@@ -505,8 +509,8 @@ fn transparent_async_get_fetches_through_reader() {
         let ka = key(0xA5);
         let kb = key(0xB5);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0x88);
         let mut store_a = empty_store();
@@ -579,7 +583,7 @@ fn fetch_blob_unavailable_is_clean() {
         let root = key(0xF1);
         let ka = key(0xA1);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
+        let proof_a = team_proofs(&root, &ka);
 
         let store_a = empty_store();
         let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
@@ -601,13 +605,10 @@ fn fetch_blob_unavailable_is_clean() {
     });
 }
 
-/// Live-neighbor shortcut for read-miss fetches. Gossip topology already told
-/// B that A is dialable, so the on-demand fetch must try that routing hint
-/// before paying the DHT lookup. A neighbor is not presumed to hold the blob:
-/// the ordinary content request and hash verification still decide that.
-/// Proven under a BLACK-HOLE DHT so the neighbor route is load-bearing.
+/// Gossip is only a wake hint. Merely sharing the team topic neither grants
+/// authority nor installs a route for exact reads.
 #[test]
-fn lazy_fetch_uses_live_gossip_neighbor_without_dht() {
+fn gossip_neighbor_alone_is_not_an_exact_fetch_route() {
     let _g = sim_guard();
     run_paused(0x60B1_0001, async {
         let net = SimNet::new(
@@ -621,11 +622,11 @@ fn lazy_fetch_uses_live_gossip_neighbor_without_dht() {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
-        // A holds an otherwise unadvertised content blob. With a black-hole
-        // DHT, B can discover a route only from live gossip topology.
+        // A holds an otherwise unadvertised content blob. Neither configured
+        // PEER evidence nor the DHT supplies B with a route.
         let (orphan_blob, orphan_hash) = content_blob(0x32);
         let mut store_a = empty_store();
         store_a
@@ -636,8 +637,7 @@ fn lazy_fetch_uses_live_gossip_neighbor_without_dht() {
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
         let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
 
-        // Settle the gossip mesh so NeighborUp makes A a live routing
-        // candidate at B. No application payload is gossiped.
+        // Settle the gossip mesh. No application payload or route is gossiped.
         for _ in 0..60u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
@@ -647,13 +647,12 @@ fn lazy_fetch_uses_live_gossip_neighbor_without_dht() {
             "precondition: the orphan blob never rode the eager walk to B"
         );
 
-        // The DHT is dark, so the ONLY way this fetch can succeed is the
-        // live-neighbor route learned independently of payload gossip.
-        let got = drive_future(peer_b.fetch_blob(orphan_hash), || peer_a.refresh(), 200)
+        // The dark DHT eventually times out; NeighborUp must not be treated as
+        // a data route or as disclosure authority.
+        let got = drive_future(peer_b.fetch_blob(orphan_hash), || peer_a.refresh(), 400)
             .await
-            .flatten()
-            .expect("live gossip neighbor must serve the read-miss fetch without the DHT");
-        assert_eq!(blake3::hash(&got).as_bytes(), &orphan_hash);
+            .expect("bounded DHT lookup completes");
+        assert!(got.is_none());
     });
 }
 
@@ -677,7 +676,7 @@ fn fetch_deadline_bounds_unavailable_resolution() {
         let root = key(0xFB);
         let ka = key(0xAB);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
+        let proof_a = team_proofs(&root, &ka);
 
         let store_a = empty_store();
         let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
@@ -716,8 +715,8 @@ fn lazy_read_unavailable_under_partition_then_heals() {
         let ka = key(0xA6);
         let kb = key(0xB6);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0xC1);
         let mut store_a = empty_store();
@@ -775,8 +774,8 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         let ka = key(0xA7);
         let kb = key(0xB7);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0xC2);
         let mut store_a = empty_store();
@@ -821,8 +820,8 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
         let ka = key(0xAC);
         let kb = key(0xBC);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0xCD);
         let mut store_a = empty_store();
@@ -888,8 +887,8 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
             let ka = key(0xAA);
             let kb = key(0xBA);
             let team_root = root.verifying_key();
-            let proof_a = connect_proof(&root, &ka);
-            let proof_b = connect_proof(&root, &kb);
+            let proof_a = team_proofs(&root, &ka);
+            let proof_b = team_proofs(&root, &kb);
 
             let (blob, hash) = content_blob(0xAB);
             let mut store_a = empty_store();
@@ -970,9 +969,9 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
         let kb = key(0xB9);
         let kc = key(0xC9);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
-        let proof_c = connect_proof(&root, &kc);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
+        let proof_c = team_proofs(&root, &kc);
         let (blob, hash) = content_blob(0xFB);
         // A and C both hold the blob; B does not.
         let mut store_a = empty_store();
@@ -1023,8 +1022,8 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0x42);
         let mut store_a = empty_store();
@@ -1073,8 +1072,8 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         let ka = key(0xA8);
         let kb = key(0xB8);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0xCC);
         let mut store_a = empty_store();
@@ -1160,8 +1159,8 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
         let ka = key(0xA0);
         let kb = key(0xB0);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         let (blob, hash) = content_blob(0x42);
         let mut store_a = empty_store();
@@ -1274,8 +1273,8 @@ fn reconcile_tick_services_out_of_band_want() {
         let ka = key(0xAD);
         let kb = key(0xBD);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
-        let proof_b = connect_proof(&root, &kb);
+        let proof_a = team_proofs(&root, &ka);
+        let proof_b = team_proofs(&root, &kb);
 
         // A holds the blob locally; B's reconciliation must not alter A's
         // independent want state.
@@ -1364,7 +1363,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let root = key(0xFE);
         let ka = key(0xAE);
         let team_root = root.verifying_key();
-        let proof_a = connect_proof(&root, &ka);
+        let proof_a = team_proofs(&root, &ka);
 
         let store_a = empty_store();
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);

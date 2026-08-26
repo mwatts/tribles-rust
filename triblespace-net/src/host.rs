@@ -256,9 +256,8 @@ struct InventoryCacheKey {
     root: [u8; 32],
 }
 
-/// A manifest pins at most four entries. Four generations per maximum
-/// concurrent inbound connection leave ample retry room while keeping memory
-/// bounded even under manifest churn.
+/// A manifest pins at most four entries, so this retains at least eight
+/// complete recent manifests globally while bounding churn-driven memory use.
 const MAX_PINNED_INVENTORY_ROOTS: usize = 32;
 
 #[derive(Default)]
@@ -352,9 +351,9 @@ fn decode_inventory_wake_frame(bytes: &[u8], team: VerifyingKey) -> Option<Inven
     Some(InventoryGeneration::from_bytes(generation))
 }
 
-/// The async capability cloned into lazy readers. Exact GET_BLOB requires only
-/// CONNECT and a content hash; broad inventory enumeration separately requires
-/// SYNC_TEAM.
+/// The async capability cloned into lazy readers. Exact GET_BLOB and broad
+/// inventory enumeration both require the connection-local SYNC_TEAM session;
+/// the content hash narrows the request but is not itself disclosure authority.
 pub(crate) trait NetCapability: Send + Sync {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
 }
@@ -438,6 +437,8 @@ struct NetCap<T: Transport> {
     transport: T,
     pool: SharedPool<T::Conn>,
     connect_proof: CapabilityProofBundle,
+    sync_proof: CapabilityProofBundle,
+    can_fetch: bool,
     my_id: PeerId,
     candidates: RoutingCandidates,
 }
@@ -447,15 +448,34 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let transport = self.transport.clone();
         let pool = self.pool.clone();
         let connect_proof = self.connect_proof.clone();
+        let sync_proof = self.sync_proof.clone();
+        let can_fetch = self.can_fetch;
         let my_id = self.my_id;
         let known = self.candidates.lock().unwrap().candidates(my_id);
         Box::pin(async move {
-            let mut bytes =
-                fetch_from_providers(&transport, &hash, &pool, &known, &connect_proof).await;
+            if !can_fetch {
+                return None;
+            }
+            let mut bytes = fetch_from_providers(
+                &transport,
+                &hash,
+                &pool,
+                &known,
+                &connect_proof,
+                &sync_proof,
+            )
+            .await;
             if bytes.is_none() {
                 let providers = providers_for(&transport, hash, my_id).await;
-                bytes = fetch_from_providers(&transport, &hash, &pool, &providers, &connect_proof)
-                    .await;
+                bytes = fetch_from_providers(
+                    &transport,
+                    &hash,
+                    &pool,
+                    &providers,
+                    &connect_proof,
+                    &sync_proof,
+                )
+                .await;
             }
             bytes.filter(|bytes| blake3::hash(bytes).as_bytes() == &hash)
         })
@@ -658,6 +678,8 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         transport: transport.clone(),
         pool: pool.clone(),
         connect_proof: config.connect_proof.clone(),
+        sync_proof: config.sync_proof.clone(),
+        can_fetch: config.qos.direction.pulls(),
         my_id,
         candidates: candidates.clone(),
     }) as Arc<dyn NetCapability>));
@@ -668,6 +690,8 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         server: InventoryServerConfig::full_team(config.team),
         events: events.clone(),
         candidates: candidates.clone(),
+        serve_inventory: config.qos.direction.serves(),
+        admit_inbound_peer: config.qos.direction.admits_inbound_peer(),
         inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CONNECTIONS_GLOBAL)),
         inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_REQUESTS_GLOBAL)),
     };
@@ -1171,11 +1195,14 @@ async fn fetch_from_providers<T: Transport>(
     pool: &SharedPool<T::Conn>,
     providers: &[PeerId],
     connect_proof: &CapabilityProofBundle,
+    sync_proof: &CapabilityProofBundle,
 ) -> Option<Vec<u8>> {
     for peer in providers.iter().copied() {
-        let Some((_, connection)) = pool_get(transport, pool, peer, connect_proof).await else {
-            continue;
-        };
+        let connection =
+            match inventory_pool_get(transport, pool, peer, connect_proof, sync_proof).await {
+                Ok(connection) => connection,
+                Err(_) => continue,
+            };
         match tokio::time::timeout(OP_DEADLINE, op_get_blob(&connection, hash)).await {
             Ok(Ok(Some(bytes))) if blake3::hash(&bytes).as_bytes() == hash => return Some(bytes),
             Ok(Ok(_)) => {}
@@ -1198,6 +1225,8 @@ struct SnapshotHandler {
     server: InventoryServerConfig,
     events: tokio::sync::mpsc::Sender<NetEvent>,
     candidates: RoutingCandidates,
+    serve_inventory: bool,
+    admit_inbound_peer: bool,
     inbound_connections: Arc<tokio::sync::Semaphore>,
     inbound_requests: Arc<tokio::sync::Semaphore>,
 }
@@ -1336,6 +1365,10 @@ impl SnapshotHandler {
         let _entered = span.enter();
         match op {
             OP_GET_BLOB => {
+                if !self.serve_inventory {
+                    anyhow::bail!("local direction policy does not serve data");
+                }
+                let _session = current_inventory_session(&authorization)?;
                 let hash = recv_hash(recv).await?;
                 require_stream_eof(recv).await?;
                 let current = self.snapshot.lock().unwrap().as_ref().cloned();
@@ -1363,6 +1396,10 @@ impl SnapshotHandler {
                     send_inventory_auth_rejected(send).await?;
                     return Ok(());
                 }
+                if !self.serve_inventory {
+                    send_inventory_auth_rejected(send).await?;
+                    return Ok(());
+                }
                 match self
                     .server
                     .authorize(peer, &proof, crate::clock::epoch_now())
@@ -1370,11 +1407,13 @@ impl SnapshotHandler {
                     Ok(session) => {
                         *authorization.lock().unwrap() =
                             InventoryAuthorization::Authorized(session);
-                        self.candidates.lock().unwrap().note(peer.to_bytes());
-                        let _ = self
-                            .events
-                            .send(NetEvent::Peer(PeerEvidence::new(self.server.team(), peer)))
-                            .await;
+                        if self.admit_inbound_peer {
+                            self.candidates.lock().unwrap().note(peer.to_bytes());
+                            let _ = self
+                                .events
+                                .send(NetEvent::Peer(PeerEvidence::new(self.server.team(), peer)))
+                                .await;
+                        }
                         send_inventory_auth_ok(send).await?;
                     }
                     Err(error) => {
@@ -1384,6 +1423,9 @@ impl SnapshotHandler {
                 }
             }
             OP_INVENTORY_MANIFEST => {
+                if !self.serve_inventory {
+                    anyhow::bail!("local direction policy does not serve inventories");
+                }
                 recv_manifest_request(recv).await?;
                 let session = current_inventory_session(&authorization)?;
                 let pinned = self
@@ -1407,6 +1449,9 @@ impl SnapshotHandler {
                 send_manifest(send, &manifest).await?;
             }
             OP_INVENTORY_NODE => {
+                if !self.serve_inventory {
+                    anyhow::bail!("local direction policy does not serve inventories");
+                }
                 let session = current_inventory_session(&authorization)?;
                 let request = recv_node_request(recv, session).await?;
                 let pinned = self.snapshots.lock().unwrap().get(
@@ -1421,6 +1466,9 @@ impl SnapshotHandler {
                 send_node_response(send, session.team(), &request, &response).await?;
             }
             OP_INVENTORY_BLOB_RANGE => {
+                if !self.serve_inventory {
+                    anyhow::bail!("local direction policy does not serve inventories");
+                }
                 let session = current_inventory_session(&authorization)?;
                 let request = recv_blob_range_request(recv).await?;
                 let pinned = self.snapshots.lock().unwrap().get(

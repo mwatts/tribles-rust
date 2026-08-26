@@ -10,7 +10,8 @@ use iroh_base::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use rand::rngs::OsRng;
 use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
 
-use triblespace_net::host::{PeerConfig, SyncDirection};
+use triblespace_net::host::PeerConfig;
+use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
 use triblespace_net::protocol::{PILE_SYNC_ALPN, connect_capability_atom};
 use triblespace_net::transport::{Transport, iroh::bind_with_endpoint};
 
@@ -36,14 +37,13 @@ fn direct_addr(id: EndpointId) -> EndpointAddr {
     )
 }
 
-fn connect_proof(key: &SigningKey) -> CapabilityProofBundle {
+fn proof(
+    key: &SigningKey,
+    atom: triblespace_core::capability::CapabilityAtom,
+) -> CapabilityProofBundle {
     CapabilityProofBundle::issue_root(
         key,
-        CapabilityClaim::root(
-            connect_capability_atom(key.verifying_key()),
-            CapabilityMode::Invoke,
-            None,
-        ),
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
         key.verifying_key(),
     )
     .unwrap()
@@ -52,10 +52,10 @@ fn connect_proof(key: &SigningKey) -> CapabilityProofBundle {
 fn config(key: &SigningKey, peers: Vec<EndpointAddr>) -> PeerConfig {
     PeerConfig {
         peers,
-        gossip_topic: None,
-        connect_root: key.verifying_key(),
-        connect_proof: connect_proof(key),
-        direction: SyncDirection::Bidirectional,
+        team: key.verifying_key(),
+        connect_proof: proof(key, connect_capability_atom(key.verifying_key())),
+        sync_proof: proof(key, sync_team_capability_atom(key.verifying_key())),
+        qos: ReconcileQos::default(),
     }
 }
 
