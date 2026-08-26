@@ -30,12 +30,13 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use super::pile::{
     CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError, Pile, PileReader,
-    PileWriteError, ReadError,
+    PileRevision, PileWriteError, ReadError,
 };
 use super::proof::CapabilityProofStore;
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    RetentionRoots, StorageClose, TransferError, WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
+    RetentionRoots, StorageClose, StoreRevision, TransferError, WantRequest, WantStore,
+    WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -193,6 +194,32 @@ pub struct Yard {
     generations: Vec<Generation>,
     config: YardConfig,
     want_state: Arc<Mutex<WantState>>,
+}
+
+/// Opaque invalidation token for the sync-visible union of a [`Yard`].
+///
+/// Pile boundaries cover every native record in each segment; persistent live
+/// sets additionally capture logical blob movement and eviction that need not
+/// append a record to the source segment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct YardRevision {
+    segments: Vec<(PileRevision, HandleSet)>,
+}
+
+impl StoreRevision for Yard {
+    type Revision = YardRevision;
+    type Error = ReadError;
+
+    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
+        let mut segments = Vec::new();
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                let boundary = segment.pile_mut().store_revision()?;
+                segments.push((boundary, segment.live.clone()));
+            }
+        }
+        Ok(YardRevision { segments })
+    }
 }
 
 impl Yard {

@@ -17,7 +17,7 @@ use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::prelude::*;
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
-use crate::repo::{WantRequest, WantStore};
+use crate::repo::{StoreRevision, WantRequest, WantStore};
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
@@ -45,6 +45,32 @@ pub struct MemoryRepo {
     capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
     peer_evidence: PeerEvidenceIndex,
+}
+
+/// O(1)-clone invalidation token for a [`MemoryRepo`]'s sync-visible sets.
+///
+/// Each field is a persistent PATCH snapshot (or a blob store backed by one),
+/// so cloning and equality compare cached roots rather than walking entries.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemoryRepoRevision {
+    blobs: MemoryBlobStore,
+    collection_records: CollectionRecordIndex,
+    capability_proofs: CapabilityProofIndex,
+    peer_evidence: PeerEvidenceIndex,
+}
+
+impl StoreRevision for MemoryRepo {
+    type Revision = MemoryRepoRevision;
+    type Error = Infallible;
+
+    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
+        Ok(MemoryRepoRevision {
+            blobs: self.blobs.clone(),
+            collection_records: self.collection_records.clone(),
+            capability_proofs: self.capability_proofs.clone(),
+            peer_evidence: self.peer_evidence.clone(),
+        })
+    }
 }
 
 /// Deterministic persistent snapshot of in-memory peer evidence.
@@ -663,5 +689,63 @@ mod tests {
         assert!(reader
             .get::<Blob<UnknownBlob>, _>(orphan.transmute())
             .is_err());
+    }
+
+    #[test]
+    fn store_revision_tracks_exactly_the_sync_visible_sets() {
+        use crate::blob::encodings::utf8string::UTF8String;
+
+        let mut repo = MemoryRepo::default();
+        let empty = repo.store_revision().unwrap();
+
+        // WANT is local operational policy, not advertised inventory.
+        repo.want(WantRequest::blob(handle(1))).unwrap();
+        let after_want = repo.store_revision().unwrap();
+        assert!(empty == after_want);
+
+        repo.put::<UTF8String, _>("revision fixture".to_owned())
+            .unwrap();
+        let after_blob = repo.store_revision().unwrap();
+        assert!(after_want != after_blob);
+
+        let target = identity_for_tests(&named_for_tests(
+            "revision-target",
+            Id::new([71; 16]).unwrap(),
+            Id::new([72; 16]).unwrap(),
+        ));
+        repo.insert(CollectionRecord::Derive(CollectionDerive::new(
+            target,
+            handle(73).into(),
+            handle(74).into(),
+        )))
+        .unwrap();
+        let after_record = repo.store_revision().unwrap();
+        assert!(after_blob != after_record);
+
+        let root = SigningKey::from_bytes(&[75; 32]);
+        let leaf = SigningKey::from_bytes(&[76; 32]);
+        let claim = CapabilityClaim::root(
+            CapabilityAtom::new(
+                CapabilityAction::new(Id::new([77; 16]).unwrap()),
+                CapabilityResource::new([78; 32]),
+            ),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let proof = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key())
+            .unwrap()
+            .proof()
+            .clone();
+        repo.insert_proof(proof).unwrap();
+        let after_proof = repo.store_revision().unwrap();
+        assert!(after_record != after_proof);
+
+        repo.insert_peer(PeerEvidence::new(
+            root.verifying_key(),
+            leaf.verifying_key(),
+        ))
+        .unwrap();
+        let after_peer = repo.store_revision().unwrap();
+        assert!(after_proof != after_peer);
     }
 }

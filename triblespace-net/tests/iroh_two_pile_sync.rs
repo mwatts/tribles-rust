@@ -5,8 +5,8 @@
 //! `sim_collection_gossip`) proves the protocol *logic*; this test proves the
 //! *transport*: two
 //! `Peer<Pile>`s — real pile files on disk — run the full production
-//! stack (`transport::iroh::bind_with_endpoint`: embedded DHT node,
-//! protocol router, iroh-gossip topic mesh, OP_AUTH with an inline CONNECT
+//! stack (`transport::iroh::bind_with_endpoint`: protocol router,
+//! iroh-gossip topic mesh, OP_AUTH with an inline CONNECT
 //! proof) over real iroh QUIC endpoints wired through
 //! `iroh::test_utils` `TestNetwork` (an in-memory packet transport —
 //! no relays, no DNS, no OS sockets — everything above the packet
@@ -95,8 +95,8 @@ async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
 }
 
 /// Bring one node up over the TestNetwork: bind the endpoint, wire the
-/// full production transport stack (`bind_with_endpoint`: DHT node,
-/// protocol router, gossip topic), spawn the host loop as a tokio
+/// full production transport stack (`bind_with_endpoint`: protocol router
+/// and gossip topic), spawn the host loop as a tokio
 /// task, and wrap the pile in a `Peer`.
 async fn bring_up(
     network: &TestNetwork,

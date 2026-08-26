@@ -1,10 +1,9 @@
-//! Production [`Transport`] adapter: iroh QUIC + iroh-gossip + the
-//! embedded Kademlia DHT node.
+//! Production [`Transport`] adapter: iroh QUIC + iroh-gossip.
 //!
 //! Everything iroh-specific that used to live inline in the host
 //! loop's startup — endpoint building (relay map, CA roots, mDNS +
 //! pkarr + mDNS address lookup), protocol-handler registration, gossip
-//! topic join, DHT node spawn — happens in [`bind`], which returns the
+//! topic join — happens in [`bind`], which returns the
 //! transport-agnostic [`Harness`] the host loop runs against.
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -22,15 +21,13 @@ use crate::host::PeerConfig;
 /// router handler tasks cannot accumulate behind an awaited send.
 const CHANNEL_CAP: usize = 64;
 
-/// The protocol ALPN forwarded into the host loop. The DHT and
-/// gossip ALPNs are *not* forwarded — their handlers are registered
-/// directly with the router here and never surface above the seam.
+/// The protocol ALPN forwarded into the host loop. The gossip ALPN is handled
+/// by iroh-gossip and never surfaces above the seam.
 const FORWARDED_ALPNS: [Alpn; 1] = [crate::protocol::PILE_SYNC_ALPN];
 
 #[derive(Clone)]
 pub struct IrohTransport {
     ep: iroh::Endpoint,
-    dht: Option<crate::dht::api::ApiClient>,
     /// Explicitly configured routes, keyed by endpoint identity.
     ///
     /// `Endpoint::connect(EndpointId, ..)` delegates route selection to
@@ -41,7 +38,7 @@ pub struct IrohTransport {
     /// discovery as the fallback for address-less peers.
     peers: Arc<BTreeMap<EndpointId, EndpointAddr>>,
     /// Keeps the router (and through it the registered protocol
-    /// handlers + gossip + DHT rpc node) alive for the transport's
+    /// handlers + gossip) alive for the transport's
     /// lifetime. The host loop never touches these; they exist below
     /// the seam.
     _alive: Arc<Anchors>,
@@ -50,7 +47,6 @@ pub struct IrohTransport {
 /// Owner of everything that must not drop while the node runs.
 struct Anchors {
     _router: iroh::protocol::Router,
-    _dht_rpc: Option<crate::dht::rpc::RpcClient>,
     /// Runtime that owns the endpoint and router. Outbound handshakes are
     /// spawned here so cancelling a caller does not drop iroh's `Connecting`
     /// future before endpoint shutdown has observed and closed it.
@@ -161,24 +157,6 @@ impl Transport for IrohTransport {
         Ok(IrohConn(conn))
     }
 
-    async fn dht_announce(&self, hash: [u8; 32]) {
-        if let Some(api) = &self.dht {
-            let blake3_hash = blake3::Hash::from_bytes(hash);
-            let _ = api.announce_provider(blake3_hash, self.ep.id()).await;
-        }
-    }
-
-    async fn dht_providers(&self, hash: [u8; 32]) -> Vec<PeerId> {
-        let Some(api) = &self.dht else {
-            return Vec::new();
-        };
-        let blake3_hash = blake3::Hash::from_bytes(hash);
-        match api.find_providers(blake3_hash).await {
-            Ok(ids) => ids.into_iter().map(|id| *id.as_bytes()).collect(),
-            Err(_) => Vec::new(),
-        }
-    }
-
     async fn shutdown(&self) {
         // The router owns the endpoint accept loop and performs the required
         // ordering: stop protocol handlers, cancel accepts, then await
@@ -277,8 +255,8 @@ fn n0_endpoint_builder(secret: iroh_base::SecretKey) -> iroh::endpoint::Builder 
         .relay_mode(iroh::RelayMode::Custom(relay_map))
 }
 
-/// Build the production transport: bind the ordinary iroh endpoint, spawn the
-/// embedded DHT node, register the protocol-forwarding handlers, join the team
+/// Build the production transport: bind the ordinary iroh endpoint, register
+/// the protocol-forwarding handler, join the team
 /// gossip topic when configured, and spawn the router.
 ///
 /// Returns `None` if the endpoint fails to bind (already logged) —
@@ -298,8 +276,8 @@ pub async fn bind(
     Some(bind_with_endpoint(ep, config).await)
 }
 
-/// Wire the full transport stack (DHT node, protocol-forwarding
-/// handlers, gossip topic, router) over an already-bound endpoint, and
+/// Wire the full transport stack (protocol forwarding, gossip topic, router)
+/// over an already-bound endpoint, and
 /// return the [`Harness`] the host loop runs against.
 ///
 /// Factored out of [`bind`] so a caller can supply its own endpoint —
@@ -311,7 +289,6 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     use iroh::protocol::Router;
     use iroh_gossip::Gossip;
 
-    let my_id = ep.id();
     let peers = Arc::new(
         config
             .peers
@@ -322,8 +299,8 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     );
 
     // Make configured routes available to every iroh sub-protocol, not only
-    // `IrohTransport::dial`: gossip and the embedded DHT initiate their own
-    // connections using endpoint ids.  A memory lookup bridges those ids back
+    // `IrohTransport::dial`: gossip initiates its own connections using
+    // endpoint ids. A memory lookup bridges those ids back
     // to the exact direct/fabric addresses supplied by the caller.
     if !config.peers.is_empty() {
         let lookup =
@@ -335,30 +312,7 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     }
     let mut router_builder = Router::builder(ep.clone());
 
-    // DHT — always on. Peers bootstrap the routing table.
-    let dht_alpn = crate::dht::rpc::ALPN;
-    let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
-        ep.clone(),
-        dht_alpn,
-        iroh_blobs::util::connection_pool::Options {
-            max_connections: 64,
-            idle_timeout: std::time::Duration::from_secs(30),
-            connect_timeout: std::time::Duration::from_secs(10),
-            on_connected: None,
-        },
-    );
-    let iroh_pool = crate::dht::pool::IrohPool::new(ep.clone(), pool);
     let bootstrap_ids: Vec<EndpointId> = config.peers.iter().map(|addr| addr.id).collect();
-    let (rpc, dht_api) = crate::dht::create_node(
-        my_id,
-        iroh_pool.clone(),
-        bootstrap_ids.clone(),
-        Default::default(),
-    );
-    iroh_pool.set_self_client(Some(rpc.downgrade()));
-    let dht_sender = rpc.inner().as_local().expect("local sender");
-    router_builder =
-        router_builder.accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
 
     // Protocol ALPNs forward into the harness channel; the host loop
     // dispatches them to the protocol handlers above the seam.
@@ -423,11 +377,9 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
 
     let transport = IrohTransport {
         ep,
-        dht: Some(dht_api),
         peers,
         _alive: Arc::new(Anchors {
             _router: router,
-            _dht_rpc: Some(rpc),
             _runtime: tokio::runtime::Handle::current(),
         }),
     };

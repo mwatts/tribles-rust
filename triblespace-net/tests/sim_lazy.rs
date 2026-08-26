@@ -35,7 +35,7 @@ use triblespace_core::repo::{
     BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, WantRequest, WantStore,
 };
 use triblespace_core::trible::TribleSet;
-use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
+use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 use common::*;
 
@@ -123,13 +123,7 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
         server_store.insert(receipt).unwrap();
         client_store.want(request).unwrap();
 
-        let net = SimNet::new(
-            0x0A11_CE01,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x0A11_CE01, SimConfig::default());
         let mut server = bring_up(
             &net,
             &server_key,
@@ -207,8 +201,9 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
     });
 }
 
-/// A holds a content blob; B does not. B's swarm fetch must pull it
-/// from A (DHT-resolved) and return the verified bytes.
+/// A holds a content blob; B does not. B's team fetch must pull it
+/// from its authenticated, explicitly configured route to A and return
+/// the verified bytes.
 #[test]
 fn fetch_blob_pulls_from_the_holder() {
     let _g = sim_guard();
@@ -227,10 +222,17 @@ fn fetch_blob_pulls_from_the_holder() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
-        // A announces its blobs to the DHT via refresh's diff-and-announce;
-        // settle the mesh (neighbor-up + announce).
+        // Settle the hosts before starting the exact read.
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
@@ -278,9 +280,17 @@ fn lazy_read_lands_wanted_in_store() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
         // B is a lazy node: no eager content.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
-        // Settle the mesh so A's blobs are announced to the DHT.
+        // Settle the hosts before starting the exact read.
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
@@ -357,7 +367,15 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -450,7 +468,15 @@ fn async_lazy_read_awaits_swarm_and_lands_wanted() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -518,7 +544,15 @@ fn transparent_async_get_fetches_through_reader() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -567,19 +601,13 @@ fn transparent_async_get_fetches_through_reader() {
     });
 }
 
-/// Black-hole DHT, no other holder: the fetch resolves to `None`
+/// With no exact route and no holder, the fetch resolves to `None`
 /// (Unavailable) — it must complete, not hang.
 #[test]
 fn fetch_blob_unavailable_is_clean() {
     let _g = sim_guard();
     run_paused(0x1234, async {
-        let net = SimNet::new(
-            0x1234,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x1234, SimConfig::default());
         let root = key(0xF1);
         let ka = key(0xA1);
         let team_root = root.verifying_key();
@@ -589,11 +617,8 @@ fn fetch_blob_unavailable_is_clean() {
         let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
 
         let (_blob, hash) = content_blob(0x99);
-        // providers_for has a 3s internal DHT timeout; give the sim
-        // enough virtual steps to cross it, then expect a None reply.
-        // No-op on_step: the inline fetch borrows `peer_a`, and stepping
-        // alone advances virtual time across the timeout (no refresh
-        // needed — there's nothing to gossip to here anyway).
+        // No-op on_step: the inline fetch borrows `peer_a`; there is no
+        // configured route to try and no gossip work needed here.
         let reply = drive_future(peer_a.fetch_blob(hash), || {}, 400)
             .await
             .flatten();
@@ -611,13 +636,7 @@ fn fetch_blob_unavailable_is_clean() {
 fn gossip_neighbor_alone_is_not_an_exact_fetch_route() {
     let _g = sim_guard();
     run_paused(0x60B1_0001, async {
-        let net = SimNet::new(
-            0x60B1_0001,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x60B1_0001, SimConfig::default());
         let root = key(0xF0);
         let ka = key(0xA0);
         let kb = key(0xB0);
@@ -625,8 +644,8 @@ fn gossip_neighbor_alone_is_not_an_exact_fetch_route() {
         let proof_a = team_proofs(&root, &ka);
         let proof_b = team_proofs(&root, &kb);
 
-        // A holds an otherwise unadvertised content blob. Neither configured
-        // PEER evidence nor the DHT supplies B with a route.
+        // A holds an otherwise unadvertised content blob. No configured or
+        // durable PEER evidence supplies B with a route.
         let (orphan_blob, orphan_hash) = content_blob(0x32);
         let mut store_a = empty_store();
         store_a
@@ -647,32 +666,25 @@ fn gossip_neighbor_alone_is_not_an_exact_fetch_route() {
             "precondition: the orphan blob never rode the eager walk to B"
         );
 
-        // The dark DHT eventually times out; NeighborUp must not be treated as
-        // a data route or as disclosure authority.
+        // NeighborUp must not be treated as a data route or as disclosure
+        // authority.
         let got = drive_future(peer_b.fetch_blob(orphan_hash), || peer_a.refresh(), 400)
             .await
-            .expect("bounded DHT lookup completes");
+            .expect("route-less fetch completes");
         assert!(got.is_none());
     });
 }
 
 /// The END-TO-END fetch deadline. With a short explicit budget, an
-/// unavailable fetch resolves `None` as soon as the budget expires —
-/// well before the internal 3s DHT timeout (let alone a stack of
-/// per-provider dial/op deadlines) would. Regression test for the
+/// unavailable fetch resolves `None` within the explicit budget rather
+/// than stacking per-route dial/op deadlines. Regression test for the
 /// previously-unbounded on-demand path, where per-stage deadlines
 /// could stack to 40s+ across a provider list.
 #[test]
 fn fetch_deadline_bounds_unavailable_resolution() {
     let _g = sim_guard();
     run_paused(0xDEAD_0011, async {
-        let net = SimNet::new(
-            0xDEAD_0011,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0xDEAD_0011, SimConfig::default());
         let root = key(0xFB);
         let ka = key(0xAB);
         let team_root = root.verifying_key();
@@ -683,18 +695,15 @@ fn fetch_deadline_bounds_unavailable_resolution() {
         let _ = net; // keep the sim alive for the fetch
 
         let (_blob, hash) = content_blob(0x9A);
-        // Budget 500 ms; the internal DHT timeout alone is 3 s. 60 sim
-        // steps × 20 ms = 1.2 s of virtual time — enough to cross the
-        // budget, NOT enough to cross the DHT timeout — so completion
-        // within the step allowance proves the overall deadline fired.
+        // Budget 500 ms. Sixty 20 ms sim steps leave ample room to prove
+        // that the overall deadline bounds all route attempts.
         let reply = drive_future(
             peer_a.fetch_blob_with_deadline(hash, Duration::from_millis(500)),
             || {},
             60,
         )
         .await;
-        let reply = reply
-            .expect("fetch must resolve within the overall budget, not hang to the DHT timeout");
+        let reply = reply.expect("fetch must resolve within the overall budget");
         assert!(
             reply.is_none(),
             "an expired budget is Unavailable, not bytes"
@@ -703,9 +712,8 @@ fn fetch_deadline_bounds_unavailable_resolution() {
 }
 
 /// Lazy read degrades to Unavailable when the network partitions the
-/// reader from the only holder, and **recovers** once the link heals —
-/// the graceful-degradation property under a real fault. (The DHT find
-/// still names the holder; it's the dial that fails, then succeeds.)
+/// reader from the only configured holder, and **recovers** once the link
+/// heals — the graceful-degradation property under a real fault.
 #[test]
 fn lazy_read_unavailable_under_partition_then_heals() {
     let _g = sim_guard();
@@ -724,15 +732,22 @@ fn lazy_read_unavailable_under_partition_then_heals() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
 
-        // Sever A↔B: the DHT still resolves A as the provider, but B's
-        // dial to A fails.
+        // Sever A↔B: B retains A as an exact route, but its dial fails.
         net.partition(pk(&ka), pk(&kb));
         let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
             .await
@@ -783,7 +798,15 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -829,7 +852,15 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -896,7 +927,15 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
             let store_b = empty_store();
 
             let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-            let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+            let peer_b = bring_up_with_peers(
+                &net,
+                &kb,
+                store_b,
+                team_root,
+                proof_b.clone(),
+                true,
+                vec![pk(&ka)],
+            );
 
             for _ in 0..40u32 {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -954,9 +993,9 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
     }
 }
 
-/// Provider fallback across a 3-node mesh: the blob lives on both A and
+/// Route fallback across a 3-node team: the blob lives on both A and
 /// C; A crashes; B's lazy read must fall back to the surviving holder.
-/// Exercises `fetch_one`'s multi-provider iteration (try next provider
+/// Exercises `fetch_one`'s multi-route iteration (try the next peer
 /// on a dial/op failure) — invisible to the 2-node tests, where there's
 /// only ever one provider.
 #[test]
@@ -982,7 +1021,15 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
         let mut peer_c = bring_up(&net, &kc, store_c, team_root, proof_c.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka), pk(&kc)],
+        );
 
         for _ in 0..50u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -994,7 +1041,7 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
             "precondition: B lacks the blob"
         );
 
-        // Crash A. Both A and C are DHT providers; B must fall back to C.
+        // Crash A. B's second authenticated route, C, must take over.
         net.crash(pk(&ka));
         let got = drive_future(
             peer_b.fetch_blob(hash),
@@ -1031,7 +1078,15 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1081,7 +1136,15 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1168,7 +1231,15 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            true,
+            vec![pk(&ka)],
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1285,9 +1356,17 @@ fn reconcile_tick_services_out_of_band_want() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
         // B: no gossip — a pure leecher; only the want-reconcile fetches.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), false);
+        let mut peer_b = bring_up_with_peers(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            proof_b.clone(),
+            false,
+            vec![pk(&ka)],
+        );
 
-        // Settle the mesh so A's blobs are announced to the DHT.
+        // Settle the hosts before reconciliation starts.
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
@@ -1351,15 +1430,9 @@ fn reconcile_unsatisfiable_want_stays_pending() {
 
     let _g = sim_guard();
     run_paused(0x9E4D, async {
-        // Black-hole DHT: provider lookups time out — the fetch resolves
-        // Unavailable in bounded (virtual) time, never hangs.
-        let net = SimNet::new(
-            0x9E4D,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
+        // With no exact routes, the fetch resolves Unavailable in bounded
+        // virtual time and never hangs.
+        let net = SimNet::new(0x9E4D, SimConfig::default());
         let root = key(0xFE);
         let ka = key(0xAE);
         let team_root = root.verifying_key();
@@ -1379,7 +1452,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
 
         // Tick 1: the want is attempted and comes back Unavailable —
         // pending, not an error, not dropped. (No-op on_step: the tick
-        // borrows peer_a; stepping alone crosses the DHT deadline.)
+        // borrows peer_a; no companion host needs refreshing.)
         let s1 = drive_future(rec.tick(&mut peer_a), || {}, 400)
             .await
             .expect("tick 1 completes despite the unsatisfiable want");
@@ -1427,8 +1500,8 @@ fn reconcile_unsatisfiable_want_stays_pending() {
 
 /// The content layer is decoupled from the gossip layer. Under **total
 /// gossip loss** the collection-evidence mesh is dark — but the lazy
-/// read uses the DHT (a global provider record) plus a direct authed
-/// dial, neither of which is gossip, so it must still succeed. A
+/// read uses an explicit authenticated route, which is independent of
+/// gossip, so it must still succeed. A
 /// regression that accidentally routed content discovery through gossip
 /// would fail here.
 #[test]

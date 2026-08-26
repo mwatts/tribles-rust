@@ -17,12 +17,11 @@ use crate::transport::PeerId;
 /// A newly installed immutable local observation.
 ///
 /// The snapshot slot is replaced before this command is sent. Consequently a
-/// generation wake or DHT announcement can never race ahead of the bytes that
+/// generation wake can never race ahead of the bytes that
 /// the direct protocol will serve.
 pub(crate) struct SnapshotNotice {
     pub(crate) generation: InventoryGeneration,
     pub(crate) peers: Vec<PeerId>,
-    pub(crate) blobs: Vec<RawHash>,
 }
 
 /// Commands sent from [`crate::peer::Peer`] to the host runtime.

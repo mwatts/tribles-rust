@@ -3,8 +3,9 @@
 //! [`Peer<S>`](peer::Peer) wraps one single-team store. Periodic authenticated
 //! PATCH walks converge peer-routing evidence, collection records, complete
 //! capability proofs, and optionally resident blobs; gossip carries only
-//! untrusted generation wakes. Exact content reads retain durable-WANT and DHT
-//! discovery semantics independently of broad inventory mirroring.
+//! untrusted generation wakes. Exact content reads retain durable-WANT
+//! semantics and search authenticated configured/PEER routes independently of
+//! broad inventory mirroring.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 

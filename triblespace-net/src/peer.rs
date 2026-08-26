@@ -20,7 +20,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    CapabilityProofStore, PeerStore, StorageFlush, WantRequest, WantStore,
+    CapabilityProofStore, PeerStore, StorageFlush, StoreRevision, WantRequest, WantStore,
 };
 
 use crate::channel::NetEvent;
@@ -39,6 +39,7 @@ where
         + PeerStore
         + WantStore
         + StorageFlush
+        + StoreRevision
         + Send
         + 'static,
     S::Reader: BlobStoreMeta,
@@ -52,6 +53,10 @@ where
     /// shared durability barrier succeeds. A failed flush is retried on every
     /// refresh without requiring the remote to redeliver the event first.
     pending_network_flush: bool,
+    /// Last local observation used to build the installed immutable inventory.
+    /// Equality is a cheap invalidation check supplied by the store; it is not
+    /// a portable generation or a semantic version.
+    last_store_revision: Option<S::Revision>,
     last_event_at: crate::clock::Mono,
 }
 
@@ -63,6 +68,7 @@ where
         + PeerStore
         + WantStore
         + StorageFlush
+        + StoreRevision
         + Send
         + 'static,
     S::Reader: BlobStoreMeta,
@@ -119,6 +125,7 @@ where
             team,
             qos,
             pending_network_flush,
+            last_store_revision: None,
             last_event_at: crate::clock::mono_now(),
         };
         // Reobserve once after assembly so external pile appends that raced
@@ -143,8 +150,8 @@ where
         self.last_event_at
     }
 
-    /// Fetch exact content through configured/learned routes and then DHT
-    /// providers. This primitive neither records a WANT nor mutates the store.
+    /// Fetch exact content through configured and authenticated PEER routes.
+    /// This primitive neither records a WANT nor mutates the store.
     pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
         self.sender
             .fetch_blob(hash, host::INTERACTIVE_FETCH_DEADLINE)
@@ -229,7 +236,22 @@ where
             }
         }
         if !self.pending_network_flush {
-            self.sender.refresh_store_snapshot(&mut *store, self.team);
+            let revision = match store.store_revision() {
+                Ok(revision) => revision,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "store revision unavailable; keeping prior inventory"
+                    );
+                    return;
+                }
+            };
+            if self.last_store_revision.as_ref() == Some(&revision) {
+                return;
+            }
+            if self.sender.refresh_store_snapshot(&mut *store, self.team) {
+                self.last_store_revision = Some(revision);
+            }
         }
     }
 
@@ -292,6 +314,7 @@ where
         + PeerStore
         + WantStore
         + StorageFlush
+        + StoreRevision
         + Send
         + 'static,
     S::Reader: BlobStoreMeta,
@@ -305,9 +328,7 @@ where
         Handle<Sch>: InlineEncoding,
     {
         let mut store = self.store.lock().expect("store mutex");
-        let handle = store.put(item)?;
-        self.sender.refresh_store_snapshot(&mut *store, self.team);
-        Ok(handle)
+        store.put(item)
     }
 }
 
@@ -319,6 +340,7 @@ where
         + PeerStore
         + WantStore
         + StorageFlush
+        + StoreRevision
         + Send
         + 'static,
     S::Reader: BlobStoreMeta,

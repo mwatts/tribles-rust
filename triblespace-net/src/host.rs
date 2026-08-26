@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -21,6 +22,7 @@ use triblespace_core::capability::CapabilityProofBundle;
 use triblespace_core::collection::CollectionStore;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::peer::PeerEvidence;
 use triblespace_core::repo::{
@@ -157,7 +159,6 @@ pub(crate) trait AnySnapshot: Send + 'static {
     fn team(&self) -> VerifyingKey;
     fn manifest(&self) -> InventoryManifest;
     fn routing_peers(&self) -> Vec<PeerId>;
-    fn blob_hashes(&self) -> Vec<RawHash>;
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn node_summary(
         &self,
@@ -186,10 +187,6 @@ where
 
     fn routing_peers(&self) -> Vec<PeerId> {
         self.routing_peers.clone()
-    }
-
-    fn blob_hashes(&self) -> Vec<RawHash> {
-        self.inventory.blobs().clone().into_iter_ordered().collect()
     }
 
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
@@ -358,33 +355,28 @@ pub(crate) trait NetCapability: Send + Sync {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
 }
 
-#[derive(Default)]
 struct RoutingTable {
-    configured: Vec<PeerId>,
-    learned: VecDeque<PeerId>,
+    configured: PATCH<32, IdentitySchema>,
+    learned: PATCH<32, IdentitySchema>,
 }
 
-const LEARNED_ROUTING_CAP: usize = 64;
-
 impl RoutingTable {
-    fn new(mut configured: Vec<PeerId>) -> Self {
-        configured.sort_unstable();
-        configured.dedup();
+    fn new(configured: Vec<PeerId>) -> Self {
+        let mut configured_index = PATCH::new();
+        for peer in configured {
+            configured_index.insert(&PatchEntry::new(&peer));
+        }
         Self {
-            configured,
-            learned: VecDeque::new(),
+            configured: configured_index,
+            learned: PATCH::new(),
         }
     }
 
     fn note(&mut self, peer: PeerId) {
-        if self.configured.contains(&peer) {
+        if self.configured.get(&peer).is_some() {
             return;
         }
-        if let Some(position) = self.learned.iter().position(|known| *known == peer) {
-            self.learned.remove(position);
-        }
-        self.learned.push_front(peer);
-        self.learned.truncate(LEARNED_ROUTING_CAP);
+        self.learned.insert(&PatchEntry::new(&peer));
     }
 
     fn replace_learned(&mut self, peers: Vec<PeerId>, self_id: PeerId) {
@@ -394,20 +386,11 @@ impl RoutingTable {
     }
 
     fn candidates(&self, self_id: PeerId) -> Vec<PeerId> {
-        let mut result = Vec::with_capacity(self.configured.len() + self.learned.len());
-        let mut seen = HashSet::new();
-        for peer in self
-            .learned
-            .iter()
-            .chain(self.configured.iter())
-            .copied()
+        let mut all = self.configured.clone();
+        all.union(self.learned.clone());
+        all.into_iter_ordered()
             .filter(|peer| *peer != self_id)
-        {
-            if seen.insert(peer) {
-                result.push(peer);
-            }
-        }
-        result
+            .collect()
     }
 }
 
@@ -456,7 +439,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
             if !can_fetch {
                 return None;
             }
-            let mut bytes = fetch_from_providers(
+            let bytes = fetch_from_providers(
                 &transport,
                 &hash,
                 &pool,
@@ -465,18 +448,6 @@ impl<T: Transport> NetCapability for NetCap<T> {
                 &sync_proof,
             )
             .await;
-            if bytes.is_none() {
-                let providers = providers_for(&transport, hash, my_id).await;
-                bytes = fetch_from_providers(
-                    &transport,
-                    &hash,
-                    &pool,
-                    &providers,
-                    &connect_proof,
-                    &sync_proof,
-                )
-                .await;
-            }
             bytes.filter(|bytes| blake3::hash(bytes).as_bytes() == &hash)
         })
     }
@@ -505,7 +476,6 @@ impl NetSender {
         let notice = SnapshotNotice {
             generation: manifest.generation(),
             peers: snapshot.routing_peers(),
-            blobs: snapshot.blob_hashes(),
         };
         *self.snapshot.lock().unwrap() = Some(shared_snapshot(snapshot));
 
@@ -629,10 +599,12 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 }
 
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-const DHT_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const INVENTORY_SWEEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const INVENTORY_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+/// Untrusted gossip can accelerate periodic correctness, but cannot schedule
+/// more than one extra sweep per interval regardless of sender volume.
+const MIN_GOSSIP_WAKE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 const HOST_POLL_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
 const INBOUND_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const INBOUND_CONNECTION_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
@@ -641,10 +613,6 @@ pub(crate) const MAX_INBOUND_CONNECTIONS_GLOBAL: usize = 64;
 pub(crate) const MAX_INBOUND_REQUESTS_PER_CONNECTION: usize = 16;
 const MAX_INBOUND_REQUESTS_GLOBAL: usize = 64;
 const MAX_CONCURRENT_SWEEPS: usize = 8;
-
-enum HostSignal {
-    Wake,
-}
 
 struct SweepOutcome {
     peer: PeerId,
@@ -712,17 +680,22 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
     });
 
-    let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let wake_pending = Arc::new(AtomicBool::new(false));
     let mut gossip_sender = None;
     if let Some((sender, mut gossip_events)) = gossip {
         gossip_sender = Some(sender);
         let team = config.team;
+        let wake_pending = wake_pending.clone();
         tokio::spawn(async move {
+            let mut last_generation = None;
             while let Some(event) = gossip_events.recv().await {
                 match event {
                     GossipEvent::Received { bytes, .. } => {
-                        if decode_inventory_wake_frame(&bytes, team).is_some() {
-                            let _ = signal_tx.send(HostSignal::Wake);
+                        if let Some(generation) = decode_inventory_wake_frame(&bytes, team)
+                            && last_generation != Some(generation)
+                        {
+                            last_generation = Some(generation);
+                            wake_pending.store(true, Ordering::Release);
                         }
                     }
                     GossipEvent::NeighborUp(peer) => {
@@ -741,8 +714,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut pending_sweeps = VecDeque::new();
     let mut failures: HashMap<PeerId, (u32, crate::clock::Mono)> = HashMap::new();
     let mut next_sweep = crate::clock::mono_now();
-    let mut next_publish = crate::clock::mono_now();
-    let mut latest_blobs = Vec::new();
+    let mut next_gossip_wake = crate::clock::mono_now();
     let mut current_generation = None;
     let commands = commands;
 
@@ -752,18 +724,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             match commands.try_recv() {
                 Ok(NetCommand::SnapshotInstalled(notice)) => {
                     current_generation = Some(notice.generation);
-                    latest_blobs = notice.blobs;
                     candidates
                         .lock()
                         .unwrap()
                         .replace_learned(notice.peers, my_id);
-                    if config.qos.direction.publishes() {
-                        for hash in latest_blobs.iter().copied() {
-                            let transport = transport.clone();
-                            tokio::spawn(async move { transport.dht_announce(hash).await });
-                        }
-                        next_publish = crate::clock::mono_now() + INVENTORY_SWEEP_PERIOD;
-                    }
                     if config.qos.direction.publishes()
                         && let Some(sender) = gossip_sender.as_ref()
                     {
@@ -792,8 +756,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             return;
         }
 
-        while let Ok(HostSignal::Wake) = signal_rx.try_recv() {
-            next_sweep = crate::clock::mono_now();
+        let now = crate::clock::mono_now();
+        if now >= next_gossip_wake && wake_pending.swap(false, Ordering::AcqRel) {
+            next_sweep = now;
+            next_gossip_wake = now + MIN_GOSSIP_WAKE_PERIOD;
         }
         while let Ok(outcome) = sweep_rx.try_recv() {
             in_flight.remove(&outcome.peer);
@@ -813,15 +779,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         let now = crate::clock::mono_now();
-        // Provider records are leases. Publication renewal is independent of
-        // pulling so WriteOnly remains discoverable and ReadOnly stays silent.
-        if config.qos.direction.publishes() && current_generation.is_some() && now >= next_publish {
-            for hash in latest_blobs.iter().copied() {
-                let transport = transport.clone();
-                tokio::spawn(async move { transport.dht_announce(hash).await });
-            }
-            next_publish = now + INVENTORY_SWEEP_PERIOD;
-        }
         if config.qos.direction.pulls() && current_generation.is_some() && now >= next_sweep {
             let queued: HashSet<_> = pending_sweeps.iter().copied().collect();
             for peer in candidates.lock().unwrap().candidates(my_id) {
@@ -1177,16 +1134,6 @@ async fn pool_evict<C: Conn>(pool: &SharedPool<C>, peer: PeerId) {
     if let Some(entry) = entry {
         pool_remove_if(pool, peer, &entry).await;
     }
-}
-
-async fn providers_for<T: Transport>(transport: &T, hash: RawHash, self_id: PeerId) -> Vec<PeerId> {
-    let mut providers = tokio::time::timeout(DHT_LOOKUP_DEADLINE, transport.dht_providers(hash))
-        .await
-        .unwrap_or_default();
-    providers.retain(|peer| *peer != self_id);
-    providers.sort_unstable();
-    providers.dedup();
-    providers
 }
 
 async fn fetch_from_providers<T: Transport>(
@@ -1635,6 +1582,15 @@ mod tests {
         let mut routes = RoutingTable::new(vec![[1; 32], [2; 32]]);
         routes.note([3; 32]);
         routes.note([1; 32]);
-        assert_eq!(routes.candidates([9; 32]), vec![[3; 32], [1; 32], [2; 32]]);
+        assert_eq!(routes.candidates([9; 32]), vec![[1; 32], [2; 32], [3; 32]]);
+    }
+
+    #[test]
+    fn routing_evidence_is_not_truncated_at_an_arbitrary_peer_count() {
+        let mut routes = RoutingTable::new(vec![[1; 32]]);
+        for byte in 2..=100 {
+            routes.note([byte; 32]);
+        }
+        assert_eq!(routes.candidates([0; 32]).len(), 100);
     }
 }

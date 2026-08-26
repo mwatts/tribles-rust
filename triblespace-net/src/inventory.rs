@@ -453,8 +453,8 @@ impl ReconcileDirection {
 /// Local blob synchronization policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlobReconcileMode {
-    /// Skip blob inventory. Durable blob WANTs use exact DHT discovery and
-    /// `GET_BLOB` independently of the periodic inventory walk.
+    /// Skip blob inventory. Durable blob WANTs use authenticated `GET_BLOB`
+    /// across configured and PEER-learned routes independently of the walk.
     #[default]
     Demand,
     /// Traverse every blob key in the authorized inventory and fetch missing bytes.

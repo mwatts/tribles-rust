@@ -6,8 +6,8 @@
 //! collection-evidence gossip — can run
 //! unmodified against either:
 //!
-//! - [`crate::transport::iroh`]: the production adapter (iroh QUIC,
-//!   iroh-gossip PlumTree, the embedded Kademlia DHT node), or
+//! - [`crate::transport::iroh`]: the production adapter (iroh QUIC and
+//!   iroh-gossip PlumTree), or
 //! - a deterministic in-memory simulator (discrete-event router with
 //!   seeded delays, drops, partitions, and crashes) for
 //!   FoundationDB/TigerBeetle-style simulation testing.
@@ -15,8 +15,8 @@
 //! Design rule: the seam carries network capabilities, not protocol. Anything
 //! that decides what bytes mean (ALPN dispatch targets, frame layouts,
 //! auth semantics, scope checks) lives above; anything that decides how
-//! bytes move (QUIC, relays, NAT traversal, mesh membership, DHT
-//! routing) lives below. The week-of-2026-06-04 bug hunt found every
+//! bytes move (QUIC, relays, NAT traversal, and mesh membership) lives below.
+//! The week-of-2026-06-04 bug hunt found every
 //! protocol bug *above* this line (snapshot/gossip ordering,
 //! authentication subject binding), which is why the
 //! host loop must run inside the simulator rather than being mocked
@@ -117,24 +117,13 @@ pub trait Transport: Clone + Send + Sync + 'static {
     fn local_id(&self) -> PeerId;
 
     /// Dial `peer` on `alpn`. Address resolution is the transport's
-    /// problem (iroh: relay + pkarr + mDNS + DHT lookup; sim: direct
+    /// problem (iroh: relay + pkarr + mDNS; sim: direct
     /// table lookup, subject to simulated partitions).
     fn dial(
         &self,
         peer: PeerId,
         alpn: Alpn,
     ) -> impl std::future::Future<Output = anyhow::Result<Self::Conn>> + Send;
-
-    /// Announce to the content-discovery layer that we hold `hash`.
-    fn dht_announce(&self, hash: [u8; 32]) -> impl std::future::Future<Output = ()> + Send;
-
-    /// Ask the content-discovery layer who holds `hash`. Order is
-    /// meaningful to callers only as a candidate list; may include
-    /// ourselves (callers filter).
-    fn dht_providers(
-        &self,
-        hash: [u8; 32],
-    ) -> impl std::future::Future<Output = Vec<PeerId>> + Send;
 
     /// Gracefully stop the underlying endpoint after the host command loop
     /// loses every owner. Production QUIC needs an awaited close so peers do

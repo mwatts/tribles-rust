@@ -62,6 +62,41 @@ pub trait StorageFlush {
     fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Cheap invalidation token for one repository's sync-visible observation.
+///
+/// The token is deliberately local and opaque: it is neither a content
+/// identity nor an ordered version and must never cross a process boundary.
+/// Equality only answers whether rebuilding a derived inventory can be
+/// skipped. Implementations may conservatively change the token when
+/// unrelated local state changes, but must change it whenever resident blobs,
+/// collection records, capability proofs, or peer evidence may have changed.
+///
+/// File-backed implementations reobserve external appends before returning.
+/// This keeps an unchanged poll proportional to the storage boundary (for a
+/// [`pile::Pile`], one file-length observation) instead of to the number of
+/// indexed objects.
+pub trait StoreRevision {
+    /// Opaque equality token retained by the caller between observations.
+    type Revision: Clone + Eq + Send + 'static;
+    /// Failure while refreshing or observing the local store.
+    type Error: Error + Debug + Send + Sync + 'static;
+
+    /// Reobserve external changes and return the current invalidation token.
+    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error>;
+}
+
+impl<S> StoreRevision for &mut S
+where
+    S: StoreRevision + ?Sized,
+{
+    type Revision = S::Revision;
+    type Error = S::Error;
+
+    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
+        (**self).store_revision()
+    }
+}
+
 impl<S> StorageFlush for &mut S
 where
     S: StorageFlush + ?Sized,

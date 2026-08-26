@@ -5,7 +5,7 @@
 //! no second record RPC and never claims global absence: an operation WANT is
 //! satisfied iff at least one matching local receipt is visible; otherwise it
 //! remains pending while periodic inventory sweeps continue. Blob WANTs retain
-//! their exact configured/PEER/DHT fetch path and exponential retry backoff.
+//! their exact configured/PEER fetch path and exponential retry backoff.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -16,7 +16,7 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use triblespace_core::repo::{
     BlobStore, BlobStoreGet, BlobStoreMeta, CapabilityProofStore, PeerStore, StorageFlush,
-    WantRequest, WantStore,
+    StoreRevision, WantRequest, WantStore,
 };
 
 use crate::peer::Peer;
@@ -80,6 +80,7 @@ impl Reconciler {
             + PeerStore
             + WantStore
             + StorageFlush
+            + StoreRevision
             + Send
             + 'static,
         S::Reader: BlobStoreMeta,

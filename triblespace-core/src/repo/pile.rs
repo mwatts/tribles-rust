@@ -2432,6 +2432,33 @@ impl BlobStore for Pile {
     }
 }
 
+/// O(1)-clone invalidation token for the sync-visible sets in a [`Pile`].
+///
+/// Operational WANTs, legacy branches, and opaque records intentionally do
+/// not participate: changing them cannot alter an advertised inventory.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PileRevision {
+    blobs: PileBlobIndex,
+    collection_records: CollectionRecordIndex,
+    capability_proofs: CapabilityProofIndex,
+    peers: PeerEvidenceIndex,
+}
+
+impl super::StoreRevision for Pile {
+    type Revision = PileRevision;
+    type Error = ReadError;
+
+    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
+        self.refresh()?;
+        Ok(PileRevision {
+            blobs: self.blobs.clone(),
+            collection_records: self.collection_records.clone(),
+            capability_proofs: self.capability_proofs.clone(),
+            peers: self.peers.clone(),
+        })
+    }
+}
+
 /// Error returned when opening or refreshing a [`Pile`].
 #[derive(Debug)]
 pub enum ReadError {
@@ -4664,7 +4691,7 @@ mod tests {
     use crate::macros::entity;
     use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
-    use crate::repo::{BlobStoreMeta, RetentionRoots, StorageClose};
+    use crate::repo::{BlobStoreMeta, RetentionRoots, StorageClose, StoreRevision};
     use crate::trible::TribleSet;
 
     fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
@@ -7801,6 +7828,34 @@ mod tests {
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
         pile1.close().unwrap();
         pile2.close().unwrap();
+    }
+
+    #[test]
+    fn store_revision_reobserves_external_appends_without_advertising_wants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "revision.pile");
+        let mut observer = Pile::open(&path).unwrap();
+        let mut writer = Pile::open(&path).unwrap();
+
+        let empty = observer.store_revision().unwrap();
+        writer
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
+                [0xA1; 32],
+            )))
+            .unwrap();
+        writer.flush().unwrap();
+        let after_external_want = observer.store_revision().unwrap();
+        assert!(empty == after_external_want);
+
+        writer
+            .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(vec![0xB2; 17])))
+            .unwrap();
+        writer.flush().unwrap();
+        let after_external_blob = observer.store_revision().unwrap();
+        assert!(after_external_want != after_external_blob);
+
+        observer.close().unwrap();
+        writer.close().unwrap();
     }
 
     #[test]

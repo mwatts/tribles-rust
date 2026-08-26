@@ -65,14 +65,6 @@ pub struct SimConfig {
     /// would retransmit; model connection loss with
     /// [`SimNet::partition`] / [`SimNet::crash`] instead).
     pub gossip_drop_prob: f64,
-    /// Content-discovery behavior. [`DhtMode::Blackhole`] models a
-    /// DHT with no reachability: `dht_providers` futures never
-    /// resolve. This is the exact failure shape of the 2026-06-10
-    /// production sync hang (providers_for awaited an answer that
-    /// would never come, with the known publisher unreachable behind
-    /// the await) — keep a scenario running under Blackhole so that
-    /// class of bug stays dead.
-    pub dht: DhtMode,
     /// Model iroh-gossip's message-id dedupe. PlumTree derives the
     /// message id from blake3(content) and suppresses re-delivery of
     /// known ids for `message_id_retention` (default 90s) — AND a
@@ -90,23 +82,11 @@ pub struct SimConfig {
 /// iroh-gossip's default `message_id_retention`.
 const GOSSIP_ID_RETENTION: Duration = Duration::from_secs(90);
 
-/// Behavior of the simulated content-discovery layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DhtMode {
-    /// Lookups resolve after one link latency (the default).
-    Responsive,
-    /// Lookups never resolve — models a DHT with zero reachability
-    /// (fresh swarm, filtered egress, dead bootstrap nodes).
-    /// Announces are silently dropped.
-    Blackhole,
-}
-
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
             latency: Duration::from_millis(1)..Duration::from_millis(30),
             gossip_drop_prob: 0.0,
-            dht: DhtMode::Responsive,
             gossip_dedupe: true,
         }
     }
@@ -139,9 +119,6 @@ struct SimNetInner {
     /// pending, so an un-deadlined singleflight pool wedges every
     /// later walk to that peer behind one stalled attempt.
     stalled_dials: BTreeSet<PeerId>,
-    /// Content-discovery table: hash -> providers, in deterministic
-    /// (BTree) order.
-    dht: BTreeMap<[u8; 32], BTreeSet<PeerId>>,
     rng: StdRng,
     config: SimConfig,
 }
@@ -185,7 +162,6 @@ impl SimNet {
                 conns: Vec::new(),
                 partitions: BTreeSet::new(),
                 stalled_dials: BTreeSet::new(),
-                dht: BTreeMap::new(),
                 rng: StdRng::seed_from_u64(seed),
                 config,
             })),
@@ -261,13 +237,27 @@ impl SimNet {
         }
     }
 
-    /// Sever the link between `a` and `b` (both directions): dials
-    /// fail, gossip frames stop flowing. Existing in-flight pipes
-    /// keep draining — like a real partition, packets already in the
-    /// kernel buffer arrive.
+    /// Sever the link between `a` and `b` in both directions.
+    ///
+    /// New dials fail, gossip frames stop flowing, and established
+    /// connections crossing the cut are reset. Leaving those connections
+    /// alive would let later operations traverse an allegedly partitioned
+    /// link forever because simulated streams are channels rather than a
+    /// finite kernel packet buffer.
     pub fn partition(&self, a: PeerId, b: PeerId) {
         let key = if a <= b { (a, b) } else { (b, a) };
-        self.inner.lock().unwrap().partitions.insert(key);
+        let mut inner = self.inner.lock().unwrap();
+        inner.partitions.insert(key);
+        inner.conns.retain(|conn| {
+            let crosses_cut = (conn.a == a && conn.b == b) || (conn.a == b && conn.b == a);
+            if crosses_cut {
+                conn.closed.store(true, Ordering::SeqCst);
+                conn.notify.notify_waiters();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Restore the link between `a` and `b`.
@@ -441,36 +431,6 @@ impl Transport for SimTransport {
             })
             .map_err(|_| anyhow::anyhow!("simnet: dial {}: node gone", hex_prefix(&peer)))?;
         Ok(dialer)
-    }
-
-    async fn dht_announce(&self, hash: [u8; 32]) {
-        let mut inner = self.net.inner.lock().unwrap();
-        if inner.config.dht == DhtMode::Blackhole {
-            return;
-        }
-        inner.dht.entry(hash).or_default().insert(self.id);
-    }
-
-    async fn dht_providers(&self, hash: [u8; 32]) -> Vec<PeerId> {
-        let (latency, blackhole) = {
-            let mut inner = self.net.inner.lock().unwrap();
-            let bh = inner.config.dht == DhtMode::Blackhole;
-            (inner.latency(), bh)
-        };
-        if blackhole {
-            // Never resolves — like a lookup against a DHT nobody
-            // answers on. Callers without their own deadline hang
-            // here, exactly like production did pre-publisher-first.
-            std::future::pending::<()>().await;
-            unreachable!();
-        }
-        tokio::time::sleep(latency).await;
-        let inner = self.net.inner.lock().unwrap();
-        inner
-            .dht
-            .get(&hash)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default()
     }
 
     async fn shutdown(&self) {}
