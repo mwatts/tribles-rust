@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bind each private-custody page and blob walk to the exact immutable snapshot
+  that answered that peer's summary. Page and blob requests echo the summary's
+  content-derived generation token; missing or superseded tokens fail closed.
+  A concurrent local append can publish the next serving generation without
+  splicing extra items into an older bucket walk and tripping strict
+  advertised-summary validation. One replaceable persistent pin per configured
+  peer, together with existing request limits, keeps retained generations
+  bounded.
+
 ### Changed
 
 - Move pile sync to ALPN `/triblespace/pile-sync/8` and carry one bounded

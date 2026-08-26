@@ -253,9 +253,9 @@ The bounded anti-entropy protocol adds three operations:
 
 | Operation | Byte | Question | Response |
 |---|---:|---|---|
-| `REPLICA_SUMMARY` | `0x08` | all 256 first-byte buckets of all three components | count, byte total, and BLAKE3 digest per bucket |
-| `REPLICA_PAGE` | `0x09` | one component, bucket, and exclusive cursor | one sorted bounded page plus a final marker |
-| `REPLICA_BLOB` | `0x0A` | exact handle, expected length, offset, and bounded maximum | at most one 1 MiB range or missing |
+| `REPLICA_SUMMARY` | `0x08` | all 256 first-byte buckets of all three components | count, byte total, and BLAKE3 digest per bucket; these derive the inventory-generation token |
+| `REPLICA_PAGE` | `0x09` | summary generation, component, bucket, and exclusive cursor | one sorted bounded page plus a final marker |
+| `REPLICA_BLOB` | `0x0A` | summary generation, exact handle, expected length, offset, and bounded maximum | at most one 1 MiB range or missing |
 
 Collection-record IDs are extended with a zero suffix only for page ordering;
 their canonical dense record bytes remain the transferred representation.
@@ -273,6 +273,18 @@ redialed once within the same sweep; a still-failed peer remains incomplete and
 retries on the next sweep while independent peers continue. Receive-file,
 allocation, write, metadata, and mapping failures are local storage failures
 and abort the sweep rather than masquerading as peer unavailability.
+Each accepted summary derives a content identity from the complete summary and
+pins that exact immutable serving generation for the authenticated peer. Every
+subsequent page and blob request must echo that generation. Publishing a newer
+local snapshot therefore cannot splice its items into an older advertised
+walk. A later summary from the same authenticated identity replaces its one
+pin; a missing or superseded token is rejected, so concurrent walks restart
+from a fresh summary instead of crossing generations. The server retains the
+current snapshot plus at most one persistent pin per statically configured
+peer; the fixed global request limit also bounds pins held transiently by
+in-flight responses. Retained snapshot generations are therefore bounded by
+the configured peer and request limits, not by the number of publications or
+connections.
 Cancellation can abandon only network/page work: store mutations are
 synchronous, temporary receive files close on drop, the transport shuts down
 gracefully, and the pile is explicitly closed before the command exits.

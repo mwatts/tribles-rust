@@ -30,8 +30,8 @@ use crate::collection_wire::{
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 use crate::replica::{
-    ReplicaBlobFetchError, ReplicaComponent, ReplicaItem, ReplicaItemId, ReplicaServerConfig,
-    ReplicaSummary,
+    ReplicaBlobFetchError, ReplicaComponent, ReplicaGeneration, ReplicaItem, ReplicaItemId,
+    ReplicaServerConfig, ReplicaSummary,
 };
 use crate::replica_wire::{
     OP_REPLICA_BLOB, OP_REPLICA_PAGE, OP_REPLICA_SUMMARY, recv_blob_request, recv_page_request,
@@ -264,6 +264,23 @@ pub(crate) trait AnyReplicaSnapshot: Send + 'static {
     fn blob_bytes(&self, id: ReplicaItemId) -> Option<anybytes::Bytes>;
 }
 
+/// One immutable custody generation shared by the current serving slot and
+/// any peer walks that already observed its summary.
+type SharedReplicaSnapshot = Arc<Mutex<Box<dyn AnyReplicaSnapshot>>>;
+type ReplicaSnapshotSlot = Arc<Mutex<Option<SharedReplicaSnapshot>>>;
+
+#[derive(Clone)]
+struct ReplicaSnapshotPin {
+    generation: ReplicaGeneration,
+    snapshot: SharedReplicaSnapshot,
+}
+
+type ReplicaSnapshotPins = Arc<Mutex<HashMap<PeerId, ReplicaSnapshotPin>>>;
+
+fn shared_replica_snapshot(snapshot: impl AnyReplicaSnapshot) -> SharedReplicaSnapshot {
+    Arc::new(Mutex::new(Box::new(snapshot)))
+}
+
 impl<R> StoreSnapshot<R>
 where
     R: triblespace_core::repo::BlobStoreGet,
@@ -356,6 +373,7 @@ pub(crate) trait NetCapability: Send + Sync {
         peer: PeerId,
         replica_set: crate::replica::ReplicaSetId,
         proof: triblespace_core::capability::CapabilityProofBundle,
+        generation: ReplicaGeneration,
         component: ReplicaComponent,
         prefix: u8,
         after: Option<ReplicaItemId>,
@@ -366,6 +384,7 @@ pub(crate) trait NetCapability: Send + Sync {
         peer: PeerId,
         replica_set: crate::replica::ReplicaSetId,
         proof: triblespace_core::capability::CapabilityProofBundle,
+        generation: ReplicaGeneration,
         id: ReplicaItemId,
         expected_len: u64,
         receive_temp_dir: std::path::PathBuf,
@@ -588,6 +607,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
         peer: PeerId,
         replica_set: crate::replica::ReplicaSetId,
         proof: triblespace_core::capability::CapabilityProofBundle,
+        generation: ReplicaGeneration,
         component: ReplicaComponent,
         prefix: u8,
         after: Option<ReplicaItemId>,
@@ -613,6 +633,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
                         &connection,
                         replica_set,
                         &proof,
+                        generation,
                         component,
                         prefix,
                         after,
@@ -637,6 +658,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
         peer: PeerId,
         replica_set: crate::replica::ReplicaSetId,
         proof: triblespace_core::capability::CapabilityProofBundle,
+        generation: ReplicaGeneration,
         id: ReplicaItemId,
         expected_len: u64,
         receive_temp_dir: std::path::PathBuf,
@@ -701,6 +723,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
                         &connection,
                         replica_set,
                         &proof,
+                        generation,
                         id,
                         expected_len,
                         offset as u64,
@@ -794,7 +817,7 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
+    replica_snapshot: ReplicaSnapshotSlot,
     /// Readiness slot for the inline fetch capability, published by the
     /// host once its transport binds. `None` until then.
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
@@ -829,9 +852,10 @@ impl NetSender {
     ///
     /// Ordinary Peer refreshes never call this path. A custody driver retains
     /// the last complete immutable view until a later explicit rebuild
-    /// succeeds.
+    /// succeeds. Peers that already fetched a summary remain pinned to the
+    /// older immutable generation until their next summary request.
     pub(crate) fn update_replica_snapshot(&self, snapshot: impl AnyReplicaSnapshot) {
-        *self.replica_snapshot.lock().unwrap() = Some(Box::new(snapshot));
+        *self.replica_snapshot.lock().unwrap() = Some(shared_replica_snapshot(snapshot));
     }
 
     /// Remove the serving view immediately. Every authenticated data operation
@@ -1017,13 +1041,22 @@ impl NetSender {
         peer: PeerId,
         replica_set: crate::replica::ReplicaSetId,
         proof: triblespace_core::capability::CapabilityProofBundle,
+        generation: ReplicaGeneration,
         component: ReplicaComponent,
         prefix: u8,
         after: Option<ReplicaItemId>,
     ) -> anyhow::Result<(Vec<ReplicaItem>, bool)> {
         self.ready_capability()
             .await?
-            .replica_page(peer, replica_set, proof, component, prefix, after)
+            .replica_page(
+                peer,
+                replica_set,
+                proof,
+                generation,
+                component,
+                prefix,
+                after,
+            )
             .await
     }
 
@@ -1032,6 +1065,7 @@ impl NetSender {
         peer: PeerId,
         replica_set: crate::replica::ReplicaSetId,
         proof: triblespace_core::capability::CapabilityProofBundle,
+        generation: ReplicaGeneration,
         id: ReplicaItemId,
         expected_len: u64,
         receive_temp_dir: std::path::PathBuf,
@@ -1041,7 +1075,15 @@ impl NetSender {
             .await
             .map_err(ReplicaBlobFetchError::local)?;
         capability
-            .replica_blob(peer, replica_set, proof, id, expected_len, receive_temp_dir)
+            .replica_blob(
+                peer,
+                replica_set,
+                proof,
+                generation,
+                id,
+                expected_len,
+                receive_temp_dir,
+            )
             .await
     }
 }
@@ -1071,7 +1113,7 @@ pub struct HostWiring {
     pub(crate) cmd_rx: mpsc::Receiver<NetCommand>,
     pub(crate) evt_tx: mpsc::Sender<NetEvent>,
     pub(crate) snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    pub(crate) replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
+    pub(crate) replica_snapshot: ReplicaSnapshotSlot,
     /// Publish half of the inline-fetch capability slot; the host fills
     /// it once its transport binds.
     pub(crate) cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
@@ -1084,8 +1126,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<NetCommand>();
     let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
     let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
-    let replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>> =
-        Arc::new(Mutex::new(None));
+    let replica_snapshot: ReplicaSnapshotSlot = Arc::new(Mutex::new(None));
     let (cap_tx, cap_rx) = tokio::sync::watch::channel::<Option<Arc<dyn NetCapability>>>(None);
 
     let sender = NetSender {
@@ -1332,7 +1373,7 @@ async fn host_loop<T: Transport>(
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
+    replica_snapshot: ReplicaSnapshotSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
     replica_server: Option<ReplicaServerConfig>,
 ) {
@@ -1384,6 +1425,7 @@ async fn host_loop<T: Transport>(
     let snapshot_handler = SnapshotHandler {
         snapshot: snapshot.clone(),
         replica_snapshot,
+        replica_snapshot_pins: Arc::new(Mutex::new(HashMap::new())),
         connect_root: config.connect_root,
         replica_server,
         inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CONNECTIONS_GLOBAL)),
@@ -1773,7 +1815,11 @@ async fn wait_until_after(expires: Option<hifitime::Epoch>) {
 #[derive(Clone)]
 struct SnapshotHandler {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
+    replica_snapshot: ReplicaSnapshotSlot,
+    /// The most recent immutable generation summarized to each authenticated
+    /// static peer. The configured peer set bounds this map, and a peer's next
+    /// summary replaces its prior pin.
+    replica_snapshot_pins: ReplicaSnapshotPins,
     connect_root: ed25519_dalek::VerifyingKey,
     replica_server: Option<ReplicaServerConfig>,
     /// Shared before-spawn connection admission budget for this node.
@@ -1821,6 +1867,7 @@ impl SnapshotHandler {
     ) {
         let snapshot = self.snapshot.clone();
         let replica_snapshot = self.replica_snapshot.clone();
+        let replica_snapshot_pins = self.replica_snapshot_pins.clone();
         let connect_root = self.connect_root;
         let replica_server = self.replica_server;
         let peer_id = connection.remote_id();
@@ -1933,12 +1980,14 @@ impl SnapshotHandler {
                 };
                 let snapshot = snapshot.clone();
                 let replica_snapshot = replica_snapshot.clone();
+                let replica_snapshot_pins = replica_snapshot_pins.clone();
                 tokio::spawn(
                     async move {
                         let operation = tokio::time::timeout(INBOUND_REQUEST_DEADLINE, async {
                             let result = serve_stream::<T::Conn>(
                                 &snapshot,
                                 &replica_snapshot,
+                                &replica_snapshot_pins,
                                 replica_server,
                                 peer,
                                 &mut send,
@@ -2020,7 +2069,8 @@ async fn authenticate_connection<C: Conn>(
 
 async fn serve_stream<C: Conn>(
     snapshot: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    replica_snapshot: &Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>>,
+    replica_snapshot: &ReplicaSnapshotSlot,
+    replica_snapshot_pins: &ReplicaSnapshotPins,
     replica_server: Option<ReplicaServerConfig>,
     peer: ed25519_dalek::VerifyingKey,
     send: &mut C::SendHalf,
@@ -2150,41 +2200,70 @@ async fn serve_stream<C: Conn>(
             let (replica_set, proof) = recv_request_prefix(recv).await?;
             authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
             crate::replica_wire::require_eof(recv).await?;
-            let summary = replica_snapshot
+            let pinned = replica_snapshot
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|snapshot| snapshot.summary())
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("custody snapshot is unavailable"))?;
+            let summary = pinned.lock().unwrap().summary();
+            let generation = summary.generation();
+            replica_snapshot_pins.lock().unwrap().insert(
+                peer.to_bytes(),
+                ReplicaSnapshotPin {
+                    generation,
+                    snapshot: pinned,
+                },
+            );
             send_summary(send, &summary).await?;
         }
         OP_REPLICA_PAGE => {
             let (replica_set, proof) = recv_request_prefix(recv).await?;
             authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
-            let (component, prefix, after) = recv_page_request(recv).await?;
-            let (page, done) = replica_snapshot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|snapshot| snapshot.page(component, prefix, after))
-                .ok_or_else(|| anyhow::anyhow!("custody snapshot is unavailable"))?;
+            let (generation, component, prefix, after) = recv_page_request(recv).await?;
+            let pinned = replica_snapshot_for_generation(
+                replica_snapshot_pins,
+                peer.to_bytes(),
+                generation,
+            )?;
+            let (page, done) = pinned.lock().unwrap().page(component, prefix, after);
+            drop(pinned);
             send_page(send, component, &page, done).await?;
         }
         OP_REPLICA_BLOB => {
             let (replica_set, proof) = recv_request_prefix(recv).await?;
             authorize_replica_operation(replica_server, replica_set, &proof, peer)?;
-            let (id, offset, maximum) = recv_blob_request(recv).await?;
-            let bytes = replica_snapshot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|snapshot| snapshot.blob_bytes(id));
+            let (generation, id, offset, maximum) = recv_blob_request(recv).await?;
+            let pinned = replica_snapshot_for_generation(
+                replica_snapshot_pins,
+                peer.to_bytes(),
+                generation,
+            )?;
+            let bytes = pinned.lock().unwrap().blob_bytes(id);
+            drop(pinned);
             send_blob_range(send, bytes.as_ref(), offset, maximum).await?;
         }
         OP_AUTH => anyhow::bail!("OP_AUTH may only appear on the first stream"),
         _ => anyhow::bail!("unknown direct RPC operation {op:#x}"),
     }
     Ok(())
+}
+
+fn replica_snapshot_for_generation(
+    pins: &ReplicaSnapshotPins,
+    peer: PeerId,
+    requested: ReplicaGeneration,
+) -> anyhow::Result<SharedReplicaSnapshot> {
+    let pin = pins
+        .lock()
+        .unwrap()
+        .get(&peer)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("custody summary is required before data requests"))?;
+    if pin.generation != requested {
+        anyhow::bail!("custody snapshot generation is stale; request a new summary");
+    }
+    Ok(pin.snapshot)
 }
 
 fn authorize_replica_operation(
@@ -2374,19 +2453,27 @@ mod inbound_auth_deadline_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use triblespace_core::blob::{Blob, encodings::UnknownBlob};
     use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
+    use triblespace_core::repo::BlobStorePut;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
 
     use super::{
-        AnyReplicaSnapshot, AnySnapshot, INBOUND_AUTH_DEADLINE, INBOUND_CONNECTION_IDLE_DEADLINE,
+        AnySnapshot, INBOUND_AUTH_DEADLINE, INBOUND_CONNECTION_IDLE_DEADLINE,
         INBOUND_REQUEST_DEADLINE, MAX_INBOUND_CONNECTIONS_GLOBAL, MAX_INBOUND_REQUESTS_GLOBAL,
-        MAX_INBOUND_REQUESTS_PER_CONNECTION, SnapshotHandler,
+        MAX_INBOUND_REQUESTS_PER_CONNECTION, SnapshotHandler, shared_replica_snapshot,
     };
     use crate::protocol::{
         OP_GET_BLOB, PILE_SYNC_ALPN, connect_capability_atom, op_auth, op_get_blob, send_u8,
     };
-    use crate::replica::{ReplicaServerConfig, ReplicaSetId};
+    use crate::replica::{
+        ReplicaComponent, ReplicaGeneration, ReplicaItemId, ReplicaServerConfig, ReplicaSetId,
+        replicate_capability_atom, snapshot_from_store,
+    };
+    use crate::replica_wire::{op_replica_blob_range, op_replica_page, op_replica_summary};
     use crate::transport::sim::{SimConfig, SimNet, SimTransport};
     use crate::transport::{Conn, Transport};
 
@@ -2403,13 +2490,43 @@ mod inbound_auth_deadline_tests {
         .unwrap()
     }
 
+    fn replica_proof(
+        root: &SigningKey,
+        leaf: &SigningKey,
+        replica_set: ReplicaSetId,
+    ) -> CapabilityProofBundle {
+        CapabilityProofBundle::issue_root(
+            root,
+            CapabilityClaim::root(
+                replicate_capability_atom(replica_set),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            leaf.verifying_key(),
+        )
+        .unwrap()
+    }
+
+    fn blob_payloads_with_prefix(prefix: u8, count: usize, mut nonce: u64) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::with_capacity(count);
+        while payloads.len() < count {
+            let payload = nonce.to_be_bytes().to_vec();
+            let blob = Blob::<UnknownBlob>::new(Bytes::from(payload.clone()));
+            if blob.get_handle().raw[0] == prefix {
+                payloads.push(payload);
+            }
+            nonce = nonce.checked_add(1).expect("test blob nonce overflow");
+        }
+        payloads
+    }
+
     fn handler(root: &SigningKey) -> SnapshotHandler {
         let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
-        let replica_snapshot: Arc<Mutex<Option<Box<dyn AnyReplicaSnapshot>>>> =
-            Arc::new(Mutex::new(None));
+        let replica_snapshot = Arc::new(Mutex::new(None));
         SnapshotHandler {
             snapshot,
             replica_snapshot,
+            replica_snapshot_pins: Arc::new(Mutex::new(Default::default())),
             connect_root: root.verifying_key(),
             replica_server: None,
             inbound_connections: Arc::new(tokio::sync::Semaphore::new(
@@ -2659,6 +2776,283 @@ mod inbound_auth_deadline_tests {
         );
         connection.close(0, b"test complete");
         task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn custody_walk_stays_on_its_summary_generation_across_publish_and_reconnect() {
+        let net = SimNet::new(
+            0xA11C,
+            SimConfig {
+                latency: Duration::ZERO..Duration::from_nanos(1),
+                ..SimConfig::default()
+            },
+        );
+        let server_key = SigningKey::from_bytes(&[0xF1; 32]);
+        let client_key = SigningKey::from_bytes(&[0xF2; 32]);
+        let connect_root = SigningKey::from_bytes(&[0xF3; 32]);
+        let replica_root = SigningKey::from_bytes(&[0xF4; 32]);
+        let replica_set = ReplicaSetId::new([0xF5; 32]);
+        let server_id = server_key.verifying_key().to_bytes();
+        let client_id = client_key.verifying_key().to_bytes();
+        let mut server = net.join(server_id, None);
+        let client = net.join(client_id, None);
+
+        let mut payloads =
+            blob_payloads_with_prefix(0x42, ReplicaComponent::Blobs.page_limit() + 2, 0);
+        // Make the concurrent append sort after generation A's first-page
+        // cursor, so serving generation B's final page necessarily reproduces
+        // the production count-overrun failure.
+        payloads.sort_unstable_by_key(|payload| *blake3::hash(payload).as_bytes());
+        let added_payload = payloads.pop().unwrap();
+        let mut generation_a = MemoryRepo::default();
+        for payload in payloads {
+            generation_a
+                .put::<UnknownBlob, _>(Bytes::from(payload))
+                .unwrap();
+        }
+        let mut generation_b = generation_a.clone();
+        let added_len = added_payload.len() as u64;
+        let added_handle = generation_b
+            .put::<UnknownBlob, _>(Bytes::from(added_payload.clone()))
+            .unwrap();
+        let added_id = ReplicaItemId(added_handle.raw);
+        let snapshot_a = snapshot_from_store(&mut generation_a).unwrap();
+        let snapshot_b = snapshot_from_store(&mut generation_b).unwrap();
+
+        let mut server_handler = handler(&connect_root);
+        *server_handler.replica_snapshot.lock().unwrap() =
+            Some(shared_replica_snapshot(snapshot_a));
+        let serving_snapshot = server_handler.replica_snapshot.clone();
+        let snapshot_pins = server_handler.replica_snapshot_pins.clone();
+        server_handler.replica_server = Some(ReplicaServerConfig {
+            trust_root: replica_root.verifying_key(),
+            replica_set,
+        });
+
+        let connection = client
+            .transport
+            .dial(server_id, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let incoming = server.incoming.recv().await.unwrap();
+        let first_handler = server_handler.clone();
+        let first_task = tokio::spawn(async move {
+            first_handler.handle::<SimTransport>(incoming.conn).await;
+        });
+        op_auth(&connection, &connect_proof(&connect_root, &client_key))
+            .await
+            .unwrap();
+        let proof = replica_proof(&replica_root, &client_key, replica_set);
+
+        // Data requests cannot select the mutable current snapshot directly:
+        // a successful summary must first establish this peer's generation.
+        let unknown_generation = ReplicaGeneration::new([0xF6; 32]);
+        assert!(
+            op_replica_page(
+                &connection,
+                replica_set,
+                &proof,
+                unknown_generation,
+                ReplicaComponent::Blobs,
+                0x42,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        let mut before_summary_target = vec![0; added_payload.len()];
+        assert!(
+            op_replica_blob_range(
+                &connection,
+                replica_set,
+                &proof,
+                unknown_generation,
+                added_id,
+                added_len,
+                0,
+                &mut before_summary_target,
+            )
+            .await
+            .is_err()
+        );
+
+        let summary = op_replica_summary(&connection, replica_set, &proof)
+            .await
+            .unwrap();
+        let generation_a_token = summary.generation();
+        assert_eq!(
+            summary.bucket(ReplicaComponent::Blobs, 0x42).count,
+            (ReplicaComponent::Blobs.page_limit() + 1) as u64
+        );
+
+        let (first_page, done) = op_replica_page(
+            &connection,
+            replica_set,
+            &proof,
+            generation_a_token,
+            ReplicaComponent::Blobs,
+            0x42,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!done);
+        assert_eq!(first_page.len(), ReplicaComponent::Blobs.page_limit());
+        let cursor = first_page.last().unwrap().id();
+
+        // This is the production race: a concurrent local sweep publishes a
+        // newly learned semantic item after this peer received generation A's
+        // summary and first page but before it asks for the final page.
+        *serving_snapshot.lock().unwrap() = Some(shared_replica_snapshot(snapshot_b));
+
+        // The newly published blob is absent from A even though it is now in
+        // the current serving slot.
+        let mut generation_a_target = vec![0; added_payload.len()];
+        assert_eq!(
+            op_replica_blob_range(
+                &connection,
+                replica_set,
+                &proof,
+                generation_a_token,
+                added_id,
+                added_len,
+                0,
+                &mut generation_a_target,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        // Pins are host-wide, not connection-local: a pooled-connection
+        // eviction and redial can resume the same immutable walk.
+        connection.close(0, b"exercise custody reconnect");
+        first_task.await.unwrap();
+        let connection = client
+            .transport
+            .dial(server_id, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let incoming = server.incoming.recv().await.unwrap();
+        let second_handler = server_handler.clone();
+        let second_task = tokio::spawn(async move {
+            second_handler.handle::<SimTransport>(incoming.conn).await;
+        });
+        op_auth(&connection, &connect_proof(&connect_root, &client_key))
+            .await
+            .unwrap();
+        let (page, done) = op_replica_page(
+            &connection,
+            replica_set,
+            &proof,
+            generation_a_token,
+            ReplicaComponent::Blobs,
+            0x42,
+            Some(cursor),
+        )
+        .await
+        .unwrap();
+        assert!(done);
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            first_page.len() + page.len(),
+            summary.bucket(ReplicaComponent::Blobs, 0x42).count as usize
+        );
+
+        // The peer's next summary is the explicit generation boundary. It
+        // replaces, rather than accumulates beside, that peer's old pin and
+        // exposes the concurrently published item on the next walk.
+        let next_summary = op_replica_summary(&connection, replica_set, &proof)
+            .await
+            .unwrap();
+        let generation_b_token = next_summary.generation();
+        assert_ne!(generation_a_token, generation_b_token);
+        assert_eq!(
+            next_summary.bucket(ReplicaComponent::Blobs, 0x42).count,
+            (ReplicaComponent::Blobs.page_limit() + 2) as u64
+        );
+
+        // A second summary from the same authenticated identity explicitly
+        // supersedes its old pin. An older concurrent walk fails closed
+        // instead of being silently spliced onto B.
+        assert!(
+            op_replica_page(
+                &connection,
+                replica_set,
+                &proof,
+                generation_a_token,
+                ReplicaComponent::Blobs,
+                0x42,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        let mut stale_blob_target = vec![0; added_payload.len()];
+        assert!(
+            op_replica_blob_range(
+                &connection,
+                replica_set,
+                &proof,
+                generation_a_token,
+                added_id,
+                added_len,
+                0,
+                &mut stale_blob_target,
+            )
+            .await
+            .is_err()
+        );
+        let (next_first_page, done) = op_replica_page(
+            &connection,
+            replica_set,
+            &proof,
+            generation_b_token,
+            ReplicaComponent::Blobs,
+            0x42,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!done);
+        let (next_final_page, done) = op_replica_page(
+            &connection,
+            replica_set,
+            &proof,
+            generation_b_token,
+            ReplicaComponent::Blobs,
+            0x42,
+            Some(next_first_page.last().unwrap().id()),
+        )
+        .await
+        .unwrap();
+        assert!(done);
+        assert_eq!(next_final_page.len(), 2);
+
+        let mut generation_b_target = vec![0; added_payload.len()];
+        assert_eq!(
+            op_replica_blob_range(
+                &connection,
+                replica_set,
+                &proof,
+                generation_b_token,
+                added_id,
+                added_len,
+                0,
+                &mut generation_b_target,
+            )
+            .await
+            .unwrap(),
+            Some(added_payload.len())
+        );
+        assert_eq!(generation_b_target, added_payload);
+        let pins = snapshot_pins.lock().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins.get(&client_id).unwrap().generation, generation_b_token);
+        drop(pins);
+
+        connection.close(0, b"test complete");
+        second_task.await.unwrap();
     }
 
     #[test]

@@ -178,6 +178,23 @@ pub(crate) struct ReplicaBucketSummary {
     pub(crate) digest: [u8; 32],
 }
 
+/// Content-derived identity of one complete immutable custody inventory.
+///
+/// Page and blob requests echo this value so a server can reject a walk whose
+/// per-peer pin was superseded instead of silently switching generations.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ReplicaGeneration([u8; 32]);
+
+impl ReplicaGeneration {
+    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 /// Fixed-size summary of all three custody components.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReplicaSummary {
@@ -196,10 +213,30 @@ impl ReplicaSummary {
     pub(crate) fn from_buckets(buckets: [[ReplicaBucketSummary; 256]; 3]) -> Self {
         Self { buckets }
     }
+
+    /// Derive the exact immutable inventory generation represented here.
+    pub(crate) fn generation(&self) -> ReplicaGeneration {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(GENERATION_DOMAIN);
+        hasher.update(&GENERATION_VERSION.to_be_bytes());
+        for component in ReplicaComponent::ALL {
+            hasher.update(&[component as u8]);
+            for prefix in 0..=u8::MAX {
+                let bucket = self.bucket(component, prefix);
+                hasher.update(&[prefix]);
+                hasher.update(&bucket.count.to_be_bytes());
+                hasher.update(&bucket.bytes.to_be_bytes());
+                hasher.update(&bucket.digest);
+            }
+        }
+        ReplicaGeneration::new(*hasher.finalize().as_bytes())
+    }
 }
 
 const SUMMARY_DOMAIN: &[u8] = b"triblespace.custody-replica-bucket\0";
 const SUMMARY_VERSION: u32 = 1;
+const GENERATION_DOMAIN: &[u8] = b"triblespace.custody-replica-generation\0";
+const GENERATION_VERSION: u32 = 1;
 /// Maximum amount of newly admitted blob payload left between durability
 /// barriers. One oversized blob is flushed immediately after admission.
 const BLOB_DURABILITY_BATCH_BYTES: u64 = 64 * 1024 * 1024;
@@ -647,6 +684,7 @@ impl ReplicaSummary {
 struct RemoteInventory {
     peer: crate::transport::PeerId,
     summary: ReplicaSummary,
+    generation: ReplicaGeneration,
 }
 
 /// Failure while receiving one remote blob, classified by the side that must
@@ -971,7 +1009,14 @@ where
                 )
                 .await
             {
-                Ok(summary) => remotes.push(RemoteInventory { peer, summary }),
+                Ok(summary) => {
+                    let generation = summary.generation();
+                    remotes.push(RemoteInventory {
+                        peer,
+                        summary,
+                        generation,
+                    });
+                }
                 Err(error) => {
                     failed.insert(peer);
                     outcome
@@ -1081,6 +1126,7 @@ where
                             remote.peer,
                             self.config.replica_set,
                             self.config.replica_proof.clone(),
+                            remote.generation,
                             component,
                             prefix,
                             after,
@@ -1121,6 +1167,7 @@ where
                                         remote.peer,
                                         self.config.replica_set,
                                         self.config.replica_proof.clone(),
+                                        remote.generation,
                                         id,
                                         info.length,
                                         self.config.receive_temp_dir.clone(),

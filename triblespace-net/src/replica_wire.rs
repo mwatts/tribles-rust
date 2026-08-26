@@ -17,8 +17,8 @@ use crate::protocol::{
     send_hash, send_u8, send_u64_be,
 };
 use crate::replica::{
-    ReplicaBucketSummary, ReplicaComponent, ReplicaItem, ReplicaItemId, ReplicaSetId,
-    ReplicaSummary,
+    ReplicaBucketSummary, ReplicaComponent, ReplicaGeneration, ReplicaItem, ReplicaItemId,
+    ReplicaSetId, ReplicaSummary,
 };
 use crate::transport::Conn;
 
@@ -139,7 +139,13 @@ pub(crate) async fn op_replica_summary<C: Conn>(
 
 pub(crate) async fn recv_page_request<R: AsyncRead + Unpin>(
     recv: &mut R,
-) -> Result<(ReplicaComponent, u8, Option<ReplicaItemId>)> {
+) -> Result<(
+    ReplicaGeneration,
+    ReplicaComponent,
+    u8,
+    Option<ReplicaItemId>,
+)> {
+    let generation = ReplicaGeneration::new(recv_hash(recv).await?);
     let component = ReplicaComponent::from_byte(recv_u8(recv).await?)?;
     let prefix = recv_u8(recv).await?;
     let after = match recv_u8(recv).await? {
@@ -153,7 +159,7 @@ pub(crate) async fn recv_page_request<R: AsyncRead + Unpin>(
         }
     }
     require_eof(recv).await?;
-    Ok((component, prefix, after))
+    Ok((generation, component, prefix, after))
 }
 
 pub(crate) async fn send_page<W: AsyncWrite + Unpin>(
@@ -307,6 +313,7 @@ pub(crate) async fn op_replica_page<C: Conn>(
     connection: &C,
     replica_set: ReplicaSetId,
     proof: &CapabilityProofBundle,
+    generation: ReplicaGeneration,
     component: ReplicaComponent,
     prefix: u8,
     after: Option<ReplicaItemId>,
@@ -316,6 +323,7 @@ pub(crate) async fn op_replica_page<C: Conn>(
         .await
         .map_err(|error| anyhow!("open replica page stream: {error}"))?;
     request_prefix(&mut send, OP_REPLICA_PAGE, replica_set, proof).await?;
+    send_hash(&mut send, &generation.into_bytes()).await?;
     send_u8(&mut send, component as u8).await?;
     send_u8(&mut send, prefix).await?;
     send_u8(&mut send, u8::from(after.is_some())).await?;
@@ -333,7 +341,8 @@ pub(crate) async fn op_replica_page<C: Conn>(
 
 pub(crate) async fn recv_blob_request<R: AsyncRead + Unpin>(
     recv: &mut R,
-) -> Result<(ReplicaItemId, u64, u32)> {
+) -> Result<(ReplicaGeneration, ReplicaItemId, u64, u32)> {
+    let generation = ReplicaGeneration::new(recv_hash(recv).await?);
     let id = ReplicaItemId(recv_hash(recv).await?);
     let offset = recv_u64_be(recv).await?;
     let maximum = crate::protocol::recv_u32_be(recv).await?;
@@ -341,7 +350,7 @@ pub(crate) async fn recv_blob_request<R: AsyncRead + Unpin>(
         bail!("replica blob range limit is {maximum}; expected 1..={BLOB_TRANSFER_CHUNK_BYTES}");
     }
     require_eof(recv).await?;
-    Ok((id, offset, maximum))
+    Ok((generation, id, offset, maximum))
 }
 
 pub(crate) async fn send_blob_range<W: AsyncWrite + Unpin>(
@@ -411,6 +420,7 @@ pub(crate) async fn op_replica_blob_range<C: Conn>(
     connection: &C,
     replica_set: ReplicaSetId,
     proof: &CapabilityProofBundle,
+    generation: ReplicaGeneration,
     requested: ReplicaItemId,
     expected_len: u64,
     offset: u64,
@@ -424,6 +434,7 @@ pub(crate) async fn op_replica_blob_range<C: Conn>(
         .await
         .map_err(|error| anyhow!("open replica blob stream: {error}"))?;
     request_prefix(&mut send, OP_REPLICA_BLOB, replica_set, proof).await?;
+    send_hash(&mut send, &generation.into_bytes()).await?;
     send_hash(&mut send, &requested.0).await?;
     send_u64_be(&mut send, offset).await?;
     crate::protocol::send_u32_be(
@@ -454,6 +465,7 @@ mod tests {
             digest: [4; 32],
         };
         let summary = ReplicaSummary::from_buckets(buckets);
+        let generation = summary.generation();
         let (mut writer, mut reader) = duplex(SUMMARY_BYTES + 1);
         let send = tokio::spawn(async move {
             send_summary(&mut writer, &summary).await.unwrap();
@@ -461,6 +473,7 @@ mod tests {
         });
         let decoded = recv_summary(&mut reader).await.unwrap();
         send.await.unwrap();
+        assert_eq!(decoded.generation(), generation);
         assert_eq!(
             decoded.bucket(ReplicaComponent::CollectionRecords, 7),
             ReplicaBucketSummary {
