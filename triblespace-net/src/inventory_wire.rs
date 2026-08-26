@@ -2,14 +2,14 @@
 //!
 //! CONNECT is still the mandatory first stream on a connection. A successful
 //! [`OP_INVENTORY_AUTH`] then installs exactly one server-selected inventory
-//! view for that connection. Manifest, node, exact `GET_BLOB`, and mirror
+//! team session for that connection. Manifest, node, exact `GET_BLOB`, and mirror
 //! range operations are rejected by the host until that second authorization
 //! succeeds. The proof is not repeated on every request.
 //!
-//! Every node and range request pins a view-scoped component token. If that
-//! immutable snapshot is no longer cached, the server returns an explicit
-//! unavailable response; it never serves bytes from its current snapshot as a
-//! fallback.
+//! Every node and range request pins an exact component Merkle root. If that
+//! immutable snapshot is no longer cached for the authorized team, the server
+//! returns an explicit unavailable response; it never serves bytes from its
+//! current snapshot as a fallback.
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -21,8 +21,8 @@ use triblespace_core::patch::{Blake3Merkle, PatchHash};
 use triblespace_core::repo::peer::{PEER_EVIDENCE_BYTES_LEN, PeerEvidence};
 
 use crate::inventory::{
-    AuthorizedInventoryView, AuthorizedViewId, ComponentManifest, InventoryComponent,
-    InventoryGeneration, InventoryManifest, InventoryProjection, InventoryToken,
+    AuthorizedInventorySession, ComponentManifest, InventoryComponent, InventoryGeneration,
+    InventoryManifest,
 };
 use crate::protocol::{
     recv_capability_proof_bundle, recv_hash, recv_u8, recv_u32_be, recv_u64_be,
@@ -30,10 +30,10 @@ use crate::protocol::{
 };
 use crate::transport::Conn;
 
-/// Authorize exactly one server-selected team inventory view on this
+/// Authorize exactly one server-selected team inventory session on this
 /// CONNECT-authenticated connection.
 pub(crate) const OP_INVENTORY_AUTH: u8 = 0x08;
-/// Fetch the four component roots and immutable per-component tokens.
+/// Fetch the four immutable component roots.
 pub(crate) const OP_INVENTORY_MANIFEST: u8 = 0x09;
 /// Fetch one authenticated PATCH node under a protocol-relative prefix.
 pub(crate) const OP_INVENTORY_NODE: u8 = 0x0A;
@@ -117,9 +117,8 @@ async fn recv_bounded_u16_frame<R: AsyncRead + Unpin>(
 /// Client-side second authorization exchange.
 pub(crate) async fn op_inventory_auth<C: Conn>(
     connection: &C,
-    team: ed25519_dalek::VerifyingKey,
     proof: &CapabilityProofBundle,
-) -> Result<AuthorizedInventoryView> {
+) -> Result<()> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -132,14 +131,8 @@ pub(crate) async fn op_inventory_auth<C: Conn>(
 
     match recv_u8(&mut recv).await? {
         INVENTORY_AUTH_OK => {
-            let projection = InventoryProjection::from_wire_tag(recv_u8(&mut recv).await?)?;
-            let id = AuthorizedViewId::from_bytes(recv_hash(&mut recv).await?);
             require_eof(&mut recv).await?;
-            let expected = AuthorizedInventoryView::full_team(team);
-            if projection != expected.projection() || id != expected.id() {
-                bail!("server selected an unexpected inventory projection");
-            }
-            Ok(expected)
+            Ok(())
         }
         INVENTORY_AUTH_REJECTED => {
             require_eof(&mut recv).await?;
@@ -158,14 +151,9 @@ pub(crate) async fn recv_inventory_auth_request<R: AsyncRead + Unpin>(
     Ok(proof)
 }
 
-/// Send a successful second-authorization response and the selected view.
-pub(crate) async fn send_inventory_auth_ok<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    view: AuthorizedInventoryView,
-) -> Result<()> {
-    send_u8(send, INVENTORY_AUTH_OK).await?;
-    send_u8(send, view.projection().wire_tag()).await?;
-    send_hash(send, &view.id().into_bytes()).await
+/// Send a successful second-authorization response.
+pub(crate) async fn send_inventory_auth_ok<W: AsyncWrite + Unpin>(send: &mut W) -> Result<()> {
+    send_u8(send, INVENTORY_AUTH_OK).await
 }
 
 /// Send a rejected second-authorization response without leaking details.
@@ -175,26 +163,10 @@ pub(crate) async fn send_inventory_auth_rejected<W: AsyncWrite + Unpin>(
     send_u8(send, INVENTORY_AUTH_REJECTED).await
 }
 
-async fn send_view_request<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    operation: u8,
-    view: AuthorizedViewId,
-) -> Result<()> {
-    send_u8(send, operation).await?;
-    send_hash(send, &view.into_bytes()).await
-}
-
-/// Decode and verify the selected view on a manifest request.
-pub(crate) async fn recv_manifest_request<R: AsyncRead + Unpin>(
-    recv: &mut R,
-    authorized: AuthorizedInventoryView,
-) -> Result<()> {
-    let requested = AuthorizedViewId::from_bytes(recv_hash(recv).await?);
-    require_eof(recv).await?;
-    if requested != authorized.id() {
-        bail!("manifest request does not name the authorized inventory view");
-    }
-    Ok(())
+/// Decode the empty body of a manifest request. The connection session fixes
+/// the only possible team inventory.
+pub(crate) async fn recv_manifest_request<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
+    require_eof(recv).await
 }
 
 /// Encode one exact four-component manifest.
@@ -202,11 +174,9 @@ pub(crate) async fn send_manifest<W: AsyncWrite + Unpin>(
     send: &mut W,
     manifest: &InventoryManifest,
 ) -> Result<()> {
-    send_hash(send, &manifest.view().into_bytes()).await?;
     send_hash(send, &manifest.generation().into_bytes()).await?;
     for component in manifest.components() {
         send_u8(send, component.component() as u8).await?;
-        send_hash(send, &component.token().into_bytes()).await?;
         send_u64_be(send, component.leaf_count()).await?;
         match component.root() {
             None => send_u8(send, 0).await?,
@@ -221,12 +191,8 @@ pub(crate) async fn send_manifest<W: AsyncWrite + Unpin>(
 
 async fn recv_manifest<R: AsyncRead + Unpin>(
     recv: &mut R,
-    expected_view: AuthorizedViewId,
+    team: ed25519_dalek::VerifyingKey,
 ) -> Result<InventoryManifest> {
-    let view = AuthorizedViewId::from_bytes(recv_hash(recv).await?);
-    if view != expected_view {
-        bail!("manifest response does not match the authorized view");
-    }
     let generation = InventoryGeneration::from_bytes(recv_hash(recv).await?);
     let mut components = Vec::with_capacity(InventoryComponent::ALL.len());
     for expected_component in InventoryComponent::ALL {
@@ -234,7 +200,6 @@ async fn recv_manifest<R: AsyncRead + Unpin>(
         if component != expected_component {
             bail!("manifest components are out of canonical order");
         }
-        let token = InventoryToken::from_bytes(recv_hash(recv).await?);
         let leaf_count = recv_u64_be(recv).await?;
         let root = match recv_u8(recv).await? {
             0 => None,
@@ -244,39 +209,39 @@ async fn recv_manifest<R: AsyncRead + Unpin>(
         if root.is_none() != (leaf_count == 0) {
             bail!("empty inventory root and leaf count disagree");
         }
-        components.push(ComponentManifest::from_wire(
-            view, component, leaf_count, root, token,
-        )?);
+        components.push(ComponentManifest::from_wire(component, leaf_count, root)?);
     }
     require_eof(recv).await?;
     let components: [ComponentManifest; 4] = components
         .try_into()
         .expect("the canonical component loop has exactly four entries");
-    InventoryManifest::from_wire(view, generation, components)
+    InventoryManifest::from_wire(team, generation, components)
 }
 
-/// Fetch an authenticated root manifest for the connection's selected view.
+/// Fetch an authenticated root manifest for the connection's authorized team.
 pub(crate) async fn op_inventory_manifest<C: Conn>(
     connection: &C,
-    view: AuthorizedInventoryView,
+    team: ed25519_dalek::VerifyingKey,
 ) -> Result<InventoryManifest> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|error| anyhow!("open inventory manifest stream: {error}"))?;
-    send_view_request(&mut send, OP_INVENTORY_MANIFEST, view.id()).await?;
+    send_u8(&mut send, OP_INVENTORY_MANIFEST).await?;
     send.shutdown()
         .await
         .map_err(|error| anyhow!("finish inventory manifest request: {error}"))?;
-    recv_manifest(&mut recv, view.id()).await
+    recv_manifest(&mut recv, team).await
 }
 
 /// Exact request for one node in a pinned component tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InventoryNodeRequest {
-    pub(crate) view: AuthorizedViewId,
     pub(crate) component: InventoryComponent,
-    pub(crate) token: InventoryToken,
+    /// Exact non-empty component root advertised by the manifest.
+    pub(crate) root: [u8; 32],
+    /// Manifest count committed by `root`.
+    pub(crate) leaf_count: u64,
     /// Prefix relative to the authorized component base.
     pub(crate) prefix: Vec<u8>,
     /// Digest the caller expects at this exact prefix.
@@ -285,23 +250,30 @@ pub(crate) struct InventoryNodeRequest {
 
 impl InventoryNodeRequest {
     pub(crate) fn new(
-        view: AuthorizedInventoryView,
+        team: ed25519_dalek::VerifyingKey,
         component: InventoryComponent,
-        token: InventoryToken,
+        root: [u8; 32],
+        leaf_count: u64,
         prefix: Vec<u8>,
         expected_digest: [u8; 32],
     ) -> Result<Self> {
-        let maximum = component.relative_key_len(view.base_prefix(component));
+        if leaf_count == 0 {
+            bail!("a node request cannot pin an empty component");
+        }
+        let maximum = component.relative_key_len(component.base_prefix(team));
         if prefix.len() > maximum {
             bail!(
                 "inventory prefix is {} bytes; component-relative key is {maximum} bytes",
                 prefix.len()
             );
         }
+        if prefix.is_empty() && expected_digest != root {
+            bail!("component-root request digest does not match its pinned root");
+        }
         Ok(Self {
-            view: view.id(),
             component,
-            token,
+            root,
+            leaf_count,
             prefix,
             expected_digest,
         })
@@ -312,9 +284,10 @@ async fn send_node_request<W: AsyncWrite + Unpin>(
     send: &mut W,
     request: &InventoryNodeRequest,
 ) -> Result<()> {
-    send_view_request(send, OP_INVENTORY_NODE, request.view).await?;
+    send_u8(send, OP_INVENTORY_NODE).await?;
     send_u8(send, request.component as u8).await?;
-    send_hash(send, &request.token.into_bytes()).await?;
+    send_hash(send, &request.root).await?;
+    send_u64_be(send, request.leaf_count).await?;
     send_u8(
         send,
         u8::try_from(request.prefix.len()).expect("inventory keys are at most 64 bytes"),
@@ -329,14 +302,14 @@ async fn send_node_request<W: AsyncWrite + Unpin>(
 /// Decode one node request relative to the connection's authorized base.
 pub(crate) async fn recv_node_request<R: AsyncRead + Unpin>(
     recv: &mut R,
-    authorized: AuthorizedInventoryView,
+    authorized: AuthorizedInventorySession,
 ) -> Result<InventoryNodeRequest> {
-    let view = AuthorizedViewId::from_bytes(recv_hash(recv).await?);
-    if view != authorized.id() {
-        bail!("node request does not name the authorized inventory view");
-    }
     let component = InventoryComponent::from_byte(recv_u8(recv).await?)?;
-    let token = InventoryToken::from_bytes(recv_hash(recv).await?);
+    let root = recv_hash(recv).await?;
+    let leaf_count = recv_u64_be(recv).await?;
+    if leaf_count == 0 {
+        bail!("a node request cannot pin an empty component");
+    }
     let prefix_length = recv_u8(recv).await? as usize;
     let maximum = component.relative_key_len(authorized.base_prefix(component));
     if prefix_length > maximum {
@@ -347,10 +320,13 @@ pub(crate) async fn recv_node_request<R: AsyncRead + Unpin>(
     let prefix = recv_exact_vec(recv, prefix_length, "inventory prefix").await?;
     let expected_digest = recv_hash(recv).await?;
     require_eof(recv).await?;
+    if prefix.is_empty() && expected_digest != root {
+        bail!("component-root request digest does not match its pinned root");
+    }
     Ok(InventoryNodeRequest {
-        view,
         component,
-        token,
+        root,
+        leaf_count,
         prefix,
         expected_digest,
     })
@@ -438,25 +414,28 @@ impl InventoryNode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InventoryNodeResponse {
     Found(InventoryNode),
-    /// The exact `(view, component, token)` snapshot is no longer cached.
+    /// The exact `(team, component, root)` snapshot is no longer cached.
     SnapshotUnavailable,
     /// No node exists at the requested prefix in the pinned snapshot.
     PrefixAbsent,
 }
 
 fn validate_node(
-    view: AuthorizedInventoryView,
+    team: ed25519_dalek::VerifyingKey,
     request: &InventoryNodeRequest,
     node: &InventoryNode,
 ) -> Result<()> {
-    if request.view != view.id() {
-        bail!("node request view does not match the authorized view");
-    }
     if node.digest() != request.expected_digest {
         bail!("inventory node digest does not match the requested digest");
     }
+    if node.leaf_count() > request.leaf_count {
+        bail!("inventory node exceeds its pinned component leaf count");
+    }
+    if request.prefix.is_empty() && node.leaf_count() != request.leaf_count {
+        bail!("inventory root node count does not match its pinned manifest count");
+    }
     let component = request.component;
-    let base = view.base_prefix(component);
+    let base = component.base_prefix(team);
     let relative_key_len = component.relative_key_len(base);
     match node {
         InventoryNode::Leaf { digest, leaf } => {
@@ -607,10 +586,10 @@ async fn recv_leaf_value<R: AsyncRead + Unpin>(
     }
 }
 
-/// Send a node, stale-token response, or absent-prefix response.
+/// Send a node, unavailable-snapshot response, or absent-prefix response.
 pub(crate) async fn send_node_response<W: AsyncWrite + Unpin>(
     send: &mut W,
-    view: AuthorizedInventoryView,
+    team: ed25519_dalek::VerifyingKey,
     request: &InventoryNodeRequest,
     response: &InventoryNodeResponse,
 ) -> Result<()> {
@@ -623,7 +602,7 @@ pub(crate) async fn send_node_response<W: AsyncWrite + Unpin>(
         }
         InventoryNodeResponse::Found(node) => node,
     };
-    validate_node(view, request, node)?;
+    validate_node(team, request, node)?;
     send_u8(send, NODE_FOUND).await?;
     match node {
         InventoryNode::Leaf { digest, leaf } => {
@@ -664,7 +643,7 @@ pub(crate) async fn send_node_response<W: AsyncWrite + Unpin>(
 
 async fn recv_node_response<R: AsyncRead + Unpin>(
     recv: &mut R,
-    view: AuthorizedInventoryView,
+    team: ed25519_dalek::VerifyingKey,
     request: &InventoryNodeRequest,
 ) -> Result<InventoryNodeResponse> {
     let kind = match recv_u8(recv).await? {
@@ -683,7 +662,7 @@ async fn recv_node_response<R: AsyncRead + Unpin>(
     let leaf_count = recv_u64_be(recv).await?;
     let relative_key_len = request
         .component
-        .relative_key_len(view.base_prefix(request.component));
+        .relative_key_len(request.component.base_prefix(team));
     let node = match kind {
         NODE_LEAF => {
             if leaf_count != 1 {
@@ -728,19 +707,16 @@ async fn recv_node_response<R: AsyncRead + Unpin>(
         other => bail!("unknown inventory node kind {other:#x}"),
     };
     require_eof(recv).await?;
-    validate_node(view, request, &node)?;
+    validate_node(team, request, &node)?;
     Ok(InventoryNodeResponse::Found(node))
 }
 
 /// Fetch one node from an exact immutable component snapshot.
 pub(crate) async fn op_inventory_node<C: Conn>(
     connection: &C,
-    view: AuthorizedInventoryView,
+    team: ed25519_dalek::VerifyingKey,
     request: &InventoryNodeRequest,
 ) -> Result<InventoryNodeResponse> {
-    if request.view != view.id() {
-        bail!("node request does not name the connection's authorized view");
-    }
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -749,14 +725,16 @@ pub(crate) async fn op_inventory_node<C: Conn>(
     send.shutdown()
         .await
         .map_err(|error| anyhow!("finish inventory node request: {error}"))?;
-    recv_node_response(&mut recv, view, request).await
+    recv_node_response(&mut recv, team, request).await
 }
 
 /// Exact request for one bounded range of a pinned inventory blob.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InventoryBlobRangeRequest {
-    pub(crate) view: AuthorizedViewId,
-    pub(crate) token: InventoryToken,
+    /// Exact non-empty Blob component root advertised by the manifest.
+    pub(crate) root: [u8; 32],
+    /// Manifest count committed by `root`.
+    pub(crate) leaf_count: u64,
     pub(crate) hash: [u8; 32],
     pub(crate) offset: u64,
     pub(crate) maximum: u32,
@@ -764,20 +742,23 @@ pub(crate) struct InventoryBlobRangeRequest {
 
 impl InventoryBlobRangeRequest {
     pub(crate) fn new(
-        view: AuthorizedInventoryView,
-        token: InventoryToken,
+        root: [u8; 32],
+        leaf_count: u64,
         hash: [u8; 32],
         offset: u64,
         maximum: u32,
     ) -> Result<Self> {
+        if leaf_count == 0 {
+            bail!("a blob range request cannot pin an empty component");
+        }
         if maximum == 0 || maximum as usize > BLOB_TRANSFER_CHUNK_BYTES {
             bail!(
                 "inventory blob range limit is {maximum}; expected 1..={BLOB_TRANSFER_CHUNK_BYTES}"
             );
         }
         Ok(Self {
-            view: view.id(),
-            token,
+            root,
+            leaf_count,
             hash,
             offset,
             maximum,
@@ -789,28 +770,25 @@ async fn send_blob_range_request<W: AsyncWrite + Unpin>(
     send: &mut W,
     request: InventoryBlobRangeRequest,
 ) -> Result<()> {
-    send_view_request(send, OP_INVENTORY_BLOB_RANGE, request.view).await?;
-    send_hash(send, &request.token.into_bytes()).await?;
+    send_u8(send, OP_INVENTORY_BLOB_RANGE).await?;
+    send_hash(send, &request.root).await?;
+    send_u64_be(send, request.leaf_count).await?;
     send_hash(send, &request.hash).await?;
     send_u64_be(send, request.offset).await?;
     send_u32_be(send, request.maximum).await
 }
 
-/// Decode a bounded blob range request for the authorized view.
+/// Decode a bounded blob range request for the authorized team session.
 pub(crate) async fn recv_blob_range_request<R: AsyncRead + Unpin>(
     recv: &mut R,
-    authorized: AuthorizedInventoryView,
 ) -> Result<InventoryBlobRangeRequest> {
-    let view = AuthorizedViewId::from_bytes(recv_hash(recv).await?);
-    if view != authorized.id() {
-        bail!("blob range request does not name the authorized inventory view");
-    }
-    let token = InventoryToken::from_bytes(recv_hash(recv).await?);
+    let root = recv_hash(recv).await?;
+    let leaf_count = recv_u64_be(recv).await?;
     let hash = recv_hash(recv).await?;
     let offset = recv_u64_be(recv).await?;
     let maximum = recv_u32_be(recv).await?;
     require_eof(recv).await?;
-    InventoryBlobRangeRequest::new(authorized, token, hash, offset, maximum)
+    InventoryBlobRangeRequest::new(root, leaf_count, hash, offset, maximum)
 }
 
 /// Result of one bounded mirror range request.
@@ -898,12 +876,8 @@ async fn recv_blob_range<R: AsyncRead + Unpin>(
 /// Fetch one bounded range from a blob in an exact pinned inventory.
 pub(crate) async fn op_inventory_blob_range<C: Conn>(
     connection: &C,
-    view: AuthorizedInventoryView,
     request: InventoryBlobRangeRequest,
 ) -> Result<InventoryBlobRangeResponse> {
-    if request.view != view.id() {
-        bail!("blob range request does not name the connection's authorized view");
-    }
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -922,38 +896,40 @@ mod tests {
 
     use super::*;
 
-    fn view() -> AuthorizedInventoryView {
-        AuthorizedInventoryView::full_team(SigningKey::from_bytes(&[1; 32]).verifying_key())
-    }
-
-    fn token(byte: u8) -> InventoryToken {
-        InventoryToken::from_bytes([byte; 32])
+    fn team() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
     #[tokio::test]
-    async fn manifest_codec_binds_view_roots_counts_and_generation() {
-        let view = view();
+    async fn manifest_codec_binds_team_roots_counts_and_generation() {
+        let team = team();
         let components = InventoryComponent::ALL.map(|component| {
             let count = component as u64;
-            ComponentManifest::new(view.id(), component, count, Some([component as u8; 32]))
+            ComponentManifest::new(component, count, Some([component as u8; 32]))
         });
-        let manifest = InventoryManifest::new(view.id(), components);
+        let manifest = InventoryManifest::new(team, components);
         let (mut writer, mut reader) = duplex(4096);
         send_manifest(&mut writer, &manifest).await.unwrap();
         writer.shutdown().await.unwrap();
-        let decoded = recv_manifest(&mut reader, view.id()).await.unwrap();
+        let decoded = recv_manifest(&mut reader, team).await.unwrap();
         assert_eq!(decoded, manifest);
     }
 
     #[tokio::test]
     async fn peer_leaf_uses_team_base_and_relative_peer_key() {
-        let view = view();
+        let team = team();
         let peer = SigningKey::from_bytes(&[2; 32]).verifying_key();
-        let absolute = PeerEvidence::new(view.team(), peer).to_bytes();
+        let absolute = PeerEvidence::new(team, peer).to_bytes();
         let digest = <Blake3Merkle as PatchHash>::leaf(&absolute);
-        let request =
-            InventoryNodeRequest::new(view, InventoryComponent::Peer, token(3), Vec::new(), digest)
-                .unwrap();
+        let request = InventoryNodeRequest::new(
+            team,
+            InventoryComponent::Peer,
+            digest,
+            1,
+            Vec::new(),
+            digest,
+        )
+        .unwrap();
         let response = InventoryNodeResponse::Found(InventoryNode::Leaf {
             digest,
             leaf: InventoryLeaf {
@@ -962,12 +938,12 @@ mod tests {
             },
         });
         let (mut writer, mut reader) = duplex(4096);
-        send_node_response(&mut writer, view, &request, &response)
+        send_node_response(&mut writer, team, &request, &response)
             .await
             .unwrap();
         writer.shutdown().await.unwrap();
         assert_eq!(
-            recv_node_response(&mut reader, view, &request)
+            recv_node_response(&mut reader, team, &request)
                 .await
                 .unwrap(),
             response
@@ -976,7 +952,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch_codec_recomputes_authenticated_shape() {
-        let view = view();
+        let team = team();
         let first_key = [0x10; 32];
         let second_key = [0x20; 32];
         let first_digest = <Blake3Merkle as PatchHash>::leaf(&first_key);
@@ -998,9 +974,15 @@ mod tests {
             <Blake3Merkle as PatchHash>::push_child(&mut state, child.edge, child.digest);
         }
         let digest = <Blake3Merkle as PatchHash>::finish_branch(state);
-        let request =
-            InventoryNodeRequest::new(view, InventoryComponent::Blob, token(4), Vec::new(), digest)
-                .unwrap();
+        let request = InventoryNodeRequest::new(
+            team,
+            InventoryComponent::Blob,
+            digest,
+            2,
+            Vec::new(),
+            digest,
+        )
+        .unwrap();
         let response = InventoryNodeResponse::Found(InventoryNode::Branch {
             digest,
             leaf_count: 2,
@@ -1011,12 +993,12 @@ mod tests {
             },
         });
         let (mut writer, mut reader) = duplex(4096);
-        send_node_response(&mut writer, view, &request, &response)
+        send_node_response(&mut writer, team, &request, &response)
             .await
             .unwrap();
         writer.shutdown().await.unwrap();
         assert_eq!(
-            recv_node_response(&mut reader, view, &request)
+            recv_node_response(&mut reader, team, &request)
                 .await
                 .unwrap(),
             response
@@ -1025,11 +1007,12 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_branch_counts_are_rejected_before_send() {
-        let view = view();
+        let team = team();
         let request = InventoryNodeRequest::new(
-            view,
+            team,
             InventoryComponent::Blob,
-            token(4),
+            [9; 32],
+            3,
             Vec::new(),
             [9; 32],
         )
@@ -1056,7 +1039,7 @@ mod tests {
         });
         let (mut writer, _reader) = duplex(4096);
         assert!(
-            send_node_response(&mut writer, view, &request, &response)
+            send_node_response(&mut writer, team, &request, &response)
                 .await
                 .is_err()
         );
@@ -1064,8 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_ranges_are_bounded_and_report_total_length() {
-        let view = view();
-        let request = InventoryBlobRangeRequest::new(view, token(5), [6; 32], 3, 4).unwrap();
+        let request = InventoryBlobRangeRequest::new([5; 32], 1, [6; 32], 3, 4).unwrap();
         let (mut writer, mut reader) = duplex(4096);
         send_blob_range(&mut writer, request, b"abcdefghij")
             .await
@@ -1080,8 +1062,8 @@ mod tests {
         );
         assert!(
             InventoryBlobRangeRequest::new(
-                view,
-                token(5),
+                [5; 32],
+                1,
                 [6; 32],
                 0,
                 BLOB_TRANSFER_CHUNK_BYTES as u32 + 1,
