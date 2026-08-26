@@ -605,7 +605,8 @@ where
     }
 }
 
-/// Build the complete immutable custody snapshot for one known store prefix.
+/// Build the complete immutable custody snapshot for one observed semantic
+/// store state.
 ///
 /// This is intentionally called only by the custody driver, never by ordinary
 /// [`Peer`](crate::peer::Peer) refresh.
@@ -1459,7 +1460,10 @@ mod tests {
 
     #[test]
     fn snapshot_generation_is_independent_of_pile_append_order() {
-        let directory = tempfile::tempdir().unwrap();
+        // Keep this fixture under Cargo's stable working tree so the long
+        // workspace-wide gate does not depend on the host temporary root's
+        // lifetime.
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let forward_path = directory.path().join("forward.pile");
         let reverse_path = directory.path().join("reverse.pile");
         std::fs::File::create(&forward_path).unwrap();
