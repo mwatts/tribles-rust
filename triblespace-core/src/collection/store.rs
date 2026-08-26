@@ -98,6 +98,23 @@ pub trait CollectionStore {
     /// Enumerate currently known records in deterministic intrinsic-id order.
     fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError>;
 
+    /// Look up one record by its intrinsic content-derived id.
+    ///
+    /// The default implementation scans the deterministic record view once
+    /// and stops as soon as it reaches or passes `id`. Backends with a keyed
+    /// primary index should override this method.
+    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        for record in self.records()? {
+            let record = record?;
+            match record.id().cmp(&id) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => return Ok(Some(record)),
+                std::cmp::Ordering::Greater => break,
+            }
+        }
+        Ok(None)
+    }
+
     /// Select one deterministic union of semantic record routes.
     ///
     /// The default implementation performs exactly one ordinary enumeration
@@ -143,6 +160,10 @@ where
 
     fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         (**self).records()
+    }
+
+    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        (**self).record(id)
     }
 
     fn select_records(
@@ -287,6 +308,21 @@ mod tests {
             2,
             "different outputs for one exact DERIVE remain visible"
         );
+    }
+
+    #[test]
+    fn default_point_lookup_scans_one_ordered_view() {
+        let records = fixture();
+        let expected = records[records.len() / 2];
+        let mut store = FallbackStore {
+            records,
+            ..FallbackStore::default()
+        };
+
+        assert_eq!(store.record(expected.id()).unwrap(), Some(expected));
+        assert_eq!(store.enumerations, 1);
+        assert_eq!(store.record(Id::new([0xff; 16]).unwrap()).unwrap(), None);
+        assert_eq!(store.enumerations, 2);
     }
 
     #[test]

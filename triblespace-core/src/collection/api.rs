@@ -1474,7 +1474,7 @@ mod tests {
 
     impl CollectionStore for AppendAfterFirstDiscovery {
         type RecordsError = Infallible;
-        type InsertError = Infallible;
+        type InsertError = <MemoryRepo as CollectionStore>::InsertError;
         type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
 
         fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {

@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -12,7 +11,9 @@ use crate::blob::MemoryBlobStore;
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::selectors_match_record;
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
-use crate::patch::{Entry, IdentitySchema, PATCH};
+use crate::id::ID_LEN;
+use crate::inline::INLINE_LEN;
+use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::prelude::*;
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
@@ -20,6 +21,10 @@ use crate::repo::{WantRequest, WantStore};
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
+
+type CollectionRecordIndex = PATCH<ID_LEN, IdentitySchema, CollectionRecord, XorSip128>;
+type CapabilityProofIndex = PATCH<INLINE_LEN, IdentitySchema, CapabilityProof, XorSip128>;
+type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
 
 /// Simple in-memory implementation of the repository storage traits.
 ///
@@ -35,16 +40,21 @@ pub struct MemoryRepo {
     /// capability, durability is the store's own property.
     pub wants: HashSet<WantRequest>,
     /// Canonical collection records keyed by intrinsic record id.
-    collection_records: BTreeMap<Id, CollectionRecord>,
+    collection_records: CollectionRecordIndex,
     /// Canonical complete capability proofs keyed by exact-body content id.
-    capability_proofs: BTreeMap<CapabilityProofId, CapabilityProof>,
+    capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
-    peer_evidence: PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema>,
+    peer_evidence: PeerEvidenceIndex,
 }
 
 /// Deterministic persistent snapshot of in-memory peer evidence.
 pub struct MemoryPeerIter {
-    inner: crate::patch::PATCHIntoOrderedIterator<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, ()>,
+    inner: crate::patch::PATCHIntoOrderedIterator<
+        PEER_EVIDENCE_BYTES_LEN,
+        IdentitySchema,
+        (),
+        XorSip128,
+    >,
 }
 
 impl Iterator for MemoryPeerIter {
@@ -75,6 +85,52 @@ impl PeerStore for MemoryRepo {
     }
 }
 
+/// Deterministic persistent snapshot of in-memory collection records.
+pub struct MemoryCollectionRecordIter {
+    keys:
+        crate::patch::PATCHIntoOrderedIterator<ID_LEN, IdentitySchema, CollectionRecord, XorSip128>,
+    lookup: CollectionRecordIndex,
+}
+
+impl Iterator for MemoryCollectionRecordIter {
+    type Item = Result<CollectionRecord, Infallible>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = self.keys.next()?;
+        let record = *self
+            .lookup
+            .get(&key)
+            .expect("collection key from PATCH snapshot must retain its value");
+        debug_assert_eq!(record.id().raw(), key);
+        Some(Ok(record))
+    }
+}
+
+/// Deterministic persistent snapshot of in-memory capability proofs.
+pub struct MemoryCapabilityProofIter {
+    keys: crate::patch::PATCHIntoOrderedIterator<
+        INLINE_LEN,
+        IdentitySchema,
+        CapabilityProof,
+        XorSip128,
+    >,
+    lookup: CapabilityProofIndex,
+}
+
+impl Iterator for MemoryCapabilityProofIter {
+    type Item = Result<CapabilityProof, Infallible>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = self.keys.next()?;
+        let proof = self
+            .lookup
+            .get(&key)
+            .expect("proof key from PATCH snapshot must retain its value");
+        debug_assert_eq!(proof.id().raw, key);
+        Some(Ok(proof.clone()))
+    }
+}
+
 /// Failure while admitting a proof to [`MemoryRepo`].
 #[derive(Debug)]
 pub enum MemoryProofInsertError {
@@ -94,61 +150,76 @@ impl fmt::Display for MemoryProofInsertError {
 
 impl Error for MemoryProofInsertError {}
 
+/// Failure while inserting a collection record into [`MemoryRepo`].
+#[derive(Debug)]
+pub enum MemoryCollectionInsertError {
+    /// An infeasible intrinsic-id collision named different canonical bytes.
+    IdCollision { id: Id },
+}
+
+impl fmt::Display for MemoryCollectionInsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdCollision { id } => {
+                write!(f, "collection record id {id} names different bytes")
+            }
+        }
+    }
+}
+
+impl Error for MemoryCollectionInsertError {}
+
 impl CapabilityProofStore for MemoryRepo {
     type ProofsError = Infallible;
     type InsertError = MemoryProofInsertError;
-    type ProofIter<'a> = std::vec::IntoIter<Result<CapabilityProof, Self::ProofsError>>;
+    type ProofIter<'a> = MemoryCapabilityProofIter;
 
     fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-        Ok(self
-            .capability_proofs
-            .values()
-            .cloned()
-            .map(Ok)
-            .collect::<Vec<_>>()
-            .into_iter())
+        let keys = self.capability_proofs.clone().into_iter_ordered();
+        Ok(MemoryCapabilityProofIter {
+            keys,
+            lookup: self.capability_proofs.clone(),
+        })
     }
 
     fn proof(
         &mut self,
         id: CapabilityProofId,
     ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-        Ok(self.capability_proofs.get(&id).cloned())
+        Ok(self.capability_proofs.get(&id.raw).cloned())
     }
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         let id = proof.id();
-        match self.capability_proofs.entry(id) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(proof);
+        if let Some(existing) = self.capability_proofs.get(&id.raw) {
+            return if existing.as_bytes() == proof.as_bytes() {
                 Ok(())
-            }
-            std::collections::btree_map::Entry::Occupied(entry)
-                if entry.get().as_bytes() == proof.as_bytes() =>
-            {
-                Ok(())
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {
+            } else {
                 Err(MemoryProofInsertError::IdCollision { id })
-            }
+            };
         }
+        self.capability_proofs
+            .insert(&Entry::with_value(&id.raw, proof));
+        Ok(())
     }
 }
 
 impl CollectionStore for MemoryRepo {
     type RecordsError = Infallible;
-    type InsertError = Infallible;
+    type InsertError = MemoryCollectionInsertError;
 
-    type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Self::RecordsError>>;
+    type RecordIter<'a> = MemoryCollectionRecordIter;
 
     fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        Ok(self
-            .collection_records
-            .values()
-            .copied()
-            .map(Ok)
-            .collect::<Vec<_>>()
-            .into_iter())
+        let keys = self.collection_records.clone().into_iter_ordered();
+        Ok(MemoryCollectionRecordIter {
+            keys,
+            lookup: self.collection_records.clone(),
+        })
+    }
+
+    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        Ok(self.collection_records.get(&id.raw()).copied())
     }
 
     fn select_records(
@@ -160,14 +231,28 @@ impl CollectionStore for MemoryRepo {
         }
         Ok(self
             .collection_records
-            .values()
-            .copied()
+            .iter_ordered()
+            .map(|key| {
+                *self
+                    .collection_records
+                    .get(key)
+                    .expect("collection key from PATCH must retain its value")
+            })
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
     }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        self.collection_records.entry(record.id()).or_insert(record);
+        let id = record.id();
+        if let Some(existing) = self.collection_records.get(&id.raw()) {
+            return if existing == &record {
+                Ok(())
+            } else {
+                Err(MemoryCollectionInsertError::IdCollision { id })
+            };
+        }
+        self.collection_records
+            .insert(&Entry::with_value(&id.raw(), record));
         Ok(())
     }
 }
@@ -199,7 +284,11 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
     {
         let reader = self.blobs.reader().expect("memory reader is infallible");
         let mut roots = crate::repo::RetentionRoots::new();
-        for record in self.collection_records.values() {
+        for key in self.collection_records.iter() {
+            let record = self
+                .collection_records
+                .get(key)
+                .expect("collection key from PATCH must retain its value");
             let CollectionRecord::Commit(commit) = record else {
                 continue;
             };
@@ -216,7 +305,11 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
                 }
             }
         }
-        for proof in self.capability_proofs.values() {
+        for key in self.capability_proofs.iter() {
+            let proof = self
+                .capability_proofs
+                .get(key)
+                .expect("proof key from PATCH must retain its value");
             if proof.verify_signatures().is_err() {
                 continue;
             }
@@ -433,6 +526,38 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
+        assert_eq!(repo.record(merge.id()).unwrap(), Some(merge));
+        assert_eq!(repo.record(Id::new([0xff; 16]).unwrap()).unwrap(), None);
+    }
+
+    #[test]
+    fn collection_index_rejects_a_different_body_under_an_existing_key() {
+        let target = identity_for_tests(&named_for_tests(
+            "target",
+            Id::new([12; 16]).unwrap(),
+            Id::new([13; 16]).unwrap(),
+        ));
+        let expected = CollectionRecord::Derive(CollectionDerive::new(
+            target,
+            Inline::new([14; 32]),
+            Inline::new([15; 32]),
+        ));
+        let mismatched = CollectionRecord::Derive(CollectionDerive::new(
+            target,
+            Inline::new([16; 32]),
+            Inline::new([17; 32]),
+        ));
+        let id = expected.id();
+
+        let mut repo = MemoryRepo::default();
+        repo.collection_records
+            .insert(&Entry::with_value(&id.raw(), mismatched));
+
+        assert!(matches!(
+            repo.insert(expected),
+            Err(MemoryCollectionInsertError::IdCollision { id: found }) if found == id
+        ));
+        assert_eq!(repo.collection_records.get(&id.raw()), Some(&mismatched));
     }
 
     #[test]

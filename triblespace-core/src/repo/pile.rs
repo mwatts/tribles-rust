@@ -23,7 +23,6 @@ use anybytes::Bytes;
 use hex_literal::hex;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -63,8 +62,7 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 use crate::patch::Entry;
-use crate::patch::IdentitySchema;
-use crate::patch::PATCH;
+use crate::patch::{IdentitySchema, XorSip128, PATCH};
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
@@ -350,6 +348,11 @@ struct CapabilityProofIndexEntry {
     data_offset: usize,
     data_len: usize,
 }
+
+type PileBlobIndex = PATCH<32, IdentitySchema, IndexEntry, XorSip128>;
+type CollectionRecordIndex = PATCH<16, IdentitySchema, CollectionRecord, XorSip128>;
+type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
+type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -2263,16 +2266,15 @@ pub struct Pile {
     /// successful durability barrier. Refreshing bytes written by another
     /// handle does not make this handle responsible for flushing them.
     dirty: bool,
-    blobs: PATCH<32, IdentitySchema, IndexEntry>,
+    blobs: PileBlobIndex,
     validations: ValidationCache,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     /// Immutable collection records keyed by their intrinsic entity id.
-    /// `BTreeMap` makes enumeration independent of append/cat order.
-    collection_records: BTreeMap<Id, CollectionRecord>,
+    collection_records: CollectionRecordIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
-    capability_proofs: BTreeMap<RawInline, CapabilityProofIndexEntry>,
+    capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
-    peers: PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema>,
+    peers: PeerEvidenceIndex,
     /// Exact byte-distinct legacy V3 collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
@@ -2307,7 +2309,7 @@ fn padding_for_blob(blob_size: usize) -> usize {
 pub struct PileReader {
     mmap: Arc<MmapRaw>,
     covered_len: usize,
-    blobs: PATCH<32, IdentitySchema, IndexEntry>,
+    blobs: PileBlobIndex,
     validations: ValidationCache,
 }
 
@@ -2323,7 +2325,7 @@ impl PileReader {
     fn new(
         mmap: Arc<MmapRaw>,
         covered_len: usize,
-        blobs: PATCH<32, IdentitySchema, IndexEntry>,
+        blobs: PileBlobIndex,
         validations: ValidationCache,
     ) -> Self {
         Self {
@@ -2789,12 +2791,12 @@ impl Pile {
             file,
             mmap,
             dirty: false,
-            blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
+            blobs: PileBlobIndex::new(),
             validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
-            collection_records: BTreeMap::new(),
-            capability_proofs: BTreeMap::new(),
-            peers: PATCH::<PEER_EVIDENCE_BYTES_LEN, IdentitySchema>::new(),
+            collection_records: CollectionRecordIndex::new(),
+            capability_proofs: CapabilityProofIndex::new(),
+            peers: PeerEvidenceIndex::new(),
             legacy_collection_headers: BTreeSet::new(),
             opaque_records: 0,
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
@@ -2944,14 +2946,15 @@ impl Pile {
             }
             PileRecordContent::Collection { record } => {
                 let id = record.id();
-                if let Some(existing) = self.collection_records.get(&id) {
+                if let Some(existing) = self.collection_records.get(&id.raw()) {
                     if existing != &record {
                         return Err(ReadError::CorruptPile {
                             valid_length: start_offset,
                         });
                     }
                 } else {
-                    self.collection_records.insert(id, record);
+                    self.collection_records
+                        .insert(&Entry::with_value(&id.raw(), record));
                 }
                 Applied::Collection { id }
             }
@@ -2998,7 +3001,8 @@ impl Pile {
                         });
                     }
                 } else {
-                    self.capability_proofs.insert(id.raw, candidate);
+                    self.capability_proofs
+                        .insert(&Entry::with_value(&id.raw, candidate));
                 }
                 Applied::CapabilityProof { id }
             }
@@ -3140,6 +3144,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.collection_records);
             std::ptr::drop_in_place(&mut this.capability_proofs);
+            std::ptr::drop_in_place(&mut this.peers);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.wants);
         }
@@ -3191,8 +3196,8 @@ use super::WantStore;
 pub struct PileBlobStoreIter {
     mmap: Arc<MmapRaw>,
     covered_len: usize,
-    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
-    lookup: PATCH<32, IdentitySchema, IndexEntry>,
+    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry, XorSip128>,
+    lookup: PileBlobIndex,
     validations: ValidationCache,
 }
 
@@ -3226,7 +3231,7 @@ impl Iterator for PileBlobStoreIter {
 /// Adapter that yields blob information from an owned PATCH snapshot.
 pub struct PileBlobStoreListIter {
     reader: PileReader,
-    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
+    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry, XorSip128>,
 }
 
 impl Iterator for PileBlobStoreListIter {
@@ -3280,17 +3285,30 @@ impl BlobStoreList for PileReader {
 
 /// Deterministic owned snapshot of the pile's native collection records.
 pub struct PileCollectionRecordIter {
-    inner: std::collections::btree_map::IntoValues<Id, CollectionRecord>,
+    keys: crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, CollectionRecord, XorSip128>,
+    lookup: CollectionRecordIndex,
 }
 
 /// Deterministic owned snapshot of the pile's complete capability proofs.
 pub struct PileCapabilityProofIter {
-    inner: std::vec::IntoIter<Result<CapabilityProof, ReadError>>,
+    mmap: Arc<MmapRaw>,
+    keys: crate::patch::PATCHIntoOrderedIterator<
+        32,
+        IdentitySchema,
+        CapabilityProofIndexEntry,
+        XorSip128,
+    >,
+    lookup: CapabilityProofIndex,
 }
 
 /// Deterministic owned snapshot of positive peer-routing evidence.
 pub struct PilePeerIter {
-    inner: crate::patch::PATCHIntoOrderedIterator<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, ()>,
+    inner: crate::patch::PATCHIntoOrderedIterator<
+        PEER_EVIDENCE_BYTES_LEN,
+        IdentitySchema,
+        (),
+        XorSip128,
+    >,
 }
 
 impl Iterator for PilePeerIter {
@@ -3308,7 +3326,23 @@ impl Iterator for PileCapabilityProofIter {
     type Item = Result<CapabilityProof, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        let key = self.keys.next()?;
+        let entry = *self
+            .lookup
+            .get(&key)
+            .expect("proof key from PATCH snapshot must retain its value");
+        let body = unsafe {
+            slice_from_raw_parts(self.mmap.as_ptr().add(entry.data_offset), entry.data_len)
+                .as_ref()
+                .unwrap()
+        };
+        Some(CapabilityProof::from_bytes(body).map_err(|_| {
+            ReadError::CorruptPile {
+                valid_length: entry
+                    .data_offset
+                    .saturating_sub(std::mem::size_of::<CapabilityProofRecordPrefix>()),
+            }
+        }))
     }
 }
 
@@ -3316,7 +3350,13 @@ impl Iterator for PileCollectionRecordIter {
     type Item = Result<CollectionRecord, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Ok)
+        let key = self.keys.next()?;
+        let record = *self
+            .lookup
+            .get(&key)
+            .expect("collection key from PATCH snapshot must retain its value");
+        debug_assert_eq!(record.id().raw(), key);
+        Some(Ok(record))
     }
 }
 
@@ -3422,9 +3462,16 @@ impl CollectionStore for Pile {
 
     fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         self.refresh()?;
+        let keys = self.collection_records.clone().into_iter_ordered();
         Ok(PileCollectionRecordIter {
-            inner: self.collection_records.clone().into_values(),
+            keys,
+            lookup: self.collection_records.clone(),
         })
+    }
+
+    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        self.refresh()?;
+        Ok(self.collection_records.get(&id.raw()).copied())
     }
 
     fn select_records(
@@ -3437,8 +3484,13 @@ impl CollectionStore for Pile {
         self.refresh()?;
         Ok(self
             .collection_records
-            .values()
-            .copied()
+            .iter_ordered()
+            .map(|key| {
+                *self
+                    .collection_records
+                    .get(key)
+                    .expect("collection key from PATCH must retain its value")
+            })
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
     }
@@ -3451,7 +3503,7 @@ impl CollectionStore for Pile {
         let result = (|| {
             self.refresh_locked()?;
 
-            if let Some(existing) = self.collection_records.get(&id) {
+            if let Some(existing) = self.collection_records.get(&id.raw()) {
                 return if existing == &record {
                     Ok(())
                 } else {
@@ -3487,23 +3539,11 @@ impl CapabilityProofStore for Pile {
 
     fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
         self.refresh()?;
-        let mut proofs = Vec::with_capacity(self.capability_proofs.len());
-        for entry in self.capability_proofs.values() {
-            let body = unsafe {
-                slice_from_raw_parts(self.mmap.as_ptr().add(entry.data_offset), entry.data_len)
-                    .as_ref()
-                    .unwrap()
-            };
-            proofs.push(CapabilityProof::from_bytes(body).map_err(|_| {
-                ReadError::CorruptPile {
-                    valid_length: entry
-                        .data_offset
-                        .saturating_sub(std::mem::size_of::<CapabilityProofRecordPrefix>()),
-                }
-            }));
-        }
+        let keys = self.capability_proofs.clone().into_iter_ordered();
         Ok(PileCapabilityProofIter {
-            inner: proofs.into_iter(),
+            mmap: self.mmap.clone(),
+            keys,
+            lookup: self.capability_proofs.clone(),
         })
     }
 
@@ -4437,8 +4477,13 @@ impl Pile {
         }
         let strong_pins = self.branches.clone();
         let collection_records = self.collection_records.clone();
-        let mut capability_proofs = Vec::with_capacity(self.capability_proofs.len());
-        for entry in self.capability_proofs.values() {
+        let mut capability_proofs =
+            Vec::with_capacity(self.capability_proofs.len().min(usize::MAX as u64) as usize);
+        for key in self.capability_proofs.iter_ordered() {
+            let entry = self
+                .capability_proofs
+                .get(key)
+                .expect("proof key from PATCH must retain its value");
             let body = unsafe {
                 slice_from_raw_parts(self.mmap.as_ptr().add(entry.data_offset), entry.data_len)
                     .as_ref()
@@ -4463,7 +4508,10 @@ impl Pile {
                 .expect("pin key from snapshot must retain its value");
             roots.retain_recursive(head);
         }
-        for record in collection_records.values() {
+        for key in collection_records.iter() {
+            let record = collection_records
+                .get(key)
+                .expect("collection key from PATCH snapshot must retain its value");
             let CollectionRecord::Commit(commit) = record else {
                 continue;
             };
@@ -4543,7 +4591,10 @@ impl Pile {
                 .map_err(PileRewriteError::Collection)?;
         }
 
-        for record in collection_records.into_values() {
+        for key in collection_records.clone().into_iter_ordered() {
+            let record = *collection_records
+                .get(&key)
+                .expect("collection key from PATCH snapshot must retain its value");
             destination
                 .insert(record)
                 .map_err(PileRewriteError::Collection)?;
@@ -4763,6 +4814,49 @@ mod tests {
             vec![proof]
         );
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn native_capability_proofs_cat_as_an_order_independent_set_union() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = fresh_empty_pile_path(&dir, "proof-a.pile");
+        let path_b = fresh_empty_pile_path(&dir, "proof-b.pile");
+        let path_ab = dir.path().join("proof-ab.pile");
+        let path_ba = dir.path().join("proof-ba.pile");
+        let (first, _) = capability_fixture(71, [72; 32]);
+        let (second, _) = capability_fixture(73, [74; 32]);
+        let (third, _) = capability_fixture(75, [76; 32]);
+
+        let mut a = Pile::open(&path_a).unwrap();
+        a.insert_proof(first.clone()).unwrap();
+        a.insert_proof(second.clone()).unwrap();
+        a.close().unwrap();
+        let mut b = Pile::open(&path_b).unwrap();
+        b.insert_proof(first.clone()).unwrap();
+        b.insert_proof(third.clone()).unwrap();
+        b.close().unwrap();
+
+        let bytes_a = std::fs::read(&path_a).unwrap();
+        let bytes_b = std::fs::read(&path_b).unwrap();
+        let mut ab = bytes_a.clone();
+        ab.extend_from_slice(&bytes_b);
+        std::fs::write(&path_ab, ab).unwrap();
+        let mut ba = bytes_b;
+        ba.extend_from_slice(&bytes_a);
+        std::fs::write(&path_ba, ba).unwrap();
+
+        let mut expected = vec![first, second, third];
+        expected.sort_unstable_by_key(|proof| proof.id().raw);
+        for path in [&path_ab, &path_ba] {
+            let mut pile = Pile::open(path).unwrap();
+            let actual = pile
+                .proofs()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, expected);
+            pile.close().unwrap();
+        }
     }
 
     #[test]
@@ -6074,6 +6168,11 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
+        assert_eq!(
+            reopened.record(expected[1].id()).unwrap(),
+            Some(expected[1])
+        );
+        assert_eq!(reopened.record(collection_test_id(0xff)).unwrap(), None);
         reopened.close().unwrap();
     }
 

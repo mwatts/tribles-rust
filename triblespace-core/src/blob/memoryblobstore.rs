@@ -5,7 +5,7 @@ use crate::blob::IntoBlob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::INLINE_LEN;
-use crate::patch::{Entry, IdentitySchema, PATCH};
+use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::repo::BlobInfo;
 use crate::repo::BlobStore;
 use crate::repo::BlobStoreGet;
@@ -21,6 +21,8 @@ use std::iter::FromIterator;
 
 use super::TryFromBlob;
 
+type BlobIndex = PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>, XorSip128>;
+
 /// In-memory blob storage keyed by content-hash handle.
 ///
 /// Internally a [`PATCH`] mapping the 32-byte raw handle to a
@@ -33,7 +35,7 @@ use super::TryFromBlob;
 ///
 /// [`reader`]: BlobStore::reader
 pub struct MemoryBlobStore {
-    blobs: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    blobs: BlobIndex,
 }
 
 impl Debug for MemoryBlobStore {
@@ -54,7 +56,7 @@ impl Debug for MemoryBlobStore {
 ///
 /// [`reader`]: BlobStore::reader
 pub struct MemoryBlobStoreReader {
-    blobs: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    blobs: BlobIndex,
 }
 
 impl Clone for MemoryBlobStoreReader {
@@ -74,7 +76,7 @@ impl PartialEq for MemoryBlobStoreReader {
 impl Eq for MemoryBlobStoreReader {}
 
 impl MemoryBlobStoreReader {
-    fn new(blobs: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>) -> Self {
+    fn new(blobs: BlobIndex) -> Self {
         MemoryBlobStoreReader { blobs }
     }
 
@@ -241,8 +243,8 @@ impl<E: Error> Error for MemoryStoreGetError<E> {}
 /// Yields `(Handle, Blob)` pairs. Owned snapshot via PATCH
 /// clones — does not borrow from the source reader.
 pub struct MemoryBlobStoreIter {
-    keys: crate::patch::PATCHIntoIterator<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
-    lookup: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    keys: crate::patch::PATCHIntoIterator<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>, XorSip128>,
+    lookup: BlobIndex,
 }
 
 impl Debug for MemoryBlobStoreIter {
