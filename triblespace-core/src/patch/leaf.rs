@@ -11,27 +11,27 @@ use super::*;
 
 #[derive(Debug)]
 #[repr(C, align(16))]
-pub(crate) struct Leaf<const KEY_LEN: usize, V> {
+pub(crate) struct Leaf<const KEY_LEN: usize, V, H: PatchHash = XorSip128> {
     pub key: [u8; KEY_LEN],
-    pub hash: u128,
+    pub hash: H::Digest,
     rc: atomic::AtomicU32,
     pub value: V,
 }
 
-impl<const KEY_LEN: usize, V> Body for Leaf<KEY_LEN, V> {
+impl<const KEY_LEN: usize, V, H: PatchHash> Body for Leaf<KEY_LEN, V, H> {
     fn tag(_body: NonNull<Self>) -> HeadTag {
         HeadTag::Leaf
     }
 }
 
-impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
+impl<const KEY_LEN: usize, V, H: PatchHash> Leaf<KEY_LEN, V, H> {
     pub(super) unsafe fn new(key: &[u8; KEY_LEN], value: V) -> NonNull<Self> {
         unsafe {
             let layout = Layout::new::<Self>();
             let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
                 handle_alloc_error(layout);
             };
-            let hash = hash_leaf_bytes(&key[..]);
+            let hash = H::leaf(&key[..]);
 
             ptr.write(Self {
                 key: *key,

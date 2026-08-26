@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fact deliberately grants no authority and implies no liveness,
   reachability, residency, or retention. Network behavior is unchanged.
 
+- Make PATCH's subtree summary a sealed policy parameter while preserving
+  `XorSip128` as the zero-overhead default. Add `Blake3Merkle`, a canonical
+  256-bit digest over path-compressed branches in ascending edge order, for
+  durable indexes and anti-entropy; archive-backed and heap construction now
+  share the same policy-generic path and root.
+
 - Add proof-gated custody replication for complete private pile replicas.
   `trible team replica {create,issue,join}` provisions an exact independent
   `REPLICATE` capability, while `trible pile net custody {status,run}`

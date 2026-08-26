@@ -373,6 +373,205 @@ struct HashKeys {
 
 static HASH_KEYS: OnceLock<HashKeys> = OnceLock::new();
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Hash-maintenance policy used by [`PATCH`].
+///
+/// Implementations are sealed because PATCH treats equal subtree summaries as
+/// equal key sets in `Eq`, union, intersection, and difference. An invalid
+/// implementation would therefore be a semantic data-loss bug rather than a
+/// merely weak cache hint.
+pub trait PatchHash: sealed::Sealed + Send + Sync + 'static {
+    /// Cached summary stored in every heap leaf and branch.
+    type Digest: Copy + core::fmt::Debug + Eq + Send + Sync + 'static;
+
+    /// Incremental state used while summarizing one branch's children.
+    type BranchState;
+
+    /// Whether child summaries form a commutative branch aggregate.
+    ///
+    /// Commutative policies can scan the physical cuckoo table directly;
+    /// ordered policies are fed children by ascending edge byte.
+    const COMMUTATIVE_BRANCH: bool;
+
+    /// Whether [`Self::edit_branch`] provides an exact updated digest.
+    /// False lets PATCH compile the edit call out and rebuild once on editor
+    /// drop; true keeps the default edit path identical to its direct
+    /// algebraic update.
+    const INCREMENTAL_BRANCH: bool;
+
+    /// Initialize any process-local state required by this policy.
+    fn init();
+
+    /// Summarize one complete key. Associated values never participate.
+    fn leaf(bytes: &[u8]) -> Self::Digest;
+
+    /// Begin summarizing a canonical branch.
+    fn begin_branch(
+        key_len: usize,
+        end_depth: usize,
+        child_count: usize,
+        leaf_count: u64,
+    ) -> Self::BranchState;
+
+    /// Add one child in ascending edge-byte order.
+    fn push_child(state: &mut Self::BranchState, edge: u8, digest: Self::Digest);
+
+    /// Finish one branch summary.
+    fn finish_branch(state: Self::BranchState) -> Self::Digest;
+
+    /// Update a branch summary after one child edit.
+    ///
+    /// PATCH calls this only when [`Self::INCREMENTAL_BRANCH`] is true, which
+    /// is a sealed-trait promise that this operation is exact.
+    fn edit_branch(
+        current: Self::Digest,
+        edge: u8,
+        old: Option<Self::Digest>,
+        new: Option<Self::Digest>,
+    ) -> Self::Digest;
+}
+
+/// PATCH's default process-private SipHash-leaf/XOR summary policy.
+///
+/// Its raw aggregates remain crate-private. [`TribleSetFingerprint`](
+/// crate::trible::TribleSetFingerprint) exposes only the separately keyed,
+/// nonlinear blinding of a root aggregate.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct XorSip128;
+
+impl sealed::Sealed for XorSip128 {}
+
+impl PatchHash for XorSip128 {
+    type Digest = u128;
+    type BranchState = u128;
+    const COMMUTATIVE_BRANCH: bool = true;
+    const INCREMENTAL_BRANCH: bool = true;
+
+    #[inline]
+    fn init() {
+        init_hash_keys();
+    }
+
+    #[inline]
+    fn leaf(bytes: &[u8]) -> Self::Digest {
+        xor_hash_leaf_bytes(bytes)
+    }
+
+    #[inline]
+    fn begin_branch(
+        _key_len: usize,
+        _end_depth: usize,
+        _child_count: usize,
+        _leaf_count: u64,
+    ) -> Self::BranchState {
+        0
+    }
+
+    #[inline]
+    fn push_child(state: &mut Self::BranchState, _edge: u8, digest: Self::Digest) {
+        *state ^= digest;
+    }
+
+    #[inline]
+    fn finish_branch(state: Self::BranchState) -> Self::Digest {
+        state
+    }
+
+    #[inline]
+    fn edit_branch(
+        mut current: Self::Digest,
+        _edge: u8,
+        old: Option<Self::Digest>,
+        new: Option<Self::Digest>,
+    ) -> Self::Digest {
+        if let Some(old) = old {
+            current ^= old;
+        }
+        if let Some(new) = new {
+            current ^= new;
+        }
+        current
+    }
+}
+
+/// Canonical BLAKE3 Merkle summaries for durable or adversarial PATCH uses.
+///
+/// Unlike [`XorSip128`], this policy commits to the canonical Patricia-trie
+/// structure: leaf keys are domain-separated from branches, and every branch
+/// commits to its key width, compressed-path end depth, fanout, subtree leaf
+/// count, ascending edge bytes, and child digests. PATCH's trie shape is a
+/// function of its key set, so insertion order and cuckoo-table placement do
+/// not affect the result.
+///
+/// BLAKE3's native chunk tree is intentionally not reused here. Its tree
+/// describes fixed-size chunks of one byte stream, whereas PATCH is a sparse
+/// radix tree whose fanout and compressed depths change under edits. Branches
+/// are therefore framed explicitly and hashed with the ordinary streaming
+/// API.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Blake3Merkle;
+
+impl sealed::Sealed for Blake3Merkle {}
+
+impl PatchHash for Blake3Merkle {
+    type Digest = [u8; 32];
+    type BranchState = blake3::Hasher;
+    const COMMUTATIVE_BRANCH: bool = false;
+    const INCREMENTAL_BRANCH: bool = false;
+
+    #[inline]
+    fn init() {
+        bytetable::init();
+    }
+
+    fn leaf(bytes: &[u8]) -> Self::Digest {
+        let mut state = blake3::Hasher::new();
+        state.update(b"triblespace.patch.leaf.v1\0");
+        state.update(&(bytes.len() as u64).to_le_bytes());
+        state.update(bytes);
+        *state.finalize().as_bytes()
+    }
+
+    fn begin_branch(
+        key_len: usize,
+        end_depth: usize,
+        child_count: usize,
+        leaf_count: u64,
+    ) -> Self::BranchState {
+        let mut state = blake3::Hasher::new();
+        state.update(b"triblespace.patch.branch.v1\0");
+        state.update(&(key_len as u64).to_le_bytes());
+        state.update(&(end_depth as u64).to_le_bytes());
+        state.update(&(child_count as u64).to_le_bytes());
+        state.update(&leaf_count.to_le_bytes());
+        state
+    }
+
+    #[inline]
+    fn push_child(state: &mut Self::BranchState, edge: u8, digest: Self::Digest) {
+        state.update(&[edge]);
+        state.update(&digest);
+    }
+
+    #[inline]
+    fn finish_branch(state: Self::BranchState) -> Self::Digest {
+        *state.finalize().as_bytes()
+    }
+
+    #[inline]
+    fn edit_branch(
+        _current: Self::Digest,
+        _edge: u8,
+        _old: Option<Self::Digest>,
+        _new: Option<Self::Digest>,
+    ) -> Self::Digest {
+        unreachable!("non-incremental PATCH hash policy was asked to edit a branch")
+    }
+}
+
 /// Fixed input-domain marker for the public
 /// [`TribleSetFingerprint`](crate::trible::TribleSetFingerprint)
 /// blinding PRF.
@@ -529,7 +728,7 @@ pub(crate) fn init_hash_keys() {
 
 /// Hash one PATCH leaf through the initialized process-local key accessor.
 #[inline]
-fn hash_leaf_bytes(bytes: &[u8]) -> u128 {
+fn xor_hash_leaf_bytes(bytes: &[u8]) -> u128 {
     use siphasher::sip128::SipHasher24;
 
     SipHasher24::new_with_key(&hash_keys().leaf)
@@ -576,7 +775,7 @@ pub(crate) fn blind_root_hash(root_hash: Option<u128>) -> Option<u128> {
 #[cfg(any(test, feature = "parallel"))]
 #[inline]
 pub(crate) fn hash_key(bytes: &[u8]) -> u128 {
-    hash_leaf_bytes(bytes)
+    XorSip128::leaf(bytes)
 }
 
 /// Builds a per-byte segment map from the segment lengths.
@@ -880,24 +1079,24 @@ impl HeadTag {
     }
 }
 
-pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
-    Leaf(NonNull<Leaf<KEY_LEN, V>>),
+pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> {
+    Leaf(NonNull<Leaf<KEY_LEN, V, H>>),
     /// Thin pointer to a `[u8; KEY_LEN]` trible living in an archive's
     /// mmap'd buffer. Lifetime is implicit — guaranteed by the enclosing
     /// PATCH's owner set.
     LocalLeaf(NonNull<[u8; KEY_LEN]>),
-    Branch(branch::BranchNN<KEY_LEN, O, V>),
+    Branch(branch::BranchNN<KEY_LEN, O, V, H>),
 }
 
 /// Immutable borrow view of a Head body.
 /// Returned by `body_ref()` and tied to the lifetime of the `&Head`.
-pub(crate) enum BodyRef<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
-    Leaf(&'a Leaf<KEY_LEN, V>),
+pub(crate) enum BodyRef<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> {
+    Leaf(&'a Leaf<KEY_LEN, V, H>),
     /// Reference to a trible's bytes within an archive. The slice's
     /// lifetime is bound to `&'a Head` via the body pointer; the actual
     /// underlying allocation is kept alive by the enclosing PATCH.
     LocalLeaf(&'a [u8; KEY_LEN]),
-    Branch(&'a Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
+    Branch(&'a Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>),
 }
 
 /// Mutation-capable borrow view of a Head body.
@@ -906,14 +1105,14 @@ pub(crate) enum BodyRef<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
 /// Branches are copy-on-write and therefore unique before this view exposes
 /// them mutably. Heap leaves, like archive-local leaves, may still be shared
 /// by another PATCH snapshot, so both leaf variants are exposed read-only.
-pub(crate) enum BodyMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
-    Leaf(&'a Leaf<KEY_LEN, V>),
+pub(crate) enum BodyMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> {
+    Leaf(&'a Leaf<KEY_LEN, V, H>),
     /// `LocalLeaf` is read-only by construction (it points into immutable
     /// archive bytes), so the mutable view yields a shared reference.
     /// Structural operations may move the Head while its PATCH owner guard
     /// remains live.
     LocalLeaf(&'a [u8; KEY_LEN]),
-    Branch(&'a mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
+    Branch(&'a mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>),
 }
 
 pub(crate) trait Body {
@@ -921,11 +1120,12 @@ pub(crate) trait Body {
 }
 
 #[repr(C)]
-pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash = XorSip128> {
     tptr: std::ptr::NonNull<u8>,
     key_ordering: PhantomData<O>,
     key_segments: PhantomData<O::Segmentation>,
     value: PhantomData<V>,
+    hash_policy: PhantomData<H>,
 }
 
 // SAFETY: a Head owns a persistent, atomically reference-counted node. Cloned
@@ -934,18 +1134,18 @@ pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
 // O and O::Segmentation are ignored deliberately: they are type-level schemas
 // used only through associated constants and functions; no value or reference
 // of either type is stored in, or accessed through, a Head.
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Send
-    for Head<KEY_LEN, O, V>
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync, H: PatchHash> Send
+    for Head<KEY_LEN, O, V, H>
 {
 }
 
 // SAFETY: the same shared-leaf and type-level-schema argument above applies.
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Sync
-    for Head<KEY_LEN, O, V>
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync, H: PatchHash> Sync
+    for Head<KEY_LEN, O, V, H>
 {
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN, O, V, H> {
     // Tagged pointer layout (64-bit only):
     // - bits 0..=3:   HeadTag (requires 16-byte aligned bodies)
     // - bits 4..=55:  body pointer bits (52 bits)
@@ -968,6 +1168,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 key_ordering: PhantomData,
                 key_segments: PhantomData,
                 value: PhantomData,
+                hash_policy: PhantomData,
             }
         }
     }
@@ -1008,6 +1209,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 key_ordering: PhantomData,
                 key_segments: PhantomData,
                 value: PhantomData,
+                hash_policy: PhantomData,
             }
         }
     }
@@ -1044,7 +1246,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    pub(crate) fn with_start(self, new_start_depth: usize) -> Head<KEY_LEN, O, V> {
+    pub(crate) fn with_start(self, new_start_depth: usize) -> Head<KEY_LEN, O, V, H> {
         let leaf_key = self.childleaf_key();
         let i = O::TREE_TO_KEY[new_start_depth];
         let key = leaf_key[i];
@@ -1056,7 +1258,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // `self.has_prefix::<KEY_LEN>(at_depth, key)` or for partial checks
     // `self.childleaf().has_prefix::<O>(at_depth, &key[..limit])` instead.
 
-    pub(crate) fn body(&self) -> BodyPtr<KEY_LEN, O, V> {
+    pub(crate) fn body(&self) -> BodyPtr<KEY_LEN, O, V, H> {
         unsafe {
             let ptr = NonNull::new_unchecked(self.tptr.as_ptr().map_addr(|addr| {
                 let masked = (addr as u64) & Self::BODY_MASK;
@@ -1071,13 +1273,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         ptr.as_ptr(),
                         count,
                     )
-                        as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>))
+                        as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>))
                 }
             }
         }
     }
 
-    pub(crate) fn body_mut(&mut self) -> BodyMut<'_, KEY_LEN, O, V> {
+    pub(crate) fn body_mut(&mut self) -> BodyMut<'_, KEY_LEN, O, V, H> {
         unsafe {
             match self.body() {
                 BodyPtr::Leaf(leaf) => BodyMut::Leaf(leaf.as_ref()),
@@ -1098,7 +1300,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     /// Returns an immutable borrow of the body (Leaf, LocalLeaf, or Branch)
     /// tied to &self.
-    pub(crate) fn body_ref(&self) -> BodyRef<'_, KEY_LEN, O, V> {
+    pub(crate) fn body_ref(&self) -> BodyRef<'_, KEY_LEN, O, V, H> {
         match self.body() {
             BodyPtr::Leaf(nn) => BodyRef::Leaf(unsafe { nn.as_ref() }),
             BodyPtr::LocalLeaf(nn) => BodyRef::LocalLeaf(unsafe { nn.as_ref() }),
@@ -1142,10 +1344,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    pub(crate) fn hash(&self) -> u128 {
+    pub(crate) fn hash(&self) -> H::Digest {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
-            BodyRef::LocalLeaf(bytes) => hash_leaf_bytes(&bytes[..]),
+            BodyRef::LocalLeaf(bytes) => H::leaf(&bytes[..]),
             BodyRef::Branch(branch) => branch.hash,
         }
     }
@@ -1271,7 +1473,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         drop(ed);
                         drop(slot.take());
                     } else if occupied_children == 1 {
-                        let mut remaining: Option<Head<KEY_LEN, O, V>> = None;
+                        let mut remaining: Option<Head<KEY_LEN, O, V, H>> = None;
                         for slot_child in &mut ed.child_table {
                             if let Some(child) = slot_child.take() {
                                 remaining = Some(child.with_start(start_depth));
@@ -1332,14 +1534,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 }
 
 // Archive-aware insertion path, available only when V = ().
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, H: PatchHash> Head<KEY_LEN, O, (), H> {
     /// Inserts a LocalLeaf whose hash was already computed by ArchiveEntry.
     /// The enclosing PATCH retains the leaf's owner independently of trie
     /// shape, so LocalLeaves can use the ordinary structural operations.
     pub(crate) fn insert_archive_leaf(
         mut this: Self,
         leaf: Self,
-        leaf_hash: u128,
+        leaf_hash: H::Digest,
         start_depth: usize,
     ) -> Self {
         if let Some((depth, this_byte_key, leaf_byte_key)) =
@@ -1374,7 +1576,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
 // Resume generic-V `Head` impl for the remaining methods (replace_leaf,
 // union, intersect, query operations, etc.) which don't care about V
 // shape and so remain in the V-generic impl block.
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN, O, V, H> {
     /// Replace the matching leaf while deferring reclamation of the old leaf.
     ///
     /// The returned retirement slot must be dropped only after the caller has
@@ -1623,8 +1825,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // arrays + present bitsets. The bitset partition tells us
             // which keys need a recursive union ("both") vs which are
             // simple pass-throughs ("only").
-            let mut this_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-            let mut other_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
+            let mut this_arr: [Option<Head<KEY_LEN, O, V, H>>; 256] = std::array::from_fn(|_| None);
+            let mut other_arr: [Option<Head<KEY_LEN, O, V, H>>; 256] =
+                std::array::from_fn(|_| None);
             let mut this_present = crate::patch::bytetable::ByteSet::new_empty();
             let mut other_present = crate::patch::bytetable::ByteSet::new_empty();
 
@@ -1651,7 +1854,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // writes to `resolved[k]` for its specific key byte —
             // disjoint by construction. The raw pointer wrapper
             // (`ScatterPtr`) makes the cross-thread sharing explicit.
-            let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
+            let mut resolved: [Option<Head<KEY_LEN, O, V, H>>; 256] = std::array::from_fn(|_| None);
             let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
 
             rayon::scope(|s| {
@@ -1772,7 +1975,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return self.intersect(other, at_depth);
         }
 
-        let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
+        let mut resolved: [Option<Head<KEY_LEN, O, V, H>>; 256] = std::array::from_fn(|_| None);
         let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
 
         // `in_place_scope` runs the outer closure on the calling
@@ -1893,7 +2096,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return self.difference(other, at_depth);
         }
 
-        let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
+        let mut resolved: [Option<Head<KEY_LEN, O, V, H>>; 256] = std::array::from_fn(|_| None);
         let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
 
         // See `par_intersect_with_ctx` for why this is
@@ -2189,8 +2392,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// Diagnostic: accumulate (branch nodes, total child-table slots,
     /// heap-`Leaf` nodes, `LocalLeaf` slots) over the subtree. Used to
     /// decompose a PATCH's *structural* byte size (vs resident RSS).
-    /// `branches` × `BRANCH_BASE_SIZE` + `slots` × 8 is the branch
-    /// allocation total; heap leaves add one `Leaf` node each.
+    /// `branches` × the policy-specific branch header + `slots` × 8 is the
+    /// branch allocation total; heap leaves add one `Leaf` node each.
     pub(crate) fn node_stats(&self, acc: &mut (u64, u64, u64, u64)) {
         match self.body_ref() {
             BodyRef::Leaf(_) => acc.2 += 1,
@@ -2457,19 +2660,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 }
 
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> ByteEntry for Head<KEY_LEN, O, V> {
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ByteEntry
+    for Head<KEY_LEN, O, V, H>
+{
     fn key(&self) -> u8 {
         self.key()
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> fmt::Debug for Head<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> fmt::Debug
+    for Head<KEY_LEN, O, V, H>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.tag().fmt(f)
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Clone for Head<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Clone
+    for Head<KEY_LEN, O, V, H>
+{
     fn clone(&self) -> Self {
         unsafe {
             match self.body() {
@@ -2489,7 +2698,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Clone for Head<KEY_LEN, O, 
 // Option<Head<...>>) directly. This keeps the API surface smaller and
 // avoids an extra helper type that simply forwarded to BranchMut.
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Drop for Head<KEY_LEN, O, V, H> {
     fn drop(&mut self) {
         unsafe {
             match self.body() {
@@ -2544,12 +2753,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
 /// assert_send::<PATCH<1, IdentitySchema, Cell<u64>>>();
 /// ```
 #[derive(Debug)]
-pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
+pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = (), H = XorSip128>
 where
     O: KeySchema<KEY_LEN>,
+    H: PatchHash,
 {
     // Field order is deliberate: Heads drop before the owner cover.
-    root: Option<Head<KEY_LEN, O, V>>,
+    root: Option<Head<KEY_LEN, O, V, H>>,
     /// Deduplicated conservative lifetime cover for every LocalLeaf anywhere
     /// below `root`. Set operations may retain provenance no longer reachable
     /// from the result, but never duplicate an owner or omit a reachable one.
@@ -2571,8 +2781,9 @@ pub struct PATCHBoundedInfixes<
     const INFIX_LEN: usize,
     O: KeySchema<KEY_LEN>,
     V,
+    H: PatchHash = XorSip128,
 > {
-    located: Option<&'a Head<KEY_LEN, O, V>>,
+    located: Option<&'a Head<KEY_LEN, O, V, H>>,
     count: u64,
 }
 
@@ -2583,7 +2794,8 @@ impl<
         const INFIX_LEN: usize,
         O: KeySchema<KEY_LEN>,
         V,
-    > PATCHBoundedInfixes<'a, KEY_LEN, PREFIX_LEN, INFIX_LEN, O, V>
+        H: PatchHash,
+    > PATCHBoundedInfixes<'a, KEY_LEN, PREFIX_LEN, INFIX_LEN, O, V, H>
 {
     /// Exact number of distinct infixes this view will emit.
     pub fn len(&self) -> u64 {
@@ -2607,9 +2819,10 @@ impl<
     }
 }
 
-impl<const KEY_LEN: usize, O, V> Clone for PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V, H> Clone for PATCH<KEY_LEN, O, V, H>
 where
     O: KeySchema<KEY_LEN>,
+    H: PatchHash,
 {
     fn clone(&self) -> Self {
         Self {
@@ -2619,22 +2832,24 @@ where
     }
 }
 
-impl<const KEY_LEN: usize, O, V> Default for PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V, H> Default for PATCH<KEY_LEN, O, V, H>
 where
     O: KeySchema<KEY_LEN>,
+    H: PatchHash,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const KEY_LEN: usize, O, V> PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V, H> PATCH<KEY_LEN, O, V, H>
 where
     O: KeySchema<KEY_LEN>,
+    H: PatchHash,
 {
     /// Creates a new empty PATCH.
     pub fn new() -> Self {
-        init_hash_keys();
+        H::init();
         PATCH {
             root: None,
             owners: None,
@@ -2647,7 +2862,7 @@ where
     /// and inserted into multiple PATCH instances.
     ///
     /// If the key is already present, this is a no-op.
-    pub fn insert(&mut self, entry: &Entry<KEY_LEN, V>) {
+    pub fn insert(&mut self, entry: &Entry<KEY_LEN, V, H>) {
         if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
             let new_head = Head::insert_leaf(this, entry.leaf(), 0);
@@ -2662,7 +2877,7 @@ where
     ///
     /// If the replaced value's destructor panics, the replacement is already
     /// fully committed when the panic is raised.
-    pub fn replace(&mut self, entry: &Entry<KEY_LEN, V>) {
+    pub fn replace(&mut self, entry: &Entry<KEY_LEN, V, H>) {
         let retired_leaf = if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
             let (new_head, retired_leaf) = Head::replace_leaf(this, entry.leaf(), 0);
@@ -2714,7 +2929,7 @@ where
 
     /// Diagnostic structural census: returns
     /// `(branch_nodes, child_table_slots, heap_leaf_nodes, local_leaf_slots)`.
-    /// Structural branch bytes ≈ `branches * BRANCH_BASE_SIZE + slots * 8`;
+    /// Structural branch bytes ≈ `branches * Self::branch_header_bytes() + slots * 8`;
     /// heap leaves add a `Leaf` node each (the key is shared across the six
     /// orderings, so count it once per trible, not once per ordering).
     pub fn node_stats(&self) -> (u64, u64, u64, u64) {
@@ -2748,7 +2963,7 @@ where
 
     /// Fixed branch header bytes, excluding the trailing child table.
     pub fn branch_header_bytes() -> usize {
-        std::mem::size_of::<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>; 0], V>>()
+        std::mem::size_of::<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>; 0], V, H>>()
     }
 
     /// Per-end-depth `(branch_count, filled_children)` histogram (65 buckets,
@@ -2783,12 +2998,12 @@ where
         self.len() == 0
     }
 
-    /// Return PATCH's internal linear root aggregate.
+    /// Return PATCH's internal root summary.
     ///
-    /// This value is crate-private deliberately. Public cache keys must pass
-    /// through [`blind_root_hash`] so callers cannot observe chosen leaf-hash
-    /// vectors and exploit the XOR maintenance law.
-    pub(crate) fn root_hash(&self) -> Option<u128> {
+    /// The default policy's value is crate-private deliberately. Public cache
+    /// keys must pass through [`blind_root_hash`] so callers cannot observe
+    /// chosen leaf-hash vectors and exploit its XOR maintenance law.
+    pub(crate) fn root_hash(&self) -> Option<H::Digest> {
         self.root.as_ref().map(|root| root.hash())
     }
 
@@ -2798,9 +3013,10 @@ where
     }
 
     /// Whether this PATCH and another PATCH share one owner-cover Arc.
-    pub(crate) fn shares_owner_guard<OO, VV>(&self, other: &PATCH<KEY_LEN, OO, VV>) -> bool
+    pub(crate) fn shares_owner_guard<OO, VV, HH>(&self, other: &PATCH<KEY_LEN, OO, VV, HH>) -> bool
     where
         OO: KeySchema<KEY_LEN>,
+        HH: PatchHash,
     {
         match (&self.owners, &other.owners) {
             (None, None) => true,
@@ -2897,7 +3113,7 @@ where
         &self,
         prefix: &[u8; PREFIX_LEN],
         limit: u64,
-    ) -> Option<PATCHBoundedInfixes<'_, KEY_LEN, PREFIX_LEN, INFIX_LEN, O, V>> {
+    ) -> Option<PATCHBoundedInfixes<'_, KEY_LEN, PREFIX_LEN, INFIX_LEN, O, V, H>> {
         const {
             assert!(PREFIX_LEN + INFIX_LEN <= KEY_LEN);
         }
@@ -3102,7 +3318,7 @@ where
 
     /// Iterates over all keys in the PATCH.
     /// The keys are returned in key ordering but random order.
-    pub fn iter<'a>(&'a self) -> PATCHIterator<'a, KEY_LEN, O, V> {
+    pub fn iter<'a>(&'a self) -> PATCHIterator<'a, KEY_LEN, O, V, H> {
         PATCHIterator::new(self)
     }
 
@@ -3111,7 +3327,7 @@ where
     /// The traversal visits every key in lexicographic key order, without
     /// accepting a prefix filter. For prefix-aware iteration, see
     /// [`PATCH::iter_prefix_count`].
-    pub fn iter_ordered<'a>(&'a self) -> PATCHOrderedIterator<'a, KEY_LEN, O, V> {
+    pub fn iter_ordered<'a>(&'a self) -> PATCHOrderedIterator<'a, KEY_LEN, O, V, H> {
         PATCHOrderedIterator::new(self)
     }
 
@@ -3120,7 +3336,7 @@ where
     /// A count of the number of elements for the given prefix is also returned.
     pub fn iter_prefix_count<'a, const PREFIX_LEN: usize>(
         &'a self,
-    ) -> PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V> {
+    ) -> PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V, H> {
         PATCHPrefixIterator::new(self)
     }
 
@@ -3287,17 +3503,33 @@ where
     }
 }
 
+impl<const KEY_LEN: usize, O, V> PATCH<KEY_LEN, O, V, Blake3Merkle>
+where
+    O: KeySchema<KEY_LEN>,
+{
+    /// Return the canonical BLAKE3 Merkle root for this key set.
+    ///
+    /// `None` is the unique empty-set representation. The digest is stable
+    /// across processes and construction histories; callers that need to
+    /// scope anti-entropy to a team should key or domain-separate this root at
+    /// that protocol boundary rather than changing PATCH's canonical identity.
+    pub fn merkle_root(&self) -> Option<[u8; 32]> {
+        self.root_hash()
+    }
+}
+
 /// Archive-backed insertion path, available only for `V = ()` because
 /// [`ArchiveEntry`] does not carry a value. Newly inserted archive keys remain
 /// LocalLeaves while the PATCH's deduplicated root cover retains their
 /// allocations.
-impl<const KEY_LEN: usize, O> PATCH<KEY_LEN, O, ()>
+impl<const KEY_LEN: usize, O, H> PATCH<KEY_LEN, O, (), H>
 where
     O: KeySchema<KEY_LEN>,
+    H: PatchHash,
 {
     /// Inserts an archive-backed key and retains its allocation before the
     /// LocalLeaf becomes reachable from the root.
-    pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN>) {
+    pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN, H>) {
         let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
         OwnerCover::retain(&mut self.owners, leaf_owner);
         if let Some(this) = self.root.take() {
@@ -3327,7 +3559,7 @@ where
     #[cfg(test)]
     pub(crate) unsafe fn from_archive_partition(
         keys: &[[u8; KEY_LEN]],
-        hashes: &[u128],
+        hashes: &[H::Digest],
         rows: &mut [u32],
         owner: &std::sync::Arc<dyn ArchiveOwner>,
     ) -> Self {
@@ -3348,7 +3580,7 @@ where
     #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn from_archive_partition_with_guard(
         keys: &[[u8; KEY_LEN]],
-        hashes: &[u128],
+        hashes: &[H::Digest],
         rows: &mut [u32],
         owner: &std::sync::Arc<dyn ArchiveOwner>,
         guard: &PATCHOwnerGuard,
@@ -3356,7 +3588,7 @@ where
         // Branch child tables use randomness initialized alongside the
         // hash-key bundle. A pre-hashed caller may reach this constructor
         // before PATCH::new.
-        init_hash_keys();
+        H::init();
         assert_eq!(keys.len(), hashes.len());
         assert_eq!(keys.len(), rows.len());
         assert!(
@@ -3436,16 +3668,17 @@ where
     ///
     /// All three build the same trie. Children own disjoint intervals of the
     /// permutation and disjoint subtrees of the result, the child heads are
-    /// reassembled in ascending key order either way, and the node hash is an
-    /// XOR over children — so neither the order children are built in nor the
-    /// order rows sit in within a bucket can reach the answer.
+    /// reassembled in ascending key order either way, and the node hash is a
+    /// canonical summary over edge-sorted children — so neither the order
+    /// children are built in nor the order rows sit in within a bucket can
+    /// reach the answer.
     #[cfg(any(test, feature = "parallel"))]
     unsafe fn build_archive_partition_head(
         keys: &[[u8; KEY_LEN]],
-        hashes: &[u128],
+        hashes: &[H::Digest],
         rows: &mut [u32],
         depth: usize,
-    ) -> (Head<KEY_LEN, O, ()>, u128) {
+    ) -> (Head<KEY_LEN, O, (), H>, H::Digest) {
         debug_assert!(!rows.is_empty());
         if rows.len() == 1 {
             let row = rows[0] as usize;
@@ -3514,10 +3747,12 @@ where
             )
         };
         let mut root = Head::new(0, body);
-        let mut hash = first_hash ^ second_hash;
+        let mut hash_state = H::begin_branch(KEY_LEN, end_depth, plan.fanout, rows.len() as u64);
+        H::push_child(&mut hash_state, first_bucket, first_hash);
+        H::push_child(&mut hash_state, second_bucket, second_hash);
         if plan.fanout == 2 {
             debug_assert_eq!(second_end, rows.len());
-            return (root, hash);
+            return (root, H::finish_branch(hash_state));
         }
 
         let mut editor = BranchMut::from_head(&mut root);
@@ -3532,14 +3767,16 @@ where
                     end_depth + 1,
                 )
             };
-            hash ^= child_hash;
+            H::push_child(&mut hash_state, byte, child_hash);
             editor.install_child_growing(child.with_key(byte));
             range_start = range_end;
         }
         debug_assert_eq!(range_start, rows.len());
 
-        // Rebuild structural aggregates once and install the exact XOR carried
-        // by recursion, avoiding another hash read from direct LocalLeaves.
+        // Rebuild structural aggregates once and install the exact canonical
+        // summary carried by recursion, avoiding another hash read from direct
+        // LocalLeaves.
+        let hash = H::finish_branch(hash_state);
         editor.finish_bulk_aggregates(hash);
         drop(editor);
         (root, hash)
@@ -3550,7 +3787,7 @@ where
     /// The partition hands each child a disjoint, contiguous interval of the
     /// permutation, so `split_at_mut` is the whole proof that the concurrent
     /// recursion cannot alias: disjoint rows, disjoint subtrees, and a node
-    /// hash that is an XOR over children.
+    /// hash summarized over children in canonical edge order.
     ///
     /// # Safety
     ///
@@ -3559,10 +3796,10 @@ where
     #[cfg(feature = "parallel")]
     unsafe fn build_archive_partition_children(
         keys: &[[u8; KEY_LEN]],
-        hashes: &[u128],
+        hashes: &[H::Digest],
         rows: &mut [u32],
         plan: &ArchivePartitionPlan,
-    ) -> (Head<KEY_LEN, O, ()>, u128) {
+    ) -> (Head<KEY_LEN, O, (), H>, H::Digest) {
         use rayon::prelude::*;
 
         let end_depth = plan.end_depth;
@@ -3578,7 +3815,7 @@ where
         }
         debug_assert!(remaining.is_empty());
 
-        let children: Vec<(u8, Head<KEY_LEN, O, ()>, u128)> = intervals
+        let children: Vec<(u8, Head<KEY_LEN, O, (), H>, H::Digest)> = intervals
             .into_par_iter()
             .map(|(byte, child_rows)| {
                 // SAFETY: the caller's contract holds for every subinterval,
@@ -3744,10 +3981,13 @@ where
     fn assemble_archive_partition_branch(
         end_depth: usize,
         initial_slots: usize,
-        mut children: Vec<(u8, Head<KEY_LEN, O, ()>, u128)>,
-    ) -> (Head<KEY_LEN, O, ()>, u128) {
+        children: Vec<(u8, Head<KEY_LEN, O, (), H>, H::Digest)>,
+    ) -> (Head<KEY_LEN, O, (), H>, H::Digest) {
         debug_assert!(children.len() >= 2);
-        let mut drain = children.drain(..);
+        debug_assert!(children.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let child_count = children.len();
+        let leaf_count = children.iter().map(|(_, child, _)| child.count()).sum();
+        let mut drain = children.into_iter();
         let (first_bucket, first_head, first_hash) = drain.next().expect("two children");
         let (second_bucket, second_head, second_hash) = drain.next().expect("two children");
         let body = if initial_slots == 2 {
@@ -3769,16 +4009,19 @@ where
             )
         };
         let mut root = Head::new(0, body);
-        let mut hash = first_hash ^ second_hash;
+        let mut hash_state = H::begin_branch(KEY_LEN, end_depth, child_count, leaf_count);
+        H::push_child(&mut hash_state, first_bucket, first_hash);
+        H::push_child(&mut hash_state, second_bucket, second_hash);
         let mut extra = drain.peekable();
         if extra.peek().is_none() {
-            return (root, hash);
+            return (root, H::finish_branch(hash_state));
         }
         let mut editor = BranchMut::from_head(&mut root);
         for (byte, child, child_hash) in extra {
-            hash ^= child_hash;
+            H::push_child(&mut hash_state, byte, child_hash);
             editor.install_child_growing(child.with_key(byte));
         }
+        let hash = H::finish_branch(hash_state);
         editor.finish_bulk_aggregates(hash);
         drop(editor);
         (root, hash)
@@ -3900,23 +4143,30 @@ struct ArchivePartitionPlan {
     initial_slots: usize,
 }
 
-impl<const KEY_LEN: usize, O, V> PartialEq for PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V, H> PartialEq for PATCH<KEY_LEN, O, V, H>
 where
     O: KeySchema<KEY_LEN>,
+    H: PatchHash,
 {
     fn eq(&self, other: &Self) -> bool {
         self.root.as_ref().map(|root| root.hash()) == other.root.as_ref().map(|root| root.hash())
     }
 }
 
-impl<const KEY_LEN: usize, O, V> Eq for PATCH<KEY_LEN, O, V> where O: KeySchema<KEY_LEN> {}
-
-impl<'a, const KEY_LEN: usize, O, V> IntoIterator for &'a PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V, H> Eq for PATCH<KEY_LEN, O, V, H>
 where
     O: KeySchema<KEY_LEN>,
+    H: PatchHash,
+{
+}
+
+impl<'a, const KEY_LEN: usize, O, V, H> IntoIterator for &'a PATCH<KEY_LEN, O, V, H>
+where
+    O: KeySchema<KEY_LEN>,
+    H: PatchHash,
 {
     type Item = &'a [u8; KEY_LEN];
-    type IntoIter = PATCHIterator<'a, KEY_LEN, O, V>;
+    type IntoIter = PATCHIterator<'a, KEY_LEN, O, V, H>;
 
     fn into_iter(self) -> Self::IntoIter {
         PATCHIterator::new(self)
@@ -3925,18 +4175,26 @@ where
 
 /// An iterator over all keys in a PATCH.
 /// The keys are returned in key ordering but in random order.
-pub struct PATCHIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+pub struct PATCHIterator<
+    'a,
+    const KEY_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+    H: PatchHash = XorSip128,
+> {
     // Root-to-leaf branch depths strictly increase within 0..KEY_LEN, so
     // seeding from the real root branch keeps the live stack within KEY_LEN.
-    stack: ArrayVec<std::slice::Iter<'a, Option<Head<KEY_LEN, O, V>>>, KEY_LEN>,
+    stack: ArrayVec<std::slice::Iter<'a, Option<Head<KEY_LEN, O, V, H>>>, KEY_LEN>,
     // A singleton root has no branch frame, including when KEY_LEN is zero.
     pending_leaf: Option<&'a [u8; KEY_LEN]>,
     remaining: usize,
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIterator<'a, KEY_LEN, O, V> {
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    PATCHIterator<'a, KEY_LEN, O, V, H>
+{
     /// Creates an iterator over all keys in `patch`.
-    pub fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
+    pub fn new(patch: &'a PATCH<KEY_LEN, O, V, H>) -> Self {
         let mut r = PATCHIterator {
             stack: ArrayVec::new(),
             pending_leaf: None,
@@ -3953,8 +4211,8 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIterator<'a, KEY_L
     }
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHIterator<'a, KEY_LEN, O, V>
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHIterator<'a, KEY_LEN, O, V, H>
 {
     type Item = &'a [u8; KEY_LEN];
 
@@ -3991,13 +4249,13 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
     }
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> ExactSizeIterator
-    for PATCHIterator<'a, KEY_LEN, O, V>
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ExactSizeIterator
+    for PATCHIterator<'a, KEY_LEN, O, V, H>
 {
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> std::iter::FusedIterator
-    for PATCHIterator<'a, KEY_LEN, O, V>
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> std::iter::FusedIterator
+    for PATCHIterator<'a, KEY_LEN, O, V, H>
 {
 }
 
@@ -4007,13 +4265,21 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> std::iter::FusedIterato
 /// layout in the underlying tree. This iterator walks the full tree and does
 /// not accept a prefix filter. For prefix-aware iteration, use
 /// [`PATCHPrefixIterator`], constructed via [`PATCH::iter_prefix_count`].
-pub struct PATCHOrderedIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
-    stack: Vec<ArrayVec<&'a Head<KEY_LEN, O, V>, 256>>,
+pub struct PATCHOrderedIterator<
+    'a,
+    const KEY_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+    H: PatchHash = XorSip128,
+> {
+    stack: Vec<ArrayVec<&'a Head<KEY_LEN, O, V, H>, 256>>,
     remaining: usize,
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a, KEY_LEN, O, V> {
-    pub fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
+{
+    pub fn new(patch: &'a PATCH<KEY_LEN, O, V, H>) -> Self {
         let mut r = PATCHOrderedIterator {
             stack: Vec::with_capacity(KEY_LEN),
             remaining: patch.len().min(usize::MAX as u64) as usize,
@@ -4038,16 +4304,26 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a
 // --- Owned consuming iterators ---
 /// Iterator that owns a PATCH and yields keys in key-order. The owner set is
 /// retained until every queued LocalLeaf has been copied out.
-pub struct PATCHIntoIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+pub struct PATCHIntoIterator<
+    const KEY_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+    H: PatchHash = XorSip128,
+> {
     // Field order is deliberate: queued Heads drop before the owner cover.
-    queue: Vec<Head<KEY_LEN, O, V>>,
+    queue: Vec<Head<KEY_LEN, O, V, H>>,
     remaining: usize,
     _owners: Option<Arc<OwnerCover>>,
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIntoIterator<KEY_LEN, O, V> {}
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    PATCHIntoIterator<KEY_LEN, O, V, H>
+{
+}
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator for PATCHIntoIterator<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHIntoIterator<KEY_LEN, O, V, H>
+{
     type Item = [u8; KEY_LEN];
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -4080,15 +4356,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator for PATCHIntoItera
 }
 
 /// Iterator that owns a PATCH and yields keys in key order.
-pub struct PATCHIntoOrderedIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+pub struct PATCHIntoOrderedIterator<
+    const KEY_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+    H: PatchHash = XorSip128,
+> {
     // Field order is deliberate: queued Heads drop before the owner cover.
-    queue: Vec<Head<KEY_LEN, O, V>>,
+    queue: Vec<Head<KEY_LEN, O, V, H>>,
     remaining: usize,
     _owners: Option<Arc<OwnerCover>>,
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHIntoOrderedIterator<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHIntoOrderedIterator<KEY_LEN, O, V, H>
 {
     type Item = [u8; KEY_LEN];
 
@@ -4108,7 +4389,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
                     return Some(*bytes);
                 }
                 BodyMut::Branch(branch) => {
-                    let slice: &mut [Option<Head<KEY_LEN, O, V>>] = &mut branch.child_table;
+                    let slice: &mut [Option<Head<KEY_LEN, O, V, H>>] = &mut branch.child_table;
                     // Sort children by their byte-key, placing empty slots (None)
                     // after all occupied slots. Using `sort_unstable_by_key` with
                     // a simple key projection is clearer than a custom
@@ -4130,9 +4411,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> IntoIterator for PATCH<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> IntoIterator
+    for PATCH<KEY_LEN, O, V, H>
+{
     type Item = [u8; KEY_LEN];
-    type IntoIter = PATCHIntoIterator<KEY_LEN, O, V>;
+    type IntoIter = PATCHIntoIterator<KEY_LEN, O, V, H>;
 
     fn into_iter(self) -> Self::IntoIter {
         let remaining = self.len().min(usize::MAX as u64) as usize;
@@ -4149,9 +4432,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> IntoIterator for PATCH<KEY_
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCH<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> PATCH<KEY_LEN, O, V, H> {
     /// Consume and return an iterator that yields keys in key order.
-    pub fn into_iter_ordered(self) -> PATCHIntoOrderedIterator<KEY_LEN, O, V> {
+    pub fn into_iter_ordered(self) -> PATCHIntoOrderedIterator<KEY_LEN, O, V, H> {
         let remaining = self.len().min(usize::MAX as u64) as usize;
         let PATCH { root, owners } = self;
         let mut q = Vec::new();
@@ -4166,8 +4449,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCH<KEY_LEN, O, V> {
     }
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHOrderedIterator<'a, KEY_LEN, O, V>
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
 {
     type Item = &'a [u8; KEY_LEN];
 
@@ -4199,13 +4482,13 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
     }
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> ExactSizeIterator
-    for PATCHOrderedIterator<'a, KEY_LEN, O, V>
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ExactSizeIterator
+    for PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
 {
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> std::iter::FusedIterator
-    for PATCHOrderedIterator<'a, KEY_LEN, O, V>
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> std::iter::FusedIterator
+    for PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
 {
 }
 
@@ -4217,14 +4500,15 @@ pub struct PATCHPrefixIterator<
     const PREFIX_LEN: usize,
     O: KeySchema<KEY_LEN>,
     V,
+    H: PatchHash = XorSip128,
 > {
-    stack: Vec<ArrayVec<&'a Head<KEY_LEN, O, V>, 256>>,
+    stack: Vec<ArrayVec<&'a Head<KEY_LEN, O, V, H>, 256>>,
 }
 
-impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V>
-    PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V>
+impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V, H>
 {
-    fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
+    fn new(patch: &'a PATCH<KEY_LEN, O, V, H>) -> Self {
         const {
             assert!(PREFIX_LEN <= KEY_LEN);
         }
@@ -4248,8 +4532,8 @@ impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V
     }
 }
 
-impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V>
+impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    Iterator for PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V, H>
 {
     type Item = ([u8; PREFIX_LEN], u64);
 
@@ -4294,6 +4578,96 @@ mod tests {
 
     #[repr(C, align(16))]
     struct AlignedArchiveKey<const KEY_LEN: usize>([u8; KEY_LEN]);
+
+    fn blake_patch<const KEY_LEN: usize>(
+        keys: &[[u8; KEY_LEN]],
+    ) -> PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle> {
+        let mut patch = PATCH::new();
+        for key in keys {
+            patch.insert(&Entry::<KEY_LEN, (), Blake3Merkle>::new(key));
+        }
+        patch
+    }
+
+    #[test]
+    fn blake3_merkle_authenticates_subtree_leaf_count() {
+        fn framed(leaf_count: u64) -> [u8; 32] {
+            let mut state = Blake3Merkle::begin_branch(16, 4, 2, leaf_count);
+            Blake3Merkle::push_child(&mut state, 3, [7; 32]);
+            Blake3Merkle::push_child(&mut state, 9, [11; 32]);
+            Blake3Merkle::finish_branch(state)
+        }
+
+        assert_ne!(framed(2), framed(3));
+    }
+
+    #[test]
+    fn blake3_merkle_is_history_independent_across_edits_and_set_operations() {
+        let keys = [
+            [0, 0, 0, 0],
+            [0, 0, 1, 0],
+            [0, 2, 0, 0],
+            [3, 0, 0, 0],
+            [3, 0, 0, 9],
+            [255, 1, 2, 3],
+        ];
+
+        let forward = blake_patch(&keys);
+        let mut reversed_keys = keys;
+        reversed_keys.reverse();
+        let reversed = blake_patch(&reversed_keys);
+        assert_eq!(forward.merkle_root(), reversed.merkle_root());
+        assert_eq!(forward, reversed);
+
+        let mut edited = forward.clone();
+        edited.remove(&keys[2]);
+        edited.insert(&Entry::<4, (), Blake3Merkle>::new(&keys[2]));
+        assert_eq!(edited.merkle_root(), forward.merkle_root());
+
+        let left = blake_patch(&keys[..4]);
+        let right = blake_patch(&keys[2..]);
+        let mut union = left.clone();
+        union.union(right.clone());
+        assert_eq!(union.merkle_root(), forward.merkle_root());
+
+        let expected_intersection = blake_patch(&keys[2..4]);
+        assert_eq!(
+            left.intersect(&right).merkle_root(),
+            expected_intersection.merkle_root()
+        );
+
+        let expected_difference = blake_patch(&keys[..2]);
+        assert_eq!(
+            left.difference(&right).merkle_root(),
+            expected_difference.merkle_root()
+        );
+    }
+
+    #[test]
+    fn blake3_merkle_heap_and_archive_construction_have_the_same_root() {
+        #[repr(C, align(16))]
+        struct AlignedBlakeArchive([[u8; 16]; 6]);
+
+        let storage = Arc::new(AlignedBlakeArchive([
+            [0; 16], [1; 16], [2; 16], [3; 16], [17; 16], [255; 16],
+        ]));
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let hashes = storage.0.map(|key| Blake3Merkle::leaf(&key));
+        let mut rows = [5, 3, 1, 4, 0, 2];
+
+        // SAFETY: the aligned wrapper makes every 16-byte row 16-byte
+        // aligned, the rows are a permutation, the keys are distinct and
+        // immutable, and `owner` retains the allocation.
+        let archive = unsafe {
+            PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_archive_partition(
+                &storage.0, &hashes, &mut rows, &owner,
+            )
+        };
+        let heap = blake_patch(&storage.0);
+
+        assert_eq!(archive.merkle_root(), heap.merkle_root());
+        assert_eq!(archive, heap);
+    }
 
     crate::key_segmentation!(PermutedInfixSegments, 12, [4, 4, 4]);
     crate::key_schema!(PermutedInfixSchema, PermutedInfixSegments, 12, [1, 2, 0]);
@@ -5486,9 +5860,38 @@ mod tests {
 
     #[test]
     fn patch_root_owner_cover_is_one_thin_arc() {
+        // Default-policy layout is a compatibility and performance contract:
+        // making PATCH generic must not charge TribleSet for the stronger
+        // digest it does not use.
+        assert_eq!(mem::size_of::<Entry<64, ()>>(), 8);
+        assert_eq!(mem::size_of::<Leaf<64, ()>>(), 96);
         assert_eq!(mem::size_of::<Head<64, IdentitySchema, ()>>(), 8);
+        assert_eq!(
+            mem::size_of::<Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 0], ()>>(
+            ),
+            48
+        );
         assert_eq!(mem::size_of::<Option<Arc<OwnerCover>>>(), 8);
         assert_eq!(mem::size_of::<PATCH<64, IdentitySchema, ()>>(), 16);
+
+        assert_eq!(mem::size_of::<Entry<64, (), Blake3Merkle>>(), 8);
+        assert_eq!(mem::size_of::<Leaf<64, (), Blake3Merkle>>(), 112);
+        assert_eq!(
+            mem::size_of::<
+                Branch<
+                    64,
+                    IdentitySchema,
+                    [Option<Head<64, IdentitySchema, (), Blake3Merkle>>; 0],
+                    (),
+                    Blake3Merkle,
+                >,
+            >(),
+            64
+        );
+        assert_eq!(
+            mem::size_of::<PATCH<64, IdentitySchema, (), Blake3Merkle>>(),
+            16
+        );
     }
 
     /// Checks what happens if we join two PATCHes that

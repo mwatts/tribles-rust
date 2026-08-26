@@ -9,8 +9,8 @@ ideas:
    like an immutable value with copy-on-write updates.
 2. **Adaptive width.** Every node is conceptually 256-ary, yet the physical
    footprint scales with the number of occupied children.
-3. **Hash maintenance.** Each subtree carries a 128-bit fingerprint that allows
-   set operations to skip identical branches early.
+3. **Hash maintenance.** Each subtree carries a policy-selected summary that
+   allows set operations to skip identical branches early.
 
 Together these properties let PATCH evaluate unions, intersections, and
 differences quickly while staying cache friendly and safe to clone.
@@ -115,7 +115,14 @@ joining any divergent covers once at aggregate set-operation boundaries.
 
 ## Hash maintenance
 
-On first use in a process, PATCH samples a private random key. Each leaf
+PATCH is generic over a sealed hash-maintenance policy. Sealing is part of the
+correctness boundary rather than API conservatism: set operations treat equal
+subtree summaries as equal key sets, so an invalid third-party implementation
+could silently lose data. The built-in policies share the same canonical trie
+and differ only in the summary cached by leaves and branches.
+
+The default `XorSip128` policy preserves PATCH's original hot-path layout and
+cost. On first use in a process it samples a private random key. Each leaf
 fingerprint is the 128-bit output of SipHash-2-4 under that key, and each branch
 stores the XOR of its children’s fingerprints. On insert or delete, the old
 contribution is XORed out and the new one XORed in, so aggregate maintenance is
@@ -140,6 +147,25 @@ blinding. Equal sets retain equal tokens within one process, while the XOR of
 public singleton tokens reveals nothing useful about the aggregate of their
 union. The token remains a 128-bit cache hint, not a durable content identifier
 or proof of equality.
+
+The `Blake3Merkle` policy provides a stable 256-bit root for durable indexes and
+anti-entropy. Leaves and branches have separate domains. A branch commits to
+the key width, compressed-path end depth, fanout, subtree leaf count, and each
+`(edge, child)` pair in ascending edge order, so insertion order and the cuckoo
+table's random physical placement cannot affect the root. BLAKE3 has no inverse
+update law:
+an edited branch is marked dirty and summarized once, in canonical order, when
+its branch editor closes. Only branches on the copy-on-write edit path pay that
+cost.
+
+BLAKE3's native chunk tree is not PATCH's tree. It represents fixed-size chunks
+of one byte stream, while PATCH is a sparse radix trie with path compression
+and changing fanout. Reusing BLAKE3 chaining values would require PATCH to cache
+the chunk tree's geometry as a second tree and would not make a child edit
+algebraic. Explicit branch framing through BLAKE3's streaming API is both
+simpler and canonical. Team-specific anti-entropy salts belong outside PATCH:
+key or domain-separate the stable Merkle root at the protocol boundary rather
+than making the collection's identity depend on who is comparing it.
 
 Archive-backed leaves do not cache their fingerprint, so PATCH avoids hashing
 them when an exact, cheaper decision is available. Pairs of leaf nodes involving

@@ -7,14 +7,11 @@ use std::alloc::alloc_zeroed;
 use std::alloc::dealloc;
 use std::alloc::handle_alloc_error;
 use std::alloc::Layout;
+use std::mem::{align_of, size_of};
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
-
-const BRANCH_ALIGN: usize = 16;
-const BRANCH_BASE_SIZE: usize = 48;
-const TABLE_ENTRY_SIZE: usize = 8;
 
 #[inline]
 pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
@@ -28,22 +25,26 @@ pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
 // encapsulates NonNull/pointer handling for mutating operations. When the
 // editor is dropped it automatically writes the final pointer back into the
 // owning Head via Head::set_body.
-pub(crate) type BranchNN<const KEY_LEN: usize, O, V> =
-    NonNull<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>>;
+pub(crate) type BranchNN<const KEY_LEN: usize, O, V, H> =
+    NonNull<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>>;
 
-pub(crate) struct BranchMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
-    head: &'a mut Head<KEY_LEN, O, V>,
-    branch_nn: BranchNN<KEY_LEN, O, V>,
+pub(crate) struct BranchMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> {
+    head: &'a mut Head<KEY_LEN, O, V, H>,
+    branch_nn: BranchNN<KEY_LEN, O, V, H>,
+    hash_dirty: bool,
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, O, V> {
-    pub(crate) fn from_head(head: &'a mut Head<KEY_LEN, O, V>) -> Self {
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    BranchMut<'a, KEY_LEN, O, V, H>
+{
+    pub(crate) fn from_head(head: &'a mut Head<KEY_LEN, O, V, H>) -> Self {
         match head.body_mut() {
             BodyMut::Branch(branch_ref) => {
                 let nn = unsafe { NonNull::new_unchecked(branch_ref as *mut _) };
                 Self {
                     head,
                     branch_nn: nn,
+                    hash_dirty: false,
                 }
             }
             BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) => {
@@ -53,42 +54,48 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     }
 
     #[allow(dead_code)]
-    pub(crate) fn from_slot(slot: &'a mut Option<Head<KEY_LEN, O, V>>) -> Self {
+    pub(crate) fn from_slot(slot: &'a mut Option<Head<KEY_LEN, O, V, H>>) -> Self {
         let head = slot.as_mut().expect("slot should not be empty");
         Self::from_head(head)
     }
 
     pub fn modify_child<F>(&mut self, key: u8, f: F)
     where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+        F: FnOnce(Option<Head<KEY_LEN, O, V, H>>) -> Option<Head<KEY_LEN, O, V, H>>,
     {
         // Delegate to the low-level NonNull based primitive which may grow and
         // update the pointer in-place.
-        Branch::modify_child(&mut self.branch_nn, key, f);
+        self.hash_dirty |= Branch::modify_child(&mut self.branch_nn, key, !self.hash_dirty, f);
     }
 
     /// Like [`modify_child`] but uses the supplied `inserted_hash`
     /// for the empty-slot insertion case instead of calling
     /// `inserted.hash()`. Lets archive ingest avoid recomputing
-    /// the LocalLeaf siphash24 once per index — the caller already
+    /// the LocalLeaf digest once per index — the caller already
     /// has it from `ArchiveEntry::hash`.
     ///
     /// The hint MUST equal the hash of whatever `f(None)` returns.
     /// When the slot is non-empty and `f(Some(_))` runs, the result
     /// is hashed normally (recursion result, hash already cached on
     /// the Branch).
-    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
+    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: H::Digest, f: F)
     where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+        F: FnOnce(Option<Head<KEY_LEN, O, V, H>>) -> Option<Head<KEY_LEN, O, V, H>>,
     {
-        Branch::modify_child_with_inserted_hint(&mut self.branch_nn, key, inserted_hash, f);
+        self.hash_dirty |= Branch::modify_child_with_inserted_hint(
+            &mut self.branch_nn,
+            key,
+            inserted_hash,
+            !self.hash_dirty,
+            f,
+        );
     }
 
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
     /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pub fn install_child_growing(&mut self, head: Head<KEY_LEN, O, V>) {
+    pub fn install_child_growing(&mut self, head: Head<KEY_LEN, O, V, H>) {
         unsafe {
             Branch::install_child_growing(&mut self.branch_nn, head);
         }
@@ -102,6 +109,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         unsafe {
             Branch::recompute_aggregates(&mut self.branch_nn);
         }
+        self.hash_dirty = false;
     }
 
     /// Finish a bulk rewrite while installing an independently accumulated
@@ -109,48 +117,67 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     ///
     /// Counts and the representative child pointer are rebuilt in one table
     /// scan, but child hashes are deliberately not read. Archive construction
-    /// already hashes each row once and carries the XOR aggregate through its
-    /// recursion, so re-reading direct `LocalLeaf` children here would repeat
-    /// that work for every index.
+    /// already hashes each row once and carries the exact branch summary
+    /// through its recursion, so re-reading direct `LocalLeaf` children here
+    /// would repeat that work for every index.
     #[cfg(any(test, feature = "parallel"))]
-    pub fn finish_bulk_aggregates(&mut self, known_hash: u128) {
+    pub fn finish_bulk_aggregates(&mut self, known_hash: H::Digest) {
         unsafe {
             Branch::finish_bulk_aggregates(&mut self.branch_nn, known_hash);
         }
+        self.hash_dirty = false;
     }
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Deref for BranchMut<'a, KEY_LEN, O, V> {
-    type Target = Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>;
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Deref
+    for BranchMut<'a, KEY_LEN, O, V, H>
+{
+    type Target = Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>;
 
     fn deref(&self) -> &Self::Target {
         unsafe { self.branch_nn.as_ref() }
     }
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> DerefMut for BranchMut<'a, KEY_LEN, O, V> {
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> DerefMut
+    for BranchMut<'a, KEY_LEN, O, V, H>
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.branch_nn.as_mut() }
     }
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for BranchMut<'a, KEY_LEN, O, V> {
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Drop
+    for BranchMut<'a, KEY_LEN, O, V, H>
+{
     fn drop(&mut self) {
+        if !H::INCREMENTAL_BRANCH && self.hash_dirty {
+            unsafe {
+                Branch::recompute_hash(&mut self.branch_nn);
+            }
+        }
         // Commit the final branch pointer into the owning Head.
         self.head.set_body(self.branch_nn);
     }
 }
 
 #[repr(C, align(16))]
-pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> {
+pub(crate) struct Branch<
+    const KEY_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    Table: ?Sized,
+    V,
+    H: PatchHash = XorSip128,
+> {
     key_ordering: PhantomData<O>,
     key_segments: PhantomData<O::Segmentation>,
     /// Phantom `V`: the value type is no longer stored on the branch
     /// itself (the childleaf is just `*const [u8; KEY_LEN]`), but it
-    /// stays carried so child `Head<KEY_LEN, O, V>` slots in
+    /// stays carried so child `Head<KEY_LEN, O, V, H>` slots in
     /// `child_table` and the `Body` impl for the concrete child-table
     /// shape stay generic in `V`.
     _value: PhantomData<fn() -> V>,
+    _hash_policy: PhantomData<H>,
 
     rc: atomic::AtomicU32,
     pub end_depth: u32,
@@ -163,7 +190,7 @@ pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Si
     pub childleaf: *const [u8; KEY_LEN],
     pub leaf_count: u64,
     pub segment_count: u64,
-    pub hash: u128,
+    pub hash: H::Digest,
     pub child_table: Table,
 }
 
@@ -172,7 +199,8 @@ impl<
         O: KeySchema<KEY_LEN>,
         Table: ?Sized + core::fmt::Debug,
         V: core::fmt::Debug,
-    > core::fmt::Debug for Branch<KEY_LEN, O, Table, V>
+        H: PatchHash,
+    > core::fmt::Debug for Branch<KEY_LEN, O, Table, V, H>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Branch")
@@ -187,7 +215,9 @@ impl<
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_LEN, O, Table, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V, H: PatchHash>
+    Branch<KEY_LEN, O, Table, V, H>
+{
     /// Returns the key bytes of the representative child leaf. The
     /// pointer is set to a heap `Leaf`'s `key` field (offset 0) or to
     /// a `LocalLeaf`'s archive-resident bytes; both yield the same
@@ -205,8 +235,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_L
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Body
-    for Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Body
+    for Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>
 {
     fn tag(body: NonNull<Self>) -> HeadTag {
         unsafe {
@@ -218,16 +248,53 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Body
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
-    Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>
 {
+    #[inline]
+    fn allocation_layout(size: usize) -> Layout {
+        let base = size_of::<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>; 0], V, H>>();
+        let bytes = base + size_of::<Option<Head<KEY_LEN, O, V, H>>>() * size;
+        // SAFETY: every caller bounds `size` to 2..=256; `base`, the Head
+        // stride, and the concrete Branch alignment are valid type layouts.
+        unsafe {
+            Layout::from_size_align_unchecked(
+                bytes,
+                align_of::<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>; 0], V, H>>(),
+            )
+        }
+    }
+
+    #[inline]
+    fn hash_two_children(
+        end_depth: usize,
+        lchild: &Head<KEY_LEN, O, V, H>,
+        lchild_hash: H::Digest,
+        rchild: &Head<KEY_LEN, O, V, H>,
+        rchild_hash: H::Digest,
+    ) -> H::Digest {
+        let leaf_count = lchild.count() + rchild.count();
+        let mut state = H::begin_branch(KEY_LEN, end_depth, 2, leaf_count);
+        if H::COMMUTATIVE_BRANCH {
+            H::push_child(&mut state, 0, lchild_hash);
+            H::push_child(&mut state, 0, rchild_hash);
+        } else if lchild.key() <= rchild.key() {
+            H::push_child(&mut state, lchild.key(), lchild_hash);
+            H::push_child(&mut state, rchild.key(), rchild_hash);
+        } else {
+            H::push_child(&mut state, rchild.key(), rchild_hash);
+            H::push_child(&mut state, lchild.key(), lchild_hash);
+        }
+        H::finish_branch(state)
+    }
+
     pub(super) fn new(
         end_depth: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
+        lchild: Head<KEY_LEN, O, V, H>,
+        rchild: Head<KEY_LEN, O, V, H>,
     ) -> NonNull<Self> {
         // Compute rchild's hash via the normal path. For LocalLeaf
-        // this triggers siphash24; the
+        // this computes the configured leaf digest; the
         // [`new_with_rchild_hash`] variant skips it when
         // the caller has the hash already.
         let rchild_hash = rchild.hash();
@@ -238,7 +305,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// `rchild_hash` and uses it instead of calling `rchild.hash()`.
     /// Lets archive-ingest divergence paths reuse the
     /// `ArchiveEntry::hash` they already have instead of recomputing
-    /// siphash24 over the LocalLeaf bytes.
+    /// the configured digest over the LocalLeaf bytes.
     ///
     /// `rchild_hash` MUST equal `rchild.hash()`. The lchild hash
     /// still goes through the normal path — it's typically a Branch
@@ -246,9 +313,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// recompute that matters is on the freshly inserted side.
     pub(super) fn new_with_rchild_hash(
         end_depth: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-        rchild_hash: u128,
+        lchild: Head<KEY_LEN, O, V, H>,
+        rchild: Head<KEY_LEN, O, V, H>,
+        rchild_hash: H::Digest,
     ) -> NonNull<Self> {
         let lchild_hash = lchild.hash();
         Self::new_with_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
@@ -259,22 +326,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// binary Branch without hashing either child a second time.
     pub(super) fn new_with_child_hashes(
         end_depth: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-        lchild_hash: u128,
-        rchild_hash: u128,
+        lchild: Head<KEY_LEN, O, V, H>,
+        rchild: Head<KEY_LEN, O, V, H>,
+        lchild_hash: H::Digest,
+        rchild_hash: H::Digest,
     ) -> NonNull<Self> {
         unsafe {
             let size = 2;
-            // SAFETY: `BRANCH_ALIGN` is a power of two and `size` is small enough
-            // that the computed layout size is valid.
-            let layout = Layout::from_size_align_unchecked(
-                BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * size),
-                BRANCH_ALIGN,
-            );
+            let layout = Self::allocation_layout(size);
             let Some(ptr) =
                 NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
-                    as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
+                    as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>)
             else {
                 handle_alloc_error(layout);
             };
@@ -284,7 +346,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild_hash ^ rchild_hash);
+            addr_of_mut!((*ptr.as_ptr()).hash).write(Self::hash_two_children(
+                end_depth,
+                &lchild,
+                lchild_hash,
+                &rchild,
+                rchild_hash,
+            ));
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
 
@@ -300,10 +368,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     #[cfg(any(test, feature = "parallel"))]
     pub(super) fn new_with_child_hashes_capacity(
         end_depth: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-        lchild_hash: u128,
-        rchild_hash: u128,
+        lchild: Head<KEY_LEN, O, V, H>,
+        rchild: Head<KEY_LEN, O, V, H>,
+        lchild_hash: H::Digest,
+        rchild_hash: H::Digest,
         size: usize,
     ) -> NonNull<Self> {
         assert!(
@@ -311,15 +379,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             "direct Branch capacity must be a power of two in 4..=256",
         );
         unsafe {
-            // SAFETY: the asserted size bound makes the trailing-table layout
-            // valid and keeps its length representable by a Branch Head tag.
-            let layout = Layout::from_size_align_unchecked(
-                BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * size),
-                BRANCH_ALIGN,
-            );
+            let layout = Self::allocation_layout(size);
             let Some(ptr) =
                 NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
-                    as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
+                    as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>)
             else {
                 handle_alloc_error(layout);
             };
@@ -330,7 +393,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild_hash ^ rchild_hash);
+            addr_of_mut!((*ptr.as_ptr()).hash).write(Self::hash_two_children(
+                end_depth,
+                &lchild,
+                lchild_hash,
+                &rchild,
+                rchild_hash,
+            ));
 
             if let Some(displaced) = (*ptr.as_ptr()).child_table.table_insert(lchild) {
                 Self::rc_dec(ptr);
@@ -379,12 +448,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
             std::ptr::drop_in_place(branch);
 
-            // SAFETY: layout parameters are constructed from constants and a
-            // runtime `size` that ensures alignment and size validity.
-            let layout = Layout::from_size_align_unchecked(
-                BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * size),
-                BRANCH_ALIGN,
-            );
+            let layout = Self::allocation_layout(size);
             let ptr = branch as *mut u8;
             dealloc(ptr, layout);
         }
@@ -401,15 +465,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 None
             } else {
                 let size = dst_len(addr_of!((*branch).child_table));
-                // SAFETY: `size` preserves alignment requirements and the size
-                // calculation cannot overflow for the allowed range.
-                let layout = Layout::from_size_align_unchecked(
-                    BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * size),
-                    BRANCH_ALIGN,
-                );
+                let layout = Self::allocation_layout(size);
                 if let Some(ptr) =
                     NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
-                        as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
+                        as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>)
                 {
                     addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
                     addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
@@ -442,17 +501,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             let new_size = old_size * 2;
             assert!(new_size <= 256);
 
-            // SAFETY: `new_size` is bounded and alignment is constant, so the
-            // resulting layout is valid for allocation.
-            let layout = Layout::from_size_align_unchecked(
-                BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * new_size),
-                BRANCH_ALIGN,
-            );
+            let layout = Self::allocation_layout(new_size);
             if let Some(ptr) = NonNull::new(std::ptr::slice_from_raw_parts(
                 alloc_zeroed(layout),
                 new_size,
             )
-                as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
+                as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>)
             {
                 addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
                 addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
@@ -466,7 +520,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     .child_table
                     .table_grow(&mut (*ptr.as_ptr()).child_table);
 
-                Branch::<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>::rc_dec(
+                Branch::<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>], V, H>::rc_dec(
                     NonNull::new_unchecked(branch),
                 );
 
@@ -488,13 +542,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// insert/update/remove logic in one place and updates branch aggregates
     /// and `childleaf` as needed. The `branch_nn` pointer may be updated in
     /// place when the underlying allocation grows.
-    pub(super) fn modify_child<F>(branch_nn: &mut NonNull<Self>, key: u8, f: F)
+    pub(super) fn modify_child<F>(
+        branch_nn: &mut NonNull<Self>,
+        key: u8,
+        hash_is_current: bool,
+        f: F,
+    ) -> bool
     where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+        F: FnOnce(Option<Head<KEY_LEN, O, V, H>>) -> Option<Head<KEY_LEN, O, V, H>>,
     {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
+            let mut hash_dirty = !hash_is_current;
 
             // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
@@ -507,7 +567,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
                 if let Some(new_child) = f(Some(child)) {
                     // Replace existing child
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
+                    let new_child_hash = new_child.hash();
+                    if hash_is_current && H::INCREMENTAL_BRANCH {
+                        (*branch).hash = H::edit_branch(
+                            (*branch).hash,
+                            key,
+                            Some(old_child_hash),
+                            Some(new_child_hash),
+                        );
+                    } else if !H::INCREMENTAL_BRANCH {
+                        hash_dirty = true;
+                    }
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -522,7 +592,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     }
                 } else {
                     // Remove existing child
-                    (*branch).hash ^= old_child_hash;
+                    if hash_is_current && H::INCREMENTAL_BRANCH {
+                        (*branch).hash =
+                            H::edit_branch((*branch).hash, key, Some(old_child_hash), None);
+                    } else if !H::INCREMENTAL_BRANCH {
+                        hash_dirty = true;
+                    }
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
 
@@ -540,7 +615,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    (*branch).hash ^= inserted.hash();
+                    let inserted_hash = inserted.hash();
+                    if hash_is_current && H::INCREMENTAL_BRANCH {
+                        (*branch).hash =
+                            H::edit_branch((*branch).hash, key, None, Some(inserted_hash));
+                    } else if !H::INCREMENTAL_BRANCH {
+                        hash_dirty = true;
+                    }
 
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();
@@ -555,7 +636,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             }
             // Debug invariant check (no-op in release builds).
             #[cfg(debug_assertions)]
-            branch_nn.as_ref().debug_check_invariants();
+            if !hash_dirty {
+                branch_nn.as_ref().debug_check_invariants();
+            }
+            hash_dirty
         }
     }
 
@@ -568,14 +652,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     pub(super) fn modify_child_with_inserted_hint<F>(
         branch_nn: &mut NonNull<Self>,
         key: u8,
-        inserted_hash: u128,
+        inserted_hash: H::Digest,
+        hash_is_current: bool,
         f: F,
-    ) where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    ) -> bool
+    where
+        F: FnOnce(Option<Head<KEY_LEN, O, V, H>>) -> Option<Head<KEY_LEN, O, V, H>>,
     {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
+            let mut hash_dirty = !hash_is_current;
 
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
@@ -589,7 +676,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Recursion result — its hash is cached on the
                     // returned Head (Branch.hash field), so calling
                     // .hash() is cheap.
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
+                    let new_child_hash = new_child.hash();
+                    if hash_is_current && H::INCREMENTAL_BRANCH {
+                        (*branch).hash = H::edit_branch(
+                            (*branch).hash,
+                            key,
+                            Some(old_child_hash),
+                            Some(new_child_hash),
+                        );
+                    } else if !H::INCREMENTAL_BRANCH {
+                        hash_dirty = true;
+                    }
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -603,7 +700,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         unreachable!();
                     }
                 } else {
-                    (*branch).hash ^= old_child_hash;
+                    if hash_is_current && H::INCREMENTAL_BRANCH {
+                        (*branch).hash =
+                            H::edit_branch((*branch).hash, key, Some(old_child_hash), None);
+                    } else if !H::INCREMENTAL_BRANCH {
+                        hash_dirty = true;
+                    }
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
 
@@ -616,10 +718,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             } else {
                 if let Some(mut inserted) = f(None) {
                     // Use the caller-supplied hint instead of
-                    // recomputing siphash24 over the LocalLeaf bytes.
+                    // recomputing the configured digest over the LocalLeaf bytes.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    (*branch).hash ^= inserted_hash;
+                    if hash_is_current && H::INCREMENTAL_BRANCH {
+                        (*branch).hash =
+                            H::edit_branch((*branch).hash, key, None, Some(inserted_hash));
+                    } else if !H::INCREMENTAL_BRANCH {
+                        hash_dirty = true;
+                    }
 
                     let mut branch_ptr = branch_nn.as_ptr();
                     while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
@@ -631,7 +738,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 }
             }
             #[cfg(debug_assertions)]
-            branch_nn.as_ref().debug_check_invariants();
+            if !hash_dirty {
+                branch_nn.as_ref().debug_check_invariants();
+            }
+            hash_dirty
         }
     }
 
@@ -649,7 +759,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) unsafe fn install_child_growing(
         branch_nn: &mut NonNull<Self>,
-        head: Head<KEY_LEN, O, V>,
+        head: Head<KEY_LEN, O, V, H>,
     ) {
         let mut to_insert = head;
         let mut branch_ptr = branch_nn.as_ptr();
@@ -670,13 +780,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let end_depth = (*branch).end_depth as usize;
         let mut agg_leaf_count: u64 = 0;
         let mut agg_segment_count: u64 = 0;
-        let mut agg_hash: u128 = 0;
         let mut first_childleaf: *const [u8; KEY_LEN] = std::ptr::null();
 
         for child in (*branch).child_table.iter().flatten() {
             agg_leaf_count += child.count();
             agg_segment_count += child.count_segment(end_depth);
-            agg_hash ^= child.hash();
             if first_childleaf.is_null() {
                 first_childleaf = child.childleaf_ptr();
             }
@@ -684,7 +792,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         (*branch).leaf_count = agg_leaf_count;
         (*branch).segment_count = agg_segment_count;
-        (*branch).hash = agg_hash;
+        Self::recompute_hash(branch_nn);
         if !first_childleaf.is_null() {
             (*branch).childleaf = first_childleaf;
         }
@@ -693,10 +801,36 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         branch_nn.as_ref().debug_check_invariants();
     }
 
+    /// Rebuild only the hash summary in canonical child-edge order.
+    pub(crate) unsafe fn recompute_hash(branch_nn: &mut NonNull<Self>) {
+        let branch = branch_nn.as_ptr();
+        let mut edges = ByteSet::new_empty();
+        for child in (*branch).child_table.iter().flatten() {
+            edges.insert(child.key());
+        }
+        let mut state = H::begin_branch(
+            KEY_LEN,
+            (*branch).end_depth as usize,
+            edges.popcount() as usize,
+            (*branch).leaf_count,
+        );
+        while let Some(edge) = edges.drain_next_ascending() {
+            let child = (*branch)
+                .child_table
+                .table_get(edge)
+                .expect("enumerated PATCH child must remain present");
+            H::push_child(&mut state, edge, child.hash());
+        }
+        (*branch).hash = H::finish_branch(state);
+    }
+
     /// Rebuild structural aggregates after a batch of child installations and
     /// install a caller-proven exact hash without traversing child hashes.
     #[cfg(any(test, feature = "parallel"))]
-    pub(crate) unsafe fn finish_bulk_aggregates(branch_nn: &mut NonNull<Self>, known_hash: u128) {
+    pub(crate) unsafe fn finish_bulk_aggregates(
+        branch_nn: &mut NonNull<Self>,
+        known_hash: H::Digest,
+    ) {
         let branch = branch_nn.as_ptr();
         let end_depth = (*branch).end_depth as usize;
         let mut agg_leaf_count: u64 = 0;
@@ -740,13 +874,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let end_depth: usize = self.end_depth as usize;
         let mut agg_leaf_count: u64 = 0;
         let mut agg_segment_count: u64 = 0;
-        let mut agg_hash: u128 = 0;
         let mut match_found = false;
+
+        let mut edges = ByteSet::new_empty();
 
         for child in self.child_table.iter().flatten() {
             agg_leaf_count = agg_leaf_count.saturating_add(child.count());
             agg_segment_count = agg_segment_count.saturating_add(child.count_segment(end_depth));
-            agg_hash ^= child.hash();
+            edges.insert(child.key());
             if child.childleaf_ptr() == self.childleaf {
                 match_found = true;
             }
@@ -760,7 +895,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             agg_segment_count, self.segment_count,
             "branch.segment_count mismatch"
         );
-        debug_assert_eq!(agg_hash, self.hash, "branch.hash mismatch");
+        let mut state = H::begin_branch(
+            KEY_LEN,
+            end_depth,
+            edges.popcount() as usize,
+            self.leaf_count,
+        );
+        while let Some(edge) = edges.drain_next_ascending() {
+            let child = self
+                .child_table
+                .table_get(edge)
+                .expect("enumerated PATCH child must remain present");
+            H::push_child(&mut state, edge, child.hash());
+        }
+        debug_assert_eq!(H::finish_branch(state), self.hash, "branch.hash mismatch");
 
         // If there are any leaves aggregated in this branch then the
         // `childleaf` pointer must match one of the children. When the
@@ -1162,12 +1310,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             // representative IS the lookup target. For ZST `V` (the only
             // shape compatible with `LocalLeaf`-backed childleaves) we
             // synthesize a reference from a dangling pointer; otherwise
-            // the childleaf points at a heap `Leaf<KEY_LEN, V>` whose
+            // the childleaf points at a heap `Leaf<KEY_LEN, V, H>` whose
             // `key` field is at offset 0, so casting recovers the Leaf.
             if std::mem::size_of::<V>() == 0 {
                 return Some(unsafe { std::ptr::NonNull::<V>::dangling().as_ref() });
             }
-            let leaf_ptr = self.childleaf as *const Leaf<KEY_LEN, V>;
+            let leaf_ptr = self.childleaf as *const Leaf<KEY_LEN, V, H>;
             return Some(unsafe { &(*leaf_ptr).value });
         }
 

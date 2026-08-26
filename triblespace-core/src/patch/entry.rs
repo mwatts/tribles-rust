@@ -11,25 +11,25 @@ use std::sync::Arc;
 /// field.
 #[derive(Debug)]
 #[repr(C)]
-pub struct Entry<const KEY_LEN: usize, V = ()> {
-    ptr: NonNull<Leaf<KEY_LEN, V>>,
+pub struct Entry<const KEY_LEN: usize, V = (), H: PatchHash = XorSip128> {
+    ptr: NonNull<Leaf<KEY_LEN, V, H>>,
 }
 
-impl<const KEY_LEN: usize> Entry<KEY_LEN> {
+impl<const KEY_LEN: usize, H: PatchHash> Entry<KEY_LEN, (), H> {
     /// Creates a new entry with the given key and a unit value.
     pub fn new(key: &[u8; KEY_LEN]) -> Self {
         unsafe {
-            let ptr = Leaf::<KEY_LEN, ()>::new(key, ());
+            let ptr = Leaf::<KEY_LEN, (), H>::new(key, ());
             Self { ptr }
         }
     }
 }
 
-impl<const KEY_LEN: usize, V> Entry<KEY_LEN, V> {
+impl<const KEY_LEN: usize, V, H: PatchHash> Entry<KEY_LEN, V, H> {
     /// Creates a new entry with the given key and associated value.
     pub fn with_value(key: &[u8; KEY_LEN], value: V) -> Self {
         unsafe {
-            let ptr = Leaf::<KEY_LEN, V>::new(key, value);
+            let ptr = Leaf::<KEY_LEN, V, H>::new(key, value);
             Self { ptr }
         }
     }
@@ -39,12 +39,12 @@ impl<const KEY_LEN: usize, V> Entry<KEY_LEN, V> {
         unsafe { &self.ptr.as_ref().value }
     }
 
-    pub(super) fn leaf<O: KeySchema<KEY_LEN>>(&self) -> Head<KEY_LEN, O, V> {
+    pub(super) fn leaf<O: KeySchema<KEY_LEN>>(&self) -> Head<KEY_LEN, O, V, H> {
         unsafe { Head::new(0, Leaf::rc_inc(self.ptr)) }
     }
 }
 
-impl<const KEY_LEN: usize, V> Clone for Entry<KEY_LEN, V> {
+impl<const KEY_LEN: usize, V, H: PatchHash> Clone for Entry<KEY_LEN, V, H> {
     fn clone(&self) -> Self {
         unsafe {
             Self {
@@ -54,7 +54,7 @@ impl<const KEY_LEN: usize, V> Clone for Entry<KEY_LEN, V> {
     }
 }
 
-impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
+impl<const KEY_LEN: usize, V, H: PatchHash> Drop for Entry<KEY_LEN, V, H> {
     fn drop(&mut self) {
         unsafe {
             Leaf::rc_dec(self.ptr);
@@ -78,19 +78,19 @@ impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
 ///
 /// Only valid for `V = ()` because archive bytes don't carry a value
 /// field — the constructor's type parameter enforces this.
-pub struct ArchiveEntry<'a, const KEY_LEN: usize> {
+pub struct ArchiveEntry<'a, const KEY_LEN: usize, H: PatchHash = XorSip128> {
     pub(super) ptr: NonNull<[u8; KEY_LEN]>,
     pub(super) owner: &'a Arc<dyn ArchiveOwner>,
-    /// Pre-computed siphash24 of the trible bytes (matches what
+    /// Precomputed policy digest of the trible bytes (matches what
     /// `Head::hash()` would compute on the resulting `LocalLeaf`).
     /// Cached once at `ArchiveEntry::new` so the 6-way fan-out across
     /// covering indexes runs one hash instead of six.
-    pub(super) hash: u128,
+    pub(super) hash: H::Digest,
 }
 
-impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
+impl<'a, const KEY_LEN: usize, H: PatchHash> ArchiveEntry<'a, KEY_LEN, H> {
     /// Creates an `ArchiveEntry` referencing a `[u8; KEY_LEN]` trible
-    /// inside an archive's bytes. Computes the siphash24 of the
+    /// inside an archive's bytes. Computes the policy digest of the
     /// trible's bytes eagerly so the 6 covering indexes can share it.
     ///
     /// # Safety
@@ -110,7 +110,7 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
             0,
             "ArchiveEntry pointer must be 16-byte aligned"
         );
-        let hash = unsafe { hash_leaf_bytes(&ptr.as_ref()[..]) };
+        let hash = unsafe { H::leaf(&ptr.as_ref()[..]) };
         Self { ptr, owner, hash }
     }
 
@@ -118,7 +118,11 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     /// Arc, and the pre-computed leaf hash.
     pub(super) fn leaf<O: KeySchema<KEY_LEN>>(
         &self,
-    ) -> (Head<KEY_LEN, O, ()>, &'a Arc<dyn ArchiveOwner>, u128) {
+    ) -> (
+        Head<KEY_LEN, O, (), H>,
+        &'a Arc<dyn ArchiveOwner>,
+        H::Digest,
+    ) {
         unsafe { (Head::new_local_leaf(0, self.ptr), self.owner, self.hash) }
     }
 
@@ -128,15 +132,15 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     }
 }
 
-impl<'a, const KEY_LEN: usize> Copy for ArchiveEntry<'a, KEY_LEN> {}
+impl<'a, const KEY_LEN: usize, H: PatchHash> Copy for ArchiveEntry<'a, KEY_LEN, H> {}
 
-impl<'a, const KEY_LEN: usize> Clone for ArchiveEntry<'a, KEY_LEN> {
+impl<'a, const KEY_LEN: usize, H: PatchHash> Clone for ArchiveEntry<'a, KEY_LEN, H> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, const KEY_LEN: usize> core::fmt::Debug for ArchiveEntry<'a, KEY_LEN> {
+impl<'a, const KEY_LEN: usize, H: PatchHash> core::fmt::Debug for ArchiveEntry<'a, KEY_LEN, H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ArchiveEntry")
             .field("ptr", &self.ptr)
