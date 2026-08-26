@@ -212,6 +212,38 @@ matching records. No local match leaves the WANT pending while periodic
 inventory sweeps continue. Obtaining a receipt's result content is a separate
 blob WANT.
 
+## Lattice-aware exact collection reuse
+
+Inventory synchronization converges immutable collection equations, but it
+does not blindly mirror every artifact named by them. An exact derived
+collection can instead ask `ensure_exact_derived` to reuse a physical cover
+already materialized elsewhere:
+
+1. the caller supplies one frozen, authenticated source ticket whose source
+   data and dependencies are resident locally;
+2. the peer freezes target `MERGE` and `DERIVE` result handles from its current
+   converged record view as speculative availability offers;
+3. the core exact resolver first accepts any complete resident cover, then—if
+   local bytes are insufficient—selects an exact antichain from those offers;
+4. the network fetches only the selected handles with authenticated exact
+   `GET_BLOB` requests and probes the same ticket again;
+5. an absent, malformed, or stale offer is removed and the resolver replans;
+   when no offered cover remains, ordinary local `ensure_exact` construction
+   is the fallback.
+
+Offers never authorize source truth and never override a complete local cover.
+Fetched target bytes are content-checked, representation-validated on the next
+probe, and admitted only as local cache evidence. These speculative reads do
+not create durable WANTs; callers that want long-lived residency must state
+that policy separately.
+
+Current `MERGE` and `DERIVE` equations are unsigned reproducible evidence. The
+exact resolver therefore recomputes their canonical results from authenticated
+source roots before trusting the offered identities. Remote reuse saves
+bandwidth and avoids retaining redundant artifacts, but does not yet attest
+away that derivation computation. A future cheaper exact witness may improve
+compute reuse without weakening this boundary.
+
 ## Wire surface
 
 All direct operations use

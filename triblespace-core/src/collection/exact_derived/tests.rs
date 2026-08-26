@@ -1430,6 +1430,256 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
 }
 
 #[test]
+fn offered_upper_is_selected_as_one_remote_cover_member() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
+    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let mut store = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
+        .collect();
+    for (source, target) in sources.iter().zip(&targets) {
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                kernel().target_collection(),
+                data(source),
+                data(target),
+            )))
+            .unwrap();
+    }
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().target_collection(),
+            data(&targets[0]),
+            data(&targets[1]),
+            data(&upper),
+        )))
+        .unwrap();
+
+    let offered = BTreeSet::from([data(&targets[0]), data(&targets[1]), data(&upper)]);
+    match kernel()
+        .probe_exact(&mut store, &ticket, &TestAlgebra, &offered)
+        .unwrap()
+    {
+        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![data(&upper)]),
+        ExactAttachPlan::Ready(_) => panic!("nonresident offered upper was already ready"),
+    }
+
+    store.put::<UnknownBlob, _>(upper.clone()).unwrap();
+    match kernel()
+        .probe_exact(&mut store, &ticket, &TestAlgebra, &offered)
+        .unwrap()
+    {
+        ExactAttachPlan::Ready(cover) => {
+            assert_eq!(cover_ids(&cover), vec![data(&upper)]);
+        }
+        ExactAttachPlan::Fetch(fetch) => panic!("landed upper still requested: {fetch:?}"),
+    }
+}
+
+#[test]
+fn unavailable_offered_upper_replans_to_offered_lower_cover() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
+    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let mut store = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
+        .collect();
+    for (source, target) in sources.iter().zip(&targets) {
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                kernel().target_collection(),
+                data(source),
+                data(target),
+            )))
+            .unwrap();
+    }
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().target_collection(),
+            data(&targets[0]),
+            data(&targets[1]),
+            data(&upper),
+        )))
+        .unwrap();
+
+    let mut offered = BTreeSet::from([data(&targets[0]), data(&targets[1]), data(&upper)]);
+    match kernel()
+        .probe_exact(&mut store, &ticket, &TestAlgebra, &offered)
+        .unwrap()
+    {
+        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![data(&upper)]),
+        ExactAttachPlan::Ready(_) => panic!("nonresident offered upper was already ready"),
+    }
+
+    offered.remove(&data(&upper));
+    let expected: Vec<_> = offered.iter().copied().collect();
+    match kernel()
+        .probe_exact(&mut store, &ticket, &TestAlgebra, &offered)
+        .unwrap()
+    {
+        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, expected),
+        ExactAttachPlan::Ready(_) => panic!("nonresident offered lowers were already ready"),
+    }
+    for target in targets {
+        store.put::<UnknownBlob, _>(target).unwrap();
+    }
+    match kernel()
+        .probe_exact(&mut store, &ticket, &TestAlgebra, &offered)
+        .unwrap()
+    {
+        ExactAttachPlan::Ready(cover) => assert_eq!(cover_ids(&cover), expected),
+        ExactAttachPlan::Fetch(fetch) => panic!("landed lowers still requested: {fetch:?}"),
+    }
+}
+
+#[test]
+fn offered_upper_does_not_displace_a_complete_resident_lower_cover() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
+    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let mut store = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
+        .collect();
+    for (source, target) in sources.iter().zip(&targets) {
+        store.put::<UnknownBlob, _>(target.clone()).unwrap();
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                kernel().target_collection(),
+                data(source),
+                data(target),
+            )))
+            .unwrap();
+    }
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().target_collection(),
+            data(&targets[0]),
+            data(&targets[1]),
+            data(&upper),
+        )))
+        .unwrap();
+
+    match kernel()
+        .probe_exact(
+            &mut store,
+            &ticket,
+            &TestAlgebra,
+            &BTreeSet::from([data(&upper)]),
+        )
+        .unwrap()
+    {
+        ExactAttachPlan::Ready(cover) => {
+            let expected: Vec<_> = targets
+                .iter()
+                .map(data)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            assert_eq!(cover_ids(&cover), expected);
+        }
+        ExactAttachPlan::Fetch(fetch) => {
+            panic!("remote upper displaced a complete resident cover: {fetch:?}")
+        }
+    }
+}
+
+#[test]
+fn unrelated_and_rejected_offers_never_become_fetch_work() {
+    let source = archive([(1, 3)]);
+    let mut store = MemoryRepo::default();
+    let commit = source_commit(&mut store, 1, &source);
+    let lying_output = data(&derive(&archive([(9, 9)])).unwrap());
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::new(
+            kernel().target_collection(),
+            data(&source),
+            lying_output,
+        )))
+        .unwrap();
+    let unrelated = CollectionData::new([0xEE; 32]);
+
+    match kernel().probe_exact(
+        &mut store,
+        &[commit],
+        &TestAlgebra,
+        &BTreeSet::from([lying_output, unrelated]),
+    ) {
+        Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
+        Err(error) => panic!("unexpected rejected-offer error: {error:?}"),
+        Ok(ExactAttachPlan::Fetch(fetch)) => {
+            panic!("unrelated or rejected offers became fetch work: {fetch:?}")
+        }
+        Ok(ExactAttachPlan::Ready(_)) => panic!("rejected equation completed the ticket"),
+    }
+}
+
+#[test]
+fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
+    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let mut store = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
+        .collect();
+    for (source, target) in sources.iter().zip(&targets) {
+        store.put::<UnknownBlob, _>(target.clone()).unwrap();
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                kernel().target_collection(),
+                data(source),
+                data(target),
+            )))
+            .unwrap();
+    }
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().target_collection(),
+            data(&targets[0]),
+            data(&targets[1]),
+            data(&upper),
+        )))
+        .unwrap();
+    let wrong = derive(&archive([(9, 9)])).unwrap();
+    store
+        .put::<UnknownBlob, _>(Blob::<UnknownBlob>::with_handle(
+            wrong.bytes,
+            upper.get_handle(),
+        ))
+        .unwrap();
+
+    let offered = BTreeSet::from([data(&upper)]);
+    match kernel()
+        .probe_exact(&mut store, &ticket, &TestAlgebra, &offered)
+        .unwrap()
+    {
+        ExactAttachPlan::Ready(cover) => {
+            let expected: Vec<_> = targets
+                .iter()
+                .map(data)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            assert_eq!(cover_ids(&cover), expected);
+        }
+        ExactAttachPlan::Fetch(fetch) => {
+            panic!("corrupt local upper became a remote fetch request: {fetch:?}")
+        }
+    }
+}
+
+#[test]
 fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
     let source = archive([(1, 3)]);
     let expected = derive(&source).unwrap();

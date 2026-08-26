@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add lattice-aware exact derived-collection reuse over the existing team
+  transport. The core resolver accepts speculative remote target handles,
+  prefers any complete resident cover, selects only an exact physical
+  antichain when local bytes are incomplete, and replans after stale or invalid
+  offers. `triblespace-net::collection_sync::ensure_exact_derived` fetches only
+  those selected handles through authenticated `GET_BLOB`, creates no durable
+  WANT, and falls back to canonical local construction. Remote equations remain
+  unsigned cache evidence and are recomputed from the authenticated source
+  ticket, so this first slice saves transfer and residency rather than claiming
+  a compute attestation.
+
 - Add a monotone native store-scope assertion binding one physical repository
   to exactly one Ed25519 team trust root. `MemoryRepo`, `Pile`, and `Yard`
   expose explicit idempotent binding; pile concatenation preserves every

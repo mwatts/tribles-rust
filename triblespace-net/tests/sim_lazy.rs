@@ -18,23 +18,32 @@ mod common;
 use std::time::Duration;
 use triblespace_core::collection::reach;
 
-use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::{Blob, BlobEncoding};
+use triblespace_core::collection::descriptor;
+use triblespace_core::collection::exact_derived::{
+    ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
+};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
-    CollectionMerge, CollectionRecord, CollectionStore, simplearchive_union,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionRecord,
+    CollectionStore, simplearchive_union,
 };
 use triblespace_core::inline::Inline;
+use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
     BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, WantRequest, WantStore,
 };
+use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
+use triblespace_net::collection_sync::ensure_exact_derived;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 use common::*;
@@ -55,6 +64,87 @@ fn content_blob(tag_byte: u8) -> (Blob<SimpleArchive>, [u8; 32]) {
     let blob: Blob<SimpleArchive> = ts.to_blob();
     let hash = blob.get_handle().raw;
     (blob, hash)
+}
+
+fn collection_data<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData
+where
+    Handle<E>: InlineEncoding,
+{
+    Handle::<E>::to_hash(blob.get_handle())
+}
+
+fn derive_test_target(source: &Blob<SimpleArchive>) -> Blob<UnknownBlob> {
+    let mut bytes = source.bytes.as_ref().to_vec();
+    bytes.push(0xA5);
+    Blob::new(bytes.into())
+}
+
+struct NetworkTestAlgebra {
+    source: Fragment,
+    target: Fragment,
+}
+
+impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for NetworkTestAlgebra {
+    fn validate_source(
+        &self,
+        descriptor: &Fragment,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<(), ExactAlgebraError> {
+        if descriptor != &self.source {
+            return Err(ExactAlgebraError::Fatal(
+                "wrong network-test source descriptor".to_owned(),
+            ));
+        }
+        simplearchive_union::validate_element(source)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &Fragment,
+        target: &Blob<UnknownBlob>,
+    ) -> Result<(), ExactAlgebraError> {
+        if descriptor != &self.target {
+            return Err(ExactAlgebraError::Fatal(
+                "wrong network-test target descriptor".to_owned(),
+            ));
+        }
+        let Some(source) = target.bytes.as_ref().strip_suffix(&[0xA5]) else {
+            return Err(ExactAlgebraError::Fatal(
+                "network-test target lacks its canonical suffix".to_owned(),
+            ));
+        };
+        simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn join_source(
+        &self,
+        low: &Blob<SimpleArchive>,
+        high: &Blob<SimpleArchive>,
+    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
+        simplearchive_union::join(low, high)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn derive(&self, source: &Blob<SimpleArchive>) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
+        Ok(derive_test_target(source))
+    }
+
+    fn join_target(
+        &self,
+        low: &Blob<UnknownBlob>,
+        high: &Blob<UnknownBlob>,
+    ) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
+        self.validate_target(&self.target, low)?;
+        self.validate_target(&self.target, high)?;
+        let low =
+            Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
+        let high =
+            Blob::<SimpleArchive>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
+        self.join_source(&low, &high)
+            .map(|joined| derive_test_target(&joined))
+    }
 }
 
 /// Drive `fut` to completion, stepping the sim between polls so the
@@ -251,6 +341,288 @@ fn fetch_blob_pulls_from_the_holder() {
             blake3::hash(&got).as_bytes(),
             &hash,
             "fetched bytes must hash to the requested content id"
+        );
+    });
+}
+
+/// The exact empty bottom is independent of both storage and the network. In
+/// particular, asking for it must not opportunistically admit inventory that
+/// is already waiting at the peer boundary.
+#[test]
+fn empty_exact_ticket_does_not_admit_pending_inventory() {
+    let _g = sim_guard();
+    run_paused(0xC0AE_0000, async {
+        let net = SimNet::new(0xC0AE_0000, SimConfig::default());
+        let root = key(0xF3);
+        let server_key = key(0xA3);
+        let client_key = key(0xB3);
+        let namespace = key(0xD3).verifying_key();
+        let team_root = root.verifying_key();
+
+        let source_descriptor = simplearchive_union::descriptor(
+            &CollectionName::new("network-empty-source").unwrap(),
+            namespace,
+            None,
+            reach::private(),
+        );
+        let target_descriptor = descriptor::naming(
+            &CollectionName::new("network-empty-target").unwrap(),
+            namespace,
+            None,
+            <UnknownBlob as MetaDescribe>::id(),
+            simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
+            reach::private(),
+        );
+        let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
+            source_descriptor.clone(),
+            target_descriptor.clone(),
+        );
+        let algebra = NetworkTestAlgebra {
+            source: source_descriptor,
+            target: target_descriptor,
+        };
+
+        let lower_a = Blob::<UnknownBlob>::new(vec![0x31].into());
+        let lower_b = Blob::<UnknownBlob>::new(vec![0x32].into());
+        let upper = Blob::<UnknownBlob>::new(vec![0x33].into());
+        let marker = CollectionMerge::new(
+            lifecycle.target_collection(),
+            collection_data(&lower_a),
+            collection_data(&lower_b),
+            collection_data(&upper),
+        );
+        let mut server_store = empty_store();
+        server_store
+            .insert(CollectionRecord::Merge(marker))
+            .unwrap();
+
+        let mut server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            team_root,
+            team_proofs(&root, &server_key),
+            false,
+        );
+        let mut client = bring_up_with_peers(
+            &net,
+            &client_key,
+            empty_store(),
+            team_root,
+            team_proofs(&root, &client_key),
+            false,
+            vec![pk(&server_key)],
+        );
+
+        // Let the host finish one inventory exchange, but deliberately do not
+        // admit its queued records into the client's store yet.
+        for _ in 0..240u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            server.refresh();
+        }
+        assert!(
+            client.store().record(marker.id()).unwrap().is_none(),
+            "precondition: the client has not admitted the pending marker",
+        );
+
+        let cover = ensure_exact_derived(&mut client, &lifecycle, &[], &algebra)
+            .await
+            .expect("the exact empty bottom is infallible");
+        assert!(cover.is_empty());
+        assert!(
+            client.store().record(marker.id()).unwrap().is_none(),
+            "empty attachment must not refresh or scan network inventory",
+        );
+
+        // Prove the preceding assertion was not vacuous: the ordinary refresh
+        // path admits the record that was already waiting at the boundary.
+        client.refresh();
+        assert!(
+            client.store().record(marker.id()).unwrap().is_some(),
+            "the marker was genuinely pending before the empty attachment",
+        );
+    });
+}
+
+/// Collection records converge through ordinary inventory while target bytes
+/// remain demand-only. The resolver first chooses a stale one-member upper
+/// offer, removes it after the exact GET misses, replans to the two available
+/// lower members, and introduces neither a durable WANT nor descriptor
+/// publication.
+#[test]
+fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
+    let _g = sim_guard();
+    run_paused(0xC0AE_0001, async {
+        let net = SimNet::new(0xC0AE_0001, SimConfig::default());
+        let root = key(0xF4);
+        let server_key = key(0xA4);
+        let client_key = key(0xB4);
+        let namespace = key(0xD4).verifying_key();
+        let team_root = root.verifying_key();
+
+        let source_descriptor = simplearchive_union::descriptor(
+            &CollectionName::new("network-cover-source").unwrap(),
+            namespace,
+            None,
+            reach::private(),
+        );
+        let target_descriptor = descriptor::naming(
+            &CollectionName::new("network-cover-target").unwrap(),
+            namespace,
+            None,
+            <UnknownBlob as MetaDescribe>::id(),
+            simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
+            reach::private(),
+        );
+        let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
+            source_descriptor.clone(),
+            target_descriptor.clone(),
+        );
+        let algebra = NetworkTestAlgebra {
+            source: source_descriptor,
+            target: target_descriptor,
+        };
+
+        let sources = [content_blob(0x71).0, content_blob(0x81).0];
+        let targets = [
+            derive_test_target(&sources[0]),
+            derive_test_target(&sources[1]),
+        ];
+        let upper = algebra.join_target(&targets[0], &targets[1]).unwrap();
+
+        let mut client_store = empty_store();
+        let metadata = client_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let ticket: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                client_store
+                    .put::<SimpleArchive, _>(source.clone())
+                    .unwrap();
+                let commit = CollectionCommit::sign(
+                    &key(0x91 + index as u8),
+                    lifecycle.source_collection(),
+                    collection_data(source),
+                    metadata,
+                );
+                client_store
+                    .insert(CollectionRecord::Commit(commit))
+                    .unwrap();
+                commit
+            })
+            .collect();
+
+        let mut server_store = empty_store();
+        for target in &targets {
+            server_store.put::<UnknownBlob, _>(target.clone()).unwrap();
+        }
+        let derives: Vec<_> = sources
+            .iter()
+            .zip(&targets)
+            .map(|(source, target)| {
+                CollectionDerive::new(
+                    lifecycle.target_collection(),
+                    collection_data(source),
+                    collection_data(target),
+                )
+            })
+            .collect();
+        for derive in &derives {
+            server_store
+                .insert(CollectionRecord::Derive(*derive))
+                .unwrap();
+        }
+        let merge = CollectionMerge::new(
+            lifecycle.target_collection(),
+            collection_data(&targets[0]),
+            collection_data(&targets[1]),
+            collection_data(&upper),
+        );
+        server_store.insert(CollectionRecord::Merge(merge)).unwrap();
+
+        let mut server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            team_root,
+            team_proofs(&root, &server_key),
+            true,
+        );
+        let mut client = bring_up_with_peers(
+            &net,
+            &client_key,
+            client_store,
+            team_root,
+            team_proofs(&root, &client_key),
+            true,
+            vec![pk(&server_key)],
+        );
+
+        let mut records_converged = false;
+        for _ in 0..240u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            server.refresh();
+            client.refresh();
+            if client.store().record(merge.id()).unwrap().is_some()
+                && derives
+                    .iter()
+                    .all(|derive| client.store().record(derive.id()).unwrap().is_some())
+            {
+                records_converged = true;
+                break;
+            }
+        }
+        assert!(records_converged, "target equations converge before reuse");
+        assert_eq!(want_count(&client), 0, "precondition: no durable wants");
+        assert!(!holds_locally(&mut client, upper.get_handle().raw));
+        assert!(!holds_locally(
+            &mut client,
+            lifecycle.target_collection().raw,
+        ));
+
+        let cover = drive_future(
+            ensure_exact_derived(&mut client, &lifecycle, &ticket, &algebra),
+            || server.refresh(),
+            240,
+        )
+        .await
+        .expect("exact cover operation completes")
+        .expect("the authenticated route supplies the replanned lower cover");
+
+        let expected: Vec<_> = targets
+            .iter()
+            .map(collection_data)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            cover
+                .members()
+                .iter()
+                .map(|(data, _)| *data)
+                .collect::<Vec<_>>(),
+            expected,
+        );
+        assert!(
+            !holds_locally(&mut client, upper.get_handle().raw),
+            "stale upper offer is not manufactured locally",
+        );
+        for target in &targets {
+            assert!(
+                holds_locally(&mut client, target.get_handle().raw),
+                "replanned lower cover member is fetched",
+            );
+        }
+        assert!(
+            !holds_locally(&mut client, lifecycle.target_collection().raw),
+            "remote reuse did not fall through to local descriptor publication",
+        );
+        assert_eq!(
+            want_count(&client),
+            0,
+            "speculative cover fetches do not create durable wants",
         );
     });
 }

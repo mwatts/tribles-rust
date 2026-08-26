@@ -182,11 +182,17 @@ pub struct ExactCover<Target: BlobEncoding> {
     members: Vec<(CollectionData, Blob<Target>)>,
 }
 
-impl<Target: BlobEncoding> ExactCover<Target> {
-    fn empty() -> Self {
+impl<Target: BlobEncoding> Default for ExactCover<Target> {
+    fn default() -> Self {
         Self {
             members: Vec::new(),
         }
+    }
+}
+
+impl<Target: BlobEncoding> ExactCover<Target> {
+    fn empty() -> Self {
+        Self::default()
     }
 
     /// Number of selected physical members.
@@ -213,6 +219,25 @@ impl<Target: BlobEncoding> ExactCover<Target> {
     pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<Target>> {
         self.members.into_iter().map(|(_, blob)| blob)
     }
+}
+
+/// Read-only outcome of probing an exact derived collection with speculative
+/// target-artifact availability.
+///
+/// Offers are operational hints, never semantic evidence. The kernel first
+/// authenticates the source ticket and recomputes the relevant equations from
+/// its signed roots. Only then may an offered target member appear in
+/// [`Self::Fetch`]. A caller that cannot obtain one of those exact handles
+/// removes it from the offered set and probes again; ordinary physical-cover
+/// selection then chooses another valid cover or reports incompleteness.
+pub enum ExactAttachPlan<Target: BlobEncoding> {
+    /// Every selected physical member is resident and freshly validated.
+    Ready(ExactCover<Target>),
+    /// Exact target members selected from the offered set but not resident.
+    ///
+    /// Handles are returned in ascending content-identity order. Fetching them
+    /// is deliberately outside this synchronous storage kernel.
+    Fetch(Vec<CollectionData>),
 }
 
 /// Failure to attach or complete one exact derived ticket.
@@ -396,6 +421,49 @@ where
         self.attach_with(store, ticket, algebra)
     }
 
+    /// Probe an exact ticket while treating target handles as speculative
+    /// remote availability hints.
+    ///
+    /// This method performs no writes and no network I/O. Unknown, unrelated,
+    /// or algebraically invalid offers are ignored. A [`ExactAttachPlan::Fetch`]
+    /// result contains only members of the exact physical cover selected by
+    /// the ordinary collection resolver. Once valid bytes have been landed
+    /// and remain visible under the same immutable record evidence, calling
+    /// this method again returns [`ExactAttachPlan::Ready`]. If a fetch fails,
+    /// remove that handle from `offered_target` and re-probe.
+    ///
+    /// Signed source data remains mandatory resident evidence. Remote offers
+    /// cannot replace or authorize a source commit.
+    pub fn probe_exact<S, A>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+        algebra: &A,
+        offered_target: &BTreeSet<CollectionData>,
+    ) -> Result<ExactAttachPlan<Target>, ExactDerivedCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Reader: BlobStoreMeta,
+        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    {
+        if ticket.is_empty() {
+            return Ok(ExactAttachPlan::Ready(ExactCover::empty()));
+        }
+        let probe = self.probe(store, ticket, algebra, false, offered_target)?;
+        if probe.is_complete() {
+            return Ok(ExactAttachPlan::Ready(probe.into_target_cover()));
+        }
+        if probe.missing.is_empty()
+            && probe.unsupported_commits.is_empty()
+            && !probe.target_fetch.is_empty()
+        {
+            return Ok(ExactAttachPlan::Fetch(
+                probe.target_fetch.iter().copied().collect(),
+            ));
+        }
+        Err(probe.incomplete_error())
+    }
+
     /// Complete missing derivations, then attach through a fresh read pass.
     ///
     /// Empty tickets perform no I/O. A complete first probe returns without
@@ -419,7 +487,7 @@ where
             return Ok(ExactCover::empty());
         }
 
-        let probe = self.probe(store, ticket, algebra, true)?;
+        let probe = self.probe(store, ticket, algebra, true, &BTreeSet::new())?;
         if probe.is_complete() {
             return Ok(probe.into_target_cover());
         }
@@ -535,7 +603,7 @@ where
         if ticket.is_empty() {
             return Ok(ExactCover::empty());
         }
-        let probe = self.probe(store, ticket, algebra, false)?;
+        let probe = self.probe(store, ticket, algebra, false, &BTreeSet::new())?;
         if !probe.is_complete() {
             return Err(probe.incomplete_error());
         }
@@ -569,6 +637,7 @@ where
         ticket: &[CollectionCommit],
         algebra: &A,
         plan_source_residual: bool,
+        offered_target: &BTreeSet<CollectionData>,
     ) -> Result<ExactProbe<S::Reader, Source, Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
@@ -640,13 +709,21 @@ where
 
         // Source compaction results are seeds too: ensure may reuse a resident
         // source upper bound even when no target artifact exists yet.
+        let mut local_results = BTreeSet::new();
         let mut resident_results = BTreeSet::new();
         let mut reverse_seen = BTreeSet::new();
         let mut reverse_queue = VecDeque::new();
         for result in producers.keys().copied() {
-            if known.contains_key(&result)
-                || self.contains_typed(&reader, result, "inspect reconstructed result")?
-            {
+            let offered = match result {
+                TypedData::Source(_) => false,
+                TypedData::Target(data) => offered_target.contains(&data),
+            };
+            let local = known.contains_key(&result)
+                || self.contains_typed(&reader, result, "inspect reconstructed result")?;
+            if local {
+                local_results.insert(result);
+            }
+            if offered || local {
                 resident_results.insert(result);
                 if reverse_seen.insert(result) {
                     reverse_queue.push_back(result);
@@ -746,24 +823,52 @@ where
             .copied()
             .collect();
 
-        let target_resident = resolution
+        let target_local = resolution
             .semantics()
             .members(target)
             .into_iter()
             .flatten()
             .copied()
-            .filter(|data| resident_results.contains(&TypedData::Target(*data)))
+            .filter(|data| local_results.contains(&TypedData::Target(*data)))
             .collect();
-        let target_physical = validated_physical_cover(
+        let local_physical = validated_physical_cover(
             &reader,
             resolution.semantics(),
             target,
-            target_resident,
+            target_local,
             &BTreeMap::new(),
+            &BTreeSet::new(),
             |blob| algebra.validate_target(&self.target, blob),
         );
+        // A speculative offer must never displace a complete resident cover.
+        // Only widen physical selection to offered members when local bytes do
+        // not already answer the exact ticket without network I/O.
+        let target_physical = if local_physical.missing.is_empty() && unsupported_commits.is_empty()
+        {
+            local_physical
+        } else {
+            let target_resident = resolution
+                .semantics()
+                .members(target)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|data| resident_results.contains(&TypedData::Target(*data)))
+                .collect();
+            validated_physical_cover(
+                &reader,
+                resolution.semantics(),
+                target,
+                target_resident,
+                &BTreeMap::new(),
+                offered_target,
+                |blob| algebra.validate_target(&self.target, blob),
+            )
+        };
 
-        let complete = target_physical.missing.is_empty() && unsupported_commits.is_empty();
+        let complete = target_physical.missing.is_empty()
+            && target_physical.fetch.is_empty()
+            && unsupported_commits.is_empty();
         let source_plan_parts = if !plan_source_residual || complete {
             None
         } else {
@@ -811,7 +916,7 @@ where
 
         Ok(ExactProbe {
             reader,
-            target_cover: ExactCover {
+            target_cover: target_physical.fetch.is_empty().then(|| ExactCover {
                 members: target_physical
                     .cover
                     .iter()
@@ -821,12 +926,13 @@ where
                             target_physical
                                 .blobs
                                 .get(data)
-                                .expect("validated target cover retains selected bytes")
+                                .expect("resident target cover retains selected bytes")
                                 .clone(),
                         )
                     })
                     .collect(),
-            },
+            }),
+            target_fetch: target_physical.fetch,
             missing: target_physical.missing,
             unsupported_commits,
             source_plan,
@@ -893,7 +999,8 @@ struct SourcePlan<Source: BlobEncoding> {
 
 struct ExactProbe<R, Source: BlobEncoding, Target: BlobEncoding> {
     reader: R,
-    target_cover: ExactCover<Target>,
+    target_cover: Option<ExactCover<Target>>,
+    target_fetch: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,
     unsupported_commits: BTreeSet<Id>,
     source_plan: Option<SourcePlan<Source>>,
@@ -901,7 +1008,10 @@ struct ExactProbe<R, Source: BlobEncoding, Target: BlobEncoding> {
 
 impl<R, Source: BlobEncoding, Target: BlobEncoding> ExactProbe<R, Source, Target> {
     fn is_complete(&self) -> bool {
-        self.missing.is_empty() && self.unsupported_commits.is_empty()
+        self.target_cover.is_some()
+            && self.target_fetch.is_empty()
+            && self.missing.is_empty()
+            && self.unsupported_commits.is_empty()
     }
 
     fn incomplete_error(&self) -> ExactDerivedCollectionError {
@@ -913,6 +1023,7 @@ impl<R, Source: BlobEncoding, Target: BlobEncoding> ExactProbe<R, Source, Target
 
     fn into_target_cover(self) -> ExactCover<Target> {
         self.target_cover
+            .expect("complete exact probe has a resident target cover")
     }
 }
 
@@ -942,6 +1053,7 @@ where
             plan.collection,
             resident,
             &plan.mandatory,
+            &BTreeSet::new(),
             |blob| algebra.validate_source(&plan.descriptor, blob),
         );
         if !physical.missing.is_empty() {
@@ -984,6 +1096,7 @@ struct ValidatedPhysicalCover<E: BlobEncoding> {
     cover: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,
     blobs: BTreeMap<CollectionData, Blob<E>>,
+    fetch: BTreeSet<CollectionData>,
 }
 
 fn validated_physical_cover<R, E, V>(
@@ -992,6 +1105,7 @@ fn validated_physical_cover<R, E, V>(
     collection: CollectionHandle,
     mut resident: BTreeSet<CollectionData>,
     mandatory: &BTreeMap<CollectionData, Blob<E>>,
+    offered: &BTreeSet<CollectionData>,
     validate: V,
 ) -> ValidatedPhysicalCover<E>
 where
@@ -1005,6 +1119,7 @@ where
         let physical = collection_physical_cover(semantics, collection, &resident);
         selected.retain(|data, _| physical.cover.contains(data));
         let mut rejected = Vec::new();
+        let mut fetch = BTreeSet::new();
         for data in physical.cover.iter().copied() {
             if mandatory.contains_key(&data) || selected.contains_key(&data) {
                 continue;
@@ -1015,7 +1130,11 @@ where
                 Ok(actual) if fresh_data_identity(&actual) == data && validate(&actual).is_ok() => {
                     selected.insert(data, actual);
                 }
-                Ok(_) | Err(_) => rejected.push(data),
+                Ok(_) => rejected.push(data),
+                Err(_) if offered.contains(&data) => {
+                    fetch.insert(data);
+                }
+                Err(_) => rejected.push(data),
             }
         }
         if rejected.is_empty() {
@@ -1029,6 +1148,7 @@ where
                 cover: physical.cover,
                 missing: physical.missing,
                 blobs,
+                fetch,
             };
         }
         for data in rejected {

@@ -5,7 +5,9 @@
 //! capability proofs, and optionally resident blobs; gossip carries only
 //! untrusted generation wakes. Exact content reads retain durable-WANT
 //! semantics and search authenticated configured/PEER routes independently of
-//! broad inventory mirroring.
+//! broad inventory mirroring. [`collection_sync`] lets the core collection
+//! resolver select an exact physical cover from speculative remote artifacts,
+//! so callers can fetch only useful materializations without creating WANTs.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
@@ -20,6 +22,7 @@ pub(crate) const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::
 /// Upper bound the exponential retry backoff saturates at.
 pub(crate) const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 pub mod clock;
+pub mod collection_sync;
 pub mod host;
 pub mod identity;
 pub mod inventory;
