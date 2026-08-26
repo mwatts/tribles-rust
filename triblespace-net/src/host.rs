@@ -14,6 +14,7 @@ use std::thread;
 
 use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures::{StreamExt, stream::FuturesUnordered};
 use iroh_base::{EndpointAddr, EndpointId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{Instrument, debug, debug_span, info_span, instrument, trace, warn};
@@ -29,7 +30,9 @@ use triblespace_core::repo::{
     BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, PeerStore,
 };
 
-use crate::channel::{NetCommand, NetEvent, SnapshotNotice};
+use crate::channel::{
+    MAX_ADMISSION_BRIDGE_BATCHES, NetCommand, NetEvent, NetEventBatch, SnapshotNotice,
+};
 use crate::identity::iroh_secret;
 use crate::inventory::{
     AuthorizedInventorySession, InventoryComponent, InventoryGeneration, InventoryManifest,
@@ -532,11 +535,11 @@ impl NetSender {
 
 /// Incoming inventory leaves for the synchronous store side.
 pub struct NetReceiver {
-    evt_rx: tokio::sync::mpsc::Receiver<NetEvent>,
+    evt_rx: tokio::sync::mpsc::Receiver<NetEventBatch>,
 }
 
 impl NetReceiver {
-    pub(crate) fn try_recv(&mut self) -> Option<NetEvent> {
+    pub(crate) fn try_recv(&mut self) -> Option<NetEventBatch> {
         self.evt_rx.try_recv().ok()
     }
 }
@@ -544,7 +547,7 @@ impl NetReceiver {
 /// Host half of [`wire`].
 pub struct HostWiring {
     cmd_rx: mpsc::Receiver<NetCommand>,
-    evt_tx: tokio::sync::mpsc::Sender<NetEvent>,
+    evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
 }
@@ -552,7 +555,10 @@ pub struct HostWiring {
 /// Construct the synchronous/asynchronous boundary for a caller-owned host.
 pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(64);
+    // Batches are independently bounded by item and byte count. Sixteen
+    // queued batches keep a first sync moving between synchronous refreshes
+    // without turning this bridge into an unbounded second store.
+    let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(MAX_ADMISSION_BRIDGE_BATCHES);
     let snapshot = Arc::new(Mutex::new(None));
     let installed_generation = Arc::new(Mutex::new(None));
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
@@ -861,7 +867,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
 
 struct HostWiringParts {
     commands: mpsc::Receiver<NetCommand>,
-    events: tokio::sync::mpsc::Sender<NetEvent>,
+    events: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
 }
@@ -877,6 +883,49 @@ impl From<HostWiring> for HostWiringParts {
     }
 }
 
+/// Use half the server's per-connection request bound so exact demand reads can
+/// share the authenticated pool while a sweep is active. QUIC streams provide
+/// the correlation envelope, so this fixed window overlaps independent node
+/// lookups without adding another wire operation or request identifier.
+const INVENTORY_NODE_WINDOW: usize = MAX_INBOUND_REQUESTS_PER_CONNECTION / 2;
+
+struct AdmissionBatcher {
+    events: tokio::sync::mpsc::Sender<NetEventBatch>,
+    pending: NetEventBatch,
+}
+
+impl AdmissionBatcher {
+    fn new(events: &tokio::sync::mpsc::Sender<NetEventBatch>) -> Self {
+        Self {
+            events: events.clone(),
+            pending: NetEventBatch::default(),
+        }
+    }
+
+    async fn push(&mut self, event: NetEvent) -> anyhow::Result<()> {
+        if let Err(event) = self.pending.try_push(event) {
+            self.flush().await?;
+            self.pending
+                .try_push(event)
+                .expect("an empty admission batch accepts one indivisible event");
+        }
+        if self.pending.is_full() {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.events
+            .send(std::mem::take(&mut self.pending))
+            .await
+            .map_err(|_| anyhow::anyhow!("store side stopped during inventory admission"))
+    }
+}
+
 async fn reconcile_inventory_peer<T: Transport>(
     transport: &T,
     pool: &SharedPool<T::Conn>,
@@ -886,16 +935,16 @@ async fn reconcile_inventory_peer<T: Transport>(
     sync_proof: &CapabilityProofBundle,
     qos: ReconcileQos,
     local: SharedSnapshot,
-    events: &tokio::sync::mpsc::Sender<NetEvent>,
+    events: &tokio::sync::mpsc::Sender<NetEventBatch>,
     candidates: &RoutingCandidates,
 ) -> anyhow::Result<()> {
     let connection = inventory_pool_get(transport, pool, peer, connect_proof, sync_proof).await?;
     let remote_key = VerifyingKey::from_bytes(&peer)?;
     candidates.lock().unwrap().note(peer);
-    events
-        .send(NetEvent::Peer(PeerEvidence::new(team, remote_key)))
-        .await
-        .map_err(|_| anyhow::anyhow!("store side stopped during inventory authorization"))?;
+    let mut admissions = AdmissionBatcher::new(events);
+    admissions
+        .push(NetEvent::Peer(PeerEvidence::new(team, remote_key)))
+        .await?;
 
     let manifest = tokio::time::timeout(OP_DEADLINE, op_inventory_manifest(&connection, team))
         .await
@@ -906,36 +955,53 @@ async fn reconcile_inventory_peer<T: Transport>(
         }
         let advertised = manifest.component(component);
         let mut walker = InventoryWalker::new(team, advertised)?;
+        let mut in_flight = FuturesUnordered::new();
         loop {
-            let request = walker.next_request(|component, prefix| {
-                local.lock().unwrap().node_summary(component, prefix)
-            })?;
-            let Some(request) = request else {
-                break;
-            };
-            let response =
-                tokio::time::timeout(OP_DEADLINE, op_inventory_node(&connection, team, &request))
+            while in_flight.len() < INVENTORY_NODE_WINDOW {
+                let request = walker.next_request(|component, prefix| {
+                    local.lock().unwrap().node_summary(component, prefix)
+                })?;
+                let Some(request) = request else {
+                    break;
+                };
+                let request_connection = connection.clone();
+                in_flight.push(async move {
+                    let response = tokio::time::timeout(
+                        OP_DEADLINE,
+                        op_inventory_node(&request_connection, team, &request),
+                    )
                     .await
                     .map_err(|_| anyhow::anyhow!("inventory node deadline exceeded"))??;
-            let missing = walker.accept(response, |component, key| {
+                    Ok::<_, anyhow::Error>((request, response))
+                });
+            }
+            let Some(result) = in_flight.next().await else {
+                break;
+            };
+            let (request, response) = result?;
+            let missing = walker.accept(&request, response, |component, key| {
                 local.lock().unwrap().contains_relative_key(component, key)
             })?;
             if let Some(leaf) = missing {
-                admit_remote_leaf(&connection, team, advertised, leaf, events).await?;
+                let event = remote_leaf_event(&connection, team, advertised, leaf).await?;
+                admissions.push(event).await?;
             }
         }
         walker.finish()?;
+        // Preserve valid progress if a later component fails. Full batches
+        // already stream as they fill; this publishes the bounded tail.
+        admissions.flush().await?;
     }
+    admissions.flush().await?;
     Ok(())
 }
 
-async fn admit_remote_leaf<C: Conn>(
+async fn remote_leaf_event<C: Conn>(
     connection: &C,
     team: VerifyingKey,
     advertised: crate::inventory::ComponentManifest,
     leaf: InventoryLeaf,
-    events: &tokio::sync::mpsc::Sender<NetEvent>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<NetEvent> {
     let event = match leaf.value {
         InventoryLeafValue::Peer => {
             let peer: [u8; 32] = leaf
@@ -961,10 +1027,7 @@ async fn admit_remote_leaf<C: Conn>(
             NetEvent::Blob { hash, bytes }
         }
     };
-    events
-        .send(event)
-        .await
-        .map_err(|_| anyhow::anyhow!("store side stopped during inventory admission"))
+    Ok(event)
 }
 
 async fn fetch_inventory_blob<C: Conn>(
@@ -1170,7 +1233,7 @@ struct SnapshotHandler {
     snapshot: SnapshotSlot,
     snapshots: InventorySnapshots,
     server: InventoryServerConfig,
-    events: tokio::sync::mpsc::Sender<NetEvent>,
+    events: tokio::sync::mpsc::Sender<NetEventBatch>,
     candidates: RoutingCandidates,
     serve_inventory: bool,
     admit_inbound_peer: bool,
@@ -1356,10 +1419,12 @@ impl SnapshotHandler {
                             InventoryAuthorization::Authorized(session);
                         if self.admit_inbound_peer {
                             self.candidates.lock().unwrap().note(peer.to_bytes());
-                            let _ = self
-                                .events
-                                .send(NetEvent::Peer(PeerEvidence::new(self.server.team(), peer)))
-                                .await;
+                            let _ =
+                                self.events
+                                    .send(NetEventBatch::singleton(NetEvent::Peer(
+                                        PeerEvidence::new(self.server.team(), peer),
+                                    )))
+                                    .await;
                         }
                         send_inventory_auth_ok(send).await?;
                     }

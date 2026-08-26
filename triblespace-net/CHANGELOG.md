@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove per-blob DHT publication and lookup from synchronization. Exact
   Demand reads use the same authenticated configured/PEER route set as
   inventory reconciliation, avoiding a second mutable discovery system.
+- Pipeline up to eight independently authenticated PATCH node reads on the
+  existing inventory protocol and admit their out-of-order responses through
+  bounded item/byte batches. Empty replicas now overlap each fixed frontier
+  window rather than paying one network round trip per node, while one
+  synchronous store drain retains one durability barrier and strict
+  pinned-root/count checks.
 
 ## [0.41.4] - 2026-05-17
 

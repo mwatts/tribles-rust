@@ -23,7 +23,7 @@ use triblespace_core::repo::{
     CapabilityProofStore, PeerStore, StorageFlush, StoreRevision, WantRequest, WantStore,
 };
 
-use crate::channel::NetEvent;
+use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, NetReceiver, NetSender};
 use crate::protocol::RawHash;
 
@@ -172,48 +172,54 @@ where
     /// manifests and periodic sweeps use them.
     pub fn refresh(&mut self) {
         let mut incoming = Vec::new();
-        while let Some(event) = self.receiver.try_recv() {
+        for _ in 0..MAX_ADMISSION_BRIDGE_BATCHES {
+            let Some(event) = self.receiver.try_recv() else {
+                break;
+            };
             self.last_event_at = crate::clock::mono_now();
             incoming.push(event);
         }
 
-        let received = incoming.len();
+        let received_batches = incoming.len();
+        let received = incoming.iter().map(|batch| batch.len()).sum::<usize>();
         let mut store = self.store.lock().expect("store mutex");
         let mut admitted = false;
-        for event in incoming {
-            match event {
-                NetEvent::Peer(evidence) => match store.insert_peer(evidence) {
-                    Ok(()) => admitted = true,
-                    Err(error) => {
-                        tracing::warn!(?error, "admitting PEER inventory evidence failed")
-                    }
-                },
-                NetEvent::CollectionRecord(record) => match store.insert(record) {
-                    Ok(()) => admitted = true,
-                    Err(error) => tracing::warn!(
-                        ?error,
-                        "admitting collection-record inventory evidence failed"
-                    ),
-                },
-                NetEvent::CapabilityProof(proof) => match store.insert_proof(proof) {
-                    Ok(()) => admitted = true,
-                    Err(error) => tracing::warn!(
-                        ?error,
-                        "admitting capability-proof inventory evidence failed"
-                    ),
-                },
-                NetEvent::Blob { hash, bytes } => {
-                    if blake3::hash(&bytes).as_bytes() != &hash {
-                        tracing::warn!(hash = %hex::encode(&hash[..4]), "discarding hash-invalid mirror blob");
-                        continue;
-                    }
-                    match store.put::<UnknownBlob, Bytes>(bytes) {
-                        Ok(handle) if handle.raw == hash => admitted = true,
-                        Ok(_) => tracing::warn!(
-                            "blob store returned a handle different from verified bytes"
-                        ),
+        for batch in incoming {
+            for event in batch.into_events() {
+                match event {
+                    NetEvent::Peer(evidence) => match store.insert_peer(evidence) {
+                        Ok(()) => admitted = true,
                         Err(error) => {
-                            tracing::warn!(?error, "landing mirror inventory blob failed")
+                            tracing::warn!(?error, "admitting PEER inventory evidence failed")
+                        }
+                    },
+                    NetEvent::CollectionRecord(record) => match store.insert(record) {
+                        Ok(()) => admitted = true,
+                        Err(error) => tracing::warn!(
+                            ?error,
+                            "admitting collection-record inventory evidence failed"
+                        ),
+                    },
+                    NetEvent::CapabilityProof(proof) => match store.insert_proof(proof) {
+                        Ok(()) => admitted = true,
+                        Err(error) => tracing::warn!(
+                            ?error,
+                            "admitting capability-proof inventory evidence failed"
+                        ),
+                    },
+                    NetEvent::Blob { hash, bytes } => {
+                        if blake3::hash(&bytes).as_bytes() != &hash {
+                            tracing::warn!(hash = %hex::encode(&hash[..4]), "discarding hash-invalid mirror blob");
+                            continue;
+                        }
+                        match store.put::<UnknownBlob, Bytes>(bytes) {
+                            Ok(handle) if handle.raw == hash => admitted = true,
+                            Ok(_) => tracing::warn!(
+                                "blob store returned a handle different from verified bytes"
+                            ),
+                            Err(error) => {
+                                tracing::warn!(?error, "landing mirror inventory blob failed")
+                            }
                         }
                     }
                 }
@@ -224,12 +230,17 @@ where
             match store.flush() {
                 Ok(()) => {
                     self.pending_network_flush = false;
-                    tracing::debug!(received, "inventory admission batch durable");
+                    tracing::debug!(
+                        received,
+                        received_batches,
+                        "inventory admission drain durable"
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(
                         ?error,
                         received,
+                        received_batches,
                         "inventory admission flush failed; snapshot withheld"
                     );
                 }

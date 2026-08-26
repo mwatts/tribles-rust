@@ -30,20 +30,21 @@ pub(crate) struct InventoryWalkResult {
     pub(crate) missing_count: u64,
 }
 
-/// Sequential traversal state for one immutable remote component root.
+/// Pipelined traversal state for one immutable remote component root.
 ///
-/// Exactly one request may be in flight because node responses do not echo
-/// their locator. `local_summary` and `local_contains` passed to the methods
-/// below must describe the same immutable local observation for the whole
-/// walk. Later local admissions can only make work redundant; they must not be
-/// used to manufacture subtree skips against a moving inventory.
+/// A request is its own authenticated locator and each bidirectional stream is
+/// its correlation envelope, so callers may keep a bounded number in flight
+/// and accept them in any order. `local_summary` and `local_contains` passed to
+/// the methods below must describe the same immutable local observation for the
+/// whole walk. Later local admissions can only make work redundant; they must
+/// not be used to manufacture subtree skips against a moving inventory.
 pub(crate) struct InventoryWalker {
     team: ed25519_dalek::VerifyingKey,
     component: InventoryComponent,
     root: Option<[u8; 32]>,
     leaf_count: u64,
     frontier: Vec<PendingNode>,
-    in_flight: Option<PendingNode>,
+    in_flight: Vec<PendingNode>,
     accounted: u64,
     missing_count: u64,
     failed: bool,
@@ -74,7 +75,7 @@ impl InventoryWalker {
             root,
             leaf_count,
             frontier,
-            in_flight: None,
+            in_flight: Vec::new(),
             accounted: 0,
             missing_count: 0,
             failed: false,
@@ -85,9 +86,10 @@ impl InventoryWalker {
 
     /// Return the next pinned remote request, skipping exact local subtrees.
     ///
-    /// `None` means the complete manifest count has been accounted for and the
-    /// walker may be consumed with [`Self::finish`]. A local summary is an
-    /// exact `(digest, leaf_count)` for the protocol-relative prefix.
+    /// `None` means there is currently no ready frontier work. Outstanding
+    /// requests may still reveal children, so the caller must wait for them
+    /// before consuming the walker with [`Self::finish`]. A local summary is
+    /// an exact `(digest, leaf_count)` for the protocol-relative prefix.
     pub(crate) fn next_request(
         &mut self,
         mut local_summary: impl FnMut(InventoryComponent, &[u8]) -> Option<([u8; 32], u64)>,
@@ -95,10 +97,6 @@ impl InventoryWalker {
         if self.failed {
             bail!("inventory walker is failed");
         }
-        if self.in_flight.is_some() {
-            bail!("inventory walker already has a request in flight");
-        }
-
         while let Some(pending) = self.frontier.pop() {
             if local_summary(self.component, &pending.prefix)
                 == Some((pending.digest, pending.leaf_count))
@@ -119,13 +117,13 @@ impl InventoryWalker {
                 pending.prefix.clone(),
                 pending.digest,
             )?;
-            self.in_flight = Some(pending);
+            self.in_flight.push(pending);
             self.verify_count_invariant()?;
             return Ok(Some(request));
         }
 
         self.verify_count_invariant()?;
-        if self.accounted != self.leaf_count {
+        if self.in_flight.is_empty() && self.accounted != self.leaf_count {
             self.failed = true;
             bail!(
                 "inventory frontier ended after accounting for {} of {} leaves",
@@ -136,8 +134,8 @@ impl InventoryWalker {
         Ok(None)
     }
 
-    /// Consume the response to the one outstanding request and yield one
-    /// missing authenticated leaf immediately.
+    /// Consume the response correlated with `request` and yield one missing
+    /// authenticated leaf immediately. Responses may arrive in any order.
     ///
     /// Snapshot eviction, an absent authenticated child, and every digest or
     /// exact-count mismatch fail the walk. None of them discharges frontier
@@ -146,13 +144,14 @@ impl InventoryWalker {
     /// valid prefix progress and a future periodic sweep repairs the remainder.
     pub(crate) fn accept(
         &mut self,
+        request: &InventoryNodeRequest,
         response: InventoryNodeResponse,
         mut local_contains: impl FnMut(InventoryComponent, &[u8]) -> bool,
     ) -> Result<Option<InventoryLeaf>> {
         if self.failed {
             bail!("inventory walker is failed");
         }
-        let result = self.accept_inner(response, &mut local_contains);
+        let result = self.accept_inner(request, response, &mut local_contains);
         if result.is_err() {
             self.failed = true;
         }
@@ -161,13 +160,24 @@ impl InventoryWalker {
 
     fn accept_inner(
         &mut self,
+        request: &InventoryNodeRequest,
         response: InventoryNodeResponse,
         local_contains: &mut impl FnMut(InventoryComponent, &[u8]) -> bool,
     ) -> Result<Option<InventoryLeaf>> {
-        let pending = self
+        if request.component != self.component
+            || Some(request.root) != self.root
+            || request.leaf_count != self.leaf_count
+        {
+            bail!("inventory response request does not belong to this pinned walk");
+        }
+        let position = self
             .in_flight
-            .take()
-            .ok_or_else(|| anyhow!("inventory response arrived without an in-flight request"))?;
+            .iter()
+            .position(|pending| {
+                pending.prefix == request.prefix && pending.digest == request.expected_digest
+            })
+            .ok_or_else(|| anyhow!("inventory response has no matching in-flight request"))?;
+        let pending = self.in_flight.swap_remove(position);
         let node = match response {
             InventoryNodeResponse::SnapshotUnavailable => {
                 bail!("pinned inventory snapshot is unavailable; request a fresh manifest")
@@ -258,7 +268,7 @@ impl InventoryWalker {
         if self.failed {
             bail!("inventory walker failed before completion");
         }
-        if self.in_flight.is_some()
+        if !self.in_flight.is_empty()
             || !self.frontier.is_empty()
             || self.accounted != self.leaf_count
         {
@@ -278,7 +288,7 @@ impl InventoryWalker {
 
     fn verify_count_invariant(&self) -> Result<()> {
         let mut total = self.accounted;
-        if let Some(in_flight) = &self.in_flight {
+        for in_flight in &self.in_flight {
             total = total
                 .checked_add(in_flight.leaf_count)
                 .ok_or_else(|| anyhow!("inventory count invariant overflow"))?;
@@ -378,11 +388,15 @@ mod tests {
             };
             requests.push(request.prefix.clone());
             if let Some(leaf) = walker
-                .accept(response(remote, &request.prefix), |component, raw| {
-                    assert_eq!(component, InventoryComponent::Blob);
-                    let key: [u8; 32] = raw.try_into().unwrap();
-                    local.get(&key).is_some()
-                })
+                .accept(
+                    &request,
+                    response(remote, &request.prefix),
+                    |component, raw| {
+                        assert_eq!(component, InventoryComponent::Blob);
+                        let key: [u8; 32] = raw.try_into().unwrap();
+                        local.get(&key).is_some()
+                    },
+                )
                 .unwrap()
             {
                 missing.push(leaf);
@@ -462,6 +476,50 @@ mod tests {
     }
 
     #[test]
+    fn independent_frontier_responses_may_arrive_out_of_order() {
+        let remote = TestInventory::from_keys((0..32u8).map(|edge| key([edge, 7, 8, 9])));
+        let mut walker = InventoryWalker::new(team(), manifest(&remote)).unwrap();
+
+        let root = walker.next_request(|_, _| None).unwrap().unwrap();
+        walker
+            .accept(&root, response(&remote, &root.prefix), |_, _| false)
+            .unwrap();
+
+        let mut frontier = Vec::new();
+        while let Some(request) = walker.next_request(|_, _| None).unwrap() {
+            frontier.push(request);
+        }
+        assert_eq!(frontier.len(), 32);
+        assert!(walker.finish().is_err(), "outstanding requests are counted");
+
+        // Reconstruct the same state because `finish` consumes the walker.
+        let mut walker = InventoryWalker::new(team(), manifest(&remote)).unwrap();
+        let root = walker.next_request(|_, _| None).unwrap().unwrap();
+        walker
+            .accept(&root, response(&remote, &root.prefix), |_, _| false)
+            .unwrap();
+        let mut frontier = Vec::new();
+        while let Some(request) = walker.next_request(|_, _| None).unwrap() {
+            frontier.push(request);
+        }
+
+        let mut missing = Vec::new();
+        for request in frontier.into_iter().rev() {
+            missing.push(
+                walker
+                    .accept(&request, response(&remote, &request.prefix), |_, _| false)
+                    .unwrap()
+                    .expect("empty local inventory misses every leaf"),
+            );
+        }
+        assert!(walker.next_request(|_, _| None).unwrap().is_none());
+        let result = walker.finish().unwrap();
+        assert_eq!(result.leaf_count, 32);
+        assert_eq!(result.missing_count, 32);
+        assert_eq!(missing.len(), 32);
+    }
+
+    #[test]
     fn unavailable_or_absent_prefix_never_completes() {
         let remote = TestInventory::from_keys([key([1, 2, 3, 0])]);
         for response in [
@@ -469,8 +527,8 @@ mod tests {
             InventoryNodeResponse::PrefixAbsent,
         ] {
             let mut walker = InventoryWalker::new(team(), manifest(&remote)).unwrap();
-            assert!(walker.next_request(|_, _| None).unwrap().is_some());
-            assert!(walker.accept(response, |_, _| false).is_err());
+            let request = walker.next_request(|_, _| None).unwrap().unwrap();
+            assert!(walker.accept(&request, response, |_, _| false).is_err());
             assert!(walker.finish().is_err());
         }
 
@@ -479,13 +537,13 @@ mod tests {
         let mut child_absent = InventoryWalker::new(team(), manifest(&branch)).unwrap();
         let root = child_absent.next_request(|_, _| None).unwrap().unwrap();
         child_absent
-            .accept(response(&branch, &root.prefix), |_, _| false)
+            .accept(&root, response(&branch, &root.prefix), |_, _| false)
             .unwrap();
         let child = child_absent.next_request(|_, _| None).unwrap().unwrap();
         assert!(!child.prefix.is_empty());
         assert!(
             child_absent
-                .accept(InventoryNodeResponse::PrefixAbsent, |_, _| false)
+                .accept(&child, InventoryNodeResponse::PrefixAbsent, |_, _| false)
                 .is_err()
         );
         assert!(child_absent.finish().is_err());
@@ -511,7 +569,7 @@ mod tests {
         }
         assert!(
             wrong_digest
-                .accept(InventoryNodeResponse::Found(node), |_, _| false)
+                .accept(&root, InventoryNodeResponse::Found(node), |_, _| false)
                 .is_err()
         );
         assert!(wrong_digest.finish().is_err());
@@ -543,6 +601,7 @@ mod tests {
         branch.children[1].leaf_count = 2;
         wrong_count
             .accept(
+                &root,
                 InventoryNodeResponse::Found(InventoryNode::Branch {
                     digest,
                     leaf_count,
@@ -554,7 +613,7 @@ mod tests {
         let child = wrong_count.next_request(|_, _| None).unwrap().unwrap();
         assert!(
             wrong_count
-                .accept(response(&remote, &child.prefix), |_, _| false)
+                .accept(&child, response(&remote, &child.prefix), |_, _| false)
                 .is_err()
         );
         assert!(wrong_count.finish().is_err());
