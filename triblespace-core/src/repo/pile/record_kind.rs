@@ -178,7 +178,7 @@ record_kinds! {
     StoreScopeRecordV1 = KIND_ID_STORE_SCOPE "EDDEDAF4E20AF86EC63A7F1F044E2D4A",
         KIND_STORE_SCOPE "97C69C746D01741C8012A56F08D2C424E0291B5424EB9CD7637FD4A655C93DFB",
         "pile-store-scope-v1",
-        "Monotone local safety assertion STORE_SCOPE(team_public_key). Envelope bytes 64..96 hold exactly one 32-byte Ed25519 team trust-root public key and 96..256 are zeros. The record spans exactly one 256-byte block and has no payload. Repeating the same assertion is idempotent; observing two distinct keys is a semantic conflict and network assembly must fail closed. This assertion is neither authorization nor peer, collection, proof, or blob inventory and is never synchronized.";
+        "Monotone local safety assertion STORE_SCOPE(team_public_key). Envelope bytes 64..96 hold exactly one 32-byte Ed25519 team trust-root public key and 96..256 are zeros. The record spans exactly one 256-byte block and has no payload. Repeating the same assertion is idempotent; observing two distinct keys is a semantic conflict and network assembly must fail closed. This assertion is neither authorization nor peer, collection, proof, or blob inventory and is never gossiped.";
 
     /// Positive local willingness to serve one content-addressed artifact.
     ///
@@ -227,7 +227,8 @@ mod tests {
     ///
     /// This is what makes the 32-byte kind resolvable rather than merely
     /// recognisable, and it is why editing a description is a format change:
-    /// the failure message below carries the new value to pin.
+    /// restore the exact description or introduce a versioned kind. Never
+    /// repin an existing kind, because already-written records name it.
     #[test]
     fn record_kind_handles_match_their_descriptions() {
         for (pinned, fragment) in described_kinds() {
@@ -235,7 +236,7 @@ mod tests {
             assert_eq!(
                 pinned,
                 computed,
-                "record kind description changed; pin {}",
+                "record kind description changed; restore its prior text or mint a versioned kind (computed {}); never repin an existing kind",
                 computed
                     .iter()
                     .map(|b| format!("{b:02X}"))
