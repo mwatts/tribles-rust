@@ -149,3 +149,7 @@ harness = false
 [[bench]]
 name = "portable_bench_lsm"
 harness = false
+
+[[bench]]
+name = "collection_evolution"
+harness = false
