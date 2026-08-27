@@ -531,16 +531,6 @@ impl CollectionCommit {
         self.id
     }
 
-    /// Full intrinsic hash from which this record's 128-bit [`Id`] is derived.
-    ///
-    /// The hash commits to the stable collection-record domain, version,
-    /// semantic kind, and exact dense payload. Its final 16 bytes are
-    /// [`Self::id`]. Unlike that compact entity id, the complete digest is
-    /// suitable as a collision-resistant key in an exact commit-support set.
-    pub fn intrinsic_hash(&self) -> [u8; 32] {
-        collection_record_hash(KIND_COLLECTION_COMMIT, &self.to_bytes())
-    }
-
     #[cfg(test)]
     pub(crate) fn with_test_id(mut self, id: Id) -> Self {
         self.id = id;
@@ -837,17 +827,13 @@ fn derive_bytes(
     concat_fields([target.raw, input.raw, output.raw])
 }
 
-fn collection_record_hash(kind: Id, payload: &[u8]) -> [u8; 32] {
+fn collection_record_id(kind: Id, payload: &[u8]) -> Id {
     let mut hasher = Blake3::new();
     hasher.update(COLLECTION_RECORD_ID_DOMAIN);
     hasher.update(&COLLECTION_RECORD_ID_VERSION.to_be_bytes());
     hasher.update(&kind.raw());
     hasher.update(payload);
-    hasher.finalize()
-}
-
-fn collection_record_id(kind: Id, payload: &[u8]) -> Id {
-    let digest = collection_record_hash(kind, payload);
+    let digest = hasher.finalize();
     let mut raw = [0u8; 16];
     raw.copy_from_slice(&digest[digest.len() - 16..]);
     Id::new(raw).expect("BLAKE3-derived collection record ids must be non-nil")
@@ -1269,12 +1255,7 @@ mod tests {
         assert_eq!(derive.to_bytes().len(), COLLECTION_DERIVE_BYTES_LEN);
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
-        assert_eq!(
-            commit.intrinsic_hash(),
-            hex!("E716D633C457291FDCA3EDBF2413E32E21FE95F313A7AADD236286EE83B5AA39")
-        );
         assert_eq!(commit.id(), id_hex!("21FE95F313A7AADD236286EE83B5AA39"));
-        assert_eq!(commit.id().raw(), commit.intrinsic_hash()[16..]);
         assert_eq!(
             commit.signature_r.raw,
             hex!("F89FCF5C72BC7EC3E376C6AB6BDEFC6ECEA3ADBBCA7A36DBF1729413A7820564")

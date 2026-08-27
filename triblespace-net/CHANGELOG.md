@@ -57,8 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   topic. CONNECT admits the transport, then exactly one SYNC_TEAM exchange
   selects disclosure authority for that connection.
 - Move pile sync to ALPN `/triblespace/pile-sync/12` for the incompatible
-  reciprocal authorization responses and aligned Blake3Merkle v3 node format.
-  Remove the unused
+  reciprocal authorization responses. Remove the unused
   CHILDREN and collection-specific operations; retain exact `GET_BLOB` and add
   bounded inventory authorization, manifest, node, and blob-range operations.
 - Use configured endpoint addresses only as bootstrap routes. Authorized

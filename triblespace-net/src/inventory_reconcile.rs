@@ -574,7 +574,7 @@ mod tests {
         );
         assert!(wrong_digest.finish().is_err());
 
-        // Blake3Merkle v3 makes this redistribution fail immediately in the
+        // Blake3Merkle makes this redistribution fail immediately in the
         // wire validator. This direct state-machine test deliberately bypasses
         // that boundary to retain defense in depth: even an internally forged
         // 3/1 -> 2/2 response cannot make the walk complete because the first

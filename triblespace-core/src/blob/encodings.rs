@@ -2,8 +2,6 @@
 
 /// Flat typed array blob encoding.
 pub mod array;
-/// Canonical addressable BLAKE3 PATCH Merkle nodes.
-pub mod blake3merkle;
 /// Opaque raw bytes blob encoding (positive choice, distinct from UnknownBlob).
 pub mod rawbytes;
 /// Canonical trible sequence blob encoding.
@@ -15,8 +13,6 @@ pub mod tensor;
 pub mod utf8string;
 /// WebAssembly bytecode blob encoding.
 pub mod wasmcode;
-
-pub use blake3merkle::Blake3MerkleNode;
 
 use crate::inline::Encodes;
 use anybytes::Bytes;

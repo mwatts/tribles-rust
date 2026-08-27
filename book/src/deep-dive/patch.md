@@ -149,22 +149,10 @@ union. The token remains a 128-bit cache hint, not a durable content identifier
 or proof of equality.
 
 The `Blake3Merkle` policy provides a stable 256-bit root for durable indexes and
-anti-entropy. Version 3 makes every logical node an addressable canonical blob:
-its cached PATCH digest is ordinary BLAKE3 over exactly those bytes. All fields
-are little-endian. A common 32-byte header carries a 24-byte magic, `u16`
-version, node kind, zero flags, and `u32` key width. A leaf appends its complete
-key and zero padding to the next 32-byte boundary. A branch appends one 32-byte
-metadata block, its compressed prefix with zero alignment padding, and one
-64-byte descriptor per ascending child: a 32-byte edge/count block followed by
-the 32-byte child digest. Child addresses are therefore aligned fields that a
-generic blob graph scanner can discover without understanding PATCH.
-`Blake3MerkleNode` is the one blob schema for these bytes at every encoded key
-width; a consumer applies `Blake3MerkleNodeBlob<N>` to require its expected
-width rather than introducing another node format.
-
-Leaves and branches have separate kind domains. A branch commits to the key
-width, canonical compressed-prefix bytes, fanout, subtree leaf count, and each
-`(edge, child leaf count, child digest)` tuple in ascending edge order.
+anti-entropy. Leaves and branches have separate domains. A branch commits to
+the key width, canonical compressed-prefix bytes, fanout, subtree leaf count,
+and each `(edge, child leaf count, child digest)` tuple in ascending edge
+order.
 The count and routing metadata used by a reconciliation proof is therefore
 authenticated at the branch that advertises it; insertion order and the cuckoo
 table's random physical placement cannot affect the root. BLAKE3 has no inverse
@@ -189,9 +177,8 @@ BLAKE3's native chunk tree is not PATCH's tree. It represents fixed-size chunks
 of one byte stream, while PATCH is a sparse radix trie with path compression
 and changing fanout. Reusing BLAKE3 chaining values would require PATCH to cache
 the chunk tree's geometry as a second tree and would not make a child edit
-algebraic. The shared canonical encoder can stream the same node bytes directly
-through a BLAKE3 hasher without allocating the materialized blob. Team-specific
-anti-entropy salts belong outside PATCH:
+algebraic. Explicit branch framing through BLAKE3's streaming API is both
+simpler and canonical. Team-specific anti-entropy salts belong outside PATCH:
 key or domain-separate the stable Merkle root at the protocol boundary rather
 than making the collection's identity depend on who is comparing it.
 

@@ -19,8 +19,6 @@ pub mod api;
 /// Reading one collection descriptor's facts.
 pub mod descriptor;
 pub mod discovery;
-/// Canonical commit-support roots and addressable collection elements.
-pub mod element;
 /// Shared exact-ticket lifecycle for canonical derived collections.
 pub mod exact_derived;
 /// Explicit size-tiered maintenance for exact canonical target covers.
@@ -52,7 +50,6 @@ pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
 pub use discovery::*;
-pub use element::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;

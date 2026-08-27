@@ -9,17 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add a canonical `SupportRoot` over the full intrinsic hashes of signed
-  collection commits and a fixed 96-byte `CollectionElement` body binding one
-  collection, exact support root, and data identity. `SupportSet` remains a
-  thin wrapper over the existing key-only PATCH: it can materialize every
-  canonical v3 node postorder through `BlobStorePut`, while `SupportRoot::load`
-  strictly verifies the recursively fetched hashes and parent/child structure
-  before rebuilding the exact PATCH. `CollectionElementBlob` is the exact
-  three-word body, so generic conservative blob traversal retains the resident
-  descriptor, support DAG, and data without a new storage record, parser, or
-  network path.
-
 - Add lattice-aware exact derived-collection reuse over the existing team
   transport. The core resolver accepts speculative remote target handles,
   prefers any complete resident cover, selects only an exact physical
@@ -111,12 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Reframe canonical `Blake3Merkle` PATCH nodes as version-3 addressable blobs.
-  The cached node digest is ordinary BLAKE3 over one strict 32-byte-aligned
-  encoding, whose child digests occupy aligned fields discoverable by generic
-  blob traversal. Add a strict borrowed node view and logical-node
-  materializer, reject alternate padding/order/count spellings, and move pile
-  sync to the incompatible `/triblespace/pile-sync/11` ALPN.
+- Keep canonical collection progress in the existing signed commits and
+  `MERGE`/`DERIVE` equations, and keep `Blake3Merkle` focused on compact
+  in-memory anti-entropy roots. Remove the unused parallel witness and
+  materialized-node storage layers.
 
 - Replace the remaining in-memory ordered sets for inert legacy V3 collection
   headers and Yard operation WANTs with PATCH indexes. Canonical PATCH
