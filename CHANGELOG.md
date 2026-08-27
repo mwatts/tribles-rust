@@ -167,6 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RFC 3339 bounds map to inclusive validity intervals. `pile net` selects exact
   `--connect-proof` and `--sync-proof` IDs under the explicit team root.
 
+- Add `trible pile net inventory`, a read-only exact manifest probe for the
+  bound pile. It prints the canonical `/14` generation plus every component's
+  leaf count and PATCH root, and fails closed if sync-visible state changes
+  during sampling.
+
 ### Changed
 
 - Make provider-cover directory admission purely aggregate and work-conserving.

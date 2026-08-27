@@ -8,12 +8,14 @@ use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 
+use triblespace_net::inventory::{InventoryComponent, InventoryManifest, InventorySnapshot};
 use triblespace_net::peer::{
     BlobReconcileMode, Peer, PeerConfig, ReconcileDirection, ReconcileQos,
 };
+use triblespace_net::protocol::PILE_SYNC_ALPN;
 
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::StoreScope;
+use triblespace_core::repo::{StoreRevision, StoreScope};
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
@@ -88,6 +90,8 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
+    /// Print the exact canonical inventory sampled from one bound pile.
+    Inventory { pile: PathBuf },
     /// Resolve and show the exact CONNECT and SYNC_TEAM proofs this node would present.
     Status {
         /// Pile containing the native proof and its exact claim closure.
@@ -146,6 +150,7 @@ pub enum Command {
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Identity { key } => run_identity(key),
+        Command::Inventory { pile } => run_inventory(pile),
         Command::Status {
             pile,
             key,
@@ -179,6 +184,112 @@ pub fn run(cmd: Command) -> Result<()> {
             quiescent_for,
         ),
     }
+}
+
+// ── Inventory evidence ──────────────────────────────────────────────
+
+fn stable_inventory_manifest(
+    pile: &mut Pile,
+) -> Result<(ed25519_dalek::VerifyingKey, InventoryManifest)> {
+    let scope_before = pile
+        .store_scope()?
+        .ok_or_else(|| anyhow!("pile has no bound team scope"))?;
+    let revision_before = pile.store_revision()?;
+    let snapshot = InventorySnapshot::from_store(pile, scope_before)?;
+    let manifest = snapshot.manifest().clone();
+    drop(snapshot);
+    let revision_after = pile.store_revision()?;
+    let scope_after = pile.store_scope()?;
+
+    ensure_inventory_sample_unchanged(
+        &revision_before,
+        &revision_after,
+        scope_before,
+        scope_after,
+    )?;
+    Ok((scope_before, manifest))
+}
+
+fn ensure_inventory_sample_unchanged<R: Eq>(
+    revision_before: &R,
+    revision_after: &R,
+    scope_before: ed25519_dalek::VerifyingKey,
+    scope_after: Option<ed25519_dalek::VerifyingKey>,
+) -> Result<()> {
+    if revision_before != revision_after || scope_after != Some(scope_before) {
+        return Err(anyhow!(
+            "sync-visible inventory changed while it was sampled; retry"
+        ));
+    }
+    Ok(())
+}
+
+fn component_label(component: InventoryComponent) -> &'static str {
+    match component {
+        InventoryComponent::Peer => "peer",
+        InventoryComponent::CollectionRecord => "collection_record",
+        InventoryComponent::CapabilityProof => "capability_proof",
+        InventoryComponent::Blob => "blob",
+    }
+}
+
+fn format_inventory_manifest(
+    team: ed25519_dalek::VerifyingKey,
+    manifest: &InventoryManifest,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    writeln!(
+        output,
+        "protocol:            {}",
+        std::str::from_utf8(PILE_SYNC_ALPN).expect("pile sync ALPN is ASCII")
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "team_root:           {}",
+        hex::encode(team.to_bytes())
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "generation:          {}",
+        hex::encode(manifest.generation().into_bytes())
+    )
+    .expect("writing to a String cannot fail");
+    for component in InventoryComponent::ALL {
+        let entry = manifest.component(component);
+        let label = component_label(component);
+        writeln!(output, "{label}_count: {count}", count = entry.leaf_count())
+            .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "{label}_root:  {}",
+            entry
+                .root()
+                .map(hex::encode)
+                .unwrap_or_else(|| "empty".into())
+        )
+        .expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn print_inventory_manifest(team: ed25519_dalek::VerifyingKey, manifest: &InventoryManifest) {
+    print!("{}", format_inventory_manifest(team, manifest));
+}
+
+fn run_inventory(pile_path: PathBuf) -> Result<()> {
+    let mut pile = open_pile(&pile_path)?;
+    let sampled = stable_inventory_manifest(&mut pile);
+    let closed = pile
+        .close()
+        .map_err(|error| anyhow!("close pile: {error:?}"));
+    let (team, manifest) = sampled?;
+    closed?;
+    print_inventory_manifest(team, &manifest);
+    Ok(())
 }
 
 // ── Identity ─────────────────────────────────────────────────────────
@@ -442,6 +553,11 @@ fn run_sync(
 mod tests {
     use super::*;
     use iroh_base::{SecretKey, TransportAddr};
+    use tempfile::NamedTempFile;
+    use triblespace_core::blob::{encodings::UnknownBlob, Bytes};
+    use triblespace_core::repo::offer::{ArtifactHandle, ArtifactOfferStore};
+    use triblespace_core::repo::peer::{PeerEvidence, PeerStore};
+    use triblespace_core::repo::BlobStorePut;
 
     #[test]
     fn peers_accept_bare_ids_and_endpoint_tickets() {
@@ -454,5 +570,96 @@ mod tests {
         assert_eq!(parse_peers(&[id.to_string()]).unwrap(), vec![id.into()]);
         assert_eq!(parse_peers(&[ticket]).unwrap(), vec![direct]);
         assert!(parse_peers(&["not-a-peer".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn inventory_evidence_requires_a_bound_scope_without_mutating_the_pile() {
+        let file = NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(file.path()).unwrap();
+        let length_before = std::fs::metadata(file.path()).unwrap().len();
+
+        let error = stable_inventory_manifest(&mut pile).unwrap_err();
+
+        assert!(error.to_string().contains("no bound team scope"));
+        assert_eq!(std::fs::metadata(file.path()).unwrap().len(), length_before);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn inventory_evidence_derives_scope_and_ignores_local_offer_intent() {
+        let file = NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(file.path()).unwrap();
+        let team = SigningKey::from_bytes(&[0x51; 32]).verifying_key();
+        pile.bind_store_scope(team).unwrap();
+        let (observed_team, before) = stable_inventory_manifest(&mut pile).unwrap();
+
+        pile.offer(ArtifactHandle::new([0xA7; 32])).unwrap();
+        let (_, after) = stable_inventory_manifest(&mut pile).unwrap();
+
+        assert_eq!(observed_team, team);
+        assert_eq!(before, after);
+        assert!(InventoryComponent::ALL
+            .into_iter()
+            .all(|component| before.component(component).leaf_count() == 0));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn changed_inventory_or_scope_rejects_the_sample() {
+        let team = SigningKey::from_bytes(&[0x61; 32]).verifying_key();
+        let other = SigningKey::from_bytes(&[0x62; 32]).verifying_key();
+
+        assert!(ensure_inventory_sample_unchanged(&0, &0, team, Some(team)).is_ok());
+        for error in [
+            ensure_inventory_sample_unchanged(&0, &1, team, Some(team)).unwrap_err(),
+            ensure_inventory_sample_unchanged(&0, &0, team, Some(other)).unwrap_err(),
+            ensure_inventory_sample_unchanged(&0, &0, team, None).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("sync-visible inventory changed"));
+        }
+    }
+
+    #[test]
+    fn populated_inventory_output_is_complete_and_canonically_ordered() {
+        let file = NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(file.path()).unwrap();
+        let team = SigningKey::from_bytes(&[0x71; 32]).verifying_key();
+        let peer = SigningKey::from_bytes(&[0x72; 32]).verifying_key();
+        pile.bind_store_scope(team).unwrap();
+        pile.insert_peer(PeerEvidence::new(team, peer)).unwrap();
+        pile.put::<UnknownBlob, _>(Bytes::from_source(b"inventory fixture".to_vec()))
+            .unwrap();
+
+        let (observed_team, manifest) = stable_inventory_manifest(&mut pile).unwrap();
+        let output = format_inventory_manifest(observed_team, &manifest);
+        let keys: Vec<_> = output
+            .lines()
+            .map(|line| line.split_once(':').unwrap().0)
+            .collect();
+
+        assert_eq!(
+            keys,
+            [
+                "protocol",
+                "team_root",
+                "generation",
+                "peer_count",
+                "peer_root",
+                "collection_record_count",
+                "collection_record_root",
+                "capability_proof_count",
+                "capability_proof_root",
+                "blob_count",
+                "blob_root",
+            ]
+        );
+        assert!(output.contains("protocol:            /triblespace/pile-sync/14\n"));
+        assert!(output.contains("peer_count: 1\n"));
+        assert!(output.contains("collection_record_count: 0\n"));
+        assert!(output.contains("collection_record_root:  empty\n"));
+        assert!(output.contains("capability_proof_count: 0\n"));
+        assert!(output.contains("capability_proof_root:  empty\n"));
+        assert!(output.contains("blob_count: 1\n"));
+        pile.close().unwrap();
     }
 }

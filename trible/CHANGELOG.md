@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add `pile net inventory <PILE>`, a read-only probe that prints the bound team,
+  canonical `/14` inventory generation, and count/root pair for PEER evidence,
+  collection records, capability proofs, and blobs. Sampling fails closed if
+  any sync-visible component or the team scope changes while the manifest is
+  built.
+
 - Add `pile migrate <PILE> seed-artifact-offers [--dry-run]`, an explicit,
   idempotent migration which recovers local OFFER intent from one frozen native
   collection-record and blob observation. It follows resident recursive

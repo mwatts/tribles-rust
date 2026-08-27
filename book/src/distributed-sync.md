@@ -368,6 +368,10 @@ The `trible` CLI selects both resident proofs explicitly:
 trible pile net identity [--key PATH]
     Initialize the key if needed and print this node's iroh identity.
 
+trible pile net inventory <PILE>
+    Print the bound team and exact generation, count, and PATCH root of every
+    locally sampled /14 inventory component.
+
 trible pile net status <PILE>
     --team-root HEX --connect-proof ID --sync-proof ID [--key PATH]
     Resolve both exact native bundles and verify their roots, actions,
@@ -387,6 +391,17 @@ IDs. `team invite` extends two explicitly selected parent paths and writes one
 versioned portable artifact. `team join` verifies both bundles against the
 separately supplied team root and invitee key before one idempotent store
 write. See [Capability Authorization](capability-auth.md) for the proof model.
+
+`inventory` is local, read-only evidence over the same canonical manifest the
+wire protocol reconciles. It derives the team from the pile's existing store
+scope and fails when the pile is unbound, conflicted, or changes while the
+snapshot is constructed. Equal generations prove equality of all four sampled
+inventory sets without depending on append order or physical pile bytes. With
+`sync --blobs demand`, blob divergence is intentional; compare the PEER,
+collection-record, and capability-proof count/root pairs for exact structural
+equality.
+Even equal sampled generations are not a proof that every possible swarm
+member has participated or that no later write can occur.
 
 Without a lifecycle flag, `sync` runs until interrupted. `--duration` provides
 a wall-clock bound. `--quiescent-for` is only a local observation that no

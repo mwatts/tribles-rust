@@ -132,6 +132,9 @@ inventory. The local pile must contain both selected native proofs and every
 claim blob they name.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
+- `pile net inventory <PILE>` — print the pile's bound team and canonical `/14`
+  inventory generation plus exact count/root evidence for every synchronized
+  component. The read fails if semantic inventory changes while sampled.
 - `pile net status <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--key PATH]` — load both exact native bundles, verify CONNECT and SYNC_TEAM for the local key at the current time, and print their IDs and step counts.
 - `pile net sync <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only] [--blobs demand|mirror]` — run authorized periodic anti-entropy. PEER evidence, native collection records, and capability proofs converge by set union. `demand` (the default) fetches blobs only for durable WANTs after DHT provider lookup; `mirror` also walks the complete blob inventory. `read-only` pulls but does not serve local data, while `write-only` serves but never pulls or demand-fetches. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
