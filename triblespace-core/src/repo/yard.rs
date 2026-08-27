@@ -35,9 +35,10 @@ use super::pile::{
 };
 use super::proof::CapabilityProofStore;
 use super::{
-    transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    RetentionRoots, StorageClose, StoreRevision, StoreScope, StoreScopeError, TransferError,
-    WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
+    transfer, ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobChildren, BlobInfo,
+    BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, RetentionRoots, StorageClose,
+    StoreRevision, StoreScope, StoreScopeError, TransferError, WantRequest, WantStore,
+    WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -199,9 +200,9 @@ pub struct Yard {
 
 /// Opaque invalidation token for the sync-visible union of a [`Yard`].
 ///
-/// Pile boundaries cover every native record in each segment; persistent live
-/// sets additionally capture logical blob movement and eviction that need not
-/// append a record to the source segment.
+/// Each Pile revision covers its sync-visible native sets; persistent live sets
+/// additionally capture logical blob movement and eviction that need not append
+/// a record to the source segment. Local wants and artifact offers are excluded.
 #[derive(Clone, PartialEq, Eq)]
 pub struct YardRevision {
     segments: Vec<(PileRevision, HandleSet)>,
@@ -564,10 +565,11 @@ impl Yard {
     /// generation's live PATCH set, so evicted blobs stop being readable through
     /// Yard readers, but they do not mutate the underlying append-only pile
     /// files. `reclaim` is the explicit physical step. For each generation it
-    /// writes the current live handles, every native collection record, and
-    /// every canonical complete proof to a sibling temporary pile, closes both
-    /// piles, atomically renames the temporary file over the original on the
-    /// same filesystem, and reopens the generation.
+    /// writes the current live handles, every native collection record, every
+    /// canonical complete proof, and every positive artifact offer to a sibling
+    /// temporary pile, closes both piles, atomically renames the temporary file
+    /// over the original on the same filesystem, and reopens the generation.
+    /// Offers survive as operational intent but do not add handles to `live`.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         let opaque_records = self.opaque_record_count().map_err(YardReclaimError::Pile)?;
         if opaque_records != 0 {
@@ -998,6 +1000,32 @@ impl CollectionStore for Yard {
     }
 }
 
+impl ArtifactOfferStore for Yard {
+    type OfferError = PileWriteError;
+
+    fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+    where
+        I: IntoIterator<Item = ArtifactHandle>,
+    {
+        let known = self.offers_snapshot()?;
+        let novel: BTreeSet<_> = handles
+            .into_iter()
+            .filter(|handle| !known.contains(*handle))
+            .collect();
+        self.generations[0].active_mut().pile_mut().offer_all(novel)
+    }
+
+    fn offers_snapshot(&mut self) -> Result<ArtifactOfferSnapshot, Self::OfferError> {
+        let mut offers = ArtifactOfferSnapshot::default();
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                offers.union(segment.pile_mut().offers_snapshot()?);
+            }
+        }
+        Ok(offers)
+    }
+}
+
 impl WantStore for Yard {
     type WantError = PileWriteError;
 
@@ -1359,6 +1387,9 @@ fn reclaim_generation(
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
+    let artifact_offers = old_pile
+        .offers_snapshot()
+        .map_err(YardReclaimError::Offer)?;
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
@@ -1389,6 +1420,9 @@ fn reclaim_generation(
             .insert_proof(proof)
             .map_err(YardReclaimError::CapabilityProof)?;
     }
+    new_pile
+        .offer_all(artifact_offers.iter())
+        .map_err(YardReclaimError::Offer)?;
     new_pile.close().map_err(YardReclaimError::Close)?;
     drop(reader);
     old_pile.close().map_err(YardReclaimError::Close)?;
@@ -1565,6 +1599,8 @@ pub enum YardReclaimError {
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
     CapabilityProof(CapabilityProofInsertError),
+    /// Positive artifact offers could not be copied.
+    Offer(PileWriteError),
     /// The generation's local team scope conflicted or could not be copied.
     StoreScope(StoreScopeError<PileWriteError>),
     Close(super::pile::FlushError),
@@ -1598,6 +1634,7 @@ impl fmt::Display for YardReclaimError {
             Self::CapabilityProof(err) => {
                 write!(f, "failed to copy a yard capability proof: {err}")
             }
+            Self::Offer(err) => write!(f, "failed to copy a yard artifact offer: {err}"),
             Self::StoreScope(err) => write!(f, "failed to copy yard store scope: {err}"),
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WantMarkers(err) => {
@@ -1673,6 +1710,53 @@ mod tests {
 
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
         assert_eq!(reopened.store_scope().unwrap(), Some(team));
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn yard_unions_offers_and_reclaim_preserves_marker_not_blob() {
+        let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
+        let offered = yard.put::<RawBytes, _>(raw_blob(b"offered")).unwrap();
+        let offered: ArtifactHandle = offered.transmute();
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .offer(ArtifactHandle::new([41; 32]))
+            .unwrap();
+        yard.offer_all([offered, offered]).unwrap();
+
+        assert_eq!(
+            yard.offers_snapshot()
+                .unwrap()
+                .iter()
+                .collect::<BTreeSet<_>>(),
+            [offered, ArtifactHandle::new([41; 32])]
+                .into_iter()
+                .collect()
+        );
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        assert!(yard
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, _>(offered)
+            .is_err());
+        yard.reclaim().unwrap();
+        assert!(yard.offers_snapshot().unwrap().contains(offered));
+        assert!(yard
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, _>(offered)
+            .is_err());
+        yard.close().unwrap();
+
+        let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
+        assert!(reopened.offers_snapshot().unwrap().contains(offered));
+        assert!(reopened
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, _>(offered)
+            .is_err());
         reopened.close().unwrap();
     }
 

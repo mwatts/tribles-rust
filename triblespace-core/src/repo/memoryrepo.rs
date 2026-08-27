@@ -17,6 +17,7 @@ use crate::id::ID_LEN;
 use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::prelude::*;
+use crate::repo::offer::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
 use crate::repo::{StoreRevision, StoreScope, StoreScopeError, WantRequest, WantStore};
@@ -47,8 +48,29 @@ pub struct MemoryRepo {
     capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
     peer_evidence: PeerEvidenceIndex,
+    /// Positive local willingness to serve artifacts. This operational state
+    /// deliberately does not participate in [`MemoryRepoRevision`].
+    artifact_offers: ArtifactOfferSnapshot,
     /// Monotone local safety assertion binding this store to one team.
     store_scope: Option<VerifyingKey>,
+}
+
+impl ArtifactOfferStore for MemoryRepo {
+    type OfferError = Infallible;
+
+    fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+    where
+        I: IntoIterator<Item = ArtifactHandle>,
+    {
+        for handle in handles {
+            self.artifact_offers.insert(handle);
+        }
+        Ok(())
+    }
+
+    fn offers_snapshot(&mut self) -> Result<ArtifactOfferSnapshot, Self::OfferError> {
+        Ok(self.artifact_offers.clone())
+    }
 }
 
 impl StoreScope for MemoryRepo {
@@ -77,6 +99,7 @@ impl StoreScope for MemoryRepo {
 ///
 /// Each field is a persistent PATCH snapshot (or a blob store backed by one),
 /// so cloning and equality compare cached roots rather than walking entries.
+/// Local wants, artifact offers, and store scope are intentionally excluded.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemoryRepoRevision {
     blobs: MemoryBlobStore,

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `ArtifactOfferStore`, a bulk-first grow-only local willingness-to-serve
+  set with cheap deterministic snapshots. `MemoryRepo`, `Pile`, `Yard`, and
+  `HybridStore` implement the primitive; Pile persists each novel offer as one
+  self-describing 256-byte record rooted at the `trible genid`-minted anchor
+  `6EE89EEA7E6ECB2463FA5EE9C955B378`. Concatenation unions offers, while
+  reframing and conservative Pile/Yard rewrites preserve the marker without
+  retaining or manufacturing the named blob. OFFER grants no authority,
+  demand, reach, collection evidence, or synchronized-inventory membership.
+
 - Add a transport-independent bounded XOR routing core. Its 256 Kademlia-style
   buckets retain at most 20 learned peers each and distinguish remotely named
   candidates from direct authenticated responders. Explicit bootstrap

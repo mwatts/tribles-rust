@@ -1,5 +1,5 @@
 //! A Pile is an append-only collection of blobs, collection records, complete
-//! capability proofs, positive peer-routing evidence, wants, and legacy
+//! capability proofs, positive peer-routing evidence, artifact offers, wants, and legacy
 //! branches stored in a single file. It is designed as a durable local
 //! repository storage that can be safely shared between threads.
 //!
@@ -66,6 +66,7 @@ use crate::patch::Entry;
 use crate::patch::{IdentitySchema, XorSip128, PATCH};
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
+use crate::repo::offer::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
 use crate::repo::{StoreScope, StoreScopeError, WantRequest, WANT_REQUEST_BYTES_LEN};
@@ -852,6 +853,29 @@ impl BlobWantRecordHeader {
     }
 }
 
+/// Positive local artifact offer: `64..96` artifact handle.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct ArtifactOfferRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    handle: RawInline,
+    reserved: [u8; 160],
+}
+
+impl ArtifactOfferRecordHeader {
+    fn new(handle: ArtifactHandle) -> Self {
+        Self {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_ARTIFACT_OFFER,
+            handle: handle.raw,
+            reserved: [0u8; 160],
+        }
+    }
+}
+
 /// Typed operation want: `64` request tag, `96..192` its three fields.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -1147,6 +1171,7 @@ const _: () = {
     assert!(std::mem::size_of::<PinHeadRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<PinTombstoneRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<BlobWantRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<ArtifactOfferRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<WantRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<PeerEvidenceRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<StoreScopeRecordHeader>() == ENVELOPE_HEADER_LEN);
@@ -1280,6 +1305,11 @@ pub enum PileRecordContent {
     WantRetract {
         /// The exact request key being retracted.
         request: WantRequest,
+    },
+    /// One positive local willingness-to-serve marker.
+    ArtifactOffer {
+        /// Content-addressed artifact the local store is willing to serve.
+        handle: ArtifactHandle,
     },
     /// One immutable current collection-algebra record. Three distinct V4
     /// magic markers share this typed raw-inspection surface.
@@ -1461,6 +1491,21 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 offset,
                 len,
                 content,
+            })
+        }
+        record_kind::KIND_ARTIFACT_OFFER => {
+            fixed_header()?;
+            let (header, _) =
+                ArtifactOfferRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if nonzero(&[&header.reserved[..]]) {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::ArtifactOffer {
+                    handle: ArtifactHandle::new(header.handle),
+                },
             })
         }
         record_kind::KIND_AUTH_PROOF => {
@@ -2290,6 +2335,7 @@ enum Applied {
     BranchTombstone { id: Id },
     WantAssert { request: WantRequest },
     WantRetract { request: WantRequest },
+    ArtifactOffer { handle: ArtifactHandle },
     Collection { id: Id },
     CapabilityProof { id: CapabilityProofId },
     Peer { evidence: PeerEvidence },
@@ -2301,7 +2347,7 @@ enum Applied {
 
 #[derive(Debug)]
 /// A grow-only collection of blobs, collection records, complete proofs,
-/// positive peer-routing evidence, wants, and pin heads backed by a single
+/// positive peer-routing evidence, artifact offers, wants, and pin heads backed by a single
 /// file on disk.
 ///
 /// Branch updates do not verify that referenced blobs exist in the pile, allowing the
@@ -2326,6 +2372,9 @@ pub struct Pile {
     capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
     peers: PeerEvidenceIndex,
+    /// Grow-only local willingness to serve artifacts. Offers are deliberately
+    /// absent from [`super::StoreRevision`] and never retain their blobs.
+    artifact_offers: ArtifactOfferSnapshot,
     /// Every monotone physical-store team-scope assertion observed on disk.
     /// More than one distinct key is retained as a semantic conflict rather
     /// than projected away by replay order.
@@ -2488,8 +2537,9 @@ impl BlobStore for Pile {
 
 /// O(1)-clone invalidation token for the sync-visible sets in a [`Pile`].
 ///
-/// Operational WANTs, legacy branches, and opaque records intentionally do
-/// not participate: changing them cannot alter an advertised inventory.
+/// Operational WANTs, artifact offers, legacy branches, and opaque records
+/// intentionally do not participate: changing them cannot alter an advertised
+/// inventory.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PileRevision {
     blobs: PileBlobIndex,
@@ -2879,6 +2929,7 @@ impl Pile {
             collection_records: CollectionRecordIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             peers: PeerEvidenceIndex::new(),
+            artifact_offers: ArtifactOfferSnapshot::default(),
             store_scopes: StoreScopeIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
@@ -3026,6 +3077,10 @@ impl Pile {
             PileRecordContent::WantRetract { request } => {
                 self.wants.remove(&request.to_bytes());
                 Applied::WantRetract { request }
+            }
+            PileRecordContent::ArtifactOffer { handle } => {
+                self.artifact_offers.insert(handle);
+                Applied::ArtifactOffer { handle }
             }
             PileRecordContent::Collection { record } => {
                 let id = record.id();
@@ -3231,6 +3286,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.collection_records);
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.peers);
+            std::ptr::drop_in_place(&mut this.artifact_offers);
             std::ptr::drop_in_place(&mut this.store_scopes);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.wants);
@@ -3769,6 +3825,60 @@ impl PeerStore for Pile {
     }
 }
 
+impl ArtifactOfferStore for Pile {
+    type OfferError = PileWriteError;
+
+    fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+    where
+        I: IntoIterator<Item = ArtifactHandle>,
+    {
+        let handles: BTreeSet<_> = handles.into_iter().collect();
+        if handles.is_empty() {
+            return Ok(());
+        }
+
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked().map_err(PileWriteError::from)?;
+            for handle in handles {
+                if self.artifact_offers.contains(handle) {
+                    continue;
+                }
+
+                self.dirty = true;
+                let written = self
+                    .file
+                    .write(ArtifactOfferRecordHeader::new(handle).as_bytes())?;
+                if written != ENVELOPE_HEADER_LEN {
+                    return Err(PileWriteError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write complete artifact-offer record",
+                    )));
+                }
+
+                match self.apply_next().map_err(PileWriteError::from)? {
+                    Some(Applied::ArtifactOffer { handle: applied }) if applied == handle => {}
+                    Some(_) | None => {
+                        return Err(PileWriteError::IoError(std::io::Error::other(
+                            "unexpected record after artifact-offer append",
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let unlock = self.file.unlock();
+        result?;
+        unlock?;
+        Ok(())
+    }
+
+    fn offers_snapshot(&mut self) -> Result<ArtifactOfferSnapshot, Self::OfferError> {
+        self.refresh().map_err(PileWriteError::from)?;
+        Ok(self.artifact_offers.clone())
+    }
+}
+
 impl Pile {
     fn observed_store_scope(
         &self,
@@ -3989,6 +4099,7 @@ impl Pile {
                     Some(Applied::BranchTombstone { .. }) => {}
                     Some(Applied::WantAssert { .. }) => {}
                     Some(Applied::WantRetract { .. }) => {}
+                    Some(Applied::ArtifactOffer { .. }) => {}
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::CapabilityProof { .. }) => {}
                     Some(Applied::Peer { .. }) => {}
@@ -4281,6 +4392,8 @@ pub struct PileReframeStats {
     pub capability_proofs: usize,
     /// Positive peer-routing facts re-encoded.
     pub peer_evidence: usize,
+    /// Positive local artifact offers re-encoded.
+    pub artifact_offers: usize,
     /// Store-scope assertions replayed. Duplicate equal assertions remain
     /// idempotent at the destination.
     pub store_scopes: usize,
@@ -4313,6 +4426,8 @@ pub enum PileReframeError {
     CapabilityProof(CapabilityProofInsertError),
     /// Positive peer-routing evidence could not be appended.
     Peer(PileWriteError),
+    /// A positive artifact offer could not be appended.
+    Offer(PileWriteError),
     /// A store-scope assertion could not be observed or replayed.
     StoreScope(StoreScopeError<PileWriteError>),
     /// The destination was not empty, so the re-encode would have mixed
@@ -4342,6 +4457,7 @@ impl std::fmt::Display for PileReframeError {
                 write!(f, "failed to re-encode a capability proof: {error}")
             }
             Self::Peer(error) => write!(f, "failed to re-encode peer evidence: {error}"),
+            Self::Offer(error) => write!(f, "failed to re-encode an artifact offer: {error}"),
             Self::StoreScope(error) => {
                 write!(f, "failed to re-encode store scope: {error}")
             }
@@ -4359,7 +4475,9 @@ impl Error for PileReframeError {
         match self {
             Self::Source(error) => Some(error),
             Self::Destination(error) => Some(error),
-            Self::Pin(error) | Self::Want(error) | Self::Peer(error) => Some(error),
+            Self::Pin(error) | Self::Want(error) | Self::Peer(error) | Self::Offer(error) => {
+                Some(error)
+            }
             Self::StoreScope(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
@@ -4399,6 +4517,8 @@ impl Error for PileReframeError {
 ///   selectors and do not stand in for verification.
 /// * Positive peer-routing evidence is a grow-only set whose canonical dense
 ///   bodies survive reframing. It contributes no blob-retention roots.
+/// * Positive artifact offers are a grow-only local set and survive reframing,
+///   but contribute no blob-retention roots.
 /// * Records that never carried live state are dropped and counted: inert
 ///   legacy V3 collection headers, retired local cells, and kinds this reader
 ///   does not interpret. Derived collections are in the same category by
@@ -4514,6 +4634,10 @@ pub fn reframe_into(
                     .map_err(PileReframeError::Peer)?;
                 stats.peer_evidence += 1;
             }
+            PileRecordContent::ArtifactOffer { handle } => {
+                destination.offer(handle).map_err(PileReframeError::Offer)?;
+                stats.artifact_offers += 1;
+            }
             PileRecordContent::StoreScope { team } => {
                 destination
                     .bind_store_scope(team)
@@ -4541,6 +4665,8 @@ pub struct PileRewriteStats {
     pub capability_proofs: usize,
     /// Number of positive peer-routing facts preserved.
     pub peer_evidence: usize,
+    /// Number of positive local artifact offers preserved.
+    pub artifact_offers: usize,
     /// Whether the source's unique store scope was preserved.
     pub store_scope: bool,
 }
@@ -4576,6 +4702,8 @@ pub enum PileRewriteError {
     CapabilityProof(CapabilityProofInsertError),
     /// Positive peer-routing evidence could not be appended.
     Peer(PileWriteError),
+    /// A positive artifact offer could not be appended.
+    Offer(PileWriteError),
     /// The source scope conflicted or the destination rejected it.
     StoreScope(StoreScopeError<PileWriteError>),
     /// The completed destination state could not be made durable.
@@ -4604,6 +4732,7 @@ impl std::fmt::Display for PileRewriteError {
                 write!(f, "failed to preserve a capability proof: {error}")
             }
             Self::Peer(error) => write!(f, "failed to preserve peer evidence: {error}"),
+            Self::Offer(error) => write!(f, "failed to preserve an artifact offer: {error}"),
             Self::StoreScope(error) => write!(f, "failed to preserve store scope: {error}"),
             Self::Flush(error) => write!(f, "failed to flush rewritten pile: {error}"),
         }
@@ -4615,7 +4744,9 @@ impl Error for PileRewriteError {
         match self {
             Self::Source(error) => Some(error),
             Self::Transfer(error) => Some(error),
-            Self::StrongPin(error) | Self::Want(error) | Self::Peer(error) => Some(error),
+            Self::StrongPin(error) | Self::Want(error) | Self::Peer(error) | Self::Offer(error) => {
+                Some(error)
+            }
             Self::StoreScope(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
@@ -4637,9 +4768,10 @@ impl Pile {
     /// and branch models to coexist during migration.
     ///
     /// The source is refreshed once; blobs, strong pins, collection records,
-    /// complete proofs, positive peer evidence, inert legacy collection
-    /// headers, and wants are then taken from that coherent applied-prefix
-    /// snapshot. Strictly verified V4
+    /// complete proofs, positive peer evidence, positive artifact offers,
+    /// inert legacy collection headers, and wants are then taken from that
+    /// coherent applied-prefix snapshot. Artifact offers are preserved as
+    /// local service intent but never become retention roots. Strictly verified V4
     /// commits retain their resident descriptor, data, and metadata recursively;
     /// an invalid commit authenticates none of its fields. A valid commit whose
     /// dependency is not resident is still copied as durable ground truth, but
@@ -4699,6 +4831,7 @@ impl Pile {
         let legacy_collection_headers = self.legacy_collection_headers.clone();
         let source_wants = self.wants.clone();
         let peer_evidence = self.peers.clone();
+        let artifact_offers = self.artifact_offers.clone();
 
         let mut roots = explicit.clone();
         for raw in &strong_pins {
@@ -4816,6 +4949,11 @@ impl Pile {
                 .map_err(PileRewriteError::Peer)?;
         }
 
+        let artifact_offer_count = artifact_offers.len() as usize;
+        destination
+            .offer_all(artifact_offers.iter())
+            .map_err(PileRewriteError::Offer)?;
+
         let mut preserved_wants = 0usize;
         if wants == WantRewritePolicy::Preserve {
             for bytes in source_wants.into_iter_ordered() {
@@ -4837,6 +4975,7 @@ impl Pile {
             wants: preserved_wants,
             capability_proofs: capability_proof_count,
             peer_evidence: peer_evidence_count,
+            artifact_offers: artifact_offer_count,
             store_scope: store_scope.is_some(),
         })
     }
@@ -4882,6 +5021,110 @@ mod tests {
 
     fn team_key(seed: u8) -> VerifyingKey {
         SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    fn artifact_handle(byte: u8) -> ArtifactHandle {
+        ArtifactHandle::new([byte; 32])
+    }
+
+    #[test]
+    fn artifact_offers_round_trip_deduplicate_and_use_one_block_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "offers.pile");
+        let mut pile = Pile::open(&path).unwrap();
+
+        pile.offer_all([artifact_handle(2), artifact_handle(1), artifact_handle(2)])
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 * 256);
+        assert_eq!(
+            pile.offers_snapshot().unwrap().iter().collect::<Vec<_>>(),
+            vec![artifact_handle(1), artifact_handle(2)]
+        );
+        pile.close().unwrap();
+
+        let mut records = PileRecords::open(&path).unwrap();
+        for expected in [artifact_handle(1), artifact_handle(2)] {
+            let record = records.next().unwrap().unwrap();
+            assert_eq!(record.len, ENVELOPE_HEADER_LEN);
+            assert!(matches!(
+                record.content,
+                PileRecordContent::ArtifactOffer { handle } if handle == expected
+            ));
+        }
+        assert!(records.next().is_none());
+
+        let mut reopened = Pile::open(&path).unwrap();
+        assert_eq!(reopened.offers_snapshot().unwrap().len(), 2);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn artifact_offers_cat_as_an_order_independent_set_union() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = fresh_empty_pile_path(&dir, "offers-a.pile");
+        let path_b = fresh_empty_pile_path(&dir, "offers-b.pile");
+        let path_ab = dir.path().join("offers-ab.pile");
+        let path_ba = dir.path().join("offers-ba.pile");
+
+        let mut a = Pile::open(&path_a).unwrap();
+        a.offer_all([artifact_handle(1), artifact_handle(2)])
+            .unwrap();
+        a.close().unwrap();
+        let mut b = Pile::open(&path_b).unwrap();
+        b.offer_all([artifact_handle(2), artifact_handle(3)])
+            .unwrap();
+        b.close().unwrap();
+
+        let bytes_a = std::fs::read(&path_a).unwrap();
+        let bytes_b = std::fs::read(&path_b).unwrap();
+        let mut ab = bytes_a.clone();
+        ab.extend_from_slice(&bytes_b);
+        std::fs::write(&path_ab, ab).unwrap();
+        let mut ba = bytes_b;
+        ba.extend_from_slice(&bytes_a);
+        std::fs::write(&path_ba, ba).unwrap();
+
+        let expected = vec![artifact_handle(1), artifact_handle(2), artifact_handle(3)];
+        for path in [&path_ab, &path_ba] {
+            let mut pile = Pile::open(path).unwrap();
+            assert_eq!(
+                pile.offers_snapshot().unwrap().iter().collect::<Vec<_>>(),
+                expected
+            );
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_offer_shaped_envelope_has_a_forgetful_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "opaque-offer.pile");
+        let mut unknown = ArtifactOfferRecordHeader::new(artifact_handle(4))
+            .as_bytes()
+            .to_vec();
+        unknown[32..64].copy_from_slice(&TEST_UNKNOWN_KIND_A);
+        append_test_bytes(&path, &unknown);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.offer(artifact_handle(5)).unwrap();
+        assert_eq!(pile.opaque_record_count().unwrap(), 1);
+        assert_eq!(
+            pile.offers_snapshot().unwrap().iter().collect::<Vec<_>>(),
+            vec![artifact_handle(5)]
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn offer_record_rejects_nonzero_reserved_bytes() {
+        let mut bytes = ArtifactOfferRecordHeader::new(artifact_handle(6))
+            .as_bytes()
+            .to_vec();
+        bytes[96] = 1;
+        assert!(matches!(
+            decode_record(&bytes, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
     }
 
     fn capability_fixture(seed: u8, resource: [u8; 32]) -> (CapabilityProof, Blob<SimpleArchive>) {
@@ -6604,6 +6847,7 @@ mod tests {
                 wants: 1,
                 capability_proofs: 0,
                 peer_evidence: 0,
+                artifact_offers: 0,
                 store_scope: false,
             }
         );
@@ -8822,6 +9066,64 @@ mod tests {
                 .unwrap(),
             vec![evidence]
         );
+        source.close().unwrap();
+        destination.close().unwrap();
+    }
+
+    #[test]
+    fn reframe_preserves_artifact_offers_without_manufacturing_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "offer-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "offer-destination.pile");
+        let offered = artifact_handle(61);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        source.offer(offered).unwrap();
+        source.close().unwrap();
+
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = reframe_into(&source_path, &mut destination).unwrap();
+        assert_eq!(stats.artifact_offers, 1);
+        assert_eq!(stats.blobs, 0);
+        assert!(destination.offers_snapshot().unwrap().contains(offered));
+        assert!(destination
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, _>(offered)
+            .is_err());
+        destination.close().unwrap();
+    }
+
+    #[test]
+    fn retained_rewrite_preserves_offer_but_not_its_unrooted_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "offer-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "offer-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let offered = source
+            .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(Bytes::from_source(
+                b"offered but not retained".to_vec(),
+            )))
+            .unwrap();
+        source.offer(offered).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+
+        assert_eq!(stats.retained_blobs, 0);
+        assert_eq!(stats.artifact_offers, 1);
+        assert!(destination.offers_snapshot().unwrap().contains(offered));
+        assert!(destination
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, _>(offered)
+            .is_err());
         source.close().unwrap();
         destination.close().unwrap();
     }

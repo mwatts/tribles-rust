@@ -7,22 +7,41 @@ use crate::inline::InlineEncoding;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::StorageFlush;
+use crate::repo::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 use crate::repo::{WantRequest, WantStore};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
-/// Store that delegates blob/want and collection-record operations to two
+/// Store that delegates blob/want/offer and collection-record operations to two
 /// independent stores.
 ///
 /// This allows mixing different storage implementations, for example an
 /// on-disk blob store with an in-memory collection-record store.
 #[derive(Debug)]
 pub struct HybridStore<B, R> {
-    /// Storage for content-addressed blobs and durable typed wants.
+    /// Storage for content-addressed blobs, durable typed wants, and offers.
     pub blobs: B,
     /// Storage for native collection records.
     pub records: R,
+}
+
+impl<B, R> ArtifactOfferStore for HybridStore<B, R>
+where
+    B: ArtifactOfferStore,
+{
+    type OfferError = B::OfferError;
+
+    fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+    where
+        I: IntoIterator<Item = ArtifactHandle>,
+    {
+        self.blobs.offer_all(handles)
+    }
+
+    fn offers_snapshot(&mut self) -> Result<ArtifactOfferSnapshot, Self::OfferError> {
+        self.blobs.offers_snapshot()
+    }
 }
 
 impl<B, R> HybridStore<B, R> {
@@ -233,6 +252,17 @@ mod tests {
             CollectionStore::records(&mut hybrid.blobs).unwrap().count(),
             0
         );
+    }
+
+    #[test]
+    fn artifact_offers_delegate_only_to_the_blob_side() {
+        let offered = ArtifactHandle::new([31; 32]);
+        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
+
+        hybrid.offer(offered).unwrap();
+        assert!(hybrid.offers_snapshot().unwrap().contains(offered));
+        assert!(hybrid.blobs.offers_snapshot().unwrap().contains(offered));
+        assert!(hybrid.records.offers_snapshot().unwrap().is_empty());
     }
 
     #[test]

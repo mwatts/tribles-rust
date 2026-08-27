@@ -89,6 +89,12 @@ Blob WANT records are an explicit rewrite choice. Preserving them copies their
 demand markers but does not promote the requested blob to an ownership root;
 dropping them omits the markers entirely.
 
+Artifact OFFER records follow a different fixed policy: conservative Pile and
+Yard rewrites always preserve their positive local service intent, but an
+offered handle is never a retention root. The marker can therefore survive as
+dormant intent while the named blob is absent, and becomes useful again if the
+same immutable bytes later return.
+
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
 collection registry. A caller selecting one semantic view must rediscover its
 records, apply its explicit open or capability admission, and supply a fresh

@@ -98,8 +98,8 @@ use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
 };
 use super::{
-    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, StorageFlush, WantRequest,
-    WantStore,
+    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobInfo, BlobStore, BlobStoreGet,
+    BlobStoreList, BlobStorePut, StorageFlush, WantRequest, WantStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -443,6 +443,24 @@ where
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.store.lock().expect("store mutex").insert(record)
+    }
+}
+
+impl<S> ArtifactOfferStore for Lazy<S>
+where
+    S: ArtifactOfferStore,
+{
+    type OfferError = S::OfferError;
+
+    fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+    where
+        I: IntoIterator<Item = ArtifactHandle>,
+    {
+        self.store.lock().expect("store mutex").offer_all(handles)
+    }
+
+    fn offers_snapshot(&mut self) -> Result<ArtifactOfferSnapshot, Self::OfferError> {
+        self.store.lock().expect("store mutex").offers_snapshot()
     }
 }
 
@@ -883,6 +901,23 @@ mod tests {
             CollectionStore::select_records(&mut lazy, &selectors).unwrap(),
             vec![record]
         );
+    }
+
+    #[test]
+    fn artifact_offers_forward_through_the_store_mutex() {
+        let mut lazy = Lazy::new(MemoryRepo::default());
+        let (_, first) = blob_of(b"first offer");
+        let (_, second) = blob_of(b"second offer");
+
+        lazy.offer_all([second, first, first]).unwrap();
+
+        let snapshot = lazy.offers_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.contains(first));
+        assert!(snapshot.contains(second));
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(snapshot.iter().collect::<Vec<_>>(), expected);
     }
 
     /// A local hit serves from the snapshot: no want is recorded.

@@ -180,6 +180,14 @@ record_kinds! {
         "pile-store-scope-v1",
         "Monotone local safety assertion STORE_SCOPE(team_public_key). Envelope bytes 64..96 hold exactly one 32-byte Ed25519 team trust-root public key and 96..256 are zeros. The record spans exactly one 256-byte block and has no payload. Repeating the same assertion is idempotent; observing two distinct keys is a semantic conflict and network assembly must fail closed. This assertion is neither authorization nor peer, collection, proof, or blob inventory and is never synchronized.";
 
+    /// Positive local willingness to serve one content-addressed artifact.
+    ///
+    /// Kind/schema id minted with `trible genid` on 2026-08-27.
+    ArtifactOfferRecordV1 = KIND_ID_ARTIFACT_OFFER "6EE89EEA7E6ECB2463FA5EE9C955B378",
+        KIND_ARTIFACT_OFFER "EA7B185AC83955D2249F4D8C83B6910D44D01C61B4E497C1B66E1B75C3ADCB6F",
+        "pile-artifact-offer-v1",
+        "Positive local willingness to serve one content-addressed artifact. Envelope bytes 64..96 hold the 32-byte BLAKE3 blob handle and 96..256 are zeros. The record spans exactly one 256-byte block and has no payload. Presence grants no authority, reach, demand, gossip-inventory membership, collection evidence, or retention; no inverse or retraction record exists.";
+
 }
 
 /// Every blob needed to resolve every known record kind.
@@ -238,6 +246,11 @@ mod tests {
             KIND_ID_PEER_EVIDENCE,
             crate::repo::peer::KIND_PEER_EVIDENCE,
             "PEER's dense semantic kind and pile description root must stay identical"
+        );
+        assert_eq!(
+            KIND_ID_ARTIFACT_OFFER,
+            crate::repo::offer::KIND_ARTIFACT_OFFER,
+            "OFFER's dense semantic kind and pile description root must stay identical"
         );
     }
 }

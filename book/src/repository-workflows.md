@@ -19,6 +19,8 @@ merge or derivation equations provide reusable physical work.
   admitted ground truth for one read or derivation.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
+- **OFFER** — positive local willingness to serve an artifact; it is neither
+  residency, demand, synchronized inventory, retention, nor authority.
 
 `MemoryRepo`, `Pile`, and the storage composition wrappers implement both the
 blob and native collection surfaces. `ObjectStoreRemote` exposes the equivalent
@@ -251,6 +253,19 @@ A reconciler may satisfy those questions from local workers or peers. The
 answer to an operation WANT is the ordinary native equation; obtaining its
 result bytes is a separate blob WANT. A WANT grants no authority and does not
 change the value of any collection.
+
+## OFFER local service intent
+
+`ArtifactOfferStore` durably records a grow-only set of handles this store is
+willing to serve. `offer_all` is the primary operation so callers can publish a
+whole successful workflow batch through one backend boundary; repeated handles
+and already-known offers are idempotent. `offers_snapshot` is a cheap immutable
+deterministic observation for local service policy.
+
+OFFER is intentionally not a second collection or network inventory. It says
+nothing about authority, reach, current residency, retention, or demand. A
+conservative rewrite carries the marker forward but may collect the artifact,
+leaving dormant intent that becomes effective if identical content returns.
 
 ## Migrate a legacy branch explicitly
 

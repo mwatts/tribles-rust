@@ -1,7 +1,7 @@
 #![allow(clippy::type_complexity)]
 //! Content-addressed blob storage, complete capability proofs, collection
-//! records, positive peer-routing evidence, durable wants, and read-only
-//! access to legacy named-pin snapshots.
+//! records, positive peer-routing evidence, durable wants and artifact offers,
+//! and read-only access to legacy named-pin snapshots.
 //!
 //! Collections are the mutable-history replacement. Legacy pin and commit
 //! encodings remain readable so existing piles can be migrated and retained,
@@ -17,6 +17,9 @@ pub mod hybridstore;
 pub mod lazy;
 /// Fully in-memory storage implementation for tests and ephemeral use.
 pub mod memoryrepo;
+/// Grow-only local willingness to serve content-addressed artifacts.
+pub mod offer;
+pub use offer::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 #[cfg(feature = "object-store")]
 /// Storage backed by an `object_store`-compatible remote (S3, local FS, etc.).
 pub mod objectstore;
@@ -78,6 +81,8 @@ pub trait StorageFlush {
 /// This keeps an unchanged poll proportional to the storage boundary (for a
 /// [`pile::Pile`], one file-length observation) instead of to the number of
 /// indexed objects.
+/// Local wants, artifact offers, and store-scope assertions are operational
+/// state and therefore do not participate.
 pub trait StoreRevision {
     /// Opaque equality token retained by the caller between observations.
     type Revision: Clone + Eq + Send + 'static;

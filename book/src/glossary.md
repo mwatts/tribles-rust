@@ -174,7 +174,7 @@ segments relevant to their bindings, further described in
 
 ### Pile
 An append-only collection of blobs, native collection records, native
-capability proofs, positive peer-routing evidence, and WANT records stored in
+capability proofs, positive peer-routing evidence, OFFER records, and WANT records stored in
 one file. Piles are memory
 mapped, recoverable after interrupted appends, and mergeable by byte
 concatenation. Legacy pin records remain decodable only for conservative
@@ -230,3 +230,10 @@ be diffed by intrinsic commit ID without walking a commit chain.
 A durable local request for a blob or for an existing merge/derive result.
 WANT is operational policy: it neither adds collection authority nor changes a
 collection's logical value.
+
+### OFFER
+
+A durable positive local willingness to serve one content-addressed artifact.
+OFFER forms a grow-only set and has no retraction. It grants no authority,
+requests no bytes, contributes no collection or synchronized-inventory
+evidence, proves no residency, and retains no blob.
