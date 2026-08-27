@@ -1,15 +1,11 @@
-//! Bounded, receiver-local hints for locating already-known collection elements.
+//! Bounded, receiver-local hints for locating already-known immutable artifacts.
 //!
-//! This is not an element-discovery index: callers must already know the
-//! [`ElementId`] they ask about. Bounded gossip is the discovery plane (with
-//! broad collection reconciliation retained only during the shadow cutover);
-//! this directory answers only "who recently said they can provide this exact
-//! element?" Exact transfer and validation remain separate operations.
-//!
-//! This is a minimal rendezvous substrate, not a complete large-swarm DHT.
-//! Nodes choose replicas from their current PEER views; temporarily divergent
-//! views can miss until peer convergence and a later lease renewal restore
-//! overlap. The directory never turns that uncertainty into a false answer.
+//! This is not an artifact-discovery index: callers must already know the
+//! [`ArtifactId`] they ask about. It answers only "who recently said they can
+//! provide this exact artifact?" Exact transfer and validation remain separate
+//! operations. Replica placement uses the network's bounded iterative XOR
+//! routing; temporary partitions and stale leases remain soft unknowns, never
+//! fabricated answers.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -19,25 +15,25 @@ use ed25519_dalek::VerifyingKey;
 use crate::clock::Mono;
 use crate::transport::PeerId;
 
-/// Content identity of one canonical collection element.
-pub type ElementId = [u8; 32];
+/// Bare physical identity of one data artifact.
+pub type ArtifactId = [u8; 32];
 
 /// Opaque team-scoped rendezvous key used to select provider-directory replicas.
 pub(crate) type ProviderKey = [u8; 32];
 
 /// Receiver-chosen lifetime of one provider hint.
 pub(crate) const PROVIDER_LEASE_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
-/// Maximum fan-out returned for one element.
+/// Maximum fan-out returned for one artifact.
 pub(crate) const MAX_PROVIDERS_PER_KEY: usize = 64;
 const _: () = assert!(MAX_PROVIDERS_PER_KEY <= u8::MAX as usize);
 /// Hard bound on all logical provider entries held by one process.
 const MAX_PROVIDER_ENTRIES: usize = 65_536;
 
 /// Derive a lookup key without exposing cross-team content overlap.
-pub(crate) fn provider_key(team: VerifyingKey, element: ElementId) -> ProviderKey {
+pub(crate) fn provider_key(team: VerifyingKey, artifact: ArtifactId) -> ProviderKey {
     let mut hasher = blake3::Hasher::new_derive_key("triblespace.net/provider-key/v1");
     hasher.update(team.as_bytes());
-    hasher.update(&element);
+    hasher.update(&artifact);
     *hasher.finalize().as_bytes()
 }
 
@@ -165,27 +161,40 @@ mod tests {
     fn keys_are_deterministic_and_team_scoped() {
         let team_a = SigningKey::from_bytes(&[1; 32]).verifying_key();
         let team_b = SigningKey::from_bytes(&[2; 32]).verifying_key();
-        let element = [3; 32];
-        assert_eq!(provider_key(team_a, element), provider_key(team_a, element));
-        assert_ne!(provider_key(team_a, element), provider_key(team_b, element));
-        assert_ne!(provider_key(team_a, element), provider_key(team_a, [4; 32]));
+        let artifact = [3; 32];
+        assert_eq!(
+            provider_key(team_a, artifact),
+            provider_key(team_a, artifact)
+        );
+        assert_ne!(
+            provider_key(team_a, artifact),
+            provider_key(team_b, artifact)
+        );
+        assert_ne!(
+            provider_key(team_a, artifact),
+            provider_key(team_a, [4; 32])
+        );
     }
 
     #[test]
-    fn one_teams_element_hint_is_invisible_under_another_team() {
+    fn one_teams_artifact_hint_is_invisible_under_another_team() {
         let now = crate::clock::mono_now();
         let team_a = SigningKey::from_bytes(&[1; 32]).verifying_key();
         let team_b = SigningKey::from_bytes(&[2; 32]).verifying_key();
-        let element = [3; 32];
+        let artifact = [3; 32];
         let provider = SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes();
         let mut directory = ProviderDirectory::default();
 
-        assert!(directory.put(provider_key(team_a, element), provider, now));
+        assert!(directory.put(provider_key(team_a, artifact), provider, now));
         assert_eq!(
-            directory.get(provider_key(team_a, element), now),
+            directory.get(provider_key(team_a, artifact), now),
             vec![provider]
         );
-        assert!(directory.get(provider_key(team_b, element), now).is_empty());
+        assert!(
+            directory
+                .get(provider_key(team_b, artifact), now)
+                .is_empty()
+        );
     }
 
     #[test]

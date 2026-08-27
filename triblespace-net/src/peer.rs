@@ -29,7 +29,7 @@ use triblespace_core::repo::{
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
-use crate::provider::ElementId;
+use crate::provider::ArtifactId;
 
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
@@ -217,7 +217,7 @@ where
         self.last_event_at
     }
 
-    /// Fetch exact content through configured and authenticated PEER routes.
+    /// Fetch exact content through its authenticated DHT provider hints.
     /// This primitive neither records a WANT nor mutates the store.
     pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
         self.sender
@@ -233,21 +233,21 @@ where
         self.sender.fetch_blob(hash, budget).await
     }
 
-    /// Announce this endpoint as a soft provider for an already-known element.
+    /// Announce this endpoint as a soft provider for an already-known artifact.
     ///
-    /// The caller is responsible for announcing only elements it can serve;
+    /// The caller is responsible for announcing only artifacts it can serve;
     /// the directory is merely a leased routing hint. It neither discovers
-    /// element IDs nor replaces exact transfer and validation.
-    pub async fn announce_element(&self, element: ElementId) -> usize {
+    /// artifact IDs nor replaces exact transfer and validation.
+    pub async fn announce_artifact(&self, artifact: ArtifactId) -> usize {
         self.sender
-            .announce_element(element, host::INTERACTIVE_FETCH_DEADLINE)
+            .announce_artifact(artifact, host::INTERACTIVE_FETCH_DEADLINE)
             .await
     }
 
-    /// Look up soft provider hints for an already-known element identity.
-    pub async fn find_element_providers(&self, element: ElementId) -> Vec<EndpointId> {
+    /// Look up soft provider hints for an already-known physical artifact.
+    pub async fn find_artifact_providers(&self, artifact: ArtifactId) -> Vec<EndpointId> {
         self.sender
-            .find_element_providers(element, host::INTERACTIVE_FETCH_DEADLINE)
+            .find_artifact_providers(artifact, host::INTERACTIVE_FETCH_DEADLINE)
             .await
             .into_iter()
             .filter_map(|provider| EndpointId::from_bytes(&provider).ok())

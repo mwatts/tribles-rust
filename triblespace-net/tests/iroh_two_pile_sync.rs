@@ -197,8 +197,8 @@ async fn two_nodes(
 }
 
 /// A content blob lives only in pile A. B records a durable want; the
-/// Reconciler services it through the explicitly configured route and lands
-/// the bytes in pile B.
+/// holder publishes it through the DHT, and B's Reconciler lands the bytes in
+/// pile B.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn want_fetches_from_holder_over_iroh() {
     init_tracing();
@@ -230,6 +230,11 @@ async fn want_fetches_from_holder_over_iroh() {
         pile.flush().expect("flush payload");
     })
     .await;
+    peer_a.refresh();
+    assert!(
+        peer_a.announce_artifact(hash).await >= 1,
+        "holder explicitly publishes the artifact before demand"
+    );
 
     // Precondition: B does not hold the payload.
     {

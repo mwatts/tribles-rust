@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   promotes only the peer that actually answered, removes failed learned routes,
   and terminates without actors, a second transport, or new dependencies.
 
+- Route immutable-artifact provider placement and lookup through authenticated
+  alpha-3 FIND_NODE walks. Exact fetch no longer probes the learned peer set:
+  holders explicitly publish artifacts through the DHT, while unannounced
+  artifacts remain clean misses. Wire protocol identity advances to pile-sync
+  ALPN v13.
+
 - Add lattice-aware exact derived-collection reuse over the existing team
   transport. The core resolver accepts speculative remote target handles,
   prefers any complete resident cover, selects only an exact physical

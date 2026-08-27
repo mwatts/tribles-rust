@@ -26,7 +26,7 @@ use triblespace_core::collection::CollectionStore;
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
+use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, CapabilityProofStore, PeerStore};
 
@@ -50,7 +50,8 @@ use crate::inventory_wire::{
     send_inventory_auth_ok, send_inventory_auth_rejected, send_manifest, send_node_response,
 };
 use crate::protocol::*;
-use crate::provider::{ElementId, ProviderDirectory, ProviderKey, provider_key};
+use crate::provider::{ArtifactId, ProviderDirectory, ProviderKey, provider_key};
+use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
 
 /// Configuration for a peer attached to one single-team store.
@@ -645,71 +646,12 @@ fn decode_inventory_wake_frame(bytes: &[u8], team: VerifyingKey) -> Option<Inven
 /// the content hash narrows the request but is not itself disclosure authority.
 pub(crate) trait NetCapability: Send + Sync {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
-    fn announce_element(&self, element: ElementId) -> futures::future::BoxFuture<'static, usize>;
-    fn find_element_providers(
+    fn announce_artifact(&self, artifact: ArtifactId)
+    -> futures::future::BoxFuture<'static, usize>;
+    fn find_artifact_providers(
         &self,
-        element: ElementId,
+        artifact: ArtifactId,
     ) -> futures::future::BoxFuture<'static, Vec<PeerId>>;
-}
-
-struct RoutingTable {
-    configured: PATCH<32, IdentitySchema>,
-    learned: PATCH<32, IdentitySchema>,
-}
-
-impl RoutingTable {
-    fn new(configured: Vec<PeerId>) -> Self {
-        let mut configured_index = PATCH::new();
-        for peer in configured {
-            configured_index.insert(&PatchEntry::new(&peer));
-        }
-        Self {
-            configured: configured_index,
-            learned: PATCH::new(),
-        }
-    }
-
-    fn note(&mut self, peer: PeerId) {
-        if self.configured.get(&peer).is_some() {
-            return;
-        }
-        self.learned.insert(&PatchEntry::new(&peer));
-    }
-
-    fn replace_learned(&mut self, peers: Vec<PeerId>, self_id: PeerId) {
-        for peer in peers.into_iter().filter(|peer| *peer != self_id) {
-            self.note(peer);
-        }
-    }
-
-    fn candidates(&self, self_id: PeerId) -> Vec<PeerId> {
-        let mut all = self.configured.clone();
-        all.union(self.learned.clone());
-        all.into_iter_ordered()
-            .filter(|peer| *peer != self_id)
-            .collect()
-    }
-
-    /// Deterministic rendezvous replicas among the currently known peers.
-    ///
-    /// Temporarily divergent PEER views can choose different replicas and
-    /// therefore yield a temporary miss. This soft directory intentionally
-    /// does not grow a second node-discovery protocol: ordinary PEER/gossip
-    /// convergence plus lease renewal repairs the overlap.
-    fn closest(&self, target: ProviderKey, self_id: PeerId, limit: usize) -> Vec<PeerId> {
-        let mut peers = self.candidates(self_id);
-        peers.push(self_id);
-        peers.sort_unstable_by(|a, b| {
-            a.iter()
-                .zip(b)
-                .zip(target)
-                .map(|((&a, &b), target)| (a ^ target).cmp(&(b ^ target)))
-                .find(|ordering| !ordering.is_eq())
-                .unwrap_or_else(|| a.cmp(b))
-        });
-        peers.truncate(limit);
-        peers
-    }
 }
 
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
@@ -770,12 +712,14 @@ struct NetCap<T: Transport> {
     providers: Arc<Mutex<ProviderDirectory>>,
 }
 
+#[derive(Clone)]
 struct ProviderClient<T: Transport> {
     transport: T,
     pool: SharedPool<T::Conn>,
     connect_proof: CapabilityProofBundle,
     sync_proof: CapabilityProofBundle,
     providers: Arc<Mutex<ProviderDirectory>>,
+    candidates: RoutingCandidates,
     my_id: PeerId,
     team: VerifyingKey,
 }
@@ -788,6 +732,7 @@ impl<T: Transport> NetCap<T> {
             connect_proof: self.connect_proof.clone(),
             sync_proof: self.sync_proof.clone(),
             providers: self.providers.clone(),
+            candidates: self.candidates.clone(),
             my_id: self.my_id,
             team: self.team,
         }
@@ -801,61 +746,54 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let connect_proof = self.connect_proof.clone();
         let sync_proof = self.sync_proof.clone();
         let can_fetch = self.can_fetch;
-        let my_id = self.my_id;
         let team = self.team;
-        let known = self.candidates.lock().unwrap().candidates(my_id);
+        let candidates = self.candidates.clone();
+        let client = self.provider_client();
         Box::pin(async move {
             if !can_fetch {
                 return None;
             }
-            let bytes = fetch_from_providers(
+
+            let providers = client.find_artifact(hash).await;
+            fetch_from_providers(
                 &transport,
                 &hash,
                 &pool,
-                &known,
+                &providers,
                 team,
                 &connect_proof,
                 &sync_proof,
+                &candidates,
             )
-            .await;
-            bytes.filter(|bytes| blake3::hash(bytes).as_bytes() == &hash)
+            .await
         })
     }
 
-    fn announce_element(&self, element: ElementId) -> futures::future::BoxFuture<'static, usize> {
+    fn announce_artifact(
+        &self,
+        artifact: ArtifactId,
+    ) -> futures::future::BoxFuture<'static, usize> {
         let can_announce = self.can_announce;
-        let key = provider_key(self.team, element);
-        let targets =
-            self.candidates
-                .lock()
-                .unwrap()
-                .closest(key, self.my_id, PROVIDER_REPLICA_COUNT);
         let client = self.provider_client();
         Box::pin(async move {
             if !can_announce {
                 return 0;
             }
-            client.announce(key, element, targets).await
+            client.announce_artifact(artifact).await
         })
     }
 
-    fn find_element_providers(
+    fn find_artifact_providers(
         &self,
-        element: ElementId,
+        artifact: ArtifactId,
     ) -> futures::future::BoxFuture<'static, Vec<PeerId>> {
         let can_find = self.can_fetch;
-        let key = provider_key(self.team, element);
-        let targets =
-            self.candidates
-                .lock()
-                .unwrap()
-                .closest(key, self.my_id, PROVIDER_REPLICA_COUNT);
         let client = self.provider_client();
         Box::pin(async move {
             if !can_find {
                 return Vec::new();
             }
-            client.find(key, element, targets).await
+            client.find_artifact(artifact).await
         })
     }
 }
@@ -940,12 +878,16 @@ impl NetSender {
         .flatten()
     }
 
-    /// Best-effort lease renewal for an already-known element identity.
+    /// Best-effort lease renewal for an already-known physical artifact.
     /// Returns the number of receiver-local replicas which accepted the hint.
-    pub async fn announce_element(&self, element: ElementId, budget: std::time::Duration) -> usize {
+    pub async fn announce_artifact(
+        &self,
+        artifact: ArtifactId,
+        budget: std::time::Duration,
+    ) -> usize {
         tokio::time::timeout(budget, async {
             let capability = self.ready_capability().await.ok()?;
-            Some(capability.announce_element(element).await)
+            Some(capability.announce_artifact(artifact).await)
         })
         .await
         .ok()
@@ -953,16 +895,16 @@ impl NetSender {
         .unwrap_or(0)
     }
 
-    /// Find soft provider hints for an already-known element identity.
-    /// This cannot enumerate or discover element IDs.
-    pub async fn find_element_providers(
+    /// Find soft provider hints for an already-known physical artifact.
+    /// This cannot enumerate or discover artifact IDs.
+    pub async fn find_artifact_providers(
         &self,
-        element: ElementId,
+        artifact: ArtifactId,
         budget: std::time::Duration,
     ) -> Vec<PeerId> {
         tokio::time::timeout(budget, async {
             let capability = self.ready_capability().await.ok()?;
-            Some(capability.find_element_providers(element).await)
+            Some(capability.find_artifact_providers(artifact).await)
         })
         .await
         .ok()
@@ -1088,10 +1030,18 @@ pub(crate) const MAX_INBOUND_CONNECTIONS_GLOBAL: usize = 64;
 pub(crate) const MAX_INBOUND_REQUESTS_PER_CONNECTION: usize = 16;
 const MAX_INBOUND_REQUESTS_GLOBAL: usize = 64;
 const MAX_CONCURRENT_SWEEPS: usize = 8;
-/// Rendezvous replication factor over the currently known PEER set.
-const PROVIDER_REPLICA_COUNT: usize = 20;
 /// Bounded parallelism for the small provider-directory RPC fan-out.
-const MAX_CONCURRENT_PROVIDER_RPCS: usize = 3;
+const MAX_CONCURRENT_PROVIDER_RPCS: usize = ALPHA;
+/// One lookup must fit comfortably inside the default interactive operation.
+const DHT_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Deadline for small provider control RPCs and authenticated connection setup.
+/// Exact artifact bodies deliberately are not capped by this deadline.
+const PROVIDER_CONTROL_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Leave at least half of the public operation budget for exact blob bytes.
+const PROVIDER_CONTROL_PHASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Admit one bounded second alpha batch without cancelling already progressing
+/// bodies. A full second avoids multiplying ordinary medium-sized transfers.
+const PROVIDER_FETCH_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 struct SweepOutcome {
     peer: PeerId,
@@ -1134,9 +1084,13 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         .collect();
     configured.sort_unstable();
     configured.dedup();
-    let candidates = Arc::new(Mutex::new(RoutingTable::new(configured)));
+    let candidates = Arc::new(Mutex::new(RoutingTable::new(my_id, configured)));
     let pool = new_shared_pool();
     let providers = Arc::new(Mutex::new(ProviderDirectory::default()));
+    let (gossip_sender, mut gossip_events) = match gossip {
+        Some((sender, events)) => (Some(sender), Some(events)),
+        None => (None, None),
+    };
     let _ = cap_tx.send(Some(Arc::new(NetCap {
         transport: transport.clone(),
         pool: pool.clone(),
@@ -1159,7 +1113,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         sync_proof: config.sync_proof.clone(),
         events: events.clone(),
         candidates: candidates.clone(),
-        providers,
+        providers: providers.clone(),
         serve_inventory: config.qos.direction.serves(),
         admit_inbound_peer: config.qos.direction.admits_inbound_peer(),
         inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CONNECTIONS_GLOBAL)),
@@ -1183,14 +1137,12 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     });
 
     let wake_pending = Arc::new(AtomicBool::new(false));
-    let mut gossip_sender = None;
-    if let Some((sender, mut gossip_events)) = gossip {
-        gossip_sender = Some(sender);
+    if let Some(mut events) = gossip_events.take() {
         let team = config.team;
         let wake_pending = wake_pending.clone();
         tokio::spawn(async move {
             let mut last_generation = None;
-            while let Some(event) = gossip_events.recv().await {
+            while let Some(event) = events.recv().await {
                 match event {
                     GossipEvent::Received { bytes, .. } => {
                         if let Some(generation) = decode_inventory_wake_frame(&bytes, team)
@@ -1226,10 +1178,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             match commands.try_recv() {
                 Ok(NetCommand::SnapshotInstalled(notice)) => {
                     current_generation = Some(notice.generation);
-                    candidates
-                        .lock()
-                        .unwrap()
-                        .replace_learned(notice.peers, my_id);
+                    let mut routes = candidates.lock().unwrap();
+                    for peer in notice.peers {
+                        routes.note_sync_candidate(peer);
+                    }
+                    drop(routes);
                     if config.qos.direction.publishes()
                         && let Some(sender) = gossip_sender.as_ref()
                     {
@@ -1268,6 +1221,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             if outcome.success {
                 failures.remove(&outcome.peer);
             } else {
+                candidates.lock().unwrap().remove(outcome.peer);
                 let attempts = failures
                     .get(&outcome.peer)
                     .map_or(1, |(attempts, _)| attempts.saturating_add(1));
@@ -1283,7 +1237,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         let now = crate::clock::mono_now();
         if config.qos.direction.pulls() && current_generation.is_some() && now >= next_sweep {
             let queued: HashSet<_> = pending_sweeps.iter().copied().collect();
-            for peer in candidates.lock().unwrap().candidates(my_id) {
+            for peer in candidates.lock().unwrap().sync_candidates() {
                 if !in_flight.contains(&peer) && !queued.contains(&peer) {
                     pending_sweeps.push_back(peer);
                 }
@@ -1439,7 +1393,7 @@ async fn reconcile_inventory_peer<T: Transport>(
     let connection =
         inventory_pool_get(transport, pool, peer, team, connect_proof, sync_proof).await?;
     let remote_key = VerifyingKey::from_bytes(&peer)?;
-    candidates.lock().unwrap().note(peer);
+    candidates.lock().unwrap().promote_authenticated(peer);
     let mut admissions = AdmissionBatcher::new(events);
     admissions
         .push(NetEvent::Peer(PeerEvidence::new(team, remote_key)))
@@ -1723,6 +1677,51 @@ async fn pool_evict<C: Conn>(pool: &SharedPool<C>, peer: PeerId) {
     }
 }
 
+async fn hedged_find_map<'a, T, R>(
+    attempts: impl IntoIterator<Item = futures::future::BoxFuture<'a, T>>,
+    mut accept: impl FnMut(T) -> Option<R>,
+) -> Option<R> {
+    let mut queued: VecDeque<_> = attempts.into_iter().collect();
+    let mut pending = FuturesUnordered::new();
+    while pending.len() < ALPHA {
+        let Some(attempt) = queued.pop_front() else {
+            break;
+        };
+        pending.push(attempt);
+    }
+    let hedge = tokio::time::sleep(PROVIDER_FETCH_HEDGE_DELAY);
+    tokio::pin!(hedge);
+    let mut hedged = false;
+
+    while !pending.is_empty() {
+        tokio::select! {
+            result = pending.next() => {
+                let result = result.expect("pending was checked as non-empty");
+                if let Some(found) = accept(result) {
+                    return Some(found);
+                }
+                let active_limit = if hedged { 2 * ALPHA } else { ALPHA };
+                while pending.len() < active_limit {
+                    let Some(attempt) = queued.pop_front() else {
+                        break;
+                    };
+                    pending.push(attempt);
+                }
+            }
+            () = &mut hedge, if !hedged && !queued.is_empty() => {
+                hedged = true;
+                while pending.len() < 2 * ALPHA {
+                    let Some(attempt) = queued.pop_front() else {
+                        break;
+                    };
+                    pending.push(attempt);
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn fetch_from_providers<T: Transport>(
     transport: &T,
     hash: &RawHash,
@@ -1731,47 +1730,164 @@ async fn fetch_from_providers<T: Transport>(
     team: VerifyingKey,
     connect_proof: &CapabilityProofBundle,
     sync_proof: &CapabilityProofBundle,
+    candidates: &RoutingCandidates,
 ) -> Option<Vec<u8>> {
-    for peer in providers.iter().copied() {
-        let connection = match inventory_pool_get(
-            transport,
-            pool,
-            peer,
-            team,
-            connect_proof,
-            sync_proof,
-        )
-        .await
-        {
-            Ok(connection) => connection,
-            Err(_) => continue,
-        };
-        match tokio::time::timeout(OP_DEADLINE, op_get_blob(&connection, hash)).await {
-            Ok(Ok(Some(bytes))) if blake3::hash(&bytes).as_bytes() == hash => return Some(bytes),
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                debug!(peer = %hex::encode(&peer[..4]), %error, "GET_BLOB failed");
-                pool_evict(pool, peer).await;
+    let attempts = providers.iter().copied().map(|peer| {
+        Box::pin(async move {
+            let connection = tokio::time::timeout(
+                PROVIDER_CONTROL_RPC_DEADLINE,
+                inventory_pool_get(transport, pool, peer, team, connect_proof, sync_proof),
+            )
+            .await;
+            let result = match connection {
+                Ok(Ok(connection)) => op_get_blob(&connection, hash).await,
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(anyhow::anyhow!("provider connection deadline exceeded")),
+            };
+            match result {
+                Ok(Some(bytes)) if blake3::hash(&bytes).as_bytes() == hash => {
+                    candidates.lock().unwrap().promote_authenticated(peer);
+                    Some(bytes)
+                }
+                Ok(None) => {
+                    candidates.lock().unwrap().promote_authenticated(peer);
+                    None
+                }
+                Ok(Some(_)) | Err(_) => {
+                    candidates.lock().unwrap().remove(peer);
+                    pool_evict(pool, peer).await;
+                    None
+                }
             }
-            Err(_) => {
-                pool_evict(pool, peer).await;
-            }
-        }
-    }
-    None
+        }) as futures::future::BoxFuture<'_, _>
+    });
+    hedged_find_map(attempts, |result| result).await
 }
 
 impl<T: Transport> ProviderClient<T> {
-    async fn announce(&self, key: ProviderKey, element: ElementId, targets: Vec<PeerId>) -> usize {
-        futures::stream::iter(targets)
-            .map(|target| self.put(target, key, element))
-            .buffer_unordered(MAX_CONCURRENT_PROVIDER_RPCS)
-            .filter(|stored| futures::future::ready(*stored))
-            .count()
-            .await
+    async fn lookup_replicas(&self, target: RoutingKey) -> Vec<PeerId> {
+        let seeds = self.candidates.lock().unwrap().closest(target, K);
+        let mut lookup = IterativeLookup::new(self.my_id, target, seeds);
+        let mut pending: FuturesUnordered<
+            futures::future::BoxFuture<'_, (PeerId, anyhow::Result<Vec<PeerId>>)>,
+        > = FuturesUnordered::new();
+        let mut active = HashSet::new();
+        let completed = tokio::time::timeout(DHT_LOOKUP_DEADLINE, async {
+            loop {
+                for peer in lookup.next_batch() {
+                    active.insert(peer);
+                    pending.push(Box::pin(async move {
+                        let reply = tokio::time::timeout(
+                            PROVIDER_CONTROL_RPC_DEADLINE,
+                            self.find_node(peer, target),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("FIND_NODE control deadline exceeded"))
+                        .and_then(|reply| reply);
+                        (peer, reply)
+                    }));
+                }
+                let Some((peer, reply)) = pending.next().await else {
+                    break;
+                };
+                active.remove(&peer);
+                match reply {
+                    Ok(peers) => {
+                        let valid = peers
+                            .into_iter()
+                            .filter(|candidate| EndpointId::from_bytes(candidate).is_ok());
+                        lookup.record_authenticated_response(
+                            peer,
+                            valid,
+                            &mut self.candidates.lock().unwrap(),
+                        );
+                    }
+                    Err(error) => {
+                        debug!(peer = %hex::encode(&peer[..4]), %error, "FIND_NODE failed");
+                        lookup.record_failure(peer, &mut self.candidates.lock().unwrap());
+                        pool_evict(&self.pool, peer).await;
+                    }
+                }
+                if lookup.is_finished() && pending.is_empty() {
+                    break;
+                }
+            }
+        })
+        .await;
+        if completed.is_err() {
+            debug!("iterative FIND_NODE deadline exceeded");
+            drop(pending);
+            for peer in active {
+                lookup.record_failure(peer, &mut self.candidates.lock().unwrap());
+                pool_evict(&self.pool, peer).await;
+            }
+        }
+
+        let mut replicas = lookup.closest_authenticated_responders().to_vec();
+        replicas.push(self.my_id);
+        replicas.sort_unstable_by(|a, b| crate::routing::distance_cmp(target, *a, *b));
+        replicas.dedup();
+        replicas.truncate(K);
+        replicas
     }
 
-    async fn put(&self, target: PeerId, key: ProviderKey, element: ElementId) -> bool {
+    async fn find_node(&self, peer: PeerId, target: RoutingKey) -> anyhow::Result<Vec<PeerId>> {
+        let connection = inventory_pool_get(
+            &self.transport,
+            &self.pool,
+            peer,
+            self.team,
+            &self.connect_proof,
+            &self.sync_proof,
+        )
+        .await?;
+        tokio::time::timeout(OP_DEADLINE, op_find_node(&connection, &target))
+            .await
+            .map_err(|_| anyhow::anyhow!("FIND_NODE deadline exceeded"))?
+    }
+
+    async fn announce_artifact(&self, artifact: ArtifactId) -> usize {
+        let key = provider_key(self.team, artifact);
+        let targets = self.lookup_replicas(key).await;
+        self.announce(key, artifact, targets).await
+    }
+
+    async fn announce(
+        &self,
+        key: ProviderKey,
+        artifact: ArtifactId,
+        targets: Vec<PeerId>,
+    ) -> usize {
+        let mut replies = futures::stream::iter(targets)
+            .map(|target| async move {
+                (
+                    target,
+                    tokio::time::timeout(
+                        PROVIDER_CONTROL_RPC_DEADLINE,
+                        self.put(target, key, artifact),
+                    )
+                    .await,
+                )
+            })
+            .buffer_unordered(MAX_CONCURRENT_PROVIDER_RPCS);
+        let mut stored = 0;
+        let _ = tokio::time::timeout(PROVIDER_CONTROL_PHASE_DEADLINE, async {
+            while let Some((target, reply)) = replies.next().await {
+                match reply {
+                    Ok(true) => stored += 1,
+                    Ok(false) => {}
+                    Err(_) => {
+                        self.candidates.lock().unwrap().remove(target);
+                        pool_evict(&self.pool, target).await;
+                    }
+                }
+            }
+        })
+        .await;
+        stored
+    }
+
+    async fn put(&self, target: PeerId, key: ProviderKey, artifact: ArtifactId) -> bool {
         if target == self.my_id {
             return self
                 .providers
@@ -1792,46 +1908,71 @@ impl<T: Transport> ProviderClient<T> {
             Ok(connection) => connection,
             Err(error) => {
                 debug!(peer = %hex::encode(&target[..4]), %error, "provider PUT setup failed");
+                self.candidates.lock().unwrap().remove(target);
                 return false;
             }
         };
-        match tokio::time::timeout(OP_DEADLINE, op_provider_put(&connection, &element)).await {
+        self.candidates
+            .lock()
+            .unwrap()
+            .promote_authenticated(target);
+        match tokio::time::timeout(OP_DEADLINE, op_provider_put(&connection, &artifact)).await {
             Ok(Ok(stored)) => stored,
             Ok(Err(error)) => {
                 debug!(peer = %hex::encode(&target[..4]), %error, "provider PUT failed");
+                self.candidates.lock().unwrap().remove(target);
                 pool_evict(&self.pool, target).await;
                 false
             }
             Err(_) => {
+                self.candidates.lock().unwrap().remove(target);
                 pool_evict(&self.pool, target).await;
                 false
             }
         }
     }
 
+    async fn find_artifact(&self, artifact: ArtifactId) -> Vec<PeerId> {
+        let key = provider_key(self.team, artifact);
+        let targets = self.lookup_replicas(key).await;
+        self.find(key, artifact, targets).await
+    }
+
     async fn find(
         &self,
         key: ProviderKey,
-        element: ElementId,
+        artifact: ArtifactId,
         targets: Vec<PeerId>,
     ) -> Vec<PeerId> {
-        let mut found: Vec<_> = futures::stream::iter(targets)
-            .map(|target| self.get(target, key, element))
-            .buffer_unordered(MAX_CONCURRENT_PROVIDER_RPCS)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
-        // Directory answers are routing hints, not authority. Drop malformed
-        // endpoint identities and let exact transfer authenticate survivors.
-        found.retain(|provider| EndpointId::from_bytes(provider).is_ok());
-        found.sort_unstable();
-        found.dedup();
-        found
+        let mut replies = futures::stream::iter(targets)
+            .map(|target| async move {
+                (
+                    target,
+                    tokio::time::timeout(
+                        PROVIDER_CONTROL_RPC_DEADLINE,
+                        self.get(target, key, artifact),
+                    )
+                    .await,
+                )
+            })
+            .buffer_unordered(ALPHA);
+        let mut found = Vec::new();
+        let _ = tokio::time::timeout(PROVIDER_CONTROL_PHASE_DEADLINE, async {
+            while let Some((target, reply)) = replies.next().await {
+                match reply {
+                    Ok(providers) => found.extend(providers),
+                    Err(_) => {
+                        self.candidates.lock().unwrap().remove(target);
+                        pool_evict(&self.pool, target).await;
+                    }
+                }
+            }
+        })
+        .await;
+        normalize_provider_results(found)
     }
 
-    async fn get(&self, target: PeerId, key: ProviderKey, element: ElementId) -> Vec<PeerId> {
+    async fn get(&self, target: PeerId, key: ProviderKey, artifact: ArtifactId) -> Vec<PeerId> {
         if target == self.my_id {
             return self
                 .providers
@@ -1852,22 +1993,39 @@ impl<T: Transport> ProviderClient<T> {
             Ok(connection) => connection,
             Err(error) => {
                 debug!(peer = %hex::encode(&target[..4]), %error, "provider GET setup failed");
+                self.candidates.lock().unwrap().remove(target);
                 return Vec::new();
             }
         };
-        match tokio::time::timeout(OP_DEADLINE, op_provider_get(&connection, &element)).await {
+        self.candidates
+            .lock()
+            .unwrap()
+            .promote_authenticated(target);
+        match tokio::time::timeout(OP_DEADLINE, op_provider_get(&connection, &artifact)).await {
             Ok(Ok(providers)) => providers,
             Ok(Err(error)) => {
                 debug!(peer = %hex::encode(&target[..4]), %error, "provider GET failed");
+                self.candidates.lock().unwrap().remove(target);
                 pool_evict(&self.pool, target).await;
                 Vec::new()
             }
             Err(_) => {
+                self.candidates.lock().unwrap().remove(target);
                 pool_evict(&self.pool, target).await;
                 Vec::new()
             }
         }
     }
+}
+
+fn normalize_provider_results(mut found: Vec<PeerId>) -> Vec<PeerId> {
+    // Directory answers are routing hints, not authority. Drop malformed
+    // endpoint identities and let exact transfer authenticate survivors.
+    found.retain(|provider| EndpointId::from_bytes(provider).is_ok());
+    found.sort_unstable();
+    found.dedup();
+    found.truncate(crate::provider::MAX_PROVIDERS_PER_KEY);
+    found
 }
 
 #[derive(Clone)]
@@ -2043,8 +2201,8 @@ impl SnapshotHandler {
                 // This exact request shape is the forged-provider defense:
                 // any appended claimed identity is rejected, and the value
                 // stored below comes only from the authenticated connection.
-                let element = recv_provider_element(recv).await?;
-                let key = provider_key(session.team(), element);
+                let artifact = recv_provider_artifact(recv).await?;
+                let key = provider_key(session.team(), artifact);
                 let stored = self.providers.lock().unwrap().put(
                     key,
                     peer.to_bytes(),
@@ -2062,8 +2220,8 @@ impl SnapshotHandler {
             }
             OP_PROVIDER_GET => {
                 let session = current_inventory_session(&authorization)?;
-                let element = recv_provider_element(recv).await?;
-                let key = provider_key(session.team(), element);
+                let artifact = recv_provider_artifact(recv).await?;
+                let key = provider_key(session.team(), artifact);
                 let providers = self
                     .providers
                     .lock()
@@ -2078,6 +2236,21 @@ impl SnapshotHandler {
                 .await?;
                 for provider in providers {
                     send_hash(send, &provider).await?;
+                }
+            }
+            OP_FIND_NODE => {
+                let _session = current_inventory_session(&authorization)?;
+                let target = recv_routing_key(recv).await?;
+                let mut peers = self.candidates.lock().unwrap().closest_verified(target, K);
+                peers.retain(|candidate| *candidate != peer.to_bytes());
+                send_u8(
+                    send,
+                    u8::try_from(peers.len())
+                        .expect("FIND_NODE fan-out is statically bounded below u8::MAX"),
+                )
+                .await?;
+                for peer in peers {
+                    send_hash(send, &peer).await?;
                 }
             }
             OP_INVENTORY_AUTH => {
@@ -2107,8 +2280,11 @@ impl SnapshotHandler {
                     (Ok(session), Ok(_)) => {
                         *authorization.lock().unwrap() =
                             InventoryAuthorization::Authorized(session);
+                        self.candidates
+                            .lock()
+                            .unwrap()
+                            .promote_authenticated(peer.to_bytes());
                         if self.admit_inbound_peer {
-                            self.candidates.lock().unwrap().note(peer.to_bytes());
                             let _ =
                                 self.events
                                     .send(NetEventBatch::singleton(NetEvent::Peer(
@@ -2272,12 +2448,20 @@ async fn require_stream_eof<R: tokio::io::AsyncRead + Unpin>(recv: &mut R) -> an
     Ok(())
 }
 
-async fn recv_provider_element<R: tokio::io::AsyncRead + Unpin>(
+async fn recv_provider_artifact<R: tokio::io::AsyncRead + Unpin>(
     recv: &mut R,
-) -> anyhow::Result<ElementId> {
-    let element = recv_hash(recv).await?;
+) -> anyhow::Result<ArtifactId> {
+    let artifact = recv_hash(recv).await?;
     require_stream_eof(recv).await?;
-    Ok(element)
+    Ok(artifact)
+}
+
+async fn recv_routing_key<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
+) -> anyhow::Result<RoutingKey> {
+    let target = recv_hash(recv).await?;
+    require_stream_eof(recv).await?;
+    Ok(target)
 }
 
 fn capability_expired(expires: Option<hifitime::Epoch>) -> bool {
@@ -2312,6 +2496,7 @@ fn op_name(op: u8) -> &'static str {
         OP_GET_BLOB => "GET_BLOB",
         OP_PROVIDER_PUT => "PROVIDER_PUT",
         OP_PROVIDER_GET => "PROVIDER_GET",
+        OP_FIND_NODE => "FIND_NODE",
         OP_INVENTORY_AUTH => "INVENTORY_AUTH",
         OP_INVENTORY_MANIFEST => "INVENTORY_MANIFEST",
         OP_INVENTORY_NODE => "INVENTORY_NODE",
@@ -2419,49 +2604,106 @@ mod tests {
 
     #[test]
     fn routing_evidence_never_replaces_bootstraps() {
-        let mut routes = RoutingTable::new(vec![[1; 32], [2; 32]]);
-        routes.note([3; 32]);
-        routes.note([1; 32]);
-        assert_eq!(routes.candidates([9; 32]), vec![[1; 32], [2; 32], [3; 32]]);
+        let local = [0; 32];
+        let configured = [[1; 32], [2; 32]];
+        let mut routes = RoutingTable::new(local, configured);
+        for byte in 3..=100 {
+            routes.note_candidate([byte; 32]);
+        }
+        for seed in configured {
+            assert!(routes.closest(seed, usize::MAX).contains(&seed));
+        }
     }
 
     #[test]
-    fn routing_evidence_is_not_truncated_at_an_arbitrary_peer_count() {
-        let mut routes = RoutingTable::new(vec![[1; 32]]);
-        for byte in 2..=100 {
-            routes.note([byte; 32]);
-        }
-        assert_eq!(routes.candidates([0; 32]).len(), 100);
+    fn aggregate_provider_replies_are_deduplicated_and_bounded() {
+        let mut providers: Vec<_> = (1..=100)
+            .map(|byte| {
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .to_bytes()
+            })
+            .collect();
+        providers.extend_from_within(..32);
+
+        let normalized = normalize_provider_results(providers);
+        assert_eq!(normalized.len(), crate::provider::MAX_PROVIDERS_PER_KEY);
+        assert!(normalized.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
-    #[test]
-    fn provider_replica_selection_is_deterministic_and_bounded() {
-        let mut routes = RoutingTable::new(Vec::new());
-        for byte in 1..=100 {
-            routes.note([byte; 32]);
+    #[tokio::test(start_paused = true)]
+    async fn exact_fetch_hedges_once_beyond_alpha_without_cancelling_slow_bodies() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut attempts: VecDeque<futures::future::BoxFuture<'_, Option<u8>>> = VecDeque::new();
+        for _ in 0..ALPHA {
+            let started = started.clone();
+            attempts.push_back(Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                futures::future::pending().await
+            }));
         }
-        let selected = routes.closest([0; 32], [0; 32], 20);
-        assert_eq!(selected.len(), 20);
-        assert_eq!(selected, (0..20).map(|byte| [byte; 32]).collect::<Vec<_>>());
-        assert_eq!(selected, routes.closest([0; 32], [0; 32], 20));
+        let healthy_started = started.clone();
+        attempts.push_back(Box::pin(async move {
+            healthy_started.fetch_add(1, Ordering::SeqCst);
+            Some(7)
+        }));
+
+        let found = hedged_find_map(attempts, |result| result).await;
+        assert_eq!(found, Some(7));
+        assert_eq!(started.load(Ordering::SeqCst), ALPHA + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_fetch_hedging_never_exceeds_two_alpha_transfers() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = (0..crate::provider::MAX_PROVIDERS_PER_KEY).map(|_| {
+            let started = started.clone();
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                futures::future::pending::<Option<()>>().await
+            }) as futures::future::BoxFuture<'_, Option<()>>
+        });
+
+        let deadline = PROVIDER_FETCH_HEDGE_DELAY + std::time::Duration::from_millis(1);
+        assert!(
+            tokio::time::timeout(deadline, hedged_find_map(attempts, |result| result))
+                .await
+                .is_err()
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 2 * ALPHA);
     }
 
     #[tokio::test]
     async fn provider_request_has_no_forgeable_provider_field() {
-        let element = [7; 32];
+        let artifact = [7; 32];
         let (mut send, mut recv) = tokio::io::duplex(64);
-        send.write_all(&element).await.unwrap();
+        send.write_all(&artifact).await.unwrap();
         send.shutdown().await.unwrap();
-        assert_eq!(recv_provider_element(&mut recv).await.unwrap(), element);
+        assert_eq!(recv_provider_artifact(&mut recv).await.unwrap(), artifact);
 
         let (mut send, mut recv) = tokio::io::duplex(64);
-        send.write_all(&element).await.unwrap();
+        send.write_all(&artifact).await.unwrap();
         send.write_all(&[8; 32]).await.unwrap();
         send.shutdown().await.unwrap();
         assert!(
-            recv_provider_element(&mut recv).await.is_err(),
+            recv_provider_artifact(&mut recv).await.is_err(),
             "an appended claimed provider identity must invalidate the request"
         );
+    }
+
+    #[tokio::test]
+    async fn find_node_request_is_exactly_one_routing_key() {
+        let target = [9; 32];
+        let (mut send, mut recv) = tokio::io::duplex(64);
+        send.write_all(&target).await.unwrap();
+        send.shutdown().await.unwrap();
+        assert_eq!(recv_routing_key(&mut recv).await.unwrap(), target);
+
+        let (mut send, mut recv) = tokio::io::duplex(64);
+        send.write_all(&target).await.unwrap();
+        send.write_all(&[1]).await.unwrap();
+        send.shutdown().await.unwrap();
+        assert!(recv_routing_key(&mut recv).await.is_err());
     }
 
     #[test]

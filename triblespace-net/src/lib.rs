@@ -9,8 +9,8 @@
 //! resolver select an exact physical cover from speculative remote artifacts,
 //! so callers can fetch only useful materializations without creating WANTs.
 //! A bounded, team-scoped provider directory can locate peers for an
-//! already-known collection-element identity; it is soft routing state, not an
-//! enumeration or element-discovery plane.
+//! already-known immutable artifact handle; it is soft routing state, not an
+//! enumeration or artifact-discovery plane.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 

@@ -327,6 +327,7 @@ fn fetch_blob_pulls_from_the_holder() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         assert!(
             !holds_locally(&mut peer_b, hash),
@@ -575,6 +576,9 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             }
         }
         assert!(records_converged, "target equations converge before reuse");
+        for target in &targets {
+            assert!(server.announce_artifact(target.get_handle().raw).await >= 1);
+        }
         assert_eq!(want_count(&client), 0, "precondition: no durable wants");
         assert!(!holds_locally(&mut client, upper.get_handle().raw));
         assert!(!holds_locally(
@@ -667,6 +671,7 @@ fn lazy_read_lands_wanted_in_store() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         // Precondition: B holds nothing locally and has no wants.
         assert!(
@@ -752,6 +757,9 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
+        }
+        for (_, hash) in &blobs {
+            assert!(peer_a.announce_artifact(*hash).await >= 1);
         }
 
         // Lazily read all three, in order — each lands wanted.
@@ -854,6 +862,7 @@ fn async_lazy_read_awaits_swarm_and_lands_wanted() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -930,6 +939,7 @@ fn transparent_async_get_fetches_through_reader() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -1118,6 +1128,7 @@ fn lazy_read_unavailable_under_partition_then_heals() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         // Sever A↔B: B retains A as an exact route, but its dial fails.
         net.partition(pk(&ka), pk(&kb));
@@ -1184,6 +1195,7 @@ fn lazy_read_unavailable_under_crash_then_revives() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         net.crash(pk(&ka));
         let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
@@ -1238,6 +1250,7 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
             .await
@@ -1313,6 +1326,7 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
                 peer_a.refresh();
             }
+            assert!(peer_a.announce_artifact(hash).await >= 1);
 
             let pa = pk(&ka);
             let pb = pk(&kb);
@@ -1408,6 +1422,8 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
             peer_a.refresh();
             peer_c.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
+        assert!(peer_c.announce_artifact(hash).await >= 1);
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -1464,6 +1480,7 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         // Drive the fetch, counting steps until completion.
         let mut fut = Box::pin(peer_b.fetch_blob(hash));
@@ -1522,6 +1539,7 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -1617,6 +1635,7 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         let pa = pk(&ka);
         let pb = pk(&kb);
@@ -1727,14 +1746,15 @@ fn reconcile_tick_services_out_of_band_want() {
         let store_b = empty_store();
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        // B: no gossip — a pure leecher; only the want-reconcile fetches.
+        // B knows the bootstrap route, but provider publication remains an
+        // explicit holder action rather than implicit peer probing.
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            false,
+            true,
             vec![pk(&ka)],
         );
 
@@ -1743,6 +1763,7 @@ fn reconcile_tick_services_out_of_band_want() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
+        assert!(peer_a.announce_artifact(hash).await >= 1);
 
         // Out-of-band want: written through the store guard, bypassing
         // the Peer's own read path — exactly what a faculty appending a
@@ -1870,13 +1891,10 @@ fn reconcile_unsatisfiable_want_stays_pending() {
     });
 }
 
-/// The content layer is decoupled from the gossip layer. Under **total
-/// gossip loss** the collection-evidence mesh is dark — but the lazy
-/// read uses an explicit authenticated route, which is independent of
-/// gossip, so it must still succeed. A regression that accidentally routed
-/// exact content discovery through gossip would fail here.
+/// Explicit DHT publication and exact transfer are independent of gossip
+/// liveness once the provider lease exists.
 #[test]
-fn lazy_fetch_is_independent_of_gossip_liveness() {
+fn published_lazy_fetch_is_independent_of_gossip_liveness() {
     let _g = sim_guard();
     let config = SimConfig {
         gossip_drop_prob: 1.0,
@@ -1885,6 +1903,10 @@ fn lazy_fetch_is_independent_of_gossip_liveness() {
     let (got, steps) = run_lazy_fetch(0x6055_1055, config);
     assert!(
         got.is_some(),
-        "lazy fetch must succeed despite total gossip loss (gave up after {steps} steps)"
+        "published provider survives total gossip loss"
+    );
+    assert!(
+        steps > 0,
+        "the DHT and exact-transfer path must actually run"
     );
 }

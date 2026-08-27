@@ -191,7 +191,7 @@ fn durable_exact_want_fetches_over_the_authenticated_demand_path() {
             publisher_store,
             team,
             team_proofs(&root, &publisher_key),
-            false,
+            true,
             Vec::new(),
             qos(ReconcileDirection::WriteOnly, BlobReconcileMode::Demand),
         );
@@ -201,11 +201,12 @@ fn durable_exact_want_fetches_over_the_authenticated_demand_path() {
             empty_store(),
             team,
             team_proofs(&root, &consumer_key),
-            false,
+            true,
             vec![pk(&publisher_key)],
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Demand),
         );
         step(&net, &mut [&mut publisher, &mut consumer], 80).await;
+        assert!(publisher.announce_artifact(blob).await >= 1);
         assert!(!has_blob(&mut consumer, blob));
 
         let request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(blob));

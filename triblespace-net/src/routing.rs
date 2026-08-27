@@ -49,6 +49,9 @@ pub(crate) struct RoutingTable {
     /// state. It remains available even if the corresponding learned route is
     /// evicted or a connection attempt fails.
     configured: BTreeSet<PeerId>,
+    /// Stored PEER/snapshot evidence eligible for periodic anti-entropy.
+    /// DHT referrals never enter this set.
+    sync: BTreeSet<PeerId>,
     buckets: [Bucket; BUCKET_COUNT],
 }
 
@@ -66,6 +69,7 @@ impl RoutingTable {
         Self {
             local,
             configured,
+            sync: BTreeSet::new(),
             buckets: std::array::from_fn(|_| Bucket::default()),
         }
     }
@@ -76,6 +80,16 @@ impl RoutingTable {
         if self.configured.contains(&peer) {
             return true;
         }
+        self.insert(peer, RouteState::Candidate)
+    }
+
+    /// Remember explicit stored PEER evidence as both a route and a periodic
+    /// anti-entropy target. This provenance is distinct from DHT referrals.
+    pub(crate) fn note_sync_candidate(&mut self, peer: PeerId) -> bool {
+        if self.configured.contains(&peer) {
+            return true;
+        }
+        self.sync.insert(peer);
         self.insert(peer, RouteState::Candidate)
     }
 
@@ -94,6 +108,7 @@ impl RoutingTable {
         self.buckets[bucket].entries.remove(&peer).is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self, peer: PeerId) -> Option<RouteState> {
         let learned = bucket_index(self.local, peer)
             .and_then(|bucket| self.buckets[bucket].entries.get(&peer).copied());
@@ -104,15 +119,18 @@ impl RoutingTable {
         })
     }
 
+    #[cfg(test)]
     /// Number of unique configured and learned identities.
     pub(crate) fn len(&self) -> usize {
         self.all().len()
     }
 
+    #[cfg(test)]
     pub(crate) fn learned_len(&self) -> usize {
         self.buckets.iter().map(|bucket| bucket.entries.len()).sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn configured_len(&self) -> usize {
         self.configured.len()
     }
@@ -141,6 +159,14 @@ impl RoutingTable {
         peers.sort_unstable_by(|a, b| distance_cmp(target, *a, *b));
         peers.truncate(limit);
         peers
+    }
+
+    /// Explicit anti-entropy targets only: local configuration plus stored
+    /// PEER/snapshot evidence, never identities learned solely through DHT.
+    pub(crate) fn sync_candidates(&self) -> Vec<PeerId> {
+        let mut peers = self.configured.clone();
+        peers.extend(self.sync.iter().copied());
+        peers.into_iter().collect()
     }
 
     fn all(&self) -> Vec<PeerId> {
@@ -211,7 +237,7 @@ fn bucket_index(local: PeerId, peer: PeerId) -> Option<usize> {
     None
 }
 
-fn distance_cmp(target: RoutingKey, a: PeerId, b: PeerId) -> Ordering {
+pub(crate) fn distance_cmp(target: RoutingKey, a: PeerId, b: PeerId) -> Ordering {
     a.iter()
         .zip(b)
         .zip(target)
@@ -673,6 +699,47 @@ mod tests {
         assert!(routes.remove(configured));
         assert_eq!(routes.state(configured), Some(RouteState::Candidate));
         assert!(routes.closest(configured, K).contains(&configured));
+    }
+
+    #[test]
+    fn dht_referrals_never_become_anti_entropy_targets() {
+        let local = [0; 32];
+        let configured = [id(1)];
+        let stored_peer = id(2);
+        let dht_peer = id(3);
+        let mut routes = RoutingTable::new(local, configured);
+
+        assert!(routes.note_sync_candidate(stored_peer));
+        assert!(routes.note_candidate(dht_peer));
+        assert!(routes.promote_authenticated(dht_peer));
+        assert_eq!(routes.sync_candidates(), vec![configured[0], stored_peer]);
+
+        assert!(routes.remove(stored_peer));
+        assert_eq!(routes.state(stored_peer), None);
+        assert_eq!(routes.sync_candidates(), vec![configured[0], stored_peer]);
+    }
+
+    #[test]
+    fn sync_provenance_survives_bucket_eviction_without_outranking_routes() {
+        let local = [0; 32];
+        let mut routes = RoutingTable::new(local, []);
+        let mut sync_peers = Vec::new();
+        for suffix in 1..=K + 1 {
+            let mut peer = [0; 32];
+            peer[0] = 0x80;
+            peer[30..].copy_from_slice(&(suffix as u16).to_be_bytes());
+            routes.note_sync_candidate(peer);
+            sync_peers.push(peer);
+        }
+        for suffix in 100..100 + K {
+            let mut peer = [0; 32];
+            peer[0] = 0x80;
+            peer[30..].copy_from_slice(&(suffix as u16).to_be_bytes());
+            routes.promote_authenticated(peer);
+        }
+
+        assert_eq!(routes.closest_verified([0; 32], K).len(), K);
+        assert_eq!(routes.sync_candidates(), sync_peers);
     }
 
     #[test]

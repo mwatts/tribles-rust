@@ -13,8 +13,9 @@
 //! Operations:
 //!   AUTH       bundle_len:u32 bundle:bytes → resp:u8 server_bundle
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
-//!   PROVIDER_PUT element:32 → resp:u8                (caller identity is provider)
-//!   PROVIDER_GET element:32 → count:u8 provider:[32; count]
+//!   PROVIDER_PUT artifact:32 → resp:u8               (caller identity is provider)
+//!   PROVIDER_GET artifact:32 → count:u8 provider:[32; count]
+//!   FIND_NODE target:32 → count:u8 peer:[32; count]
 //!   INVENTORY_AUTH, MANIFEST, NODE, and BLOB_RANGE are defined by
 //!   `inventory_wire`; they form the bounded SYNC_TEAM-authorized Merkle walk.
 //!
@@ -25,13 +26,13 @@
 //! it is non-bearer evidence bound to the caller key and sent over TLS to the
 //! exact identity the client intended to dial, but the proof itself is not
 //! cryptographically bound to that receiver key. It is not a confidential or
-//! zero-knowledge credential. No SYNC proof, element ID, query, or data request
+//! zero-knowledge credential. No SYNC proof, artifact ID, query, or data request
 //! is sent until reciprocal CONNECT verification succeeds.
 //! Content and inventory operations additionally wait for reciprocal SYNC_TEAM.
 //! `PROVIDER_PUT` is the one soft-state write: it binds the TLS-authenticated
 //! caller to a receiver-local lease and never accepts a claimed provider identity.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/12";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/13";
 
 use ed25519_dalek::VerifyingKey;
 use hifitime::Epoch;
@@ -70,8 +71,10 @@ pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_AUTH: u8 = 0x05;
 /// Renew the authenticated caller's receiver-local provider lease.
 pub const OP_PROVIDER_PUT: u8 = 0x06;
-/// Query live provider leases for one already-known, team-scoped element key.
+/// Query live provider leases for one already-known, team-scoped artifact key.
 pub const OP_PROVIDER_GET: u8 = 0x07;
+/// Query up to K directly verified routes nearest one arbitrary XOR key.
+pub const OP_FIND_NODE: u8 = 0x0C;
 
 /// Auth response: CONNECT capability verified. Subsequent direct RPCs on this
 /// connection may proceed.
@@ -286,10 +289,10 @@ pub async fn op_get_blob<C: Conn>(conn: &C, hash: &RawHash) -> Result<Option<Vec
 
 /// PROVIDER_PUT: renew this connection's authenticated endpoint as provider.
 /// The request intentionally contains no provider identity to forge.
-pub async fn op_provider_put<C: Conn>(conn: &C, element: &RawHash) -> Result<bool> {
+pub async fn op_provider_put<C: Conn>(conn: &C, artifact: &RawHash) -> Result<bool> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_PROVIDER_PUT).await?;
-    send_hash(&mut send, element).await?;
+    send_hash(&mut send, artifact).await?;
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let stored = match recv_u8(&mut recv).await? {
@@ -302,10 +305,10 @@ pub async fn op_provider_put<C: Conn>(conn: &C, element: &RawHash) -> Result<boo
 }
 
 /// PROVIDER_GET: return the receiver's bounded live provider hints.
-pub async fn op_provider_get<C: Conn>(conn: &C, element: &RawHash) -> Result<Vec<[u8; 32]>> {
+pub async fn op_provider_get<C: Conn>(conn: &C, artifact: &RawHash) -> Result<Vec<[u8; 32]>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_PROVIDER_GET).await?;
-    send_hash(&mut send, element).await?;
+    send_hash(&mut send, artifact).await?;
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let count = recv_u8(&mut recv).await? as usize;
@@ -321,6 +324,37 @@ pub async fn op_provider_get<C: Conn>(conn: &C, element: &RawHash) -> Result<Vec
     }
     require_response_eof(&mut recv).await?;
     Ok(providers)
+}
+
+/// FIND_NODE: return at most K directly authenticated routing identities
+/// nearest an arbitrary 256-bit XOR target.
+pub async fn op_find_node<C: Conn>(
+    conn: &C,
+    target: &crate::routing::RoutingKey,
+) -> Result<Vec<crate::transport::PeerId>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_FIND_NODE).await?;
+    send_hash(&mut send, target).await?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
+    recv_find_node_response(&mut recv).await
+}
+
+pub(crate) async fn recv_find_node_response<R: AsyncRead + Unpin>(
+    recv: &mut R,
+) -> Result<Vec<crate::transport::PeerId>> {
+    let count = recv_u8(recv).await? as usize;
+    if count > crate::routing::K {
+        return Err(anyhow!(
+            "FIND_NODE response has {count} entries; limit is {}",
+            crate::routing::K
+        ));
+    }
+    let mut peers = Vec::with_capacity(count);
+    for _ in 0..count {
+        peers.push(recv_hash(recv).await?);
+    }
+    require_response_eof(recv).await?;
+    Ok(peers)
 }
 
 async fn require_response_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
@@ -640,5 +674,31 @@ mod bounds_tests {
         let bytes = (u64::MAX - 1).to_be_bytes();
         let mut input = bytes.as_slice();
         assert!(recv_blob_response(&mut input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn find_node_response_enforces_count_and_exact_eof() {
+        let oversized = [u8::try_from(crate::routing::K + 1).unwrap()];
+        assert!(
+            recv_find_node_response(&mut oversized.as_slice())
+                .await
+                .is_err()
+        );
+
+        let trailing = [0, 1];
+        assert!(
+            recv_find_node_response(&mut trailing.as_slice())
+                .await
+                .is_err()
+        );
+
+        let mut exact = vec![u8::try_from(crate::routing::K).unwrap()];
+        for byte in 0..crate::routing::K as u8 {
+            exact.extend_from_slice(&[byte; 32]);
+        }
+        let peers = recv_find_node_response(&mut exact.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(peers.len(), crate::routing::K);
     }
 }
