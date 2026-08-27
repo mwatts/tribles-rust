@@ -11,21 +11,33 @@
 //! fetches or persists ambient state.
 //!
 //! Operations:
-//!   AUTH       bundle_len:u32 bundle:bytes → resp:u8  (0x00 = OK, 0x01 = REJECTED)
+//!   AUTH       bundle_len:u32 bundle:bytes → resp:u8 server_bundle
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   PROVIDER_PUT element:32 → resp:u8                (caller identity is provider)
 //!   PROVIDER_GET element:32 → count:u8 provider:[32; count]
 //!   INVENTORY_AUTH, MANIFEST, NODE, and BLOB_RANGE are defined by
 //!   `inventory_wire`; they form the bounded SYNC_TEAM-authorized Merkle walk.
 //!
-//! Content and inventory operations disclose bytes only after CONNECT followed
-//! by a successful connection-local SYNC_TEAM authorization. `PROVIDER_PUT` is
-//! the one soft-state write: it binds the TLS-authenticated caller to a
-//! receiver-local lease and never accepts a claimed provider identity.
+//! Both authorization exchanges are mutual: an accepted server appends its own
+//! subject-bound proof to the success response, and the client verifies that
+//! proof before pooling the connection or sending the next phase. The initiating
+//! CONNECT bundle necessarily crosses before the server proves its capability;
+//! it is non-bearer evidence bound to the caller key and sent over TLS to the
+//! exact identity the client intended to dial, but the proof itself is not
+//! cryptographically bound to that receiver key. It is not a confidential or
+//! zero-knowledge credential. No SYNC proof, element ID, query, or data request
+//! is sent until reciprocal CONNECT verification succeeds.
+//! Content and inventory operations additionally wait for reciprocal SYNC_TEAM.
+//! `PROVIDER_PUT` is the one soft-state write: it binds the TLS-authenticated
+//! caller to a receiver-local lease and never accepts a claimed provider identity.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/11";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/12";
 
-use triblespace_core::capability::{CapabilityProofBundle, MAX_CAPABILITY_PROOF_BUNDLE_BYTES};
+use ed25519_dalek::VerifyingKey;
+use hifitime::Epoch;
+use triblespace_core::capability::{
+    CapabilityProofBundle, CapabilityRequest, MAX_CAPABILITY_PROOF_BUNDLE_BYTES, VerifiedCapability,
+};
 use triblespace_core::id::{Id, id_hex};
 
 /// Permission to establish an authenticated direct-RPC connection.
@@ -53,7 +65,8 @@ pub const OP_GET_BLOB: u8 = 0x02;
 // 0x03 was the retired blob-children operation.
 // 0x04 was the retired branch-head operation.
 /// First stream on every connection. Body: one length-prefixed canonical
-/// capability proof. Response: u8 status (`AUTH_OK` or `AUTH_REJECTED`).
+/// capability proof. A successful response carries the server's own bounded
+/// CONNECT proof immediately after `AUTH_OK`.
 pub const OP_AUTH: u8 = 0x05;
 /// Renew the authenticated caller's receiver-local provider lease.
 pub const OP_PROVIDER_PUT: u8 = 0x06;
@@ -185,16 +198,75 @@ pub async fn recv_capability_proof_bundle<R: AsyncRead + Unpin>(
 
 /// AUTH: present a complete CONNECT proof bundle. Must be the first stream
 /// opened on every new connection.
-pub async fn op_auth<C: Conn>(conn: &C, bundle: &CapabilityProofBundle) -> Result<()> {
+pub async fn op_auth<C: Conn>(
+    conn: &C,
+    bundle: &CapabilityProofBundle,
+    team: VerifyingKey,
+    expected_remote: [u8; 32],
+) -> Result<VerifiedCapability> {
+    if conn.remote_id() != expected_remote {
+        return Err(anyhow!(
+            "dialed endpoint identity does not match the requested peer"
+        ));
+    }
+    let remote = VerifyingKey::from_bytes(&expected_remote)
+        .map_err(|error| anyhow!("invalid remote endpoint identity: {error}"))?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_AUTH).await?;
     send_capability_proof_bundle(&mut send, bundle).await?;
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
-    let resp = recv_u8(&mut recv).await?;
-    match resp {
-        AUTH_OK => Ok(()),
-        AUTH_REJECTED => Err(anyhow!("server rejected CONNECT proof bundle")),
-        other => Err(anyhow!("unknown auth response: {other:#x}")),
+    recv_proof_response(
+        &mut recv,
+        team,
+        remote,
+        CapabilityRequest::new(
+            connect_capability_atom(team),
+            triblespace_core::capability::CapabilityMode::Invoke,
+        ),
+        crate::clock::epoch_now(),
+        "CONNECT",
+    )
+    .await
+}
+
+/// Verify one subject-bound endpoint proof under an explicit request and instant.
+///
+/// This is shared by startup validation and the two mutual-authentication
+/// responses so the local and remote boundaries cannot drift semantically.
+pub(crate) fn verify_endpoint_proof(
+    bundle: &CapabilityProofBundle,
+    team: VerifyingKey,
+    endpoint: VerifyingKey,
+    request: CapabilityRequest,
+    now: Epoch,
+    label: &'static str,
+) -> Result<VerifiedCapability> {
+    bundle
+        .verify(team, now, endpoint, request)
+        .map_err(|error| anyhow!("verify {label} endpoint proof: {error}"))
+}
+
+/// Decode and verify the proof carried by a successful authorization response.
+/// The length is rejected before allocation and trailing bytes are forbidden.
+pub(crate) async fn recv_proof_response<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    team: VerifyingKey,
+    expected_remote: VerifyingKey,
+    request: CapabilityRequest,
+    now: Epoch,
+    label: &'static str,
+) -> Result<VerifiedCapability> {
+    match recv_u8(recv).await? {
+        AUTH_OK => {
+            let proof = recv_capability_proof_bundle(recv).await?;
+            require_response_eof(recv).await?;
+            verify_endpoint_proof(&proof, team, expected_remote, request, now, label)
+        }
+        AUTH_REJECTED => {
+            require_response_eof(recv).await?;
+            Err(anyhow!("server rejected {label} proof bundle"))
+        }
+        other => Err(anyhow!("unknown {label} auth response: {other:#x}")),
     }
 }
 
@@ -292,7 +364,7 @@ mod bounds_tests {
     use hifitime::Epoch;
     use triblespace_core::capability::{
         CAPABILITY_PROOF_BUNDLE_VERSION, CapabilityAtom, CapabilityClaim, CapabilityMode,
-        CapabilityRequest, CapabilityResource,
+        CapabilityRequest, CapabilityResource, CapabilityValidity,
     };
 
     fn connect_proof_bundle() -> (SigningKey, SigningKey, CapabilityProofBundle) {
@@ -332,6 +404,47 @@ mod bounds_tests {
             .unwrap();
 
         (root, peer, leaf_bundle)
+    }
+
+    fn one_step_bundle(
+        root: &SigningKey,
+        peer: &SigningKey,
+        atom: CapabilityAtom,
+        validity: Option<CapabilityValidity>,
+    ) -> CapabilityProofBundle {
+        CapabilityProofBundle::issue_root(
+            root,
+            CapabilityClaim::root(atom, CapabilityMode::Invoke, validity),
+            peer.verifying_key(),
+        )
+        .unwrap()
+    }
+
+    fn successful_response(bundle: &CapabilityProofBundle) -> Vec<u8> {
+        let proof = bundle.to_bytes().unwrap();
+        let mut bytes = Vec::with_capacity(1 + 4 + proof.len());
+        bytes.push(AUTH_OK);
+        bytes.extend_from_slice(&(proof.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&proof);
+        bytes
+    }
+
+    async fn verify_connect_response(
+        bytes: &[u8],
+        team: VerifyingKey,
+        peer: VerifyingKey,
+        now: Epoch,
+    ) -> Result<VerifiedCapability> {
+        let mut input = bytes;
+        recv_proof_response(
+            &mut input,
+            team,
+            peer,
+            CapabilityRequest::new(connect_capability_atom(team), CapabilityMode::Invoke),
+            now,
+            "CONNECT",
+        )
+        .await
     }
 
     #[test]
@@ -384,6 +497,132 @@ mod bounds_tests {
         bytes.extend_from_slice(&body);
         let mut input = bytes.as_slice();
         assert!(recv_capability_proof_bundle(&mut input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_auth_response_requires_the_exact_server_subject_team_and_action() {
+        let team = SigningKey::from_bytes(&[0xB1; 32]);
+        let server = SigningKey::from_bytes(&[0xB2; 32]);
+        let other_server = SigningKey::from_bytes(&[0xB3; 32]);
+        let other_team = SigningKey::from_bytes(&[0xB4; 32]);
+        let now = Epoch::from_tai_seconds(10.0);
+        let atom = connect_capability_atom(team.verifying_key());
+
+        let correct = one_step_bundle(&team, &server, atom, None);
+        assert!(
+            verify_connect_response(
+                &successful_response(&correct),
+                team.verifying_key(),
+                server.verifying_key(),
+                now,
+            )
+            .await
+            .is_ok()
+        );
+
+        let wrong_subject = one_step_bundle(&team, &other_server, atom, None);
+        assert!(
+            verify_connect_response(
+                &successful_response(&wrong_subject),
+                team.verifying_key(),
+                server.verifying_key(),
+                now,
+            )
+            .await
+            .is_err()
+        );
+
+        let wrong_team = one_step_bundle(&other_team, &server, atom, None);
+        assert!(
+            verify_connect_response(
+                &successful_response(&wrong_team),
+                team.verifying_key(),
+                server.verifying_key(),
+                now,
+            )
+            .await
+            .is_err()
+        );
+
+        let wrong_action = one_step_bundle(
+            &team,
+            &server,
+            crate::inventory::sync_team_capability_atom(team.verifying_key()),
+            None,
+        );
+        assert!(
+            verify_connect_response(
+                &successful_response(&wrong_action),
+                team.verifying_key(),
+                server.verifying_key(),
+                now,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_auth_response_rejects_an_expired_server_proof() {
+        let team = SigningKey::from_bytes(&[0xC1; 32]);
+        let server = SigningKey::from_bytes(&[0xC2; 32]);
+        let validity =
+            CapabilityValidity::new(Epoch::from_tai_seconds(1.0), Epoch::from_tai_seconds(2.0))
+                .unwrap();
+        let proof = one_step_bundle(
+            &team,
+            &server,
+            connect_capability_atom(team.verifying_key()),
+            Some(validity),
+        );
+        assert!(
+            verify_connect_response(
+                &successful_response(&proof),
+                team.verifying_key(),
+                server.verifying_key(),
+                Epoch::from_tai_seconds(3.0),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_response_rejects_malformed_and_oversized_server_bundles() {
+        let team = SigningKey::from_bytes(&[0xD1; 32]);
+        let server = SigningKey::from_bytes(&[0xD2; 32]);
+        let now = Epoch::from_tai_seconds(0.0);
+
+        let mut malformed = vec![AUTH_OK];
+        malformed.extend_from_slice(&2_u32.to_be_bytes());
+        malformed.extend_from_slice(&[CAPABILITY_PROOF_BUNDLE_VERSION, 0]);
+        assert!(
+            verify_connect_response(
+                &malformed,
+                team.verifying_key(),
+                server.verifying_key(),
+                now,
+            )
+            .await
+            .is_err()
+        );
+
+        let mut oversized = vec![AUTH_OK];
+        oversized.extend_from_slice(
+            &u32::try_from(MAX_CAPABILITY_PROOF_BUNDLE_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert!(
+            verify_connect_response(
+                &oversized,
+                team.verifying_key(),
+                server.verifying_key(),
+                now,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

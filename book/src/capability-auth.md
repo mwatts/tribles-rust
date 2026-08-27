@@ -140,21 +140,34 @@ mode     = Invoke
 leaf     = authenticated transport peer key
 ```
 
-Protocol v10 carries one length-prefixed `CapabilityProofBundle` in the first
-`OP_AUTH` stream. The server supplies its configured team root, current TAI
-instant, and transport peer key to verification. Rejection closes the
-connection; a bounded accepted session closes after the effective inclusive
-upper validity bound.
+Protocol v12 carries one length-prefixed `CapabilityProofBundle` in the first
+`OP_AUTH` stream and returns the server's own bounded bundle after the success
+status. Each side supplies its configured team root, one current TAI instant,
+and the other endpoint's TLS-authenticated key to verification. The client
+checks that the connection identity is the endpoint it intended to dial before
+sending its proof. Rejection closes the connection; a bounded accepted session
+is discarded after either effective inclusive upper validity bound.
+
+This first exchange is mutual authentication, not credential secrecy. The
+initiator's proof necessarily reaches the dialed TLS endpoint before that
+endpoint proves its own CONNECT capability. Because the proof is bound to the
+initiator's exact key it is non-bearer evidence. The client sends it over TLS
+to the identity it intended to dial, but the proof itself is not
+cryptographically bound to that receiver key; the protocol is neither
+confidential nor zero knowledge at the capability-bundle layer. No later proof,
+element identity, query, or data request crosses until the reciprocal CONNECT
+proof verifies.
 
 CONNECT admits only the transport connection. It grants no collection
 `ACTION_WRITE`, generic read policy, inventory disclosure, semantic trust,
 retention, or blob availability. A second exact atom,
 `ACTION_SYNC_TEAM(team_root)` in Invoke mode for the same transport key, must
-be presented once through `INVENTORY_AUTH` before manifests, nodes, blob
-ranges, or even a known-hash `GET_BLOB` may be served. These two proofs may
-have different delegation paths and validity bounds. The team root also
-derives the gossip topic, but receiving a wake frame grants neither CONNECT nor
-SYNC_TEAM authority.
+be exchanged once through `INVENTORY_AUTH` before manifests, nodes, provider
+operations, blob ranges, or even a known-hash `GET_BLOB` may be served. The
+client verifies the returned server proof against the same TLS endpoint before
+sending any useful request. These two proofs may have different delegation
+paths and validity bounds. The team root also derives the gossip topic, but
+receiving a wake frame grants neither CONNECT nor SYNC_TEAM authority.
 
 There is no pre-auth fetch. The presenter sends each complete bundle inline.
 After both authorizations, collection records converge independently of blob

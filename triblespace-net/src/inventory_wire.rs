@@ -1,10 +1,11 @@
 //! Bounded wire codec for authorized prefix-Merkle reconciliation.
 //!
 //! CONNECT is still the mandatory first stream on a connection. A successful
-//! [`OP_INVENTORY_AUTH`] then installs exactly one server-selected inventory
-//! team session for that connection. Manifest, node, exact `GET_BLOB`, and mirror
-//! range operations are rejected by the host until that second authorization
-//! succeeds. The proof is not repeated on every request.
+//! [`OP_INVENTORY_AUTH`] then exchanges the two subject-bound SYNC_TEAM proofs
+//! and installs exactly one server-selected inventory team session for that
+//! connection. Manifest, node, exact `GET_BLOB`, provider, and mirror range
+//! operations are rejected until that mutual second authorization succeeds.
+//! The proofs are not repeated on every request.
 //!
 //! Every node and range request pins an exact component Merkle root. If that
 //! immutable snapshot is no longer cached for the authorized team, the server
@@ -14,7 +15,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{
-    CapabilityProof, CapabilityProofBundle, MAX_CAPABILITY_PROOF_STEPS,
+    CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityRequest,
+    MAX_CAPABILITY_PROOF_STEPS, VerifiedCapability,
 };
 use triblespace_core::collection::{COLLECTION_COMMIT_BYTES_LEN, CollectionRecord};
 use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH, PatchHash};
@@ -22,11 +24,11 @@ use triblespace_core::repo::peer::{PEER_EVIDENCE_BYTES_LEN, PeerEvidence};
 
 use crate::inventory::{
     AuthorizedInventorySession, ComponentManifest, InventoryComponent, InventoryGeneration,
-    InventoryManifest,
+    InventoryManifest, sync_team_capability_atom,
 };
 use crate::protocol::{
-    recv_capability_proof_bundle, recv_hash, recv_u8, recv_u32_be, recv_u64_be,
-    send_capability_proof_bundle, send_hash, send_u8, send_u32_be, send_u64_be,
+    recv_capability_proof_bundle, recv_hash, recv_proof_response, recv_u8, recv_u32_be,
+    recv_u64_be, send_capability_proof_bundle, send_hash, send_u8, send_u32_be, send_u64_be,
 };
 use crate::transport::Conn;
 
@@ -40,8 +42,8 @@ pub(crate) const OP_INVENTORY_NODE: u8 = 0x0A;
 /// Fetch one bounded range of a blob present in a pinned Blob inventory.
 pub(crate) const OP_INVENTORY_BLOB_RANGE: u8 = 0x0B;
 
-pub(crate) const INVENTORY_AUTH_OK: u8 = 0x00;
-pub(crate) const INVENTORY_AUTH_REJECTED: u8 = 0x01;
+pub(crate) const INVENTORY_AUTH_OK: u8 = crate::protocol::AUTH_OK;
+pub(crate) const INVENTORY_AUTH_REJECTED: u8 = crate::protocol::AUTH_REJECTED;
 
 const NODE_FOUND: u8 = 0x00;
 const NODE_SNAPSHOT_UNAVAILABLE: u8 = 0x01;
@@ -114,11 +116,18 @@ async fn recv_bounded_u16_frame<R: AsyncRead + Unpin>(
     recv_exact_vec(recv, length, what).await
 }
 
-/// Client-side second authorization exchange.
+/// Client-side reciprocal second authorization exchange.
 pub(crate) async fn op_inventory_auth<C: Conn>(
     connection: &C,
     proof: &CapabilityProofBundle,
-) -> Result<()> {
+    team: ed25519_dalek::VerifyingKey,
+    expected_remote: [u8; 32],
+) -> Result<VerifiedCapability> {
+    if connection.remote_id() != expected_remote {
+        bail!("inventory connection identity does not match the requested peer");
+    }
+    let remote = ed25519_dalek::VerifyingKey::from_bytes(&expected_remote)
+        .map_err(|error| anyhow!("invalid remote endpoint identity: {error}"))?;
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -129,17 +138,15 @@ pub(crate) async fn op_inventory_auth<C: Conn>(
         .await
         .map_err(|error| anyhow!("finish inventory auth request: {error}"))?;
 
-    match recv_u8(&mut recv).await? {
-        INVENTORY_AUTH_OK => {
-            require_eof(&mut recv).await?;
-            Ok(())
-        }
-        INVENTORY_AUTH_REJECTED => {
-            require_eof(&mut recv).await?;
-            bail!("server rejected SYNC_TEAM proof bundle")
-        }
-        status => bail!("unknown inventory auth response {status:#x}"),
-    }
+    recv_proof_response(
+        &mut recv,
+        team,
+        remote,
+        CapabilityRequest::new(sync_team_capability_atom(team), CapabilityMode::Invoke),
+        crate::clock::epoch_now(),
+        "SYNC_TEAM",
+    )
+    .await
 }
 
 /// Decode the one proof bundle carried by [`OP_INVENTORY_AUTH`].
@@ -152,8 +159,12 @@ pub(crate) async fn recv_inventory_auth_request<R: AsyncRead + Unpin>(
 }
 
 /// Send a successful second-authorization response.
-pub(crate) async fn send_inventory_auth_ok<W: AsyncWrite + Unpin>(send: &mut W) -> Result<()> {
-    send_u8(send, INVENTORY_AUTH_OK).await
+pub(crate) async fn send_inventory_auth_ok<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    proof: &CapabilityProofBundle,
+) -> Result<()> {
+    send_u8(send, INVENTORY_AUTH_OK).await?;
+    send_capability_proof_bundle(send, proof).await
 }
 
 /// Send a rejected second-authorization response without leaking details.

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Make both connection authorization phases mutual without another handshake:
+  successful CONNECT and SYNC_TEAM responses carry the server's bounded proof,
+  verified against the configured team, exact action/resource, current time,
+  and expected TLS endpoint before the connection or inventory session is used.
+  Startup now rejects local outbound proofs for another endpoint or atom, and
+  pooled remote authority is discarded when its effective validity expires.
+
 - Add one SYNC_TEAM-authorized, four-component inventory for a dedicated team
   store. Canonical BLAKE3 PATCH roots cover `PEER(team, peer)` evidence,
   collection records, capability proofs, and resident blobs. Root-pinned node
@@ -49,8 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connect_proof, sync_proof, qos }`. The team trust root also derives the gossip
   topic. CONNECT admits the transport, then exactly one SYNC_TEAM exchange
   selects disclosure authority for that connection.
-- Move pile sync to ALPN `/triblespace/pile-sync/11` for the incompatible
-  aligned Blake3Merkle v3 node format. Remove the unused
+- Move pile sync to ALPN `/triblespace/pile-sync/12` for the incompatible
+  reciprocal authorization responses and aligned Blake3Merkle v3 node format.
+  Remove the unused
   CHILDREN and collection-specific operations; retain exact `GET_BLOB` and add
   bounded inventory authorization, manifest, node, and blob-range operations.
 - Use configured endpoint addresses only as bootstrap routes. Authorized

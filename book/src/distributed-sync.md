@@ -103,16 +103,33 @@ authority satisfies an Invoke request; Delegate-only authority does not.
 
 The first stream of every connection is `OP_AUTH` with the complete CONNECT
 `CapabilityProofBundle`. Verification uses the externally configured team
-root, the transport-authenticated caller key, and the current time. A rejected
-connection closes. A bounded accepted connection also closes when the
-effective inclusive CONNECT validity interval expires.
+root, the transport-authenticated caller key, and the current time. On success
+the server returns its own bounded CONNECT bundle in that same response; the
+client verifies its team, exact action/resource, current validity, and leaf
+against the expected TLS-authenticated remote endpoint before pooling the
+connection. A rejected connection closes. Both sides stop using a bounded
+accepted connection when the corresponding effective inclusive CONNECT
+validity interval expires.
 
-After CONNECT, `INVENTORY_AUTH` presents the complete SYNC_TEAM bundle once
-for that connection. Successful verification installs one team-selected,
-validity-bounded session. The client cannot nominate another scope, and a
-second authorization attempt on the same connection is rejected. Manifest,
-node, blob-range, and known-hash `GET_BLOB` requests all require this live
-session. Knowing a content hash is not disclosure authority.
+The initiator's CONNECT bundle necessarily crosses before the receiver proves
+its own CONNECT capability. That bundle is non-bearer evidence cryptographically
+bound to the caller and exact delegate key. The client checks that the TLS
+identity is the endpoint it intended to dial before sending even this first
+proof, but the proof itself is not cryptographically bound to that receiver
+key; this exchange does not claim credential confidentiality or zero knowledge.
+It sends no SYNC proof, element identity, query, or data request until the
+returned CONNECT proof verifies.
+
+After mutual CONNECT, `INVENTORY_AUTH` presents the complete SYNC_TEAM bundle
+once for that connection. The server returns its own bounded SYNC_TEAM bundle
+only after accepting the caller; the client verifies it against the same team,
+remote TLS endpoint, exact SYNC_TEAM atom, and current instant before issuing
+any useful request. Successful reciprocal verification installs one
+team-selected, validity-bounded session on each side. The client cannot
+nominate another scope, and a second authorization attempt on the same
+connection is rejected. Manifest, node, provider, blob-range, and known-hash
+`GET_BLOB` requests all require this live session. Knowing a content hash is
+not disclosure authority.
 
 Neither handshake searches the store for a proof or fetches missing claims.
 Each selected bundle contains its exact ordered proof and claim closure inline.
@@ -247,14 +264,14 @@ compute reuse without weakening this boundary.
 ## Wire surface
 
 All direct operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/11"`. One QUIC stream carries one
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/12"`. One QUIC stream carries one
 strictly framed operation:
 
 | Operation | Byte | Purpose |
 |---|---:|---|
 | `GET_BLOB` | `0x02` | read one exact current blob after both authorizations |
-| `OP_AUTH` | `0x05` | present CONNECT bundle; mandatory first stream only |
-| `INVENTORY_AUTH` | `0x08` | install the one connection-local SYNC_TEAM session |
+| `OP_AUTH` | `0x05` | exchange subject-bound CONNECT bundles; mandatory first stream only |
+| `INVENTORY_AUTH` | `0x08` | exchange SYNC_TEAM bundles and install one connection-local session |
 | `INVENTORY_MANIFEST` | `0x09` | read the four ordered component roots and generation |
 | `INVENTORY_NODE` | `0x0A` | read one expected-digest node from a pinned component |
 | `INVENTORY_BLOB_RANGE` | `0x0B` | read at most one bounded range from a pinned Blob root |
@@ -300,7 +317,8 @@ distributed proof of convergence.
 
 - Synchronization is componentwise set union, never last-writer-wins state.
 - The backing store is a single-team security boundary.
-- CONNECT admits transport; SYNC_TEAM separately authorizes every disclosure.
+- CONNECT and SYNC_TEAM are reciprocal subject-bound proofs; SYNC_TEAM
+  separately authorizes every disclosure.
 - Proof presence, PEER evidence, and gossip grant no authority.
 - Gossip wakes reconciliation; periodic authenticated sweeps establish
   eventual progress.

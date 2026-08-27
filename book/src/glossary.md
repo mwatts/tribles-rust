@@ -108,9 +108,10 @@ The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
 direct-RPC session. Its resource is the team's exact 32-byte trust-root public
 key, and its claimed subject must equal the transport peer key. CONNECT grants
 no WRITE, generic READ, inventory disclosure, collection reach, semantic
-trust, or retention authority. Protocol v10 carries the complete proof bundle
-inline on the connection's first `OP_AUTH` stream. A separate SYNC_TEAM proof
-for the same team and endpoint must authorize inventory and blob reads.
+trust, or retention authority. Protocol v12 exchanges complete subject-bound
+proof bundles on the connection's first `OP_AUTH` stream. A separate reciprocal
+SYNC_TEAM exchange for the same team and endpoints must authorize inventory and
+blob reads.
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,

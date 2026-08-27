@@ -46,11 +46,22 @@ backing store must be dedicated to that team because collection records,
 proofs, and blobs have content identities but no intrinsic team label.
 
 Every connection first presents a complete CONNECT proof bound to its
-transport key. Before any inventory or blob disclosure, it presents a separate
-SYNC_TEAM proof exactly once for that connection. Both proofs must be rooted
-at `team`, invoke their exact action for the endpoint key, and be current.
-Knowing a team root, joining its gossip topic, possessing a content hash, or
-holding PEER evidence is not sufficient.
+transport key, and the server returns its own bounded CONNECT proof in the same
+round trip. Before any inventory or blob disclosure, the client and server
+repeat that reciprocal exchange for SYNC_TEAM exactly once on the connection.
+Both sides' proofs must be rooted at `team`, invoke their exact action for the
+TLS-authenticated endpoint key, and be current. Startup rejects local proof
+configuration for another endpoint, team, action, or validity interval.
+
+The initiating CONNECT proof necessarily reaches the exact dialed TLS identity
+before that endpoint proves CONNECT authority. It is non-bearer evidence bound
+to the initiator's key and sent over TLS to the identity the client intended to
+dial; the proof itself is not cryptographically bound to the receiver key. It
+is not a confidential or zero-knowledge credential. No SYNC proof, element
+identity, query, or data request is sent until the returned CONNECT proof
+verifies; useful requests additionally wait for reciprocal SYNC_TEAM. Knowing
+a team root, joining its gossip topic, possessing a content hash, or holding
+PEER evidence is not sufficient.
 
 ## Reconciliation policy
 

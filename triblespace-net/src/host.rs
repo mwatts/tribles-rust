@@ -19,7 +19,9 @@ use iroh_base::{EndpointAddr, EndpointId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{Instrument, debug, debug_span, info_span, instrument, trace, warn};
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::capability::{CapabilityProofBundle, CapabilityProofId};
+use triblespace_core::capability::{
+    CapabilityMode, CapabilityProofBundle, CapabilityProofId, CapabilityRequest, CapabilityValidity,
+};
 use triblespace_core::collection::CollectionStore;
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
@@ -35,7 +37,7 @@ use crate::identity::iroh_secret;
 use crate::inventory::{
     AuthorizedInventorySession, BlobInventory, CapabilityProofInventory, CollectionRecordInventory,
     InventoryComponent, InventoryGeneration, InventoryManifest, InventoryServerConfig,
-    InventorySnapshot, PeerInventory, ReconcileQos,
+    InventorySnapshot, PeerInventory, ReconcileQos, sync_team_capability_atom,
 };
 use crate::inventory_reconcile::InventoryWalker;
 use crate::inventory_wire::{
@@ -71,6 +73,33 @@ pub struct PeerConfig {
     pub sync_proof: CapabilityProofBundle,
     /// Local scheduling and blob-residency choices. Never sent as authority.
     pub qos: ReconcileQos,
+}
+
+fn validate_local_authorizations(
+    config: &PeerConfig,
+    endpoint: VerifyingKey,
+    now: hifitime::Epoch,
+) -> anyhow::Result<()> {
+    crate::protocol::verify_endpoint_proof(
+        &config.connect_proof,
+        config.team,
+        endpoint,
+        CapabilityRequest::new(connect_capability_atom(config.team), CapabilityMode::Invoke),
+        now,
+        "local CONNECT",
+    )?;
+    crate::protocol::verify_endpoint_proof(
+        &config.sync_proof,
+        config.team,
+        endpoint,
+        CapabilityRequest::new(
+            sync_team_capability_atom(config.team),
+            CapabilityMode::Invoke,
+        ),
+        now,
+        "local SYNC_TEAM",
+    )?;
+    Ok(())
 }
 
 /// Team-derived gossip topic. Keeping the derivation explicit prevents a
@@ -686,8 +715,31 @@ impl RoutingTable {
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
 
 struct PoolEntry<C> {
-    connection: tokio::sync::OnceCell<C>,
-    inventory_auth: tokio::sync::OnceCell<()>,
+    connection: tokio::sync::OnceCell<AuthenticatedConnection<C>>,
+    inventory_auth: tokio::sync::OnceCell<RemoteAuthorization>,
+}
+
+#[derive(Clone)]
+struct AuthenticatedConnection<C> {
+    connection: C,
+    validity: Option<CapabilityValidity>,
+}
+
+impl<C> AuthenticatedConnection<C> {
+    fn is_current_at(&self, now: hifitime::Epoch) -> bool {
+        self.validity.is_none_or(|validity| validity.contains(now))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RemoteAuthorization {
+    validity: Option<CapabilityValidity>,
+}
+
+impl RemoteAuthorization {
+    fn is_current_at(self, now: hifitime::Epoch) -> bool {
+        self.validity.is_none_or(|validity| validity.contains(now))
+    }
 }
 
 impl<C> Default for PoolEntry<C> {
@@ -725,6 +777,7 @@ struct ProviderClient<T: Transport> {
     sync_proof: CapabilityProofBundle,
     providers: Arc<Mutex<ProviderDirectory>>,
     my_id: PeerId,
+    team: VerifyingKey,
 }
 
 impl<T: Transport> NetCap<T> {
@@ -736,6 +789,7 @@ impl<T: Transport> NetCap<T> {
             sync_proof: self.sync_proof.clone(),
             providers: self.providers.clone(),
             my_id: self.my_id,
+            team: self.team,
         }
     }
 }
@@ -748,6 +802,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let sync_proof = self.sync_proof.clone();
         let can_fetch = self.can_fetch;
         let my_id = self.my_id;
+        let team = self.team;
         let known = self.candidates.lock().unwrap().candidates(my_id);
         Box::pin(async move {
             if !can_fetch {
@@ -758,6 +813,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
                 &hash,
                 &pool,
                 &known,
+                team,
                 &connect_proof,
                 &sync_proof,
             )
@@ -979,6 +1035,9 @@ pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wir
 pub fn spawn(key: SigningKey, config: PeerConfig) -> anyhow::Result<(NetSender, NetReceiver)> {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
+    let endpoint = VerifyingKey::from_bytes(id.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid local endpoint identity: {error}"))?;
+    validate_local_authorizations(&config, endpoint, crate::clock::epoch_now())?;
     let (sender, receiver, wiring) = wire(id);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     let _thread = thread::Builder::new()
@@ -1053,6 +1112,20 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         cap_tx,
     } = HostWiringParts::from(wiring);
     let my_id = transport.local_id();
+    let endpoint = match VerifyingKey::from_bytes(&my_id) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            warn!(%error, "invalid local transport identity");
+            transport.shutdown().await;
+            return;
+        }
+    };
+    if let Err(error) = validate_local_authorizations(&config, endpoint, crate::clock::epoch_now())
+    {
+        warn!(%error, "local outbound capability proofs do not authorize this endpoint");
+        transport.shutdown().await;
+        return;
+    }
     let mut configured: Vec<_> = config
         .peers
         .iter()
@@ -1081,6 +1154,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         snapshot: snapshot.clone(),
         snapshots,
         server: InventoryServerConfig::full_team(config.team),
+        local: endpoint,
+        connect_proof: config.connect_proof.clone(),
+        sync_proof: config.sync_proof.clone(),
         events: events.clone(),
         candidates: candidates.clone(),
         providers,
@@ -1360,7 +1436,8 @@ async fn reconcile_inventory_peer<T: Transport>(
     events: &tokio::sync::mpsc::Sender<NetEventBatch>,
     candidates: &RoutingCandidates,
 ) -> anyhow::Result<()> {
-    let connection = inventory_pool_get(transport, pool, peer, connect_proof, sync_proof).await?;
+    let connection =
+        inventory_pool_get(transport, pool, peer, team, connect_proof, sync_proof).await?;
     let remote_key = VerifyingKey::from_bytes(&peer)?;
     candidates.lock().unwrap().note(peer);
     let mut admissions = AdmissionBatcher::new(events);
@@ -1526,11 +1603,15 @@ async fn fetch_inventory_blob<C: Conn>(
 async fn connect_authed<T: Transport>(
     transport: &T,
     peer: PeerId,
+    team: VerifyingKey,
     connect_proof: &CapabilityProofBundle,
-) -> anyhow::Result<T::Conn> {
+) -> anyhow::Result<AuthenticatedConnection<T::Conn>> {
     let connection = transport.dial(peer, PILE_SYNC_ALPN).await?;
-    op_auth(&connection, connect_proof).await?;
-    Ok(connection)
+    let verified = op_auth(&connection, connect_proof, team, peer).await?;
+    Ok(AuthenticatedConnection {
+        connection,
+        validity: verified.effective_validity(),
+    })
 }
 
 async fn pool_entry<C>(pool: &SharedPool<C>, peer: PeerId) -> Arc<PoolEntry<C>> {
@@ -1545,6 +1626,7 @@ async fn pool_get<T: Transport>(
     transport: &T,
     pool: &SharedPool<T::Conn>,
     peer: PeerId,
+    team: VerifyingKey,
     connect_proof: &CapabilityProofBundle,
 ) -> Option<(Arc<PoolEntry<T::Conn>>, T::Conn)> {
     let entry = pool_entry(pool, peer).await;
@@ -1553,14 +1635,21 @@ async fn pool_get<T: Transport>(
         .get_or_try_init(|| async {
             tokio::time::timeout(
                 DIAL_DEADLINE,
-                connect_authed(transport, peer, connect_proof),
+                connect_authed(transport, peer, team, connect_proof),
             )
             .await
             .map_err(|_| anyhow::anyhow!("connection setup deadline exceeded"))?
         })
         .await;
     match initialized {
-        Ok(connection) => Some((entry.clone(), connection.clone())),
+        Ok(connection) if connection.is_current_at(crate::clock::epoch_now()) => {
+            Some((entry.clone(), connection.connection.clone()))
+        }
+        Ok(_) => {
+            debug!(peer = %hex::encode(&peer[..4]), "remote CONNECT capability expired");
+            pool_remove_if(pool, peer, &entry).await;
+            None
+        }
         Err(error) => {
             debug!(peer = %hex::encode(&peer[..4]), %error, "authenticated dial failed");
             pool_remove_if(pool, peer, &entry).await;
@@ -1573,23 +1662,37 @@ async fn inventory_pool_get<T: Transport>(
     transport: &T,
     pool: &SharedPool<T::Conn>,
     peer: PeerId,
+    team: VerifyingKey,
     connect_proof: &CapabilityProofBundle,
     sync_proof: &CapabilityProofBundle,
 ) -> anyhow::Result<T::Conn> {
-    let (entry, connection) = pool_get(transport, pool, peer, connect_proof)
+    let (entry, connection) = pool_get(transport, pool, peer, team, connect_proof)
         .await
         .ok_or_else(|| anyhow::anyhow!("peer is unavailable"))?;
     let authorized = entry
         .inventory_auth
         .get_or_try_init(|| async {
-            tokio::time::timeout(OP_DEADLINE, op_inventory_auth(&connection, sync_proof))
-                .await
-                .map_err(|_| anyhow::anyhow!("inventory authorization deadline exceeded"))?
+            let verified = tokio::time::timeout(
+                OP_DEADLINE,
+                op_inventory_auth(&connection, sync_proof, team, peer),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("inventory authorization deadline exceeded"))??;
+            Ok::<_, anyhow::Error>(RemoteAuthorization {
+                validity: verified.effective_validity(),
+            })
         })
         .await;
-    if let Err(error) = authorized {
-        pool_remove_if(pool, peer, &entry).await;
-        return Err(error);
+    match authorized {
+        Ok(authorization) if authorization.is_current_at(crate::clock::epoch_now()) => {}
+        Ok(_) => {
+            pool_remove_if(pool, peer, &entry).await;
+            anyhow::bail!("remote SYNC_TEAM capability expired");
+        }
+        Err(error) => {
+            pool_remove_if(pool, peer, &entry).await;
+            return Err(error);
+        }
     }
     Ok(connection)
 }
@@ -1609,7 +1712,7 @@ async fn pool_remove_if<C: Conn>(pool: &SharedPool<C>, peer: PeerId, expected: &
     if let Some(entry) = removed
         && let Some(connection) = entry.connection.get()
     {
-        connection.close(0, b"pool evict");
+        connection.connection.close(0, b"pool evict");
     }
 }
 
@@ -1625,15 +1728,24 @@ async fn fetch_from_providers<T: Transport>(
     hash: &RawHash,
     pool: &SharedPool<T::Conn>,
     providers: &[PeerId],
+    team: VerifyingKey,
     connect_proof: &CapabilityProofBundle,
     sync_proof: &CapabilityProofBundle,
 ) -> Option<Vec<u8>> {
     for peer in providers.iter().copied() {
-        let connection =
-            match inventory_pool_get(transport, pool, peer, connect_proof, sync_proof).await {
-                Ok(connection) => connection,
-                Err(_) => continue,
-            };
+        let connection = match inventory_pool_get(
+            transport,
+            pool,
+            peer,
+            team,
+            connect_proof,
+            sync_proof,
+        )
+        .await
+        {
+            Ok(connection) => connection,
+            Err(_) => continue,
+        };
         match tokio::time::timeout(OP_DEADLINE, op_get_blob(&connection, hash)).await {
             Ok(Ok(Some(bytes))) if blake3::hash(&bytes).as_bytes() == hash => return Some(bytes),
             Ok(Ok(_)) => {}
@@ -1671,6 +1783,7 @@ impl<T: Transport> ProviderClient<T> {
             &self.transport,
             &self.pool,
             target,
+            self.team,
             &self.connect_proof,
             &self.sync_proof,
         )
@@ -1730,6 +1843,7 @@ impl<T: Transport> ProviderClient<T> {
             &self.transport,
             &self.pool,
             target,
+            self.team,
             &self.connect_proof,
             &self.sync_proof,
         )
@@ -1761,6 +1875,9 @@ struct SnapshotHandler {
     snapshot: SnapshotSlot,
     snapshots: InventorySnapshots,
     server: InventoryServerConfig,
+    local: VerifyingKey,
+    connect_proof: CapabilityProofBundle,
+    sync_proof: CapabilityProofBundle,
     events: tokio::sync::mpsc::Sender<NetEventBatch>,
     candidates: RoutingCandidates,
     providers: Arc<Mutex<ProviderDirectory>>,
@@ -1803,6 +1920,8 @@ impl SnapshotHandler {
                 let result = authenticate_connection::<T::Conn>(
                     self.server.team(),
                     peer,
+                    self.local,
+                    &self.connect_proof,
                     &mut send,
                     &mut recv,
                 )
@@ -1981,11 +2100,11 @@ impl SnapshotHandler {
                 // read-only node may use that session for the soft provider
                 // directory while its local direction policy still rejects
                 // every inventory/blob disclosure operation below.
-                match self
-                    .server
-                    .authorize(peer, &proof, crate::clock::epoch_now())
-                {
-                    Ok(session) => {
+                let now = crate::clock::epoch_now();
+                let caller = self.server.authorize(peer, &proof, now);
+                let local = self.server.authorize(self.local, &self.sync_proof, now);
+                match (caller, local) {
+                    (Ok(session), Ok(_)) => {
                         *authorization.lock().unwrap() =
                             InventoryAuthorization::Authorized(session);
                         if self.admit_inbound_peer {
@@ -1997,10 +2116,14 @@ impl SnapshotHandler {
                                     )))
                                     .await;
                         }
-                        send_inventory_auth_ok(send).await?;
+                        send_inventory_auth_ok(send, &self.sync_proof).await?;
                     }
-                    Err(error) => {
-                        debug!(%error, "SYNC_TEAM capability rejected");
+                    (Err(error), _) => {
+                        debug!(%error, "caller SYNC_TEAM capability rejected");
+                        send_inventory_auth_rejected(send).await?;
+                    }
+                    (_, Err(error)) => {
+                        debug!(%error, "local SYNC_TEAM capability is no longer current");
                         send_inventory_auth_rejected(send).await?;
                     }
                 }
@@ -2095,6 +2218,8 @@ fn current_inventory_session(
 async fn authenticate_connection<C: Conn>(
     team: VerifyingKey,
     peer: VerifyingKey,
+    local: VerifyingKey,
+    local_proof: &CapabilityProofBundle,
     send: &mut C::SendHalf,
     recv: &mut C::RecvHalf,
 ) -> anyhow::Result<Option<triblespace_core::capability::VerifiedCapability>> {
@@ -2107,17 +2232,28 @@ async fn authenticate_connection<C: Conn>(
         }
         let proof = recv_capability_proof_bundle(recv).await?;
         require_stream_eof(recv).await?;
-        Ok(proof.verify(
+        let now = crate::clock::epoch_now();
+        let caller = proof.verify(
             team,
-            crate::clock::epoch_now(),
+            now,
             peer,
             CapabilityRequest::new(connect_capability_atom(team), CapabilityMode::Invoke),
-        )?)
+        )?;
+        crate::protocol::verify_endpoint_proof(
+            local_proof,
+            team,
+            local,
+            CapabilityRequest::new(connect_capability_atom(team), CapabilityMode::Invoke),
+            now,
+            "local CONNECT",
+        )?;
+        Ok(caller)
     }
     .await;
     match verdict {
         Ok(verified) => {
             send_u8(send, AUTH_OK).await?;
+            send_capability_proof_bundle(send, local_proof).await?;
             Ok(Some(verified))
         }
         Err(error) => {
@@ -2210,6 +2346,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
+    use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
     use triblespace_core::collection::{
         CollectionCommit, CollectionData, CollectionRecord, CollectionStore,
     };
@@ -2221,6 +2358,50 @@ mod tests {
 
     fn key(byte: u8) -> VerifyingKey {
         SigningKey::from_bytes(&[byte; 32]).verifying_key()
+    }
+
+    fn endpoint_proof(
+        root: &SigningKey,
+        endpoint: &SigningKey,
+        atom: triblespace_core::capability::CapabilityAtom,
+    ) -> CapabilityProofBundle {
+        CapabilityProofBundle::issue_root(
+            root,
+            CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+            endpoint.verifying_key(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn startup_rejects_outbound_proofs_for_another_local_endpoint() {
+        let team = SigningKey::from_bytes(&[0x71; 32]);
+        let endpoint = SigningKey::from_bytes(&[0x72; 32]);
+        let other = SigningKey::from_bytes(&[0x73; 32]);
+        let config = PeerConfig {
+            peers: Vec::new(),
+            team: team.verifying_key(),
+            connect_proof: endpoint_proof(
+                &team,
+                &other,
+                connect_capability_atom(team.verifying_key()),
+            ),
+            sync_proof: endpoint_proof(
+                &team,
+                &endpoint,
+                sync_team_capability_atom(team.verifying_key()),
+            ),
+            qos: ReconcileQos::default(),
+        };
+
+        assert!(
+            validate_local_authorizations(
+                &config,
+                endpoint.verifying_key(),
+                hifitime::Epoch::from_tai_seconds(0.0),
+            )
+            .is_err()
+        );
     }
 
     #[test]
