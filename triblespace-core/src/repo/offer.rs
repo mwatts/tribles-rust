@@ -185,11 +185,13 @@ impl<S> OfferCapture<S>
 where
     S: ArtifactOfferStore,
 {
-    /// Retry the exact pending OFFER batch without inserting a semantic record.
+    /// Record the exact pending OFFER batch without inserting a semantic record.
     ///
-    /// Partial success is lawful because offers are grow-only. On failure the
-    /// complete request remains pending, so retrying all handles is idempotent.
-    pub fn retry_offers(&mut self) -> Result<(), S::OfferError> {
+    /// This is useful when a workflow deliberately streams large dependencies
+    /// ahead of its eventual semantic record. Partial success is lawful because
+    /// offers are grow-only. On failure the complete request remains pending,
+    /// so calling this again is idempotent.
+    pub fn offer_pending(&mut self) -> Result<(), S::OfferError> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -302,7 +304,7 @@ where
     }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        if let Err(source) = self.retry_offers() {
+        if let Err(source) = self.offer_pending() {
             return Err(OfferCaptureInsertError::Offer {
                 source,
                 artifacts: self.pending.iter().copied().collect(),
