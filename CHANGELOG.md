@@ -10,11 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add a transport-independent bounded XOR routing core. Its 256 Kademlia-style
-  buckets retain at most 20 peers each and distinguish configured or remotely
-  named candidates from direct authenticated responders. A caller-driven
-  alpha-3 iterative lookup accepts bounded FIND_NODE hints, promotes only the
-  peer that actually answered, removes failed routes, and terminates without
-  actors, a second transport, or new dependencies.
+  buckets retain at most 20 learned peers each and distinguish remotely named
+  candidates from direct authenticated responders. Explicit bootstrap
+  configuration remains separate from evictable learned state. A caller-driven
+  alpha-3 iterative lookup accepts bounded FIND_NODE hints, retains its K
+  closest direct responders independently of long-lived route eviction,
+  promotes only the peer that actually answered, removes failed learned routes,
+  and terminates without actors, a second transport, or new dependencies.
 
 - Add lattice-aware exact derived-collection reuse over the existing team
   transport. The core resolver accepts speculative remote target handles,

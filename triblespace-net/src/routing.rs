@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::transport::PeerId;
 
+/// An arbitrary point in the 256-bit XOR keyspace.
+pub(crate) type RoutingKey = [u8; 32];
 /// Number of peers retained in one XOR-distance bucket.
 pub(crate) const K: usize = 20;
 /// Maximum number of concurrent requests in one iterative lookup.
@@ -38,9 +40,15 @@ struct Bucket {
 /// XOR distance from `local`.  A bucket retains at most [`K`] identities.
 /// Verified peers take precedence over candidates; ties are resolved by XOR
 /// distance from the local peer and then by identity.  Consequently inserting
-/// the same evidence in a different order produces the same table.
+/// the same evidence in a different order produces the same table. Explicit
+/// local configuration is retained separately and is expected to be bounded
+/// by the caller rather than by rules for hostile learned state.
 pub(crate) struct RoutingTable {
     local: PeerId,
+    /// Explicit local configuration is trusted provenance, not hostile learned
+    /// state. It remains available even if the corresponding learned route is
+    /// evicted or a connection attempt fails.
+    configured: BTreeSet<PeerId>,
     buckets: [Bucket; BUCKET_COUNT],
 }
 
@@ -51,19 +59,23 @@ impl RoutingTable {
     where
         I: IntoIterator<Item = PeerId>,
     {
-        let mut table = Self {
+        let configured = configured
+            .into_iter()
+            .filter(|peer| *peer != local)
+            .collect();
+        Self {
             local,
+            configured,
             buckets: std::array::from_fn(|_| Bucket::default()),
-        };
-        for peer in configured {
-            table.note_candidate(peer);
         }
-        table
     }
 
     /// Remember an unverified identity without demoting an already verified
     /// route. Returns whether the identity survived the bucket bound.
     pub(crate) fn note_candidate(&mut self, peer: PeerId) -> bool {
+        if self.configured.contains(&peer) {
+            return true;
+        }
         self.insert(peer, RouteState::Candidate)
     }
 
@@ -73,7 +85,8 @@ impl RoutingTable {
         self.insert(peer, RouteState::Verified)
     }
 
-    /// Remove failed or explicitly withdrawn routing evidence.
+    /// Remove failed learned evidence. Explicit local configuration survives
+    /// and becomes an unverified candidate again.
     pub(crate) fn remove(&mut self, peer: PeerId) -> bool {
         let Some(bucket) = bucket_index(self.local, peer) else {
             return false;
@@ -82,22 +95,32 @@ impl RoutingTable {
     }
 
     pub(crate) fn state(&self, peer: PeerId) -> Option<RouteState> {
-        let bucket = bucket_index(self.local, peer)?;
-        self.buckets[bucket].entries.get(&peer).copied()
+        let learned = bucket_index(self.local, peer)
+            .and_then(|bucket| self.buckets[bucket].entries.get(&peer).copied());
+        learned.or_else(|| {
+            self.configured
+                .contains(&peer)
+                .then_some(RouteState::Candidate)
+        })
     }
 
+    /// Number of unique configured and learned identities.
     pub(crate) fn len(&self) -> usize {
+        self.all().len()
+    }
+
+    pub(crate) fn learned_len(&self) -> usize {
         self.buckets.iter().map(|bucket| bucket.entries.len()).sum()
+    }
+
+    pub(crate) fn configured_len(&self) -> usize {
+        self.configured.len()
     }
 
     /// Return at most `limit` known identities ordered by XOR distance from
     /// `target`. Candidate status does not affect distance order.
-    pub(crate) fn closest(&self, target: PeerId, limit: usize) -> Vec<PeerId> {
-        let mut peers: Vec<_> = self
-            .buckets
-            .iter()
-            .flat_map(|bucket| bucket.entries.keys().copied())
-            .collect();
+    pub(crate) fn closest(&self, target: RoutingKey, limit: usize) -> Vec<PeerId> {
+        let mut peers = self.all();
         peers.sort_unstable_by(|a, b| distance_cmp(target, *a, *b));
         peers.truncate(limit);
         peers
@@ -105,7 +128,7 @@ impl RoutingTable {
 
     /// Like [`Self::closest`], but excludes identities that have never
     /// answered this process directly.
-    pub(crate) fn closest_verified(&self, target: PeerId, limit: usize) -> Vec<PeerId> {
+    pub(crate) fn closest_verified(&self, target: RoutingKey, limit: usize) -> Vec<PeerId> {
         let mut peers: Vec<_> =
             self.buckets
                 .iter()
@@ -118,6 +141,18 @@ impl RoutingTable {
         peers.sort_unstable_by(|a, b| distance_cmp(target, *a, *b));
         peers.truncate(limit);
         peers
+    }
+
+    fn all(&self) -> Vec<PeerId> {
+        let mut peers = self.configured.clone();
+        for peer in self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.entries.keys().copied())
+        {
+            peers.insert(peer);
+        }
+        peers.into_iter().collect()
     }
 
     fn insert(&mut self, peer: PeerId, state: RouteState) -> bool {
@@ -176,7 +211,7 @@ fn bucket_index(local: PeerId, peer: PeerId) -> Option<usize> {
     None
 }
 
-fn distance_cmp(target: PeerId, a: PeerId, b: PeerId) -> Ordering {
+fn distance_cmp(target: RoutingKey, a: PeerId, b: PeerId) -> Ordering {
     a.iter()
         .zip(b)
         .zip(target)
@@ -200,13 +235,14 @@ enum LookupState {
 /// only the peer that directly answered is promoted.
 pub(crate) struct IterativeLookup {
     local: PeerId,
-    target: PeerId,
+    target: RoutingKey,
     shortlist: BTreeMap<PeerId, LookupState>,
     queried: BTreeSet<PeerId>,
+    authenticated_responders: Vec<PeerId>,
 }
 
 impl IterativeLookup {
-    pub(crate) fn new<I>(local: PeerId, target: PeerId, seeds: I) -> Self
+    pub(crate) fn new<I>(local: PeerId, target: RoutingKey, seeds: I) -> Self
     where
         I: IntoIterator<Item = PeerId>,
     {
@@ -215,6 +251,7 @@ impl IterativeLookup {
             target,
             shortlist: BTreeMap::new(),
             queried: BTreeSet::new(),
+            authenticated_responders: Vec::new(),
         };
         lookup.add_candidates(bounded_closest(target, local, seeds));
         lookup.trim_shortlist();
@@ -275,6 +312,14 @@ impl IterativeLookup {
         }
 
         self.shortlist.insert(peer, LookupState::Responded);
+        self.authenticated_responders = bounded_closest(
+            self.target,
+            self.local,
+            self.authenticated_responders
+                .iter()
+                .copied()
+                .chain(std::iter::once(peer)),
+        );
         routes.promote_authenticated(peer);
         let candidates = bounded_closest(self.target, self.local, candidates);
         for candidate in &candidates {
@@ -308,6 +353,13 @@ impl IterativeLookup {
         !has_in_flight && (!has_pending || self.queried.len() >= MAX_LOOKUP_QUERIES)
     }
 
+    /// The at-most-K peers closest to the target that answered this lookup
+    /// directly and authenticated successfully. This lookup-local evidence is
+    /// independent of later routing-table eviction.
+    pub(crate) fn closest_authenticated_responders(&self) -> &[PeerId] {
+        &self.authenticated_responders
+    }
+
     #[cfg(test)]
     fn shortlist_len(&self) -> usize {
         self.shortlist.len()
@@ -339,7 +391,7 @@ impl IterativeLookup {
 
 /// Select a bounded, order-independent set from an untrusted iterator without
 /// first collecting the whole reply.
-fn bounded_closest<I>(target: PeerId, local: PeerId, peers: I) -> Vec<PeerId>
+fn bounded_closest<I>(target: RoutingKey, local: PeerId, peers: I) -> Vec<PeerId>
 where
     I: IntoIterator<Item = PeerId>,
 {
@@ -371,7 +423,7 @@ mod tests {
 
     fn drive_lookup(
         local: PeerId,
-        target: PeerId,
+        target: RoutingKey,
         seeds: Vec<PeerId>,
         network: &BTreeMap<PeerId, Vec<PeerId>>,
     ) -> (RoutingTable, Vec<PeerId>) {
@@ -413,6 +465,8 @@ mod tests {
         let local = id(1);
         let table = RoutingTable::new(local, [local, id(2), id(2)]);
         assert_eq!(table.len(), 1);
+        assert_eq!(table.configured_len(), 1);
+        assert_eq!(table.learned_len(), 0);
         assert_eq!(table.state(local), None);
         assert_eq!(table.state(id(2)), Some(RouteState::Candidate));
         assert!(table.closest_verified(id(2), K).is_empty());
@@ -450,8 +504,14 @@ mod tests {
         }
 
         let verified: Vec<_> = peers.iter().step_by(7).copied().collect();
-        let mut forward = RoutingTable::new(local, peers.iter().copied());
-        let mut reverse = RoutingTable::new(local, peers.iter().rev().copied());
+        let mut forward = RoutingTable::new(local, []);
+        let mut reverse = RoutingTable::new(local, []);
+        for peer in &peers {
+            forward.note_candidate(*peer);
+        }
+        for peer in peers.iter().rev() {
+            reverse.note_candidate(*peer);
+        }
         for peer in &verified {
             forward.promote_authenticated(*peer);
         }
@@ -459,8 +519,8 @@ mod tests {
             reverse.promote_authenticated(*peer);
         }
 
-        assert!(forward.len() <= ROUTING_CAPACITY);
-        assert!(reverse.len() <= ROUTING_CAPACITY);
+        assert!(forward.learned_len() <= ROUTING_CAPACITY);
+        assert!(reverse.learned_len() <= ROUTING_CAPACITY);
         for index in 0..BUCKET_COUNT {
             assert!(forward.bucket_len(index) <= K);
             assert!(reverse.bucket_len(index) <= K);
@@ -475,8 +535,14 @@ mod tests {
         );
 
         // Candidate insertion alone is likewise independent of observation order.
-        let forward_candidates = RoutingTable::new(local, peers.iter().copied());
-        let reverse_candidates = RoutingTable::new(local, peers.iter().rev().copied());
+        let mut forward_candidates = RoutingTable::new(local, []);
+        let mut reverse_candidates = RoutingTable::new(local, []);
+        for peer in &peers {
+            forward_candidates.note_candidate(*peer);
+        }
+        for peer in peers.iter().rev() {
+            reverse_candidates.note_candidate(*peer);
+        }
         assert_eq!(
             forward_candidates.closest([0xff; 32], ROUTING_CAPACITY),
             reverse_candidates.closest([0xff; 32], ROUTING_CAPACITY)
@@ -574,7 +640,89 @@ mod tests {
             }
         }
         assert_eq!(contacted, K);
-        assert_eq!(routes.len(), 0);
+        assert_eq!(routes.learned_len(), 0);
+        assert_eq!(routes.configured_len(), K);
+        assert_eq!(routes.len(), K);
+        assert!((1..=K as u16).all(|n| routes.state(id(n)) == Some(RouteState::Candidate)));
+    }
+
+    #[test]
+    fn configured_seed_survives_learned_eviction_and_failure() {
+        let local = id(0);
+        let configured = id(0xffff);
+        let mut routes = RoutingTable::new(local, [configured]);
+
+        routes.promote_authenticated(configured);
+        assert_eq!(routes.state(configured), Some(RouteState::Verified));
+        for n in 0x8000..0x8000 + K as u16 {
+            routes.promote_authenticated(id(n));
+        }
+        assert!(
+            !routes
+                .closest_verified(configured, ROUTING_CAPACITY)
+                .contains(&configured)
+        );
+        assert_eq!(routes.state(configured), Some(RouteState::Candidate));
+        assert!(routes.closest(configured, K).contains(&configured));
+
+        // A later failed retry can remove learned liveness evidence, but not
+        // the explicit local instruction to use this peer as a bootstrap.
+        assert!(routes.remove(id(0x8000)));
+        assert!(routes.promote_authenticated(configured));
+        assert_eq!(routes.state(configured), Some(RouteState::Verified));
+        assert!(routes.remove(configured));
+        assert_eq!(routes.state(configured), Some(RouteState::Candidate));
+        assert!(routes.closest(configured, K).contains(&configured));
+    }
+
+    #[test]
+    fn lookup_retains_target_near_authenticated_responders_after_route_eviction() {
+        let local = id(0);
+        let responder = id(0xffff);
+        let target: RoutingKey = responder;
+        let mut routes = RoutingTable::new(local, [responder]);
+        let mut lookup = IterativeLookup::new(local, target, [responder]);
+
+        assert_eq!(lookup.next_batch(), vec![responder]);
+        assert!(lookup.record_authenticated_response(responder, [], &mut routes));
+        assert_eq!(lookup.closest_authenticated_responders(), &[responder]);
+
+        // All peers occupy the same local-distance bucket. The long-lived
+        // table prefers the K routes nearer `local`, but lookup results remain
+        // ranked by the arbitrary lookup target.
+        for n in 0x8000..0x8000 + K as u16 {
+            routes.promote_authenticated(id(n));
+        }
+        assert!(
+            !routes
+                .closest_verified(target, ROUTING_CAPACITY)
+                .contains(&responder)
+        );
+        assert_eq!(lookup.closest_authenticated_responders(), &[responder]);
+    }
+
+    #[test]
+    fn lookup_responder_result_is_bounded_and_target_ordered() {
+        let local = id(0);
+        let target = id(25);
+        let mut routes = RoutingTable::new(local, [id(1)]);
+        let mut lookup = IterativeLookup::new(local, target, [id(1)]);
+
+        for n in 1..=25 {
+            assert_eq!(lookup.next_batch(), vec![id(n)]);
+            let next = (n < 25).then(|| id(n + 1));
+            assert!(lookup.record_authenticated_response(id(n), next.into_iter(), &mut routes));
+        }
+
+        let responders = lookup.closest_authenticated_responders();
+        assert_eq!(responders.len(), K);
+        assert_eq!(responders[0], target);
+        assert!(!responders.contains(&id(2)));
+        assert!(
+            responders
+                .windows(2)
+                .all(|pair| distance_cmp(target, pair[0], pair[1]).is_le())
+        );
     }
 
     #[test]
