@@ -104,13 +104,6 @@ reader can recompute.
 - None at the moment.
 
 ## 0.7.0 Release Preparation
-- **Delta helpers.**
-  - Design a helper that produces delta `TribleSet`s for `pattern_changes!` and
-    drafts an API signature for review.
-  - Implement the helper plus unit tests that demonstrate incremental update
-    workflows and guard against regressions.
-  - Document the helper in the book or API docs with a migration note for users
-    maintaining custom delta code.
 - **Documentation polish.**
   - Draft advanced query examples that compose multiple `attributes!` modules
     and slot them into the book structure.

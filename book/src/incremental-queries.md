@@ -74,41 +74,34 @@ applications interested in witness events should project the witness identity.
 ## Use collection tickets as continuation tokens
 
 A native collection ticket is the exact commit set observed by one discovery
-pass. Its intrinsic commit IDs make a natural storage-level continuation token:
+pass. Its complete signed records make a natural storage-level continuation
+token. [`exact_ticket_additions`](triblespace::core::collection::exact_ticket_additions)
+compares two observations, verifies that the earlier support remains a subset
+of the later support, and returns only the newly observed commits:
 
 ```rust,ignore
-use std::collections::BTreeSet;
-use triblespace::core::collection::reach;
-
-let current = collection.ticket()?;
-let new_commits: Vec<_> = current
-    .iter()
-    .copied()
-    .filter(|commit| !seen.contains(&commit.id()))
-    .collect();
-
-let view = SimpleArchiveCollection::new(
-    name.clone(),
-    team,
-    collection.admission().trust_root(),
-    reach::private(),
-);
-let changed = view.attach_exact(collection.storage_mut(), &new_commits)?;
-let full = view.attach_exact(collection.storage_mut(), &current)?;
-
-for row in find!(result, pattern_changes!(&full, &changed, [
-    /* constraints */
-])) {
-    // consume row
-}
-
-seen = current.iter().map(|commit| commit.id()).collect::<BTreeSet<_>>();
+{{#include ../../examples/collection_pattern_changes.rs:collection_pattern_changes_observe}}
 ```
 
-This computes a set difference over immutable records; it does not walk a
-parent chain or ask an ambient head what changed. Exact-ticket attachment also
-ensures that commits first observed after `current` cannot leak into either
-fact view merely because their blobs are already resident.
+This computes a support-set difference over immutable records; it does not walk
+a parent chain, inspect a physical merge cover, or ask an ambient head what
+changed. If a previous member is absent, the helper returns
+`ExactTicketAdvanceError::ResetRequired`: additions-only maintenance is no
+longer sound, so rebuild the accumulated application state from `current`.
+Advance the saved ticket only after the complete fallible fold succeeds, as the
+example does, to make a failed fold retry the same support.
+
+The two pattern inputs need not share a representation. The runnable example
+(`cargo run --example collection_pattern_changes`) queries the full current
+ticket through a reused or freshly maintained `SuccinctArchive` cover while
+attaching only the added support as a cheap `SimpleArchive`-backed `TribleSet`.
+Exact-ticket attachment ensures that commits first observed after `current`
+cannot leak into either view merely because their blobs are already resident.
+
+Commit support is deliberately not an exact fact difference. A new commit may
+repeat a fact already present, and that new witness may legitimately make a
+projected result recur. Consumers requiring global once-only delivery retain
+their consumed result identities independently.
 
 When an ingestion API already returns its newly produced fragment, using that
 fragment's facts directly is cheaper than rematerializing a ticket subset. The

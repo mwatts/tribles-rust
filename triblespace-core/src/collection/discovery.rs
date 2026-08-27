@@ -6,6 +6,7 @@
 //! recovery path: a structural storage failure is fatal. It verifies signed
 //! commits, classifies records, and canonicalizes the resulting semantic view.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -102,11 +103,131 @@ impl fmt::Display for ExactTicketError {
 
 impl Error for ExactTicketError {}
 
-/// Canonical intrinsic-id order for one exact ticket.
-pub(crate) fn canonicalize_exact_ticket(
-    ticket: &[CollectionCommit],
+/// Failure to compare two exact ticket observations as one monotone advance.
+///
+/// [`exact_ticket_additions`] performs no storage access or signature
+/// verification. These errors concern only the supplied complete records and
+/// the additions-only relationship between the two observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactTicketAdvanceError {
+    /// A supplied commit names another collection descriptor.
+    WrongCollection {
+        /// Intrinsic commit record id.
+        commit: Id,
+        /// Descriptor shared by both observations.
+        expected: CollectionHandle,
+        /// Descriptor named by the supplied commit.
+        actual: CollectionHandle,
+    },
+    /// Two supplied records have the same intrinsic id but different bytes.
+    ConflictingCommit {
+        /// Colliding intrinsic commit record id.
+        commit: Id,
+    },
+    /// A member of the previous observation is absent from the current one.
+    ///
+    /// Additions-only incremental evaluation is unsound across this boundary;
+    /// rebuild application state from `current` instead.
+    ResetRequired {
+        /// First missing previous member in canonical intrinsic-id order.
+        missing: Id,
+    },
+}
+
+impl fmt::Display for ExactTicketAdvanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongCollection {
+                commit,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "ticket commit {commit:X} names collection {} instead of {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
+            ),
+            Self::ConflictingCommit { commit } => write!(
+                f,
+                "ticket contains byte-distinct commits with intrinsic id {commit:X}",
+            ),
+            Self::ResetRequired { missing } => write!(
+                f,
+                "previous ticket commit {missing:X} is absent from the current observation; \
+                 additions-only processing requires a reset",
+            ),
+        }
+    }
+}
+
+impl Error for ExactTicketAdvanceError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TicketShapeError {
+    WrongCollection {
+        commit: Id,
+        expected: CollectionHandle,
+        actual: CollectionHandle,
+    },
+    ConflictingCommit {
+        commit: Id,
+    },
+}
+
+impl From<TicketShapeError> for ExactTicketError {
+    fn from(error: TicketShapeError) -> Self {
+        match error {
+            TicketShapeError::WrongCollection {
+                commit,
+                expected,
+                actual,
+            } => Self::WrongCollection {
+                commit,
+                expected,
+                actual,
+            },
+            TicketShapeError::ConflictingCommit { commit } => Self::ConflictingCommit { commit },
+        }
+    }
+}
+
+impl From<TicketShapeError> for ExactTicketAdvanceError {
+    fn from(error: TicketShapeError) -> Self {
+        match error {
+            TicketShapeError::WrongCollection {
+                commit,
+                expected,
+                actual,
+            } => Self::WrongCollection {
+                commit,
+                expected,
+                actual,
+            },
+            TicketShapeError::ConflictingCommit { commit } => Self::ConflictingCommit { commit },
+        }
+    }
+}
+
+fn canonicalize_ticket_records<'a>(
+    ticket: &'a [CollectionCommit],
     expected: CollectionHandle,
-) -> Result<Vec<CollectionCommit>, ExactTicketError> {
+) -> Result<Cow<'a, [CollectionCommit]>, TicketShapeError> {
+    // `Collection::ticket` already returns this order. Preserve that common
+    // O(n) path while accepting the more permissive slice shape used by exact
+    // attachment APIs.
+    if ticket.windows(2).all(|pair| pair[0].id() < pair[1].id()) {
+        for commit in ticket {
+            if commit.collection() != expected {
+                return Err(TicketShapeError::WrongCollection {
+                    commit: commit.id(),
+                    expected,
+                    actual: commit.collection(),
+                });
+            }
+        }
+        return Ok(Cow::Borrowed(ticket));
+    }
+
     let mut ticket = ticket.to_vec();
     ticket.sort_unstable_by(|left, right| {
         left.id()
@@ -116,7 +237,7 @@ pub(crate) fn canonicalize_exact_ticket(
     let mut commits = BTreeMap::<Id, CollectionCommit>::new();
     for commit in &ticket {
         if commit.collection() != expected {
-            return Err(ExactTicketError::WrongCollection {
+            return Err(TicketShapeError::WrongCollection {
                 commit: commit.id(),
                 expected,
                 actual: commit.collection(),
@@ -129,13 +250,80 @@ pub(crate) fn canonicalize_exact_ticket(
             std::collections::btree_map::Entry::Occupied(entry)
                 if entry.get().to_bytes() == commit.to_bytes() => {}
             std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(ExactTicketError::ConflictingCommit {
+                return Err(TicketShapeError::ConflictingCommit {
                     commit: commit.id(),
                 });
             }
         }
     }
-    Ok(commits.into_values().collect())
+    Ok(Cow::Owned(commits.into_values().collect()))
+}
+
+/// Canonical intrinsic-id order for one exact ticket.
+pub(crate) fn canonicalize_exact_ticket(
+    ticket: &[CollectionCommit],
+    expected: CollectionHandle,
+) -> Result<Vec<CollectionCommit>, ExactTicketError> {
+    canonicalize_ticket_records(ticket, expected)
+        .map(Cow::into_owned)
+        .map_err(Into::into)
+}
+
+/// Return the signed commit support newly present in an exact ticket.
+///
+/// Both inputs are mathematical sets of complete [`CollectionCommit`] records
+/// for `collection`. Byte-identical duplicates collapse and output is ordered
+/// by intrinsic record id. When every previous member remains present, the
+/// result is exactly `current - previous`. If a previous member disappeared,
+/// [`ExactTicketAdvanceError::ResetRequired`] reports that additions-only
+/// incremental evaluation is no longer sound.
+///
+/// This compares semantic support, not materialized facts or physical lattice
+/// covers. A newly admitted commit may repeat facts already present and can
+/// legitimately provide a new witness to an incremental query. The helper
+/// performs no storage access and no signature verification; obtain both
+/// observations from the same admitted [`crate::collection::Collection`]
+/// facade before calling it.
+pub fn exact_ticket_additions(
+    collection: CollectionHandle,
+    previous: &[CollectionCommit],
+    current: &[CollectionCommit],
+) -> Result<Vec<CollectionCommit>, ExactTicketAdvanceError> {
+    let previous = canonicalize_ticket_records(previous, collection)?;
+    let current = canonicalize_ticket_records(current, collection)?;
+    let mut additions = Vec::with_capacity(current.len().saturating_sub(previous.len()));
+    let (mut old, mut new) = (0, 0);
+
+    while old < previous.len() && new < current.len() {
+        match previous[old].id().cmp(&current[new].id()) {
+            std::cmp::Ordering::Less => {
+                return Err(ExactTicketAdvanceError::ResetRequired {
+                    missing: previous[old].id(),
+                });
+            }
+            std::cmp::Ordering::Equal => {
+                if previous[old].to_bytes() != current[new].to_bytes() {
+                    return Err(ExactTicketAdvanceError::ConflictingCommit {
+                        commit: previous[old].id(),
+                    });
+                }
+                old += 1;
+                new += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                additions.push(current[new]);
+                new += 1;
+            }
+        }
+    }
+
+    if old < previous.len() {
+        return Err(ExactTicketAdvanceError::ResetRequired {
+            missing: previous[old].id(),
+        });
+    }
+    additions.extend_from_slice(&current[new..]);
+    Ok(additions)
 }
 
 /// Require every canonical ticket member to byte-match strict discovered data.
@@ -654,6 +842,79 @@ mod tests {
             r,
             s,
         )
+    }
+
+    #[test]
+    fn exact_ticket_additions_canonicalizes_support_sets() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let target = collection(1);
+        let first = CollectionCommit::sign(&signing_key, target, hash(1), empty_metadata_handle());
+        let second = CollectionCommit::sign(&signing_key, target, hash(2), empty_metadata_handle());
+        let third = CollectionCommit::sign(&signing_key, target, hash(3), empty_metadata_handle());
+
+        let additions = exact_ticket_additions(
+            target,
+            &[second, first, first],
+            &[third, first, second, third],
+        )
+        .unwrap();
+        assert_eq!(additions, vec![third]);
+
+        let all = exact_ticket_additions(target, &[], &[third, first, second, first]).unwrap();
+        let mut expected = vec![first, second, third];
+        expected.sort_unstable_by_key(CollectionCommit::id);
+        assert_eq!(all, expected);
+        assert!(exact_ticket_additions(target, &expected, &expected)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn exact_ticket_additions_requires_a_reset_after_support_shrinks() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let target = collection(1);
+        let missing =
+            CollectionCommit::sign(&signing_key, target, hash(1), empty_metadata_handle());
+
+        assert_eq!(
+            exact_ticket_additions(target, &[missing], &[]),
+            Err(ExactTicketAdvanceError::ResetRequired {
+                missing: missing.id(),
+            })
+        );
+    }
+
+    #[test]
+    fn exact_ticket_additions_rejects_cross_observation_id_conflicts() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let target = collection(1);
+        let first = CollectionCommit::sign(&signing_key, target, hash(1), empty_metadata_handle());
+        let conflicting =
+            CollectionCommit::sign(&signing_key, target, hash(2), empty_metadata_handle())
+                .with_test_id(first.id());
+
+        assert_eq!(
+            exact_ticket_additions(target, &[first], &[conflicting]),
+            Err(ExactTicketAdvanceError::ConflictingCommit { commit: first.id() })
+        );
+    }
+
+    #[test]
+    fn exact_ticket_additions_rejects_another_collection() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let expected = collection(1);
+        let actual = collection(2);
+        let foreign =
+            CollectionCommit::sign(&signing_key, actual, hash(1), empty_metadata_handle());
+
+        assert_eq!(
+            exact_ticket_additions(expected, &[], &[foreign]),
+            Err(ExactTicketAdvanceError::WrongCollection {
+                commit: foreign.id(),
+                expected,
+                actual,
+            })
+        );
     }
 
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {

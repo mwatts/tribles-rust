@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `exact_ticket_additions` as the pure continuation boundary between two
+  exact collection observations. It canonicalizes complete commit sets,
+  returns newly observed signed support only when the previous ticket remains
+  a subset, and reports `ResetRequired` before additions-only incremental
+  processing can cross a shrinking admission view. A runnable example combines
+  a maintained Succinct full view, a cheap SimpleArchive support delta,
+  `pattern_changes!`, and checkpoint advancement after successful consumption.
+
 - Make a consumer's own records joinable to `telemetry`'s spans rather than
   merely correlated with them by a string. `telemetry::current_span_entity()`
   returns the entity the layer minted for the innermost telemetry span entered
