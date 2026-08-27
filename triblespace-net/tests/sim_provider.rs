@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::repo::BlobStorePut;
+use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStorePut};
 use triblespace_net::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
@@ -56,7 +56,7 @@ fn provider_hints_bind_to_the_announcer_and_repair_after_partition() {
         let artifact = [0x73; 32];
         net.partition(pk(&key_a), pk(&key_b));
         assert_eq!(
-            a.announce_artifact(artifact).await,
+            a.announce_artifact_raw_for_test(artifact).await,
             1,
             "self lease survives the cut"
         );
@@ -66,7 +66,7 @@ fn provider_hints_bind_to_the_announcer_and_repair_after_partition() {
         );
 
         net.heal(pk(&key_a), pk(&key_b));
-        assert_eq!(a.announce_artifact(artifact).await, 2);
+        assert_eq!(a.announce_artifact_raw_for_test(artifact).await, 2);
         let providers = b.find_artifact_providers(artifact).await;
         assert_eq!(providers, vec![a.id()]);
         assert_ne!(providers, vec![b.id()]);
@@ -101,7 +101,7 @@ fn the_same_artifact_id_does_not_cross_team_authorization() {
         settle(&mut [&mut a, &mut b]).await;
 
         let artifact = [0x74; 32];
-        assert_eq!(a.announce_artifact(artifact).await, 1);
+        assert_eq!(a.announce_artifact_raw_for_test(artifact).await, 1);
         assert!(b.find_artifact_providers(artifact).await.is_empty());
     });
 }
@@ -142,6 +142,189 @@ fn unannounced_holder_is_not_discovered_from_known_peer_evidence() {
         assert!(b.find_artifact_providers(artifact).await.is_empty());
         assert_eq!(b.fetch_blob(artifact).await, None);
         assert!(b.find_artifact_providers(artifact).await.is_empty());
+    });
+}
+
+#[test]
+fn offer_only_change_publishes_an_already_resident_blob() {
+    let _guard = sim_guard();
+    run_paused(0xD1AE_C707, async {
+        let net = SimNet::new(0xD1AE_C707, SimConfig::default());
+        let root = key(0xF7);
+        let source_key = key(0xA7);
+        let reader_key = key(0xB7);
+        let team = root.verifying_key();
+        let bytes = vec![0x87; 257];
+        let mut source_store = empty_store();
+        let artifact = source_store
+            .put::<UnknownBlob, _>(Bytes::from_source(bytes.clone()))
+            .unwrap()
+            .raw;
+        let mut source = bring_up_with_peers(
+            &net,
+            &source_key,
+            source_store,
+            team,
+            team_proofs(&root, &source_key),
+            vec![pk(&reader_key)],
+        );
+        let mut reader = bring_up_with_peers(
+            &net,
+            &reader_key,
+            empty_store(),
+            team,
+            team_proofs(&root, &reader_key),
+            vec![pk(&source_key)],
+        );
+        settle(&mut [&mut source, &mut reader]).await;
+        assert!(reader.find_artifact_providers(artifact).await.is_empty());
+
+        offer_resident(&mut source, artifact).await;
+        assert_eq!(
+            reader.find_artifact_providers(artifact).await,
+            vec![source.id()]
+        );
+        assert_eq!(reader.fetch_blob(artifact).await, Some(bytes));
+    });
+}
+
+#[test]
+fn offered_absent_blob_stays_dormant_until_resident() {
+    let _guard = sim_guard();
+    run_paused(0xD1AE_C708, async {
+        let net = SimNet::new(0xD1AE_C708, SimConfig::default());
+        let root = key(0xF8);
+        let source_key = key(0xA8);
+        let reader_key = key(0xB8);
+        let team = root.verifying_key();
+        let bytes = vec![0x88; 257];
+        let artifact = *blake3::hash(&bytes).as_bytes();
+        let mut source = bring_up_with_peers(
+            &net,
+            &source_key,
+            empty_store(),
+            team,
+            team_proofs(&root, &source_key),
+            vec![pk(&reader_key)],
+        );
+        let mut reader = bring_up_with_peers(
+            &net,
+            &reader_key,
+            empty_store(),
+            team,
+            team_proofs(&root, &reader_key),
+            vec![pk(&source_key)],
+        );
+        settle(&mut [&mut source, &mut reader]).await;
+
+        source.store().offer(ArtifactHandle::new(artifact)).unwrap();
+        source.refresh();
+        settle(&mut [&mut source, &mut reader]).await;
+        assert!(reader.find_artifact_providers(artifact).await.is_empty());
+
+        let landed = source
+            .store()
+            .put::<UnknownBlob, _>(Bytes::from_source(bytes.clone()))
+            .unwrap();
+        assert_eq!(landed.raw, artifact);
+        source.refresh();
+        settle(&mut [&mut source, &mut reader]).await;
+        assert_eq!(
+            reader.find_artifact_providers(artifact).await,
+            vec![source.id()]
+        );
+        assert_eq!(reader.fetch_blob(artifact).await, Some(bytes));
+    });
+}
+
+#[test]
+fn readonly_offer_is_dormant() {
+    let _guard = sim_guard();
+    run_paused(0xD1AE_C709, async {
+        let net = SimNet::new(0xD1AE_C709, SimConfig::default());
+        let root = key(0xF9);
+        let source_key = key(0xA9);
+        let reader_key = key(0xB9);
+        let team = root.verifying_key();
+        let mut source_store = empty_store();
+        let artifact = source_store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![0x89; 257]))
+            .unwrap()
+            .raw;
+        source_store.offer(ArtifactHandle::new(artifact)).unwrap();
+        let mut source = bring_up_with_qos(
+            &net,
+            &source_key,
+            source_store,
+            team,
+            team_proofs(&root, &source_key),
+            vec![pk(&reader_key)],
+            ReconcileQos {
+                direction: ReconcileDirection::ReadOnly,
+                blobs: BlobReconcileMode::Demand,
+            },
+        );
+        let mut reader = bring_up_with_peers(
+            &net,
+            &reader_key,
+            empty_store(),
+            team,
+            team_proofs(&root, &reader_key),
+            vec![pk(&source_key)],
+        );
+        settle(&mut [&mut source, &mut reader]).await;
+        assert!(reader.find_artifact_providers(artifact).await.is_empty());
+        assert_eq!(reader.fetch_blob(artifact).await, None);
+    });
+}
+
+#[test]
+fn automatic_publication_renews_before_provider_lease_expiry() {
+    let _guard = sim_guard();
+    run_paused(0xD1AE_C70A, async {
+        let net = SimNet::new(0xD1AE_C70A, SimConfig::default());
+        let root = key(0xFA);
+        let source_key = key(0xAA);
+        let reader_key = key(0xBA);
+        let team = root.verifying_key();
+        let mut source_store = empty_store();
+        let artifact = source_store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![0x8A; 257]))
+            .unwrap()
+            .raw;
+        source_store.offer(ArtifactHandle::new(artifact)).unwrap();
+        let mut source = bring_up_with_peers(
+            &net,
+            &source_key,
+            source_store,
+            team,
+            team_proofs(&root, &source_key),
+            vec![pk(&reader_key)],
+        );
+        let mut reader = bring_up_with_peers(
+            &net,
+            &reader_key,
+            empty_store(),
+            team,
+            team_proofs(&root, &reader_key),
+            vec![pk(&source_key)],
+        );
+        settle(&mut [&mut source, &mut reader]).await;
+        assert_eq!(
+            reader.find_artifact_providers(artifact).await,
+            vec![source.id()]
+        );
+
+        SimNet::step(&vclock(), Duration::from_secs(13 * 60 * 60)).await;
+        settle(&mut [&mut source, &mut reader]).await;
+        SimNet::step(&vclock(), Duration::from_secs(12 * 60 * 60 + 1)).await;
+        settle(&mut [&mut source, &mut reader]).await;
+
+        assert_eq!(
+            reader.find_artifact_providers(artifact).await,
+            vec![source.id()],
+            "the original 24-hour lease has elapsed, so this is a renewal"
+        );
     });
 }
 
@@ -196,10 +379,7 @@ fn sparse_line_discovers_and_fetches_an_artifact_across_multiple_hops() {
         );
         settle(&mut [&mut a, &mut b, &mut c, &mut d]).await;
 
-        assert!(
-            a.announce_artifact(artifact).await >= 3,
-            "iterative lookup must leave the source's immediate neighborhood"
-        );
+        offer_resident(&mut a, artifact).await;
         let providers = d.find_artifact_providers(artifact).await;
         assert_eq!(providers, vec![a.id()]);
         assert_eq!(d.fetch_blob(artifact).await, Some(bytes));
@@ -256,7 +436,7 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
         net.stall_dials(pk(&stalled_key));
 
         let artifact = [0x85; 32];
-        let mut announcement = Box::pin(source.announce_artifact(artifact));
+        let mut announcement = Box::pin(source.announce_artifact_raw_for_test(artifact));
         let stored = loop {
             if let std::task::Poll::Ready(stored) = futures::poll!(announcement.as_mut()) {
                 break stored;
@@ -342,10 +522,10 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
             vec![pk(&directory_key)],
         );
         settle(&mut [&mut directory, &mut bad, &mut bad_2, &mut bad_3, &mut good]).await;
-        assert!(bad.announce_artifact(artifact).await >= 2);
-        assert!(bad_2.announce_artifact(artifact).await >= 2);
-        assert!(bad_3.announce_artifact(artifact).await >= 2);
-        assert!(good.announce_artifact(artifact).await >= 2);
+        assert!(bad.announce_artifact_raw_for_test(artifact).await >= 2);
+        assert!(bad_2.announce_artifact_raw_for_test(artifact).await >= 2);
+        assert!(bad_3.announce_artifact_raw_for_test(artifact).await >= 2);
+        assert!(good.announce_artifact_raw_for_test(artifact).await >= 2);
 
         net.stall_dials(pk(&bad_key));
         net.stall_dials(pk(&bad_key_2));

@@ -23,8 +23,8 @@ use triblespace_core::collection::{
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::{
-    BlobStore, BlobStoreMeta, CapabilityProofStore, PeerStore, StorageFlush, StoreRevision,
-    StoreScope, WantStore,
+    ArtifactOfferStore, BlobStore, BlobStoreMeta, CapabilityProofStore, PeerStore, StorageFlush,
+    StoreRevision, StoreScope, WantStore,
 };
 
 use crate::peer::Peer;
@@ -112,6 +112,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + ArtifactOfferStore
         + StoreScope
         + WantStore
         + StorageFlush

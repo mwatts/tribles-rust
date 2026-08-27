@@ -37,7 +37,10 @@ use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, StoreScope, WantRequest, WantStore};
+use triblespace_core::repo::{
+    ArtifactHandle, ArtifactOfferStore, BlobStoreGet, BlobStorePut, StoreScope, WantRequest,
+    WantStore,
+};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
@@ -229,11 +232,14 @@ async fn want_fetches_from_holder_over_iroh() {
         pile.flush().expect("flush payload");
     })
     .await;
+    {
+        let mut store = peer_a.store();
+        store
+            .offer(ArtifactHandle::new(hash))
+            .expect("record artifact offer");
+        store.flush().expect("flush artifact offer");
+    }
     peer_a.refresh();
-    assert!(
-        peer_a.announce_artifact(hash).await >= 1,
-        "holder explicitly publishes the artifact before demand"
-    );
 
     // Precondition: B does not hold the payload.
     {

@@ -6,7 +6,7 @@
 //! a CONNECT- and SYNC_TEAM-authorized direct connection and is checked against
 //! a pinned PATCH root.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -27,7 +27,9 @@ use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, CapabilityProofStore, PeerStore};
+use triblespace_core::repo::{
+    ArtifactOfferSnapshot, BlobStore, BlobStoreGet, CapabilityProofStore, PeerStore,
+};
 
 use crate::channel::{
     MAX_ADMISSION_BRIDGE_BATCHES, NetCommand, NetEvent, NetEventBatch, SnapshotNotice,
@@ -49,7 +51,9 @@ use crate::inventory_wire::{
     send_inventory_auth_ok, send_inventory_auth_rejected, send_manifest, send_node_response,
 };
 use crate::protocol::*;
-use crate::provider::{ArtifactId, ProviderDirectory, ProviderKey, provider_key};
+use crate::provider::{
+    ArtifactId, PROVIDER_LEASE_LIFETIME, ProviderDirectory, ProviderKey, provider_key,
+};
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
 
@@ -613,8 +617,11 @@ fn pinned_snapshot_if_serving(
 /// the content hash narrows the request but is not itself disclosure authority.
 pub(crate) trait NetCapability: Send + Sync {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
-    fn announce_artifact(&self, artifact: ArtifactId)
-    -> futures::future::BoxFuture<'static, usize>;
+    #[cfg(feature = "sim")]
+    fn announce_artifact_raw_for_test(
+        &self,
+        artifact: ArtifactId,
+    ) -> futures::future::BoxFuture<'static, usize>;
     fn find_artifact_providers(
         &self,
         artifact: ArtifactId,
@@ -672,7 +679,6 @@ struct NetCap<T: Transport> {
     connect_proof: CapabilityProofBundle,
     sync_proof: CapabilityProofBundle,
     can_fetch: bool,
-    can_announce: bool,
     my_id: PeerId,
     team: VerifyingKey,
     candidates: RoutingCandidates,
@@ -736,18 +742,13 @@ impl<T: Transport> NetCapability for NetCap<T> {
         })
     }
 
-    fn announce_artifact(
+    #[cfg(feature = "sim")]
+    fn announce_artifact_raw_for_test(
         &self,
         artifact: ArtifactId,
     ) -> futures::future::BoxFuture<'static, usize> {
-        let can_announce = self.can_announce;
         let client = self.provider_client();
-        Box::pin(async move {
-            if !can_announce {
-                return 0;
-            }
-            client.announce_artifact(artifact).await
-        })
+        Box::pin(async move { client.announce_artifact(artifact).await })
     }
 
     fn find_artifact_providers(
@@ -812,6 +813,10 @@ impl NetSender {
         }
     }
 
+    pub(crate) fn update_artifact_offers(&self, offers: ArtifactOfferSnapshot) {
+        let _ = self.cmd_tx.send(NetCommand::ArtifactOffersUpdated(offers));
+    }
+
     pub fn clear_snapshot(&self) {
         let retired = self.snapshot.lock().unwrap().take();
         drop(retired);
@@ -844,16 +849,16 @@ impl NetSender {
         .flatten()
     }
 
-    /// Best-effort lease renewal for an already-known physical artifact.
-    /// Returns the number of receiver-local replicas which accepted the hint.
-    pub async fn announce_artifact(
+    /// Publish an arbitrary provider hint for adversarial simulation tests.
+    #[cfg(feature = "sim")]
+    pub(crate) async fn announce_artifact_raw_for_test(
         &self,
         artifact: ArtifactId,
         budget: std::time::Duration,
     ) -> usize {
         tokio::time::timeout(budget, async {
             let capability = self.ready_capability().await.ok()?;
-            Some(capability.announce_artifact(artifact).await)
+            Some(capability.announce_artifact_raw_for_test(artifact).await)
         })
         .await
         .ok()
@@ -1001,6 +1006,14 @@ const MAX_CONCURRENT_SWEEPS: usize = 8;
 const SWEEPS_PER_PERIOD: usize = K;
 /// Bounded parallelism for the small provider-directory RPC fan-out.
 const MAX_CONCURRENT_PROVIDER_RPCS: usize = ALPHA;
+/// Bound whole-artifact publication independently of the alpha-bounded RPC
+/// fan-out inside one DHT announcement.
+const MAX_CONCURRENT_OFFER_ANNOUNCEMENTS: usize = ALPHA;
+/// Renew with half the receiver-selected lease still remaining. Scheduling
+/// from successful completion absorbs lookup latency without accumulating
+/// catch-up bursts after a delayed host iteration.
+const PROVIDER_RENEWAL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(PROVIDER_LEASE_LIFETIME.as_secs() / 2);
 /// One lookup must fit comfortably inside the default interactive operation.
 const DHT_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 /// Deadline for small provider control RPCs and authenticated connection setup.
@@ -1109,6 +1122,152 @@ impl SweepScheduler {
     }
 }
 
+struct ArtifactAnnouncementOutcome {
+    artifact: ArtifactId,
+    accepted: usize,
+}
+
+/// Bounded fair scheduling for durable local artifact offers.
+///
+/// `active` is already the intersection of policy offers and the current Blob
+/// serving snapshot. One ordered due set gives additions immediate service,
+/// preserves deadlines across unrelated snapshot changes, and ensures an
+/// over-capacity artifact cannot monopolize the host poll loop. There is no
+/// fixed queue cap: concurrency bounds work, not remembered intent.
+struct ArtifactOfferScheduler {
+    active: BTreeSet<ArtifactId>,
+    due: BTreeSet<(crate::clock::Mono, ArtifactId)>,
+    due_by_artifact: HashMap<ArtifactId, crate::clock::Mono>,
+    in_flight: HashSet<ArtifactId>,
+    failures: HashMap<ArtifactId, u32>,
+}
+
+impl ArtifactOfferScheduler {
+    fn new() -> Self {
+        Self {
+            active: BTreeSet::new(),
+            due: BTreeSet::new(),
+            due_by_artifact: HashMap::new(),
+            in_flight: HashSet::new(),
+            failures: HashMap::new(),
+        }
+    }
+
+    fn observe_active(&mut self, active: BTreeSet<ArtifactId>, now: crate::clock::Mono) {
+        let removed: Vec<_> = self.active.difference(&active).copied().collect();
+        for artifact in removed {
+            self.unschedule(artifact);
+            self.failures.remove(&artifact);
+        }
+
+        let added: Vec<_> = active.difference(&self.active).copied().collect();
+        self.active = active;
+        for artifact in added {
+            if !self.in_flight.contains(&artifact) {
+                self.schedule(artifact, now);
+            }
+        }
+    }
+
+    fn schedule(&mut self, artifact: ArtifactId, due: crate::clock::Mono) {
+        if let Some(previous) = self.due_by_artifact.insert(artifact, due) {
+            self.due.remove(&(previous, artifact));
+        }
+        self.due.insert((due, artifact));
+    }
+
+    fn unschedule(&mut self, artifact: ArtifactId) {
+        if let Some(previous) = self.due_by_artifact.remove(&artifact) {
+            self.due.remove(&(previous, artifact));
+        }
+    }
+
+    fn pop_due(&mut self, now: crate::clock::Mono) -> Option<ArtifactId> {
+        loop {
+            let (due, artifact) = self.due.first().copied()?;
+            if due > now {
+                return None;
+            }
+            self.due.remove(&(due, artifact));
+            self.due_by_artifact.remove(&artifact);
+            if self.active.contains(&artifact) && self.in_flight.insert(artifact) {
+                return Some(artifact);
+            }
+        }
+    }
+
+    /// Stop considering an entry which failed a final resident-snapshot check.
+    /// A pending snapshot notice will recompute the exact intersection and add
+    /// it back if residency returns.
+    fn suspend(&mut self, artifact: ArtifactId) {
+        self.in_flight.remove(&artifact);
+        self.active.remove(&artifact);
+        self.unschedule(artifact);
+        self.failures.remove(&artifact);
+    }
+
+    fn complete(&mut self, outcome: ArtifactAnnouncementOutcome, now: crate::clock::Mono) {
+        self.in_flight.remove(&outcome.artifact);
+        if !self.active.contains(&outcome.artifact) {
+            return;
+        }
+
+        let delay = if outcome.accepted > 0 {
+            self.failures.remove(&outcome.artifact);
+            PROVIDER_RENEWAL_INTERVAL
+        } else {
+            let attempts = self
+                .failures
+                .get(&outcome.artifact)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            self.failures.insert(outcome.artifact, attempts);
+            let shift = attempts.saturating_sub(1).min(31);
+            crate::RETRY_BACKOFF_BASE
+                .saturating_mul(1u32 << shift)
+                .min(crate::RETRY_BACKOFF_CAP)
+        };
+        self.schedule(outcome.artifact, now + delay);
+    }
+
+    fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    #[cfg(test)]
+    fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
+    #[cfg(test)]
+    fn next_due(&self, artifact: ArtifactId) -> Option<crate::clock::Mono> {
+        self.due_by_artifact.get(&artifact).copied()
+    }
+}
+
+fn active_artifact_offers(
+    offers: &ArtifactOfferSnapshot,
+    snapshot: &SnapshotSlot,
+    serves: bool,
+) -> BTreeSet<ArtifactId> {
+    if !serves {
+        return BTreeSet::new();
+    }
+    let current = snapshot.lock().unwrap().as_ref().cloned();
+    let Some(current) = current else {
+        return BTreeSet::new();
+    };
+    offers
+        .iter()
+        .filter_map(|handle| {
+            current
+                .contains_relative_key(InventoryComponent::Blob, &handle.raw)
+                .then_some(handle.raw)
+        })
+        .collect()
+}
+
 async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
     let Harness {
         transport,
@@ -1147,18 +1306,19 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let candidates = Arc::new(Mutex::new(RoutingTable::new(my_id, configured)));
     let pool = new_shared_pool();
     let providers = Arc::new(Mutex::new(ProviderDirectory::default()));
-    let _ = cap_tx.send(Some(Arc::new(NetCap {
+    let net_cap = Arc::new(NetCap {
         transport: transport.clone(),
         pool: pool.clone(),
         connect_proof: config.connect_proof.clone(),
         sync_proof: config.sync_proof.clone(),
         can_fetch: config.qos.direction.pulls(),
-        can_announce: config.qos.direction.serves(),
         my_id,
         team: config.team,
         candidates: candidates.clone(),
         providers: providers.clone(),
-    }) as Arc<dyn NetCapability>));
+    });
+    let publication_client = net_cap.provider_client();
+    let _ = cap_tx.send(Some(net_cap as Arc<dyn NetCapability>));
 
     let handler = SnapshotHandler {
         snapshot: snapshot.clone(),
@@ -1196,10 +1356,15 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut in_flight = HashSet::new();
     let mut failures: HashMap<PeerId, (u32, crate::clock::Mono)> = HashMap::new();
     let mut sweeps = SweepScheduler::new();
+    let (offer_tx, mut offer_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ArtifactAnnouncementOutcome>();
+    let mut artifact_offers = ArtifactOfferSnapshot::default();
+    let mut offer_scheduler = ArtifactOfferScheduler::new();
     let commands = commands;
 
     loop {
         let mut disconnected = false;
+        let mut publication_inputs_changed = false;
         loop {
             match commands.try_recv() {
                 Ok(NetCommand::SnapshotInstalled(notice)) => {
@@ -1213,6 +1378,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     // evidence but cannot reset or multiply the fixed periodic
                     // work budget.
                     sweeps.observe_snapshot(crate::clock::mono_now());
+                    publication_inputs_changed = true;
+                }
+                Ok(NetCommand::ArtifactOffersUpdated(offers)) => {
+                    artifact_offers = offers;
+                    publication_inputs_changed = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1224,6 +1394,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         if disconnected {
             transport.shutdown().await;
             return;
+        }
+        if publication_inputs_changed {
+            let active =
+                active_artifact_offers(&artifact_offers, &snapshot, config.qos.direction.serves());
+            offer_scheduler.observe_active(active, crate::clock::mono_now());
         }
 
         while let Ok(outcome) = sweep_rx.try_recv() {
@@ -1242,6 +1417,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     .min(crate::RETRY_BACKOFF_CAP);
                 failures.insert(outcome.peer, (attempts, crate::clock::mono_now() + backoff));
             }
+        }
+        while let Ok(outcome) = offer_rx.try_recv() {
+            offer_scheduler.complete(outcome, crate::clock::mono_now());
         }
 
         let now = crate::clock::mono_now();
@@ -1303,6 +1481,32 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         }
                     };
                     let _ = sweep_tx.send(SweepOutcome { peer, success });
+                });
+            }
+        }
+
+        if config.qos.direction.serves() && snapshot.lock().unwrap().is_some() {
+            while offer_scheduler.in_flight_len() < MAX_CONCURRENT_OFFER_ANNOUNCEMENTS {
+                let Some(artifact) = offer_scheduler.pop_due(now) else {
+                    break;
+                };
+                let resident_now = snapshot.lock().unwrap().as_ref().is_some_and(|current| {
+                    current.contains_relative_key(InventoryComponent::Blob, &artifact)
+                });
+                if !resident_now {
+                    offer_scheduler.suspend(artifact);
+                    continue;
+                }
+                let client = publication_client.clone();
+                let offer_tx = offer_tx.clone();
+                tokio::spawn(async move {
+                    let accepted = tokio::time::timeout(
+                        INTERACTIVE_FETCH_DEADLINE,
+                        client.announce_artifact(artifact),
+                    )
+                    .await
+                    .unwrap_or(0);
+                    let _ = offer_tx.send(ArtifactAnnouncementOutcome { artifact, accepted });
                 });
             }
         }
@@ -2532,8 +2736,8 @@ mod tests {
         CollectionCommit, CollectionData, CollectionRecord, CollectionStore,
     };
     use triblespace_core::inline::Inline;
-    use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStorePut};
 
     use super::*;
 
@@ -2729,6 +2933,142 @@ mod tests {
             ),
             SWEEPS_PER_PERIOD
         );
+    }
+
+    #[test]
+    fn offer_scheduler_is_bounded_and_fair_beyond_concurrency() {
+        let now = crate::clock::mono_now();
+        let count = 3 * MAX_CONCURRENT_OFFER_ANNOUNCEMENTS + 2;
+        let active: BTreeSet<_> = (1..=count)
+            .map(|index| [u8::try_from(index).unwrap(); 32])
+            .collect();
+        let mut scheduler = ArtifactOfferScheduler::new();
+        scheduler.observe_active(active, now);
+        assert_eq!(scheduler.active_len(), count);
+
+        let mut seen = BTreeSet::new();
+        while seen.len() < count {
+            let mut batch = Vec::new();
+            while scheduler.in_flight_len() < MAX_CONCURRENT_OFFER_ANNOUNCEMENTS {
+                let Some(artifact) = scheduler.pop_due(now) else {
+                    break;
+                };
+                assert!(
+                    seen.insert(artifact),
+                    "an active offer launches once per due time"
+                );
+                batch.push(artifact);
+            }
+            assert!(!batch.is_empty());
+            assert!(batch.len() <= MAX_CONCURRENT_OFFER_ANNOUNCEMENTS);
+            for artifact in batch {
+                scheduler.complete(
+                    ArtifactAnnouncementOutcome {
+                        artifact,
+                        accepted: 1,
+                    },
+                    now,
+                );
+            }
+        }
+        assert_eq!(seen.len(), count);
+    }
+
+    #[test]
+    fn offer_scheduler_renews_at_half_life_and_retries_with_backoff() {
+        let now = crate::clock::mono_now();
+        let success = [1; 32];
+        let retry = [2; 32];
+        let mut scheduler = ArtifactOfferScheduler::new();
+        scheduler.observe_active(BTreeSet::from([success, retry]), now);
+
+        assert_eq!(scheduler.pop_due(now), Some(success));
+        scheduler.complete(
+            ArtifactAnnouncementOutcome {
+                artifact: success,
+                accepted: 1,
+            },
+            now,
+        );
+        assert_eq!(
+            scheduler.next_due(success),
+            Some(now + PROVIDER_RENEWAL_INTERVAL)
+        );
+
+        assert_eq!(scheduler.pop_due(now), Some(retry));
+        scheduler.complete(
+            ArtifactAnnouncementOutcome {
+                artifact: retry,
+                accepted: 0,
+            },
+            now,
+        );
+        assert_eq!(
+            scheduler.next_due(retry),
+            Some(now + crate::RETRY_BACKOFF_BASE)
+        );
+
+        let retry_at = now + crate::RETRY_BACKOFF_BASE;
+        assert_eq!(scheduler.pop_due(retry_at), Some(retry));
+        scheduler.complete(
+            ArtifactAnnouncementOutcome {
+                artifact: retry,
+                accepted: 0,
+            },
+            retry_at,
+        );
+        assert_eq!(
+            scheduler.next_due(retry),
+            Some(retry_at + (crate::RETRY_BACKOFF_BASE * 2))
+        );
+    }
+
+    #[test]
+    fn offer_scheduler_preserves_deadlines_across_equivalent_snapshots() {
+        let now = crate::clock::mono_now();
+        let artifact = [3; 32];
+        let mut scheduler = ArtifactOfferScheduler::new();
+        scheduler.observe_active(BTreeSet::from([artifact]), now);
+        assert_eq!(scheduler.pop_due(now), Some(artifact));
+        scheduler.complete(
+            ArtifactAnnouncementOutcome {
+                artifact,
+                accepted: 1,
+            },
+            now,
+        );
+        let renewal = scheduler.next_due(artifact);
+        scheduler.observe_active(BTreeSet::from([artifact]), now + Duration::from_secs(1));
+        assert_eq!(scheduler.next_due(artifact), renewal);
+
+        scheduler.observe_active(BTreeSet::new(), now + Duration::from_secs(2));
+        assert_eq!(scheduler.active_len(), 0);
+        assert_eq!(scheduler.next_due(artifact), None);
+    }
+
+    #[test]
+    fn active_offers_are_exactly_policy_intersect_resident_snapshot() {
+        let team = key(1);
+        let mut store = MemoryRepo::default();
+        let resident = store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![7; 257]))
+            .unwrap()
+            .raw;
+        let absent = [9; 32];
+        store
+            .offer_all([ArtifactHandle::new(resident), ArtifactHandle::new(absent)])
+            .unwrap();
+        let offers = store.offers_snapshot().unwrap();
+        let snapshot = Arc::new(StoreSnapshot::from_store(&mut store, team).unwrap());
+        let slot = Arc::new(Mutex::new(Some(snapshot)));
+
+        assert_eq!(
+            active_artifact_offers(&offers, &slot, true),
+            BTreeSet::from([resident])
+        );
+        assert!(active_artifact_offers(&offers, &slot, false).is_empty());
+        slot.lock().unwrap().take();
+        assert!(active_artifact_offers(&offers, &slot, true).is_empty());
     }
 
     #[test]

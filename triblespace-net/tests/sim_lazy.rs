@@ -324,7 +324,7 @@ fn fetch_blob_pulls_from_the_holder() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         assert!(
             !holds_locally(&mut peer_b, hash),
@@ -570,7 +570,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
         }
         assert!(records_converged, "target equations converge before reuse");
         for target in &targets {
-            assert!(server.announce_artifact(target.get_handle().raw).await >= 1);
+            offer_resident(&mut server, target.get_handle().raw).await;
         }
         assert_eq!(want_count(&client), 0, "precondition: no durable wants");
         assert!(!holds_locally(&mut client, upper.get_handle().raw));
@@ -663,7 +663,7 @@ fn lazy_read_lands_wanted_in_store() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         // Precondition: B holds nothing locally and has no wants.
         assert!(
@@ -750,7 +750,7 @@ fn lazy_store_eviction_is_safe_and_refetches() {
             peer_a.refresh();
         }
         for (_, hash) in &blobs {
-            assert!(peer_a.announce_artifact(*hash).await >= 1);
+            offer_resident(&mut peer_a, *hash).await;
         }
 
         // Lazily read all three, in order — each lands wanted.
@@ -852,7 +852,7 @@ fn async_lazy_read_awaits_swarm_and_lands_wanted() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -928,7 +928,7 @@ fn transparent_async_get_fetches_through_reader() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -1116,7 +1116,7 @@ fn lazy_read_unavailable_under_partition_then_heals() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         // Sever A↔B: B retains A as an exact route, but its dial fails.
         net.partition(pk(&ka), pk(&kb));
@@ -1182,7 +1182,7 @@ fn lazy_read_unavailable_under_crash_then_revives() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         net.crash(pk(&ka));
         let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
@@ -1236,7 +1236,7 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
             .await
@@ -1311,7 +1311,7 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
                 peer_a.refresh();
             }
-            assert!(peer_a.announce_artifact(hash).await >= 1);
+            offer_resident(&mut peer_a, hash).await;
 
             let pa = pk(&ka);
             let pb = pk(&kb);
@@ -1406,8 +1406,8 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
             peer_a.refresh();
             peer_c.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
-        assert!(peer_c.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
+        offer_resident(&mut peer_c, hash).await;
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -1463,7 +1463,7 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         // Drive the fetch, counting steps until completion.
         let mut fut = Box::pin(peer_b.fetch_blob(hash));
@@ -1521,7 +1521,7 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
@@ -1616,7 +1616,7 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         let pa = pk(&ka);
         let pb = pk(&kb);
@@ -1743,7 +1743,7 @@ fn reconcile_tick_services_out_of_band_want() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_a.announce_artifact(hash).await >= 1);
+        offer_resident(&mut peer_a, hash).await;
 
         // Out-of-band want: written through the store guard, bypassing
         // the Peer's own read path — exactly what a faculty appending a

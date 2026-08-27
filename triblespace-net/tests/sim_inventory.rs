@@ -201,7 +201,7 @@ fn durable_exact_want_fetches_over_the_authenticated_demand_path() {
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Demand),
         );
         step(&net, &mut [&mut publisher, &mut consumer], 80).await;
-        assert!(publisher.announce_artifact(blob).await >= 1);
+        offer_resident(&mut publisher, blob).await;
         assert!(!has_blob(&mut consumer, blob));
 
         let request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(blob));

@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining or manufacturing the named blob. OFFER grants no authority,
   demand, reach, collection evidence, or synchronized-inventory membership.
 
+- Drive DHT provider publication exclusively from durable OFFER intent
+  intersected with the current resident Blob serving snapshot. `Peer` observes
+  offers independently of `StoreRevision`; serving hosts announce additions
+  immediately and renew successful receiver-local leases at half-life through
+  a bounded fair due-time scheduler. Absent blobs, cleared snapshots, and
+  read-only peers remain dormant, while failed or capacity-rejected attempts
+  use bounded backoff. The former production announcement bypass is now
+  available only as an explicitly test-only simulator hook for stale-provider
+  and adversarial routing scenarios.
+
 - Add a transport-independent bounded XOR routing core. Its 256 Kademlia-style
   buckets retain at most 20 learned peers each and distinguish remotely named
   candidates from direct authenticated responders. Explicit bootstrap
@@ -29,9 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Route immutable-artifact provider placement and lookup through authenticated
   alpha-3 FIND_NODE walks. Exact fetch no longer probes the learned peer set:
-  holders explicitly publish artifacts through the DHT, while unannounced
-  artifacts remain clean misses. Wire protocol identity advances to pile-sync
-  ALPN v13.
+  serving holders publish the resident subset of their durable OFFERs through
+  the DHT, while unoffered artifacts remain clean misses. Wire protocol
+  identity advances to pile-sync ALPN v13.
 
 - Add lattice-aware exact derived-collection reuse over the existing team
   transport. The core resolver accepts speculative remote target handles,

@@ -10,6 +10,7 @@ use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
     CollectionRecord,
 };
+use triblespace_core::repo::ArtifactOfferSnapshot;
 use triblespace_core::repo::peer::PeerEvidence;
 
 use crate::protocol::RawHash;
@@ -27,6 +28,12 @@ pub(crate) struct SnapshotNotice {
 /// Commands sent from [`crate::peer::Peer`] to the host runtime.
 pub(crate) enum NetCommand {
     SnapshotInstalled(SnapshotNotice),
+    /// Replace the host's local publication policy observation.
+    ///
+    /// Offers are operational service intent, not another synchronized
+    /// inventory component. The host intersects this set with its current
+    /// immutable Blob serving snapshot before publishing any provider hint.
+    ArtifactOffersUpdated(ArtifactOfferSnapshot),
 }
 
 /// Authenticated, structurally canonical inventory items returned by a walk.

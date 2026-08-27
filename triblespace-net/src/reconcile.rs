@@ -16,8 +16,8 @@ use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use triblespace_core::repo::{
-    BlobStore, BlobStoreGet, BlobStoreMeta, CapabilityProofStore, PeerStore, StorageFlush,
-    StoreRevision, StoreScope, WantRequest, WantStore,
+    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, CapabilityProofStore, PeerStore,
+    StorageFlush, StoreRevision, StoreScope, WantRequest, WantStore,
 };
 
 use crate::peer::Peer;
@@ -79,6 +79,7 @@ impl Reconciler {
             + CollectionStore
             + CapabilityProofStore
             + PeerStore
+            + ArtifactOfferStore
             + StoreScope
             + WantStore
             + StorageFlush

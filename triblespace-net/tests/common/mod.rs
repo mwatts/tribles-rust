@@ -14,8 +14,8 @@ use triblespace_core::capability::{
 };
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
-use triblespace_core::repo::StoreScope;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, StoreScope};
 use triblespace_net::host;
 use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
 use triblespace_net::peer::{Peer, PeerConfig};
@@ -195,4 +195,19 @@ pub fn bring_up_with_qos(
 /// An empty store intentionally independent of CONNECT proof-bundle residency.
 pub fn empty_store() -> MemoryRepo {
     MemoryRepo::default()
+}
+
+/// Persist one local service offer, expose it through `Peer::refresh`, and
+/// give the automatic DHT publisher a bounded deterministic window to run.
+/// The caller must already have landed the exact bytes: ordinary tests use the
+/// same truthful production path as applications.
+pub async fn offer_resident(peer: &mut Peer<MemoryRepo>, hash: [u8; 32]) {
+    peer.store()
+        .offer(ArtifactHandle::new(hash))
+        .expect("memory store accepts artifact offer");
+    peer.refresh();
+    for _ in 0..20 {
+        SimNet::step(&vclock(), std::time::Duration::from_millis(20)).await;
+        peer.refresh();
+    }
 }

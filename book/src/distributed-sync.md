@@ -6,8 +6,9 @@ crate synchronizes one team's TribleSpace store over
 with two narrow progress paths:
 
 - bounded fair pairwise PATCH walks converge monotone store inventories; and
-- a bounded XOR DHT locates explicitly published providers for an
-  already-known exact artifact handle.
+- a bounded XOR DHT locates providers whose durable local OFFER intersects
+  their current resident Blob snapshot, for an already-known exact artifact
+  handle.
 
 Stored routing evidence and DHT referrals grant no authority. Every inventory
 walk, provider operation, and exact read uses reciprocal CONNECT and SYNC_TEAM
@@ -192,13 +193,33 @@ evidence are periodic anti-entropy targets; identities named only by DHT
 referrals are not. A referred identity becomes verified routing state only
 after a direct reciprocal capability-authenticated response.
 
-`announce_artifact(c)` derives a team-scoped provider key from `(team, c)` and
-stores a receiver-local soft lease for the authenticated caller at the `K`
-closest responsive nodes. A reader that already knows `c` performs iterative
-`FIND_NODE`, asks those replicas for live provider hints, and fetches from the
-returned providers. Exact transfer repeats reciprocal authorization and checks
-that the received bytes hash to `c`. An unannounced holder is honestly
-unavailable; the implementation never falls back to probing every known peer.
+Artifact publication has one production path. `ArtifactOfferStore` records
+grow-only local willingness to serve `c`; `Peer::refresh` observes that policy
+independently of the four-component `StoreRevision`, so an OFFER-only append
+does not rebuild semantic inventory. The host intersects the complete OFFER
+snapshot with the Blob keys in its current immutable serving snapshot. Only
+that intersection is published, and only under a serving direction.
+
+Newly active offers are announced immediately. The host derives a team-scoped
+provider key from `(team, c)` and stores a receiver-local soft lease for the
+authenticated caller at the `K` closest responsive nodes. Successful leases
+are renewed at half their lifetime; failed or capacity-rejected announcements
+retry with bounded exponential backoff. An ordered due-time scheduler bounds
+whole-artifact concurrency while eventually visiting every offered resident
+artifact, including sets larger than one launch batch. Restart simply
+reobserves the durable OFFER snapshot. An absent artifact, a cleared serving
+snapshot, or `ReadOnly` direction leaves the offer dormant; if residency or a
+serving view later returns, the normal snapshot update activates it. In-flight
+stale hints need no cancellation protocol because receivers expire leases.
+
+A reader that already knows `c` performs iterative `FIND_NODE`, asks those
+replicas for live provider hints, and fetches from the returned providers.
+Every provider operation and exact transfer uses the existing reciprocal
+CONNECT and SYNC_TEAM authorization; transfer also checks that the received
+bytes hash to `c`. A holder without an active resident OFFER is honestly
+unavailable, and the implementation never falls back to probing every known
+peer. OFFER itself grants no authority, retention, demand, or inventory
+membership.
 
 ## Local quality of service
 
@@ -343,6 +364,8 @@ distributed proof of convergence.
 - Every Merkle walk pins exact roots and fails closed when a snapshot is gone.
 - Demand is explicit local interest; inventory observation creates no hidden
   WANT.
+- Provider publication is exactly `OFFER ∩ resident Blob snapshot ∩ serving
+  QoS`; OFFER-only changes never rebuild synchronized inventory.
 - Mirror residency is not retention.
 - Operation answers are ordinary converged collection evidence, including
   conflicts.

@@ -21,9 +21,9 @@ use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    CapabilityProofStore, PeerStore, StorageFlush, StoreRevision, StoreScope, StoreScopeError,
-    WantRequest, WantStore,
+    ArtifactOfferSnapshot, ArtifactOfferStore, BlobChildren, BlobStore, BlobStoreGet,
+    BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofStore, PeerStore, StorageFlush,
+    StoreRevision, StoreScope, StoreScopeError, WantRequest, WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
@@ -85,6 +85,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + ArtifactOfferStore
         + WantStore
         + StorageFlush
         + StoreRevision
@@ -105,6 +106,10 @@ where
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
     last_store_revision: Option<S::Revision>,
+    /// Last durable local publication policy sent to the host. Offers are
+    /// deliberately observed independently of the four-component inventory
+    /// revision because changing them must not rebuild semantic inventory.
+    last_artifact_offers: Option<ArtifactOfferSnapshot>,
     last_event_at: crate::clock::Mono,
 }
 
@@ -114,6 +119,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + ArtifactOfferStore
         + StoreScope
         + WantStore
         + StorageFlush
@@ -193,6 +199,7 @@ where
             qos,
             pending_network_flush,
             last_store_revision: None,
+            last_artifact_offers: None,
             last_event_at: crate::clock::mono_now(),
         };
         // Reobserve once after assembly so external pile appends that raced
@@ -233,14 +240,17 @@ where
         self.sender.fetch_blob(hash, budget).await
     }
 
-    /// Announce this endpoint as a soft provider for an already-known artifact.
+    /// Publish an arbitrary provider hint for adversarial simulation tests.
     ///
-    /// The caller is responsible for announcing only artifacts it can serve;
-    /// the directory is merely a leased routing hint. It neither discovers
-    /// artifact IDs nor replaces exact transfer and validation.
-    pub async fn announce_artifact(&self, artifact: ArtifactId) -> usize {
+    /// Production publication has exactly one path: durable
+    /// [`ArtifactOfferStore`] intent intersected with the current resident
+    /// Blob snapshot. This bypass exists only for tests that deliberately need
+    /// a lying or stale provider.
+    #[cfg(feature = "sim")]
+    #[doc(hidden)]
+    pub async fn announce_artifact_raw_for_test(&self, artifact: ArtifactId) -> usize {
         self.sender
-            .announce_artifact(artifact, host::INTERACTIVE_FETCH_DEADLINE)
+            .announce_artifact_raw_for_test(artifact, host::INTERACTIVE_FETCH_DEADLINE)
             .await
     }
 
@@ -361,6 +371,16 @@ where
                         ?error,
                         "store revision unavailable; keeping prior inventory"
                     );
+                    // Offer observation is an independent local policy lane.
+                    // Keep the previous semantic inventory, but do not skip a
+                    // newly appended offer merely because its unrelated
+                    // invalidation token is temporarily unavailable.
+                    Self::observe_artifact_offers(
+                        &self.sender,
+                        self.team,
+                        &mut self.last_artifact_offers,
+                        &mut *store,
+                    )?;
                     return Ok(());
                 }
             };
@@ -368,12 +388,49 @@ where
             // is intentionally absent from that sync-visible token, so check
             // it again before an equality fast-path can retain a serving view.
             Self::validate_store_scope(&mut *store, self.team)?;
-            if self.last_store_revision.as_ref() == Some(&revision) {
-                return Ok(());
-            }
-            if Self::install_validated_snapshot(&self.sender, &mut *store, self.team)? {
+            if self.last_store_revision.as_ref() != Some(&revision)
+                && Self::install_validated_snapshot(&self.sender, &mut *store, self.team)?
+            {
                 self.last_store_revision = Some(revision);
             }
+        }
+        Self::observe_artifact_offers(
+            &self.sender,
+            self.team,
+            &mut self.last_artifact_offers,
+            &mut *store,
+        )?;
+        Ok(())
+    }
+
+    fn observe_artifact_offers(
+        sender: &NetSender,
+        team: VerifyingKey,
+        last_artifact_offers: &mut Option<ArtifactOfferSnapshot>,
+        store: &mut S,
+    ) -> Result<(), PeerOpenError<S::ScopeError>> {
+        let offers = match store.offers_snapshot() {
+            Ok(offers) => offers,
+            Err(error) => {
+                // The failed observation may still have re-read externally
+                // appended records. Recheck scope before retaining the prior
+                // host view; a policy read failure must not mask a newly
+                // visible cross-team assertion.
+                Self::validate_store_scope(store, team)?;
+                // Offers are grow-only. Retaining the last coherent snapshot
+                // across a transient observation failure is conservative and
+                // cannot resurrect retracted intent.
+                tracing::warn!(?error, "artifact-offer snapshot unavailable");
+                return Ok(());
+            }
+        };
+        // File-backed offer observation may itself reobserve an externally
+        // appended scope conflict. Never hand policy to the team-scoped host
+        // before checking that boundary again.
+        Self::validate_store_scope(store, team)?;
+        if last_artifact_offers.as_ref() != Some(&offers) {
+            sender.update_artifact_offers(offers.clone());
+            *last_artifact_offers = Some(offers);
         }
         Ok(())
     }
@@ -457,6 +514,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + ArtifactOfferStore
         + StoreScope
         + WantStore
         + StorageFlush
@@ -484,6 +542,7 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
+        + ArtifactOfferStore
         + StoreScope
         + WantStore
         + StorageFlush
