@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Make a consumer's own records joinable to `telemetry`'s spans rather than
+  merely correlated with them by a string. `telemetry::current_span_entity()`
+  returns the entity the layer minted for the innermost telemetry span entered
+  on this thread, so a consumer inside that span can reference it from its own
+  tribles and have "this span" and "this record" be the same entity in a query.
+  The layer also captures *every* span field, not only `source`, and implements
+  `on_record`, so a fact the caller only learns mid-span is no longer dropped —
+  fatal before now for any consumer whose facts are not all known at span
+  creation. Fields are `(field_name, field_value)` entities linked by `field`;
+  identity is the name/value pair, so spans sharing a field share its entity.
+  Values are text, because the layer cannot know a consumer's encodings; typed
+  facts belong to the consumer, joined through the span entity. `source` is
+  still promoted to its own attribute when it arrives with the span's creation,
+  which is all it has ever meant.
+
 - Make successful collection publication automatically emit durable OFFER
   intent before its semantic record. An operation-scoped capture facade covers
   signed COMMIT dependencies and Fragment attachments, SimpleArchive MERGE,

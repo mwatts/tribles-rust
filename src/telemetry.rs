@@ -13,22 +13,27 @@
 //! silently picks a destination the caller did not name is worse than no
 //! telemetry, so an unset `TELEMETRY_PILE` now disables telemetry outright.
 //!
-//! # A `Yard` is the intended store, not a `Pile`
+//! # Why this writes to a `Pile`, and what would have to change
 //!
 //! Telemetry is exhaust: high volume, and worth less the older it gets. A
-//! [`Pile`] can only grow, so it is the wrong *kind* of store for it.
-//! [`Yard`](crate::core::repo::yard::Yard) is the right kind — generational
-//! piles whose retention and compaction evict blobs without breaking Pile's
-//! append-only contract — and `Collection<Yard>` already satisfies every bound
-//! `Collection::{commit, flush, close}` needs, so the store swap itself is
-//! small. What is *not* small is retention: `Yard::collect` treats every
-//! strictly signature-valid native collection commit as a recursive retention
-//! root, and this layer's spans are exactly such commits, so a yard would
-//! retain all of them anyway until something can retire old commit records.
-//! Retention policy (generation count, what triggers `collect`/`reclaim`, how
-//! long spans live) is a decision for the operator, not a default this module
-//! should invent — a sink that silently discards diagnostics is the same class
-//! of bug as one that silently picks a destination.
+//! [`Pile`] can only grow, so it is the wrong *kind* of store for it, and
+//! [`Yard`](crate::core::repo::yard::Yard) — generational piles whose
+//! retention and compaction evict blobs without breaking Pile's append-only
+//! contract — is the right kind. Retargeting at one today would nonetheless
+//! reclaim **nothing**: [`Yard::collect`](crate::core::repo::yard::Yard::collect)
+//! conservatively treats every signature-valid collection commit as a
+//! *recursive retention root*, and every span this layer writes is such a
+//! commit, so the whole firehose stays live. A yard mode that cannot reclaim
+//! would look like a fix and be none, which is worse than not having one.
+//!
+//! Yard becomes the right destination once retention is an operator-supplied
+//! policy whose semantics can actually retire old telemetry commits. That is
+//! a policy decision — how long spans live, what triggers `collect`/`reclaim`
+//! — and not a default this module should invent: a sink that silently
+//! discards diagnostics is the same class of bug as one that silently picks a
+//! destination. Finding and framing are Sol's (`liora-gpt`, 2026-08-27), who
+//! owns this retention model; ask there before building on this note. Until
+//! then an explicitly named `TELEMETRY_PILE` is the working destination.
 //!
 //! # Timestamps are process-local
 //!
@@ -37,6 +42,7 @@
 //! meaningful; the begin/end instants are comparable only *within* one process,
 //! and never across processes or runs.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,12 +79,35 @@ pub mod schema {
         "2786FA563372FB6EF469EC7710719A49" unsafe as pub end_ns: U256BE;
         "7593602383D0B0D21BBE382A67E5BD9F" unsafe as pub duration_ns: U256BE;
         "7E96DD9A0B5002796B645ED25F5E99AC" unsafe as pub source: Handle<UTF8String>;
+        /// Links a span to one captured tracing field.
+        ///
+        /// Repeated: a span carries one of these per field it recorded, at
+        /// creation or later. Field entities are intrinsic, so the same
+        /// name/value pair recorded by a thousand spans is one entity a
+        /// thousand spans point at.
+        "CB99FD67D62C020DDE788F6281393131" as pub field: GenId;
+        /// The tracing field's name, as written at the callsite.
+        ///
+        /// Inline rather than a handle because this is the key a consumer
+        /// queries by, and an inline value compares directly inside
+        /// `pattern!`. Fields whose names exceed the inline bound are not
+        /// captured.
+        "097951EF7FC4C64A4AE9ADBD9ED89482" as pub field_name: ShortString;
+        /// The field's value, rendered as text.
+        ///
+        /// Text because the layer cannot know a consumer's encodings, and a
+        /// wrong encoding is worse than an honest rendering. A consumer that
+        /// needs typed facts writes its own tribles and joins them to the span
+        /// through [`super::current_span_entity`].
+        "14EC66BA540E0625F67DE25C9F15AAA8" as pub field_value: Handle<UTF8String>;
     }
 
     #[allow(non_upper_case_globals)]
     pub const kind_session: Id = crate::macros::id_hex!("2701F7019B865D461F0169B1303026D6");
     #[allow(non_upper_case_globals)]
     pub const kind_span: Id = crate::macros::id_hex!("0AF9FEB9A2BFEB1BE8A8229829181085");
+    #[allow(non_upper_case_globals)]
+    pub const kind_field: Id = crate::macros::id_hex!("78ED1365CC69B4DCA54BC7EBA8444D30");
 
     #[allow(non_upper_case_globals)]
     pub const telemetry_metadata: Id = crate::macros::id_hex!("BCFDE38F7E452924C72803239392EA05");
@@ -110,6 +139,14 @@ pub mod schema {
             metadata::name: "telemetry_span",
             metadata::description:
                 "A begin/end span with optional parent links.",
+            metadata::tag: metadata::KIND_TAG,
+        };
+        protocol += entity! { ExclusiveId::force_ref(&kind_field) @
+            metadata::name: "telemetry_field",
+            metadata::description:
+                "One tracing field captured from a span: its name, and its value rendered \
+                 as text. Identity is the name/value pair, so spans sharing a field share \
+                 its entity.",
             metadata::tag: metadata::KIND_TAG,
         };
 
@@ -229,33 +266,91 @@ struct TelemetrySpanData {
     start_ns: u64,
 }
 
+/// Render a `Debug` value the way a reader expects to see it: a string field
+/// debug-formats to `"quoted"`, and the quotes are formatting, not content.
+fn unquoted_debug(value: &dyn std::fmt::Debug) -> String {
+    let raw = format!("{value:?}");
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw
+    }
+}
+
+/// Every field a span records, plus `source` promoted to its own attribute.
+///
+/// `source` is promoted only when it arrives with the span's creation, which
+/// is the only thing [`schema::source`] has ever meant. A `source` recorded
+/// later is an ordinary captured field, so no span ever grows a second value
+/// under an attribute that existing consumers read as single-valued.
 #[derive(Default)]
 struct FieldCapture {
     source: Option<String>,
+    fields: Vec<(&'static str, String)>,
+}
+
+impl FieldCapture {
+    fn capture(&mut self, field: &tracing::field::Field, value: String) {
+        if value.is_empty() {
+            return;
+        }
+        let name = field.name();
+        if name == "source" && self.source.is_none() {
+            self.source = Some(value.clone());
+        }
+        // A name that does not fit inline cannot be the queryable key this is
+        // for, and silently storing it under a different shape would be worse
+        // than not storing it.
+        if is_valid_short(name) {
+            self.fields.push((name, value));
+        }
+    }
 }
 
 impl tracing::field::Visit for FieldCapture {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        match field.name() {
-            "source" if !value.is_empty() => self.source = Some(value.to_string()),
-            _ => {}
-        }
+        self.capture(field, value.to_string());
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        match field.name() {
-            "source" => {
-                let mut raw = format!("{value:?}");
-                if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-                    raw = raw[1..raw.len() - 1].to_string();
-                }
-                if !raw.is_empty() {
-                    self.source = Some(raw);
-                }
-            }
-            _ => {}
-        }
+        self.capture(field, unquoted_debug(value));
     }
+}
+
+thread_local! {
+    /// Telemetry entities for the spans entered on this thread, innermost last.
+    ///
+    /// The layer keeps this in step with `on_enter`/`on_exit` because the
+    /// entity id lives in the span's registry extensions, which an ordinary
+    /// caller has no handle on — it would need the concrete subscriber type to
+    /// look one up. Mirroring the enter/exit stack instead answers the only
+    /// question a caller inside a span actually asks, for any subscriber.
+    /// A slot is `None` for a span this layer did not record.
+    static ENTERED_SPANS: RefCell<Vec<Option<Id>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The telemetry entity of the innermost telemetry span entered on this
+/// thread, or `None` when none is.
+///
+/// This is what makes a consumer's own records *joinable* to the layer's
+/// spans rather than merely correlated with them by a string: write this id
+/// into your own tribles and "this span" and "this turn" are the same entity
+/// in a query.
+///
+/// ```rust,ignore
+/// let span = tracing::info_span!(target: "drive", "turn");
+/// let _entered = span.enter();
+/// if let Some(span_entity) = triblespace::telemetry::current_span_entity() {
+///     facts += entity! { turn @ my::span: span_entity };
+/// }
+/// ```
+///
+/// The value is thread-local and scope-bound, exactly like
+/// [`tracing::Span::current`]: call it inside the span, on the thread that
+/// entered it. It reports the innermost *recorded* span, so a span the layer
+/// skipped does not hide the telemetry span enclosing it.
+pub fn current_span_entity() -> Option<Id> {
+    ENTERED_SPANS.with(|entered| entered.borrow().iter().rev().find_map(|recorded| *recorded))
 }
 
 /// Tracing layer that turns spans into TribleSpace telemetry.
@@ -346,6 +441,55 @@ where
             meta.name(),
             fields.source,
         );
+        span_fields(&mut state.batch, span_id, &fields.fields);
+    }
+
+    /// Persist fields recorded after the span opened.
+    ///
+    /// Without this, a fact the caller only learns mid-span is lost, which
+    /// rules out every consumer whose facts are not all known at creation.
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: Context<'_, S>,
+    ) {
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        let Some(data) = span.extensions().get::<TelemetrySpanData>().copied() else {
+            return;
+        };
+
+        let mut fields = FieldCapture::default();
+        values.record(&mut fields);
+        if fields.fields.is_empty() {
+            return;
+        }
+
+        let thread_state = self.inner.get_or_init_thread();
+        let mut state = thread_state.lock().expect("telemetry thread state lock");
+        span_fields(&mut state.batch, data.span, &fields.fields);
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, ctx: Context<'_, S>) {
+        // Pushed unconditionally, including as `None`, so that `on_exit` pops
+        // this thread's own frame no matter what the layer knows about the
+        // span — an unbalanced stack would misattribute every later span.
+        let recorded = ctx
+            .span(id)
+            .and_then(|span| span.extensions().get::<TelemetrySpanData>().map(|d| d.span));
+        ENTERED_SPANS.with(|entered| entered.borrow_mut().push(recorded));
+    }
+
+    fn on_exit(&self, _id: &tracing::span::Id, _ctx: Context<'_, S>) {
+        ENTERED_SPANS.with(|entered| {
+            entered.borrow_mut().pop();
+        });
     }
 
     fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
@@ -585,6 +729,33 @@ fn span_begin(
     }
 }
 
+/// Attach captured fields to a span.
+///
+/// Called both at span creation and from `on_record`, because a fact learned
+/// later is the same kind of fact. Field entities are intrinsic, so recording
+/// the same name and value twice is idempotent. Recording the same *name* with
+/// two different values leaves both, and the layer records no ordering between
+/// them: facts accumulate, they do not overwrite.
+fn span_fields(batch: &mut Fragment, span_id: Id, fields: &[(&'static str, String)]) {
+    if fields.is_empty() {
+        return;
+    }
+
+    let span_entity = ExclusiveId::force_ref(&span_id);
+    for (name, value) in fields {
+        let field = entity! { _ @
+            metadata::tag: schema::kind_field,
+            schema::field_name: *name,
+            schema::field_value: value.clone(),
+        };
+        let Some(field_id) = field.root() else {
+            continue;
+        };
+        *batch += field;
+        *batch += entity! { span_entity @ schema::field: field_id };
+    }
+}
+
 fn span_end(batch: &mut Fragment, span_id: Id, at_ns: u64, duration_ns: u64) {
     let span_entity = ExclusiveId::force_ref(&span_id);
     *batch += entity! { span_entity @
@@ -596,9 +767,44 @@ fn span_end(batch: &mut Fragment, span_id: Id, at_ns: u64, duration_ns: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::blob::encodings::simplearchive::SimpleArchive;
+    use crate::core::blob::encodings::UnknownBlob;
     use crate::core::collection::CollectionStore;
 
     static TELEMETRY_ENV: Mutex<()> = Mutex::new(());
+
+    /// Every fact the pile holds, read back through a fresh `Pile` with no
+    /// state carried over from the writing process.
+    ///
+    /// The sink signs with a per-session key it never exposes, so this reads
+    /// the committed archives directly rather than through a `Collection`
+    /// facade. Blobs that are not archives simply fail to decode.
+    fn cold_read_facts(path: &Path) -> TribleSet {
+        let mut pile = Pile::open(path).expect("reopen the telemetry pile");
+        pile.refresh().expect("refresh the reopened pile");
+        let reader = pile.reader().expect("read the reopened pile");
+
+        let handles: Vec<_> = reader
+            .blobs()
+            .map(|info| info.expect("list a blob").handle)
+            .collect();
+        let mut facts = TribleSet::new();
+        for handle in handles {
+            let Ok(blob) = reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
+                continue;
+            };
+            if let Ok(archived) = blob
+                .transmute::<SimpleArchive>()
+                .try_from_blob::<TribleSet>()
+            {
+                facts += archived;
+            }
+        }
+
+        drop(reader);
+        pile.close().expect("close the reopened pile");
+        facts
+    }
 
     #[test]
     fn layer_from_env_uses_an_open_process_local_collection() {
@@ -629,6 +835,110 @@ mod tests {
             "session start and end are the only collection records"
         );
         pile.close().unwrap();
+    }
+
+    /// THE JOIN GATE. A consumer inside a span can read the entity the layer
+    /// minted for it, and a field the consumer only learns mid-span still
+    /// reaches the pile — both proved against a cold reopen, because an
+    /// in-memory assertion proves the API and not the persistence.
+    #[test]
+    fn a_span_entity_and_a_late_field_survive_a_cold_reopen() {
+        let _env = TELEMETRY_ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.pile");
+        std::fs::File::create(&path).unwrap();
+        std::env::set_var(ENV_TELEMETRY_PILE, &path);
+        std::env::set_var(ENV_TELEMETRY_COLLECTION_NAME, "telemetry-join");
+
+        let (layer, telemetry) = Telemetry::layer_from_env("join gate").expect("telemetry starts");
+        std::env::remove_var(ENV_TELEMETRY_PILE);
+        std::env::remove_var(ENV_TELEMETRY_COLLECTION_NAME);
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let observed = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "telemetry_gate",
+                "turn",
+                source = "turn-7",
+                // Known at creation, and not the one field the layer used to
+                // capture.
+                disposition = "spoke",
+                // Not known until the work is done.
+                work_type = tracing::field::Empty,
+            );
+            let entered = span.enter();
+            let observed =
+                current_span_entity().expect("a consumer inside the span sees its entity");
+            span.record("work_type", "decided-mid-span");
+            drop(entered);
+            observed
+        });
+
+        assert_eq!(
+            current_span_entity(),
+            None,
+            "the entered-span stack unwinds with the span"
+        );
+
+        // Dropping the guard flushes every thread batch and closes the pile.
+        drop(telemetry);
+
+        let facts = cold_read_facts(&path);
+
+        let categories: Vec<Inline<ShortString>> = find!(
+            category: Inline<ShortString>,
+            pattern!(&facts, [{ observed @ schema::category: ?category }])
+        )
+        .collect();
+        assert_eq!(
+            categories,
+            vec!["telemetry_gate".to_inline()],
+            "the id the accessor handed out is the entity the layer persisted, so a \
+             consumer's own tribles can join to it"
+        );
+
+        let expect = |text: &str| {
+            let mut probe = Fragment::empty();
+            let handle: Inline<Handle<UTF8String>> = probe.put(text.to_string());
+            handle
+        };
+        let value_of = |name: &'static str| -> Vec<Inline<Handle<UTF8String>>> {
+            find!(
+                value: Inline<Handle<UTF8String>>,
+                pattern!(&facts, [
+                    { observed @ schema::field: _?field },
+                    { _?field @ schema::field_name: name, schema::field_value: ?value },
+                ])
+            )
+            .collect()
+        };
+
+        assert_eq!(
+            value_of("work_type"),
+            vec![expect("decided-mid-span")],
+            "a field recorded AFTER the span opened reaches the pile"
+        );
+        assert_eq!(
+            value_of("disposition"),
+            vec![expect("spoke")],
+            "and so does a creation-time field that is not named `source`"
+        );
+        assert_eq!(
+            value_of("source"),
+            vec![expect("turn-7")],
+            "`source` is captured as an ordinary field too"
+        );
+
+        let sources: Vec<Inline<Handle<UTF8String>>> = find!(
+            source: Inline<Handle<UTF8String>>,
+            pattern!(&facts, [{ observed @ schema::source: ?source }])
+        )
+        .collect();
+        assert_eq!(
+            sources,
+            vec![expect("turn-7")],
+            "and it is still promoted to the attribute existing consumers read"
+        );
     }
 
     /// The sink writes where it was told and nowhere else. `PILE` names an
