@@ -81,6 +81,10 @@ events, inserts them monotonically, crosses one storage durability barrier,
 and only then replaces the immutable snapshot served by the host. Thus remote
 readers never observe a newly admitted batch before that batch is durable.
 External appends to a file-backed pile are reobserved at this same boundary.
+`Peer::try_refresh` performs the identical boundary and fail-closed serving
+cleanup while returning a scope error to an operation that must not continue
+against a physically conflicted store; ordinary scheduler loops may use the
+unit-returning `refresh` surface and observe the warning instead.
 
 ## Two independent capabilities
 

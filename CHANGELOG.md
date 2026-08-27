@@ -1959,6 +1959,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make nonempty exact-derived network attachment fail closed when refreshing
+  discovers a conflicting store scope, rather than clearing the serving view
+  and then continuing against that physical store. Speculative remote cover
+  members now also share one absolute interactive fetch deadline, so stale
+  cover width cannot multiply the operation's network latency bound.
+
 - Workspace preflight now runs `cargo fmt --all -- --check`; the repository
   root is also the `triblespace` facade package, so the bare form silently
   omitted other workspace members. Contributor instructions now state the

@@ -43,7 +43,7 @@ use triblespace_core::repo::{
 };
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
-use triblespace_net::collection_sync::ensure_exact_derived;
+use triblespace_net::collection_sync::{ExactDerivedSyncError, ensure_exact_derived};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 use common::*;
@@ -437,6 +437,104 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
             client.store().record(marker.id()).unwrap().is_some(),
             "the marker was genuinely pending before the empty attachment",
         );
+    });
+}
+
+/// A nonempty exact attachment is an operation on one physically team-scoped
+/// store. If an external append introduces a conflicting scope, the checked
+/// refresh boundary must report it before ticket discovery, fetch, landing,
+/// or local construction can continue.
+#[test]
+fn nonempty_exact_attachment_reports_external_scope_conflict() {
+    let _g = sim_guard();
+    run_paused(0xC0AE_0002, async {
+        use std::io::Write;
+
+        use iroh_base::EndpointId;
+        use triblespace_core::repo::StoreScope;
+        use triblespace_core::repo::pile::Pile;
+        use triblespace_net::host;
+        use triblespace_net::inventory::ReconcileQos;
+        use triblespace_net::peer::Peer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let serving_path = dir.path().join("serving.pile");
+        let conflicting_path = dir.path().join("conflicting.pile");
+        std::fs::File::create(&serving_path).unwrap();
+        std::fs::File::create(&conflicting_path).unwrap();
+
+        let serving_team = key(0xE1).verifying_key();
+        let conflicting_team = key(0xE2).verifying_key();
+        let namespace = key(0xE3).verifying_key();
+        let source_descriptor = simplearchive_union::descriptor(
+            &CollectionName::new("scope-conflict-source").unwrap(),
+            namespace,
+            None,
+            reach::private(),
+        );
+        let target_descriptor = descriptor::naming(
+            &CollectionName::new("scope-conflict-target").unwrap(),
+            namespace,
+            None,
+            <UnknownBlob as MetaDescribe>::id(),
+            simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
+            reach::private(),
+        );
+        let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
+            source_descriptor.clone(),
+            target_descriptor.clone(),
+        );
+        let algebra = NetworkTestAlgebra {
+            source: source_descriptor,
+            target: target_descriptor,
+        };
+
+        let mut serving = Pile::open(&serving_path).unwrap();
+        serving.bind_store_scope(serving_team).unwrap();
+        let source = content_blob(0xA1).0;
+        serving.put::<SimpleArchive, _>(source.clone()).unwrap();
+        let metadata = serving
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let commit = CollectionCommit::sign(
+            &key(0xE4),
+            lifecycle.source_collection(),
+            collection_data(&source),
+            metadata,
+        );
+        serving.insert(CollectionRecord::Commit(commit)).unwrap();
+
+        let mut conflicting = Pile::open(&conflicting_path).unwrap();
+        conflicting.bind_store_scope(conflicting_team).unwrap();
+        conflicting.close().unwrap();
+
+        let endpoint = key(0xE5).verifying_key();
+        let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint_id);
+        let mut peer = Peer::with_wiring(
+            serving,
+            serving_team,
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        )
+        .unwrap();
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&serving_path)
+            .unwrap()
+            .write_all(&std::fs::read(&conflicting_path).unwrap())
+            .unwrap();
+
+        let result = ensure_exact_derived(&mut peer, &lifecycle, &[commit], &algebra).await;
+        assert!(matches!(
+            result,
+            Err(ExactDerivedSyncError::Storage {
+                operation: "refresh exact-derived network store",
+                ..
+            })
+        ));
     });
 }
 

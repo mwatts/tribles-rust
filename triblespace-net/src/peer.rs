@@ -34,7 +34,8 @@ use crate::provider::ArtifactId;
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
 
-/// Failure while attaching a physical store to a team-scoped network host.
+/// Failure while attaching or refreshing a physical store against a
+/// team-scoped network host.
 #[derive(Debug)]
 pub enum PeerOpenError<E> {
     /// The store's scope assertion could not be observed coherently.
@@ -204,7 +205,7 @@ where
         };
         // Reobserve once after assembly so external pile appends that raced
         // construction are included before the first scheduler sweep.
-        peer.refresh_checked()?;
+        peer.try_refresh()?;
         Ok(peer)
     }
 
@@ -255,14 +256,26 @@ where
     /// still meaningful: file-backed stores reobserve external appends before
     /// manifests and periodic sweeps use them.
     pub fn refresh(&mut self) {
-        if let Err(error) = self.refresh_checked() {
+        if let Err(error) = self.try_refresh() {
             tracing::warn!(%error, "network store scope invalid; clearing serving view");
+        }
+    }
+
+    /// Drain pending network evidence and publish one checked store snapshot.
+    ///
+    /// Unlike [`Self::refresh`], this reports scope failures to callers that
+    /// must not continue operating on a physically conflicted store. Both
+    /// surfaces perform the same fail-closed cleanup before returning.
+    pub fn try_refresh(&mut self) -> Result<(), PeerOpenError<S::ScopeError>> {
+        let result = self.refresh_checked();
+        if result.is_err() {
             self.sender.clear_snapshot();
             // A transient scope-observation failure must not strand the peer
             // with no snapshot merely because the sync-visible revision did
             // not change before the next successful refresh.
             self.last_store_revision = None;
         }
+        result
     }
 
     fn refresh_checked(&mut self) -> Result<(), PeerOpenError<S::ScopeError>> {
@@ -840,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_withdraws_snapshot_after_external_scope_conflict() {
+    fn checked_refresh_reports_and_withdraws_external_scope_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let serving_path = dir.path().join("serving.pile");
         let conflicting_path = dir.path().join("conflicting.pile");
@@ -875,8 +888,17 @@ mod tests {
             .unwrap()
             .write_all(&std::fs::read(&conflicting_path).unwrap())
             .unwrap();
-        peer.refresh();
+        let error = peer
+            .try_refresh()
+            .expect_err("checked refresh must report the external scope conflict");
 
+        assert!(
+            matches!(
+                error,
+                PeerOpenError::Scope(StoreScopeError::Conflict { .. })
+            ),
+            "checked refresh must preserve the exact fail-closed cause",
+        );
         assert!(
             !snapshot_probe.snapshot_available(),
             "a peer must stop serving after reobserving conflicting store scopes"

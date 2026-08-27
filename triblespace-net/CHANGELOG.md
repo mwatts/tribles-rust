@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Report checked-refresh scope conflicts to nonempty exact-derived attachment
+  before ticket discovery or mutation, while preserving the same serving-view
+  cleanup as ordinary refresh. All speculative cover-member fetches now share
+  one absolute interactive deadline instead of renewing it per member.
+
 - Reobserve externally appended pile bytes before enumerating any inventory
   component, and expose a replacement serving snapshot only after one batched
   admission flush succeeds. A bounded event queue applies backpressure between
