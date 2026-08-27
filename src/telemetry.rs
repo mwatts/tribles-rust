@@ -1,3 +1,42 @@
+//! Span-based profiling that persists `tracing` spans into a TribleSpace
+//! collection.
+//!
+//! # The destination is never inferred
+//!
+//! [`Telemetry::layer_from_env`] writes only to the pile named by
+//! `TELEMETRY_PILE`. It used to fall back to `PILE` when that was unset, and
+//! that fallback is gone: `PILE` is the variable an application points at its
+//! *own* store, so the fallback aimed a per-span firehose at whatever durable
+//! file the process happened to be working with. A pile is append-only, so
+//! nothing written there can ever be removed, and a replicated pile carries
+//! the exhaust to every machine that holds a copy. A telemetry sink that
+//! silently picks a destination the caller did not name is worse than no
+//! telemetry, so an unset `TELEMETRY_PILE` now disables telemetry outright.
+//!
+//! # A `Yard` is the intended store, not a `Pile`
+//!
+//! Telemetry is exhaust: high volume, and worth less the older it gets. A
+//! [`Pile`] can only grow, so it is the wrong *kind* of store for it.
+//! [`Yard`](crate::core::repo::yard::Yard) is the right kind — generational
+//! piles whose retention and compaction evict blobs without breaking Pile's
+//! append-only contract — and `Collection<Yard>` already satisfies every bound
+//! `Collection::{commit, flush, close}` needs, so the store swap itself is
+//! small. What is *not* small is retention: `Yard::collect` treats every
+//! strictly signature-valid native collection commit as a recursive retention
+//! root, and this layer's spans are exactly such commits, so a yard would
+//! retain all of them anyway until something can retire old commit records.
+//! Retention policy (generation count, what triggers `collect`/`reclaim`, how
+//! long spans live) is a decision for the operator, not a default this module
+//! should invent — a sink that silently discards diagnostics is the same class
+//! of bug as one that silently picks a destination.
+//!
+//! # Timestamps are process-local
+//!
+//! [`schema::begin_ns`], [`schema::end_ns`] and [`schema::duration_ns`] count
+//! nanoseconds from an [`Instant`] captured when the sink starts. Durations are
+//! meaningful; the begin/end instants are comparable only *within* one process,
+//! and never across processes or runs.
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,7 +58,6 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
 
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
-const ENV_PILE: &str = "PILE";
 const ENV_TELEMETRY_COLLECTION_NAME: &str = "TELEMETRY_COLLECTION_NAME";
 const ENV_TELEMETRY_FLUSH_MS: &str = "TELEMETRY_FLUSH_MS";
 
@@ -348,12 +386,26 @@ impl Telemetry {
     /// This does **not** install a tracing subscriber. Embed the returned layer into your
     /// application's subscriber, and keep the returned [`Telemetry`] guard alive to
     /// flush and close the sink on shutdown.
+    ///
+    /// The destination is `TELEMETRY_PILE` and nothing else. When it is unset
+    /// or empty this returns `None`, and it does **not** fall back to `PILE`:
+    /// see the [module documentation](self) for why a telemetry sink must
+    /// never infer a durable destination the caller did not name.
     pub fn layer_from_env(session_name: &str) -> Option<(TelemetryLayer, Self)> {
-        let pile_path = std::env::var(ENV_TELEMETRY_PILE)
-            .ok()
-            .or_else(|| std::env::var(ENV_PILE).ok())?;
+        let pile_path = std::env::var(ENV_TELEMETRY_PILE).unwrap_or_default();
         let pile_path = pile_path.trim();
         if pile_path.is_empty() {
+            // Silence is right when nothing asked for telemetry, and wrong once
+            // something did: a caller that named a collection has stated its
+            // intent, and the missing destination is then a misconfiguration
+            // rather than an absence.
+            if std::env::var_os(ENV_TELEMETRY_COLLECTION_NAME).is_some() {
+                log::warn!(
+                    "{ENV_TELEMETRY_COLLECTION_NAME} is set but {ENV_TELEMETRY_PILE} is not; \
+                     telemetry is disabled. The destination is never inferred — this no longer \
+                     falls back to PILE, which names an application's own append-only store."
+                );
+            }
             return None;
         }
         let pile_path = PathBuf::from(pile_path);
@@ -577,6 +629,37 @@ mod tests {
             "session start and end are the only collection records"
         );
         pile.close().unwrap();
+    }
+
+    /// The sink writes where it was told and nowhere else. `PILE` names an
+    /// application's own append-only store, so inferring it turned a missing
+    /// telemetry destination into a permanent, replicated firehose aimed at
+    /// data the caller never offered.
+    #[test]
+    fn an_unset_telemetry_pile_never_falls_back_to_the_ambient_pile() {
+        let _env = TELEMETRY_ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ambient = dir.path().join("ambient.pile");
+        std::fs::File::create(&ambient).unwrap();
+
+        std::env::remove_var(ENV_TELEMETRY_PILE);
+        std::env::set_var("PILE", &ambient);
+        std::env::set_var(ENV_TELEMETRY_COLLECTION_NAME, "telemetry-test");
+
+        let started = Telemetry::layer_from_env("test session");
+
+        std::env::remove_var("PILE");
+        std::env::remove_var(ENV_TELEMETRY_COLLECTION_NAME);
+
+        assert!(
+            started.is_none(),
+            "an unset TELEMETRY_PILE disables telemetry instead of guessing a destination"
+        );
+        assert_eq!(
+            std::fs::metadata(&ambient).unwrap().len(),
+            0,
+            "the ambient pile was never opened, let alone written to"
+        );
     }
 
     #[test]

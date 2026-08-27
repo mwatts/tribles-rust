@@ -154,6 +154,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Stop `telemetry::Telemetry::layer_from_env` from falling back from
+  `TELEMETRY_PILE` to `PILE`. A caller that set only `PILE` previously got
+  telemetry and now gets none: `PILE` names an application's own append-only
+  store, so the fallback aimed a per-span firehose at data the caller never
+  offered, permanently and — for a replicated pile — on every machine holding a
+  copy. An unset `TELEMETRY_PILE` now disables telemetry, warning only when
+  `TELEMETRY_COLLECTION_NAME` is set, which is the case where telemetry was
+  clearly intended and the destination is genuinely missing.
+
 - Remove publisherless inventory-generation gossip end to end, including the
   iroh-gossip dependency and simulator side plane. Authenticated pairwise PATCH
   reconciliation is now the only epidemic inventory exchange, while explicit
