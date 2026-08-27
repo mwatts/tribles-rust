@@ -326,9 +326,12 @@ fn automatic_publication_renews_before_provider_lease_expiry() {
             vec![source.id()]
         );
 
-        SimNet::step(&vclock(), Duration::from_secs(13 * 60 * 60)).await;
+        // Lease policy reads the injectable protocol clock. Jump it directly
+        // rather than making the paused Tokio runtime visit 4.6 million
+        // unrelated 10 ms host-poll timers on the way to the half-life.
+        vclock().advance(Duration::from_secs(13 * 60 * 60));
         settle(&mut [&mut source, &mut reader]).await;
-        SimNet::step(&vclock(), Duration::from_secs(12 * 60 * 60 + 1)).await;
+        vclock().advance(Duration::from_secs(12 * 60 * 60 + 1));
         settle(&mut [&mut source, &mut reader]).await;
 
         assert_eq!(

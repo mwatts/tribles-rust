@@ -201,29 +201,42 @@ snapshot with the Blob keys in its current immutable serving snapshot. Only
 that intersection is published, and only under a serving direction.
 
 Newly active offers are announced immediately. The host derives a team-scoped
-provider key from `(team, c)` and stores a receiver-local soft lease for the
-authenticated caller at the `K` closest responsive nodes. A node with no
-remote routing evidence treats that self lease as a sane singleton success.
+provider key `r = provider_key(team, c)` for every active artifact, builds one
+canonical BLAKE3-Merkle PATCH, and groups its keys by the fixed first byte of
+`r`. Publication therefore has at most 256 prefix shards regardless of the
+number of offered artifacts. Each shard is routed under a separate
+team-and-prefix DHT key to the `K` closest responsive nodes. A node with no
+remote routing evidence treats its local shard leases as a sane success.
 Once any configured, synchronized, or learned remote route exists, at least
 one remote directory must accept the announcement: local self-insertion alone
 does not turn an outage into an apparent replicated success. Failed or
 capacity-rejected replication retries with bounded exponential backoff.
 
-Successful leases are renewed at half their lifetime. An ordered due-time
-scheduler bounds whole-artifact concurrency while eventually visiting every
-offered resident artifact, including sets larger than one launch batch. It
-also retains each successful lease deadline and emits a rate-limited warning
-if fair backlog ever consumes the complete renewal margin; intent is never
-truncated. Restart simply reobserves the durable OFFER snapshot. An absent
-artifact, a cleared serving snapshot, or `ReadOnly` direction leaves the offer
-dormant; if residency or a serving view later returns, the normal snapshot
-update activates it. In-flight stale hints need no cancellation protocol
-because receivers expire leases. There is no imperative publication bypass,
-even in the simulator: stale-provider tests advertise truthful resident bytes
-and then exercise ordinary eviction.
+Publication first probes `(prefix, digest, count)`. An equal root renews the
+receiver-local lease without transferring or walking membership. A changed
+root requests one strictly ascending body of full 32-byte provider keys. The
+receiver checks the authenticated provider identity, prefix, count, bounds,
+ordering, and rebuilt PATCH digest before atomically replacing the shard and
+its inverse memberships. Capacity or validation failure preserves the old
+valid shard. Missing prefixes receive no imperative removal; their leases
+simply expire. A pathologically oversized single prefix is reported and
+omitted while neighboring exact shards continue to publish and renew.
+
+Successful prefix leases are renewed at half their lifetime. An ordered
+due-time scheduler admits at most `alpha = 3` changed or due prefixes at once,
+uses fair backoff, and retains successful deadlines across changed-root retry.
+Restart reobserves the durable OFFER snapshot. An absent artifact, a cleared
+serving snapshot, or `ReadOnly` direction leaves the offer dormant; if
+residency or a serving view later returns, normal snapshot observation
+activates it. In-flight stale hints need no cancellation protocol because
+receivers expire leases.
 
 A reader that already knows `c` performs iterative `FIND_NODE`, asks those
-replicas for live provider hints, and fetches from the returned providers.
+replicas for the corresponding team-and-prefix directory, and sends the raw
+artifact handle in `PROVIDER_GET`. Each replica derives `r` itself and returns
+only exact providers from its inverse index. Result fan-out is bounded and
+rotated without capping stored memberships. The reader then fetches from the
+returned providers.
 Every provider operation and exact transfer uses the existing reciprocal
 CONNECT and SYNC_TEAM authorization; transfer also checks that the received
 bytes hash to `c`. A holder without an active resident OFFER is honestly
@@ -308,22 +321,23 @@ compute reuse without weakening this boundary.
 ## Wire surface
 
 All direct operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/13"`. One QUIC stream carries one
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/14"`. One QUIC stream carries one
 strictly framed operation:
 
 | Operation | Byte | Purpose |
 |---|---:|---|
 | `GET_BLOB` | `0x02` | read one exact current blob after both authorizations |
 | `OP_AUTH` | `0x05` | exchange subject-bound CONNECT bundles; mandatory first stream only |
-| `PROVIDER_PUT` | `0x06` | renew the authenticated caller's soft provider lease |
+| `PROVIDER_PROBE` | `0x06` | compare or renew one authenticated provider-prefix root |
 | `PROVIDER_GET` | `0x07` | read live hints for one already-known artifact |
 | `INVENTORY_AUTH` | `0x08` | exchange SYNC_TEAM bundles and install one connection-local session |
 | `INVENTORY_MANIFEST` | `0x09` | read the four ordered component roots and generation |
 | `INVENTORY_NODE` | `0x0A` | read one expected-digest node from a pinned component |
 | `INVENTORY_BLOB_RANGE` | `0x0B` | read at most one bounded range from a pinned Blob root |
 | `FIND_NODE` | `0x0C` | read up to `K` directly verified routes nearest one XOR key |
+| `PROVIDER_BODY` | `0x0D` | atomically install one changed canonical prefix body |
 
-The provider lease is bounded receiver-local soft state; there is no remote
+Provider-cover leases are bounded receiver-local soft state; there is no remote
 semantic write, collection-evidence, operation-receipt, blob-child, custody, or
 replica operation. Receivers admit strictly checked results through their own
 local store boundary.
@@ -375,7 +389,8 @@ distributed proof of convergence.
 - Demand is explicit local interest; inventory observation creates no hidden
   WANT.
 - Provider publication is exactly `OFFER ∩ resident Blob snapshot ∩ serving
-  QoS`; OFFER-only changes never rebuild synchronized inventory.
+  QoS`; at most 256 independently expiring prefix leases replace per-artifact
+  state, and OFFER-only changes never rebuild synchronized inventory.
 - Mirror residency is not retention.
 - Operation answers are ordinary converged collection evidence, including
   conflicts.

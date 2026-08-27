@@ -59,19 +59,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace the split peer configuration with `PeerConfig { peers, team,
   connect_proof, sync_proof, qos }`. CONNECT admits the transport, then exactly
   one SYNC_TEAM exchange selects disclosure authority for that connection.
-- Move pile sync to ALPN `/triblespace/pile-sync/13` for the incompatible
-  reciprocal authorization and provider-directory protocol. Retain exact
+- Move pile sync to ALPN `/triblespace/pile-sync/14` for the incompatible
+  reciprocal authorization and provider-cover protocol. Retain exact
   `GET_BLOB`, bounded inventory authorization/manifest/node/blob-range
-  operations, and bounded `PROVIDER_PUT`, `PROVIDER_GET`, and `FIND_NODE`.
+  operations, and bounded `PROVIDER_PROBE`, `PROVIDER_BODY`, `PROVIDER_GET`,
+  and `FIND_NODE`.
 - Use configured endpoint addresses only as bootstrap routes. Authorized
   sessions and synchronized monotone PEER evidence add routing candidates but
   never authority, liveness, residency, or retention claims. DHT referrals are
   not periodic anti-entropy targets and become verified routes only after a
   direct authenticated response.
-- Use a bounded team-scoped XOR DHT for explicit immutable-artifact provider
-  publication and lookup. Exact Demand reads never probe every known peer: an
-  announced handle resolves through soft provider leases and is content-checked
-  after authenticated transfer.
+- Replace one soft lease per offered artifact with a canonical team-scoped
+  provider cover. Active `OFFER ∩ resident ∩ serving` keys form at most
+  256 first-byte PATCH shards; changed roots transfer one strictly validated
+  full-key body, while equal roots renew in O(1). Prefix leases replace inverse
+  memberships atomically, retain the prior valid shard after rejected
+  replacements, and expire when omitted. Exact Demand reads route through the
+  bounded XOR DHT by team and prefix, query only the exact derived membership,
+  and content-check the authenticated transfer.
 - Pipeline up to eight independently authenticated PATCH node reads on the
   existing inventory protocol and admit their out-of-order responses through
   bounded item/byte batches. Empty replicas now overlap each fixed frontier

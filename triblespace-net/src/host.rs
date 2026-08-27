@@ -52,7 +52,9 @@ use crate::inventory_wire::{
 };
 use crate::protocol::*;
 use crate::provider::{
-    ArtifactId, PROVIDER_LEASE_LIFETIME, ProviderDirectory, ProviderKey, provider_key,
+    ArtifactId, PROVIDER_LEASE_LIFETIME, ProviderCover, ProviderCoverBuild, ProviderDirectory,
+    ProviderKey, ProviderProbe, ProviderShard, ProviderShardCandidate, provider_key,
+    provider_prefix_key,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
@@ -973,11 +975,12 @@ const MAX_CONCURRENT_SWEEPS: usize = 8;
 /// budget instead of a second deployment knob. The cursor carries fairness
 /// across periods when the stored PEER set is larger than this bound.
 const SWEEPS_PER_PERIOD: usize = K;
-/// Bounded parallelism for the small provider-directory RPC fan-out.
+/// Bounded parallelism for provider-directory shard fan-out.
 const MAX_CONCURRENT_PROVIDER_RPCS: usize = ALPHA;
-/// Bound whole-artifact publication independently of the alpha-bounded RPC
-/// fan-out inside one DHT announcement.
-const MAX_CONCURRENT_OFFER_ANNOUNCEMENTS: usize = ALPHA;
+/// Bound whole-prefix publication independently of the alpha-bounded RPC
+/// fan-out inside one DHT announcement. Work therefore never scales with the
+/// number of offered artifacts.
+const MAX_CONCURRENT_PREFIX_ANNOUNCEMENTS: usize = ALPHA;
 /// Renew with half the receiver-selected lease still remaining. Scheduling
 /// from successful completion absorbs lookup latency without accumulating
 /// catch-up bursts after a delayed host iteration.
@@ -993,6 +996,9 @@ const DHT_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 const PROVIDER_CONTROL_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Leave at least half of the public operation budget for exact blob bytes.
 const PROVIDER_CONTROL_PHASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Changed shard bodies are bounded but intentionally much larger than DHT
+/// control frames.
+const PROVIDER_SHARD_PUBLICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 /// Admit one bounded second alpha batch without cancelling already progressing
 /// bodies. A full second avoids multiplying ordinary medium-sized transfers.
 const PROVIDER_FETCH_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1094,8 +1100,9 @@ impl SweepScheduler {
     }
 }
 
-struct ArtifactAnnouncementOutcome {
-    artifact: ArtifactId,
+struct ProviderShardAnnouncementOutcome {
+    prefix: u8,
+    digest: [u8; 32],
     attempted_at: crate::clock::Mono,
     publication: ProviderPublication,
 }
@@ -1113,137 +1120,148 @@ impl ProviderPublication {
     }
 }
 
-/// Bounded fair scheduling for durable local artifact offers.
+/// Bounded fair scheduling over changed or due provider-cover prefixes.
 ///
-/// `active` is already the intersection of policy offers and the current Blob
-/// serving snapshot. One ordered due set gives additions immediate service,
-/// preserves deadlines across unrelated snapshot changes, and ensures an
-/// over-capacity artifact cannot monopolize the host poll loop. There is no
-/// fixed queue cap: concurrency bounds work, not remembered intent.
-struct ArtifactOfferScheduler {
-    active: BTreeSet<ArtifactId>,
-    due: BTreeSet<(crate::clock::Mono, ArtifactId)>,
-    due_by_artifact: HashMap<ArtifactId, crate::clock::Mono>,
-    lease_deadlines: BTreeSet<(crate::clock::Mono, ArtifactId)>,
-    lease_deadline_by_artifact: HashMap<ArtifactId, crate::clock::Mono>,
-    in_flight: HashSet<ArtifactId>,
-    failures: HashMap<ArtifactId, u32>,
+/// A cover may contain any number of artifacts, but has at most 256 schedule
+/// units. Unchanged roots retain their deadlines; a changed root is published
+/// immediately and a prefix omitted from the next cover simply stops renewing.
+struct ProviderCoverScheduler {
+    cover: ProviderCover,
+    due: BTreeSet<(crate::clock::Mono, u8)>,
+    due_by_prefix: HashMap<u8, crate::clock::Mono>,
+    lease_deadlines: BTreeSet<(crate::clock::Mono, u8)>,
+    lease_deadline_by_prefix: HashMap<u8, crate::clock::Mono>,
+    in_flight: HashSet<u8>,
+    failures: HashMap<u8, u32>,
     next_backlog_warning: Option<crate::clock::Mono>,
 }
 
-impl ArtifactOfferScheduler {
+impl ProviderCoverScheduler {
     fn new() -> Self {
         Self {
-            active: BTreeSet::new(),
+            cover: ProviderCover::default(),
             due: BTreeSet::new(),
-            due_by_artifact: HashMap::new(),
+            due_by_prefix: HashMap::new(),
             lease_deadlines: BTreeSet::new(),
-            lease_deadline_by_artifact: HashMap::new(),
+            lease_deadline_by_prefix: HashMap::new(),
             in_flight: HashSet::new(),
             failures: HashMap::new(),
             next_backlog_warning: None,
         }
     }
 
-    fn observe_active(&mut self, active: BTreeSet<ArtifactId>, now: crate::clock::Mono) {
-        let removed: Vec<_> = self.active.difference(&active).copied().collect();
-        for artifact in removed {
-            self.unschedule(artifact);
-            self.remove_lease_deadline(artifact);
-            self.failures.remove(&artifact);
+    fn observe_cover(&mut self, cover: ProviderCover, now: crate::clock::Mono) {
+        if self.cover.same_membership(&cover) {
+            self.cover = cover;
+            return;
+        }
+        let removed: Vec<_> = self
+            .cover
+            .iter()
+            .filter_map(|(&prefix, _)| cover.get(prefix).is_none().then_some(prefix))
+            .collect();
+        for prefix in removed {
+            self.unschedule(prefix);
+            self.remove_lease_deadline(prefix);
+            self.failures.remove(&prefix);
         }
 
-        let added: Vec<_> = active.difference(&self.active).copied().collect();
-        self.active = active;
-        for artifact in added {
-            if !self.in_flight.contains(&artifact) {
-                self.schedule(artifact, now);
+        let changed: Vec<_> = cover
+            .iter()
+            .filter_map(|(&prefix, shard)| {
+                let unchanged = self.cover.get(prefix).is_some_and(|old| {
+                    old.digest() == shard.digest() && old.count() == shard.count()
+                });
+                (!unchanged).then_some(prefix)
+            })
+            .collect();
+        self.cover = cover;
+        for prefix in changed {
+            self.failures.remove(&prefix);
+            if !self.in_flight.contains(&prefix) {
+                self.schedule(prefix, now);
             }
         }
     }
 
-    fn schedule(&mut self, artifact: ArtifactId, due: crate::clock::Mono) {
-        if let Some(previous) = self.due_by_artifact.insert(artifact, due) {
-            self.due.remove(&(previous, artifact));
+    fn schedule(&mut self, prefix: u8, due: crate::clock::Mono) {
+        if let Some(previous) = self.due_by_prefix.insert(prefix, due) {
+            self.due.remove(&(previous, prefix));
         }
-        self.due.insert((due, artifact));
+        self.due.insert((due, prefix));
     }
 
-    fn unschedule(&mut self, artifact: ArtifactId) {
-        if let Some(previous) = self.due_by_artifact.remove(&artifact) {
-            self.due.remove(&(previous, artifact));
-        }
-    }
-
-    fn set_lease_deadline(&mut self, artifact: ArtifactId, deadline: crate::clock::Mono) {
-        if let Some(previous) = self.lease_deadline_by_artifact.insert(artifact, deadline) {
-            self.lease_deadlines.remove(&(previous, artifact));
-        }
-        self.lease_deadlines.insert((deadline, artifact));
-    }
-
-    fn remove_lease_deadline(&mut self, artifact: ArtifactId) {
-        if let Some(previous) = self.lease_deadline_by_artifact.remove(&artifact) {
-            self.lease_deadlines.remove(&(previous, artifact));
+    fn unschedule(&mut self, prefix: u8) {
+        if let Some(previous) = self.due_by_prefix.remove(&prefix) {
+            self.due.remove(&(previous, prefix));
         }
     }
 
-    fn pop_due(&mut self, now: crate::clock::Mono) -> Option<ArtifactId> {
+    fn set_lease_deadline(&mut self, prefix: u8, deadline: crate::clock::Mono) {
+        if let Some(previous) = self.lease_deadline_by_prefix.insert(prefix, deadline) {
+            self.lease_deadlines.remove(&(previous, prefix));
+        }
+        self.lease_deadlines.insert((deadline, prefix));
+    }
+
+    fn remove_lease_deadline(&mut self, prefix: u8) {
+        if let Some(previous) = self.lease_deadline_by_prefix.remove(&prefix) {
+            self.lease_deadlines.remove(&(previous, prefix));
+        }
+    }
+
+    fn pop_due(&mut self, now: crate::clock::Mono) -> Option<ProviderShard> {
         loop {
-            let (due, artifact) = self.due.first().copied()?;
+            let (due, prefix) = self.due.first().copied()?;
             if due > now {
                 return None;
             }
-            self.due.remove(&(due, artifact));
-            self.due_by_artifact.remove(&artifact);
-            if self.active.contains(&artifact) && self.in_flight.insert(artifact) {
-                return Some(artifact);
+            self.due.remove(&(due, prefix));
+            self.due_by_prefix.remove(&prefix);
+            let Some(shard) = self.cover.get(prefix).cloned() else {
+                continue;
+            };
+            if self.in_flight.insert(prefix) {
+                return Some(shard);
             }
         }
     }
 
-    /// Stop considering an entry which failed a final resident-snapshot check.
-    /// A pending snapshot notice will recompute the exact intersection and add
-    /// it back if residency returns.
-    fn suspend(&mut self, artifact: ArtifactId) {
-        self.in_flight.remove(&artifact);
-        self.active.remove(&artifact);
-        self.unschedule(artifact);
-        self.remove_lease_deadline(artifact);
-        self.failures.remove(&artifact);
-    }
-
-    fn complete(&mut self, outcome: ArtifactAnnouncementOutcome, now: crate::clock::Mono) {
-        self.in_flight.remove(&outcome.artifact);
-        if !self.active.contains(&outcome.artifact) {
+    fn complete(&mut self, outcome: ProviderShardAnnouncementOutcome, now: crate::clock::Mono) {
+        self.in_flight.remove(&outcome.prefix);
+        let Some(current) = self.cover.get(outcome.prefix) else {
+            return;
+        };
+        if current.digest() != outcome.digest {
+            self.schedule(outcome.prefix, now);
             return;
         }
 
         let delay = if outcome.publication.succeeded() {
-            self.failures.remove(&outcome.artifact);
+            self.failures.remove(&outcome.prefix);
             // The receiver installs its lease during the attempt. Starting at
             // launch is a conservative lower bound on every accepted remote
             // lease deadline; completion time could overstate it by a whole
             // control-phase timeout.
             self.set_lease_deadline(
-                outcome.artifact,
+                outcome.prefix,
                 outcome.attempted_at + PROVIDER_LEASE_LIFETIME,
             );
             PROVIDER_RENEWAL_INTERVAL
         } else {
             let attempts = self
                 .failures
-                .get(&outcome.artifact)
+                .get(&outcome.prefix)
                 .copied()
                 .unwrap_or(0)
                 .saturating_add(1);
-            self.failures.insert(outcome.artifact, attempts);
+            self.failures.insert(outcome.prefix, attempts);
             let shift = attempts.saturating_sub(1).min(31);
             crate::RETRY_BACKOFF_BASE
                 .saturating_mul(1u32 << shift)
                 .min(crate::RETRY_BACKOFF_CAP)
         };
-        self.schedule(outcome.artifact, now + delay);
+        self.schedule(outcome.prefix, now + delay);
     }
 
     /// Report a definite lease miss at most once per warning interval. The
@@ -1252,8 +1270,8 @@ impl ArtifactOfferScheduler {
     fn warnable_expired_lease(
         &mut self,
         now: crate::clock::Mono,
-    ) -> Option<(ArtifactId, crate::clock::Mono)> {
-        let (deadline, artifact) = self.lease_deadlines.first().copied()?;
+    ) -> Option<(u8, crate::clock::Mono)> {
+        let (deadline, prefix) = self.lease_deadlines.first().copied()?;
         if deadline > now
             || self
                 .next_backlog_warning
@@ -1262,7 +1280,7 @@ impl ArtifactOfferScheduler {
             return None;
         }
         self.next_backlog_warning = Some(now + OFFER_BACKLOG_WARNING_INTERVAL);
-        Some((artifact, deadline))
+        Some((prefix, deadline))
     }
 
     fn in_flight_len(&self) -> usize {
@@ -1271,40 +1289,41 @@ impl ArtifactOfferScheduler {
 
     #[cfg(test)]
     fn active_len(&self) -> usize {
-        self.active.len()
+        self.cover.shard_count()
     }
 
     #[cfg(test)]
-    fn next_due(&self, artifact: ArtifactId) -> Option<crate::clock::Mono> {
-        self.due_by_artifact.get(&artifact).copied()
+    fn next_due(&self, prefix: u8) -> Option<crate::clock::Mono> {
+        self.due_by_prefix.get(&prefix).copied()
     }
 
     #[cfg(test)]
-    fn lease_deadline(&self, artifact: ArtifactId) -> Option<crate::clock::Mono> {
-        self.lease_deadline_by_artifact.get(&artifact).copied()
+    fn lease_deadline(&self, prefix: u8) -> Option<crate::clock::Mono> {
+        self.lease_deadline_by_prefix.get(&prefix).copied()
     }
 }
 
-fn active_artifact_offers(
+fn active_provider_cover(
     offers: &ArtifactOfferSnapshot,
     snapshot: &SnapshotSlot,
     serves: bool,
-) -> BTreeSet<ArtifactId> {
+    team: VerifyingKey,
+) -> ProviderCoverBuild {
     if !serves {
-        return BTreeSet::new();
+        return ProviderCoverBuild::default();
     }
     let current = snapshot.lock().unwrap().as_ref().cloned();
     let Some(current) = current else {
-        return BTreeSet::new();
+        return ProviderCoverBuild::default();
     };
-    offers
-        .iter()
-        .filter_map(|handle| {
+    ProviderCover::from_artifacts(
+        team,
+        offers.iter().filter_map(|handle| {
             current
                 .contains_relative_key(InventoryComponent::Blob, &handle.raw)
                 .then_some(handle.raw)
-        })
-        .collect()
+        }),
+    )
 }
 
 async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
@@ -1396,9 +1415,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut failures: HashMap<PeerId, (u32, crate::clock::Mono)> = HashMap::new();
     let mut sweeps = SweepScheduler::new();
     let (offer_tx, mut offer_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ArtifactAnnouncementOutcome>();
+        tokio::sync::mpsc::unbounded_channel::<ProviderShardAnnouncementOutcome>();
     let mut artifact_offers = ArtifactOfferSnapshot::default();
-    let mut offer_scheduler = ArtifactOfferScheduler::new();
+    let mut offer_scheduler = ProviderCoverScheduler::new();
     let commands = commands;
 
     loop {
@@ -1435,9 +1454,20 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             return;
         }
         if publication_inputs_changed {
-            let active =
-                active_artifact_offers(&artifact_offers, &snapshot, config.qos.direction.serves());
-            offer_scheduler.observe_active(active, crate::clock::mono_now());
+            let build = active_provider_cover(
+                &artifact_offers,
+                &snapshot,
+                config.qos.direction.serves(),
+                config.team,
+            );
+            for omitted in &build.omitted {
+                warn!(
+                    prefix = format_args!("{:#04x}", omitted.prefix),
+                    count = omitted.count,
+                    "active provider-cover prefix exceeds the bounded publication body"
+                );
+            }
+            offer_scheduler.observe_cover(build.cover, crate::clock::mono_now());
         }
 
         while let Ok(outcome) = sweep_rx.try_recv() {
@@ -1462,11 +1492,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         let now = crate::clock::mono_now();
-        if let Some((artifact, deadline)) = offer_scheduler.warnable_expired_lease(now) {
+        if let Some((prefix, deadline)) = offer_scheduler.warnable_expired_lease(now) {
             warn!(
-                artifact = %hex::encode(&artifact[..4]),
+                prefix,
                 lag_ms = now.duration_since(deadline).as_millis(),
-                "artifact-offer backlog missed a provider lease renewal deadline"
+                "provider-cover backlog missed a shard lease renewal deadline"
             );
         }
         if config.qos.direction.pulls() && sweeps.period_is_due(now) {
@@ -1532,33 +1562,29 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         if config.qos.direction.serves() && snapshot.lock().unwrap().is_some() {
-            while offer_scheduler.in_flight_len() < MAX_CONCURRENT_OFFER_ANNOUNCEMENTS {
-                let Some(artifact) = offer_scheduler.pop_due(now) else {
+            while offer_scheduler.in_flight_len() < MAX_CONCURRENT_PREFIX_ANNOUNCEMENTS {
+                let Some(shard) = offer_scheduler.pop_due(now) else {
                     break;
                 };
-                let resident_now = snapshot.lock().unwrap().as_ref().is_some_and(|current| {
-                    current.contains_relative_key(InventoryComponent::Blob, &artifact)
-                });
-                if !resident_now {
-                    offer_scheduler.suspend(artifact);
-                    continue;
-                }
                 let client = publication_client.clone();
                 let offer_tx = offer_tx.clone();
                 let attempted_at = now;
+                let prefix = shard.prefix();
+                let digest = shard.digest();
                 tokio::spawn(async move {
                     let remote_expected = client.expects_remote();
                     let publication = tokio::time::timeout(
-                        INTERACTIVE_FETCH_DEADLINE,
-                        client.announce_artifact(artifact, remote_expected),
+                        PROVIDER_SHARD_PUBLICATION_DEADLINE,
+                        client.announce_shard(&shard, remote_expected),
                     )
                     .await
                     .unwrap_or(ProviderPublication {
                         remote_expected,
                         ..ProviderPublication::default()
                     });
-                    let _ = offer_tx.send(ArtifactAnnouncementOutcome {
-                        artifact,
+                    let _ = offer_tx.send(ProviderShardAnnouncementOutcome {
+                        prefix,
+                        digest,
                         attempted_at,
                         publication,
                     });
@@ -2105,20 +2131,19 @@ impl<T: Transport> ProviderClient<T> {
         self.candidates.lock().unwrap().expects_remote()
     }
 
-    async fn announce_artifact(
+    async fn announce_shard(
         &self,
-        artifact: ArtifactId,
+        shard: &ProviderShard,
         remote_expected: bool,
     ) -> ProviderPublication {
-        let key = provider_key(self.team, artifact);
-        let targets = self.lookup_replicas(key).await;
-        self.announce(key, artifact, targets, remote_expected).await
+        let target = provider_prefix_key(self.team, shard.prefix());
+        let targets = self.lookup_replicas(target).await;
+        self.announce(shard, targets, remote_expected).await
     }
 
     async fn announce(
         &self,
-        key: ProviderKey,
-        artifact: ArtifactId,
+        shard: &ProviderShard,
         targets: Vec<PeerId>,
         remote_expected: bool,
     ) -> ProviderPublication {
@@ -2126,11 +2151,7 @@ impl<T: Transport> ProviderClient<T> {
             .map(|target| async move {
                 (
                     target,
-                    tokio::time::timeout(
-                        PROVIDER_CONTROL_RPC_DEADLINE,
-                        self.put(target, key, artifact),
-                    )
-                    .await,
+                    tokio::time::timeout(OP_DEADLINE, self.put(target, shard)).await,
                 )
             })
             .buffer_unordered(MAX_CONCURRENT_PROVIDER_RPCS);
@@ -2138,7 +2159,7 @@ impl<T: Transport> ProviderClient<T> {
             remote_expected,
             ..ProviderPublication::default()
         };
-        let _ = tokio::time::timeout(PROVIDER_CONTROL_PHASE_DEADLINE, async {
+        let _ = tokio::time::timeout(PROVIDER_SHARD_PUBLICATION_DEADLINE, async {
             while let Some((target, reply)) = replies.next().await {
                 match reply {
                     Ok(true) if target == self.my_id => publication.local_accepted = true,
@@ -2155,13 +2176,32 @@ impl<T: Transport> ProviderClient<T> {
         publication
     }
 
-    async fn put(&self, target: PeerId, key: ProviderKey, artifact: ArtifactId) -> bool {
+    async fn put(&self, target: PeerId, shard: &ProviderShard) -> bool {
         if target == self.my_id {
-            return self
-                .providers
-                .lock()
-                .unwrap()
-                .put(key, self.my_id, crate::clock::mono_now());
+            let now = crate::clock::mono_now();
+            let probe = self.providers.lock().unwrap().probe(
+                shard.prefix(),
+                shard.digest(),
+                shard.count(),
+                self.my_id,
+                now,
+            );
+            return match probe {
+                ProviderProbe::Known => true,
+                ProviderProbe::Full => false,
+                ProviderProbe::Need => ProviderShardCandidate::validate(
+                    shard.prefix(),
+                    shard.digest(),
+                    shard.count(),
+                    shard.keys().to_vec(),
+                )
+                .is_ok_and(|candidate| {
+                    self.providers
+                        .lock()
+                        .unwrap()
+                        .install(candidate, self.my_id, now)
+                }),
+            };
         }
         let connection = match inventory_pool_get(
             &self.transport,
@@ -2175,7 +2215,7 @@ impl<T: Transport> ProviderClient<T> {
         {
             Ok(connection) => connection,
             Err(error) => {
-                debug!(peer = %hex::encode(&target[..4]), %error, "provider PUT setup failed");
+                debug!(peer = %hex::encode(&target[..4]), %error, "provider shard setup failed");
                 self.candidates.lock().unwrap().remove(target);
                 return false;
             }
@@ -2184,25 +2224,57 @@ impl<T: Transport> ProviderClient<T> {
             .lock()
             .unwrap()
             .promote_authenticated(target);
-        match tokio::time::timeout(OP_DEADLINE, op_provider_put(&connection, &artifact)).await {
-            Ok(Ok(stored)) => stored,
+        let probe = match tokio::time::timeout(
+            PROVIDER_CONTROL_RPC_DEADLINE,
+            op_provider_probe(&connection, shard.prefix(), &shard.digest(), shard.count()),
+        )
+        .await
+        {
+            Ok(Ok(probe)) => probe,
             Ok(Err(error)) => {
-                debug!(peer = %hex::encode(&target[..4]), %error, "provider PUT failed");
+                debug!(peer = %hex::encode(&target[..4]), %error, "provider PROBE failed");
                 self.candidates.lock().unwrap().remove(target);
                 pool_evict(&self.pool, target).await;
-                false
+                return false;
             }
             Err(_) => {
                 self.candidates.lock().unwrap().remove(target);
                 pool_evict(&self.pool, target).await;
-                false
+                return false;
+            }
+        };
+        match probe {
+            ProviderProbe::Known => true,
+            ProviderProbe::Full => false,
+            ProviderProbe::Need => {
+                match tokio::time::timeout(
+                    OP_DEADLINE,
+                    op_provider_body(&connection, shard.prefix(), &shard.digest(), shard.keys()),
+                )
+                .await
+                {
+                    Ok(Ok(stored)) => stored,
+                    Ok(Err(error)) => {
+                        debug!(peer = %hex::encode(&target[..4]), %error, "provider BODY failed");
+                        self.candidates.lock().unwrap().remove(target);
+                        pool_evict(&self.pool, target).await;
+                        false
+                    }
+                    Err(_) => {
+                        self.candidates.lock().unwrap().remove(target);
+                        pool_evict(&self.pool, target).await;
+                        false
+                    }
+                }
             }
         }
     }
 
     async fn find_artifact(&self, artifact: ArtifactId) -> Vec<PeerId> {
         let key = provider_key(self.team, artifact);
-        let targets = self.lookup_replicas(key).await;
+        let targets = self
+            .lookup_replicas(provider_prefix_key(self.team, key[0]))
+            .await;
         self.find(key, artifact, targets).await
     }
 
@@ -2464,24 +2536,39 @@ impl SnapshotHandler {
                     send_u64_be(send, u64::MAX).await?;
                 }
             }
-            OP_PROVIDER_PUT => {
-                let session = current_inventory_session(&authorization)?;
-                // This exact request shape is the forged-provider defense:
-                // any appended claimed identity is rejected, and the value
-                // stored below comes only from the authenticated connection.
-                let artifact = recv_provider_artifact(recv).await?;
-                let key = provider_key(session.team(), artifact);
-                let stored = self.providers.lock().unwrap().put(
-                    key,
+            OP_PROVIDER_PROBE => {
+                let _session = current_inventory_session(&authorization)?;
+                let (prefix, digest, count) = recv_provider_probe(recv).await?;
+                let response = self.providers.lock().unwrap().probe(
+                    prefix,
+                    digest,
+                    count,
+                    peer.to_bytes(),
+                    crate::clock::mono_now(),
+                );
+                let response = match response {
+                    ProviderProbe::Known => PROVIDER_PROBE_KNOWN,
+                    ProviderProbe::Need => PROVIDER_PROBE_NEED,
+                    ProviderProbe::Full => PROVIDER_PROBE_FULL,
+                };
+                send_u8(send, response).await?;
+            }
+            OP_PROVIDER_BODY => {
+                let _session = current_inventory_session(&authorization)?;
+                // The provider identity is solely the authenticated transport
+                // peer. The body contains only team-scoped rendezvous keys.
+                let candidate = recv_provider_body(recv).await?;
+                let stored = self.providers.lock().unwrap().install(
+                    candidate,
                     peer.to_bytes(),
                     crate::clock::mono_now(),
                 );
                 send_u8(
                     send,
                     if stored {
-                        PROVIDER_PUT_OK
+                        PROVIDER_BODY_OK
                     } else {
-                        PROVIDER_PUT_FULL
+                        PROVIDER_BODY_FULL
                     },
                 )
                 .await?;
@@ -2724,6 +2811,36 @@ async fn recv_provider_artifact<R: tokio::io::AsyncRead + Unpin>(
     Ok(artifact)
 }
 
+async fn recv_provider_probe<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
+) -> anyhow::Result<(u8, [u8; 32], u32)> {
+    let prefix = recv_u8(recv).await?;
+    let digest = recv_hash(recv).await?;
+    let count = recv_u32_be(recv).await?;
+    require_stream_eof(recv).await?;
+    Ok((prefix, digest, count))
+}
+
+async fn recv_provider_body<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
+) -> anyhow::Result<ProviderShardCandidate> {
+    let prefix = recv_u8(recv).await?;
+    let digest = recv_hash(recv).await?;
+    let count = recv_u32_be(recv).await?;
+    let count_usize = usize::try_from(count).expect("u32 fits usize on supported platforms");
+    if count_usize == 0 || count_usize > crate::provider::MAX_PROVIDER_SHARD_MEMBERS {
+        anyhow::bail!("provider-cover body count is outside the supported bounds");
+    }
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(count_usize)
+        .map_err(|error| anyhow::anyhow!("cannot allocate provider-cover body: {error}"))?;
+    for _ in 0..count {
+        keys.push(recv_hash(recv).await?);
+    }
+    require_stream_eof(recv).await?;
+    ProviderShardCandidate::validate(prefix, digest, count, keys)
+}
+
 async fn recv_routing_key<R: tokio::io::AsyncRead + Unpin>(
     recv: &mut R,
 ) -> anyhow::Result<RoutingKey> {
@@ -2762,7 +2879,8 @@ fn op_name(op: u8) -> &'static str {
     match op {
         OP_AUTH => "AUTH",
         OP_GET_BLOB => "GET_BLOB",
-        OP_PROVIDER_PUT => "PROVIDER_PUT",
+        OP_PROVIDER_PROBE => "PROVIDER_PROBE",
+        OP_PROVIDER_BODY => "PROVIDER_BODY",
         OP_PROVIDER_GET => "PROVIDER_GET",
         OP_FIND_NODE => "FIND_NODE",
         OP_INVENTORY_AUTH => "INVENTORY_AUTH",
@@ -2795,6 +2913,7 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
@@ -2811,6 +2930,24 @@ mod tests {
 
     fn key(byte: u8) -> VerifyingKey {
         SigningKey::from_bytes(&[byte; 32]).verifying_key()
+    }
+
+    fn artifact(index: u64) -> ArtifactId {
+        let mut artifact = [0; 32];
+        artifact[24..].copy_from_slice(&index.to_be_bytes());
+        artifact
+    }
+
+    fn cover_with_prefixes(team: VerifyingKey, prefixes: usize) -> ProviderCover {
+        let mut artifacts = Vec::new();
+        for index in 0..u64::MAX {
+            artifacts.push(artifact(index));
+            let cover = ProviderCover::from_artifacts(team, artifacts.iter().copied()).cover;
+            if cover.shard_count() == prefixes {
+                return cover;
+            }
+        }
+        unreachable!("provider-key derivation did not populate enough prefixes")
     }
 
     fn endpoint_proof(
@@ -3004,35 +3141,34 @@ mod tests {
     }
 
     #[test]
-    fn offer_scheduler_is_bounded_and_fair_beyond_concurrency() {
+    fn provider_cover_scheduler_is_bounded_and_fair_beyond_concurrency() {
         let now = crate::clock::mono_now();
-        let count = 3 * MAX_CONCURRENT_OFFER_ANNOUNCEMENTS + 2;
-        let active: BTreeSet<_> = (1..=count)
-            .map(|index| [u8::try_from(index).unwrap(); 32])
-            .collect();
-        let mut scheduler = ArtifactOfferScheduler::new();
-        scheduler.observe_active(active, now);
+        let count = 3 * MAX_CONCURRENT_PREFIX_ANNOUNCEMENTS + 2;
+        let cover = cover_with_prefixes(key(9), count);
+        let mut scheduler = ProviderCoverScheduler::new();
+        scheduler.observe_cover(cover, now);
         assert_eq!(scheduler.active_len(), count);
 
         let mut seen = BTreeSet::new();
         while seen.len() < count {
             let mut batch = Vec::new();
-            while scheduler.in_flight_len() < MAX_CONCURRENT_OFFER_ANNOUNCEMENTS {
-                let Some(artifact) = scheduler.pop_due(now) else {
+            while scheduler.in_flight_len() < MAX_CONCURRENT_PREFIX_ANNOUNCEMENTS {
+                let Some(shard) = scheduler.pop_due(now) else {
                     break;
                 };
                 assert!(
-                    seen.insert(artifact),
-                    "an active offer launches once per due time"
+                    seen.insert(shard.prefix()),
+                    "an active prefix launches once per due time"
                 );
-                batch.push(artifact);
+                batch.push(shard);
             }
             assert!(!batch.is_empty());
-            assert!(batch.len() <= MAX_CONCURRENT_OFFER_ANNOUNCEMENTS);
-            for artifact in batch {
+            assert!(batch.len() <= MAX_CONCURRENT_PREFIX_ANNOUNCEMENTS);
+            for shard in batch {
                 scheduler.complete(
-                    ArtifactAnnouncementOutcome {
-                        artifact,
+                    ProviderShardAnnouncementOutcome {
+                        prefix: shard.prefix(),
+                        digest: shard.digest(),
                         attempted_at: now,
                         publication: ProviderPublication {
                             remote_expected: true,
@@ -3048,17 +3184,21 @@ mod tests {
     }
 
     #[test]
-    fn offer_scheduler_renews_at_half_life_and_retries_with_backoff() {
+    fn provider_cover_scheduler_renews_at_half_life_and_retries_with_backoff() {
         let now = crate::clock::mono_now();
-        let success = [1; 32];
-        let retry = [2; 32];
-        let mut scheduler = ArtifactOfferScheduler::new();
-        scheduler.observe_active(BTreeSet::from([success, retry]), now);
+        let cover = cover_with_prefixes(key(10), 2);
+        let prefixes: Vec<_> = cover.iter().map(|(&prefix, _)| prefix).collect();
+        let success = prefixes[0];
+        let retry = prefixes[1];
+        let mut scheduler = ProviderCoverScheduler::new();
+        scheduler.observe_cover(cover, now);
 
-        assert_eq!(scheduler.pop_due(now), Some(success));
+        let success_shard = scheduler.pop_due(now).unwrap();
+        assert_eq!(success_shard.prefix(), success);
         scheduler.complete(
-            ArtifactAnnouncementOutcome {
-                artifact: success,
+            ProviderShardAnnouncementOutcome {
+                prefix: success,
+                digest: success_shard.digest(),
                 attempted_at: now,
                 publication: ProviderPublication {
                     local_accepted: true,
@@ -3072,10 +3212,12 @@ mod tests {
             Some(now + PROVIDER_RENEWAL_INTERVAL)
         );
 
-        assert_eq!(scheduler.pop_due(now), Some(retry));
+        let retry_shard = scheduler.pop_due(now).unwrap();
+        assert_eq!(retry_shard.prefix(), retry);
         scheduler.complete(
-            ArtifactAnnouncementOutcome {
-                artifact: retry,
+            ProviderShardAnnouncementOutcome {
+                prefix: retry,
+                digest: retry_shard.digest(),
                 attempted_at: now,
                 publication: ProviderPublication {
                     local_accepted: true,
@@ -3091,10 +3233,12 @@ mod tests {
         );
 
         let retry_at = now + crate::RETRY_BACKOFF_BASE;
-        assert_eq!(scheduler.pop_due(retry_at), Some(retry));
+        let retry_shard = scheduler.pop_due(retry_at).unwrap();
+        assert_eq!(retry_shard.prefix(), retry);
         scheduler.complete(
-            ArtifactAnnouncementOutcome {
-                artifact: retry,
+            ProviderShardAnnouncementOutcome {
+                prefix: retry,
+                digest: retry_shard.digest(),
                 attempted_at: retry_at,
                 publication: ProviderPublication {
                     local_accepted: true,
@@ -3116,15 +3260,17 @@ mod tests {
     }
 
     #[test]
-    fn offer_scheduler_preserves_deadlines_across_equivalent_snapshots() {
+    fn provider_cover_scheduler_preserves_deadlines_across_equivalent_snapshots() {
         let now = crate::clock::mono_now();
-        let artifact = [3; 32];
-        let mut scheduler = ArtifactOfferScheduler::new();
-        scheduler.observe_active(BTreeSet::from([artifact]), now);
-        assert_eq!(scheduler.pop_due(now), Some(artifact));
+        let cover = cover_with_prefixes(key(11), 1);
+        let prefix = *cover.iter().next().unwrap().0;
+        let mut scheduler = ProviderCoverScheduler::new();
+        scheduler.observe_cover(cover.clone(), now);
+        let shard = scheduler.pop_due(now).unwrap();
         scheduler.complete(
-            ArtifactAnnouncementOutcome {
-                artifact,
+            ProviderShardAnnouncementOutcome {
+                prefix,
+                digest: shard.digest(),
                 attempted_at: now,
                 publication: ProviderPublication {
                     local_accepted: true,
@@ -3133,26 +3279,162 @@ mod tests {
             },
             now,
         );
-        let renewal = scheduler.next_due(artifact);
-        scheduler.observe_active(BTreeSet::from([artifact]), now + Duration::from_secs(1));
-        assert_eq!(scheduler.next_due(artifact), renewal);
+        let renewal = scheduler.next_due(prefix);
+        scheduler.observe_cover(cover, now + Duration::from_secs(1));
+        assert_eq!(scheduler.next_due(prefix), renewal);
 
-        scheduler.observe_active(BTreeSet::new(), now + Duration::from_secs(2));
+        scheduler.observe_cover(ProviderCover::default(), now + Duration::from_secs(2));
         assert_eq!(scheduler.active_len(), 0);
-        assert_eq!(scheduler.next_due(artifact), None);
-        assert_eq!(scheduler.lease_deadline(artifact), None);
+        assert_eq!(scheduler.next_due(prefix), None);
+        assert_eq!(scheduler.lease_deadline(prefix), None);
     }
 
     #[test]
-    fn offer_scheduler_rate_limits_definite_lease_miss_warnings() {
+    fn changed_prefix_retains_old_deadline_and_collapses_history_by_current_root() {
         let now = crate::clock::mono_now();
-        let artifact = [4; 32];
-        let mut scheduler = ArtifactOfferScheduler::new();
-        scheduler.observe_active(BTreeSet::from([artifact]), now);
-        assert_eq!(scheduler.pop_due(now), Some(artifact));
+        let team = key(12);
+        let original = cover_with_prefixes(team, 1);
+        let prefix = *original.iter().next().unwrap().0;
+        let original_shard = original.get(prefix).unwrap().clone();
+        let mut artifacts = vec![artifact(0)];
+        let mut candidate_index = 1_u64;
+        let changed = loop {
+            artifacts.push(artifact(candidate_index));
+            candidate_index += 1;
+            let candidate = ProviderCover::from_artifacts(team, artifacts.iter().copied()).cover;
+            if candidate.shard_count() == 1
+                && candidate
+                    .get(prefix)
+                    .is_some_and(|shard| shard.digest() != original_shard.digest())
+            {
+                break candidate;
+            }
+            if candidate.shard_count() > 1 {
+                artifacts.pop();
+            }
+        };
+        let mut scheduler = ProviderCoverScheduler::new();
+        scheduler.observe_cover(original.clone(), now);
+        let first = scheduler.pop_due(now).unwrap();
         scheduler.complete(
-            ArtifactAnnouncementOutcome {
-                artifact,
+            ProviderShardAnnouncementOutcome {
+                prefix,
+                digest: first.digest(),
+                attempted_at: now,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    ..ProviderPublication::default()
+                },
+            },
+            now,
+        );
+        let old_deadline = now + PROVIDER_LEASE_LIFETIME;
+        let renewal = now + PROVIDER_RENEWAL_INTERVAL;
+        let renewing = scheduler.pop_due(renewal).unwrap();
+        scheduler.observe_cover(changed, renewal);
+        assert_eq!(
+            scheduler.lease_deadline(prefix),
+            Some(old_deadline),
+            "a failed changed-root publication can still miss the old lease"
+        );
+        scheduler.observe_cover(original, renewal);
+        scheduler.complete(
+            ProviderShardAnnouncementOutcome {
+                prefix,
+                digest: renewing.digest(),
+                attempted_at: renewal,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    ..ProviderPublication::default()
+                },
+            },
+            renewal,
+        );
+        assert_eq!(
+            scheduler.next_due(prefix),
+            Some(renewal + PROVIDER_RENEWAL_INTERVAL),
+            "A→B→A while A is in flight already realizes the current state"
+        );
+        assert_eq!(
+            scheduler.lease_deadline(prefix),
+            Some(renewal + PROVIDER_LEASE_LIFETIME)
+        );
+    }
+
+    #[test]
+    fn oversized_prefix_expires_while_neighboring_exact_prefix_stays_scheduled() {
+        let now = crate::clock::mono_now();
+        let team = key(13);
+        let mut by_prefix = BTreeMap::<u8, Vec<ArtifactId>>::new();
+        let (oversized_prefix, pair) = (0..u64::MAX)
+            .find_map(|index| {
+                let artifact = artifact(index);
+                let prefix = provider_key(team, artifact)[0];
+                let artifacts = by_prefix.entry(prefix).or_default();
+                artifacts.push(artifact);
+                (artifacts.len() == 2).then(|| (prefix, artifacts.clone()))
+            })
+            .expect("two provider keys eventually share a prefix");
+        let neighbor = (0..u64::MAX)
+            .map(artifact)
+            .find(|artifact| provider_key(team, *artifact)[0] != oversized_prefix)
+            .expect("a provider key eventually lands in another prefix");
+        let healthy_prefix = provider_key(team, neighbor)[0];
+        let artifacts = [pair[0], pair[1], neighbor];
+
+        let initial = ProviderCover::from_artifacts_with_shard_limit(team, artifacts, 2);
+        assert!(initial.omitted.is_empty());
+        let mut scheduler = ProviderCoverScheduler::new();
+        scheduler.observe_cover(initial.cover, now);
+        while let Some(shard) = scheduler.pop_due(now) {
+            scheduler.complete(
+                ProviderShardAnnouncementOutcome {
+                    prefix: shard.prefix(),
+                    digest: shard.digest(),
+                    attempted_at: now,
+                    publication: ProviderPublication {
+                        local_accepted: true,
+                        ..ProviderPublication::default()
+                    },
+                },
+                now,
+            );
+        }
+        let healthy_due = scheduler.next_due(healthy_prefix);
+        let healthy_deadline = scheduler.lease_deadline(healthy_prefix);
+        assert!(scheduler.lease_deadline(oversized_prefix).is_some());
+
+        let partial = ProviderCover::from_artifacts_with_shard_limit(team, artifacts, 1);
+        assert_eq!(
+            partial.omitted,
+            vec![crate::provider::OmittedProviderPrefix {
+                prefix: oversized_prefix,
+                count: 2,
+            }]
+        );
+        assert!(partial.cover.get(oversized_prefix).is_none());
+        assert!(partial.cover.get(healthy_prefix).is_some());
+        scheduler.observe_cover(partial.cover, now + Duration::from_secs(1));
+
+        assert_eq!(scheduler.active_len(), 1);
+        assert_eq!(scheduler.next_due(oversized_prefix), None);
+        assert_eq!(scheduler.lease_deadline(oversized_prefix), None);
+        assert_eq!(scheduler.next_due(healthy_prefix), healthy_due);
+        assert_eq!(scheduler.lease_deadline(healthy_prefix), healthy_deadline);
+    }
+
+    #[test]
+    fn provider_cover_scheduler_rate_limits_definite_lease_miss_warnings() {
+        let now = crate::clock::mono_now();
+        let cover = cover_with_prefixes(key(13), 1);
+        let prefix = *cover.iter().next().unwrap().0;
+        let mut scheduler = ProviderCoverScheduler::new();
+        scheduler.observe_cover(cover, now);
+        let shard = scheduler.pop_due(now).unwrap();
+        scheduler.complete(
+            ProviderShardAnnouncementOutcome {
+                prefix,
+                digest: shard.digest(),
                 attempted_at: now,
                 publication: ProviderPublication {
                     local_accepted: true,
@@ -3165,12 +3447,12 @@ mod tests {
         let deadline = now + PROVIDER_LEASE_LIFETIME;
         assert_eq!(
             scheduler.warnable_expired_lease(deadline),
-            Some((artifact, deadline))
+            Some((prefix, deadline))
         );
         assert_eq!(scheduler.warnable_expired_lease(deadline), None);
         assert_eq!(
             scheduler.warnable_expired_lease(deadline + OFFER_BACKLOG_WARNING_INTERVAL),
-            Some((artifact, deadline))
+            Some((prefix, deadline))
         );
     }
 
@@ -3190,13 +3472,20 @@ mod tests {
         let snapshot = Arc::new(StoreSnapshot::from_store(&mut store, team).unwrap());
         let slot = Arc::new(Mutex::new(Some(snapshot)));
 
-        assert_eq!(
-            active_artifact_offers(&offers, &slot, true),
-            BTreeSet::from([resident])
+        let active = active_provider_cover(&offers, &slot, true, team).cover;
+        let expected = ProviderCover::from_artifacts(team, [resident]).cover;
+        assert!(active.same_membership(&expected));
+        assert!(
+            active_provider_cover(&offers, &slot, false, team)
+                .cover
+                .same_membership(&ProviderCover::default())
         );
-        assert!(active_artifact_offers(&offers, &slot, false).is_empty());
         slot.lock().unwrap().take();
-        assert!(active_artifact_offers(&offers, &slot, true).is_empty());
+        assert!(
+            active_provider_cover(&offers, &slot, true, team)
+                .cover
+                .same_membership(&ProviderCover::default())
+        );
     }
 
     #[test]
@@ -3273,6 +3562,40 @@ mod tests {
             recv_provider_artifact(&mut recv).await.is_err(),
             "an appended claimed provider identity must invalidate the request"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_body_rejects_corruption_truncation_and_trailing_bytes() {
+        let mut first = [0; 32];
+        first[0] = 7;
+        first[31] = 1;
+        let mut second = first;
+        second[31] = 2;
+        let keys = [first, second];
+        let digest =
+            PATCH::<32, IdentitySchema, (), triblespace_core::patch::Blake3Merkle>::from_keys(keys)
+                .merkle_root()
+                .unwrap();
+        let mut body = Vec::new();
+        body.push(7);
+        body.extend_from_slice(&digest);
+        body.extend_from_slice(&2_u32.to_be_bytes());
+        for key in keys {
+            body.extend_from_slice(&key);
+        }
+        assert!(recv_provider_body(&mut body.as_slice()).await.is_ok());
+
+        let mut corrupt = body.clone();
+        corrupt[1] ^= 1;
+        assert!(recv_provider_body(&mut corrupt.as_slice()).await.is_err());
+
+        let mut truncated = body.clone();
+        truncated.pop();
+        assert!(recv_provider_body(&mut truncated.as_slice()).await.is_err());
+
+        let mut trailing = body;
+        trailing.push(0);
+        assert!(recv_provider_body(&mut trailing.as_slice()).await.is_err());
     }
 
     #[tokio::test]
