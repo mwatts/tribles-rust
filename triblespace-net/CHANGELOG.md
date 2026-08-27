@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound the shared outbound connection pool to 64 fully reciprocal
+  CONNECT+SYNC_TEAM-authorized sessions. Successful sessions use deterministic
+  LRU residency; capacity retirement preserves in-flight shallow connection
+  leases, while failure and expiry evict only the exact observed generation.
+  CONNECT and SYNC_TEAM now initialize one terminal singleflight session, so a
+  canceled second exchange cannot remain cached as a live half-authorized
+  connection.
+
 - Build replacement serving snapshots from `StoreRevisionChanges`: changed
   components alone are enumerated, unchanged immutable inventory PATCHes are
   retained before construction, and every installed snapshot still carries a

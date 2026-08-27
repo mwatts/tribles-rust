@@ -148,6 +148,15 @@ connection is rejected. Manifest, node, provider, blob-range, and known-hash
 `GET_BLOB` requests all require this live session. Knowing a content hash is
 not disclosure authority.
 
+The client shares one pool across reconciliation and DHT operations and keeps
+at most 64 fully CONNECT- and SYNC_TEAM-authorized sessions resident. A peer
+enters the least-recently-used set only after both reciprocal exchanges
+succeed. Capacity retirement releases the pool's ownership without actively
+closing the shallow connection clones held by in-flight operations; a later
+request redials and rechecks both proofs. Failure and expiry remove only the
+exact session generation that observed them, so a late operation cannot evict
+a newer redial of the same peer.
+
 Neither handshake searches the store for a proof or fetches missing claims.
 Each selected bundle contains its exact ordered proof and claim closure inline.
 Stored proof presence remains evidence only.

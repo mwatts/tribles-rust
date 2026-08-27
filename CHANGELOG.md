@@ -174,6 +174,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound the unified inventory/DHT outbound pool to 64 fully reciprocal
+  CONNECT+SYNC_TEAM-authorized sessions with deterministic LRU residency.
+  Retirement releases cache ownership without interrupting in-flight shallow
+  connection leases, and late failures can evict only their exact session
+  generation rather than a newer redial.
+
 - Make store revision invalidation component-aware. `MemoryRepo`, `Pile`, and
   `Yard` now distinguish Blob membership, collection records, capability
   proofs, PEER evidence, and the local Blob reader lease. Network refreshes

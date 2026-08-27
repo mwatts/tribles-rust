@@ -731,46 +731,150 @@ pub(crate) trait NetCapability: Send + Sync {
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
 
 struct PoolEntry<C> {
-    connection: tokio::sync::OnceCell<AuthenticatedConnection<C>>,
-    inventory_auth: tokio::sync::OnceCell<RemoteAuthorization>,
+    session: tokio::sync::OnceCell<Result<AuthenticatedSession<C>, Arc<anyhow::Error>>>,
 }
 
 #[derive(Clone)]
-struct AuthenticatedConnection<C> {
+struct AuthenticatedSession<C> {
     connection: C,
-    validity: Option<CapabilityValidity>,
+    connect_validity: Option<CapabilityValidity>,
+    sync_validity: Option<CapabilityValidity>,
 }
 
-impl<C> AuthenticatedConnection<C> {
+impl<C> AuthenticatedSession<C> {
     fn is_current_at(&self, now: hifitime::Epoch) -> bool {
-        self.validity.is_none_or(|validity| validity.contains(now))
+        self.connect_validity
+            .is_none_or(|validity| validity.contains(now))
+            && self
+                .sync_validity
+                .is_none_or(|validity| validity.contains(now))
     }
 }
 
-#[derive(Clone, Copy)]
-struct RemoteAuthorization {
-    validity: Option<CapabilityValidity>,
+/// One operation's lease on an exact pool generation.
+///
+/// Carrying the entry alongside the shallow connection clone prevents a late
+/// failure from evicting a newer redial of the same peer after capacity
+/// retirement.
+#[derive(Clone)]
+struct PooledConnection<C> {
+    entry: Arc<PoolEntry<C>>,
+    connection: C,
 }
 
-impl RemoteAuthorization {
-    fn is_current_at(self, now: hifitime::Epoch) -> bool {
-        self.validity.is_none_or(|validity| validity.contains(now))
+impl<C> PooledConnection<C> {
+    fn conn(&self) -> &C {
+        &self.connection
     }
 }
 
 impl<C> Default for PoolEntry<C> {
     fn default() -> Self {
         Self {
-            connection: tokio::sync::OnceCell::new(),
-            inventory_auth: tokio::sync::OnceCell::new(),
+            session: tokio::sync::OnceCell::new(),
         }
     }
 }
 
-type SharedPool<C> = Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<PoolEntry<C>>>>>;
+/// One shared cache of successfully CONNECT- and SYNC_TEAM-authorized peers.
+///
+/// A peer joins the bounded recency queue only after both checks succeed, so an
+/// unauthenticated dial cannot evict a useful connection. Retiring a successful
+/// entry drops only the pool's ownership: [`Conn`] clones held by active
+/// operations remain valid and finish naturally instead of being closed
+/// underneath their streams. Pending attempts do not retain a connection until
+/// both authorizations succeed; bounding all outbound work is a separate
+/// admission-control concern. A completed protocol failure or expired proof
+/// invalidates its exact generation; cancellation at an outer scheduling
+/// deadline merely drops that operation's lease because it is not evidence
+/// that the shared session failed.
+struct ConnectionPool<C> {
+    entries: HashMap<PeerId, Arc<PoolEntry<C>>>,
+    least_to_most_recent: VecDeque<PeerId>,
+    resident_limit: usize,
+}
+
+impl<C> ConnectionPool<C> {
+    fn new(resident_limit: usize) -> Self {
+        assert!(
+            resident_limit > 0,
+            "a connection pool needs one resident slot"
+        );
+        Self {
+            entries: HashMap::new(),
+            least_to_most_recent: VecDeque::new(),
+            resident_limit,
+        }
+    }
+
+    fn entry(&mut self, peer: PeerId) -> Arc<PoolEntry<C>> {
+        self.entries
+            .entry(peer)
+            .or_insert_with(|| Arc::new(PoolEntry::default()))
+            .clone()
+    }
+
+    /// Admit one fully authorized entry and retire the least recently used
+    /// successful entries above the fixed residency bound.
+    ///
+    /// The returned entries are deliberately not closed. Dropping them outside
+    /// the mutex releases idle connections while shallow clones keep in-flight
+    /// leases alive. A later request for a retired peer creates a fresh
+    /// singleflight entry and re-runs both validity checks.
+    fn admit_if_current(
+        &mut self,
+        peer: PeerId,
+        expected: &Arc<PoolEntry<C>>,
+    ) -> Option<Arc<PoolEntry<C>>> {
+        if !self
+            .entries
+            .get(&peer)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            return None;
+        }
+
+        Self::forget(&mut self.least_to_most_recent, peer);
+        self.least_to_most_recent.push_back(peer);
+        if self.least_to_most_recent.len() <= self.resident_limit {
+            return None;
+        }
+        let oldest = self
+            .least_to_most_recent
+            .pop_front()
+            .expect("an over-limit recency queue is non-empty");
+        self.entries.remove(&oldest)
+    }
+
+    fn remove_if(
+        &mut self,
+        peer: PeerId,
+        expected: &Arc<PoolEntry<C>>,
+    ) -> Option<Arc<PoolEntry<C>>> {
+        if !self
+            .entries
+            .get(&peer)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            return None;
+        }
+        Self::forget(&mut self.least_to_most_recent, peer);
+        self.entries.remove(&peer)
+    }
+
+    fn forget(queue: &mut VecDeque<PeerId>, peer: PeerId) {
+        if let Some(position) = queue.iter().position(|candidate| *candidate == peer) {
+            queue.remove(position);
+        }
+    }
+}
+
+type SharedPool<C> = Arc<Mutex<ConnectionPool<C>>>;
 
 fn new_shared_pool<C>() -> SharedPool<C> {
-    Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    Arc::new(Mutex::new(ConnectionPool::new(
+        MAX_AUTHENTICATED_CONNECTIONS,
+    )))
 }
 
 struct NetCap<T: Transport> {
@@ -1085,6 +1189,10 @@ const INBOUND_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_
 pub(crate) const MAX_INBOUND_CONNECTIONS_GLOBAL: usize = 64;
 pub(crate) const MAX_INBOUND_REQUESTS_PER_CONNECTION: usize = 16;
 const MAX_INBOUND_REQUESTS_GLOBAL: usize = 64;
+/// Retain at most the same number of fully authorized outbound connections as
+/// the server admits inbound. Pending handshakes enter this residency set only
+/// after CONNECT and SYNC_TEAM both succeed.
+const MAX_AUTHENTICATED_CONNECTIONS: usize = MAX_INBOUND_CONNECTIONS_GLOBAL;
 const MAX_CONCURRENT_SWEEPS: usize = 8;
 /// Maximum number of new pairwise reconciliations admitted by one period.
 ///
@@ -1670,12 +1778,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         Ok(Ok(())) => true,
                         Ok(Err(error)) => {
                             debug!(peer = %hex::encode(&peer[..4]), %error, "inventory sweep failed");
-                            pool_evict(&pool, peer).await;
                             false
                         }
                         Err(_) => {
                             debug!(peer = %hex::encode(&peer[..4]), "inventory sweep deadline exceeded");
-                            pool_evict(&pool, peer).await;
                             false
                         }
                     };
@@ -1796,6 +1902,23 @@ async fn reconcile_inventory_peer<T: Transport>(
 ) -> anyhow::Result<()> {
     let connection =
         inventory_pool_get(transport, pool, peer, team, connect_proof, sync_proof).await?;
+    let result =
+        reconcile_authenticated_peer(&connection, peer, team, qos, local, events, candidates).await;
+    if result.is_err() {
+        pool_invalidate(pool, peer, &connection.entry);
+    }
+    result
+}
+
+async fn reconcile_authenticated_peer<C: Conn>(
+    connection: &PooledConnection<C>,
+    peer: PeerId,
+    team: VerifyingKey,
+    qos: ReconcileQos,
+    local: SharedSnapshot,
+    events: &tokio::sync::mpsc::Sender<NetEventBatch>,
+    candidates: &RoutingCandidates,
+) -> anyhow::Result<()> {
     let remote_key = VerifyingKey::from_bytes(&peer)?;
     candidates.lock().unwrap().promote_authenticated(peer);
     let mut admissions = AdmissionBatcher::new(events);
@@ -1803,9 +1926,10 @@ async fn reconcile_inventory_peer<T: Transport>(
         .push(NetEvent::Peer(PeerEvidence::new(team, remote_key)))
         .await?;
 
-    let manifest = tokio::time::timeout(OP_DEADLINE, op_inventory_manifest(&connection, team))
-        .await
-        .map_err(|_| anyhow::anyhow!("inventory manifest deadline exceeded"))??;
+    let manifest =
+        tokio::time::timeout(OP_DEADLINE, op_inventory_manifest(connection.conn(), team))
+            .await
+            .map_err(|_| anyhow::anyhow!("inventory manifest deadline exceeded"))??;
     for component in InventoryComponent::ALL {
         if !qos.traverses(component) {
             continue;
@@ -1824,7 +1948,7 @@ async fn reconcile_inventory_peer<T: Transport>(
                 in_flight.push(async move {
                     let response = tokio::time::timeout(
                         OP_DEADLINE,
-                        op_inventory_node(&request_connection, team, &request),
+                        op_inventory_node(request_connection.conn(), team, &request),
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("inventory node deadline exceeded"))??;
@@ -1839,7 +1963,7 @@ async fn reconcile_inventory_peer<T: Transport>(
                 local.contains_relative_key(component, key)
             })?;
             if let Some(leaf) = missing {
-                let event = remote_leaf_event(&connection, team, advertised, leaf).await?;
+                let event = remote_leaf_event(connection.conn(), team, advertised, leaf).await?;
                 admissions.push(event).await?;
             }
         }
@@ -1959,65 +2083,46 @@ async fn fetch_inventory_blob<C: Conn>(
 
 #[instrument(
     level = "info",
-    skip(transport, team, connect_proof),
+    skip(transport, team, connect_proof, sync_proof),
     fields(peer = %hex::encode(&peer[..4]))
 )]
-async fn connect_authed<T: Transport>(
+async fn connect_inventory_session<T: Transport>(
     transport: &T,
     peer: PeerId,
     team: VerifyingKey,
     connect_proof: &CapabilityProofBundle,
-) -> anyhow::Result<AuthenticatedConnection<T::Conn>> {
-    let connection = transport.dial(peer, PILE_SYNC_ALPN).await?;
-    let verified = op_auth(&connection, connect_proof, team, peer).await?;
-    Ok(AuthenticatedConnection {
+    sync_proof: &CapabilityProofBundle,
+) -> anyhow::Result<AuthenticatedSession<T::Conn>> {
+    let (connection, connect_validity) = tokio::time::timeout(DIAL_DEADLINE, async {
+        let connection = transport.dial(peer, PILE_SYNC_ALPN).await?;
+        let verified = op_auth(&connection, connect_proof, team, peer).await?;
+        Ok::<_, anyhow::Error>((connection, verified.effective_validity()))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("connection setup deadline exceeded"))??;
+    let verified = tokio::time::timeout(
+        OP_DEADLINE,
+        op_inventory_auth(&connection, sync_proof, team, peer),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("inventory authorization deadline exceeded"))??;
+    Ok(AuthenticatedSession {
         connection,
-        validity: verified.effective_validity(),
+        connect_validity,
+        sync_validity: verified.effective_validity(),
     })
 }
 
-async fn pool_entry<C>(pool: &SharedPool<C>, peer: PeerId) -> Arc<PoolEntry<C>> {
-    pool.lock()
-        .await
-        .entry(peer)
-        .or_insert_with(|| Arc::new(PoolEntry::default()))
-        .clone()
+fn pool_entry<C>(pool: &SharedPool<C>, peer: PeerId) -> Arc<PoolEntry<C>> {
+    pool.lock().unwrap().entry(peer)
 }
 
-async fn pool_get<T: Transport>(
-    transport: &T,
-    pool: &SharedPool<T::Conn>,
-    peer: PeerId,
-    team: VerifyingKey,
-    connect_proof: &CapabilityProofBundle,
-) -> Option<(Arc<PoolEntry<T::Conn>>, T::Conn)> {
-    let entry = pool_entry(pool, peer).await;
-    let initialized = entry
-        .connection
-        .get_or_try_init(|| async {
-            tokio::time::timeout(
-                DIAL_DEADLINE,
-                connect_authed(transport, peer, team, connect_proof),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("connection setup deadline exceeded"))?
-        })
-        .await;
-    match initialized {
-        Ok(connection) if connection.is_current_at(crate::clock::epoch_now()) => {
-            Some((entry.clone(), connection.connection.clone()))
-        }
-        Ok(_) => {
-            debug!(peer = %hex::encode(&peer[..4]), "remote CONNECT capability expired");
-            pool_remove_if(pool, peer, &entry).await;
-            None
-        }
-        Err(error) => {
-            debug!(peer = %hex::encode(&peer[..4]), %error, "authenticated dial failed");
-            pool_remove_if(pool, peer, &entry).await;
-            None
-        }
-    }
+fn pool_admit_if_current<C>(pool: &SharedPool<C>, peer: PeerId, expected: &Arc<PoolEntry<C>>) {
+    let retired = pool.lock().unwrap().admit_if_current(peer, expected);
+    // Capacity retirement is not failure eviction. In particular, do not call
+    // Conn::close: operations own shallow connection clones and must be able to
+    // finish after the pool releases its cache reference.
+    drop(retired);
 }
 
 async fn inventory_pool_get<T: Transport>(
@@ -2027,61 +2132,38 @@ async fn inventory_pool_get<T: Transport>(
     team: VerifyingKey,
     connect_proof: &CapabilityProofBundle,
     sync_proof: &CapabilityProofBundle,
-) -> anyhow::Result<T::Conn> {
-    let (entry, connection) = pool_get(transport, pool, peer, team, connect_proof)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("peer is unavailable"))?;
-    let authorized = entry
-        .inventory_auth
-        .get_or_try_init(|| async {
-            let verified = tokio::time::timeout(
-                OP_DEADLINE,
-                op_inventory_auth(&connection, sync_proof, team, peer),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("inventory authorization deadline exceeded"))??;
-            Ok::<_, anyhow::Error>(RemoteAuthorization {
-                validity: verified.effective_validity(),
-            })
+) -> anyhow::Result<PooledConnection<T::Conn>> {
+    let entry = pool_entry(pool, peer);
+    let initialized = entry
+        .session
+        .get_or_init(|| async {
+            connect_inventory_session(transport, peer, team, connect_proof, sync_proof)
+                .await
+                .map_err(Arc::new)
         })
         .await;
-    match authorized {
-        Ok(authorization) if authorization.is_current_at(crate::clock::epoch_now()) => {}
+    let connection = match initialized {
+        Ok(session) if session.is_current_at(crate::clock::epoch_now()) => {
+            session.connection.clone()
+        }
         Ok(_) => {
-            pool_remove_if(pool, peer, &entry).await;
-            anyhow::bail!("remote SYNC_TEAM capability expired");
+            pool_invalidate(pool, peer, &entry);
+            anyhow::bail!("remote CONNECT or SYNC_TEAM capability expired");
         }
         Err(error) => {
-            pool_remove_if(pool, peer, &entry).await;
-            return Err(error);
-        }
-    }
-    Ok(connection)
-}
-
-async fn pool_remove_if<C: Conn>(pool: &SharedPool<C>, peer: PeerId, expected: &Arc<PoolEntry<C>>) {
-    let removed = {
-        let mut guard = pool.lock().await;
-        if guard
-            .get(&peer)
-            .is_some_and(|current| Arc::ptr_eq(current, expected))
-        {
-            guard.remove(&peer)
-        } else {
-            None
+            debug!(peer = %hex::encode(&peer[..4]), %error, "authenticated session failed");
+            pool_invalidate(pool, peer, &entry);
+            return Err(anyhow::anyhow!(error.to_string()));
         }
     };
-    if let Some(entry) = removed
-        && let Some(connection) = entry.connection.get()
-    {
-        connection.connection.close(0, b"pool evict");
-    }
+    pool_admit_if_current(pool, peer, &entry);
+    Ok(PooledConnection { entry, connection })
 }
 
-async fn pool_evict<C: Conn>(pool: &SharedPool<C>, peer: PeerId) {
-    let entry = pool.lock().await.get(&peer).cloned();
-    if let Some(entry) = entry {
-        pool_remove_if(pool, peer, &entry).await;
+fn pool_invalidate<C: Conn>(pool: &SharedPool<C>, peer: PeerId, entry: &Arc<PoolEntry<C>>) {
+    let _ = pool.lock().unwrap().remove_if(peer, entry);
+    if let Some(Ok(session)) = entry.session.get() {
+        session.connection.close(0, b"pool evict");
     }
 }
 
@@ -2142,16 +2224,25 @@ async fn fetch_from_providers<T: Transport>(
 ) -> Option<Vec<u8>> {
     let attempts = providers.iter().copied().map(|peer| {
         Box::pin(async move {
-            let connection = tokio::time::timeout(
+            let connection = match tokio::time::timeout(
                 PROVIDER_CONTROL_RPC_DEADLINE,
                 inventory_pool_get(transport, pool, peer, team, connect_proof, sync_proof),
             )
-            .await;
-            let result = match connection {
-                Ok(Ok(connection)) => op_get_blob(&connection, hash).await,
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(anyhow::anyhow!("provider connection deadline exceeded")),
+            .await
+            {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    debug!(peer = %hex::encode(&peer[..4]), %error, "provider connection failed");
+                    candidates.lock().unwrap().remove(peer);
+                    return None;
+                }
+                Err(_) => {
+                    debug!(peer = %hex::encode(&peer[..4]), "provider connection deadline exceeded");
+                    candidates.lock().unwrap().remove(peer);
+                    return None;
+                }
             };
+            let result = op_get_blob(connection.conn(), hash).await;
             match result {
                 Ok(Some(bytes)) if blake3::hash(&bytes).as_bytes() == hash => {
                     candidates.lock().unwrap().promote_authenticated(peer);
@@ -2163,7 +2254,7 @@ async fn fetch_from_providers<T: Transport>(
                 }
                 Ok(Some(_)) | Err(_) => {
                     candidates.lock().unwrap().remove(peer);
-                    pool_evict(pool, peer).await;
+                    pool_invalidate(pool, peer, &connection.entry);
                     None
                 }
             }
@@ -2213,7 +2304,6 @@ impl<T: Transport> ProviderClient<T> {
                     Err(error) => {
                         debug!(peer = %hex::encode(&peer[..4]), %error, "FIND_NODE failed");
                         lookup.record_failure(peer, &mut self.candidates.lock().unwrap());
-                        pool_evict(&self.pool, peer).await;
                     }
                 }
                 if lookup.is_finished() && pending.is_empty() {
@@ -2227,7 +2317,6 @@ impl<T: Transport> ProviderClient<T> {
             drop(pending);
             for peer in active {
                 lookup.record_failure(peer, &mut self.candidates.lock().unwrap());
-                pool_evict(&self.pool, peer).await;
             }
         }
 
@@ -2249,9 +2338,19 @@ impl<T: Transport> ProviderClient<T> {
             &self.sync_proof,
         )
         .await?;
-        tokio::time::timeout(OP_DEADLINE, op_find_node(&connection, &target))
-            .await
-            .map_err(|_| anyhow::anyhow!("FIND_NODE deadline exceeded"))?
+        let result =
+            match tokio::time::timeout(OP_DEADLINE, op_find_node(connection.conn(), &target)).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    pool_invalidate(&self.pool, peer, &connection.entry);
+                    anyhow::bail!("FIND_NODE deadline exceeded");
+                }
+            };
+        if result.is_err() {
+            pool_invalidate(&self.pool, peer, &connection.entry);
+        }
+        result
     }
 
     fn expects_remote(&self) -> bool {
@@ -2294,7 +2393,6 @@ impl<T: Transport> ProviderClient<T> {
                     Ok(false) => {}
                     Err(_) => {
                         self.candidates.lock().unwrap().remove(target);
-                        pool_evict(&self.pool, target).await;
                     }
                 }
             }
@@ -2353,7 +2451,12 @@ impl<T: Transport> ProviderClient<T> {
             .promote_authenticated(target);
         let probe = match tokio::time::timeout(
             PROVIDER_CONTROL_RPC_DEADLINE,
-            op_provider_probe(&connection, shard.prefix(), &shard.digest(), shard.count()),
+            op_provider_probe(
+                connection.conn(),
+                shard.prefix(),
+                &shard.digest(),
+                shard.count(),
+            ),
         )
         .await
         {
@@ -2361,12 +2464,12 @@ impl<T: Transport> ProviderClient<T> {
             Ok(Err(error)) => {
                 debug!(peer = %hex::encode(&target[..4]), %error, "provider PROBE failed");
                 self.candidates.lock().unwrap().remove(target);
-                pool_evict(&self.pool, target).await;
+                pool_invalidate(&self.pool, target, &connection.entry);
                 return false;
             }
             Err(_) => {
                 self.candidates.lock().unwrap().remove(target);
-                pool_evict(&self.pool, target).await;
+                pool_invalidate(&self.pool, target, &connection.entry);
                 return false;
             }
         };
@@ -2376,7 +2479,12 @@ impl<T: Transport> ProviderClient<T> {
             ProviderProbe::Need => {
                 match tokio::time::timeout(
                     OP_DEADLINE,
-                    op_provider_body(&connection, shard.prefix(), &shard.digest(), shard.keys()),
+                    op_provider_body(
+                        connection.conn(),
+                        shard.prefix(),
+                        &shard.digest(),
+                        shard.keys(),
+                    ),
                 )
                 .await
                 {
@@ -2384,12 +2492,12 @@ impl<T: Transport> ProviderClient<T> {
                     Ok(Err(error)) => {
                         debug!(peer = %hex::encode(&target[..4]), %error, "provider BODY failed");
                         self.candidates.lock().unwrap().remove(target);
-                        pool_evict(&self.pool, target).await;
+                        pool_invalidate(&self.pool, target, &connection.entry);
                         false
                     }
                     Err(_) => {
                         self.candidates.lock().unwrap().remove(target);
-                        pool_evict(&self.pool, target).await;
+                        pool_invalidate(&self.pool, target, &connection.entry);
                         false
                     }
                 }
@@ -2430,7 +2538,6 @@ impl<T: Transport> ProviderClient<T> {
                     Ok(providers) => replies_by_replica.push((target, providers)),
                     Err(_) => {
                         self.candidates.lock().unwrap().remove(target);
-                        pool_evict(&self.pool, target).await;
                     }
                 }
             }
@@ -2468,17 +2575,18 @@ impl<T: Transport> ProviderClient<T> {
             .lock()
             .unwrap()
             .promote_authenticated(target);
-        match tokio::time::timeout(OP_DEADLINE, op_provider_get(&connection, &artifact)).await {
+        match tokio::time::timeout(OP_DEADLINE, op_provider_get(connection.conn(), &artifact)).await
+        {
             Ok(Ok(providers)) => providers,
             Ok(Err(error)) => {
                 debug!(peer = %hex::encode(&target[..4]), %error, "provider GET failed");
                 self.candidates.lock().unwrap().remove(target);
-                pool_evict(&self.pool, target).await;
+                pool_invalidate(&self.pool, target, &connection.entry);
                 Vec::new()
             }
             Err(_) => {
                 self.candidates.lock().unwrap().remove(target);
-                pool_evict(&self.pool, target).await;
+                pool_invalidate(&self.pool, target, &connection.entry);
                 Vec::new()
             }
         }
@@ -3078,6 +3186,50 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
+    struct CountingConn {
+        remote: PeerId,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl Conn for CountingConn {
+        type SendHalf = tokio::io::DuplexStream;
+        type RecvHalf = tokio::io::DuplexStream;
+
+        fn remote_id(&self) -> PeerId {
+            self.remote
+        }
+
+        async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
+            Ok(tokio::io::duplex(1))
+        }
+
+        async fn accept_bi(&self) -> Option<(Self::SendHalf, Self::RecvHalf)> {
+            None
+        }
+
+        fn close(&self, _code: u32, _reason: &[u8]) {
+            self.closes.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    async fn install_counted_session(
+        entry: &Arc<PoolEntry<CountingConn>>,
+        connection: CountingConn,
+    ) {
+        let session = entry
+            .session
+            .get_or_init(|| async {
+                Ok(AuthenticatedSession {
+                    connection,
+                    connect_validity: None,
+                    sync_validity: None,
+                })
+            })
+            .await;
+        assert!(session.is_ok());
+    }
+
     fn key(byte: u8) -> VerifyingKey {
         SigningKey::from_bytes(&[byte; 32]).verifying_key()
     }
@@ -3086,6 +3238,95 @@ mod tests {
         let mut artifact = [0; 32];
         artifact[24..].copy_from_slice(&index.to_be_bytes());
         artifact
+    }
+
+    #[test]
+    fn connection_pool_bounds_only_successfully_admitted_entries() {
+        let a = [1; 32];
+        let b = [2; 32];
+        let c = [3; 32];
+        let d = [4; 32];
+        let mut pool = ConnectionPool::<()>::new(2);
+
+        let a_entry = pool.entry(a);
+        assert!(pool.admit_if_current(a, &a_entry).is_none());
+        let b_entry = pool.entry(b);
+        assert!(pool.admit_if_current(b, &b_entry).is_none());
+
+        // A pending, not-yet-authorized peer consumes no resident slot and
+        // therefore cannot flush a healthy connection through dial churn.
+        let c_entry = pool.entry(c);
+        assert_eq!(pool.least_to_most_recent, VecDeque::from([a, b]));
+        assert!(pool.entries.contains_key(&a));
+        assert!(pool.entries.contains_key(&b));
+
+        let retired = pool
+            .admit_if_current(c, &c_entry)
+            .expect("C should retire A");
+        assert!(Arc::ptr_eq(&retired, &a_entry));
+        assert_eq!(pool.least_to_most_recent, VecDeque::from([b, c]));
+        assert!(!pool.entries.contains_key(&a));
+
+        // Reuse moves B to the back, so admitting D retires C. Retirement
+        // returns the owning Arc without closing any shallow connection lease.
+        assert!(pool.admit_if_current(b, &b_entry).is_none());
+        let d_entry = pool.entry(d);
+        let retired = pool
+            .admit_if_current(d, &d_entry)
+            .expect("D should retire C");
+        assert!(Arc::ptr_eq(&retired, &c_entry));
+        assert_eq!(pool.least_to_most_recent, VecDeque::from([b, d]));
+
+        // A late success from a retired generation cannot evict or reorder the
+        // current cache.
+        assert!(pool.admit_if_current(c, &c_entry).is_none());
+        assert_eq!(pool.least_to_most_recent, VecDeque::from([b, d]));
+    }
+
+    #[tokio::test]
+    async fn connection_pool_failure_closes_only_its_exact_generation() {
+        let peer = [1; 32];
+        let other = [2; 32];
+        let pool = Arc::new(Mutex::new(ConnectionPool::new(1)));
+        let retired_closes = Arc::new(AtomicUsize::new(0));
+        let current_closes = Arc::new(AtomicUsize::new(0));
+
+        let retired_generation = pool_entry(&pool, peer);
+        install_counted_session(
+            &retired_generation,
+            CountingConn {
+                remote: peer,
+                closes: retired_closes.clone(),
+            },
+        )
+        .await;
+        pool_admit_if_current(&pool, peer, &retired_generation);
+
+        let other_entry = pool_entry(&pool, other);
+        pool_admit_if_current(&pool, other, &other_entry);
+        assert_eq!(retired_closes.load(AtomicOrdering::SeqCst), 0);
+
+        let current_generation = pool_entry(&pool, peer);
+        install_counted_session(
+            &current_generation,
+            CountingConn {
+                remote: peer,
+                closes: current_closes.clone(),
+            },
+        )
+        .await;
+        pool_admit_if_current(&pool, peer, &current_generation);
+
+        pool_invalidate(&pool, peer, &retired_generation);
+        assert_eq!(retired_closes.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(current_closes.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            pool.lock()
+                .unwrap()
+                .entries
+                .get(&peer)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &current_generation))
+        );
     }
 
     fn cover_with_prefixes(team: VerifyingKey, prefixes: usize) -> ProviderCover {
