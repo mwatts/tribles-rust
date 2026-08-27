@@ -106,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reframe canonical `Blake3Merkle` PATCH nodes as version-3 addressable blobs.
+  The cached node digest is ordinary BLAKE3 over one strict 32-byte-aligned
+  encoding, whose child digests occupy aligned fields discoverable by generic
+  blob traversal. Add a strict borrowed node view and logical-node
+  materializer, reject alternate padding/order/count spellings, and move pile
+  sync to the incompatible `/triblespace/pile-sync/11` ALPN.
+
 - Replace the remaining in-memory ordered sets for inert legacy V3 collection
   headers and Yard operation WANTs with PATCH indexes. Canonical PATCH
   traversal preserves their byte order, while Yard no longer sorts the full

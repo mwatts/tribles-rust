@@ -247,7 +247,7 @@ compute reuse without weakening this boundary.
 ## Wire surface
 
 All direct operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/10"`. One QUIC stream carries one
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/11"`. One QUIC stream carries one
 strictly framed operation:
 
 | Operation | Byte | Purpose |

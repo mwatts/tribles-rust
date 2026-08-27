@@ -20,7 +20,7 @@
 //! a successful connection-local SYNC_TEAM authorization. Remote evidence is
 //! admitted through the authenticated inventory walk, never a write RPC.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/10";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/11";
 
 use triblespace_core::capability::{CapabilityProofBundle, MAX_CAPABILITY_PROOF_BUNDLE_BYTES};
 use triblespace_core::id::{Id, id_hex};

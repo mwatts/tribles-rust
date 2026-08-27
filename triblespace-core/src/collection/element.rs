@@ -229,7 +229,7 @@ mod tests {
         let support = SupportRoot::from_commits([&commit]).unwrap();
         assert_eq!(
             support.into_bytes(),
-            hex!("98692252BFAB005E4059B196165DDDBE2B92334E6A284CD2E8EED0508F71315A")
+            hex!("C56A0E9B5573102E62E40210B90C5F69C83E040F8636C3C59408E3B479ECEDB2")
         );
 
         let element = CollectionElement::new(collection(1), support, data(2));
@@ -241,7 +241,7 @@ mod tests {
         assert_eq!(CollectionElement::from_bytes(bytes), element);
         assert_eq!(
             element.content_hash(),
-            hex!("A31ED3F3D6D4ED1886043A9B0324FB58B6A9AA4D0BA9CC21AB711DDB4C1EF578")
+            hex!("15039C7B101782B35D30B77EC47B9FD7F60D51B0D574BD8DCBBA256D11D483E1")
         );
 
         assert_ne!(

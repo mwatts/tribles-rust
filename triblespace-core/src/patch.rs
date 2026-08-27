@@ -16,6 +16,7 @@ mod branch;
 pub mod bytetable;
 mod entry;
 mod leaf;
+mod merkle_blob;
 
 use arrayvec::ArrayVec;
 
@@ -26,6 +27,10 @@ use leaf::*;
 
 /// Re-export of all byte table utilities.
 pub use bytetable::*;
+pub use merkle_blob::{
+    Blake3MerkleNodeBlob, Blake3MerkleNodeChild, Blake3MerkleNodeDecodeError,
+    BLAKE3_MERKLE_NODE_ALIGNMENT, BLAKE3_MERKLE_NODE_VERSION,
+};
 use rand::thread_rng;
 use rand::RngCore;
 use std::cmp::Reverse;
@@ -517,11 +522,10 @@ impl PatchHash for XorSip128 {
 /// PATCH's trie shape is a function of its key set, so insertion order and
 /// cuckoo-table placement do not affect the result.
 ///
-/// BLAKE3's native chunk tree is intentionally not reused here. Its tree
-/// describes fixed-size chunks of one byte stream, whereas PATCH is a sparse
-/// radix tree whose fanout and compressed depths change under edits. Branches
-/// are therefore framed explicitly and hashed with the ordinary streaming
-/// API.
+/// Version 3 frames each node as a canonical, 32-byte-aligned blob. The PATCH
+/// digest is ordinary BLAKE3 over those exact bytes, and child digests occupy
+/// aligned 32-byte fields discoverable by generic blob graph traversal. See
+/// [`Blake3MerkleNodeBlob`] for strict decoding.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Blake3Merkle;
 
@@ -540,9 +544,7 @@ impl PatchHash for Blake3Merkle {
 
     fn leaf(bytes: &[u8]) -> Self::Digest {
         let mut state = blake3::Hasher::new();
-        state.update(b"triblespace.patch.leaf.v1\0");
-        state.update(&(bytes.len() as u64).to_le_bytes());
-        state.update(bytes);
+        merkle_blob::encode_leaf(&mut state, bytes);
         *state.finalize().as_bytes()
     }
 
@@ -554,24 +556,24 @@ impl PatchHash for Blake3Merkle {
         leaf_count: u64,
     ) -> Self::BranchState {
         debug_assert_eq!(representative.len(), tree_to_key.len());
-        debug_assert!(end_depth <= representative.len());
+        debug_assert!(end_depth < representative.len());
         let mut state = blake3::Hasher::new();
-        state.update(b"triblespace.patch.branch.v2\0");
-        state.update(&(representative.len() as u64).to_le_bytes());
-        state.update(&(end_depth as u64).to_le_bytes());
-        for &key_index in &tree_to_key[..end_depth] {
-            state.update(&[representative[key_index]]);
-        }
-        state.update(&(child_count as u64).to_le_bytes());
-        state.update(&leaf_count.to_le_bytes());
+        merkle_blob::encode_branch_start(
+            &mut state,
+            representative.len(),
+            end_depth,
+            child_count,
+            leaf_count,
+            tree_to_key[..end_depth]
+                .iter()
+                .map(|&key_index| representative[key_index]),
+        );
         state
     }
 
     #[inline]
     fn push_child(state: &mut Self::BranchState, edge: u8, leaf_count: u64, digest: Self::Digest) {
-        state.update(&[edge]);
-        state.update(&leaf_count.to_le_bytes());
-        state.update(&digest);
+        merkle_blob::encode_child(state, edge, leaf_count, digest);
     }
 
     #[inline]
@@ -2890,6 +2892,48 @@ impl<'a, const KEY_LEN: usize, V> PATCHMerkleNode<'a, KEY_LEN, V> {
     /// Iterate over logical children in ascending edge-byte order.
     pub fn children(&self) -> PATCHMerkleChildren<'a, KEY_LEN, V> {
         PATCHMerkleChildren::new(*self)
+    }
+
+    /// Materialize this node's canonical, addressable version-3 blob.
+    ///
+    /// Ordinary `blake3::hash` over the returned bytes equals [`Self::digest`].
+    /// Every child digest in a branch starts at a 32-byte-aligned offset, so a
+    /// generic blob store can conservatively discover and retain the subtree.
+    pub fn canonical_blob_bytes(&self) -> Vec<u8> {
+        if self.is_leaf() {
+            let mut bytes = Vec::with_capacity(
+                merkle_blob::leaf_encoded_len(KEY_LEN)
+                    .expect("a PATCH key width fits the host address space"),
+            );
+            merkle_blob::encode_leaf(&mut bytes, self.representative());
+            debug_assert_eq!(*blake3::hash(&bytes).as_bytes(), self.digest());
+            return bytes;
+        }
+
+        let prefix = self.prefix();
+        let mut children = self.children();
+        let child_count = children.len();
+        assert!(
+            (2..=256).contains(&child_count),
+            "a logical PATCH branch has 2..=256 children"
+        );
+        let mut bytes = Vec::with_capacity(
+            merkle_blob::branch_encoded_len(prefix.len(), child_count)
+                .expect("a PATCH branch encoding fits the host address space"),
+        );
+        merkle_blob::encode_branch_start(
+            &mut bytes,
+            KEY_LEN,
+            prefix.len(),
+            child_count,
+            self.leaf_count(),
+            prefix.iter().copied(),
+        );
+        for (edge, child) in &mut children {
+            merkle_blob::encode_child(&mut bytes, edge, child.leaf_count(), child.digest());
+        }
+        debug_assert_eq!(*blake3::hash(&bytes).as_bytes(), self.digest());
+        bytes
     }
 
     /// Iterate over at most `limit` keys in this subtree, strictly after
@@ -5242,6 +5286,52 @@ mod tests {
         for (_, child) in node.children() {
             merkle_inventory(child, out);
         }
+    }
+
+    fn assert_addressable_merkle_nodes<const KEY_LEN: usize>(keys: &[[u8; KEY_LEN]]) {
+        fn walk<const KEY_LEN: usize>(node: PATCHMerkleNode<'_, KEY_LEN, ()>) {
+            let bytes = node.canonical_blob_bytes();
+            assert_eq!(bytes.len() % BLAKE3_MERKLE_NODE_ALIGNMENT, 0);
+            assert_eq!(*blake3::hash(&bytes).as_bytes(), node.digest());
+
+            let decoded = Blake3MerkleNodeBlob::<KEY_LEN>::decode(&bytes).unwrap();
+            assert_eq!(decoded.canonical_blob_bytes(), bytes);
+            assert_eq!(decoded.digest(), node.digest());
+            assert_eq!(decoded.prefix(), node.prefix());
+            assert_eq!(decoded.leaf_count(), node.leaf_count());
+            assert_eq!(decoded.is_leaf(), node.is_leaf());
+            assert_eq!(decoded.key(), node.is_leaf().then(|| node.representative()));
+
+            let children = node.children().collect::<Vec<_>>();
+            let decoded_children = decoded.children().collect::<Vec<_>>();
+            assert_eq!(decoded_children.len(), children.len());
+            for (descriptor, (edge, child)) in decoded_children.iter().zip(children) {
+                assert_eq!(descriptor.edge(), edge);
+                assert_eq!(descriptor.leaf_count(), child.leaf_count());
+                assert_eq!(descriptor.digest(), child.digest());
+                walk(child);
+            }
+        }
+
+        let patch = blake_patch(keys);
+        walk(patch.merkle_node(&[]).expect("nonempty test PATCH"));
+    }
+
+    #[test]
+    fn canonical_node_blobs_are_the_hashed_preimages_across_key_widths() {
+        fn keys<const KEY_LEN: usize>() -> Vec<[u8; KEY_LEN]> {
+            let mut first = [0x11; KEY_LEN];
+            let mut second = first;
+            let mut third = first;
+            first[KEY_LEN - 1] = 1;
+            second[KEY_LEN - 1] = 2;
+            third[KEY_LEN / 2] = 3;
+            vec![first, second, third]
+        }
+
+        assert_addressable_merkle_nodes(&keys::<16>());
+        assert_addressable_merkle_nodes(&keys::<32>());
+        assert_addressable_merkle_nodes(&keys::<64>());
     }
 
     #[test]

@@ -49,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connect_proof, sync_proof, qos }`. The team trust root also derives the gossip
   topic. CONNECT admits the transport, then exactly one SYNC_TEAM exchange
   selects disclosure authority for that connection.
-- Move pile sync to ALPN `/triblespace/pile-sync/10`. Remove the unused
+- Move pile sync to ALPN `/triblespace/pile-sync/11` for the incompatible
+  aligned Blake3Merkle v3 node format. Remove the unused
   CHILDREN and collection-specific operations; retain exact `GET_BLOB` and add
   bounded inventory authorization, manifest, node, and blob-range operations.
 - Use configured endpoint addresses only as bootstrap routes. Authorized
