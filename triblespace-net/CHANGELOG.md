@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make provider-cover directory admission purely aggregate and work-conserving.
+  Receivers now bound only live shard count and total live memberships; one
+  provider may use all otherwise-free capacity. Replacement admits the exact
+  `(directory - old shard + candidate)` weight, including at either boundary.
+
 - Replace collection-evidence gossip, exact receipt RPCs, and the separate
   custody replica protocol with one periodic inventory anti-entropy path.
   Authenticated pairwise PATCH reconciliation is the epidemic exchange; the

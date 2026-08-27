@@ -235,12 +235,16 @@ the offer dormant; if residency or a serving view later returns, normal
 snapshot observation activates it. In-flight stale hints need no cancellation
 protocol because receivers expire leases.
 
-Receiver memory has a global membership bound and a lower per-provider fair
-share. Consequently a single publisher above that fair share is not guaranteed
-complete directory coverage in a swarm so small that every prefix selects the
-same replicas. Rejected prefixes remain soft unknown and retry; this is an
-explicit availability-versus-monopoly QoS choice, not a claim that every valid
-publisher cover fits every receiver.
+Receiver admission is bounded only by the aggregate directory weight
+`(live shards, live memberships) <= (65,536, 2^24)`. It is work-conserving:
+any provider may use capacity which is presently free, with no lower
+per-provider ceiling. Replacement computes the weight after removing the old
+shard and adding its candidate, so a same-weight replacement remains possible
+at either exact boundary. A prefix rejected because the aggregate directory is
+full remains soft unknown and retries after capacity expires. Admission is
+therefore first-arrival: one authorized provider may occupy the whole bounded
+directory until its leases expire. Principal fairness is intentionally outside
+this soft discovery primitive.
 
 A reader that already knows `c` performs iterative `FIND_NODE`, asks those
 replicas for the corresponding team-and-prefix directory, and sends the raw

@@ -34,11 +34,10 @@ const _: () = assert!(MAX_PROVIDERS_PER_KEY <= u8::MAX as usize);
 /// keys spread across 256 prefixes, so the mean shard reaches this limit only
 /// around 16.7 million active offers; pathological skew is omitted explicitly.
 pub(crate) const MAX_PROVIDER_SHARD_MEMBERS: usize = 1 << 16;
+/// Aggregate receiver-local directory bounds. Admission is work-conserving:
+/// every provider may use any capacity not already occupied by live shards.
 const MAX_PROVIDER_SHARDS: usize = 65_536;
 const MAX_PROVIDER_MEMBERS: usize = 1 << 24;
-/// Fair receiver-local share across the prefix shards this directory happens
-/// to hold for one provider. This is not a publisher-cover ceiling.
-const MAX_PROVIDER_MEMBERS_PER_PROVIDER: usize = 1 << 20;
 /// Bound work performed by one exact directory lookup. A soft directory may
 /// return fewer hints rather than monopolize an async worker on an adversarially
 /// dense prefix; the per-prefix cursor makes repeated lookups cover every
@@ -271,7 +270,6 @@ pub(crate) struct ProviderDirectory {
     lookup_cursor_by_prefix: BTreeMap<u8, PeerId>,
     deadlines: BTreeSet<(Mono, u8, PeerId)>,
     member_count: usize,
-    members_by_provider: BTreeMap<PeerId, usize>,
     limits: DirectoryLimits,
 }
 
@@ -280,7 +278,6 @@ struct DirectoryLimits {
     lease: Duration,
     shards: usize,
     members: usize,
-    members_per_provider: usize,
 }
 
 impl Default for ProviderDirectory {
@@ -291,12 +288,10 @@ impl Default for ProviderDirectory {
             lookup_cursor_by_prefix: BTreeMap::new(),
             deadlines: BTreeSet::new(),
             member_count: 0,
-            members_by_provider: BTreeMap::new(),
             limits: DirectoryLimits {
                 lease: PROVIDER_LEASE_LIFETIME,
                 shards: MAX_PROVIDER_SHARDS,
                 members: MAX_PROVIDER_MEMBERS,
-                members_per_provider: MAX_PROVIDER_MEMBERS_PER_PROVIDER,
             },
         }
     }
@@ -328,19 +323,7 @@ impl ProviderDirectory {
             return ProviderProbe::Known;
         }
 
-        let old_count = self.shards.get(&key).map_or(0, |shard| shard.keys.len());
-        let projected_members = self.member_count - old_count + count;
-        let projected_provider_members = self
-            .members_by_provider
-            .get(&provider)
-            .copied()
-            .unwrap_or(0)
-            - old_count
-            + count;
-        if (!self.shards.contains_key(&key) && self.shards.len() >= self.limits.shards)
-            || projected_members > self.limits.members
-            || projected_provider_members > self.limits.members_per_provider
-        {
+        if !self.admits_replacement(key, count) {
             ProviderProbe::Full
         } else {
             ProviderProbe::Need
@@ -358,19 +341,7 @@ impl ProviderDirectory {
         self.prune_expired(now);
         let key = (candidate.prefix, provider);
 
-        let old_count = self.shards.get(&key).map_or(0, |shard| shard.keys.len());
-        let projected_members = self.member_count - old_count + candidate.count();
-        let projected_provider_members = self
-            .members_by_provider
-            .get(&provider)
-            .copied()
-            .unwrap_or(0)
-            - old_count
-            + candidate.count();
-        if (!self.shards.contains_key(&key) && self.shards.len() >= self.limits.shards)
-            || projected_members > self.limits.members
-            || projected_provider_members > self.limits.members_per_provider
-        {
+        if !self.admits_replacement(key, candidate.count()) {
             return false;
         }
 
@@ -378,7 +349,6 @@ impl ProviderDirectory {
         if let Some(old) = self.shards.remove(&key) {
             self.deadlines.remove(&(old.expires_at, key.0, key.1));
             self.member_count -= old.keys.len();
-            self.decrement_provider_members(provider, old.keys.len());
         }
 
         let expires_at = now + self.limits.lease;
@@ -389,7 +359,6 @@ impl ProviderDirectory {
                 .insert(provider);
         }
         self.member_count += candidate.count();
-        *self.members_by_provider.entry(provider).or_default() += candidate.count();
         self.deadlines.insert((expires_at, key.0, key.1));
         self.shards.insert(
             key,
@@ -400,6 +369,22 @@ impl ProviderDirectory {
             },
         );
         true
+    }
+
+    /// Test the exact aggregate weight after atomically replacing `key`.
+    ///
+    /// The old shard is removed before the candidate is added, so a directory
+    /// at either boundary can still accept a same-weight replacement. There is
+    /// deliberately no provider-specific share: admission consumes whatever
+    /// aggregate capacity is free at this receiver.
+    fn admits_replacement(&self, key: (u8, PeerId), candidate_members: usize) -> bool {
+        let (old_shards, old_members) = self
+            .shards
+            .get(&key)
+            .map_or((0, 0), |shard| (1, shard.keys.len()));
+        let projected_shards = self.shards.len() - old_shards + 1;
+        let projected_members = self.member_count - old_members + candidate_members;
+        projected_shards <= self.limits.shards && projected_members <= self.limits.members
     }
 
     /// Return bounded live providers for one exact rendezvous key.
@@ -481,7 +466,6 @@ impl ProviderDirectory {
                 continue;
             };
             self.member_count -= shard.keys.len();
-            self.decrement_provider_members(provider, shard.keys.len());
             let remove_prefix = {
                 let providers = self
                     .providers_by_prefix
@@ -497,33 +481,13 @@ impl ProviderDirectory {
         }
     }
 
-    fn decrement_provider_members(&mut self, provider: PeerId, count: usize) {
-        let remove = {
-            let members = self
-                .members_by_provider
-                .get_mut(&provider)
-                .expect("stored shard contributes to provider membership");
-            *members -= count;
-            *members == 0
-        };
-        if remove {
-            self.members_by_provider.remove(&provider);
-        }
-    }
-
     #[cfg(test)]
-    fn with_limits(
-        lease: Duration,
-        shards: usize,
-        members: usize,
-        members_per_provider: usize,
-    ) -> Self {
+    fn with_limits(lease: Duration, shards: usize, members: usize) -> Self {
         Self {
             limits: DirectoryLimits {
                 lease,
                 shards,
                 members,
-                members_per_provider,
             },
             ..Self::default()
         }
@@ -653,7 +617,7 @@ mod tests {
         let digest = candidate.digest;
         let count = candidate.count() as u32;
         let exact = candidate.keys[17];
-        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 4, 2000, 2000);
+        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 4, 2000);
 
         assert!(install(&mut directory, candidate, provider, now));
         let prefix_index_before = directory.providers_by_prefix.clone();
@@ -674,23 +638,30 @@ mod tests {
     }
 
     #[test]
-    fn replacement_updates_exact_membership_and_failed_replacement_is_atomic() {
+    fn replacement_at_both_aggregate_boundaries_is_atomic() {
         let now = crate::clock::mono_now();
         let provider = [3; 32];
-        let old = candidate(9, [1, 2]);
+        let neighbor = [4; 32];
+        let old = candidate(9, [1, 2, 3]);
         let old_key = old.keys[0];
-        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 1, 3, 3);
+        let neighbor_shard = candidate(10, [1, 2]);
+        let neighbor_key = neighbor_shard.keys[0];
+        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 2, 5);
         assert!(install(&mut directory, old, provider, now));
+        assert!(install(&mut directory, neighbor_shard, neighbor, now));
+        assert_eq!(directory.shards.len(), 2);
+        assert_eq!(directory.member_count, 5);
 
-        let replacement = candidate(9, [2, 3]);
+        let replacement = candidate(9, [4, 5, 6]);
         let retained = replacement.keys[0];
-        let added = replacement.keys[1];
         assert!(install(&mut directory, replacement, provider, now));
         assert!(directory.get(old_key, now).is_empty());
         assert_eq!(directory.get(retained, now), vec![provider]);
-        assert_eq!(directory.get(added, now), vec![provider]);
+        assert_eq!(directory.get(neighbor_key, now), vec![neighbor]);
+        assert_eq!(directory.shards.len(), 2);
+        assert_eq!(directory.member_count, 5);
 
-        let too_large = candidate(9, [4, 5, 6, 7]);
+        let too_large = candidate(9, [7, 8, 9, 10]);
         assert_eq!(
             directory.probe(
                 too_large.prefix,
@@ -703,7 +674,9 @@ mod tests {
         );
         assert!(!directory.install(too_large, provider, now));
         assert_eq!(directory.get(retained, now), vec![provider]);
-        assert_eq!(directory.get(added, now), vec![provider]);
+        assert_eq!(directory.get(neighbor_key, now), vec![neighbor]);
+        assert_eq!(directory.shards.len(), 2);
+        assert_eq!(directory.member_count, 5);
     }
 
     #[test]
@@ -717,31 +690,89 @@ mod tests {
     }
 
     #[test]
-    fn one_provider_can_represent_more_than_65_536_members() {
+    fn one_provider_above_the_old_fair_share_is_admitted_while_aggregate_fits() {
         let now = crate::clock::mono_now();
         let provider = [4; 32];
         let mut directory = ProviderDirectory::default();
-        let first = candidate(11, 0..32_768);
-        let second = candidate(12, 0..32_769);
-        let exact = second.keys[32_768];
-        assert!(install(&mut directory, first, provider, now));
-        assert!(install(&mut directory, second, provider, now));
+        let mut exact = None;
+        for prefix in 0..=16_u8 {
+            let count = if prefix == 16 {
+                1
+            } else {
+                MAX_PROVIDER_SHARD_MEMBERS as u32
+            };
+            let shard = candidate(prefix, 0..count);
+            exact = shard.keys.last().copied();
+            assert!(install(&mut directory, shard, provider, now));
+        }
+
+        let exact = exact.expect("the final shard is nonempty");
         assert_eq!(directory.get(exact, now), vec![provider]);
-        assert_eq!(directory.member_count, 65_537);
+        assert_eq!(directory.member_count, (1 << 20) + 1);
     }
 
     #[test]
-    fn one_provider_cannot_consume_an_otherwise_available_global_directory() {
+    fn mixed_providers_are_admitted_while_aggregate_capacity_fits() {
         let now = crate::clock::mono_now();
-        let greedy = [7; 32];
-        let peer = [8; 32];
-        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 8, 100, 4);
-        assert!(install(&mut directory, candidate(1, 0..4), greedy, now));
+        let first = [7; 32];
+        let second = [8; 32];
+        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 2, 6);
+        assert!(install(&mut directory, candidate(1, 0..4), first, now));
+        assert!(install(&mut directory, candidate(2, 0..2), second, now));
+        assert_eq!(directory.shards.len(), 2);
+        assert_eq!(directory.member_count, 6);
+    }
+
+    #[test]
+    fn exact_global_overflow_is_rejected() {
+        let now = crate::clock::mono_now();
+        let first = [7; 32];
+        let second = [8; 32];
+        let overflow = [9; 32];
+        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 4, 3);
+        assert!(install(&mut directory, candidate(1, 0..2), first, now));
+        assert!(install(&mut directory, candidate(2, [1]), second, now));
+
+        let rejected = candidate(3, [1]);
         assert_eq!(
-            directory.probe(2, candidate(2, [1]).digest, 1, greedy, now),
+            directory.probe(
+                rejected.prefix,
+                rejected.digest,
+                rejected.count() as u32,
+                overflow,
+                now,
+            ),
             ProviderProbe::Full
         );
-        assert!(install(&mut directory, candidate(2, [1]), peer, now));
+        assert!(!directory.install(rejected, overflow, now));
+        assert_eq!(directory.shards.len(), 2);
+        assert_eq!(directory.member_count, 3);
+    }
+
+    #[test]
+    fn exact_shard_overflow_is_rejected() {
+        let now = crate::clock::mono_now();
+        let first = [7; 32];
+        let second = [8; 32];
+        let overflow = [9; 32];
+        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 2, 10);
+        assert!(install(&mut directory, candidate(1, [1]), first, now));
+        assert!(install(&mut directory, candidate(2, [1]), second, now));
+
+        let rejected = candidate(3, [1]);
+        assert_eq!(
+            directory.probe(
+                rejected.prefix,
+                rejected.digest,
+                rejected.count() as u32,
+                overflow,
+                now,
+            ),
+            ProviderProbe::Full
+        );
+        assert!(!directory.install(rejected, overflow, now));
+        assert_eq!(directory.shards.len(), 2);
+        assert_eq!(directory.member_count, 2);
     }
 
     #[test]
@@ -806,7 +837,7 @@ mod tests {
     fn expiry_reclamation_is_bounded_and_unreclaimed_shards_are_not_returned() {
         let now = crate::clock::mono_now();
         let exact = candidate(3, [1]).keys[0];
-        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(1), 100, 100, 1);
+        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(1), 100, 100);
         for byte in 1..=65 {
             assert!(install(&mut directory, candidate(3, [1]), [byte; 32], now,));
         }

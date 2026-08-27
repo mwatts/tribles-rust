@@ -169,6 +169,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make provider-cover directory admission purely aggregate and work-conserving.
+  Receivers now bound only live shard count and total live memberships; one
+  provider may use all otherwise-free capacity. Atomic replacement tests the
+  exact `(directory - old shard + candidate)` weight, so equal-weight renewal
+  remains possible at either full boundary without a fixed publisher quota.
+
 - Stop `telemetry::Telemetry::layer_from_env` from falling back from
   `TELEMETRY_PILE` to `PILE`. A caller that set only `PILE` previously got
   telemetry and now gets none: `PILE` names an application's own append-only
