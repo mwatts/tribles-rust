@@ -5627,6 +5627,8 @@ mod tests {
         let wanted = Inline::<Handle<UnknownBlob>>::new([5; 32]);
         pile.want(WantRequest::blob(wanted)).unwrap();
         pile.unwant(WantRequest::blob(wanted)).unwrap();
+        let offered = artifact_handle(6);
+        pile.offer(offered).unwrap();
 
         let collection_records = collection_test_records();
         for record in &collection_records {
@@ -5640,6 +5642,7 @@ mod tests {
             (record_kind::KIND_PIN_TOMBSTONE, 1),
             (record_kind::KIND_BLOB_WANT_ASSERT, 1),
             (record_kind::KIND_BLOB_WANT_RETRACT, 1),
+            (record_kind::KIND_ARTIFACT_OFFER, 1),
             (record_kind::KIND_COLLECTION_COMMIT, 1),
             (record_kind::KIND_COLLECTION_MERGE, 1),
             (record_kind::KIND_COLLECTION_DERIVE, 1),
@@ -5872,9 +5875,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "self-describing.pile");
         let mut pile = Pile::open(&path).unwrap();
-        // Thirteen description archives plus the deduplicated name, layout, and
+        // Fourteen description archives plus the deduplicated name, layout, and
         // attribute-metafact blobs they reference.
-        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 46);
+        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 49);
 
         let branch_id = Id::new([3; 16]).unwrap();
         pile.append_legacy_pin_for_test(branch_id, None, Some(Inline::new([4; 32])))
@@ -5888,6 +5891,7 @@ mod tests {
         }
         pile.insert_peer(peer_evidence(6, 7)).unwrap();
         pile.bind_store_scope(team_key(8)).unwrap();
+        pile.offer(artifact_handle(9)).unwrap();
         let reader = pile.reader().unwrap();
 
         let mut records = PileRecords::open(&path).unwrap();
