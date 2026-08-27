@@ -81,6 +81,29 @@ collection recipes define canonical merge and derivation operations, so a
 validated derived artifact can be cached or forgotten without changing the
 authority of the signed source commits.
 
+## Exact collection-support blobs
+
+`SupportSet` is a thin semantic wrapper around the existing key-only
+`PATCH<32, IdentitySchema, (), Blake3Merkle>`. Its keys are complete intrinsic
+hashes of signed collection commits. Materializing a nonempty set writes each
+canonical PATCH v3 node through ordinary `BlobStorePut`, children before their
+parent; the existing `SupportRoot` is the root node's ordinary blob handle.
+There is no manifest or support-specific storage record, and the empty set
+continues to have no root.
+
+Loading through `SupportRoot::load` recursively uses `BlobStoreGet`. It checks
+each node's BLAKE3 address and strict v3 spelling, verifies every immediate
+prefix, edge, and subtree-count relationship, rejects repeated traversal, and
+rebuilds the exact PATCH from the authenticated leaf keys. This is structural
+validation only: commit hashes remain semantic support keys, not duplicate
+commit blobs, and authorization remains the collection resolver's job.
+
+`CollectionElementBlob` stores exactly three aligned 32-byte words:
+`descriptor || support || data`. Consequently the generic conservative walker
+already sees every resident owned component. Recursively retaining the element
+retains its descriptor and data blobs plus the complete materialized support
+DAG; no backend needs a collection-element parser.
+
 ## Conservative references
 
 The generic retention walker scans blob bytes in aligned 32-byte chunks and

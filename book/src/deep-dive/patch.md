@@ -158,6 +158,9 @@ metadata block, its compressed prefix with zero alignment padding, and one
 64-byte descriptor per ascending child: a 32-byte edge/count block followed by
 the 32-byte child digest. Child addresses are therefore aligned fields that a
 generic blob graph scanner can discover without understanding PATCH.
+`Blake3MerkleNode` is the one blob schema for these bytes at every encoded key
+width; a consumer applies `Blake3MerkleNodeBlob<N>` to require its expected
+width rather than introducing another node format.
 
 Leaves and branches have separate kind domains. A branch commits to the key
 width, canonical compressed-prefix bytes, fanout, subtree leaf count, and each

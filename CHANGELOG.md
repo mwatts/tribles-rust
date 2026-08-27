@@ -11,9 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add a canonical `SupportRoot` over the full intrinsic hashes of signed
   collection commits and a fixed 96-byte `CollectionElement` body binding one
-  collection, exact support root, and data identity. The new core types are a
-  shadow-compatible foundation for content-addressed lattice-cover exchange;
-  they do not add storage records or network behavior.
+  collection, exact support root, and data identity. `SupportSet` remains a
+  thin wrapper over the existing key-only PATCH: it can materialize every
+  canonical v3 node postorder through `BlobStorePut`, while `SupportRoot::load`
+  strictly verifies the recursively fetched hashes and parent/child structure
+  before rebuilding the exact PATCH. `CollectionElementBlob` is the exact
+  three-word body, so generic conservative blob traversal retains the resident
+  descriptor, support DAG, and data without a new storage record, parser, or
+  network path.
 
 - Add lattice-aware exact derived-collection reuse over the existing team
   transport. The core resolver accepts speculative remote target handles,
