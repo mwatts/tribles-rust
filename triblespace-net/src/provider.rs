@@ -416,7 +416,9 @@ impl ProviderDirectory {
             .or_else(|| providers.last().copied())
             .expect("a retained prefix has at least one provider");
         let mut result = Vec::with_capacity(MAX_PROVIDERS_PER_KEY.min(providers.len()));
+        let mut first_scanned = None;
         let mut last_scanned = None;
+        let mut scanned = 0;
         use std::ops::Bound::{Excluded, Unbounded};
         for provider in providers
             .range((Excluded(cursor), Unbounded))
@@ -424,7 +426,11 @@ impl ProviderDirectory {
             .take(MAX_PROVIDER_SHARDS_SCANNED_PER_GET)
             .copied()
         {
+            if first_scanned.is_none() {
+                first_scanned = Some(provider);
+            }
             last_scanned = Some(provider);
+            scanned += 1;
             let Some(shard) = self.shards.get(&(prefix, provider)) else {
                 continue;
             };
@@ -435,8 +441,18 @@ impl ProviderDirectory {
                 }
             }
         }
-        if let Some(last) = last_scanned {
-            self.lookup_cursor_by_prefix.insert(prefix, last);
+        // A complete nonempty cycle would otherwise return to its starting
+        // position forever. Advance by one candidate so replica-local result
+        // order rotates across calls and aggregate truncation cannot hide the
+        // same tail indefinitely. Partial/empty scans advance by their whole
+        // bounded window to reach sparse candidates promptly.
+        let next_cursor = if !result.is_empty() && scanned == providers.len() {
+            first_scanned
+        } else {
+            last_scanned
+        };
+        if let Some(next) = next_cursor {
+            self.lookup_cursor_by_prefix.insert(prefix, next);
         }
         result
     }
@@ -743,6 +759,24 @@ mod tests {
         assert_eq!(second.len(), MAX_PROVIDERS_PER_KEY);
         let seen: BTreeSet<_> = first.into_iter().chain(second).collect();
         assert_eq!(seen.len(), 70, "the result cap is not a storage cap");
+    }
+
+    #[test]
+    fn a_full_local_result_cycle_rotates_its_start_across_calls() {
+        let now = crate::clock::mono_now();
+        let exact = candidate(3, [1]).keys[0];
+        let mut directory = ProviderDirectory::default();
+        for byte in 1..=64 {
+            assert!(install(&mut directory, candidate(3, [1]), [byte; 32], now,));
+        }
+
+        let first = directory.get(exact, now);
+        let second = directory.get(exact, now);
+        assert_ne!(first, second);
+        assert_eq!(
+            first.iter().copied().collect::<BTreeSet<_>>(),
+            second.iter().copied().collect()
+        );
     }
 
     #[test]

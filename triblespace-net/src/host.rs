@@ -3565,6 +3565,37 @@ mod tests {
         assert!(normalized.contains(&only_healthy));
     }
 
+    #[test]
+    fn aggregate_provider_replies_preserve_replica_rotation_across_calls() {
+        let left: Vec<_> = (1..=64)
+            .map(|byte| {
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .to_bytes()
+            })
+            .collect();
+        let right: Vec<_> = (65..=128)
+            .map(|byte| {
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .to_bytes()
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        for rotation in 0..64 {
+            let mut rotated_left = left.clone();
+            let mut rotated_right = right.clone();
+            rotated_left.rotate_left(rotation);
+            rotated_right.rotate_left(rotation);
+            seen.extend(interleave_provider_replies(vec![
+                ([1; 32], rotated_left),
+                ([2; 32], rotated_right),
+            ]));
+        }
+
+        assert_eq!(seen.len(), 128);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn exact_fetch_hedges_once_beyond_alpha_without_cancelling_slow_bodies() {
         let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
