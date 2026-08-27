@@ -63,8 +63,8 @@ impl<E: Error + 'static> Error for StoreScopeError<E> {
 /// Storage capable of a single monotone team-scope assertion.
 ///
 /// This trait deliberately exposes no rebind or removal operation. The scope
-/// protects local network assembly and is neither authorization nor gossiped
-/// inventory.
+/// protects local network assembly and is neither authorization nor
+/// synchronized inventory.
 pub trait StoreScope {
     /// Backend error produced while observing or appending an assertion.
     type ScopeError: Error + Send + Sync + 'static;

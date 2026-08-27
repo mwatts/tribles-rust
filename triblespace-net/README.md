@@ -4,7 +4,9 @@ Authorized team inventory synchronization for TribleSpace over
 [iroh](https://www.iroh.computer). A peer periodically reconciles four
 monotone store components—PEER routing evidence, collection records,
 capability proofs, and optionally blobs—through authenticated Merkle walks.
-Gossip is only a lossy wake hint and never grants authority.
+These bounded pairwise PATCH unions are the epidemic exchange itself; there is
+no separate broadcast wake plane. Exact artifacts are located through the
+authenticated DHT after explicit provider publication.
 
 The user-facing surface is `Peer<S>`, a synchronous store wrapper backed by an
 async host. `Peer::refresh` drains verified network events, crosses one storage
@@ -41,9 +43,9 @@ let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
 peer.refresh();
 ```
 
-`team` is the exact Ed25519 trust root, inventory scope, and gossip topic. The
-backing store must be dedicated to that team because collection records,
-proofs, and blobs have content identities but no intrinsic team label.
+`team` is the exact Ed25519 trust root and inventory scope. The backing store
+must be dedicated to that team because collection records, proofs, and blobs
+have content identities but no intrinsic team label.
 
 Every connection first presents a complete CONNECT proof bound to its
 transport key, and the server returns its own bounded CONNECT proof in the same
@@ -60,34 +62,36 @@ dial; the proof itself is not cryptographically bound to the receiver key. It
 is not a confidential or zero-knowledge credential. No SYNC proof, element
 identity, query, or data request is sent until the returned CONNECT proof
 verifies; useful requests additionally wait for reciprocal SYNC_TEAM. Knowing
-a team root, joining its gossip topic, possessing a content hash, or holding
-PEER evidence is not sufficient.
+a team root or content hash, or holding PEER evidence, is not sufficient.
 
 ## Reconciliation policy
 
 PEER, collection-record, and capability-proof inventories always converge when
 pulling is enabled. Blob behavior is local policy:
 
-- `Demand` skips the broad blob inventory. Durable blob WANTs use an exact,
-  SYNC_TEAM-authorized `GET_BLOB` through configured and learned routes.
+- `Demand` skips the broad blob inventory. Durable blob WANTs locate an
+  explicitly published provider through the DHT, then use exact,
+  SYNC_TEAM-authorized `GET_BLOB`.
 - `Mirror` also walks the complete authorized blob inventory and fetches
   missing bytes in bounded ranges. Mirroring is a synchronization policy, not
   a retention promise; an evicting store may discard bytes later.
 
 Direction is also local policy:
 
-- `Bidirectional` pulls and admits remote inventory, advertises and serves its
-  local inventory, and learns authenticated inbound peers.
-- `ReadOnly` pulls and services local WANTs but neither advertises nor serves
-  local data.
-- `WriteOnly` advertises and serves local data but never pulls, demand-fetches,
-  or admits inbound readers as local PEER evidence.
+- `Bidirectional` pulls and admits remote inventory, serves its local
+  inventory, and learns authenticated inbound peers.
+- `ReadOnly` pulls and services local WANTs but does not serve local data.
+- `WriteOnly` serves local data but never pulls, demand-fetches, or admits
+  inbound readers as local PEER evidence.
 
 Configured endpoint addresses are bootstrap routes. Successful authorized
 sessions and synchronized `PEER(team, peer)` evidence can add routing
-candidates; gossip neighbors never do. Gossip frames contain only an exact
-team-scoped generation wake-up, so lost or duplicated frames affect latency,
-not correctness. Periodic sweeps provide eventual recovery.
+candidates. Every 30-second period admits at most `K = 20` candidates from a
+fair rotating cursor, with at most eight live sweeps. Slow or failed peers
+therefore cannot create an unbounded pending scan, while every stored or
+configured peer in an eventually stable set is revisited after backoff. A first
+installed snapshot starts one period immediately; later snapshots cannot
+manufacture extra budget.
 
 Collection-operation WANTs need no special RPC. Since every native collection
 record is already part of the team inventory, the reconciler refreshes the

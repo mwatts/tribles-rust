@@ -321,10 +321,10 @@ impl ComponentManifest {
 const GENERATION_DOMAIN: &[u8] = b"triblespace.inventory.generation\0";
 const GENERATION_VERSION: u32 = 1;
 
-/// Content-derived wake generation for one complete four-component manifest.
+/// Content-derived identity for one complete four-component manifest.
 ///
-/// Gossip carries this value only as an untrusted hint to schedule an
-/// authenticated manifest check. It is not completeness evidence.
+/// This binds the team, roots, and leaf counts served in one immutable view.
+/// It is a cache identity, not evidence of global completeness.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InventoryGeneration([u8; 32]);
 
@@ -350,7 +350,7 @@ impl InventoryGeneration {
         Self(*hasher.finalize().as_bytes())
     }
 
-    /// Return the portable wake-generation bytes.
+    /// Return the portable manifest-generation bytes.
     pub const fn into_bytes(self) -> [u8; 32] {
         self.0
     }
@@ -399,7 +399,7 @@ impl InventoryManifest {
         })
     }
 
-    /// Untrusted-gossip wake value, authenticated here by the manifest frame.
+    /// Content-derived identity of this exact manifest.
     pub const fn generation(self: &Self) -> InventoryGeneration {
         self.generation
     }
@@ -418,12 +418,12 @@ impl InventoryManifest {
 /// Local direction policy for periodic reconciliation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReconcileDirection {
-    /// Pull remote inventories and publish/serve the local inventory.
+    /// Pull remote inventories and serve the local inventory.
     #[default]
     Bidirectional,
-    /// Pull remote inventories without advertising or serving local data.
+    /// Pull remote inventories without serving local data.
     ReadOnly,
-    /// Publish and serve local data without pulling or exact-WANT fetching.
+    /// Serve local data without pulling or exact-WANT fetching.
     WriteOnly,
 }
 
@@ -431,11 +431,6 @@ impl ReconcileDirection {
     /// Whether the local scheduler should initiate authenticated walks.
     pub const fn pulls(self) -> bool {
         !matches!(self, Self::WriteOnly)
-    }
-
-    /// Whether the local scheduler should publish wake hints.
-    pub const fn publishes(self) -> bool {
-        !matches!(self, Self::ReadOnly)
     }
 
     /// Whether authenticated peers may read the local inventory and blobs.
@@ -453,8 +448,8 @@ impl ReconcileDirection {
 /// Local blob synchronization policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlobReconcileMode {
-    /// Skip blob inventory. Durable blob WANTs use authenticated `GET_BLOB`
-    /// across configured and PEER-learned routes independently of the walk.
+    /// Skip blob inventory. Durable blob WANTs use team-scoped DHT provider
+    /// lookup followed by authenticated `GET_BLOB`, independently of the walk.
     #[default]
     Demand,
     /// Traverse every blob key in the authorized inventory and fetch missing bytes.
@@ -472,7 +467,7 @@ pub enum BlobReconcileMode {
 /// server-selected inventory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReconcileQos {
-    /// Whether this peer pulls, publishes wake hints, or both.
+    /// Whether this peer pulls, serves, or does both.
     pub direction: ReconcileDirection,
     /// Demand-driven or full-residency blob behavior.
     pub blobs: BlobReconcileMode,

@@ -30,9 +30,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - `pile net status` and `pile net sync` now require explicit
   `--connect-proof` and `--sync-proof` IDs under one `--team-root`, load both
   exact claim closures, and verify them for the local endpoint before
-  networking. The team root derives the gossip topic. `sync` exposes only
-  semantic policy—`--direction bidirectional|read-only|write-only` and
-  `--blobs demand|mirror`—plus bootstrap routes and lifecycle bounds.
+  networking. `sync` exposes only semantic
+  policy—`--direction bidirectional|read-only|write-only` and `--blobs
+  demand|mirror`—plus bootstrap routes and lifecycle bounds. Pairwise PATCH
+  reconciliation is the epidemic exchange; there is no broadcast wake plane.
 - Remove the separate `pile net custody` and `team replica` command families.
   The single team inventory now reconciles PEER evidence, collection records,
   capability proofs, and optionally blobs; durable operation WANTs observe the

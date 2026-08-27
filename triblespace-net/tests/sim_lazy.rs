@@ -220,7 +220,6 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
             server_store,
             root.verifying_key(),
             server_proof.clone(),
-            false,
         );
         let mut client = bring_up_with_peers(
             &net,
@@ -228,7 +227,6 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
             client_store,
             root.verifying_key(),
             client_proof.clone(),
-            false,
             vec![pk(&server_key)],
         );
         let mut converged = false;
@@ -311,14 +309,13 @@ fn fetch_blob_pulls_from_the_holder() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -403,7 +400,6 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
             server_store,
             team_root,
             team_proofs(&root, &server_key),
-            false,
         );
         let mut client = bring_up_with_peers(
             &net,
@@ -411,7 +407,6 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
             empty_store(),
             team_root,
             team_proofs(&root, &client_key),
-            false,
             vec![pk(&server_key)],
         );
 
@@ -549,7 +544,6 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             server_store,
             team_root,
             team_proofs(&root, &server_key),
-            true,
         );
         let mut client = bring_up_with_peers(
             &net,
@@ -557,7 +551,6 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             client_store,
             team_root,
             team_proofs(&root, &client_key),
-            true,
             vec![pk(&server_key)],
         );
 
@@ -654,7 +647,7 @@ fn lazy_read_lands_wanted_in_store() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         // B is a lazy node: no eager content.
         let mut peer_b = bring_up_with_peers(
             &net,
@@ -662,7 +655,6 @@ fn lazy_read_lands_wanted_in_store() {
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -743,14 +735,13 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         }
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -847,14 +838,13 @@ fn async_lazy_read_awaits_swarm_and_lands_wanted() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -924,14 +914,13 @@ fn transparent_async_get_fetches_through_reader() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -996,11 +985,11 @@ fn fetch_blob_unavailable_is_clean() {
         let proof_a = team_proofs(&root, &ka);
 
         let store_a = empty_store();
-        let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
 
         let (_blob, hash) = content_blob(0x99);
         // No-op on_step: the inline fetch borrows `peer_a`; there is no
-        // configured route to try and no gossip work needed here.
+        // configured route to try.
         let reply = drive_future(peer_a.fetch_blob(hash), || {}, 400)
             .await
             .flatten();
@@ -1012,10 +1001,10 @@ fn fetch_blob_unavailable_is_clean() {
     });
 }
 
-/// Gossip is only a wake hint. Merely sharing the team topic neither grants
-/// authority nor installs a route for exact reads.
+/// Merely coexisting in one transport does not install a route for exact
+/// reads. Discovery remains explicit configured/PEER/DHT evidence.
 #[test]
-fn gossip_neighbor_alone_is_not_an_exact_fetch_route() {
+fn transport_presence_alone_is_not_an_exact_fetch_route() {
     let _g = sim_guard();
     run_paused(0x60B1_0001, async {
         let net = SimNet::new(0x60B1_0001, SimConfig::default());
@@ -1035,10 +1024,10 @@ fn gossip_neighbor_alone_is_not_an_exact_fetch_route() {
             .unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, proof_b.clone());
 
-        // Settle the gossip mesh. No application payload or route is gossiped.
+        // Let both independent hosts settle without giving B any route to A.
         for _ in 0..60u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
@@ -1048,8 +1037,8 @@ fn gossip_neighbor_alone_is_not_an_exact_fetch_route() {
             "precondition: the orphan blob never rode the eager walk to B"
         );
 
-        // NeighborUp must not be treated as a data route or as disclosure
-        // authority.
+        // Mere network presence must not be treated as a data route or as
+        // disclosure authority.
         let got = drive_future(peer_b.fetch_blob(orphan_hash), || peer_a.refresh(), 400)
             .await
             .expect("route-less fetch completes");
@@ -1073,7 +1062,7 @@ fn fetch_deadline_bounds_unavailable_resolution() {
         let proof_a = team_proofs(&root, &ka);
 
         let store_a = empty_store();
-        let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let _ = net; // keep the sim alive for the fetch
 
         let (_blob, hash) = content_blob(0x9A);
@@ -1113,14 +1102,13 @@ fn lazy_read_unavailable_under_partition_then_heals() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -1180,14 +1168,13 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -1235,14 +1222,13 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -1311,14 +1297,13 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
             store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
             let store_b = empty_store();
 
-            let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+            let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
             let peer_b = bring_up_with_peers(
                 &net,
                 &kb,
                 store_b,
                 team_root,
                 proof_b.clone(),
-                true,
                 vec![pk(&ka)],
             );
 
@@ -1405,15 +1390,14 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
         store_c.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
-        let mut peer_c = bring_up(&net, &kc, store_c, team_root, proof_c.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
+        let mut peer_c = bring_up(&net, &kc, store_c, team_root, proof_c.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka), pk(&kc)],
         );
 
@@ -1465,14 +1449,13 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -1524,14 +1507,13 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let mut peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -1620,14 +1602,13 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         let peer_b = bring_up_with_peers(
             &net,
             &kb,
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -1722,8 +1703,8 @@ fn lazy_fetch_succeeds_across_many_seeds() {
 /// durable want-marker". A faculty (another process) appends a want
 /// record for a blob the node doesn't hold; the sync daemon's reconcile
 /// tick notices the want, fetches the blob from whoever holds it, and
-/// lands it under the existing want. B runs without gossip, keeping the test
-/// focused on exact Demand fetch rather than inventory wake-up.
+/// lands it under the existing want. The test stays focused on exact Demand
+/// fetch rather than broad inventory mirroring.
 #[test]
 fn reconcile_tick_services_out_of_band_want() {
     use triblespace_net::reconcile::Reconciler;
@@ -1745,7 +1726,7 @@ fn reconcile_tick_services_out_of_band_want() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = empty_store();
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
         // B knows the bootstrap route, but provider publication remains an
         // explicit holder action rather than implicit peer probing.
         let mut peer_b = bring_up_with_peers(
@@ -1754,7 +1735,6 @@ fn reconcile_tick_services_out_of_band_want() {
             store_b,
             team_root,
             proof_b.clone(),
-            true,
             vec![pk(&ka)],
         );
 
@@ -1832,7 +1812,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let proof_a = team_proofs(&root, &ka);
 
         let store_a = empty_store();
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone(), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, proof_a.clone());
 
         // A want for content nobody holds (an arbitrary content id).
         let hash = *blake3::hash(b"nobody holds this blob").as_bytes();
@@ -1891,20 +1871,12 @@ fn reconcile_unsatisfiable_want_stays_pending() {
     });
 }
 
-/// Explicit DHT publication and exact transfer are independent of gossip
-/// liveness once the provider lease exists.
+/// Explicit DHT publication and exact transfer need no broadcast side plane.
 #[test]
-fn published_lazy_fetch_is_independent_of_gossip_liveness() {
+fn published_lazy_fetch_uses_only_dht_and_exact_transfer() {
     let _g = sim_guard();
-    let config = SimConfig {
-        gossip_drop_prob: 1.0,
-        ..SimConfig::default()
-    };
-    let (got, steps) = run_lazy_fetch(0x6055_1055, config);
-    assert!(
-        got.is_some(),
-        "published provider survives total gossip loss"
-    );
+    let (got, steps) = run_lazy_fetch(0x6055_1055, SimConfig::default());
+    assert!(got.is_some(), "published provider resolves without gossip");
     assert!(
         steps > 0,
         "the DHT and exact-transfer path must actually run"

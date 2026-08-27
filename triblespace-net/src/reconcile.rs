@@ -5,7 +5,8 @@
 //! no second record RPC and never claims global absence: an operation WANT is
 //! satisfied iff at least one matching local receipt is visible; otherwise it
 //! remains pending while periodic inventory sweeps continue. Blob WANTs retain
-//! their exact configured/PEER fetch path and exponential retry backoff.
+//! their explicit DHT-provider lookup, exact authenticated fetch, and
+//! exponential retry backoff.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};

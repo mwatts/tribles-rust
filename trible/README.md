@@ -110,22 +110,22 @@ descriptions.
 
 ### Distributed pile sync
 
-Built on `triblespace-net` (authenticated iroh QUIC plus gossip wake hints). A node presents two
-independent exact proofs rooted at the team public key: CONNECT admits the
-transport connection and SYNC_TEAM authorizes disclosure and reconciliation of
-that team's inventory. The local pile must contain both selected native proofs
-and every claim blob they name. The team root also deterministically selects
-the gossip topic; gossip carries only lossy generation wake hints.
+Built on `triblespace-net` (authenticated iroh QUIC, bounded PATCH
+anti-entropy, and DHT provider lookup). A node presents two independent exact
+proofs rooted at the team public key: CONNECT admits the transport connection
+and SYNC_TEAM authorizes disclosure and reconciliation of that team's
+inventory. The local pile must contain both selected native proofs and every
+claim blob they name.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
 - `pile net status <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--key PATH]` — load both exact native bundles, verify CONNECT and SYNC_TEAM for the local key at the current time, and print their IDs and step counts.
-- `pile net sync <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only] [--blobs demand|mirror]` — run authorized periodic anti-entropy. PEER evidence, native collection records, and capability proofs converge by set union. `demand` (the default) fetches blobs only for durable WANTs; `mirror` also walks the complete blob inventory. `read-only` pulls but does not advertise or serve local data, while `write-only` advertises and serves but never pulls or demand-fetches. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+- `pile net sync <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only] [--blobs demand|mirror]` — run authorized periodic anti-entropy. PEER evidence, native collection records, and capability proofs converge by set union. `demand` (the default) fetches blobs only for durable WANTs after DHT provider lookup; `mirror` also walks the complete blob inventory. `read-only` pulls but does not serve local data, while `write-only` serves but never pulls or demand-fetches. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
 The pile is one team-scoped store: records, proofs, and blobs do not carry a
 separate team label. Configured peers are bootstrap routes, and successful
 authorized synchronization carries monotone `PEER(team, peer)` routing
-evidence. Lost gossip does not prevent convergence because periodic direct
-sweeps remain the correctness path.
+evidence. Bounded fair pairwise PATCH reconciliation is the epidemic exchange;
+there is no publisherless broadcast wake plane.
 
 ### Team capabilities
 

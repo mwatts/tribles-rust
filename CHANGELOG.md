@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose explicit idempotent binding; pile concatenation preserves every
   assertion so conflicting teams fail closed on observation. Reframing,
   retained rewrites, and Yard reclamation preserve the assertion, while it is
-  deliberately excluded from network inventory and gossip. `Peer`
+  deliberately excluded from synchronized network inventory. `Peer`
   construction is now fallible and refuses unbound, conflicting, or
   wrong-team stores before spawning or exposing a network snapshot. Every
   later refresh revalidates the assertion around snapshot construction and
@@ -52,13 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CONNECT. Expected-digest node and bounded blob-range frames pin exact roots
   and reject unavailable snapshots instead of falling back to current state.
   Demand versus Mirror and bidirectional/read-only/write-only direction are
-  local policy; evidence presence never grants authority. Team-derived gossip
-  carries only generation wake hints, while periodic authenticated sweeps
-  remain the correctness path.
+  local policy; evidence presence never grants authority. Bounded periodic
+  pairwise reconciliation is the epidemic exchange itself.
 - Add deterministic simulation coverage for unified authorized inventory
   synchronization: direction and Demand/Mirror QoS, durable exact WANTs,
   non-serving ReadOnly peers, root/leaf/expiry/mode authorization failures,
-  periodic recovery under total gossip loss, and authenticated PEER-based
+  periodic convergence with no broadcast plane, and authenticated PEER-based
   route expansion all exercise the production host and wire path.
 
 - Add native monotone `PEER(team_public_key, peer_public_key)` routing
@@ -68,8 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reopen, reframe, and retained rewrites preserve union semantics, while the
   fact deliberately grants no authority and implies no liveness,
   reachability, residency, or retention. Authorized inventory sessions
-  synchronize this evidence and use it as routing candidates; unauthenticated
-  gossip neighbors never become routes.
+  synchronize this evidence and use it as routing candidates; unverified DHT
+  referrals never become periodic anti-entropy targets.
 
 - Make PATCH's subtree summary a sealed policy parameter while preserving
   `XorSip128` as the zero-overhead default. Add `Blake3Merkle`, a canonical
@@ -110,10 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meets, and current time against the separately supplied team root before one
   idempotent store write; and `show` selects one proof by ID. Optional paired
   RFC 3339 bounds map to inclusive validity intervals. `pile net` selects exact
-  `--connect-proof` and `--sync-proof` IDs, and derives gossip rendezvous from
-  the team root.
+  `--connect-proof` and `--sync-proof` IDs under the explicit team root.
 
 ### Changed
+
+- Remove publisherless inventory-generation gossip end to end, including the
+  iroh-gossip dependency and simulator side plane. Authenticated pairwise PATCH
+  reconciliation is now the only epidemic inventory exchange, while explicit
+  immutable-artifact publication and lookup remain in the bounded DHT.
+- Bound periodic anti-entropy to a fair rotating budget of `K = 20` newly
+  admitted peers per 30-second period and at most eight live sweeps. The host
+  retains at most one period's eligible queue, examines backoff-delayed peers
+  only at period boundaries, carries its identity cursor across peer-set
+  insertion/removal, and arms only on the first installed snapshot so repeated
+  local generations cannot amplify work.
 
 - Keep canonical collection progress in the existing signed commits and
   `MERGE`/`DERIVE` equations, and keep `Blake3Merkle` focused on compact
@@ -174,10 +183,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SYNC_TEAM session required by manifest, node, blob-range, and exact blob
   reads. Mixed older endpoints fail protocol negotiation. Proof records are a
   native grow-only set with exact lookup and direct claim rooting; their
-  presence grants no authority and creates no implicit gossip or WANT.
+  presence grants no authority and creates no implicit replication or WANT.
   `PeerConfig` now takes one team root, both proof bundles, bootstrap routes,
-  and local reconciliation QoS; its gossip topic is derived from the team
-  root.
+  and local reconciliation QoS.
 
 - Pin inventory history per component rather than retaining whole store
   snapshots for every changed root. Unchanged roots reuse their immutable

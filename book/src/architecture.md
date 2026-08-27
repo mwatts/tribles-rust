@@ -226,10 +226,11 @@ evidence, and WANT records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
 content-derived object keys. The network layer uses authenticated Merkle walks
 to union one team's PEER evidence, collection records, proofs, and optionally
-blobs. Team-derived gossip carries wake hints, configured and synchronized
-PEER evidence supplies exact blob routes, and merge/derive questions are
-answered from the converged local record index. In every case convergence
-means unioning evidence; it does not mean electing a winner.
+blobs. Bounded fair pairwise PATCH reconciliation is the epidemic exchange,
+while an authenticated DHT locates explicitly published providers of an exact
+artifact handle. Merge/derive questions are answered from the converged local
+record index. In every case convergence means unioning evidence; it does not
+mean electing a winner.
 
 Legacy branch and pin records remain decodable only so old piles can be
 inspected, conservatively retained, and explicitly migrated. They are not part

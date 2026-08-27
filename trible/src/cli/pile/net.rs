@@ -121,7 +121,7 @@ pub enum Command {
         /// Exact SYNC_TEAM proof id (BLAKE3 of canonical proof bytes).
         #[arg(long)]
         sync_proof: String,
-        /// Whether to pull inventories, publish wake hints, or both.
+        /// Whether to pull inventories, serve them, or do both.
         #[arg(long, value_enum, default_value = "bidirectional")]
         direction: DirectionArg,
         /// Fetch blobs only for durable WANTs, or mirror the complete blob inventory.
@@ -314,13 +314,9 @@ fn run_sync(
     )?;
     eprintln!("node: {}", peer.id());
     eprintln!("team_root: {}", hex::encode(team_root.to_bytes()));
-    eprintln!(
-        "gossip_topic: {}  (derived from team root)",
-        hex::encode(triblespace_net::host::team_gossip_topic(team_root))
-    );
     let dir_label = match qos.direction {
         ReconcileDirection::Bidirectional => "bidirectional",
-        ReconcileDirection::ReadOnly => "read-only (no publish)",
+        ReconcileDirection::ReadOnly => "read-only (no serve)",
         ReconcileDirection::WriteOnly => "write-only (no fetch)",
     };
     eprintln!("direction: {dir_label}");
@@ -392,7 +388,7 @@ fn run_sync(
             }
         }
 
-        // Drain authenticated inventory and publish any externally appended
+        // Drain authenticated inventory and install any externally appended
         // local evidence through one durability barrier.
         peer.refresh();
 

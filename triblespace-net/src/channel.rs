@@ -2,9 +2,7 @@
 //!
 //! Inventory admission is monotone. The host streams authenticated leaves to
 //! the store side in bounded batches, where one refresh drain inserts all
-//! available batches and crosses a single durability barrier. Gossip never
-//! carries semantic records; it only wakes the authenticated anti-entropy
-//! scheduler.
+//! available batches and crosses a single durability barrier.
 
 use anybytes::Bytes;
 use triblespace_core::capability::CapabilityProof;
@@ -14,17 +12,15 @@ use triblespace_core::collection::{
 };
 use triblespace_core::repo::peer::PeerEvidence;
 
-use crate::inventory::InventoryGeneration;
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
 
 /// A newly installed immutable local observation.
 ///
-/// The snapshot slot is replaced before this command is sent. Consequently a
-/// generation wake can never race ahead of the bytes that
-/// the direct protocol will serve.
+/// The snapshot slot is replaced before this command is sent. The host uses
+/// the first notice to start anti-entropy immediately and later notices only
+/// to learn newly stored PEER evidence; periodic scheduling remains bounded.
 pub(crate) struct SnapshotNotice {
-    pub(crate) generation: InventoryGeneration,
     pub(crate) peers: Vec<PeerId>,
 }
 

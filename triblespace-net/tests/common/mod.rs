@@ -120,24 +120,15 @@ where
 /// Bring one node up on `net`: join the sim mesh, wire the host loop
 /// as a local task, return the `Peer<MemoryRepo>`. `store` is the
 /// node's pre-seeded local store. Both proofs are sent inline and need not be
-/// resident in that store. `gossip` controls team-topic participation.
+/// resident in that store.
 pub fn bring_up(
     net: &SimNet,
     signing_key: &SigningKey,
     store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
     proofs: TeamProofs,
-    gossip: bool,
 ) -> Peer<MemoryRepo> {
-    bring_up_with_peers(
-        net,
-        signing_key,
-        store,
-        connect_root,
-        proofs,
-        gossip,
-        Vec::new(),
-    )
+    bring_up_with_peers(net, signing_key, store, connect_root, proofs, Vec::new())
 }
 
 /// [`bring_up`] with an explicit configured-peer discovery boundary.
@@ -151,7 +142,6 @@ pub fn bring_up_with_peers(
     store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
     proofs: TeamProofs,
-    gossip: bool,
     peers: Vec<[u8; 32]>,
 ) -> Peer<MemoryRepo> {
     bring_up_with_qos(
@@ -160,7 +150,6 @@ pub fn bring_up_with_peers(
         store,
         connect_root,
         proofs,
-        gossip,
         peers,
         ReconcileQos::default(),
     )
@@ -172,7 +161,6 @@ pub fn bring_up_with_qos(
     mut store: MemoryRepo,
     connect_root: ed25519_dalek::VerifyingKey,
     proofs: TeamProofs,
-    gossip: bool,
     peers: Vec<[u8; 32]>,
     qos: ReconcileQos,
 ) -> Peer<MemoryRepo> {
@@ -180,8 +168,7 @@ pub fn bring_up_with_qos(
         .bind_store_scope(connect_root)
         .expect("simulation store accepts its explicit team scope");
     let id = pk(signing_key);
-    let gossip_topic = gossip.then_some(connect_root.to_bytes());
-    let harness = net.join(id, gossip_topic);
+    let harness = net.join(id);
     let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id).expect("endpoint id"));
     tokio::task::spawn_local(host::run_host(
         harness,

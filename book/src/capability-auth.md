@@ -166,18 +166,17 @@ be exchanged once through `INVENTORY_AUTH` before manifests, nodes, provider
 operations, blob ranges, or even a known-hash `GET_BLOB` may be served. The
 client verifies the returned server proof against the same TLS endpoint before
 sending any useful request. These two proofs may have different delegation
-paths and validity bounds. The team root also derives the gossip topic, but
-receiving a wake frame grants neither CONNECT nor SYNC_TEAM authority.
+paths and validity bounds.
 
 There is no pre-auth fetch. The presenter sends each complete bundle inline.
 After both authorizations, collection records converge independently of blob
 policy: a `COMMIT` does not pull its referenced blobs in Demand mode, and an
 observed handle does not create a WANT.
 
-## WANT and gossip boundaries
+## WANT and synchronization boundaries
 
 Capability proof records are durable local set evidence, but the capability
-layer defines no proof-specific gossip or WANT. Authorized team inventory may
+layer defines no proof-specific replication or WANT. Authorized team inventory may
 union resident proofs like any other inert evidence; that still does not make
 them active authority. Portable bundles are transferred explicitly when they
 must authorize an operation, such as in an invite or one of the two connection
@@ -187,7 +186,7 @@ requested by their exact handles when local policy wants them.
 This separation is intentional:
 
 - proof presence is not authority;
-- gossip rendezvous is not team membership;
+- routing or DHT presence is not team membership;
 - WANT is local demand, not authorization; and
 - blob availability is not semantic validity.
 

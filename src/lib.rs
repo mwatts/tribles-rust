@@ -6,8 +6,8 @@ pub use triblespace_core::arrayvec;
 pub use triblespace_core as core;
 
 /// Distributed sync via iroh: [`net::peer::Peer<S>`] wraps any store with
-/// signed collection-evidence gossip, durable wants, and content-addressed
-/// blob fetching. Gated behind the `net` feature.
+/// authenticated PATCH anti-entropy, durable wants, and DHT-located
+/// content-addressed blob fetching. Gated behind the `net` feature.
 #[cfg(feature = "net")]
 pub use triblespace_net as net;
 

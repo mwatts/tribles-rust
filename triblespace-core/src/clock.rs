@@ -7,15 +7,15 @@
 //! those. Under simulation, [`install_virtual`](crate::clock::install_virtual) swaps in a
 //! [`VirtualClock`](crate::clock::VirtualClock) that only moves when the simulator's
 //! discrete-event scheduler advances it — so cooldown expiry, renewal
-//! windows, and rebroadcast ticks become deterministic functions of
+//! windows, and periodic reconciliation become deterministic functions of
 //! the event schedule rather than of wall time.
 //!
 //! Two kinds of time, deliberately distinct:
 //!
 //! - [`mono_now`](crate::clock::mono_now) → [`Mono`](crate::clock::Mono): monotonic nanoseconds since an arbitrary
 //!   per-process origin. Replaces `std::time::Instant` for durations
-//!   and timeouts (redispatch cooldowns, quiescence tracking, the
-//!   gossip rebroadcast period). `Mono` is plain data (`u64` ns) so it
+//!   and timeouts (redispatch cooldowns, quiescence tracking, and
+//!   anti-entropy periods). `Mono` is plain data (`u64` ns) so it
 //!   can cross thread and serialization boundaries freely, which
 //!   `Instant` cannot.
 //! - [`epoch_now`](crate::clock::epoch_now) → `hifitime::Epoch`: wall-clock TAI time. Used

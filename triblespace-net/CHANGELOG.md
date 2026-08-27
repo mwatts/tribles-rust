@@ -24,8 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining key-validated canonical bodies as immutable leaf values.
 - Add semantic reconciliation QoS. PEER, collection-record, and proof
   inventories always participate in pulls; `BlobReconcileMode::Demand` leaves
-  broad blobs out while durable WANTs use exact authenticated reads, and
-  `Mirror` also traverses and fetches the complete blob inventory.
+  broad blobs out while durable WANTs use authenticated DHT provider lookup
+  followed by exact reads, and `Mirror` also traverses and fetches the complete
+  blob inventory.
 
 ### Fixed
 
@@ -37,36 +38,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested, while still rejecting delegate-only authority. Exact blob reads
   now require the same connection-local SYNC_TEAM session as inventory reads;
   CONNECT alone discloses nothing.
-- Schedule immediate and periodic direct sweeps independently of lossy gossip,
-  isolate failures per peer, bound dial and operation deadlines, evict failed
-  pooled sessions, and retain a fair pending queue beyond the concurrent-sweep
-  limit.
+- Start one direct sweep period immediately on the first installed snapshot,
+  then admit at most `K = 20` peers per 30-second period through a stable
+  identity cursor with at most eight live walks. Isolate failures per peer,
+  respect bounded backoff at period boundaries, bound dial and operation
+  deadlines, and evict failed pooled sessions without retaining or repeatedly
+  scanning an all-peer pending queue.
 - Enforce direction policy at the data boundary: read-only peers neither
-  advertise nor serve local inventory or blobs; write-only peers never pull,
-  demand-fetch, or admit inbound readers as durable PEER evidence.
+  serve local inventory nor blobs; write-only peers never pull, demand-fetch,
+  or admit inbound readers as durable PEER evidence.
 
 ### Changed
 
 - Replace collection-evidence gossip, exact receipt RPCs, and the separate
   custody replica protocol with one periodic inventory anti-entropy path.
-  Gossip now carries only a versioned `(team, generation)` wake hint; periodic
-  direct sweeps are the correctness mechanism. Operation WANTs observe matching
-  receipts through the local indexed collection-record union after refresh.
+  Authenticated pairwise PATCH reconciliation is the epidemic exchange; the
+  publisherless inventory-generation wake and iroh-gossip side plane are gone.
+  Operation WANTs observe matching receipts through the local indexed
+  collection-record union after refresh.
 - Replace the split peer configuration with `PeerConfig { peers, team,
-  connect_proof, sync_proof, qos }`. The team trust root also derives the gossip
-  topic. CONNECT admits the transport, then exactly one SYNC_TEAM exchange
-  selects disclosure authority for that connection.
-- Move pile sync to ALPN `/triblespace/pile-sync/12` for the incompatible
-  reciprocal authorization responses. Remove the unused
-  CHILDREN and collection-specific operations; retain exact `GET_BLOB` and add
-  bounded inventory authorization, manifest, node, and blob-range operations.
+  connect_proof, sync_proof, qos }`. CONNECT admits the transport, then exactly
+  one SYNC_TEAM exchange selects disclosure authority for that connection.
+- Move pile sync to ALPN `/triblespace/pile-sync/13` for the incompatible
+  reciprocal authorization and provider-directory protocol. Retain exact
+  `GET_BLOB`, bounded inventory authorization/manifest/node/blob-range
+  operations, and bounded `PROVIDER_PUT`, `PROVIDER_GET`, and `FIND_NODE`.
 - Use configured endpoint addresses only as bootstrap routes. Authorized
   sessions and synchronized monotone PEER evidence add routing candidates but
-  never authority, liveness, residency, or retention claims. Gossip neighbors
-  are not routes.
-- Remove per-blob DHT publication and lookup from synchronization. Exact
-  Demand reads use the same authenticated configured/PEER route set as
-  inventory reconciliation, avoiding a second mutable discovery system.
+  never authority, liveness, residency, or retention claims. DHT referrals are
+  not periodic anti-entropy targets and become verified routes only after a
+  direct authenticated response.
+- Use a bounded team-scoped XOR DHT for explicit immutable-artifact provider
+  publication and lookup. Exact Demand reads never probe every known peer: an
+  announced handle resolves through soft provider leases and is content-checked
+  after authenticated transfer.
 - Pipeline up to eight independently authenticated PATCH node reads on the
   existing inventory protocol and admit their out-of-order responses through
   bounded item/byte batches. Empty replicas now overlap each fixed frontier

@@ -41,7 +41,6 @@ fn provider_hints_bind_to_the_announcer_and_repair_after_partition() {
             empty_store(),
             team,
             team_proofs(&root, &key_a),
-            false,
             vec![pk(&key_b)],
         );
         let mut b = bring_up_with_peers(
@@ -50,7 +49,6 @@ fn provider_hints_bind_to_the_announcer_and_repair_after_partition() {
             empty_store(),
             team,
             team_proofs(&root, &key_b),
-            false,
             vec![pk(&key_a)],
         );
         settle(&mut [&mut a, &mut b]).await;
@@ -90,7 +88,6 @@ fn the_same_artifact_id_does_not_cross_team_authorization() {
             empty_store(),
             root_a.verifying_key(),
             team_proofs(&root_a, &key_a),
-            false,
             vec![pk(&key_b)],
         );
         let mut b = bring_up_with_peers(
@@ -99,7 +96,6 @@ fn the_same_artifact_id_does_not_cross_team_authorization() {
             empty_store(),
             root_b.verifying_key(),
             team_proofs(&root_b, &key_b),
-            false,
             vec![pk(&key_a)],
         );
         settle(&mut [&mut a, &mut b]).await;
@@ -111,7 +107,7 @@ fn the_same_artifact_id_does_not_cross_team_authorization() {
 }
 
 #[test]
-fn unannounced_holder_is_not_discovered_by_known_peer_or_gossip_membership() {
+fn unannounced_holder_is_not_discovered_from_known_peer_evidence() {
     let _guard = sim_guard();
     run_paused(0xD1AE_C704, async {
         let net = SimNet::new(0xD1AE_C704, SimConfig::default());
@@ -131,7 +127,6 @@ fn unannounced_holder_is_not_discovered_by_known_peer_or_gossip_membership() {
             store_a,
             team,
             team_proofs(&root, &key_a),
-            false,
             vec![pk(&key_b)],
         );
         let mut b = bring_up_with_peers(
@@ -140,7 +135,6 @@ fn unannounced_holder_is_not_discovered_by_known_peer_or_gossip_membership() {
             empty_store(),
             team,
             team_proofs(&root, &key_b),
-            false,
             vec![pk(&key_a)],
         );
         settle(&mut [&mut a, &mut b]).await;
@@ -174,7 +168,6 @@ fn sparse_line_discovers_and_fetches_an_artifact_across_multiple_hops() {
             store_a,
             team,
             team_proofs(&root, &keys[0]),
-            false,
             vec![ids[1]],
         );
         let mut b = bring_up_with_peers(
@@ -183,7 +176,6 @@ fn sparse_line_discovers_and_fetches_an_artifact_across_multiple_hops() {
             empty_store(),
             team,
             team_proofs(&root, &keys[1]),
-            false,
             vec![ids[0], ids[2]],
         );
         let mut c = bring_up_with_peers(
@@ -192,7 +184,6 @@ fn sparse_line_discovers_and_fetches_an_artifact_across_multiple_hops() {
             empty_store(),
             team,
             team_proofs(&root, &keys[2]),
-            false,
             vec![ids[1], ids[3]],
         );
         let mut d = bring_up_with_peers(
@@ -201,7 +192,6 @@ fn sparse_line_discovers_and_fetches_an_artifact_across_multiple_hops() {
             empty_store(),
             team,
             team_proofs(&root, &keys[3]),
-            false,
             vec![ids[2]],
         );
         settle(&mut [&mut a, &mut b, &mut c, &mut d]).await;
@@ -233,7 +223,6 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
             empty_store(),
             team,
             team_proofs(&root, &stalled_key),
-            false,
         );
         let mut referred = bring_up_with_peers(
             &net,
@@ -241,7 +230,6 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
             empty_store(),
             team,
             team_proofs(&root, &referred_key),
-            false,
             vec![pk(&healthy_key)],
         );
         let mut healthy = bring_up_with_peers(
@@ -250,7 +238,6 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
             empty_store(),
             team,
             team_proofs(&root, &healthy_key),
-            false,
             vec![pk(&referred_key)],
         );
         let mut source = bring_up_with_qos(
@@ -259,7 +246,6 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
             empty_store(),
             team,
             team_proofs(&root, &source_key),
-            false,
             vec![pk(&stalled_key), pk(&healthy_key)],
             ReconcileQos {
                 direction: ReconcileDirection::WriteOnly,
@@ -317,7 +303,6 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
             empty_store(),
             team,
             team_proofs(&root, &directory_key),
-            false,
             vec![pk(&bad_key), pk(&bad_key_2), pk(&bad_key_3), pk(&good_key)],
             ReconcileQos {
                 direction: ReconcileDirection::WriteOnly,
@@ -330,7 +315,6 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
             bad_store,
             team,
             team_proofs(&root, &bad_key),
-            false,
             vec![pk(&directory_key)],
         );
         let mut good = bring_up_with_peers(
@@ -339,7 +323,6 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
             good_store,
             team,
             team_proofs(&root, &good_key),
-            false,
             vec![pk(&directory_key)],
         );
         let mut bad_2 = bring_up_with_peers(
@@ -348,7 +331,6 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
             empty_store(),
             team,
             team_proofs(&root, &bad_key_2),
-            false,
             vec![pk(&directory_key)],
         );
         let mut bad_3 = bring_up_with_peers(
@@ -357,7 +339,6 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
             empty_store(),
             team,
             team_proofs(&root, &bad_key_3),
-            false,
             vec![pk(&directory_key)],
         );
         settle(&mut [&mut directory, &mut bad, &mut bad_2, &mut bad_3, &mut good]).await;
@@ -375,7 +356,6 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
             empty_store(),
             team,
             team_proofs(&root, &requester_key),
-            false,
             vec![pk(&directory_key)],
         );
         settle(&mut [&mut directory, &mut good, &mut requester]).await;

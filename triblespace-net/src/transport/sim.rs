@@ -3,7 +3,7 @@
 //! [`SimNet`] is a process-local network: nodes join it, get a
 //! [`Harness<SimTransport>`] back, and from there the *entire*
 //! production protocol stack — host loop, CONNECT/SYNC_TEAM-authorized
-//! inventory reads, and generation-wake gossip — runs unmodified over
+//! inventory reads, and DHT provider operations — runs unmodified over
 //! in-memory pipes instead of iroh QUIC.
 //!
 //! # Determinism contract
@@ -20,20 +20,18 @@
 //!    when the scenario script says so; every latency sleep and
 //!    cooldown check resolves in deterministic order on the paused
 //!    timer wheel.
-//! 3. **Seeded randomness.** Link latencies and drops draw from the
-//!    net's own seeded RNG; protocol-side id minting is seeded via
+//! 3. **Seeded randomness.** Link latencies draw from the net's own seeded RNG;
+//!    protocol-side id minting is seeded via
 //!    `triblespace_core::id::rngid::seed_ids` (the `deterministic`
 //!    feature this module's `sim` feature pulls in). Node keys are
 //!    derived from the seed by the test harness.
 //!
 //! # Fault injection
 //!
-//! [`SimNet::partition`] / [`SimNet::heal`] block dialing and gossip
-//! between pairs; [`SimNet::crash`] takes a node off the network
-//! entirely (dials fail, gossip skips it) until
-//! [`SimNet::revive`]. Per-frame gossip drops happen with
-//! [`SimConfig::gossip_drop_prob`]. Faults affect *delivery*, never
-//! identity — `Conn::remote_id` always reports the true dialer, so
+//! [`SimNet::partition`] / [`SimNet::heal`] block dialing between pairs;
+//! [`SimNet::crash`] takes a node off the network entirely until
+//! [`SimNet::revive`]. Faults affect *delivery*, never identity —
+//! `Conn::remote_id` always reports the true dialer, so
 //! identity-dependent OP_AUTH subject binding is exercised honestly.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,7 +46,7 @@ use rand::rngs::StdRng;
 use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
 
-use super::{Alpn, Conn, GossipEvent, GossipSink, Harness, Incoming, PeerId, Transport};
+use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
 
 /// Capacity of each in-memory stream pipe. Bounded inventory blob ranges are
 /// at most 1 MiB; larger exact reads rely on normal concurrent backpressure.
@@ -59,48 +57,19 @@ const PIPE_CAPACITY: usize = 4 * 1024 * 1024;
 pub struct SimConfig {
     /// Per-message one-way latency, drawn uniformly per delivery.
     pub latency: Range<Duration>,
-    /// Probability of silently dropping a gossip frame on a given
-    /// link (connection-oriented traffic is never dropped — QUIC
-    /// would retransmit; model connection loss with
-    /// [`SimNet::partition`] / [`SimNet::crash`] instead).
-    pub gossip_drop_prob: f64,
-    /// Model iroh-gossip's message-id dedupe. PlumTree derives the
-    /// message id from blake3(content) and suppresses re-delivery of
-    /// known ids for `message_id_retention` (default 90s) — AND a
-    /// suppressed duplicate REFRESHES its retention window
-    /// (plumtree.rs:511 in iroh-gossip 0.98). Net effect: an
-    /// IDENTICAL frame re-broadcast on a shorter period than the
-    /// retention window is suppressed forever at every receiver that
-    /// saw it once. Defaults ON because production behaves this way;
-    /// turning it off recreates the pre-2026-06-11 sim that
-    /// validated rebroadcast-driven recovery the real mesh does not
-    /// provide.
-    pub gossip_dedupe: bool,
 }
-
-/// iroh-gossip's default `message_id_retention`.
-const GOSSIP_ID_RETENTION: Duration = Duration::from_secs(90);
 
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
             latency: Duration::from_millis(1)..Duration::from_millis(30),
-            gossip_drop_prob: 0.0,
-            gossip_dedupe: true,
         }
     }
 }
 
 struct NodeSlot {
     incoming_tx: mpsc::UnboundedSender<Incoming<SimConn>>,
-    gossip_tx: Option<mpsc::UnboundedSender<GossipEvent>>,
-    gossip_topic: Option<[u8; 32]>,
     up: bool,
-    /// PlumTree-style dedupe cache: message-id (blake3 of frame) ->
-    /// suppression deadline in virtual nanoseconds. Duplicates seen
-    /// before the deadline are dropped AND refresh the deadline,
-    /// mirroring iroh-gossip's received_messages semantics.
-    gossip_seen: std::collections::HashMap<[u8; 32], u64>,
 }
 
 struct SimNetInner {
@@ -168,41 +137,16 @@ impl SimNet {
     }
 
     /// Join the network as `id`. Returns the transport harness for the node's
-    /// host loop. Production always passes the team-derived topic; the optional
-    /// value is a simulator seam for testing gossip loss and topic isolation.
-    ///
-    /// Joining emits `NeighborUp` both ways between the new node and
-    /// every existing gossip participant — the sim mesh is fully
-    /// connected, which makes `delivered_from` always the original
-    /// publisher (a simplification PlumTree converges to for small
-    /// meshes anyway).
-    pub fn join(&self, id: PeerId, gossip_topic: Option<[u8; 32]>) -> Harness<SimTransport> {
+    /// host loop.
+    pub fn join(&self, id: PeerId) -> Harness<SimTransport> {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let gossip_pair = if gossip_topic.is_some() {
-            Some(mpsc::unbounded_channel())
-        } else {
-            None
-        };
 
         let mut inner = self.inner.lock().unwrap();
-        if let Some((new_tx, _)) = &gossip_pair {
-            for (other_id, other) in inner.nodes.iter() {
-                if other.gossip_topic == gossip_topic
-                    && let Some(other_tx) = &other.gossip_tx
-                {
-                    let _ = other_tx.send(GossipEvent::NeighborUp(id));
-                    let _ = new_tx.send(GossipEvent::NeighborUp(*other_id));
-                }
-            }
-        }
         inner.nodes.insert(
             id,
             NodeSlot {
                 incoming_tx,
-                gossip_tx: gossip_pair.as_ref().map(|(tx, _)| tx.clone()),
-                gossip_topic,
                 up: true,
-                gossip_seen: std::collections::HashMap::new(),
             },
         );
         drop(inner);
@@ -216,30 +160,16 @@ impl SimNet {
         // sends never block the simulator's lock scope.)
         let (b_incoming_tx, b_incoming_rx) = mpsc::channel(1024);
         tokio::spawn(bridge(incoming_rx, b_incoming_tx));
-        let gossip = gossip_pair.map(|(tx, rx)| {
-            let (b_tx, b_rx) = mpsc::channel(1024);
-            tokio::spawn(bridge(rx, b_tx));
-            (
-                SimGossip {
-                    net: self.clone(),
-                    from: id,
-                    topic: gossip_topic.expect("gossip pair requires a configured topic"),
-                    _tx: tx,
-                },
-                b_rx,
-            )
-        });
         Harness {
             transport,
             incoming: b_incoming_rx,
-            gossip,
         }
     }
 
     /// Sever the link between `a` and `b` in both directions.
     ///
-    /// New dials fail, gossip frames stop flowing, and established
-    /// connections crossing the cut are reset. Leaving those connections
+    /// New dials fail and established connections crossing the cut are reset.
+    /// Leaving those connections
     /// alive would let later operations traverse an allegedly partitioned
     /// link forever because simulated streams are channels rather than a
     /// finite kernel packet buffer.
@@ -265,7 +195,7 @@ impl SimNet {
         self.inner.lock().unwrap().partitions.remove(&key);
     }
 
-    /// Take `id` off the network: dials to it fail, gossip skips it.
+    /// Take `id` off the network: dials to it fail.
     /// Its host loop keeps running (a crashed process is modeled by
     /// also dropping the node's Peer + harness; a *disconnected* node
     /// is modeled by this alone).
@@ -361,7 +291,6 @@ pub struct SimTransport {
 
 impl Transport for SimTransport {
     type Conn = SimConn;
-    type Gossip = SimGossip;
 
     fn local_id(&self) -> PeerId {
         self.id
@@ -433,86 +362,6 @@ impl Transport for SimTransport {
     }
 
     async fn shutdown(&self) {}
-}
-
-/// Broadcast half of the sim gossip topic.
-#[derive(Clone)]
-pub struct SimGossip {
-    net: SimNet,
-    from: PeerId,
-    topic: [u8; 32],
-    /// Keeps the node's own event channel alive for the lifetime of
-    /// the sink (mirrors iroh-gossip, where dropping the topic handle
-    /// ends the subscription).
-    _tx: mpsc::UnboundedSender<GossipEvent>,
-}
-
-impl GossipSink for SimGossip {
-    async fn broadcast(&self, frame: Vec<u8>) -> anyhow::Result<()> {
-        // Collect targets + per-target latency under the lock, then
-        // deliver outside it via delayed tasks on the paused wheel.
-        let deliveries: Vec<(mpsc::UnboundedSender<GossipEvent>, Duration)> = {
-            let mut inner = self.net.inner.lock().unwrap();
-            let me_up = inner.nodes.get(&self.from).map(|n| n.up).unwrap_or(false);
-            if !me_up {
-                return Ok(()); // crashed nodes shout into the void
-            }
-            let targets: Vec<PeerId> = inner
-                .nodes
-                .iter()
-                .filter(|(id, slot)| {
-                    **id != self.from
-                        && slot.up
-                        && slot.gossip_topic == Some(self.topic)
-                        && slot.gossip_tx.is_some()
-                })
-                .map(|(id, _)| *id)
-                .collect();
-            let dedupe = inner.config.gossip_dedupe;
-            let msg_id: [u8; 32] = *blake3::hash(&frame).as_bytes();
-            let now_ns = crate::clock::mono_now().as_nanos();
-            let retention = GOSSIP_ID_RETENTION.as_nanos() as u64;
-            targets
-                .into_iter()
-                .filter_map(|id| {
-                    if inner.partitioned(&self.from, &id) {
-                        return None;
-                    }
-                    let drop_prob = inner.config.gossip_drop_prob;
-                    if drop_prob > 0.0 && inner.rng.gen_bool(drop_prob) {
-                        return None;
-                    }
-                    let lat = inner.latency();
-                    let node = inner.nodes.get_mut(&id)?;
-                    if dedupe {
-                        // Known id within retention => suppress AND
-                        // refresh the window (plumtree behavior: a
-                        // duplicate re-arms its own suppression).
-                        let deadline = node.gossip_seen.entry(msg_id).or_insert(0);
-                        if *deadline > now_ns {
-                            *deadline = now_ns + retention;
-                            return None;
-                        }
-                        *deadline = now_ns + retention;
-                    }
-                    node.gossip_tx.clone().map(|tx| (tx, lat))
-                })
-                .collect()
-        };
-
-        let from = self.from;
-        for (tx, lat) in deliveries {
-            let bytes = frame.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(lat).await;
-                let _ = tx.send(GossipEvent::Received {
-                    bytes,
-                    delivered_from: from,
-                });
-            });
-        }
-        Ok(())
-    }
 }
 
 /// A simulated connection: two endpoints exchanging bidirectional
@@ -669,37 +518,5 @@ mod tests {
             c_recv.read_exact(&mut resp).await.is_err(),
             "client read on an abandoned stream must EOF, not hang"
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn explicit_topics_isolate_gossip_independently_of_node_identity() {
-        let net = SimNet::new(7, SimConfig::default());
-        let mut a = net.join([1; 32], Some([0xA0; 32]));
-        let mut b = net.join([2; 32], Some([0xB0; 32]));
-        let mut c = net.join([3; 32], Some([0xA0; 32]));
-        let (a_sink, mut a_events) = a.gossip.take().unwrap();
-        let (_, mut b_events) = b.gossip.take().unwrap();
-        let (_, mut c_events) = c.gossip.take().unwrap();
-
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            a_events.try_recv(),
-            Ok(GossipEvent::NeighborUp(peer)) if peer == [3; 32]
-        ));
-        assert!(matches!(
-            c_events.try_recv(),
-            Ok(GossipEvent::NeighborUp(peer)) if peer == [1; 32]
-        ));
-        assert!(b_events.try_recv().is_err());
-
-        a_sink.broadcast(vec![1, 2, 3]).await.unwrap();
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(50)).await;
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            c_events.try_recv(),
-            Ok(GossipEvent::Received { bytes, .. }) if bytes == vec![1, 2, 3]
-        ));
-        assert!(b_events.try_recv().is_err());
     }
 }

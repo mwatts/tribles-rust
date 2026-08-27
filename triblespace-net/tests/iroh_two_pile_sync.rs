@@ -4,9 +4,8 @@
 //! The deterministic-simulation suite proves the protocol *logic*; this test
 //! proves the *transport*: two
 //! `Peer<Pile>`s — real pile files on disk — run the full production
-//! stack (`transport::iroh::bind_with_endpoint`: protocol router,
-//! team-derived iroh-gossip mesh, and inline CONNECT/SYNC_TEAM
-//! authorization) over real iroh QUIC endpoints wired through
+//! stack (`transport::iroh::bind_with_endpoint`: protocol router and inline
+//! CONNECT/SYNC_TEAM authorization) over real iroh QUIC endpoints wired through
 //! `iroh::test_utils` `TestNetwork` (an in-memory packet transport —
 //! no relays, no DNS, no OS sockets — everything above the packet
 //! layer is the production code path).
@@ -93,8 +92,8 @@ async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
 }
 
 /// Bring one node up over the TestNetwork: bind the endpoint, wire the
-/// full production transport stack (`bind_with_endpoint`: protocol router
-/// and team-derived gossip topic), spawn the host loop as a tokio
+/// full production transport stack (`bind_with_endpoint`: protocol router),
+/// spawn the host loop as a tokio
 /// task, and wrap the pile in a `Peer`.
 async fn bring_up(
     network: &TestNetwork,

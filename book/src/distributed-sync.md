@@ -2,15 +2,17 @@
 
 The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
 crate synchronizes one team's TribleSpace store over
-[iroh](https://www.iroh.computer/). It has one data protocol and two
-deliberately narrow discovery mechanisms:
+[iroh](https://www.iroh.computer/). It has one authenticated direct protocol
+with two narrow progress paths:
 
-- authenticated QUIC performs authorized inventory walks and exact blob reads;
-- a team-derived gossip topic carries lossy generation wake hints.
+- bounded fair pairwise PATCH walks converge monotone store inventories; and
+- a bounded XOR DHT locates explicitly published providers for an
+  already-known exact artifact handle.
 
-Gossip neighbors and stored routing evidence grant no authority. Periodic
-authenticated inventory sweeps are the correctness path, so dropped or
-duplicated wake frames affect latency rather than convergence.
+Stored routing evidence and DHT referrals grant no authority. Every inventory
+walk, provider operation, and exact read uses reciprocal CONNECT and SYNC_TEAM
+authorization. Pairwise set union is the epidemic exchange itself; there is no
+publisherless broadcast wake plane.
 
 The user-visible surface is `Peer<S>`. It wraps a synchronous local store and
 owns the asynchronous host. There is no remote mutable head, receipt RPC,
@@ -44,8 +46,8 @@ peer.refresh();
 ```
 
 `team` is simultaneously the external capability trust root, inventory scope,
-and deterministic gossip topic. The backing store must be dedicated to this
-one team. Only PEER evidence contains a team key intrinsically; collection
+and provider-key namespace. The backing store must be dedicated to this one
+team. Only PEER evidence contains a team key intrinsically; collection
 records, proofs, and blobs are content-addressed global forms. Attaching a
 mixed-team store would therefore disclose all of those resident sets to any
 caller authorized for the configured team.
@@ -140,8 +142,8 @@ Stored proof presence remains evidence only.
 Each component is an ordered PATCH inventory with a canonical BLAKE3 Merkle
 summary. A manifest contains the four component tags, leaf counts, and roots in
 fixed order. Its generation hash binds the version, team key, and all four
-entries. The generation is useful as a wake value and cache key, but it is not
-an authorization token or evidence of global completeness.
+entries. The generation is a cache identity, not an authorization token or
+evidence of global completeness.
 
 A puller compares remote summaries with its local trees and descends only
 differing prefixes. Every node request states the expected component root,
@@ -166,10 +168,13 @@ splices bytes from its current state into the older walk. The client obtains a
 fresh manifest and restarts that component. Mirror blob transfers use bounded
 ranges and verify the complete BLAKE3 handle before admission.
 
-Periodic sweeps compare every eligible route even if gossip is silent. A
-gossip frame contains only a version, the exact team key, and a manifest
-generation. It schedules an earlier authenticated check; the delivering mesh
-neighbor is not presumed to be the publisher and is never inserted as a route.
+The first installed local snapshot starts anti-entropy immediately. Thereafter
+each 30-second period admits at most `K = 20` peers from a fair rotating cursor,
+with at most eight live walks. The pending queue therefore never contains more
+than one period's eligible budget and never carries backoff-delayed peers.
+Slow sweeps do not accumulate catch-up periods, repeated snapshot installation
+cannot manufacture work, and every configured or stored PEER candidate in an
+eventually stable peer set is selected as the cursor cycles.
 
 ## Routing and discovery
 
@@ -181,28 +186,36 @@ union carries those candidates transitively without creating a mutable roster.
 An endpoint remains only a candidate until the two proof handshakes succeed.
 Every returned payload is checked against its requested BLAKE3 handle.
 
-The team key derives the production gossip topic, preventing an authorized
-store from accidentally rendezvousing on another team's mesh. Joining that
-topic, observing a generation, or appearing as a gossip neighbor still grants
-no transport or inventory authority.
+The same routing table powers an iterative Kademlia-style XOR lookup with
+256 buckets, `K = 20`, and `alpha = 3`. Configured and synchronized PEER
+evidence are periodic anti-entropy targets; identities named only by DHT
+referrals are not. A referred identity becomes verified routing state only
+after a direct reciprocal capability-authenticated response.
+
+`announce_artifact(c)` derives a team-scoped provider key from `(team, c)` and
+stores a receiver-local soft lease for the authenticated caller at the `K`
+closest responsive nodes. A reader that already knows `c` performs iterative
+`FIND_NODE`, asks those replicas for live provider hints, and fetches from the
+returned providers. Exact transfer repeats reciprocal authorization and checks
+that the received bytes hash to `c`. An unannounced holder is honestly
+unavailable; the implementation never falls back to probing every known peer.
 
 ## Local quality of service
 
 Direction controls which work this node performs; it is never sent as an
 authorization claim:
 
-- `Bidirectional` pulls remote inventories, publishes wake hints, serves local
-  inventory and blobs, and may retain an authenticated inbound peer as PEER
-  routing evidence.
-- `ReadOnly` pulls and services local WANTs, but neither publishes nor serves
-  local inventory or blobs.
-- `WriteOnly` publishes and serves local data, but never pulls,
-  demand-fetches, or records inbound readers as pull routes.
+- `Bidirectional` pulls remote inventories, serves local inventory and blobs,
+  and may retain an authenticated inbound peer as PEER routing evidence.
+- `ReadOnly` pulls and services local WANTs, but does not serve local inventory
+  or blobs.
+- `WriteOnly` serves local data, but never pulls, demand-fetches, or records
+  inbound readers as pull routes.
 
 The blob mode is independent:
 
-- `Demand` skips the broad Blob inventory. A durable exact blob WANT tries the
-  configured and learned authenticated routes.
+- `Demand` skips the broad Blob inventory. A durable exact blob WANT uses the
+  DHT provider path for that already-known handle.
 - `Mirror` also walks the complete authorized Blob inventory and fetches every
   missing resident blob in bounded ranges.
 
@@ -218,9 +231,9 @@ exact blob, a matching native `MERGE`, or a matching native `DERIVE` record.
 WANTs remain durable and are retried with bounded backoff; temporary
 unreachability means “not obtained yet,” never “absent.”
 
-Blob WANTs use exact authenticated `GET_BLOB` over known team routes in Demand
-mode. The received bytes are content-checked, landed, and flushed before the
-WANT is counted as fulfilled.
+Blob WANTs use explicit DHT provider discovery followed by exact authenticated
+`GET_BLOB` in Demand mode. The received bytes are content-checked, landed, and
+flushed before the WANT is counted as fulfilled.
 
 Collection-operation WANTs need no network operation. The full team inventory
 already converges all collection records, including conflicting valid
@@ -264,21 +277,25 @@ compute reuse without weakening this boundary.
 ## Wire surface
 
 All direct operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/12"`. One QUIC stream carries one
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/13"`. One QUIC stream carries one
 strictly framed operation:
 
 | Operation | Byte | Purpose |
 |---|---:|---|
 | `GET_BLOB` | `0x02` | read one exact current blob after both authorizations |
 | `OP_AUTH` | `0x05` | exchange subject-bound CONNECT bundles; mandatory first stream only |
+| `PROVIDER_PUT` | `0x06` | renew the authenticated caller's soft provider lease |
+| `PROVIDER_GET` | `0x07` | read live hints for one already-known artifact |
 | `INVENTORY_AUTH` | `0x08` | exchange SYNC_TEAM bundles and install one connection-local session |
 | `INVENTORY_MANIFEST` | `0x09` | read the four ordered component roots and generation |
 | `INVENTORY_NODE` | `0x0A` | read one expected-digest node from a pinned component |
 | `INVENTORY_BLOB_RANGE` | `0x0B` | read at most one bounded range from a pinned Blob root |
+| `FIND_NODE` | `0x0C` | read up to `K` directly verified routes nearest one XOR key |
 
-There is no remote write, collection-evidence, operation-receipt, blob-child,
-custody, or replica operation. Receivers admit strictly checked results through
-their own local store boundary.
+The provider lease is bounded receiver-local soft state; there is no remote
+semantic write, collection-evidence, operation-receipt, blob-child, custody, or
+replica operation. Receivers admit strictly checked results through their own
+local store boundary.
 
 ## CLI
 
@@ -319,9 +336,10 @@ distributed proof of convergence.
 - The backing store is a single-team security boundary.
 - CONNECT and SYNC_TEAM are reciprocal subject-bound proofs; SYNC_TEAM
   separately authorizes every disclosure.
-- Proof presence, PEER evidence, and gossip grant no authority.
-- Gossip wakes reconciliation; periodic authenticated sweeps establish
-  eventual progress.
+- Proof presence, PEER evidence, DHT referrals, and provider hints grant no
+  authority.
+- Bounded fair pairwise PATCH reconciliation establishes epidemic progress;
+  there is no separate wake plane.
 - Every Merkle walk pins exact roots and fails closed when a snapshot is gone.
 - Demand is explicit local interest; inventory observation creates no hidden
   WANT.

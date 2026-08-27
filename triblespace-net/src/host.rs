@@ -2,13 +2,12 @@
 //!
 //! The synchronous [`crate::peer::Peer`] owns the store. This module owns
 //! transport, connection authentication, immutable serving snapshots, and the
-//! periodic anti-entropy scheduler. Gossip is deliberately only a wake-up
-//! hint: every useful byte arrives through a CONNECT- and SYNC_TEAM-authorized
-//! direct connection and is checked against a pinned PATCH root.
+//! bounded periodic anti-entropy scheduler. Every useful byte arrives through
+//! a CONNECT- and SYNC_TEAM-authorized direct connection and is checked against
+//! a pinned PATCH root.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -17,7 +16,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::{StreamExt, stream::FuturesUnordered};
 use iroh_base::{EndpointAddr, EndpointId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{Instrument, debug, debug_span, info_span, instrument, trace, warn};
+use tracing::{Instrument, debug, debug_span, info_span, instrument, warn};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::{
     CapabilityMode, CapabilityProofBundle, CapabilityProofId, CapabilityRequest, CapabilityValidity,
@@ -52,19 +51,19 @@ use crate::inventory_wire::{
 use crate::protocol::*;
 use crate::provider::{ArtifactId, ProviderDirectory, ProviderKey, provider_key};
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
-use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
+use crate::transport::{Conn, Harness, PeerId, Transport};
 
 /// Configuration for a peer attached to one single-team store.
 ///
-/// `team` is simultaneously the capability trust root, inventory scope, and
-/// gossip rendezvous. The backing store must not mix team-unscoped records,
-/// proofs, or blobs from another team.
+/// `team` is simultaneously the capability trust root and inventory scope.
+/// The backing store must not mix team-unscoped records, proofs, or blobs from
+/// another team.
 #[derive(Clone)]
 pub struct PeerConfig {
     /// Bootstrap routes. Stored PEER evidence can add routing candidates but
     /// never grants authority.
     pub peers: Vec<EndpointAddr>,
-    /// Team trust root, inventory scope, and gossip topic.
+    /// Team trust root and inventory scope.
     pub team: VerifyingKey,
     /// Complete proof authorizing this endpoint key for exact CONNECT on
     /// `team`.
@@ -101,13 +100,6 @@ fn validate_local_authorizations(
         "local SYNC_TEAM",
     )?;
     Ok(())
-}
-
-/// Team-derived gossip topic. Keeping the derivation explicit prevents a
-/// caller from accidentally rendezvousing an authorized store on another
-/// team's mesh.
-pub fn team_gossip_topic(team: VerifyingKey) -> [u8; 32] {
-    team.to_bytes()
 }
 
 trait BlobSnapshotReader: Send + Sync + 'static {
@@ -616,31 +608,6 @@ fn pinned_snapshot_if_serving(
     snapshots.lock().unwrap().get(team, component, root)
 }
 
-const GOSSIP_INVENTORY_WAKE: u8 = 0x04;
-const GOSSIP_INVENTORY_WAKE_VERSION: u32 = 1;
-const GOSSIP_INVENTORY_WAKE_LEN: usize = 1 + 4 + 32 + 32;
-
-fn inventory_wake_frame(team: VerifyingKey, generation: InventoryGeneration) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(GOSSIP_INVENTORY_WAKE_LEN);
-    frame.push(GOSSIP_INVENTORY_WAKE);
-    frame.extend_from_slice(&GOSSIP_INVENTORY_WAKE_VERSION.to_be_bytes());
-    frame.extend_from_slice(team.as_bytes());
-    frame.extend_from_slice(&generation.into_bytes());
-    frame
-}
-
-fn decode_inventory_wake_frame(bytes: &[u8], team: VerifyingKey) -> Option<InventoryGeneration> {
-    if bytes.len() != GOSSIP_INVENTORY_WAKE_LEN
-        || bytes[0] != GOSSIP_INVENTORY_WAKE
-        || bytes[1..5] != GOSSIP_INVENTORY_WAKE_VERSION.to_be_bytes()
-        || bytes[5..37] != team.to_bytes()
-    {
-        return None;
-    }
-    let generation = bytes[37..].try_into().ok()?;
-    Some(InventoryGeneration::from_bytes(generation))
-}
-
 /// The async capability cloned into lazy readers. Exact GET_BLOB and broad
 /// inventory enumeration both require the connection-local SYNC_TEAM session;
 /// the content hash narrows the request but is not itself disclosure authority.
@@ -824,7 +791,6 @@ impl NetSender {
         });
         let manifest = snapshot.manifest();
         let notice = SnapshotNotice {
-            generation: manifest.generation(),
             peers: snapshot.routing_peers(),
         };
         let snapshot = Arc::new(snapshot);
@@ -840,8 +806,8 @@ impl NetSender {
         drop(retired_components);
 
         let mut installed = self.installed_generation.lock().unwrap();
-        if *installed != Some(notice.generation) {
-            *installed = Some(notice.generation);
+        if *installed != Some(manifest.generation()) {
+            *installed = Some(manifest.generation());
             let _ = self.cmd_tx.send(NetCommand::SnapshotInstalled(notice));
         }
     }
@@ -1019,9 +985,6 @@ const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const INVENTORY_SWEEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const INVENTORY_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
-/// Untrusted gossip can accelerate periodic correctness, but cannot schedule
-/// more than one extra sweep per interval regardless of sender volume.
-const MIN_GOSSIP_WAKE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 const HOST_POLL_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
 const INBOUND_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const INBOUND_CONNECTION_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1030,6 +993,12 @@ pub(crate) const MAX_INBOUND_CONNECTIONS_GLOBAL: usize = 64;
 pub(crate) const MAX_INBOUND_REQUESTS_PER_CONNECTION: usize = 16;
 const MAX_INBOUND_REQUESTS_GLOBAL: usize = 64;
 const MAX_CONCURRENT_SWEEPS: usize = 8;
+/// Maximum number of new pairwise reconciliations admitted by one period.
+///
+/// Reusing the DHT replication width gives the scheduler one fixed natural
+/// budget instead of a second deployment knob. The cursor carries fairness
+/// across periods when the stored PEER set is larger than this bound.
+const SWEEPS_PER_PERIOD: usize = K;
 /// Bounded parallelism for the small provider-directory RPC fan-out.
 const MAX_CONCURRENT_PROVIDER_RPCS: usize = ALPHA;
 /// One lookup must fit comfortably inside the default interactive operation.
@@ -1048,11 +1017,102 @@ struct SweepOutcome {
     success: bool,
 }
 
+/// Bounded fair admission for periodic pairwise anti-entropy.
+///
+/// `pending` contains only peers admitted by the current period, never every
+/// known peer and never a backoff-delayed peer. It is refilled only after it is
+/// empty and a period is due, so slow sweeps cannot accumulate catch-up work.
+/// The lexicographic cursor is an identity rather than a vector index, keeping
+/// progress well-defined when grow-only peer evidence inserts around it.
+struct SweepScheduler {
+    next_period: Option<crate::clock::Mono>,
+    cursor: Option<PeerId>,
+    pending: VecDeque<PeerId>,
+}
+
+impl SweepScheduler {
+    fn new() -> Self {
+        Self {
+            next_period: None,
+            cursor: None,
+            pending: VecDeque::with_capacity(SWEEPS_PER_PERIOD),
+        }
+    }
+
+    /// Arm the first period when the serving snapshot exists. Further
+    /// generations deliberately do not move the deadline.
+    fn observe_snapshot(&mut self, now: crate::clock::Mono) {
+        self.next_period.get_or_insert(now);
+    }
+
+    fn period_is_due(&self, now: crate::clock::Mono) -> bool {
+        self.pending.is_empty()
+            && self
+                .next_period
+                .is_some_and(|next_period| now >= next_period)
+    }
+
+    fn admit_period(
+        &mut self,
+        now: crate::clock::Mono,
+        candidates: &[PeerId],
+        in_flight: &HashSet<PeerId>,
+        failures: &HashMap<PeerId, (u32, crate::clock::Mono)>,
+    ) -> usize {
+        let Some(next_period) = self.next_period else {
+            return 0;
+        };
+        if now < next_period || !self.pending.is_empty() {
+            return 0;
+        }
+        // Never replay missed periods in a burst. One delayed host iteration
+        // admits one budget and starts the next interval from its observation.
+        self.next_period = Some(now + INVENTORY_SWEEP_PERIOD);
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        let start = self
+            .cursor
+            .map_or(0, |cursor| match candidates.binary_search(&cursor) {
+                Ok(index) => (index + 1) % candidates.len(),
+                Err(index) if index < candidates.len() => index,
+                Err(_) => 0,
+            });
+        let mut admitted = 0;
+        for offset in 0..candidates.len() {
+            let peer = candidates[(start + offset) % candidates.len()];
+            self.cursor = Some(peer);
+            if in_flight.contains(&peer)
+                || failures
+                    .get(&peer)
+                    .is_some_and(|(_, retry_at)| now < *retry_at)
+            {
+                continue;
+            }
+            self.pending.push_back(peer);
+            admitted += 1;
+            if admitted == SWEEPS_PER_PERIOD {
+                break;
+            }
+        }
+        admitted
+    }
+
+    fn pop(&mut self) -> Option<PeerId> {
+        self.pending.pop_front()
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
     let Harness {
         transport,
         mut incoming,
-        gossip,
     } = harness;
     let HostWiringParts {
         commands,
@@ -1087,10 +1147,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let candidates = Arc::new(Mutex::new(RoutingTable::new(my_id, configured)));
     let pool = new_shared_pool();
     let providers = Arc::new(Mutex::new(ProviderDirectory::default()));
-    let (gossip_sender, mut gossip_events) = match gossip {
-        Some((sender, events)) => (Some(sender), Some(events)),
-        None => (None, None),
-    };
     let _ = cap_tx.send(Some(Arc::new(NetCap {
         transport: transport.clone(),
         pool: pool.clone(),
@@ -1136,40 +1192,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
     });
 
-    let wake_pending = Arc::new(AtomicBool::new(false));
-    if let Some(mut events) = gossip_events.take() {
-        let team = config.team;
-        let wake_pending = wake_pending.clone();
-        tokio::spawn(async move {
-            let mut last_generation = None;
-            while let Some(event) = events.recv().await {
-                match event {
-                    GossipEvent::Received { bytes, .. } => {
-                        if let Some(generation) = decode_inventory_wake_frame(&bytes, team)
-                            && last_generation != Some(generation)
-                        {
-                            last_generation = Some(generation);
-                            wake_pending.store(true, Ordering::Release);
-                        }
-                    }
-                    GossipEvent::NeighborUp(peer) => {
-                        trace!(peer = %hex::encode(&peer[..4]), "team gossip neighbor up");
-                    }
-                    GossipEvent::NeighborDown(peer) => {
-                        trace!(peer = %hex::encode(&peer[..4]), "team gossip neighbor down");
-                    }
-                }
-            }
-        });
-    }
-
     let (sweep_tx, mut sweep_rx) = tokio::sync::mpsc::unbounded_channel::<SweepOutcome>();
     let mut in_flight = HashSet::new();
-    let mut pending_sweeps = VecDeque::new();
     let mut failures: HashMap<PeerId, (u32, crate::clock::Mono)> = HashMap::new();
-    let mut next_sweep = crate::clock::mono_now();
-    let mut next_gossip_wake = crate::clock::mono_now();
-    let mut current_generation = None;
+    let mut sweeps = SweepScheduler::new();
     let commands = commands;
 
     loop {
@@ -1177,27 +1203,16 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         loop {
             match commands.try_recv() {
                 Ok(NetCommand::SnapshotInstalled(notice)) => {
-                    current_generation = Some(notice.generation);
                     let mut routes = candidates.lock().unwrap();
                     for peer in notice.peers {
                         routes.note_sync_candidate(peer);
                     }
                     drop(routes);
-                    if config.qos.direction.publishes()
-                        && let Some(sender) = gossip_sender.as_ref()
-                    {
-                        let sender = sender.clone();
-                        let frame = inventory_wake_frame(config.team, notice.generation);
-                        tokio::spawn(async move {
-                            if let Err(error) = sender.broadcast(frame).await {
-                                debug!(%error, "inventory wake broadcast failed");
-                            }
-                        });
-                    }
-                    // The slot was installed before this command. Pull now so
-                    // startup and every newly admitted generation converge
-                    // without waiting for gossip or the periodic interval.
-                    next_sweep = crate::clock::mono_now();
+                    // The first immutable serving view starts anti-entropy
+                    // immediately. Later local generations update stored-peer
+                    // evidence but cannot reset or multiply the fixed periodic
+                    // work budget.
+                    sweeps.observe_snapshot(crate::clock::mono_now());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1211,11 +1226,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             return;
         }
 
-        let now = crate::clock::mono_now();
-        if now >= next_gossip_wake && wake_pending.swap(false, Ordering::AcqRel) {
-            next_sweep = now;
-            next_gossip_wake = now + MIN_GOSSIP_WAKE_PERIOD;
-        }
         while let Ok(outcome) = sweep_rx.try_recv() {
             in_flight.remove(&outcome.peer);
             if outcome.success {
@@ -1235,33 +1245,20 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         let now = crate::clock::mono_now();
-        if config.qos.direction.pulls() && current_generation.is_some() && now >= next_sweep {
-            let queued: HashSet<_> = pending_sweeps.iter().copied().collect();
-            for peer in candidates.lock().unwrap().sync_candidates() {
-                if !in_flight.contains(&peer) && !queued.contains(&peer) {
-                    pending_sweeps.push_back(peer);
-                }
-            }
-            next_sweep = now + INVENTORY_SWEEP_PERIOD;
+        if config.qos.direction.pulls() && sweeps.period_is_due(now) {
+            let candidates = candidates.lock().unwrap().sync_candidates();
+            sweeps.admit_period(now, &candidates, &in_flight, &failures);
         }
 
         let local = snapshot.lock().unwrap().as_ref().cloned();
         if config.qos.direction.pulls()
             && let Some(local) = local
         {
-            let mut deferred = VecDeque::new();
             while in_flight.len() < MAX_CONCURRENT_SWEEPS {
-                let Some(peer) = pending_sweeps.pop_front() else {
+                let Some(peer) = sweeps.pop() else {
                     break;
                 };
                 if in_flight.contains(&peer) {
-                    continue;
-                }
-                if failures
-                    .get(&peer)
-                    .is_some_and(|(_, retry_at)| now < *retry_at)
-                {
-                    deferred.push_back(peer);
                     continue;
                 }
                 in_flight.insert(peer);
@@ -1308,7 +1305,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     let _ = sweep_tx.send(SweepOutcome { peer, success });
                 });
             }
-            pending_sweeps.extend(deferred);
         }
 
         tokio::time::sleep(HOST_POLL_PERIOD).await;
@@ -2590,19 +2586,6 @@ mod tests {
     }
 
     #[test]
-    fn wake_is_exactly_team_scoped_and_versioned() {
-        let team = key(1);
-        let generation = InventoryGeneration::from_bytes([7; 32]);
-        let frame = inventory_wake_frame(team, generation);
-        assert_eq!(decode_inventory_wake_frame(&frame, team), Some(generation));
-        assert_eq!(decode_inventory_wake_frame(&frame, key(2)), None);
-
-        let mut malformed = frame;
-        malformed[4] ^= 1;
-        assert_eq!(decode_inventory_wake_frame(&malformed, team), None);
-    }
-
-    #[test]
     fn routing_evidence_never_replaces_bootstraps() {
         let local = [0; 32];
         let configured = [[1; 32], [2; 32]];
@@ -2613,6 +2596,139 @@ mod tests {
         for seed in configured {
             assert!(routes.closest(seed, usize::MAX).contains(&seed));
         }
+    }
+
+    fn drain_sweep_period(scheduler: &mut SweepScheduler) -> Vec<PeerId> {
+        let mut selected = Vec::new();
+        while let Some(peer) = scheduler.pop() {
+            selected.push(peer);
+        }
+        selected
+    }
+
+    #[test]
+    fn sweep_scheduler_is_bounded_and_fair_across_peer_set_changes() {
+        let mut candidates: Vec<_> = (1..=(2 * SWEEPS_PER_PERIOD + 7))
+            .map(|index| [u8::try_from(index).unwrap(); 32])
+            .collect();
+        let now = crate::clock::mono_now();
+        let mut scheduler = SweepScheduler::new();
+        scheduler.observe_snapshot(now);
+        let in_flight = HashSet::new();
+        let failures = HashMap::new();
+        let mut selected = HashSet::new();
+
+        assert_eq!(
+            scheduler.admit_period(now, &candidates, &in_flight, &failures),
+            SWEEPS_PER_PERIOD
+        );
+        assert_eq!(scheduler.pending_len(), SWEEPS_PER_PERIOD);
+        selected.extend(drain_sweep_period(&mut scheduler));
+
+        // Remove the exact cursor and insert identities on both sides of its
+        // former position. The identity-based insertion-point cursor must not
+        // strand either new or surviving evidence.
+        let old_cursor = scheduler.cursor.unwrap();
+        candidates.retain(|peer| *peer != old_cursor && *peer != [35; 32]);
+        candidates.push([0; 32]);
+        candidates.push([250; 32]);
+        candidates.sort_unstable();
+
+        let mut tick = now + INVENTORY_SWEEP_PERIOD;
+        for _ in 0..=candidates.len().div_ceil(SWEEPS_PER_PERIOD) {
+            let admitted = scheduler.admit_period(tick, &candidates, &in_flight, &failures);
+            assert!(admitted <= SWEEPS_PER_PERIOD);
+            assert!(scheduler.pending_len() <= SWEEPS_PER_PERIOD);
+            selected.extend(drain_sweep_period(&mut scheduler));
+            tick = tick + INVENTORY_SWEEP_PERIOD;
+        }
+
+        assert!(
+            candidates.iter().all(|peer| selected.contains(peer)),
+            "every surviving or inserted peer is eventually selected"
+        );
+    }
+
+    #[test]
+    fn sweep_scheduler_checks_backoff_only_once_per_period() {
+        let candidates = vec![[1; 32], [2; 32], [3; 32]];
+        let now = crate::clock::mono_now();
+        let retry_at = now + INVENTORY_SWEEP_PERIOD + INVENTORY_SWEEP_PERIOD;
+        let failures = HashMap::from([([2; 32], (1, retry_at))]);
+        let in_flight = HashSet::new();
+        let mut scheduler = SweepScheduler::new();
+        assert!(!scheduler.period_is_due(now));
+        scheduler.observe_snapshot(now);
+        assert!(scheduler.period_is_due(now));
+
+        assert_eq!(
+            scheduler.admit_period(now, &candidates, &in_flight, &failures),
+            2
+        );
+        assert_eq!(drain_sweep_period(&mut scheduler), vec![[1; 32], [3; 32]]);
+        assert!(!scheduler.period_is_due(now + Duration::from_millis(10)));
+        assert_eq!(
+            scheduler.admit_period(
+                now + Duration::from_millis(10),
+                &candidates,
+                &in_flight,
+                &failures,
+            ),
+            0,
+            "an empty queue does not trigger a host-poll-rate rescan"
+        );
+
+        let next = now + INVENTORY_SWEEP_PERIOD;
+        assert!(scheduler.period_is_due(next));
+        scheduler.admit_period(next, &candidates, &in_flight, &failures);
+        assert!(!drain_sweep_period(&mut scheduler).contains(&[2; 32]));
+        scheduler.admit_period(
+            next + INVENTORY_SWEEP_PERIOD,
+            &candidates,
+            &in_flight,
+            &failures,
+        );
+        assert!(drain_sweep_period(&mut scheduler).contains(&[2; 32]));
+    }
+
+    #[test]
+    fn repeated_snapshots_do_not_reset_or_amplify_the_period_budget() {
+        let candidates: Vec<_> = (1..=SWEEPS_PER_PERIOD + 1)
+            .map(|index| [u8::try_from(index).unwrap(); 32])
+            .collect();
+        let now = crate::clock::mono_now();
+        let mut scheduler = SweepScheduler::new();
+        scheduler.observe_snapshot(now);
+        scheduler.observe_snapshot(now + Duration::from_secs(10));
+
+        assert_eq!(
+            scheduler.admit_period(now, &candidates, &HashSet::new(), &HashMap::new()),
+            SWEEPS_PER_PERIOD,
+            "the first snapshot starts immediately"
+        );
+        drain_sweep_period(&mut scheduler);
+
+        for millis in [10, 20, 1_000, 29_999] {
+            scheduler.observe_snapshot(now + Duration::from_millis(millis));
+            assert_eq!(
+                scheduler.admit_period(
+                    now + Duration::from_millis(millis),
+                    &candidates,
+                    &HashSet::new(),
+                    &HashMap::new(),
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            scheduler.admit_period(
+                now + INVENTORY_SWEEP_PERIOD,
+                &candidates,
+                &HashSet::new(),
+                &HashMap::new(),
+            ),
+            SWEEPS_PER_PERIOD
+        );
     }
 
     #[test]
@@ -2638,19 +2754,19 @@ mod tests {
         for _ in 0..ALPHA {
             let started = started.clone();
             attempts.push_back(Box::pin(async move {
-                started.fetch_add(1, Ordering::SeqCst);
+                started.fetch_add(1, AtomicOrdering::SeqCst);
                 futures::future::pending().await
             }));
         }
         let healthy_started = started.clone();
         attempts.push_back(Box::pin(async move {
-            healthy_started.fetch_add(1, Ordering::SeqCst);
+            healthy_started.fetch_add(1, AtomicOrdering::SeqCst);
             Some(7)
         }));
 
         let found = hedged_find_map(attempts, |result| result).await;
         assert_eq!(found, Some(7));
-        assert_eq!(started.load(Ordering::SeqCst), ALPHA + 1);
+        assert_eq!(started.load(AtomicOrdering::SeqCst), ALPHA + 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2659,7 +2775,7 @@ mod tests {
         let attempts = (0..crate::provider::MAX_PROVIDERS_PER_KEY).map(|_| {
             let started = started.clone();
             Box::pin(async move {
-                started.fetch_add(1, Ordering::SeqCst);
+                started.fetch_add(1, AtomicOrdering::SeqCst);
                 futures::future::pending::<Option<()>>().await
             }) as futures::future::BoxFuture<'_, Option<()>>
         });
@@ -2670,7 +2786,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(started.load(Ordering::SeqCst), 2 * ALPHA);
+        assert_eq!(started.load(AtomicOrdering::SeqCst), 2 * ALPHA);
     }
 
     #[tokio::test]

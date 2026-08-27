@@ -89,7 +89,7 @@ fn status_has_no_ambient_or_sentinel_configuration() {
 }
 
 #[test]
-fn sync_derives_team_gossip_and_exposes_only_semantic_qos() {
+fn sync_exposes_only_semantic_qos() {
     let help = Command::cargo_bin("trible")
         .unwrap()
         .args(["pile", "net", "sync", "--help"])

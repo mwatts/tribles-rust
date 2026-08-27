@@ -1,8 +1,8 @@
 //! Unified authorized-inventory protocol — deterministic simulation.
 //!
-//! These scenarios exercise the production host loop over `SimNet`. Gossip is
-//! only a lossy wake hint; all semantic evidence and blob bytes cross the same
-//! CONNECT + SYNC_TEAM authenticated inventory protocol.
+//! These scenarios exercise the production host loop over `SimNet`. Pairwise
+//! authenticated PATCH reconciliation is the only epidemic exchange; all
+//! semantic evidence and blob bytes cross CONNECT + SYNC_TEAM.
 #![cfg(feature = "sim")]
 
 mod common;
@@ -131,7 +131,6 @@ fn component_and_blob_qos_share_one_authenticated_protocol() {
             publisher_store,
             team,
             publisher_proofs,
-            true,
             Vec::new(),
             qos(ReconcileDirection::WriteOnly, BlobReconcileMode::Demand),
         );
@@ -141,7 +140,6 @@ fn component_and_blob_qos_share_one_authenticated_protocol() {
             empty_store(),
             team,
             team_proofs(&root, &demand_key),
-            true,
             vec![pk(&publisher_key)],
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Demand),
         );
@@ -151,7 +149,6 @@ fn component_and_blob_qos_share_one_authenticated_protocol() {
             empty_store(),
             team,
             team_proofs(&root, &mirror_key),
-            true,
             vec![pk(&publisher_key)],
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Mirror),
         );
@@ -191,7 +188,6 @@ fn durable_exact_want_fetches_over_the_authenticated_demand_path() {
             publisher_store,
             team,
             team_proofs(&root, &publisher_key),
-            true,
             Vec::new(),
             qos(ReconcileDirection::WriteOnly, BlobReconcileMode::Demand),
         );
@@ -201,7 +197,6 @@ fn durable_exact_want_fetches_over_the_authenticated_demand_path() {
             empty_store(),
             team,
             team_proofs(&root, &consumer_key),
-            true,
             vec![pk(&publisher_key)],
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Demand),
         );
@@ -253,7 +248,6 @@ fn read_only_peer_discloses_neither_inventory_nor_blob_bytes() {
             source_store,
             team,
             team_proofs(&root, &source_key),
-            false,
             Vec::new(),
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Mirror),
         );
@@ -263,7 +257,6 @@ fn read_only_peer_discloses_neither_inventory_nor_blob_bytes() {
             empty_store(),
             team,
             team_proofs(&root, &reader_key),
-            false,
             vec![pk(&source_key)],
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Mirror),
         );
@@ -316,7 +309,6 @@ fn sync_authority_checks_root_leaf_time_and_invoke_mode() {
             publisher_store,
             team,
             team_proofs(&root, &publisher_key),
-            false,
             Vec::new(),
             qos(ReconcileDirection::WriteOnly, BlobReconcileMode::Demand),
         );
@@ -359,7 +351,6 @@ fn sync_authority_checks_root_leaf_time_and_invoke_mode() {
                 ),
                 sync: sync(&root, &founder_key, CapabilityMode::InvokeAndDelegate, None),
             },
-            false,
             vec![pk(&publisher_key)],
             mirror,
         );
@@ -372,7 +363,6 @@ fn sync_authority_checks_root_leaf_time_and_invoke_mode() {
                 connect: connect(&delegate_key),
                 sync: sync(&root, &delegate_key, CapabilityMode::Delegate, None),
             },
-            false,
             vec![pk(&publisher_key)],
             mirror,
         );
@@ -385,7 +375,6 @@ fn sync_authority_checks_root_leaf_time_and_invoke_mode() {
                 connect: connect(&wrong_root_key),
                 sync: sync(&alien_root, &wrong_root_key, CapabilityMode::Invoke, None),
             },
-            false,
             vec![pk(&publisher_key)],
             mirror,
         );
@@ -398,7 +387,6 @@ fn sync_authority_checks_root_leaf_time_and_invoke_mode() {
                 connect: connect(&wrong_leaf_key),
                 sync: sync(&root, &unrelated_leaf, CapabilityMode::Invoke, None),
             },
-            false,
             vec![pk(&publisher_key)],
             mirror,
         );
@@ -423,7 +411,6 @@ fn sync_authority_checks_root_leaf_time_and_invoke_mode() {
                 connect: connect(&expired_key),
                 sync: sync(&root, &expired_key, CapabilityMode::Invoke, Some(expired)),
             },
-            false,
             vec![pk(&publisher_key)],
             mirror,
         );
@@ -465,16 +452,10 @@ fn sync_authority_checks_root_leaf_time_and_invoke_mode() {
 }
 
 #[test]
-fn periodic_reconciliation_recovers_total_wake_loss() {
+fn periodic_reconciliation_converges_without_a_gossip_plane() {
     let _guard = sim_guard();
     run_paused(0x1A11_0005, async {
-        let net = SimNet::new(
-            0x1A11_0005,
-            SimConfig {
-                gossip_drop_prob: 1.0,
-                ..SimConfig::default()
-            },
-        );
+        let net = SimNet::new(0x1A11_0005, SimConfig::default());
         let root = key(0xF5);
         let publisher_key = key(0xA5);
         let consumer_key = key(0xB5);
@@ -485,7 +466,6 @@ fn periodic_reconciliation_recovers_total_wake_loss() {
             empty_store(),
             team,
             team_proofs(&root, &publisher_key),
-            true,
             Vec::new(),
             qos(ReconcileDirection::WriteOnly, BlobReconcileMode::Demand),
         );
@@ -495,7 +475,6 @@ fn periodic_reconciliation_recovers_total_wake_loss() {
             empty_store(),
             team,
             team_proofs(&root, &consumer_key),
-            true,
             vec![pk(&publisher_key)],
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Demand),
         );
@@ -507,7 +486,7 @@ fn periodic_reconciliation_recovers_total_wake_loss() {
         step(&net, &mut [&mut publisher, &mut consumer], 20).await;
         assert!(
             !has_record(&consumer, late),
-            "with every gossip wake dropped, the update waits for anti-entropy"
+            "the update waits for its next bounded anti-entropy period"
         );
 
         SimNet::step(&vclock(), Duration::from_secs(31)).await;
@@ -543,7 +522,6 @@ fn authenticated_peer_inventory_expands_the_route_set() {
             bootstrap_store,
             team,
             team_proofs(&root, &bootstrap_key),
-            false,
             Vec::new(),
             qos(ReconcileDirection::WriteOnly, BlobReconcileMode::Demand),
         );
@@ -553,7 +531,6 @@ fn authenticated_peer_inventory_expands_the_route_set() {
             discovered_store,
             team,
             team_proofs(&root, &discovered_key),
-            false,
             Vec::new(),
             qos(ReconcileDirection::WriteOnly, BlobReconcileMode::Demand),
         );
@@ -563,7 +540,6 @@ fn authenticated_peer_inventory_expands_the_route_set() {
             empty_store(),
             team,
             team_proofs(&root, &consumer_key),
-            false,
             vec![pk(&bootstrap_key)],
             qos(ReconcileDirection::ReadOnly, BlobReconcileMode::Demand),
         );
@@ -577,8 +553,19 @@ fn authenticated_peer_inventory_expands_the_route_set() {
 
         assert!(has_peer(&consumer, discovered_evidence));
         assert!(
+            !has_record(&consumer, discovered_record),
+            "a learned PEER snapshot does not mint an extra scheduler period"
+        );
+        SimNet::step(&vclock(), Duration::from_secs(31)).await;
+        step(
+            &net,
+            &mut [&mut bootstrap, &mut discovered, &mut consumer],
+            200,
+        )
+        .await;
+        assert!(
             has_record(&consumer, discovered_record),
-            "the only route to B came from A's authenticated PEER inventory"
+            "the next fair period selects the route learned from authenticated PEER inventory"
         );
     });
 }

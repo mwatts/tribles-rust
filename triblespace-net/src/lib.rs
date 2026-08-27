@@ -2,10 +2,11 @@
 //!
 //! [`Peer<S>`](peer::Peer) wraps one single-team store. Periodic authenticated
 //! PATCH walks converge peer-routing evidence, collection records, complete
-//! capability proofs, and optionally resident blobs; gossip carries only
-//! untrusted generation wakes. Exact content reads retain durable-WANT
-//! semantics and search authenticated configured/PEER routes independently of
-//! broad inventory mirroring. [`collection_sync`] lets the core collection
+//! capability proofs, and optionally resident blobs. A bounded rotating
+//! scheduler makes those pairwise set unions the epidemic exchange itself;
+//! there is no broadcast wake plane. Exact content reads retain durable-WANT
+//! semantics and use authenticated DHT provider lookup independently of broad
+//! inventory mirroring. [`collection_sync`] lets the core collection
 //! resolver select an exact physical cover from speculative remote artifacts,
 //! so callers can fetch only useful materializations without creating WANTs.
 //! A bounded, team-scoped provider directory can locate peers for an

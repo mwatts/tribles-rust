@@ -16,7 +16,6 @@ iroh-base = "1.0"
 # on the well-supported path).
 iroh-mdns-address-lookup = "0.4"
 url = "2"
-iroh-gossip = { version = "0.101", features = ["net"] }
 anyhow = "1"
 anybytes = { version = "0.20.2", features = ["zerocopy"] }
 memmap2 = "0.9"

@@ -192,18 +192,18 @@ referencing those blobs stay portable. The corresponding traits are
 ### Team Root
 The external Ed25519 key expected as `K0` in a team's direct capability proofs.
 Its exact 32 public bytes are the resource for both CONNECT and SYNC_TEAM, the
-scope prefix for the four-component inventory, and the deterministic gossip
-topic. These shared bytes do not conflate authority: receiving team gossip or
-holding one proof never implies the other proof or any data access. Keeping
-the secret offline after bootstrap is operational practice, not a one-use
-rule: anyone holding it can issue another independent root proof.
+scope prefix for the four-component inventory, and the namespace for provider
+DHT keys. These shared bytes do not conflate authority: routing knowledge or
+holding one proof never implies the other proof or any data access. Keeping the
+secret offline after bootstrap is operational practice, not a one-use rule:
+anyone holding it can issue another independent root proof.
 
 ### SYNC_TEAM
 The exact `ACTION_SYNC_TEAM` atom used by `triblespace-net` to authorize one
 team inventory session after CONNECT. Invoke authority for the authenticated
 transport key permits disclosure of that team's PEER, collection-record,
 capability-proof, and blob inventory. It is connection-local, validity-bounded,
-and independent of routing evidence, gossip participation, and local
+and independent of routing evidence, DHT participation, and local
 Demand/Mirror or direction policy.
 
 ### Trible

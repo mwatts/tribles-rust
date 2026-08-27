@@ -50,7 +50,6 @@ fn one_store_drain_admits_more_than_the_old_per_leaf_bridge_capacity() {
             publisher_store,
             team,
             team_proofs(&root, &publisher_key),
-            false,
             Vec::new(),
             ReconcileQos {
                 direction: ReconcileDirection::WriteOnly,
@@ -63,7 +62,6 @@ fn one_store_drain_admits_more_than_the_old_per_leaf_bridge_capacity() {
             MemoryRepo::default(),
             team,
             team_proofs(&root, &consumer_key),
-            false,
             vec![pk(&publisher_key)],
             ReconcileQos {
                 direction: ReconcileDirection::ReadOnly,

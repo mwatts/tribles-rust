@@ -1,9 +1,8 @@
-//! Production [`Transport`] adapter: iroh QUIC + iroh-gossip.
+//! Production [`Transport`] adapter over iroh QUIC.
 //!
 //! Everything iroh-specific that used to live inline in the host
 //! loop's startup — endpoint building (relay map, CA roots, mDNS +
-//! pkarr + mDNS address lookup), protocol-handler registration, gossip
-//! topic join — happens in [`bind`], which returns the
+//! pkarr + mDNS address lookup) and protocol-handler registration — happens in [`bind`], which returns the
 //! transport-agnostic [`Harness`] the host loop runs against.
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -13,16 +12,15 @@ use iroh_base::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use super::{Alpn, Conn, GossipEvent, GossipSink, Harness, Incoming, PeerId, Transport};
+use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
 use crate::host::PeerConfig;
 
-/// Capacity for the inbound-connection and gossip-event channels.
-/// Inbound connection forwarding fails closed when this queue is full so
+/// Capacity for the inbound-connection channel. Inbound connection forwarding
+/// fails closed when this queue is full so
 /// router handler tasks cannot accumulate behind an awaited send.
 const CHANNEL_CAP: usize = 64;
 
-/// The protocol ALPN forwarded into the host loop. The gossip ALPN is handled
-/// by iroh-gossip and never surfaces above the seam.
+/// The protocol ALPN forwarded into the host loop.
 const FORWARDED_ALPNS: [Alpn; 1] = [crate::protocol::PILE_SYNC_ALPN];
 
 #[derive(Clone)]
@@ -37,10 +35,9 @@ pub struct IrohTransport {
     /// route authoritative for outbound protocol connections while preserving
     /// discovery as the fallback for address-less peers.
     peers: Arc<BTreeMap<EndpointId, EndpointAddr>>,
-    /// Keeps the router (and through it the registered protocol
-    /// handlers + gossip) alive for the transport's
-    /// lifetime. The host loop never touches these; they exist below
-    /// the seam.
+    /// Keeps the router (and through it the registered protocol handlers)
+    /// alive for the transport's lifetime. The host loop never touches these;
+    /// they exist below the seam.
     _alive: Arc<Anchors>,
 }
 
@@ -80,21 +77,8 @@ impl Conn for IrohConn {
     }
 }
 
-#[derive(Clone)]
-pub struct IrohGossip(iroh_gossip::api::GossipSender);
-
-impl GossipSink for IrohGossip {
-    async fn broadcast(&self, frame: Vec<u8>) -> anyhow::Result<()> {
-        self.0
-            .broadcast(frame.into())
-            .await
-            .map_err(|e| anyhow::anyhow!("gossip broadcast: {e}"))
-    }
-}
-
 impl Transport for IrohTransport {
     type Conn = IrohConn;
-    type Gossip = IrohGossip;
 
     fn local_id(&self) -> PeerId {
         *self.ep.id().as_bytes()
@@ -256,8 +240,7 @@ fn n0_endpoint_builder(secret: iroh_base::SecretKey) -> iroh::endpoint::Builder 
 }
 
 /// Build the production transport: bind the ordinary iroh endpoint, register
-/// the protocol-forwarding handler, join the team-derived gossip topic when
-/// configured, and spawn the router.
+/// the protocol-forwarding handler, and spawn the router.
 ///
 /// Binding failure is returned to the caller so constructing a production
 /// peer can never appear to succeed with an already-dead network thread.
@@ -269,8 +252,7 @@ pub async fn bind(
     Ok(bind_with_endpoint(ep, config).await)
 }
 
-/// Wire the full transport stack (protocol forwarding, gossip topic, router)
-/// over an already-bound endpoint, and
+/// Wire the protocol forwarder and router over an already-bound endpoint, then
 /// return the [`Harness`] the host loop runs against.
 ///
 /// Factored out of [`bind`] so a caller can supply its own endpoint —
@@ -280,7 +262,6 @@ pub async fn bind(
 pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harness<IrohTransport> {
     use iroh::address_lookup::{EndpointInfo, MemoryLookup};
     use iroh::protocol::Router;
-    use iroh_gossip::Gossip;
 
     let peers = Arc::new(
         config
@@ -291,10 +272,9 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
             .collect(),
     );
 
-    // Make configured routes available to every iroh sub-protocol, not only
-    // `IrohTransport::dial`: gossip initiates its own connections using
-    // endpoint ids. A memory lookup bridges those ids back
-    // to the exact direct/fabric addresses supplied by the caller.
+    // Make configured routes available to iroh's discovery services as well
+    // as `IrohTransport::dial`. A memory lookup bridges endpoint ids back to
+    // the exact direct/fabric addresses supplied by the caller.
     if !config.peers.is_empty() {
         let lookup =
             MemoryLookup::from_endpoint_info(config.peers.iter().cloned().map(EndpointInfo::from));
@@ -304,8 +284,6 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
         }
     }
     let mut router_builder = Router::builder(ep.clone());
-
-    let bootstrap_ids: Vec<EndpointId> = config.peers.iter().map(|addr| addr.id).collect();
 
     // Protocol ALPNs forward into the harness channel; the host loop
     // dispatches them to the protocol handlers above the seam.
@@ -319,52 +297,6 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
             },
         );
     }
-
-    // Gossip: join the team-derived topic and translate
-    // iroh-gossip events into the transport-agnostic GossipEvent stream.
-    // Authorization never chooses rendezvous topology. Always `subscribe`
-    // (non-blocking): the join completes in the background as peers
-    // come online; `subscribe_and_join` would hang nodes that start
-    // at different times.
-    let gossip_topic = crate::host::team_gossip_topic(config.team);
-    let g = Gossip::builder().spawn(ep.clone());
-    router_builder = router_builder.accept(iroh_gossip::ALPN, g.clone());
-    let topic_id = iroh_gossip::TopicId::from_bytes(gossip_topic);
-    let gossip = match g.subscribe(topic_id, bootstrap_ids.clone()).await {
-        Ok(topic) => {
-            let (sender, receiver) = topic.split();
-            let (gev_tx, gev_rx) = mpsc::channel::<GossipEvent>(CHANNEL_CAP);
-            tokio::spawn(async move {
-                use futures::TryStreamExt;
-                let mut receiver = receiver;
-                while let Ok(Some(event)) = receiver.try_next().await {
-                    let mapped = match event {
-                        iroh_gossip::api::Event::Received(msg) => Some(GossipEvent::Received {
-                            bytes: msg.content.to_vec(),
-                            delivered_from: *msg.delivered_from.as_bytes(),
-                        }),
-                        iroh_gossip::api::Event::NeighborUp(peer) => {
-                            Some(GossipEvent::NeighborUp(*peer.as_bytes()))
-                        }
-                        iroh_gossip::api::Event::NeighborDown(peer) => {
-                            Some(GossipEvent::NeighborDown(*peer.as_bytes()))
-                        }
-                        _ => None,
-                    };
-                    if let Some(ev) = mapped {
-                        if gev_tx.send(ev).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-            Some((IrohGossip(sender), gev_rx))
-        }
-        Err(e) => {
-            warn!(error = %e, "gossip subscribe failed; running without gossip");
-            None
-        }
-    };
 
     let router = router_builder.spawn();
 
@@ -380,6 +312,5 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     Harness {
         transport,
         incoming: inc_rx,
-        gossip,
     }
 }
