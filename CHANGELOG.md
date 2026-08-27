@@ -174,6 +174,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make store revision invalidation component-aware. `MemoryRepo`, `Pile`, and
+  `Yard` now distinguish Blob membership, collection records, capability
+  proofs, PEER evidence, and the local Blob reader lease. Network refreshes
+  enumerate and rebuild only changed BLAKE3 inventory PATCHes, carry unchanged
+  component snapshots forward directly, and still replace an obsolete reader
+  when physical pile backing changes under identical Blob membership.
+
 - Make provider-cover directory admission purely aggregate and work-conserving.
   Receivers now bound only live shard count and total live memberships; one
   provider may use all otherwise-free capacity. Atomic replacement tests the

@@ -37,8 +37,8 @@ use super::proof::CapabilityProofStore;
 use super::{
     transfer, ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobChildren, BlobInfo,
     BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, RetentionRoots, StorageClose,
-    StoreRevision, StoreScope, StoreScopeError, TransferError, WantRequest, WantStore,
-    WANT_REQUEST_BYTES_LEN,
+    StoreRevision, StoreRevisionChanges, StoreScope, StoreScopeError, TransferError, WantRequest,
+    WantStore, WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -202,7 +202,9 @@ pub struct Yard {
 ///
 /// Each Pile revision covers its sync-visible native sets; persistent live sets
 /// additionally capture logical blob movement and eviction that need not append
-/// a record to the source segment. Local wants and artifact offers are excluded.
+/// a record to the source segment. Local wants and artifact offers do not alter
+/// semantic inventory bits, though a segment's changed reader lease is retained
+/// as local invalidation evidence.
 #[derive(Clone, PartialEq, Eq)]
 pub struct YardRevision {
     segments: Vec<(PileRevision, HandleSet)>,
@@ -221,6 +223,28 @@ impl StoreRevision for Yard {
             }
         }
         Ok(YardRevision { segments })
+    }
+
+    fn revision_changes(
+        previous: &Self::Revision,
+        current: &Self::Revision,
+    ) -> StoreRevisionChanges {
+        if previous.segments.len() != current.segments.len() {
+            return StoreRevisionChanges::ALL;
+        }
+
+        previous.segments.iter().zip(&current.segments).fold(
+            StoreRevisionChanges::NONE,
+            |mut changes, ((previous_pile, previous_live), (current_pile, current_live))| {
+                changes = changes.union(current_pile.changes_since(previous_pile));
+                if previous_live != current_live {
+                    changes = changes
+                        .union(StoreRevisionChanges::BLOBS)
+                        .union(StoreRevisionChanges::BLOB_READER);
+                }
+                changes
+            },
+        )
     }
 }
 
@@ -1692,6 +1716,37 @@ mod tests {
 
     fn raw_blob(bytes: &'static [u8]) -> Bytes {
         Bytes::from_source(bytes.to_vec())
+    }
+
+    #[test]
+    fn yard_revision_lifts_reader_and_live_set_changes() {
+        let (_dir, mut yard) = yard_with(1, YardConfig::default());
+        let empty = yard.store_revision().unwrap();
+
+        yard.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
+            [0x51; INLINE_LEN],
+        )))
+        .unwrap();
+        let after_want = yard.store_revision().unwrap();
+        assert_eq!(
+            Yard::revision_changes(&empty, &after_want),
+            StoreRevisionChanges::BLOB_READER,
+        );
+
+        yard.put::<RawBytes, _>(raw_blob(b"revision fixture"))
+            .unwrap();
+        let after_blob = yard.store_revision().unwrap();
+        assert_eq!(
+            Yard::revision_changes(&after_want, &after_blob),
+            StoreRevisionChanges::BLOBS.union(StoreRevisionChanges::BLOB_READER),
+        );
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        let after_collect = yard.store_revision().unwrap();
+        assert_eq!(
+            Yard::revision_changes(&after_blob, &after_collect),
+            StoreRevisionChanges::BLOBS.union(StoreRevisionChanges::BLOB_READER),
+        );
     }
 
     #[test]

@@ -71,6 +71,55 @@ pub trait StorageFlush {
     fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Component mask for a changed sync-visible store observation.
+///
+/// This is deliberately local invalidation evidence, not a portable revision
+/// or a promise that a component changed by only one element. It lets a
+/// consumer retain already-derived state for components that provably did not
+/// change while conservatively rebuilding everything for stores that cannot
+/// distinguish them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreRevisionChanges(u8);
+
+impl StoreRevisionChanges {
+    /// No sync-visible component changed.
+    pub const NONE: Self = Self(0);
+    /// Resident blob membership may have changed.
+    pub const BLOBS: Self = Self(1 << 0);
+    /// Native collection records may have changed.
+    pub const COLLECTION_RECORDS: Self = Self(1 << 1);
+    /// Complete capability proofs may have changed.
+    pub const CAPABILITY_PROOFS: Self = Self(1 << 2);
+    /// Peer-routing evidence may have changed.
+    pub const PEERS: Self = Self(1 << 3);
+    /// The local blob reader/access lease changed without necessarily changing
+    /// resident blob membership.
+    pub const BLOB_READER: Self = Self(1 << 4);
+    /// Every sync-visible component and the blob access lease may have changed.
+    pub const ALL: Self = Self(
+        Self::BLOBS.0
+            | Self::COLLECTION_RECORDS.0
+            | Self::CAPABILITY_PROOFS.0
+            | Self::PEERS.0
+            | Self::BLOB_READER.0,
+    );
+
+    /// Whether every bit in `change` is present.
+    pub const fn contains(self, change: Self) -> bool {
+        self.0 & change.0 == change.0
+    }
+
+    /// Whether neither a sync-visible component nor the blob access lease changed.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Union two conservative change observations.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// Cheap invalidation token for one repository's sync-visible observation.
 ///
 /// The token is deliberately local and opaque: it is neither a content
@@ -83,9 +132,10 @@ pub trait StorageFlush {
 /// File-backed implementations reobserve external appends before returning.
 /// This keeps an unchanged poll proportional to the storage boundary (for a
 /// [`pile::Pile`], one file-length observation) instead of to the number of
-/// indexed objects.
-/// Local wants, artifact offers, and store-scope assertions are operational
-/// state and therefore do not participate.
+/// indexed objects. Local wants, artifact offers, and store-scope assertions
+/// do not mark semantic component bits. A file-backed implementation may still
+/// vary its opaque token and report [`StoreRevisionChanges::BLOB_READER`] when
+/// such an append replaces or extends the local reader lease.
 pub trait StoreRevision {
     /// Opaque equality token retained by the caller between observations.
     type Revision: Clone + Eq + Send + 'static;
@@ -94,6 +144,26 @@ pub trait StoreRevision {
 
     /// Reobserve external changes and return the current invalidation token.
     fn store_revision(&mut self) -> Result<Self::Revision, Self::Error>;
+
+    /// Conservatively classify the difference between two local tokens.
+    ///
+    /// Backends with component-separated persistent indexes should override
+    /// this. The default preserves correctness for every existing backend by
+    /// rebuilding all components whenever the opaque aggregate token differs.
+    /// Implementations must overapproximate: false positives cost work, while
+    /// a false negative can strand derived state after the caller remembers
+    /// `current` as its installed revision. Both tokens must come from the same
+    /// store lineage.
+    fn revision_changes(
+        previous: &Self::Revision,
+        current: &Self::Revision,
+    ) -> StoreRevisionChanges {
+        if previous == current {
+            StoreRevisionChanges::NONE
+        } else {
+            StoreRevisionChanges::ALL
+        }
+    }
 }
 
 impl<S> StoreRevision for &mut S
@@ -105,6 +175,43 @@ where
 
     fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
         (**self).store_revision()
+    }
+
+    fn revision_changes(
+        previous: &Self::Revision,
+        current: &Self::Revision,
+    ) -> StoreRevisionChanges {
+        S::revision_changes(previous, current)
+    }
+}
+
+#[cfg(test)]
+mod store_revision_tests {
+    use std::convert::Infallible;
+
+    use super::{StoreRevision, StoreRevisionChanges};
+
+    struct CoarseRevision(u8);
+
+    impl StoreRevision for CoarseRevision {
+        type Revision = u8;
+        type Error = Infallible;
+
+        fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
+            Ok(self.0)
+        }
+    }
+
+    #[test]
+    fn default_change_classification_is_conservative() {
+        assert_eq!(
+            CoarseRevision::revision_changes(&1, &1),
+            StoreRevisionChanges::NONE,
+        );
+        assert_eq!(
+            CoarseRevision::revision_changes(&1, &2),
+            StoreRevisionChanges::ALL,
+        );
     }
 }
 

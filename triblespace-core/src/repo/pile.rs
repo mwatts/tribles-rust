@@ -2537,15 +2537,53 @@ impl BlobStore for Pile {
 
 /// O(1)-clone invalidation token for the sync-visible sets in a [`Pile`].
 ///
-/// Operational WANTs, artifact offers, legacy branches, and opaque records
-/// intentionally do not participate: changing them cannot alter an advertised
-/// inventory.
+/// Operational WANTs, artifact offers, legacy branches, and opaque records do
+/// not alter semantic inventory bits. Their physical append boundary still
+/// participates in the local reader token so a replaced mmap/access lease is
+/// not pinned indefinitely behind otherwise identical blob membership.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PileRevision {
     blobs: PileBlobIndex,
+    reader: PileReaderRevision,
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
     peers: PeerEvidenceIndex,
+}
+
+#[derive(Clone)]
+struct PileReaderRevision {
+    mmap: Arc<MmapRaw>,
+    covered_len: usize,
+}
+
+impl PartialEq for PileReaderRevision {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.mmap, &other.mmap) && self.covered_len == other.covered_len
+    }
+}
+
+impl Eq for PileReaderRevision {}
+
+impl PileRevision {
+    pub(crate) fn changes_since(&self, previous: &Self) -> super::StoreRevisionChanges {
+        let mut changes = super::StoreRevisionChanges::NONE;
+        if previous.blobs != self.blobs {
+            changes = changes.union(super::StoreRevisionChanges::BLOBS);
+        }
+        if previous.reader != self.reader {
+            changes = changes.union(super::StoreRevisionChanges::BLOB_READER);
+        }
+        if previous.collection_records != self.collection_records {
+            changes = changes.union(super::StoreRevisionChanges::COLLECTION_RECORDS);
+        }
+        if previous.capability_proofs != self.capability_proofs {
+            changes = changes.union(super::StoreRevisionChanges::CAPABILITY_PROOFS);
+        }
+        if previous.peers != self.peers {
+            changes = changes.union(super::StoreRevisionChanges::PEERS);
+        }
+        changes
+    }
 }
 
 impl super::StoreRevision for Pile {
@@ -2556,10 +2594,21 @@ impl super::StoreRevision for Pile {
         self.refresh()?;
         Ok(PileRevision {
             blobs: self.blobs.clone(),
+            reader: PileReaderRevision {
+                mmap: self.mmap.clone(),
+                covered_len: self.applied_length,
+            },
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             peers: self.peers.clone(),
         })
+    }
+
+    fn revision_changes(
+        previous: &Self::Revision,
+        current: &Self::Revision,
+    ) -> super::StoreRevisionChanges {
+        current.changes_since(previous)
     }
 }
 
@@ -8247,6 +8296,7 @@ mod tests {
         let handle = pile1.put(blob).unwrap();
         pile1.flush().unwrap();
         pile1.refresh().unwrap();
+        let before_replacement = pile1.store_revision().unwrap();
 
         // Corrupt the first enveloped blob's payload (the fixed header is 256 bytes).
         use std::io::Seek;
@@ -8264,7 +8314,12 @@ mod tests {
         pile2.flush().unwrap();
 
         // Refresh the first pile; it should replace the corrupted blob with the new one.
-        pile1.refresh().unwrap();
+        let after_replacement = pile1.store_revision().unwrap();
+        assert_eq!(
+            Pile::revision_changes(&before_replacement, &after_replacement),
+            crate::repo::StoreRevisionChanges::BLOB_READER,
+            "same-handle backing replacement keeps membership but refreshes access",
+        );
         let reader = pile1.reader().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
@@ -8273,7 +8328,7 @@ mod tests {
     }
 
     #[test]
-    fn store_revision_reobserves_external_appends_without_advertising_wants() {
+    fn store_revision_separates_external_wants_from_inventory_membership() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "revision.pile");
         let mut observer = Pile::open(&path).unwrap();
@@ -8287,7 +8342,11 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
         let after_external_want = observer.store_revision().unwrap();
-        assert!(empty == after_external_want);
+        assert!(empty != after_external_want);
+        assert_eq!(
+            Pile::revision_changes(&empty, &after_external_want),
+            crate::repo::StoreRevisionChanges::BLOB_READER,
+        );
 
         writer
             .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(vec![0xB2; 17])))
@@ -8295,6 +8354,39 @@ mod tests {
         writer.flush().unwrap();
         let after_external_blob = observer.store_revision().unwrap();
         assert!(after_external_want != after_external_blob);
+        assert_eq!(
+            Pile::revision_changes(&after_external_want, &after_external_blob),
+            crate::repo::StoreRevisionChanges::BLOBS
+                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+        );
+
+        writer.insert(collection_test_records()[0]).unwrap();
+        writer.flush().unwrap();
+        let after_external_record = observer.store_revision().unwrap();
+        assert_eq!(
+            Pile::revision_changes(&after_external_blob, &after_external_record),
+            crate::repo::StoreRevisionChanges::COLLECTION_RECORDS
+                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+        );
+
+        let (proof, _) = capability_fixture(81, [82; 32]);
+        writer.insert_proof(proof).unwrap();
+        writer.flush().unwrap();
+        let after_external_proof = observer.store_revision().unwrap();
+        assert_eq!(
+            Pile::revision_changes(&after_external_record, &after_external_proof),
+            crate::repo::StoreRevisionChanges::CAPABILITY_PROOFS
+                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+        );
+
+        writer.insert_peer(peer_evidence(83, 84)).unwrap();
+        writer.flush().unwrap();
+        let after_external_peer = observer.store_revision().unwrap();
+        assert_eq!(
+            Pile::revision_changes(&after_external_proof, &after_external_peer),
+            crate::repo::StoreRevisionChanges::PEERS
+                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+        );
 
         observer.close().unwrap();
         writer.close().unwrap();

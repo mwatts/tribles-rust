@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Build replacement serving snapshots from `StoreRevisionChanges`: changed
+  components alone are enumerated, unchanged immutable inventory PATCHes are
+  retained before construction, and every installed snapshot still carries a
+  fresh Blob reader. A missing prior snapshot forces a conservative full build.
+
 - Make provider-cover directory admission purely aggregate and work-conserving.
   Receivers now bound only live shard count and total live memberships; one
   provider may use all otherwise-free capacity. Replacement admits the exact

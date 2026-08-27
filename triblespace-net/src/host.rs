@@ -28,7 +28,8 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
 use triblespace_core::repo::{
-    ArtifactOfferSnapshot, BlobStore, BlobStoreGet, CapabilityProofStore, PeerStore,
+    ArtifactOfferSnapshot, BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, PeerStore,
+    StoreRevisionChanges,
 };
 
 use crate::channel::{
@@ -38,7 +39,8 @@ use crate::identity::iroh_secret;
 use crate::inventory::{
     AuthorizedInventorySession, BlobInventory, CapabilityProofInventory, CollectionRecordInventory,
     InventoryComponent, InventoryGeneration, InventoryManifest, InventoryServerConfig,
-    InventorySnapshot, PeerInventory, ReconcileQos, sync_team_capability_atom,
+    PeerInventory, ReconcileQos, build_key_inventory, build_proof_inventory,
+    build_record_inventory, sync_team_capability_atom,
 };
 use crate::inventory_reconcile::InventoryWalker;
 use crate::inventory_wire::{
@@ -265,7 +267,10 @@ impl InventoryComponentSnapshot {
 
     fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
         match &self.data {
-            InventoryComponentData::Blob { reader, .. } => reader.get_blob(hash),
+            InventoryComponentData::Blob { inventory, reader } => {
+                inventory.get(&hash)?;
+                reader.get_blob(hash)
+            }
             _ => None,
         }
     }
@@ -328,72 +333,167 @@ pub(crate) struct StoreSnapshot {
 }
 
 impl StoreSnapshot {
+    #[cfg(test)]
     pub(crate) fn from_store<S>(store: &mut S, team: VerifyingKey) -> anyhow::Result<Self>
     where
         S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
     {
-        // Pile::reader performs external-append reobservation. Do it before
-        // enumerating native evidence so one refresh sees every component.
-        let reader = store.reader().map_err(anyhow::Error::new)?;
-        let peers = store
-            .peers()
-            .map_err(anyhow::Error::new)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::new)?;
-        let records = store
-            .records()
-            .map_err(anyhow::Error::new)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::new)?;
-        let proofs = store
-            .proofs()
-            .map_err(anyhow::Error::new)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::new)?;
-        let mut routing_peers: Vec<_> = peers
-            .iter()
-            .filter(|evidence| evidence.team() == team)
-            .map(|evidence| evidence.peer().to_bytes())
-            .collect();
-        routing_peers.sort_unstable();
-        routing_peers.dedup();
+        Self::from_store_changes(store, team, None, StoreRevisionChanges::ALL)
+    }
 
-        let inventory = InventorySnapshot::from_observation(team, reader, peers, records, proofs)?;
+    pub(crate) fn from_store_changes<S>(
+        store: &mut S,
+        team: VerifyingKey,
+        previous: Option<&Self>,
+        changes: StoreRevisionChanges,
+    ) -> anyhow::Result<Self>
+    where
+        S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
+    {
+        let previous = previous.filter(|snapshot| snapshot.team == team);
+        let changes = if previous.is_some() {
+            changes
+        } else {
+            StoreRevisionChanges::ALL
+        };
+
+        // Pile::reader performs external-append reobservation. Always obtain a
+        // fresh reader even when blob membership is unchanged: the same root
+        // can acquire a newer backend lease or newly readable payload bytes.
+        let reader = store.reader().map_err(anyhow::Error::new)?;
+
+        let (peer_component, routing_peers) = if changes.contains(StoreRevisionChanges::PEERS) {
+            let peers = store
+                .peers()
+                .map_err(anyhow::Error::new)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::new)?;
+            let mut routing_peers: Vec<_> = peers
+                .iter()
+                .filter(|evidence| evidence.team() == team)
+                .map(|evidence| evidence.peer().to_bytes())
+                .collect();
+            routing_peers.sort_unstable();
+            routing_peers.dedup();
+            let inventory =
+                build_key_inventory(peers.into_iter().map(|evidence| *evidence.as_bytes()));
+            let root = inventory.merkle_node(team.as_bytes());
+            (
+                Arc::new(InventoryComponentSnapshot {
+                    team,
+                    manifest: crate::inventory::ComponentManifest::new(
+                        InventoryComponent::Peer,
+                        root.map_or(0, |node| node.leaf_count()),
+                        root.map(|node| node.digest()),
+                    ),
+                    data: InventoryComponentData::Peer(inventory),
+                }),
+                routing_peers,
+            )
+        } else {
+            let previous = previous.expect("an unchanged component requires a prior snapshot");
+            (
+                previous.component(InventoryComponent::Peer).clone(),
+                previous.routing_peers.clone(),
+            )
+        };
+
+        let record_component = if changes.contains(StoreRevisionChanges::COLLECTION_RECORDS) {
+            let records = store
+                .records()
+                .map_err(anyhow::Error::new)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::new)?;
+            let inventory = build_record_inventory(records)?;
+            Arc::new(InventoryComponentSnapshot {
+                team,
+                manifest: crate::inventory::ComponentManifest::new(
+                    InventoryComponent::CollectionRecord,
+                    inventory.len(),
+                    inventory.merkle_root(),
+                ),
+                data: InventoryComponentData::CollectionRecord(inventory),
+            })
+        } else {
+            previous
+                .expect("an unchanged component requires a prior snapshot")
+                .component(InventoryComponent::CollectionRecord)
+                .clone()
+        };
+
+        let proof_component = if changes.contains(StoreRevisionChanges::CAPABILITY_PROOFS) {
+            let proofs = store
+                .proofs()
+                .map_err(anyhow::Error::new)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::new)?;
+            let inventory = build_proof_inventory(proofs)?;
+            Arc::new(InventoryComponentSnapshot {
+                team,
+                manifest: crate::inventory::ComponentManifest::new(
+                    InventoryComponent::CapabilityProof,
+                    inventory.len(),
+                    inventory.merkle_root(),
+                ),
+                data: InventoryComponentData::CapabilityProof(inventory),
+            })
+        } else {
+            previous
+                .expect("an unchanged component requires a prior snapshot")
+                .component(InventoryComponent::CapabilityProof)
+                .clone()
+        };
+
+        let (blob_inventory, blob_manifest) = if changes.contains(StoreRevisionChanges::BLOBS) {
+            let blob_keys = reader
+                .blobs()
+                .map(|info| info.map(|info| info.handle.raw))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::new)?;
+            let inventory = Arc::new(build_key_inventory(blob_keys));
+            let manifest = crate::inventory::ComponentManifest::new(
+                InventoryComponent::Blob,
+                inventory.len(),
+                inventory.merkle_root(),
+            );
+            (inventory, manifest)
+        } else {
+            let previous = previous
+                .expect("an unchanged component requires a prior snapshot")
+                .component(InventoryComponent::Blob);
+            let InventoryComponentData::Blob { inventory, .. } = &previous.data else {
+                unreachable!("the Blob component slot always contains blob snapshots")
+            };
+            (inventory.clone(), previous.manifest)
+        };
+        let blob_component = Arc::new(InventoryComponentSnapshot {
+            team,
+            manifest: blob_manifest,
+            data: InventoryComponentData::Blob {
+                inventory: blob_inventory,
+                reader: Arc::new(CloneableBlobSnapshotReader(Mutex::new(reader))),
+            },
+        });
+
         let components = [
-            Arc::new(InventoryComponentSnapshot {
-                team,
-                manifest: inventory.manifest().component(InventoryComponent::Peer),
-                data: InventoryComponentData::Peer(inventory.peers().clone()),
-            }),
-            Arc::new(InventoryComponentSnapshot {
-                team,
-                manifest: inventory
-                    .manifest()
-                    .component(InventoryComponent::CollectionRecord),
-                data: InventoryComponentData::CollectionRecord(inventory.records().clone()),
-            }),
-            Arc::new(InventoryComponentSnapshot {
-                team,
-                manifest: inventory
-                    .manifest()
-                    .component(InventoryComponent::CapabilityProof),
-                data: InventoryComponentData::CapabilityProof(inventory.proofs().clone()),
-            }),
-            Arc::new(InventoryComponentSnapshot {
-                team,
-                manifest: inventory.manifest().component(InventoryComponent::Blob),
-                data: InventoryComponentData::Blob {
-                    inventory: Arc::new(inventory.blobs().clone()),
-                    reader: Arc::new(CloneableBlobSnapshotReader(Mutex::new(
-                        inventory.reader().clone(),
-                    ))),
-                },
-            }),
+            peer_component,
+            record_component,
+            proof_component,
+            blob_component,
         ];
+        let manifest = InventoryManifest::new(
+            team,
+            [
+                components[InventoryComponent::Peer.index()].manifest,
+                components[InventoryComponent::CollectionRecord.index()].manifest,
+                components[InventoryComponent::CapabilityProof.index()].manifest,
+                components[InventoryComponent::Blob.index()].manifest,
+            ],
+        );
 
         Ok(StoreSnapshot {
             team,
-            manifest: inventory.manifest().clone(),
+            manifest,
             components,
             routing_peers,
         })
@@ -410,6 +510,9 @@ impl StoreSnapshot {
         let mut retired = Vec::new();
         for component in InventoryComponent::ALL {
             let index = component.index();
+            if Arc::ptr_eq(&self.components[index], &previous.components[index]) {
+                continue;
+            }
             if self.components[index].reusable_with(&previous.components[index]) {
                 let replacement = if component == InventoryComponent::Blob {
                     Arc::new(
@@ -771,6 +874,10 @@ pub struct NetSender {
 impl NetSender {
     pub fn id(&self) -> EndpointId {
         self.id
+    }
+
+    pub(crate) fn current_snapshot(&self) -> Option<SharedSnapshot> {
+        self.snapshot.lock().unwrap().clone()
     }
 
     pub(crate) fn update_snapshot(&self, mut snapshot: StoreSnapshot) {
@@ -2967,7 +3074,7 @@ mod tests {
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStorePut};
+    use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStorePut, StoreRevision};
 
     use super::*;
 
@@ -3808,6 +3915,7 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(vec![7; 1024]))
             .unwrap();
 
+        let first_revision = store.store_revision().unwrap();
         let first = StoreSnapshot::from_store(&mut store, team).unwrap();
         let first_blob = first.component(InventoryComponent::Blob).clone();
         let InventoryComponentData::Blob {
@@ -3825,8 +3933,16 @@ mod tests {
         let first_proofs = first.component(InventoryComponent::CapabilityProof).clone();
 
         CollectionStore::insert(&mut store, commit(&author, 1)).unwrap();
-        let mut second = StoreSnapshot::from_store(&mut store, team).unwrap();
-        drop(second.reuse_unchanged_components(&first));
+        let second_revision = store.store_revision().unwrap();
+        let changes = MemoryRepo::revision_changes(&first_revision, &second_revision);
+        let second =
+            StoreSnapshot::from_store_changes(&mut store, team, Some(&first), changes).unwrap();
+        let full = StoreSnapshot::from_store(&mut store, team).unwrap();
+        assert_eq!(second.manifest(), full.manifest());
+        let forced =
+            StoreSnapshot::from_store_changes(&mut store, team, None, StoreRevisionChanges::NONE)
+                .unwrap();
+        assert_eq!(forced.manifest(), full.manifest());
 
         assert!(!Arc::ptr_eq(
             &first_blob,
@@ -3852,6 +3968,30 @@ mod tests {
             &first_proofs,
             second.component(InventoryComponent::CapabilityProof)
         ));
+    }
+
+    #[test]
+    fn a_fresh_reader_cannot_serve_a_blob_absent_from_its_reused_inventory() {
+        let team = key(1);
+        let mut store = MemoryRepo::default();
+        let first_handle = store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![1; 64]))
+            .unwrap();
+        let first = StoreSnapshot::from_store(&mut store, team).unwrap();
+
+        let later_handle = store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![2; 64]))
+            .unwrap();
+        let raced = StoreSnapshot::from_store_changes(
+            &mut store,
+            team,
+            Some(&first),
+            StoreRevisionChanges::BLOB_READER,
+        )
+        .unwrap();
+
+        assert!(raced.get_blob(&first_handle.raw).is_some());
+        assert!(raced.get_blob(&later_handle.raw).is_none());
     }
 
     #[test]

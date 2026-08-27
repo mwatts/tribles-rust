@@ -23,7 +23,7 @@ use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     ArtifactOfferSnapshot, ArtifactOfferStore, BlobChildren, BlobStore, BlobStoreGet,
     BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofStore, PeerStore, StorageFlush,
-    StoreRevision, StoreScope, StoreScopeError, WantRequest, WantStore,
+    StoreRevision, StoreRevisionChanges, StoreScope, StoreScopeError, WantRequest, WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
@@ -387,9 +387,28 @@ where
             // is intentionally absent from that sync-visible token, so check
             // it again before an equality fast-path can retain a serving view.
             Self::validate_store_scope(&mut *store, self.team)?;
-            if self.last_store_revision.as_ref() != Some(&revision)
-                && Self::install_validated_snapshot(&self.sender, &mut *store, self.team)?
-            {
+            let previous_snapshot = self.sender.current_snapshot();
+            let changes = if previous_snapshot.is_none() {
+                StoreRevisionChanges::ALL
+            } else {
+                self.last_store_revision
+                    .as_ref()
+                    .map_or(StoreRevisionChanges::ALL, |previous| {
+                        S::revision_changes(previous, &revision)
+                    })
+            };
+            if changes.is_empty() {
+                // An implementation may conservatively vary its opaque token
+                // for state outside the semantic components. Remember that
+                // observation instead of classifying the same no-op forever.
+                self.last_store_revision = Some(revision);
+            } else if Self::install_validated_snapshot(
+                &self.sender,
+                &mut *store,
+                self.team,
+                previous_snapshot.as_deref(),
+                changes,
+            )? {
                 self.last_store_revision = Some(revision);
             }
         }
@@ -438,9 +457,11 @@ where
         sender: &NetSender,
         store: &mut S,
         team: VerifyingKey,
+        previous: Option<&StoreSnapshot>,
+        changes: StoreRevisionChanges,
     ) -> Result<bool, PeerOpenError<S::ScopeError>> {
         Self::validate_store_scope(store, team)?;
-        let snapshot = match StoreSnapshot::from_store(store, team) {
+        let snapshot = match StoreSnapshot::from_store_changes(store, team, previous, changes) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(%error, "store inventory snapshot unavailable; clearing serving view");

@@ -86,6 +86,16 @@ cleanup while returning a scope error to an operation that must not continue
 against a physically conflicted store; ordinary scheduler loops may use the
 unit-returning `refresh` surface and observe the warning instead.
 
+The store revision is component-aware local invalidation evidence. An equal
+token performs no inventory work. An unequal token conservatively identifies
+which of PEER, collection-record, capability-proof, and Blob membership may
+have changed; backends without that knowledge report all four. The host carries
+unchanged immutable PATCH components directly into the next snapshot and
+enumerates only changed components. Blob access is a fifth, non-semantic bit:
+a pile append or remap can require a fresh reader lease even when the set of
+Blob handles is identical, so the host refreshes the reader while sharing the
+existing Blob Merkle tree. These tokens and masks never cross the network.
+
 ## Two independent capabilities
 
 Every useful connection proves two exact actions rooted at the same team key:

@@ -513,13 +513,13 @@ pub type BlobInventory = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 ///
 /// Keeping construction behind this helper isolates store observation from
 /// PATCH's canonical bottom-up snapshot construction.
-fn build_key_inventory<const KEY_LEN: usize>(
+pub(crate) fn build_key_inventory<const KEY_LEN: usize>(
     keys: impl IntoIterator<Item = [u8; KEY_LEN]>,
 ) -> PATCH<KEY_LEN, IdentitySchema, (), Blake3Merkle> {
     PATCH::from_keys(keys)
 }
 
-fn build_record_inventory(
+pub(crate) fn build_record_inventory(
     records: impl IntoIterator<Item = CollectionRecord>,
 ) -> Result<CollectionRecordInventory> {
     let mut records: Vec<_> = records
@@ -541,7 +541,7 @@ fn build_record_inventory(
     Ok(inventory)
 }
 
-fn build_proof_inventory(
+pub(crate) fn build_proof_inventory(
     proofs: impl IntoIterator<Item = CapabilityProof>,
 ) -> Result<CapabilityProofInventory> {
     // CapabilityProof::id() hashes the complete proof body. Cache it once;
@@ -574,9 +574,6 @@ fn build_proof_inventory(
 pub struct InventorySnapshot<R> {
     team: ed25519_dalek::VerifyingKey,
     reader: R,
-    peers: PeerInventory,
-    records: CollectionRecordInventory,
-    proofs: CapabilityProofInventory,
     blobs: BlobInventory,
     manifest: InventoryManifest,
 }
@@ -697,9 +694,6 @@ where
         Ok(Self {
             team,
             reader,
-            peers: peer_inventory,
-            records: record_inventory,
-            proofs: proof_inventory,
             blobs: blob_inventory,
             manifest,
         })
@@ -718,22 +712,6 @@ where
     /// Frozen reader used to serve a blob named by this inventory.
     pub const fn reader(&self) -> &R {
         &self.reader
-    }
-
-    pub(crate) const fn peers(&self) -> &PeerInventory {
-        &self.peers
-    }
-
-    pub(crate) const fn records(&self) -> &CollectionRecordInventory {
-        &self.records
-    }
-
-    pub(crate) const fn proofs(&self) -> &CapabilityProofInventory {
-        &self.proofs
-    }
-
-    pub(crate) const fn blobs(&self) -> &BlobInventory {
-        &self.blobs
     }
 }
 
@@ -933,16 +911,13 @@ mod tests {
         CollectionStore::insert(&mut store, invalid).unwrap();
 
         let snapshot = InventorySnapshot::from_store(&mut store, team.verifying_key()).unwrap();
-        assert_eq!(snapshot.peers().len(), 3);
         assert_eq!(
             snapshot
-                .peers()
-                .merkle_node(team.verifying_key().as_bytes())
-                .unwrap()
+                .manifest()
+                .component(InventoryComponent::Peer)
                 .leaf_count(),
             2
         );
-        assert_eq!(snapshot.records().len(), 1);
         assert_eq!(
             snapshot
                 .manifest()

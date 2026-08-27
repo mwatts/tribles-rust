@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact direct root. It never scans opaque claim values as child handles, and
   proof presence alone grants no authority.
 
+### Changed
+
+- Add conservative `StoreRevisionChanges` classification to `StoreRevision`.
+  The default treats every unequal opaque token as a full change, while
+  `MemoryRepo`, `Pile`, and `Yard` compare their persistent component indexes
+  directly. A separate local Blob-reader bit catches remaps and same-handle
+  backing replacement even though PATCH equality intentionally hashes keys,
+  not attached storage offsets.
+
 ## [0.41.4] - 2026-05-17
 
 Lock-step bump alongside the trailing-dot-leak +

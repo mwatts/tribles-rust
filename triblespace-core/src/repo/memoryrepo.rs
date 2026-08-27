@@ -20,7 +20,9 @@ use crate::prelude::*;
 use crate::repo::offer::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::CapabilityProofStore;
-use crate::repo::{StoreRevision, StoreScope, StoreScopeError, WantRequest, WantStore};
+use crate::repo::{
+    StoreRevision, StoreRevisionChanges, StoreScope, StoreScopeError, WantRequest, WantStore,
+};
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
@@ -119,6 +121,28 @@ impl StoreRevision for MemoryRepo {
             capability_proofs: self.capability_proofs.clone(),
             peer_evidence: self.peer_evidence.clone(),
         })
+    }
+
+    fn revision_changes(
+        previous: &Self::Revision,
+        current: &Self::Revision,
+    ) -> StoreRevisionChanges {
+        let mut changes = StoreRevisionChanges::NONE;
+        if previous.blobs != current.blobs {
+            changes = changes
+                .union(StoreRevisionChanges::BLOBS)
+                .union(StoreRevisionChanges::BLOB_READER);
+        }
+        if previous.collection_records != current.collection_records {
+            changes = changes.union(StoreRevisionChanges::COLLECTION_RECORDS);
+        }
+        if previous.capability_proofs != current.capability_proofs {
+            changes = changes.union(StoreRevisionChanges::CAPABILITY_PROOFS);
+        }
+        if previous.peer_evidence != current.peer_evidence {
+            changes = changes.union(StoreRevisionChanges::PEERS);
+        }
+        changes
     }
 }
 
@@ -751,11 +775,19 @@ mod tests {
         repo.want(WantRequest::blob(handle(1))).unwrap();
         let after_want = repo.store_revision().unwrap();
         assert!(empty == after_want);
+        assert_eq!(
+            MemoryRepo::revision_changes(&empty, &after_want),
+            StoreRevisionChanges::NONE,
+        );
 
         repo.put::<UTF8String, _>("revision fixture".to_owned())
             .unwrap();
         let after_blob = repo.store_revision().unwrap();
         assert!(after_want != after_blob);
+        assert_eq!(
+            MemoryRepo::revision_changes(&after_want, &after_blob),
+            StoreRevisionChanges::BLOBS.union(StoreRevisionChanges::BLOB_READER),
+        );
 
         let target = identity_for_tests(&named_for_tests(
             "revision-target",
@@ -770,6 +802,10 @@ mod tests {
         .unwrap();
         let after_record = repo.store_revision().unwrap();
         assert!(after_blob != after_record);
+        assert_eq!(
+            MemoryRepo::revision_changes(&after_blob, &after_record),
+            StoreRevisionChanges::COLLECTION_RECORDS,
+        );
 
         let root = SigningKey::from_bytes(&[75; 32]);
         let leaf = SigningKey::from_bytes(&[76; 32]);
@@ -788,6 +824,10 @@ mod tests {
         repo.insert_proof(proof).unwrap();
         let after_proof = repo.store_revision().unwrap();
         assert!(after_record != after_proof);
+        assert_eq!(
+            MemoryRepo::revision_changes(&after_record, &after_proof),
+            StoreRevisionChanges::CAPABILITY_PROOFS,
+        );
 
         repo.insert_peer(PeerEvidence::new(
             root.verifying_key(),
@@ -796,5 +836,9 @@ mod tests {
         .unwrap();
         let after_peer = repo.store_revision().unwrap();
         assert!(after_proof != after_peer);
+        assert_eq!(
+            MemoryRepo::revision_changes(&after_proof, &after_peer),
+            StoreRevisionChanges::PEERS,
+        );
     }
 }
