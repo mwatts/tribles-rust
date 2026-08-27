@@ -8,6 +8,9 @@
 //! broad inventory mirroring. [`collection_sync`] lets the core collection
 //! resolver select an exact physical cover from speculative remote artifacts,
 //! so callers can fetch only useful materializations without creating WANTs.
+//! A bounded, team-scoped provider directory can locate peers for an
+//! already-known collection-element identity; it is soft routing state, not an
+//! enumeration or element-discovery plane.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
@@ -30,5 +33,6 @@ pub(crate) mod inventory_reconcile;
 pub(crate) mod inventory_wire;
 pub mod peer;
 pub mod protocol;
+pub mod provider;
 pub mod reconcile;
 pub mod transport;

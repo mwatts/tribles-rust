@@ -13,12 +13,15 @@
 //! Operations:
 //!   AUTH       bundle_len:u32 bundle:bytes → resp:u8  (0x00 = OK, 0x01 = REJECTED)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
+//!   PROVIDER_PUT element:32 → resp:u8                (caller identity is provider)
+//!   PROVIDER_GET element:32 → count:u8 provider:[32; count]
 //!   INVENTORY_AUTH, MANIFEST, NODE, and BLOB_RANGE are defined by
 //!   `inventory_wire`; they form the bounded SYNC_TEAM-authorized Merkle walk.
 //!
-//! The protocol is read-only: it discloses bytes only after CONNECT followed by
-//! a successful connection-local SYNC_TEAM authorization. Remote evidence is
-//! admitted through the authenticated inventory walk, never a write RPC.
+//! Content and inventory operations disclose bytes only after CONNECT followed
+//! by a successful connection-local SYNC_TEAM authorization. `PROVIDER_PUT` is
+//! the one soft-state write: it binds the TLS-authenticated caller to a
+//! receiver-local lease and never accepts a claimed provider identity.
 
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/11";
 
@@ -52,7 +55,10 @@ pub const OP_GET_BLOB: u8 = 0x02;
 /// First stream on every connection. Body: one length-prefixed canonical
 /// capability proof. Response: u8 status (`AUTH_OK` or `AUTH_REJECTED`).
 pub const OP_AUTH: u8 = 0x05;
-// 0x06 and 0x07 were the retired collection-evidence operations.
+/// Renew the authenticated caller's receiver-local provider lease.
+pub const OP_PROVIDER_PUT: u8 = 0x06;
+/// Query live provider leases for one already-known, team-scoped element key.
+pub const OP_PROVIDER_GET: u8 = 0x07;
 
 /// Auth response: CONNECT capability verified. Subsequent direct RPCs on this
 /// connection may proceed.
@@ -60,6 +66,11 @@ pub const AUTH_OK: u8 = 0x00;
 /// Auth response: the inline proof was malformed or did not authorize the TLS
 /// peer to CONNECT. The connection should be closed by the client.
 pub const AUTH_REJECTED: u8 = 0x01;
+
+/// Provider hint was stored or renewed.
+pub const PROVIDER_PUT_OK: u8 = 0x00;
+/// Receiver-local directory capacity was exhausted.
+pub const PROVIDER_PUT_FULL: u8 = 0x01;
 
 pub type RawHash = [u8; 32];
 
@@ -199,6 +210,53 @@ pub async fn op_get_blob<C: Conn>(conn: &C, hash: &RawHash) -> Result<Option<Vec
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     recv_blob_response(&mut recv).await
+}
+
+/// PROVIDER_PUT: renew this connection's authenticated endpoint as provider.
+/// The request intentionally contains no provider identity to forge.
+pub async fn op_provider_put<C: Conn>(conn: &C, element: &RawHash) -> Result<bool> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_PROVIDER_PUT).await?;
+    send_hash(&mut send, element).await?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
+
+    let stored = match recv_u8(&mut recv).await? {
+        PROVIDER_PUT_OK => true,
+        PROVIDER_PUT_FULL => false,
+        other => return Err(anyhow!("unknown provider-put response: {other:#x}")),
+    };
+    require_response_eof(&mut recv).await?;
+    Ok(stored)
+}
+
+/// PROVIDER_GET: return the receiver's bounded live provider hints.
+pub async fn op_provider_get<C: Conn>(conn: &C, element: &RawHash) -> Result<Vec<[u8; 32]>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_PROVIDER_GET).await?;
+    send_hash(&mut send, element).await?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
+
+    let count = recv_u8(&mut recv).await? as usize;
+    if count > crate::provider::MAX_PROVIDERS_PER_KEY {
+        return Err(anyhow!(
+            "provider-get response has {count} entries; limit is {}",
+            crate::provider::MAX_PROVIDERS_PER_KEY
+        ));
+    }
+    let mut providers = Vec::with_capacity(count);
+    for _ in 0..count {
+        providers.push(recv_hash(&mut recv).await?);
+    }
+    require_response_eof(&mut recv).await?;
+    Ok(providers)
+}
+
+async fn require_response_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
+    let mut trailing = [0u8; 1];
+    if recv.read(&mut trailing).await? != 0 {
+        return Err(anyhow!("response contains trailing bytes"));
+    }
+    Ok(())
 }
 
 async fn recv_blob_response<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<Vec<u8>>> {

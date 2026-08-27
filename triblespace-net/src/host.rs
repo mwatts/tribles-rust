@@ -48,6 +48,7 @@ use crate::inventory_wire::{
     send_inventory_auth_ok, send_inventory_auth_rejected, send_manifest, send_node_response,
 };
 use crate::protocol::*;
+use crate::provider::{ElementId, ProviderDirectory, ProviderKey, provider_key};
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
 
 /// Configuration for a peer attached to one single-team store.
@@ -615,6 +616,11 @@ fn decode_inventory_wake_frame(bytes: &[u8], team: VerifyingKey) -> Option<Inven
 /// the content hash narrows the request but is not itself disclosure authority.
 pub(crate) trait NetCapability: Send + Sync {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
+    fn announce_element(&self, element: ElementId) -> futures::future::BoxFuture<'static, usize>;
+    fn find_element_providers(
+        &self,
+        element: ElementId,
+    ) -> futures::future::BoxFuture<'static, Vec<PeerId>>;
 }
 
 struct RoutingTable {
@@ -654,6 +660,27 @@ impl RoutingTable {
             .filter(|peer| *peer != self_id)
             .collect()
     }
+
+    /// Deterministic rendezvous replicas among the currently known peers.
+    ///
+    /// Temporarily divergent PEER views can choose different replicas and
+    /// therefore yield a temporary miss. This soft directory intentionally
+    /// does not grow a second node-discovery protocol: ordinary PEER/gossip
+    /// convergence plus lease renewal repairs the overlap.
+    fn closest(&self, target: ProviderKey, self_id: PeerId, limit: usize) -> Vec<PeerId> {
+        let mut peers = self.candidates(self_id);
+        peers.push(self_id);
+        peers.sort_unstable_by(|a, b| {
+            a.iter()
+                .zip(b)
+                .zip(target)
+                .map(|((&a, &b), target)| (a ^ target).cmp(&(b ^ target)))
+                .find(|ordering| !ordering.is_eq())
+                .unwrap_or_else(|| a.cmp(b))
+        });
+        peers.truncate(limit);
+        peers
+    }
 }
 
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
@@ -684,8 +711,33 @@ struct NetCap<T: Transport> {
     connect_proof: CapabilityProofBundle,
     sync_proof: CapabilityProofBundle,
     can_fetch: bool,
+    can_announce: bool,
     my_id: PeerId,
+    team: VerifyingKey,
     candidates: RoutingCandidates,
+    providers: Arc<Mutex<ProviderDirectory>>,
+}
+
+struct ProviderClient<T: Transport> {
+    transport: T,
+    pool: SharedPool<T::Conn>,
+    connect_proof: CapabilityProofBundle,
+    sync_proof: CapabilityProofBundle,
+    providers: Arc<Mutex<ProviderDirectory>>,
+    my_id: PeerId,
+}
+
+impl<T: Transport> NetCap<T> {
+    fn provider_client(&self) -> ProviderClient<T> {
+        ProviderClient {
+            transport: self.transport.clone(),
+            pool: self.pool.clone(),
+            connect_proof: self.connect_proof.clone(),
+            sync_proof: self.sync_proof.clone(),
+            providers: self.providers.clone(),
+            my_id: self.my_id,
+        }
+    }
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
@@ -711,6 +763,43 @@ impl<T: Transport> NetCapability for NetCap<T> {
             )
             .await;
             bytes.filter(|bytes| blake3::hash(bytes).as_bytes() == &hash)
+        })
+    }
+
+    fn announce_element(&self, element: ElementId) -> futures::future::BoxFuture<'static, usize> {
+        let can_announce = self.can_announce;
+        let key = provider_key(self.team, element);
+        let targets =
+            self.candidates
+                .lock()
+                .unwrap()
+                .closest(key, self.my_id, PROVIDER_REPLICA_COUNT);
+        let client = self.provider_client();
+        Box::pin(async move {
+            if !can_announce {
+                return 0;
+            }
+            client.announce(key, element, targets).await
+        })
+    }
+
+    fn find_element_providers(
+        &self,
+        element: ElementId,
+    ) -> futures::future::BoxFuture<'static, Vec<PeerId>> {
+        let can_find = self.can_fetch;
+        let key = provider_key(self.team, element);
+        let targets =
+            self.candidates
+                .lock()
+                .unwrap()
+                .closest(key, self.my_id, PROVIDER_REPLICA_COUNT);
+        let client = self.provider_client();
+        Box::pin(async move {
+            if !can_find {
+                return Vec::new();
+            }
+            client.find(key, element, targets).await
         })
     }
 }
@@ -793,6 +882,36 @@ impl NetSender {
         .await
         .ok()
         .flatten()
+    }
+
+    /// Best-effort lease renewal for an already-known element identity.
+    /// Returns the number of receiver-local replicas which accepted the hint.
+    pub async fn announce_element(&self, element: ElementId, budget: std::time::Duration) -> usize {
+        tokio::time::timeout(budget, async {
+            let capability = self.ready_capability().await.ok()?;
+            Some(capability.announce_element(element).await)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+    }
+
+    /// Find soft provider hints for an already-known element identity.
+    /// This cannot enumerate or discover element IDs.
+    pub async fn find_element_providers(
+        &self,
+        element: ElementId,
+        budget: std::time::Duration,
+    ) -> Vec<PeerId> {
+        tokio::time::timeout(budget, async {
+            let capability = self.ready_capability().await.ok()?;
+            Some(capability.find_element_providers(element).await)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
     }
 }
 
@@ -910,6 +1029,10 @@ pub(crate) const MAX_INBOUND_CONNECTIONS_GLOBAL: usize = 64;
 pub(crate) const MAX_INBOUND_REQUESTS_PER_CONNECTION: usize = 16;
 const MAX_INBOUND_REQUESTS_GLOBAL: usize = 64;
 const MAX_CONCURRENT_SWEEPS: usize = 8;
+/// Rendezvous replication factor over the currently known PEER set.
+const PROVIDER_REPLICA_COUNT: usize = 20;
+/// Bounded parallelism for the small provider-directory RPC fan-out.
+const MAX_CONCURRENT_PROVIDER_RPCS: usize = 3;
 
 struct SweepOutcome {
     peer: PeerId,
@@ -940,14 +1063,18 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     configured.dedup();
     let candidates = Arc::new(Mutex::new(RoutingTable::new(configured)));
     let pool = new_shared_pool();
+    let providers = Arc::new(Mutex::new(ProviderDirectory::default()));
     let _ = cap_tx.send(Some(Arc::new(NetCap {
         transport: transport.clone(),
         pool: pool.clone(),
         connect_proof: config.connect_proof.clone(),
         sync_proof: config.sync_proof.clone(),
         can_fetch: config.qos.direction.pulls(),
+        can_announce: config.qos.direction.serves(),
         my_id,
+        team: config.team,
         candidates: candidates.clone(),
+        providers: providers.clone(),
     }) as Arc<dyn NetCapability>));
 
     let handler = SnapshotHandler {
@@ -956,6 +1083,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         server: InventoryServerConfig::full_team(config.team),
         events: events.clone(),
         candidates: candidates.clone(),
+        providers,
         serve_inventory: config.qos.direction.serves(),
         admit_inbound_peer: config.qos.direction.admits_inbound_peer(),
         inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CONNECTIONS_GLOBAL)),
@@ -1521,6 +1649,113 @@ async fn fetch_from_providers<T: Transport>(
     None
 }
 
+impl<T: Transport> ProviderClient<T> {
+    async fn announce(&self, key: ProviderKey, element: ElementId, targets: Vec<PeerId>) -> usize {
+        futures::stream::iter(targets)
+            .map(|target| self.put(target, key, element))
+            .buffer_unordered(MAX_CONCURRENT_PROVIDER_RPCS)
+            .filter(|stored| futures::future::ready(*stored))
+            .count()
+            .await
+    }
+
+    async fn put(&self, target: PeerId, key: ProviderKey, element: ElementId) -> bool {
+        if target == self.my_id {
+            return self
+                .providers
+                .lock()
+                .unwrap()
+                .put(key, self.my_id, crate::clock::mono_now());
+        }
+        let connection = match inventory_pool_get(
+            &self.transport,
+            &self.pool,
+            target,
+            &self.connect_proof,
+            &self.sync_proof,
+        )
+        .await
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                debug!(peer = %hex::encode(&target[..4]), %error, "provider PUT setup failed");
+                return false;
+            }
+        };
+        match tokio::time::timeout(OP_DEADLINE, op_provider_put(&connection, &element)).await {
+            Ok(Ok(stored)) => stored,
+            Ok(Err(error)) => {
+                debug!(peer = %hex::encode(&target[..4]), %error, "provider PUT failed");
+                pool_evict(&self.pool, target).await;
+                false
+            }
+            Err(_) => {
+                pool_evict(&self.pool, target).await;
+                false
+            }
+        }
+    }
+
+    async fn find(
+        &self,
+        key: ProviderKey,
+        element: ElementId,
+        targets: Vec<PeerId>,
+    ) -> Vec<PeerId> {
+        let mut found: Vec<_> = futures::stream::iter(targets)
+            .map(|target| self.get(target, key, element))
+            .buffer_unordered(MAX_CONCURRENT_PROVIDER_RPCS)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        // Directory answers are routing hints, not authority. Drop malformed
+        // endpoint identities and let exact transfer authenticate survivors.
+        found.retain(|provider| EndpointId::from_bytes(provider).is_ok());
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    async fn get(&self, target: PeerId, key: ProviderKey, element: ElementId) -> Vec<PeerId> {
+        if target == self.my_id {
+            return self
+                .providers
+                .lock()
+                .unwrap()
+                .get(key, crate::clock::mono_now());
+        }
+        let connection = match inventory_pool_get(
+            &self.transport,
+            &self.pool,
+            target,
+            &self.connect_proof,
+            &self.sync_proof,
+        )
+        .await
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                debug!(peer = %hex::encode(&target[..4]), %error, "provider GET setup failed");
+                return Vec::new();
+            }
+        };
+        match tokio::time::timeout(OP_DEADLINE, op_provider_get(&connection, &element)).await {
+            Ok(Ok(providers)) => providers,
+            Ok(Err(error)) => {
+                debug!(peer = %hex::encode(&target[..4]), %error, "provider GET failed");
+                pool_evict(&self.pool, target).await;
+                Vec::new()
+            }
+            Err(_) => {
+                pool_evict(&self.pool, target).await;
+                Vec::new()
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SnapshotHandler {
     snapshot: SnapshotSlot,
@@ -1528,6 +1763,7 @@ struct SnapshotHandler {
     server: InventoryServerConfig,
     events: tokio::sync::mpsc::Sender<NetEventBatch>,
     candidates: RoutingCandidates,
+    providers: Arc<Mutex<ProviderDirectory>>,
     serve_inventory: bool,
     admit_inbound_peer: bool,
     inbound_connections: Arc<tokio::sync::Semaphore>,
@@ -1683,6 +1919,48 @@ impl SnapshotHandler {
                     send_u64_be(send, u64::MAX).await?;
                 }
             }
+            OP_PROVIDER_PUT => {
+                let session = current_inventory_session(&authorization)?;
+                // This exact request shape is the forged-provider defense:
+                // any appended claimed identity is rejected, and the value
+                // stored below comes only from the authenticated connection.
+                let element = recv_provider_element(recv).await?;
+                let key = provider_key(session.team(), element);
+                let stored = self.providers.lock().unwrap().put(
+                    key,
+                    peer.to_bytes(),
+                    crate::clock::mono_now(),
+                );
+                send_u8(
+                    send,
+                    if stored {
+                        PROVIDER_PUT_OK
+                    } else {
+                        PROVIDER_PUT_FULL
+                    },
+                )
+                .await?;
+            }
+            OP_PROVIDER_GET => {
+                let session = current_inventory_session(&authorization)?;
+                let element = recv_provider_element(recv).await?;
+                let key = provider_key(session.team(), element);
+                let providers = self
+                    .providers
+                    .lock()
+                    .unwrap()
+                    .get(key, crate::clock::mono_now());
+                debug_assert!(providers.len() <= crate::provider::MAX_PROVIDERS_PER_KEY);
+                send_u8(
+                    send,
+                    u8::try_from(providers.len())
+                        .expect("provider fan-out is statically bounded below u8::MAX"),
+                )
+                .await?;
+                for provider in providers {
+                    send_hash(send, &provider).await?;
+                }
+            }
             OP_INVENTORY_AUTH => {
                 let proof = recv_inventory_auth_request(recv).await?;
                 let already_attempted = {
@@ -1699,10 +1977,10 @@ impl SnapshotHandler {
                     send_inventory_auth_rejected(send).await?;
                     return Ok(());
                 }
-                if !self.serve_inventory {
-                    send_inventory_auth_rejected(send).await?;
-                    return Ok(());
-                }
+                // SYNC_TEAM establishes a connection-local team session. A
+                // read-only node may use that session for the soft provider
+                // directory while its local direction policy still rejects
+                // every inventory/blob disclosure operation below.
                 match self
                     .server
                     .authorize(peer, &proof, crate::clock::epoch_now())
@@ -1858,6 +2136,14 @@ async fn require_stream_eof<R: tokio::io::AsyncRead + Unpin>(recv: &mut R) -> an
     Ok(())
 }
 
+async fn recv_provider_element<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
+) -> anyhow::Result<ElementId> {
+    let element = recv_hash(recv).await?;
+    require_stream_eof(recv).await?;
+    Ok(element)
+}
+
 fn capability_expired(expires: Option<hifitime::Epoch>) -> bool {
     expires.is_some_and(|upper| crate::clock::epoch_now() > upper)
 }
@@ -1888,6 +2174,8 @@ fn op_name(op: u8) -> &'static str {
     match op {
         OP_AUTH => "AUTH",
         OP_GET_BLOB => "GET_BLOB",
+        OP_PROVIDER_PUT => "PROVIDER_PUT",
+        OP_PROVIDER_GET => "PROVIDER_GET",
         OP_INVENTORY_AUTH => "INVENTORY_AUTH",
         OP_INVENTORY_MANIFEST => "INVENTORY_MANIFEST",
         OP_INVENTORY_NODE => "INVENTORY_NODE",
@@ -1963,6 +2251,36 @@ mod tests {
             routes.note([byte; 32]);
         }
         assert_eq!(routes.candidates([0; 32]).len(), 100);
+    }
+
+    #[test]
+    fn provider_replica_selection_is_deterministic_and_bounded() {
+        let mut routes = RoutingTable::new(Vec::new());
+        for byte in 1..=100 {
+            routes.note([byte; 32]);
+        }
+        let selected = routes.closest([0; 32], [0; 32], 20);
+        assert_eq!(selected.len(), 20);
+        assert_eq!(selected, (0..20).map(|byte| [byte; 32]).collect::<Vec<_>>());
+        assert_eq!(selected, routes.closest([0; 32], [0; 32], 20));
+    }
+
+    #[tokio::test]
+    async fn provider_request_has_no_forgeable_provider_field() {
+        let element = [7; 32];
+        let (mut send, mut recv) = tokio::io::duplex(64);
+        send.write_all(&element).await.unwrap();
+        send.shutdown().await.unwrap();
+        assert_eq!(recv_provider_element(&mut recv).await.unwrap(), element);
+
+        let (mut send, mut recv) = tokio::io::duplex(64);
+        send.write_all(&element).await.unwrap();
+        send.write_all(&[8; 32]).await.unwrap();
+        send.shutdown().await.unwrap();
+        assert!(
+            recv_provider_element(&mut recv).await.is_err(),
+            "an appended claimed provider identity must invalidate the request"
+        );
     }
 
     #[test]

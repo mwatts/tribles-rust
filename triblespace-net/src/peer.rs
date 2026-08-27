@@ -29,6 +29,7 @@ use triblespace_core::repo::{
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
+use crate::provider::ElementId;
 
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
@@ -230,6 +231,27 @@ where
         budget: std::time::Duration,
     ) -> Option<Vec<u8>> {
         self.sender.fetch_blob(hash, budget).await
+    }
+
+    /// Announce this endpoint as a soft provider for an already-known element.
+    ///
+    /// The caller is responsible for announcing only elements it can serve;
+    /// the directory is merely a leased routing hint. It neither discovers
+    /// element IDs nor replaces exact transfer and validation.
+    pub async fn announce_element(&self, element: ElementId) -> usize {
+        self.sender
+            .announce_element(element, host::INTERACTIVE_FETCH_DEADLINE)
+            .await
+    }
+
+    /// Look up soft provider hints for an already-known element identity.
+    pub async fn find_element_providers(&self, element: ElementId) -> Vec<EndpointId> {
+        self.sender
+            .find_element_providers(element, host::INTERACTIVE_FETCH_DEADLINE)
+            .await
+            .into_iter()
+            .filter_map(|provider| EndpointId::from_bytes(&provider).ok())
+            .collect()
     }
 
     /// Drain authenticated inventory progress, cross one durability barrier,
