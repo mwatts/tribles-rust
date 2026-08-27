@@ -12,7 +12,7 @@
 //! A bounded, team-scoped provider directory can locate peers for an
 //! already-known immutable artifact handle. Providers publish at most 256
 //! canonical prefix-cover leases rather than one lease per artifact; exact
-//! inverse lookup remains soft routing state, not an enumeration or
+//! membership checks remain bounded soft routing state, not an enumeration or
 //! artifact-discovery plane.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.

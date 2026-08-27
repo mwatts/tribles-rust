@@ -39,6 +39,15 @@ const MAX_PROVIDER_MEMBERS: usize = 1 << 24;
 /// Fair receiver-local share across the prefix shards this directory happens
 /// to hold for one provider. This is not a publisher-cover ceiling.
 const MAX_PROVIDER_MEMBERS_PER_PROVIDER: usize = 1 << 20;
+/// Bound work performed by one exact directory lookup. A soft directory may
+/// return fewer hints rather than monopolize an async worker on an adversarially
+/// dense prefix; the per-prefix cursor makes repeated lookups cover every
+/// candidate eventually.
+const MAX_PROVIDER_SHARDS_SCANNED_PER_GET: usize = 256;
+/// Bound opportunistic expiry reclamation performed by one RPC. Expired shards
+/// which remain queued are filtered by their deadline and conservatively retain
+/// capacity until a later call reclaims them.
+const MAX_EXPIRED_PROVIDER_SHARDS_PER_CALL: usize = 64;
 
 type ProviderPatch = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 
@@ -253,12 +262,13 @@ struct StoredProviderShard {
 }
 
 /// Receiver-local soft directory. The primary map owns complete shards; the
-/// inverse map answers only exact memberships and is updated under the same
-/// mutex as each replacement.
+/// prefix index only names candidate providers. Exact lookup checks the sorted
+/// immutable shard body, avoiding a second copy of every membership and making
+/// replacement and expiry proportional to shards rather than artifacts.
 pub(crate) struct ProviderDirectory {
     shards: BTreeMap<(u8, PeerId), StoredProviderShard>,
-    providers_by_key: BTreeMap<ProviderKey, BTreeSet<PeerId>>,
-    lookup_cursor_by_key: BTreeMap<ProviderKey, PeerId>,
+    providers_by_prefix: BTreeMap<u8, BTreeSet<PeerId>>,
+    lookup_cursor_by_prefix: BTreeMap<u8, PeerId>,
     deadlines: BTreeSet<(Mono, u8, PeerId)>,
     member_count: usize,
     members_by_provider: BTreeMap<PeerId, usize>,
@@ -277,8 +287,8 @@ impl Default for ProviderDirectory {
     fn default() -> Self {
         Self {
             shards: BTreeMap::new(),
-            providers_by_key: BTreeMap::new(),
-            lookup_cursor_by_key: BTreeMap::new(),
+            providers_by_prefix: BTreeMap::new(),
+            lookup_cursor_by_prefix: BTreeMap::new(),
             deadlines: BTreeSet::new(),
             member_count: 0,
             members_by_provider: BTreeMap::new(),
@@ -338,7 +348,7 @@ impl ProviderDirectory {
     }
 
     /// Atomically install one already-validated body. Capacity failure leaves
-    /// the old live shard and inverse memberships untouched.
+    /// the old live shard untouched.
     pub(crate) fn install(
         &mut self,
         candidate: ProviderShardCandidate,
@@ -364,19 +374,17 @@ impl ProviderDirectory {
             return false;
         }
 
+        let replacing = self.shards.contains_key(&key);
         if let Some(old) = self.shards.remove(&key) {
             self.deadlines.remove(&(old.expires_at, key.0, key.1));
             self.member_count -= old.keys.len();
             self.decrement_provider_members(provider, old.keys.len());
-            for provider_key in old.keys.iter() {
-                self.remove_inverse(*provider_key, provider);
-            }
         }
 
         let expires_at = now + self.limits.lease;
-        for provider_key in candidate.keys.iter() {
-            self.providers_by_key
-                .entry(*provider_key)
+        if !replacing {
+            self.providers_by_prefix
+                .entry(candidate.prefix)
                 .or_default()
                 .insert(provider);
         }
@@ -397,27 +405,38 @@ impl ProviderDirectory {
     /// Return bounded live providers for one exact rendezvous key.
     pub(crate) fn get(&mut self, key: ProviderKey, now: Mono) -> Vec<PeerId> {
         self.prune_expired(now);
-        let Some(providers) = self.providers_by_key.get(&key) else {
+        let prefix = key[0];
+        let Some(providers) = self.providers_by_prefix.get(&prefix) else {
             return Vec::new();
         };
-        let cursor = self.lookup_cursor_by_key.get(&key).copied();
+        let cursor = self
+            .lookup_cursor_by_prefix
+            .get(&prefix)
+            .copied()
+            .or_else(|| providers.last().copied())
+            .expect("a retained prefix has at least one provider");
         let mut result = Vec::with_capacity(MAX_PROVIDERS_PER_KEY.min(providers.len()));
-        if let Some(cursor) = cursor {
-            use std::ops::Bound::{Excluded, Unbounded};
-            result.extend(
-                providers
-                    .range((Excluded(cursor), Unbounded))
-                    .chain(providers.range(..=cursor))
-                    .take(MAX_PROVIDERS_PER_KEY)
-                    .copied(),
-            );
-        } else {
-            result.extend(providers.iter().take(MAX_PROVIDERS_PER_KEY).copied());
-        }
-        if providers.len() > MAX_PROVIDERS_PER_KEY
-            && let Some(last) = result.last().copied()
+        let mut last_scanned = None;
+        use std::ops::Bound::{Excluded, Unbounded};
+        for provider in providers
+            .range((Excluded(cursor), Unbounded))
+            .chain(providers.range(..=cursor))
+            .take(MAX_PROVIDER_SHARDS_SCANNED_PER_GET)
+            .copied()
         {
-            self.lookup_cursor_by_key.insert(key, last);
+            last_scanned = Some(provider);
+            let Some(shard) = self.shards.get(&(prefix, provider)) else {
+                continue;
+            };
+            if shard.expires_at > now && shard.keys.binary_search(&key).is_ok() {
+                result.push(provider);
+                if result.len() == MAX_PROVIDERS_PER_KEY {
+                    break;
+                }
+            }
+        }
+        if let Some(last) = last_scanned {
+            self.lookup_cursor_by_prefix.insert(prefix, last);
         }
         result
     }
@@ -433,7 +452,10 @@ impl ProviderDirectory {
     }
 
     fn prune_expired(&mut self, now: Mono) {
-        while let Some((expires_at, prefix, provider)) = self.deadlines.first().copied() {
+        for _ in 0..MAX_EXPIRED_PROVIDER_SHARDS_PER_CALL {
+            let Some((expires_at, prefix, provider)) = self.deadlines.first().copied() else {
+                break;
+            };
             if expires_at > now {
                 break;
             }
@@ -444,20 +466,18 @@ impl ProviderDirectory {
             };
             self.member_count -= shard.keys.len();
             self.decrement_provider_members(provider, shard.keys.len());
-            for provider_key in shard.keys.iter() {
-                self.remove_inverse(*provider_key, provider);
+            let remove_prefix = {
+                let providers = self
+                    .providers_by_prefix
+                    .get_mut(&prefix)
+                    .expect("stored shard contributes to its prefix index");
+                providers.remove(&provider);
+                providers.is_empty()
+            };
+            if remove_prefix {
+                self.providers_by_prefix.remove(&prefix);
+                self.lookup_cursor_by_prefix.remove(&prefix);
             }
-        }
-    }
-
-    fn remove_inverse(&mut self, key: ProviderKey, provider: PeerId) {
-        let Some(providers) = self.providers_by_key.get_mut(&key) else {
-            return;
-        };
-        providers.remove(&provider);
-        if providers.is_empty() {
-            self.providers_by_key.remove(&key);
-            self.lookup_cursor_by_key.remove(&key);
         }
     }
 
@@ -620,12 +640,12 @@ mod tests {
         let mut directory = ProviderDirectory::with_limits(Duration::from_secs(10), 4, 2000, 2000);
 
         assert!(install(&mut directory, candidate, provider, now));
-        let inverse_before = directory.providers_by_key.len();
+        let prefix_index_before = directory.providers_by_prefix.clone();
         assert_eq!(
             directory.probe(7, digest, count, provider, now + Duration::from_secs(5)),
             ProviderProbe::Known
         );
-        assert_eq!(directory.providers_by_key.len(), inverse_before);
+        assert_eq!(directory.providers_by_prefix, prefix_index_before);
         assert_eq!(
             directory.get(exact, now + Duration::from_secs(14)),
             vec![provider]
@@ -638,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_updates_the_inverse_and_failed_replacement_is_atomic() {
+    fn replacement_updates_exact_membership_and_failed_replacement_is_atomic() {
         let now = crate::clock::mono_now();
         let provider = [3; 32];
         let old = candidate(9, [1, 2]);
@@ -723,5 +743,51 @@ mod tests {
         assert_eq!(second.len(), MAX_PROVIDERS_PER_KEY);
         let seen: BTreeSet<_> = first.into_iter().chain(second).collect();
         assert_eq!(seen.len(), 70, "the result cap is not a storage cap");
+    }
+
+    #[test]
+    fn sparse_lookup_scans_a_bounded_rotating_prefix_window() {
+        let now = crate::clock::mono_now();
+        let exact = candidate(3, [999]).keys[0];
+        let mut directory = ProviderDirectory::default();
+        let mut expected = [0; 32];
+        expected[30..].copy_from_slice(&299_u16.to_be_bytes());
+        for index in 0..300_u16 {
+            let mut provider = [0; 32];
+            provider[30..].copy_from_slice(&index.to_be_bytes());
+            let suffix = if provider == expected { 999 } else { 1 };
+            assert!(install(
+                &mut directory,
+                candidate(3, [suffix]),
+                provider,
+                now,
+            ));
+        }
+
+        assert!(directory.get(exact, now).is_empty());
+        assert_eq!(directory.get(exact, now), vec![expected]);
+    }
+
+    #[test]
+    fn expiry_reclamation_is_bounded_and_unreclaimed_shards_are_not_returned() {
+        let now = crate::clock::mono_now();
+        let exact = candidate(3, [1]).keys[0];
+        let mut directory = ProviderDirectory::with_limits(Duration::from_secs(1), 100, 100, 1);
+        for byte in 1..=65 {
+            assert!(install(&mut directory, candidate(3, [1]), [byte; 32], now,));
+        }
+
+        assert!(
+            directory
+                .get(exact, now + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(directory.shards.len(), 1);
+        assert!(
+            directory
+                .get(exact, now + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert!(directory.shards.is_empty());
     }
 }

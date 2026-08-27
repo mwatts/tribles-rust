@@ -13,21 +13,25 @@ use triblespace_core::collection::{
 use triblespace_core::repo::ArtifactOfferSnapshot;
 use triblespace_core::repo::peer::PeerEvidence;
 
+use crate::inventory::ComponentManifest;
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
 
-/// A newly installed immutable local observation.
+/// A changed immutable local serving observation.
 ///
 /// The snapshot slot is replaced before this command is sent. The host uses
 /// the first notice to start anti-entropy immediately and later notices only
 /// to learn newly stored PEER evidence; periodic scheduling remains bounded.
 pub(crate) struct SnapshotNotice {
     pub(crate) peers: Vec<PeerId>,
+    /// Exact Blob component now installed, or `None` when the serving snapshot
+    /// was cleared. Other component changes do not affect provider covers.
+    pub(crate) blob: Option<ComponentManifest>,
 }
 
 /// Commands sent from [`crate::peer::Peer`] to the host runtime.
 pub(crate) enum NetCommand {
-    SnapshotInstalled(SnapshotNotice),
+    SnapshotChanged(SnapshotNotice),
     /// Replace the host's local publication policy observation.
     ///
     /// Offers are operational service intent, not another synchronized

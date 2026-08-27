@@ -72,11 +72,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace one soft lease per offered artifact with a canonical team-scoped
   provider cover. Active `OFFER ∩ resident ∩ serving` keys form at most
   256 first-byte PATCH shards; changed roots transfer one strictly validated
-  full-key body, while equal roots renew in O(1). Prefix leases replace inverse
-  memberships atomically, retain the prior valid shard after rejected
-  replacements, and expire when omitted. Exact Demand reads route through the
-  bounded XOR DHT by team and prefix, query only the exact derived membership,
-  and content-check the authenticated transfer.
+  full-key body, while equal roots renew in O(1). Prefix leases replace one
+  immutable shard atomically, retain the prior valid shard after rejected
+  replacements, and expire when omitted. A bounded rotating prefix scan checks
+  exact membership without duplicating every key in an inverse index. Exact
+  Demand reads route through the bounded XOR DHT by team and prefix and
+  content-check the authenticated transfer. Cover reconstruction now follows
+  only OFFER or Blob-component changes, and clearing the serving snapshot
+  immediately stops renewal; unrelated inventory churn no longer rehashes the
+  full offer set.
 - Pipeline up to eight independently authenticated PATCH node reads on the
   existing inventory protocol and admit their out-of-order responses through
   bounded item/byte batches. Empty replicas now overlap each fixed frontier

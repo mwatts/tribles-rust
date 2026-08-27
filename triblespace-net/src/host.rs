@@ -781,6 +781,7 @@ impl NetSender {
         let manifest = snapshot.manifest();
         let notice = SnapshotNotice {
             peers: snapshot.routing_peers(),
+            blob: Some(manifest.component(InventoryComponent::Blob)),
         };
         let snapshot = Arc::new(snapshot);
         let retired_blob_reader = self
@@ -797,7 +798,7 @@ impl NetSender {
         let mut installed = self.installed_generation.lock().unwrap();
         if *installed != Some(manifest.generation()) {
             *installed = Some(manifest.generation());
-            let _ = self.cmd_tx.send(NetCommand::SnapshotInstalled(notice));
+            let _ = self.cmd_tx.send(NetCommand::SnapshotChanged(notice));
         }
     }
 
@@ -807,8 +808,17 @@ impl NetSender {
 
     pub fn clear_snapshot(&self) {
         let retired = self.snapshot.lock().unwrap().take();
+        let had_snapshot = retired.is_some();
         drop(retired);
         *self.installed_generation.lock().unwrap() = None;
+        if had_snapshot {
+            let _ = self
+                .cmd_tx
+                .send(NetCommand::SnapshotChanged(SnapshotNotice {
+                    peers: Vec::new(),
+                    blob: None,
+                }));
+        }
     }
 
     #[cfg(test)]
@@ -1418,6 +1428,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         tokio::sync::mpsc::unbounded_channel::<ProviderShardAnnouncementOutcome>();
     let mut artifact_offers = ArtifactOfferSnapshot::default();
     let mut offer_scheduler = ProviderCoverScheduler::new();
+    let mut publication_blob = None;
     let commands = commands;
 
     loop {
@@ -1425,7 +1436,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         let mut publication_inputs_changed = false;
         loop {
             match commands.try_recv() {
-                Ok(NetCommand::SnapshotInstalled(notice)) => {
+                Ok(NetCommand::SnapshotChanged(notice)) => {
                     let mut routes = candidates.lock().unwrap();
                     for peer in notice.peers {
                         routes.note_sync_candidate(peer);
@@ -1435,8 +1446,13 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     // immediately. Later local generations update stored-peer
                     // evidence but cannot reset or multiply the fixed periodic
                     // work budget.
-                    sweeps.observe_snapshot(crate::clock::mono_now());
-                    publication_inputs_changed = true;
+                    if notice.blob.is_some() {
+                        sweeps.observe_snapshot(crate::clock::mono_now());
+                    }
+                    if publication_blob != notice.blob {
+                        publication_blob = notice.blob;
+                        publication_inputs_changed = true;
+                    }
                 }
                 Ok(NetCommand::ArtifactOffersUpdated(offers)) => {
                     artifact_offers = offers;
@@ -2296,11 +2312,11 @@ impl<T: Transport> ProviderClient<T> {
                 )
             })
             .buffer_unordered(ALPHA);
-        let mut found = Vec::new();
+        let mut replies_by_replica = Vec::new();
         let _ = tokio::time::timeout(PROVIDER_CONTROL_PHASE_DEADLINE, async {
             while let Some((target, reply)) = replies.next().await {
                 match reply {
-                    Ok(providers) => found.extend(providers),
+                    Ok(providers) => replies_by_replica.push((target, providers)),
                     Err(_) => {
                         self.candidates.lock().unwrap().remove(target);
                         pool_evict(&self.pool, target).await;
@@ -2309,7 +2325,7 @@ impl<T: Transport> ProviderClient<T> {
             }
         })
         .await;
-        normalize_provider_results(found)
+        interleave_provider_replies(replies_by_replica)
     }
 
     async fn get(&self, target: PeerId, key: ProviderKey, artifact: ArtifactId) -> Vec<PeerId> {
@@ -2358,13 +2374,36 @@ impl<T: Transport> ProviderClient<T> {
     }
 }
 
-fn normalize_provider_results(mut found: Vec<PeerId>) -> Vec<PeerId> {
-    // Directory answers are routing hints, not authority. Drop malformed
-    // endpoint identities and let exact transfer authenticate survivors.
-    found.retain(|provider| EndpointId::from_bytes(provider).is_ok());
-    found.sort_unstable();
-    found.dedup();
-    found.truncate(crate::provider::MAX_PROVIDERS_PER_KEY);
+fn interleave_provider_replies(mut replies: Vec<(PeerId, Vec<PeerId>)>) -> Vec<PeerId> {
+    // Directory answers are routing hints, not authority. Replica order is
+    // canonicalized before round-robin interleaving so one replica's low
+    // endpoint ids cannot permanently crowd every hint from another replica.
+    // Exact transfer authenticates every survivor.
+    replies.sort_unstable_by_key(|(replica, _)| *replica);
+    for (_, providers) in &mut replies {
+        providers.retain(|provider| EndpointId::from_bytes(provider).is_ok());
+    }
+
+    let mut found = Vec::new();
+    let mut seen = BTreeSet::new();
+    let rounds = replies
+        .iter()
+        .map(|(_, providers)| providers.len())
+        .max()
+        .unwrap_or(0);
+    for round in 0..rounds {
+        for (_, providers) in &replies {
+            let Some(provider) = providers.get(round).copied() else {
+                continue;
+            };
+            if seen.insert(provider) {
+                found.push(provider);
+                if found.len() == crate::provider::MAX_PROVIDERS_PER_KEY {
+                    return found;
+                }
+            }
+        }
+    }
     found
 }
 
@@ -3499,9 +3538,31 @@ mod tests {
             .collect();
         providers.extend_from_within(..32);
 
-        let normalized = normalize_provider_results(providers);
+        let normalized = interleave_provider_replies(vec![([1; 32], providers)]);
         assert_eq!(normalized.len(), crate::provider::MAX_PROVIDERS_PER_KEY);
-        assert!(normalized.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            normalized.iter().copied().collect::<BTreeSet<_>>().len(),
+            normalized.len()
+        );
+    }
+
+    #[test]
+    fn aggregate_provider_replies_do_not_let_one_replica_crowd_out_another() {
+        let crowded: Vec<_> = (1..=64)
+            .map(|byte| {
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .to_bytes()
+            })
+            .collect();
+        let only_healthy = SigningKey::from_bytes(&[100; 32])
+            .verifying_key()
+            .to_bytes();
+
+        let normalized =
+            interleave_provider_replies(vec![([1; 32], crowded), ([2; 32], vec![only_healthy])]);
+        assert_eq!(normalized.len(), crate::provider::MAX_PROVIDERS_PER_KEY);
+        assert!(normalized.contains(&only_healthy));
     }
 
     #[tokio::test(start_paused = true)]

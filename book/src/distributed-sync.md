@@ -217,26 +217,40 @@ receiver-local lease without transferring or walking membership. A changed
 root requests one strictly ascending body of full 32-byte provider keys. The
 receiver checks the authenticated provider identity, prefix, count, bounds,
 ordering, and rebuilt PATCH digest before atomically replacing the shard and
-its inverse memberships. Capacity or validation failure preserves the old
+its prefix-directory entry. Capacity or validation failure preserves the old
 valid shard. Missing prefixes receive no imperative removal; their leases
-simply expire. A pathologically oversized single prefix is reported and
-omitted while neighboring exact shards continue to publish and renew.
+simply expire. Expiry reclamation is bounded per request, while deadline checks
+prevent unreclaimed stale shards from being returned. A pathologically
+oversized single prefix is reported and omitted while neighboring exact shards
+continue to publish and renew.
 
 Successful prefix leases are renewed at half their lifetime. An ordered
 due-time scheduler admits at most `alpha = 3` changed or due prefixes at once,
 uses fair backoff, and retains successful deadlines across changed-root retry.
-Restart reobserves the durable OFFER snapshot. An absent artifact, a cleared
-serving snapshot, or `ReadOnly` direction leaves the offer dormant; if
-residency or a serving view later returns, normal snapshot observation
-activates it. In-flight stale hints need no cancellation protocol because
-receivers expire leases.
+Cover reconstruction is keyed by the durable OFFER snapshot and the immutable
+Blob-component root: peer, record, or proof churn reuses the existing cover
+instead of rehashing every offer. Restart reobserves the durable OFFER snapshot.
+An absent artifact, a cleared serving snapshot, or `ReadOnly` direction leaves
+the offer dormant; if residency or a serving view later returns, normal
+snapshot observation activates it. In-flight stale hints need no cancellation
+protocol because receivers expire leases.
+
+Receiver memory has a global membership bound and a lower per-provider fair
+share. Consequently a single publisher above that fair share is not guaranteed
+complete directory coverage in a swarm so small that every prefix selects the
+same replicas. Rejected prefixes remain soft unknown and retry; this is an
+explicit availability-versus-monopoly QoS choice, not a claim that every valid
+publisher cover fits every receiver.
 
 A reader that already knows `c` performs iterative `FIND_NODE`, asks those
 replicas for the corresponding team-and-prefix directory, and sends the raw
 artifact handle in `PROVIDER_GET`. Each replica derives `r` itself and returns
-only exact providers from its inverse index. Result fan-out is bounded and
-rotated without capping stored memberships. The reader then fetches from the
-returned providers.
+only providers whose live sorted prefix shard contains that exact key. Both the
+candidate scan and result fan-out are bounded and rotate across calls without
+capping stored memberships. Because this is a soft directory, one lookup may
+return fewer hints (including none) under adversarially dense occupancy; it
+never returns a false membership, and repeated lookups advance through every
+candidate. The reader then fetches from the returned providers.
 Every provider operation and exact transfer uses the existing reciprocal
 CONNECT and SYNC_TEAM authorization; transfer also checks that the received
 bytes hash to `c`. A holder without an active resident OFFER is honestly
