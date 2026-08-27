@@ -1850,7 +1850,11 @@ async fn fetch_inventory_blob<C: Conn>(
     Ok(Bytes::from_source(mapping))
 }
 
-#[instrument(level = "info", skip(transport, connect_proof), fields(peer = %hex::encode(&peer[..4])))]
+#[instrument(
+    level = "info",
+    skip(transport, team, connect_proof),
+    fields(peer = %hex::encode(&peer[..4]))
+)]
 async fn connect_authed<T: Transport>(
     transport: &T,
     peer: PeerId,
