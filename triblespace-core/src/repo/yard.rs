@@ -1007,6 +1007,11 @@ impl ArtifactOfferStore for Yard {
     where
         I: IntoIterator<Item = ArtifactHandle>,
     {
+        let handles: BTreeSet<_> = handles.into_iter().collect();
+        if handles.is_empty() {
+            return Ok(());
+        }
+
         let known = self.offers_snapshot()?;
         let novel: BTreeSet<_> = handles
             .into_iter()
@@ -1758,6 +1763,19 @@ mod tests {
             .get::<Blob<UnknownBlob>, _>(offered)
             .is_err());
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn empty_offer_batch_is_the_identity_without_observing_segments() {
+        use std::io::Write;
+
+        let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
+        let mut file = fs::OpenOptions::new().append(true).open(&paths[1]).unwrap();
+        file.write_all(&[0xFF; 8]).unwrap();
+        file.sync_all().unwrap();
+
+        yard.offer_all(std::iter::empty()).unwrap();
+        assert!(yard.offer(ArtifactHandle::new([42; 32])).is_err());
     }
 
     #[test]

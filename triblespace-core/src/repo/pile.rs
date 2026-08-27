@@ -2335,7 +2335,7 @@ enum Applied {
     BranchTombstone { id: Id },
     WantAssert { request: WantRequest },
     WantRetract { request: WantRequest },
-    ArtifactOffer { handle: ArtifactHandle },
+    ArtifactOffer,
     Collection { id: Id },
     CapabilityProof { id: CapabilityProofId },
     Peer { evidence: PeerEvidence },
@@ -3080,7 +3080,7 @@ impl Pile {
             }
             PileRecordContent::ArtifactOffer { handle } => {
                 self.artifact_offers.insert(handle);
-                Applied::ArtifactOffer { handle }
+                Applied::ArtifactOffer
             }
             PileRecordContent::Collection { record } => {
                 let id = record.id();
@@ -3840,30 +3840,45 @@ impl ArtifactOfferStore for Pile {
         self.file.lock()?;
         let result = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
-            for handle in handles {
-                if self.artifact_offers.contains(handle) {
-                    continue;
-                }
+            let novel: Vec<_> = handles
+                .into_iter()
+                .filter(|handle| !self.artifact_offers.contains(*handle))
+                .collect();
+            if novel.is_empty() {
+                return Ok(());
+            }
 
-                self.dirty = true;
-                let written = self
-                    .file
-                    .write(ArtifactOfferRecordHeader::new(handle).as_bytes())?;
-                if written != ENVELOPE_HEADER_LEN {
+            self.dirty = true;
+            let records_per_write = ATOMIC_WRITE_LIMIT / ENVELOPE_HEADER_LEN;
+            debug_assert!(records_per_write > 0);
+            for chunk in novel.chunks(records_per_write) {
+                let encoded_len = chunk.len() * ENVELOPE_HEADER_LEN;
+                let mut encoded = Vec::with_capacity(encoded_len);
+                for handle in chunk {
+                    encoded.extend_from_slice(ArtifactOfferRecordHeader::new(*handle).as_bytes());
+                }
+                debug_assert_eq!(encoded.len(), encoded_len);
+
+                // One append syscall keeps every chunk indivisible even from a
+                // writer that ignores our advisory lock. The chunk boundary is
+                // record-aligned, so a batch larger than the platform-safe
+                // atomic-write limit may be interleaved but never corrupted.
+                let written = self.file.write(&encoded)?;
+                if written != encoded_len {
                     return Err(PileWriteError::IoError(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
-                        "failed to write complete artifact-offer record",
+                        "failed to write complete artifact-offer batch",
                     )));
                 }
-
-                match self.apply_next().map_err(PileWriteError::from)? {
-                    Some(Applied::ArtifactOffer { handle: applied }) if applied == handle => {}
-                    Some(_) | None => {
-                        return Err(PileWriteError::IoError(std::io::Error::other(
-                            "unexpected record after artifact-offer append",
-                        )));
-                    }
-                }
+            }
+            self.refresh_locked().map_err(PileWriteError::from)?;
+            if novel
+                .iter()
+                .any(|handle| !self.artifact_offers.contains(*handle))
+            {
+                return Err(PileWriteError::IoError(std::io::Error::other(
+                    "artifact-offer batch missing after append",
+                )));
             }
             Ok(())
         })();
@@ -4099,7 +4114,7 @@ impl Pile {
                     Some(Applied::BranchTombstone { .. }) => {}
                     Some(Applied::WantAssert { .. }) => {}
                     Some(Applied::WantRetract { .. }) => {}
-                    Some(Applied::ArtifactOffer { .. }) => {}
+                    Some(Applied::ArtifactOffer) => {}
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::CapabilityProof { .. }) => {}
                     Some(Applied::Peer { .. }) => {}
