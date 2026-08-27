@@ -30,12 +30,14 @@ pub(crate) const PROVIDER_LEASE_LIFETIME: Duration = Duration::from_secs(24 * 60
 pub(crate) const MAX_PROVIDERS_PER_KEY: usize = 64;
 const _: () = assert!(MAX_PROVIDERS_PER_KEY <= u8::MAX as usize);
 
-/// A single shard may be large enough to cover substantial, adversarially
-/// skewed stores. The bound exists only to make wire allocation finite; it is
-/// deliberately far above the old per-artifact directory limit.
+/// A single shard body is bounded near 2 MiB. Uniform team-scoped provider
+/// keys spread across 256 prefixes, so the mean shard reaches this limit only
+/// around 16.7 million active offers; pathological skew is omitted explicitly.
 pub(crate) const MAX_PROVIDER_SHARD_MEMBERS: usize = 1 << 16;
 const MAX_PROVIDER_SHARDS: usize = 65_536;
 const MAX_PROVIDER_MEMBERS: usize = 1 << 24;
+/// Fair receiver-local share across the prefix shards this directory happens
+/// to hold for one provider. This is not a publisher-cover ceiling.
 const MAX_PROVIDER_MEMBERS_PER_PROVIDER: usize = 1 << 20;
 
 type ProviderPatch = PATCH<32, IdentitySchema, (), Blake3Merkle>;
