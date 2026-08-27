@@ -19,7 +19,7 @@ use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     CollectionCommit, CollectionHandle, CollectionStore, VerifyingKey,
 };
-use triblespace_core::repo::{BlobStore, BlobStoreMeta};
+use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 use triblespace_core::trible::Fragment;
 
 use crate::path_summary_union;
@@ -188,7 +188,7 @@ impl PathSummaryCollection {
         ticket: &[CollectionCommit],
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
-        S: BlobStore + CollectionStore,
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel().ensure_exact(store, ticket, self)?;
@@ -338,6 +338,23 @@ mod tests {
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.0.insert(record)
+        }
+    }
+
+    impl triblespace_core::repo::ArtifactOfferStore for CollectionOnly {
+        type OfferError = <MemoryRepo as triblespace_core::repo::ArtifactOfferStore>::OfferError;
+
+        fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+        where
+            I: IntoIterator<Item = triblespace_core::repo::ArtifactHandle>,
+        {
+            self.0.offer_all(handles)
+        }
+
+        fn offers_snapshot(
+            &mut self,
+        ) -> Result<triblespace_core::repo::ArtifactOfferSnapshot, Self::OfferError> {
+            self.0.offers_snapshot()
         }
     }
 

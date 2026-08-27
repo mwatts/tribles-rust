@@ -25,7 +25,8 @@ use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::repo::{
-    BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, StorageClose, StorageFlush,
+    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut,
+    OfferCaptureInsertError, StorageClose, StorageFlush,
 };
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
@@ -829,7 +830,7 @@ where
 
 impl<S> Collection<S>
 where
-    S: BlobStorePut + CollectionStore,
+    S: BlobStorePut + CollectionStore + ArtifactOfferStore,
 {
     /// Publish one self-contained fragment under explicit admission.
     ///
@@ -847,7 +848,10 @@ where
     pub fn commit(
         &mut self,
         fragment: Fragment,
-    ) -> Result<CollectionCommit, CollectionCommitError<S::PutError, S::InsertError>> {
+    ) -> Result<
+        CollectionCommit,
+        CollectionCommitError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
+    > {
         let instant = clock::epoch_now();
         let collection = self.collection();
         let writer = Inline::new(self.signing_key.verifying_key().to_bytes());
@@ -1518,6 +1522,23 @@ mod tests {
         }
     }
 
+    impl crate::repo::ArtifactOfferStore for AppendAfterFirstDiscovery {
+        type OfferError = <MemoryRepo as crate::repo::ArtifactOfferStore>::OfferError;
+
+        fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+        where
+            I: IntoIterator<Item = crate::repo::ArtifactHandle>,
+        {
+            self.inner.offer_all(handles)
+        }
+
+        fn offers_snapshot(
+            &mut self,
+        ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
+            self.inner.offers_snapshot()
+        }
+    }
+
     fn fragment(entity: u8, attachment: bool) -> Fragment {
         let mut row = [entity; TRIBLE_LEN];
         row[16..32].fill(1);
@@ -1591,6 +1612,28 @@ mod tests {
             reach::private(),
             CollectionAdmission::Open,
         )
+    }
+
+    #[test]
+    fn commit_offers_descriptor_attachments_data_and_metadata() {
+        let mut collection = open_collection(&test_name(), SigningKey::from_bytes(&[8; 32]));
+        let mut committed = fragment_with_metadata(1, 2);
+        let attachment: Inline<Handle<UTF8String>> = committed.put("offered attachment".to_owned());
+        let data: Blob<SimpleArchive> = committed.facts().clone().to_blob();
+        let metadata: Blob<SimpleArchive> = committed.metafacts().clone().to_blob();
+        let expected = [
+            collection.collection().transmute(),
+            attachment.transmute(),
+            data.get_handle().transmute(),
+            metadata.get_handle().transmute(),
+        ];
+
+        collection.commit(committed).unwrap();
+
+        let offers = collection.storage_mut().offers_snapshot().unwrap();
+        for handle in expected {
+            assert!(offers.contains(handle));
+        }
     }
 
     fn keep_only<I>(store: &mut MemoryRepo, handles: I)

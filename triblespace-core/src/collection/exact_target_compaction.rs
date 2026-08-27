@@ -14,7 +14,7 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, BlobEncoding};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
-use crate::repo::{BlobStore, BlobStoreMeta, BlobStorePut};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, BlobStorePut, OfferCapture};
 use crate::trible::Fragment;
 
 use super::exact_derived::{
@@ -178,6 +178,25 @@ pub fn compact_exact_target<S, Source, Target, A>(
     algebra: &A,
 ) -> Result<ExactCover<Target>, ExactTargetCompactionError>
 where
+    S: BlobStore + CollectionStore + ArtifactOfferStore,
+    S::Reader: BlobStoreMeta,
+    Source: BlobEncoding + 'static,
+    Target: BlobEncoding + 'static,
+    Handle<Source>: InlineEncoding,
+    Handle<Target>: InlineEncoding,
+    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+{
+    let mut capture = OfferCapture::new(store);
+    compact_exact_target_unoffered(exact, &mut capture, ticket, algebra)
+}
+
+pub(crate) fn compact_exact_target_unoffered<S, Source, Target, A>(
+    exact: &ExactDerivedCollection<Source, Target>,
+    store: &mut S,
+    ticket: &[CollectionCommit],
+    algebra: &A,
+) -> Result<ExactCover<Target>, ExactTargetCompactionError>
+where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
     Source: BlobEncoding + 'static,
@@ -186,7 +205,7 @@ where
     Handle<Target>: InlineEncoding,
     A: ExactDerivedAlgebra<Source, Target> + ?Sized,
 {
-    let mut cover = exact.ensure_exact(store, ticket, algebra)?;
+    let mut cover = exact.ensure_exact_unoffered(store, ticket, algebra)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 

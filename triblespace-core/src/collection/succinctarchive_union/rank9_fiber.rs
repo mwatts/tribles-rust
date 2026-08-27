@@ -26,7 +26,9 @@ use crate::collection::{
 };
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::repo::{
+    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, OfferCapture,
+};
 use crate::trible::{Fragment, TribleSet};
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -248,7 +250,7 @@ impl Rank9Fiber {
         cover: ExactCover<SuccinctArchiveBlob>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
-        S: BlobStore + CollectionStore,
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let probe = self.probe(store, cover, true)?;
@@ -261,6 +263,8 @@ impl Rank9Fiber {
             member.runtime = None;
         }
 
+        let mut capture = OfferCapture::new(store);
+        let store = &mut capture;
         self.publish_descriptor(store, "raw", self.source.clone(), self.source_collection)?;
         self.publish_descriptor(store, "Rank9", self.target.clone(), self.target_collection)?;
 
@@ -285,17 +289,19 @@ impl Rank9Fiber {
                 debug_assert_eq!(output, expected, "fixed Rank9 recipe is functional");
             }
             member.output = Some(output);
-            if !member.claim_present {
-                claims.push(CollectionDerive::new(
-                    self.target_collection,
-                    member.raw_data,
-                    output,
-                ));
-                member.claim_present = true;
-            }
+            // Reinsert the exact DERIVE even when it already exists. Record
+            // insertion is idempotent, and it is the publication boundary
+            // through which an operation-scoped OfferCapture advertises a
+            // repaired sidecar before making that repair visible as complete.
+            claims.push(CollectionDerive::new(
+                self.target_collection,
+                member.raw_data,
+                output,
+            ));
+            member.claim_present = true;
         }
 
-        // Every newly claimed endpoint precedes the first new equation. A
+        // Every stored endpoint precedes an idempotent equation insert. A
         // failure above can leave only harmless orphan blobs, never a new
         // claim naming bytes this attempt failed to store.
         for claim in claims {

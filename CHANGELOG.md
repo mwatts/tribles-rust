@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Make successful collection publication automatically emit durable OFFER
+  intent before its semantic record. An operation-scoped capture facade covers
+  signed COMMIT dependencies and Fragment attachments, SimpleArchive MERGE,
+  exact DERIVE and compaction, and Succinct raw/Rank9 artifacts. OFFER failure
+  withholds the semantic record with a deterministic retry-all batch; record
+  failure leaves only harmless grow-only offers. Staged commits expose only
+  the capturing facade, so intervening artifact writes cannot silently bypass
+  advertisement.
+
 - Add `ArtifactOfferStore`, a bulk-first grow-only local willingness-to-serve
   set with cheap deterministic snapshots. `MemoryRepo`, `Pile`, `Yard`, and
   `HybridStore` implement the primitive; Pile persists each novel offer as one

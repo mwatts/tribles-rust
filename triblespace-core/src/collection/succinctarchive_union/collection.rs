@@ -38,7 +38,7 @@ use crate::collection::records::{
 };
 use crate::collection::{CollectionCommit, CollectionHandle, CollectionStore};
 use crate::metadata::MetaDescribe;
-use crate::repo::{BlobStore, BlobStoreMeta};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
 use super::rank9_fiber::Rank9Fiber;
 
@@ -254,7 +254,7 @@ impl SuccinctArchiveCollection {
         ticket: &[CollectionCommit],
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore,
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel().ensure_exact(store, ticket, self)?;
@@ -276,7 +276,7 @@ impl SuccinctArchiveCollection {
         ticket: &[CollectionCommit],
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore,
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let cover = compact_exact_target(&self.kernel(), store, ticket, self)?;
@@ -504,6 +504,23 @@ mod tests {
         }
     }
 
+    impl crate::repo::ArtifactOfferStore for CollectionOnly {
+        type OfferError = <MemoryRepo as crate::repo::ArtifactOfferStore>::OfferError;
+
+        fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+        where
+            I: IntoIterator<Item = crate::repo::ArtifactHandle>,
+        {
+            self.repo.offer_all(handles)
+        }
+
+        fn offers_snapshot(
+            &mut self,
+        ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
+            self.repo.offers_snapshot()
+        }
+    }
+
     impl BlobStorePut for CollectionOnly {
         type PutError = <MemoryRepo as BlobStorePut>::PutError;
 
@@ -683,6 +700,23 @@ mod tests {
         }
     }
 
+    impl crate::repo::ArtifactOfferStore for FaultStore {
+        type OfferError = <MemoryRepo as crate::repo::ArtifactOfferStore>::OfferError;
+
+        fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+        where
+            I: IntoIterator<Item = crate::repo::ArtifactHandle>,
+        {
+            self.repo.offer_all(handles)
+        }
+
+        fn offers_snapshot(
+            &mut self,
+        ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
+            self.repo.offers_snapshot()
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum FiberWriteEvent {
         Put(TypeId, CollectionData),
@@ -838,6 +872,24 @@ mod tests {
         }
     }
 
+    impl crate::repo::ArtifactOfferStore for GuardStore {
+        type OfferError = <MemoryRepo as crate::repo::ArtifactOfferStore>::OfferError;
+
+        fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
+        where
+            I: IntoIterator<Item = crate::repo::ArtifactHandle>,
+        {
+            self.assert_no_reader();
+            self.repo.offer_all(handles)
+        }
+
+        fn offers_snapshot(
+            &mut self,
+        ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
+            self.repo.offers_snapshot()
+        }
+    }
+
     struct PanicStore;
 
     impl BlobStorePut for PanicStore {
@@ -873,6 +925,23 @@ mod tests {
 
         fn insert(&mut self, _: CollectionRecord) -> Result<(), Self::InsertError> {
             panic!("empty Succinct ticket inserted a record")
+        }
+    }
+
+    impl crate::repo::ArtifactOfferStore for PanicStore {
+        type OfferError = Infallible;
+
+        fn offer_all<I>(&mut self, _: I) -> Result<(), Self::OfferError>
+        where
+            I: IntoIterator<Item = crate::repo::ArtifactHandle>,
+        {
+            panic!("empty Succinct ticket attempted an OFFER write")
+        }
+
+        fn offers_snapshot(
+            &mut self,
+        ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
+            Ok(crate::repo::ArtifactOfferSnapshot::default())
         }
     }
 
@@ -1377,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_canonical_endpoint_is_repaired_without_duplicate_derive() {
+    fn missing_canonical_endpoint_is_repaired_with_idempotent_derive_reinsertion() {
         let (collection, mut store, commit, expected, raw) = one_raw_fixture(14);
         let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
         store
@@ -1398,14 +1467,14 @@ mod tests {
         assert_eq!(store.writes(), (0, 0));
         let repaired = collection.ensure_exact(&mut store, &[commit]).unwrap();
         assert_eq!(attached_facts(&repaired), expected);
-        assert_eq!(store.writes(), (3, 0));
+        assert_eq!(store.writes(), (3, 1));
         assert_eq!(rank9_derives(&mut store, &collection).len(), 1);
         let reader = store.reader().unwrap();
         assert!(reader.contains_blob(canonical.get_handle()).unwrap());
     }
 
     #[test]
-    fn corrupt_canonical_endpoint_is_repaired_without_duplicate_derive() {
+    fn corrupt_canonical_endpoint_is_repaired_with_idempotent_derive_reinsertion() {
         let (collection, mut base, commit, expected, raw) = one_raw_fixture(21);
         let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
         base.put::<SuccinctArchiveRank9IndexBlob, _>(canonical.clone())
@@ -1429,7 +1498,7 @@ mod tests {
         assert_eq!(store.writes(), (0, 0));
         let repaired = collection.ensure_exact(&mut store, &[commit]).unwrap();
         assert_eq!(attached_facts(&repaired), expected);
-        assert_eq!(store.writes(), (3, 0));
+        assert_eq!(store.writes(), (3, 1));
         assert_eq!(rank9_derives(&mut store, &collection).len(), 1);
         let reader = store.reader().unwrap();
         let resident: Blob<SuccinctArchiveRank9IndexBlob> =
@@ -1739,6 +1808,23 @@ mod tests {
             .unwrap();
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
         assert_eq!(attached.segment_count(), 2);
+        let derived_outputs: Vec<_> = records(&mut store)
+            .into_iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Derive(claim)
+                    if claim.target() == collection.collection()
+                        || claim.target() == collection.rank9_collection() =>
+                {
+                    Some(claim.mapping().1.transmute())
+                }
+                _ => None,
+            })
+            .collect();
+        let offers = store.offers_snapshot().unwrap();
+        assert!(!derived_outputs.is_empty());
+        assert!(derived_outputs
+            .into_iter()
+            .all(|output| offers.contains(output)));
     }
 
     #[test]
@@ -1767,11 +1853,16 @@ mod tests {
             .unwrap();
         assert_eq!(attached.segment_count(), 1);
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
-        assert!(records(&mut store).into_iter().any(|record| matches!(
-            record,
-            CollectionRecord::Merge(claim)
-                if claim.collection() == collection.collection()
-        )));
+        let merged = records(&mut store)
+            .into_iter()
+            .find_map(|record| match record {
+                CollectionRecord::Merge(claim) if claim.collection() == collection.collection() => {
+                    Some(claim.result().transmute())
+                }
+                _ => None,
+            })
+            .expect("compaction published a raw MERGE");
+        assert!(store.offers_snapshot().unwrap().contains(merged));
     }
 
     #[test]

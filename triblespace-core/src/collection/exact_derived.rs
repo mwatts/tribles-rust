@@ -23,7 +23,9 @@ use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut};
+use crate::repo::{
+    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, OfferCapture,
+};
 use crate::trible::Fragment;
 
 use super::discovery::{
@@ -473,6 +475,21 @@ where
     /// dropped before descriptors and all output blobs are written ahead of
     /// unsigned `DERIVE` records. No flush or signed record is emitted.
     pub fn ensure_exact<S, A>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+        algebra: &A,
+    ) -> Result<ExactCover<Target>, ExactDerivedCollectionError>
+    where
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S::Reader: BlobStoreMeta,
+        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    {
+        let mut capture = OfferCapture::new(store);
+        self.ensure_exact_unoffered(&mut capture, ticket, algebra)
+    }
+
+    pub(crate) fn ensure_exact_unoffered<S, A>(
         &self,
         store: &mut S,
         ticket: &[CollectionCommit],

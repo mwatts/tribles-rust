@@ -21,6 +21,36 @@ use crate::repo::memoryrepo::MemoryRepo;
 use crate::repo::{BlobStoreList, BlobStorePut};
 use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
+macro_rules! inert_test_offers {
+    ($($store:ty),+ $(,)?) => {$(
+        impl crate::repo::ArtifactOfferStore for $store {
+            type OfferError = Infallible;
+
+            fn offer_all<I>(&mut self, _: I) -> Result<(), Self::OfferError>
+            where
+                I: IntoIterator<Item = crate::repo::ArtifactHandle>,
+            {
+                Ok(())
+            }
+
+            fn offers_snapshot(
+                &mut self,
+            ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
+                Ok(crate::repo::ArtifactOfferSnapshot::default())
+            }
+        }
+    )+};
+}
+
+inert_test_offers!(
+    PanicStore,
+    CountingStore,
+    GuardStore,
+    RejectPutStore,
+    DropMergeStore,
+    LossyStore,
+);
+
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
 }

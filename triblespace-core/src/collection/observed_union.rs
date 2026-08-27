@@ -82,7 +82,7 @@ use super::records::{
     collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
 use super::{simplearchive_union, CollectionCommit, CollectionStore};
-use crate::repo::{BlobStore, BlobStoreMeta};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
 /// Width of one stored id.
 const ID_LEN: usize = 16;
@@ -434,7 +434,7 @@ impl ObservedSetCollection {
         ticket: &[CollectionCommit],
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
-        S: BlobStore + CollectionStore,
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel().ensure_exact(store, ticket, self)?;

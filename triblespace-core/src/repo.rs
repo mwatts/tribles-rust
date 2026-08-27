@@ -19,7 +19,10 @@ pub mod lazy;
 pub mod memoryrepo;
 /// Grow-only local willingness to serve content-addressed artifacts.
 pub mod offer;
-pub use offer::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
+pub use offer::{
+    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, OfferCapture,
+    OfferCaptureInsertError,
+};
 #[cfg(feature = "object-store")]
 /// Storage backed by an `object_store`-compatible remote (S3, local FS, etc.).
 pub mod objectstore;
