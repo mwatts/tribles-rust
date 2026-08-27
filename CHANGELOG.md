@@ -24,9 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immediately and renew successful receiver-local leases at half-life through
   a bounded fair due-time scheduler. Absent blobs, cleared snapshots, and
   read-only peers remain dormant, while failed or capacity-rejected attempts
-  use bounded backoff. The former production announcement bypass is now
-  available only as an explicitly test-only simulator hook for stale-provider
-  and adversarial routing scenarios.
+  use bounded backoff. When any configured, synchronized, or learned remote
+  route exists, local self-insertion alone no longer masks failed DHT
+  replication; true singleton nodes still renew their self lease normally.
+  Lease deadlines expose a rate-limited warning if fair backlog ever exhausts
+  the half-life margin. Remove the imperative announcement bypass completely,
+  including from the simulator.
 
 - Add a transport-independent bounded XOR routing core. Its 256 Kademlia-style
   buckets retain at most 20 learned peers each and distinguish remotely named

@@ -617,11 +617,6 @@ fn pinned_snapshot_if_serving(
 /// the content hash narrows the request but is not itself disclosure authority.
 pub(crate) trait NetCapability: Send + Sync {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
-    #[cfg(feature = "sim")]
-    fn announce_artifact_raw_for_test(
-        &self,
-        artifact: ArtifactId,
-    ) -> futures::future::BoxFuture<'static, usize>;
     fn find_artifact_providers(
         &self,
         artifact: ArtifactId,
@@ -742,15 +737,6 @@ impl<T: Transport> NetCapability for NetCap<T> {
         })
     }
 
-    #[cfg(feature = "sim")]
-    fn announce_artifact_raw_for_test(
-        &self,
-        artifact: ArtifactId,
-    ) -> futures::future::BoxFuture<'static, usize> {
-        let client = self.provider_client();
-        Box::pin(async move { client.announce_artifact(artifact).await })
-    }
-
     fn find_artifact_providers(
         &self,
         artifact: ArtifactId,
@@ -847,23 +833,6 @@ impl NetSender {
         .await
         .ok()
         .flatten()
-    }
-
-    /// Publish an arbitrary provider hint for adversarial simulation tests.
-    #[cfg(feature = "sim")]
-    pub(crate) async fn announce_artifact_raw_for_test(
-        &self,
-        artifact: ArtifactId,
-        budget: std::time::Duration,
-    ) -> usize {
-        tokio::time::timeout(budget, async {
-            let capability = self.ready_capability().await.ok()?;
-            Some(capability.announce_artifact_raw_for_test(artifact).await)
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0)
     }
 
     /// Find soft provider hints for an already-known physical artifact.
@@ -1014,6 +983,9 @@ const MAX_CONCURRENT_OFFER_ANNOUNCEMENTS: usize = ALPHA;
 /// catch-up bursts after a delayed host iteration.
 const PROVIDER_RENEWAL_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(PROVIDER_LEASE_LIFETIME.as_secs() / 2);
+/// A missed lease is actionable, but one overloaded scheduler must not fill
+/// logs every 10ms while it works through the same backlog.
+const OFFER_BACKLOG_WARNING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// One lookup must fit comfortably inside the default interactive operation.
 const DHT_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 /// Deadline for small provider control RPCs and authenticated connection setup.
@@ -1124,7 +1096,21 @@ impl SweepScheduler {
 
 struct ArtifactAnnouncementOutcome {
     artifact: ArtifactId,
-    accepted: usize,
+    attempted_at: crate::clock::Mono,
+    publication: ProviderPublication,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProviderPublication {
+    local_accepted: bool,
+    remote_expected: bool,
+    remote_accepted: usize,
+}
+
+impl ProviderPublication {
+    fn succeeded(self) -> bool {
+        self.remote_accepted > 0 || (!self.remote_expected && self.local_accepted)
+    }
 }
 
 /// Bounded fair scheduling for durable local artifact offers.
@@ -1138,8 +1124,11 @@ struct ArtifactOfferScheduler {
     active: BTreeSet<ArtifactId>,
     due: BTreeSet<(crate::clock::Mono, ArtifactId)>,
     due_by_artifact: HashMap<ArtifactId, crate::clock::Mono>,
+    lease_deadlines: BTreeSet<(crate::clock::Mono, ArtifactId)>,
+    lease_deadline_by_artifact: HashMap<ArtifactId, crate::clock::Mono>,
     in_flight: HashSet<ArtifactId>,
     failures: HashMap<ArtifactId, u32>,
+    next_backlog_warning: Option<crate::clock::Mono>,
 }
 
 impl ArtifactOfferScheduler {
@@ -1148,8 +1137,11 @@ impl ArtifactOfferScheduler {
             active: BTreeSet::new(),
             due: BTreeSet::new(),
             due_by_artifact: HashMap::new(),
+            lease_deadlines: BTreeSet::new(),
+            lease_deadline_by_artifact: HashMap::new(),
             in_flight: HashSet::new(),
             failures: HashMap::new(),
+            next_backlog_warning: None,
         }
     }
 
@@ -1157,6 +1149,7 @@ impl ArtifactOfferScheduler {
         let removed: Vec<_> = self.active.difference(&active).copied().collect();
         for artifact in removed {
             self.unschedule(artifact);
+            self.remove_lease_deadline(artifact);
             self.failures.remove(&artifact);
         }
 
@@ -1182,6 +1175,19 @@ impl ArtifactOfferScheduler {
         }
     }
 
+    fn set_lease_deadline(&mut self, artifact: ArtifactId, deadline: crate::clock::Mono) {
+        if let Some(previous) = self.lease_deadline_by_artifact.insert(artifact, deadline) {
+            self.lease_deadlines.remove(&(previous, artifact));
+        }
+        self.lease_deadlines.insert((deadline, artifact));
+    }
+
+    fn remove_lease_deadline(&mut self, artifact: ArtifactId) {
+        if let Some(previous) = self.lease_deadline_by_artifact.remove(&artifact) {
+            self.lease_deadlines.remove(&(previous, artifact));
+        }
+    }
+
     fn pop_due(&mut self, now: crate::clock::Mono) -> Option<ArtifactId> {
         loop {
             let (due, artifact) = self.due.first().copied()?;
@@ -1203,6 +1209,7 @@ impl ArtifactOfferScheduler {
         self.in_flight.remove(&artifact);
         self.active.remove(&artifact);
         self.unschedule(artifact);
+        self.remove_lease_deadline(artifact);
         self.failures.remove(&artifact);
     }
 
@@ -1212,8 +1219,16 @@ impl ArtifactOfferScheduler {
             return;
         }
 
-        let delay = if outcome.accepted > 0 {
+        let delay = if outcome.publication.succeeded() {
             self.failures.remove(&outcome.artifact);
+            // The receiver installs its lease during the attempt. Starting at
+            // launch is a conservative lower bound on every accepted remote
+            // lease deadline; completion time could overstate it by a whole
+            // control-phase timeout.
+            self.set_lease_deadline(
+                outcome.artifact,
+                outcome.attempted_at + PROVIDER_LEASE_LIFETIME,
+            );
             PROVIDER_RENEWAL_INTERVAL
         } else {
             let attempts = self
@@ -1231,6 +1246,25 @@ impl ArtifactOfferScheduler {
         self.schedule(outcome.artifact, now + delay);
     }
 
+    /// Report a definite lease miss at most once per warning interval. The
+    /// ordered deadline set makes the normal not-overdue check O(1), without
+    /// truncating or separately planning the fair work queue.
+    fn warnable_expired_lease(
+        &mut self,
+        now: crate::clock::Mono,
+    ) -> Option<(ArtifactId, crate::clock::Mono)> {
+        let (deadline, artifact) = self.lease_deadlines.first().copied()?;
+        if deadline > now
+            || self
+                .next_backlog_warning
+                .is_some_and(|next_warning| next_warning > now)
+        {
+            return None;
+        }
+        self.next_backlog_warning = Some(now + OFFER_BACKLOG_WARNING_INTERVAL);
+        Some((artifact, deadline))
+    }
+
     fn in_flight_len(&self) -> usize {
         self.in_flight.len()
     }
@@ -1243,6 +1277,11 @@ impl ArtifactOfferScheduler {
     #[cfg(test)]
     fn next_due(&self, artifact: ArtifactId) -> Option<crate::clock::Mono> {
         self.due_by_artifact.get(&artifact).copied()
+    }
+
+    #[cfg(test)]
+    fn lease_deadline(&self, artifact: ArtifactId) -> Option<crate::clock::Mono> {
+        self.lease_deadline_by_artifact.get(&artifact).copied()
     }
 }
 
@@ -1423,6 +1462,13 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         let now = crate::clock::mono_now();
+        if let Some((artifact, deadline)) = offer_scheduler.warnable_expired_lease(now) {
+            warn!(
+                artifact = %hex::encode(&artifact[..4]),
+                lag_ms = now.duration_since(deadline).as_millis(),
+                "artifact-offer backlog missed a provider lease renewal deadline"
+            );
+        }
         if config.qos.direction.pulls() && sweeps.period_is_due(now) {
             let candidates = candidates.lock().unwrap().sync_candidates();
             sweeps.admit_period(now, &candidates, &in_flight, &failures);
@@ -1499,14 +1545,23 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 }
                 let client = publication_client.clone();
                 let offer_tx = offer_tx.clone();
+                let attempted_at = now;
                 tokio::spawn(async move {
-                    let accepted = tokio::time::timeout(
+                    let remote_expected = client.expects_remote();
+                    let publication = tokio::time::timeout(
                         INTERACTIVE_FETCH_DEADLINE,
-                        client.announce_artifact(artifact),
+                        client.announce_artifact(artifact, remote_expected),
                     )
                     .await
-                    .unwrap_or(0);
-                    let _ = offer_tx.send(ArtifactAnnouncementOutcome { artifact, accepted });
+                    .unwrap_or(ProviderPublication {
+                        remote_expected,
+                        ..ProviderPublication::default()
+                    });
+                    let _ = offer_tx.send(ArtifactAnnouncementOutcome {
+                        artifact,
+                        attempted_at,
+                        publication,
+                    });
                 });
             }
         }
@@ -2046,10 +2101,18 @@ impl<T: Transport> ProviderClient<T> {
             .map_err(|_| anyhow::anyhow!("FIND_NODE deadline exceeded"))?
     }
 
-    async fn announce_artifact(&self, artifact: ArtifactId) -> usize {
+    fn expects_remote(&self) -> bool {
+        self.candidates.lock().unwrap().expects_remote()
+    }
+
+    async fn announce_artifact(
+        &self,
+        artifact: ArtifactId,
+        remote_expected: bool,
+    ) -> ProviderPublication {
         let key = provider_key(self.team, artifact);
         let targets = self.lookup_replicas(key).await;
-        self.announce(key, artifact, targets).await
+        self.announce(key, artifact, targets, remote_expected).await
     }
 
     async fn announce(
@@ -2057,7 +2120,8 @@ impl<T: Transport> ProviderClient<T> {
         key: ProviderKey,
         artifact: ArtifactId,
         targets: Vec<PeerId>,
-    ) -> usize {
+        remote_expected: bool,
+    ) -> ProviderPublication {
         let mut replies = futures::stream::iter(targets)
             .map(|target| async move {
                 (
@@ -2070,11 +2134,15 @@ impl<T: Transport> ProviderClient<T> {
                 )
             })
             .buffer_unordered(MAX_CONCURRENT_PROVIDER_RPCS);
-        let mut stored = 0;
+        let mut publication = ProviderPublication {
+            remote_expected,
+            ..ProviderPublication::default()
+        };
         let _ = tokio::time::timeout(PROVIDER_CONTROL_PHASE_DEADLINE, async {
             while let Some((target, reply)) = replies.next().await {
                 match reply {
-                    Ok(true) => stored += 1,
+                    Ok(true) if target == self.my_id => publication.local_accepted = true,
+                    Ok(true) => publication.remote_accepted += 1,
                     Ok(false) => {}
                     Err(_) => {
                         self.candidates.lock().unwrap().remove(target);
@@ -2084,7 +2152,7 @@ impl<T: Transport> ProviderClient<T> {
             }
         })
         .await;
-        stored
+        publication
     }
 
     async fn put(&self, target: PeerId, key: ProviderKey, artifact: ArtifactId) -> bool {
@@ -2965,7 +3033,12 @@ mod tests {
                 scheduler.complete(
                     ArtifactAnnouncementOutcome {
                         artifact,
-                        accepted: 1,
+                        attempted_at: now,
+                        publication: ProviderPublication {
+                            remote_expected: true,
+                            remote_accepted: 1,
+                            ..ProviderPublication::default()
+                        },
                     },
                     now,
                 );
@@ -2986,7 +3059,11 @@ mod tests {
         scheduler.complete(
             ArtifactAnnouncementOutcome {
                 artifact: success,
-                accepted: 1,
+                attempted_at: now,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    ..ProviderPublication::default()
+                },
             },
             now,
         );
@@ -2999,7 +3076,12 @@ mod tests {
         scheduler.complete(
             ArtifactAnnouncementOutcome {
                 artifact: retry,
-                accepted: 0,
+                attempted_at: now,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    remote_expected: true,
+                    remote_accepted: 0,
+                },
             },
             now,
         );
@@ -3013,7 +3095,12 @@ mod tests {
         scheduler.complete(
             ArtifactAnnouncementOutcome {
                 artifact: retry,
-                accepted: 0,
+                attempted_at: retry_at,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    remote_expected: true,
+                    remote_accepted: 0,
+                },
             },
             retry_at,
         );
@@ -3021,6 +3108,11 @@ mod tests {
             scheduler.next_due(retry),
             Some(retry_at + (crate::RETRY_BACKOFF_BASE * 2))
         );
+        assert_eq!(
+            scheduler.lease_deadline(success),
+            Some(now + PROVIDER_LEASE_LIFETIME)
+        );
+        assert_eq!(scheduler.lease_deadline(retry), None);
     }
 
     #[test]
@@ -3033,7 +3125,11 @@ mod tests {
         scheduler.complete(
             ArtifactAnnouncementOutcome {
                 artifact,
-                accepted: 1,
+                attempted_at: now,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    ..ProviderPublication::default()
+                },
             },
             now,
         );
@@ -3044,6 +3140,38 @@ mod tests {
         scheduler.observe_active(BTreeSet::new(), now + Duration::from_secs(2));
         assert_eq!(scheduler.active_len(), 0);
         assert_eq!(scheduler.next_due(artifact), None);
+        assert_eq!(scheduler.lease_deadline(artifact), None);
+    }
+
+    #[test]
+    fn offer_scheduler_rate_limits_definite_lease_miss_warnings() {
+        let now = crate::clock::mono_now();
+        let artifact = [4; 32];
+        let mut scheduler = ArtifactOfferScheduler::new();
+        scheduler.observe_active(BTreeSet::from([artifact]), now);
+        assert_eq!(scheduler.pop_due(now), Some(artifact));
+        scheduler.complete(
+            ArtifactAnnouncementOutcome {
+                artifact,
+                attempted_at: now,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    ..ProviderPublication::default()
+                },
+            },
+            now,
+        );
+
+        let deadline = now + PROVIDER_LEASE_LIFETIME;
+        assert_eq!(
+            scheduler.warnable_expired_lease(deadline),
+            Some((artifact, deadline))
+        );
+        assert_eq!(scheduler.warnable_expired_lease(deadline), None);
+        assert_eq!(
+            scheduler.warnable_expired_lease(deadline + OFFER_BACKLOG_WARNING_INTERVAL),
+            Some((artifact, deadline))
+        );
     }
 
     #[test]

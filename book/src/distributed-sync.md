@@ -202,15 +202,25 @@ that intersection is published, and only under a serving direction.
 
 Newly active offers are announced immediately. The host derives a team-scoped
 provider key from `(team, c)` and stores a receiver-local soft lease for the
-authenticated caller at the `K` closest responsive nodes. Successful leases
-are renewed at half their lifetime; failed or capacity-rejected announcements
-retry with bounded exponential backoff. An ordered due-time scheduler bounds
-whole-artifact concurrency while eventually visiting every offered resident
-artifact, including sets larger than one launch batch. Restart simply
-reobserves the durable OFFER snapshot. An absent artifact, a cleared serving
-snapshot, or `ReadOnly` direction leaves the offer dormant; if residency or a
-serving view later returns, the normal snapshot update activates it. In-flight
-stale hints need no cancellation protocol because receivers expire leases.
+authenticated caller at the `K` closest responsive nodes. A node with no
+remote routing evidence treats that self lease as a sane singleton success.
+Once any configured, synchronized, or learned remote route exists, at least
+one remote directory must accept the announcement: local self-insertion alone
+does not turn an outage into an apparent replicated success. Failed or
+capacity-rejected replication retries with bounded exponential backoff.
+
+Successful leases are renewed at half their lifetime. An ordered due-time
+scheduler bounds whole-artifact concurrency while eventually visiting every
+offered resident artifact, including sets larger than one launch batch. It
+also retains each successful lease deadline and emits a rate-limited warning
+if fair backlog ever consumes the complete renewal margin; intent is never
+truncated. Restart simply reobserves the durable OFFER snapshot. An absent
+artifact, a cleared serving snapshot, or `ReadOnly` direction leaves the offer
+dormant; if residency or a serving view later returns, the normal snapshot
+update activates it. In-flight stale hints need no cancellation protocol
+because receivers expire leases. There is no imperative publication bypass,
+even in the simulator: stale-provider tests advertise truthful resident bytes
+and then exercise ordinary eviction.
 
 A reader that already knows `c` performs iterative `FIND_NODE`, asks those
 replicas for live provider hints, and fetches from the returned providers.

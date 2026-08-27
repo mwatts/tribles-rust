@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStorePut};
+use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStoreKeep, BlobStorePut};
 use triblespace_net::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
@@ -27,7 +27,7 @@ async fn settle(
 }
 
 #[test]
-fn provider_hints_bind_to_the_announcer_and_repair_after_partition() {
+fn automatic_offer_retries_remote_replication_after_partition() {
     let _guard = sim_guard();
     run_paused(0xD1AE_C701, async {
         let net = SimNet::new(0xD1AE_C701, SimConfig::default());
@@ -35,10 +35,16 @@ fn provider_hints_bind_to_the_announcer_and_repair_after_partition() {
         let key_a = key(0xA1);
         let key_b = key(0xB1);
         let team = root.verifying_key();
+        let bytes = vec![0x73; 257];
+        let mut store_a = empty_store();
+        let artifact = store_a
+            .put::<UnknownBlob, _>(Bytes::from_source(bytes.clone()))
+            .unwrap()
+            .raw;
         let mut a = bring_up_with_peers(
             &net,
             &key_a,
-            empty_store(),
+            store_a,
             team,
             team_proofs(&root, &key_a),
             vec![pk(&key_b)],
@@ -53,22 +59,23 @@ fn provider_hints_bind_to_the_announcer_and_repair_after_partition() {
         );
         settle(&mut [&mut a, &mut b]).await;
 
-        let artifact = [0x73; 32];
         net.partition(pk(&key_a), pk(&key_b));
-        assert_eq!(
-            a.announce_artifact_raw_for_test(artifact).await,
-            1,
-            "self lease survives the cut"
-        );
+        offer_resident(&mut a, artifact).await;
         assert!(
             b.find_artifact_providers(artifact).await.is_empty(),
             "a missed lease is a temporary unknown, never a fabricated answer"
         );
 
         net.heal(pk(&key_a), pk(&key_b));
-        assert_eq!(a.announce_artifact_raw_for_test(artifact).await, 2);
+        SimNet::step(&vclock(), Duration::from_secs(2)).await;
+        settle(&mut [&mut a, &mut b]).await;
+        net.partition(pk(&key_a), pk(&key_b));
         let providers = b.find_artifact_providers(artifact).await;
-        assert_eq!(providers, vec![a.id()]);
+        assert_eq!(
+            providers,
+            vec![a.id()],
+            "the retry populated B's remote directory; A is unreachable during this lookup"
+        );
         assert_ne!(providers, vec![b.id()]);
     });
 }
@@ -82,10 +89,17 @@ fn the_same_artifact_id_does_not_cross_team_authorization() {
         let root_b = key(0xE2);
         let key_a = key(0xA2);
         let key_b = key(0xB2);
+        let bytes = vec![0x74; 257];
+        let mut store_a = empty_store();
+        let artifact = store_a
+            .put::<UnknownBlob, _>(Bytes::from_source(bytes))
+            .unwrap()
+            .raw;
+        store_a.offer(ArtifactHandle::new(artifact)).unwrap();
         let mut a = bring_up_with_peers(
             &net,
             &key_a,
-            empty_store(),
+            store_a,
             root_a.verifying_key(),
             team_proofs(&root_a, &key_a),
             vec![pk(&key_b)],
@@ -99,9 +113,6 @@ fn the_same_artifact_id_does_not_cross_team_authorization() {
             vec![pk(&key_a)],
         );
         settle(&mut [&mut a, &mut b]).await;
-
-        let artifact = [0x74; 32];
-        assert_eq!(a.announce_artifact_raw_for_test(artifact).await, 1);
         assert!(b.find_artifact_providers(artifact).await.is_empty());
     });
 }
@@ -420,10 +431,16 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
             team_proofs(&root, &healthy_key),
             vec![pk(&referred_key)],
         );
+        let bytes = vec![0x85; 257];
+        let mut source_store = empty_store();
+        let artifact = source_store
+            .put::<UnknownBlob, _>(Bytes::from_source(bytes))
+            .unwrap()
+            .raw;
         let mut source = bring_up_with_qos(
             &net,
             &source_key,
-            empty_store(),
+            source_store,
             team,
             team_proofs(&root, &source_key),
             vec![pk(&stalled_key), pk(&healthy_key)],
@@ -435,20 +452,17 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
         settle(&mut [&mut stalled, &mut healthy, &mut referred, &mut source]).await;
         net.stall_dials(pk(&stalled_key));
 
-        let artifact = [0x85; 32];
-        let mut announcement = Box::pin(source.announce_artifact_raw_for_test(artifact));
-        let stored = loop {
-            if let std::task::Poll::Ready(stored) = futures::poll!(announcement.as_mut()) {
-                break stored;
-            }
-            SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            stalled.refresh();
-            healthy.refresh();
-            referred.refresh();
-        };
-        assert!(
-            stored >= 3,
-            "healthy seed must reveal and query its closer referral before the global deadline"
+        offer_resident(&mut source, artifact).await;
+        SimNet::step(&vclock(), Duration::from_secs(4)).await;
+        settle(&mut [&mut stalled, &mut healthy, &mut referred, &mut source]).await;
+
+        net.partition(pk(&referred_key), pk(&source_key));
+        net.partition(pk(&referred_key), pk(&healthy_key));
+        net.partition(pk(&referred_key), pk(&stalled_key));
+        assert_eq!(
+            referred.find_artifact_providers(artifact).await,
+            vec![source.id()],
+            "the healthy seed revealed a closer remote directory despite the stalled seed"
         );
     });
 }
@@ -467,27 +481,28 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
         let requester_key = key(0xB6);
         let team = root.verifying_key();
         let bytes = vec![0x86; 257];
-        let mut bad_store = empty_store();
-        let artifact = bad_store
-            .put::<UnknownBlob, _>(Bytes::from_source(bytes.clone()))
-            .unwrap()
-            .raw;
-        let mut good_store = empty_store();
-        good_store
-            .put::<UnknownBlob, _>(Bytes::from_source(bytes.clone()))
-            .unwrap();
+        let make_offered_store = || {
+            let mut store = empty_store();
+            let artifact = store
+                .put::<UnknownBlob, _>(Bytes::from_source(bytes.clone()))
+                .unwrap()
+                .raw;
+            store.offer(ArtifactHandle::new(artifact)).unwrap();
+            (store, artifact)
+        };
+        let (bad_store, artifact) = make_offered_store();
+        let (bad_store_2, artifact_2) = make_offered_store();
+        let (bad_store_3, artifact_3) = make_offered_store();
+        let (good_store, good_artifact) = make_offered_store();
+        assert_eq!([artifact_2, artifact_3, good_artifact], [artifact; 3]);
 
-        let mut directory = bring_up_with_qos(
+        let mut directory = bring_up_with_peers(
             &net,
             &directory_key,
             empty_store(),
             team,
             team_proofs(&root, &directory_key),
             vec![pk(&bad_key), pk(&bad_key_2), pk(&bad_key_3), pk(&good_key)],
-            ReconcileQos {
-                direction: ReconcileDirection::WriteOnly,
-                blobs: BlobReconcileMode::Demand,
-            },
         );
         let mut bad = bring_up_with_peers(
             &net,
@@ -508,7 +523,7 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
         let mut bad_2 = bring_up_with_peers(
             &net,
             &bad_key_2,
-            empty_store(),
+            bad_store_2,
             team,
             team_proofs(&root, &bad_key_2),
             vec![pk(&directory_key)],
@@ -516,16 +531,30 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
         let mut bad_3 = bring_up_with_peers(
             &net,
             &bad_key_3,
-            empty_store(),
+            bad_store_3,
             team,
             team_proofs(&root, &bad_key_3),
             vec![pk(&directory_key)],
         );
         settle(&mut [&mut directory, &mut bad, &mut bad_2, &mut bad_3, &mut good]).await;
-        assert!(bad.announce_artifact_raw_for_test(artifact).await >= 2);
-        assert!(bad_2.announce_artifact_raw_for_test(artifact).await >= 2);
-        assert!(bad_3.announce_artifact_raw_for_test(artifact).await >= 2);
-        assert!(good.announce_artifact_raw_for_test(artifact).await >= 2);
+        SimNet::step(&vclock(), Duration::from_secs(4)).await;
+        settle(&mut [&mut directory, &mut bad, &mut bad_2, &mut bad_3, &mut good]).await;
+        let published = directory.find_artifact_providers(artifact).await;
+        for provider in [bad.id(), bad_2.id(), bad_3.id(), good.id()] {
+            assert!(
+                published.contains(&provider),
+                "all truthful offers must reach the shared directory before eviction; missing {provider} from {published:?}"
+            );
+        }
+
+        // A stale lease is production-realistic: each bad provider really
+        // offered resident bytes, then evicted them without a non-monotone
+        // unpublish operation. The directory hint remains soft until expiry.
+        for peer in [&mut bad, &mut bad_2, &mut bad_3] {
+            peer.store().keep(Vec::<ArtifactHandle>::new());
+            peer.refresh();
+            assert!(peer.try_local(artifact).is_none());
+        }
 
         net.stall_dials(pk(&bad_key));
         net.stall_dials(pk(&bad_key_2));

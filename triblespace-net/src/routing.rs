@@ -169,6 +169,17 @@ impl RoutingTable {
         peers.into_iter().collect()
     }
 
+    /// Whether this node has any durable seed, synchronized peer evidence, or
+    /// learned DHT route from which remote replication can reasonably be
+    /// expected. Failed learned routes may leave their synchronized
+    /// provenance behind, so an outage cannot silently turn a replicated
+    /// publication into a singleton publication on its next retry.
+    pub(crate) fn expects_remote(&self) -> bool {
+        !self.configured.is_empty()
+            || !self.sync.is_empty()
+            || self.buckets.iter().any(|bucket| !bucket.entries.is_empty())
+    }
+
     fn all(&self) -> Vec<PeerId> {
         let mut peers = self.configured.clone();
         for peer in self
@@ -497,6 +508,21 @@ mod tests {
         assert_eq!(table.state(id(2)), Some(RouteState::Candidate));
         assert!(table.closest_verified(id(2), K).is_empty());
         assert_eq!(table.closest(id(2), K), vec![id(2)]);
+    }
+
+    #[test]
+    fn durable_peer_provenance_keeps_remote_replication_expected_during_outage() {
+        let local = id(1);
+        let remote = id(2);
+        let mut table = RoutingTable::new(local, []);
+        assert!(!table.expects_remote());
+        assert!(table.note_sync_candidate(remote));
+        assert!(table.expects_remote());
+        assert!(table.remove(remote));
+        assert!(
+            table.expects_remote(),
+            "a failed route must not silently turn a replicated publication into a singleton"
+        );
     }
 
     #[test]

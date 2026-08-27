@@ -240,20 +240,6 @@ where
         self.sender.fetch_blob(hash, budget).await
     }
 
-    /// Publish an arbitrary provider hint for adversarial simulation tests.
-    ///
-    /// Production publication has exactly one path: durable
-    /// [`ArtifactOfferStore`] intent intersected with the current resident
-    /// Blob snapshot. This bypass exists only for tests that deliberately need
-    /// a lying or stale provider.
-    #[cfg(feature = "sim")]
-    #[doc(hidden)]
-    pub async fn announce_artifact_raw_for_test(&self, artifact: ArtifactId) -> usize {
-        self.sender
-            .announce_artifact_raw_for_test(artifact, host::INTERACTIVE_FETCH_DEADLINE)
-            .await
-    }
-
     /// Look up soft provider hints for an already-known physical artifact.
     pub async fn find_artifact_providers(&self, artifact: ArtifactId) -> Vec<EndpointId> {
         self.sender
