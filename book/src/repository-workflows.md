@@ -267,6 +267,29 @@ nothing about authority, reach, current residency, retention, or demand. A
 conservative rewrite carries the marker forward but may collect the artifact,
 leaving dormant intent that becomes effective if identical content returns.
 
+Piles populated before OFFER was part of normal publication can recover this
+local intent explicitly:
+
+```text
+trible pile migrate data.pile seed-artifact-offers --dry-run
+trible pile migrate data.pile seed-artifact-offers
+```
+
+The command freezes native collection records, then observes one resident-blob
+and one existing-OFFER snapshot. A strictly signed COMMIT contributes the
+resident conservative closure of its collection descriptor, data, and
+metadata, including resident attachments. MERGE contributes only its resident
+descriptor and result; DERIVE contributes only its resident target descriptor
+and output. Inputs are reproducible provenance rather than serving intent.
+Invalid commits are inert, missing references are counted without creating
+WANTs, corrupt selected content fails the run before any new OFFER is written,
+and unrelated resident blobs are never scanned. Re-running is idempotent.
+
+This is intentionally a dedicated operator action rather than part of generic
+schema migration: it states willingness to serve historical artifacts. It does
+not add collection evidence, bind a team, require a ticket, or turn OFFER into
+a garbage-collection root.
+
 ## Migrate a legacy branch explicitly
 
 Old piles may contain signed commit DAGs and mutable pin records. Current

@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the capturing facade, so intervening artifact writes cannot silently bypass
   advertisement.
 
+- Add `trible pile migrate <PILE> seed-artifact-offers [--dry-run]` as an
+  explicit bridge for resident collection artifacts published before OFFER
+  became part of the normal publication boundary. It freezes native records,
+  validates every selected resident artifact before appending, recursively
+  follows only strictly signed COMMIT ownership, and treats MERGE results and
+  DERIVE outputs as direct cache artifacts without pulling their inputs into
+  policy. Missing references are counted without becoming WANTs; invalid
+  commits are inert; unrelated blobs are never scanned. Re-running is
+  idempotent, and seeded OFFERs remain service intent rather than GC roots.
+
 - Add `ArtifactOfferStore`, a bulk-first grow-only local willingness-to-serve
   set with cheap deterministic snapshots. `MemoryRepo`, `Pile`, `Yard`, and
   `HybridStore` implement the primitive; Pile persists each novel offer as one

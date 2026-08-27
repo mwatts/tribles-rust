@@ -66,6 +66,9 @@ Run `trible <COMMAND>` to invoke a subcommand.
 - `pile diagnose locate-hash <PILE> <HANDLE>` — scan raw pile bytes and report where a handle appears (blob header vs payload references).
 - `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
 - `pile migrate <PILE> run [MIGRATION]` — run migrations (all by default). Pass `--dry-run` to preview changes.
+- `pile migrate <PILE> seed-artifact-offers [--dry-run]` — explicitly recover
+  durable local serving intent for resident artifacts named by native
+  collection records written before OFFER publication was automatic.
 
 Legacy piles can be migrated directly into native collections:
 
@@ -86,6 +89,17 @@ target before target bytes are staged. The proof may be omitted only when the
 signing key is the authority root, in which case the command mints, stores, and
 prints the exact root proof. The current CLI does not create, advance, merge,
 or delete branches.
+
+`seed-artifact-offers` is deliberately outside the schema-migration `run`
+sequence. It is an operator policy choice, not a format repair: strictly
+signed COMMITs contribute the resident recursive closure of their descriptor,
+data, and metadata; MERGE contributes only its resident descriptor and result,
+while DERIVE contributes only its resident target descriptor and output.
+Missing references are counted without creating WANTs, invalid commits
+contribute nothing, and unrelated resident blobs are not scanned. The command
+validates its complete frozen candidate set before appending in bounded
+batches. Re-running is idempotent, and OFFER remains neither authority nor a
+garbage-collection root.
 
 #### Blobs
 

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Add `pile migrate <PILE> seed-artifact-offers [--dry-run]`, an explicit,
+  idempotent migration which recovers local OFFER intent from one frozen native
+  collection-record and blob observation. It follows resident recursive
+  closure only for strictly signed COMMIT dependencies, offers only direct
+  MERGE descriptor/result and DERIVE target/output artifacts, skips and counts
+  missing references without WANTs, and fails before writing on corrupt
+  candidates.
+
 ### Changed
 
 - Keep team bootstrap one-step while separating transport from synchronization
