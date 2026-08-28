@@ -731,10 +731,10 @@ mod tests {
         let mut repo = MemoryRepo::default();
         let child = repo.put::<UTF8String, _>("owned child".to_owned()).unwrap();
         let fragment = entity! { crate::metadata::name: child };
-        let name = crate::collection::records::CollectionName::new("owned").unwrap();
+        let name = "owned";
         let key = SigningKey::from_bytes(&[23; 32]);
         let team = key.verifying_key();
-        let descriptor = simplearchive_union::descriptor(&name, team, None, reach::private());
+        let descriptor = simplearchive_union::descriptor(name, team, reach::private());
         let collection = identity_for_tests(&descriptor);
         let commit = Collection::new(
             &mut repo,

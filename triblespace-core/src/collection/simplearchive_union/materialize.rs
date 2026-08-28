@@ -191,7 +191,6 @@ mod tests {
     use crate::blob::encodings::UnknownBlob;
     use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
-    use crate::collection::records::CollectionName;
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
         CollectionCommit, CollectionMerge, CollectionRecord, CollectionStore,
@@ -332,9 +331,8 @@ mod tests {
 
     fn root(name: &str) -> Fragment {
         super::super::descriptor(
-            &CollectionName::new(name).unwrap(),
+            name,
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         )
     }

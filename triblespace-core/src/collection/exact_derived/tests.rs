@@ -13,7 +13,6 @@ use crate::collection::descriptor::{self, identity_for_tests};
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
-use crate::collection::records::CollectionName;
 use crate::collection::simplearchive_union;
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
@@ -60,26 +59,16 @@ fn test_team() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[1; 32]).verifying_key()
 }
 
-fn test_name(name: &str) -> CollectionName {
-    CollectionName::new(name).unwrap()
-}
-
 fn source_root() -> Fragment {
-    simplearchive_union::descriptor(
-        &test_name("source"),
-        test_team(),
-        Some(test_team()),
-        reach::private(),
-    )
+    simplearchive_union::descriptor("source", test_team(), reach::private())
 }
 
 fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
     ExactDerivedCollection::new(
         source_root(),
         descriptor::naming(
-            &test_name("target"),
+            "target",
             test_team(),
-            Some(test_team()),
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
@@ -1776,9 +1765,8 @@ fn ungrounded_source_superset_cannot_escape_the_ticket() {
 fn algebra_rejects_a_lying_source_descriptor() {
     let source = archive([(1, 3)]);
     let lying_source = descriptor::naming(
-        &test_name("source"),
+        "source",
         test_team(),
-        Some(test_team()),
         <UnknownBlob as MetaDescribe>::id(),
         id(99),
         reach::private(),

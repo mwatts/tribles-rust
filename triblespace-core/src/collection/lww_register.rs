@@ -60,7 +60,6 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, BlobEncoding};
-use crate::collection::records::CollectionName;
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
 use crate::macros::entity;
@@ -497,13 +496,12 @@ impl RegisterOrder for LwwIndex {
 /// Exact maintained LWW projection of one named root collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LwwRegisterCollection {
-    name: CollectionName,
-    namespace: VerifyingKey,
-    source_authority: Option<VerifyingKey>,
+    name: String,
+    source_authority: VerifyingKey,
     identity: Id,
     orders: Id,
     source_reach: Fragment,
-    authority: Option<VerifyingKey>,
+    authority: VerifyingKey,
     reach: Fragment,
 }
 
@@ -511,21 +509,18 @@ impl LwwRegisterCollection {
     /// Construct a maintained LWW register over one named root collection.
     ///
     /// `source_authority` must match the root descriptor exactly, while
-    /// `authority` independently controls this derived collection. Either may
-    /// be open (`None`) regardless of the other.
+    /// `authority` independently controls this derived collection.
     pub fn new(
-        name: CollectionName,
-        namespace: VerifyingKey,
-        source_authority: Option<VerifyingKey>,
+        name: String,
+        source_authority: VerifyingKey,
         identity: Id,
         orders: Id,
         source_reach: Fragment,
-        authority: Option<VerifyingKey>,
+        authority: VerifyingKey,
         reach: Fragment,
     ) -> Self {
         Self {
             name,
-            namespace,
             source_authority,
             identity,
             orders,
@@ -536,22 +531,17 @@ impl LwwRegisterCollection {
     }
 
     /// Name of the source root collection.
-    pub fn name(&self) -> &CollectionName {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Public-key namespace which scopes the source root's name.
-    pub fn namespace(&self) -> VerifyingKey {
-        self.namespace
-    }
-
-    /// Optional capability trust root declared by the source descriptor.
-    pub fn source_authority(&self) -> Option<VerifyingKey> {
+    /// Mandatory capability trust root declared by the source descriptor.
+    pub fn source_authority(&self) -> VerifyingKey {
         self.source_authority
     }
 
-    /// Optional capability trust root declared by this derived collection.
-    pub fn authority(&self) -> Option<VerifyingKey> {
+    /// Mandatory capability trust root declared by this derived collection.
+    pub fn authority(&self) -> VerifyingKey {
         self.authority
     }
 
@@ -579,7 +569,6 @@ impl LwwRegisterCollection {
     pub fn source_descriptor(&self) -> Fragment {
         simplearchive_union::descriptor(
             &self.name,
-            self.namespace,
             self.source_authority,
             self.source_reach.clone(),
         )
@@ -1037,64 +1026,34 @@ mod tests {
     }
 
     #[test]
-    fn open_source_and_derived_descriptors_omit_authority_exactly() {
+    fn source_and_derived_descriptors_carry_independent_mandatory_authorities() {
         use crate::collection::descriptor as descriptor_facts;
 
-        let namespace = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key();
-        let name = CollectionName::new("open-lww-source").unwrap();
+        let source_authority = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key();
+        let target_authority = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let name = "lww-source".to_owned();
         let collection = LwwRegisterCollection::new(
             name.clone(),
-            namespace,
-            None,
+            source_authority,
             state_of.id(),
             written_at.id(),
             reach::private(),
-            None,
+            target_authority,
             reach::private(),
         );
 
         assert_eq!(
             collection.source_descriptor(),
-            simplearchive_union::descriptor(&name, namespace, None, reach::private())
-        );
-        assert!(descriptor_facts::authority(collection.source_descriptor().facts()).is_none());
-        assert!(descriptor_facts::authority(collection.descriptor().facts()).is_none());
-
-        let gated_target = LwwRegisterCollection::new(
-            name.clone(),
-            namespace,
-            None,
-            state_of.id(),
-            written_at.id(),
-            reach::private(),
-            Some(namespace),
-            reach::private(),
-        );
-        assert!(descriptor_facts::authority(gated_target.source_descriptor().facts()).is_none());
-        assert_eq!(
-            descriptor_facts::authority(gated_target.descriptor().facts())
-                .transpose()
-                .unwrap(),
-            Some(namespace)
-        );
-
-        let gated_source = LwwRegisterCollection::new(
-            name,
-            namespace,
-            Some(namespace),
-            state_of.id(),
-            written_at.id(),
-            reach::private(),
-            None,
-            reach::private(),
+            simplearchive_union::descriptor(&name, source_authority, reach::private())
         );
         assert_eq!(
-            descriptor_facts::authority(gated_source.source_descriptor().facts())
-                .transpose()
-                .unwrap(),
-            Some(namespace)
+            descriptor_facts::authority(collection.source_descriptor().facts()),
+            Ok(source_authority)
         );
-        assert!(descriptor_facts::authority(gated_source.descriptor().facts()).is_none());
+        assert_eq!(
+            descriptor_facts::authority(collection.descriptor().facts()),
+            Ok(target_authority)
+        );
     }
 
     #[test]
@@ -1102,13 +1061,12 @@ mod tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         let team = signing_key.verifying_key();
         let collection = LwwRegisterCollection::new(
-            CollectionName::new("maintained-lww").unwrap(),
+            "maintained-lww".to_owned(),
             team,
-            Some(team),
             state_of.id(),
             written_at.id(),
             reach::private(),
-            Some(team),
+            team,
             reach::private(),
         );
         let register = ufoid();

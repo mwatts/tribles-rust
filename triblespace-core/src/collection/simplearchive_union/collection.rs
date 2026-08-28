@@ -13,7 +13,6 @@ use ed25519_dalek::VerifyingKey;
 // particular one.
 #[cfg(test)]
 use crate::collection::reach;
-use crate::collection::records::CollectionName;
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -37,9 +36,8 @@ use crate::trible::{Fragment, TribleSet};
 /// read and has no API capable of inserting blobs or collection records.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleArchiveCollection {
-    name: CollectionName,
-    namespace: VerifyingKey,
-    authority: Option<VerifyingKey>,
+    name: String,
+    authority: VerifyingKey,
     reach: Fragment,
 }
 
@@ -49,15 +47,9 @@ impl SimpleArchiveCollection {
     /// `reach` is not decoration on a read facade: it is part of the
     /// descriptor this facade hashes, so a facade that names the wrong reach
     /// names a different collection and matches no ticket.
-    pub fn new(
-        name: CollectionName,
-        namespace: VerifyingKey,
-        authority: Option<VerifyingKey>,
-        reach: Fragment,
-    ) -> Self {
+    pub fn new(name: String, authority: VerifyingKey, reach: Fragment) -> Self {
         Self {
             name,
-            namespace,
             authority,
             reach,
         }
@@ -68,29 +60,19 @@ impl SimpleArchiveCollection {
         &self.reach
     }
 
-    /// Name this collection is known by within its namespace.
-    pub fn name(&self) -> &CollectionName {
+    /// Human-readable name of this root collection.
+    pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Public-key namespace which scopes this root's name.
-    pub fn namespace(&self) -> VerifyingKey {
-        self.namespace
-    }
-
-    /// Optional external capability trust root in this descriptor.
-    pub fn authority(&self) -> Option<VerifyingKey> {
+    /// Mandatory external capability trust root in this descriptor.
+    pub fn authority(&self) -> VerifyingKey {
         self.authority
     }
 
     /// Canonical `SimpleArchive` set-union descriptor facts.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(
-            &self.name,
-            self.namespace,
-            self.authority,
-            self.reach.clone(),
-        )
+        super::descriptor(&self.name, self.authority, self.reach.clone())
     }
 
     /// Content identity of this collection's descriptor.
@@ -220,7 +202,6 @@ mod tests {
     use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
     use crate::blob::{Blob, BlobEncoding, Bytes, IntoBlob};
     use crate::collection::descriptor::identity_for_tests;
-    use crate::collection::records::CollectionName;
     use crate::collection::{CollectionRecord, CollectionRecordSelector, ExactTicketError};
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
@@ -230,9 +211,8 @@ mod tests {
 
     fn test_facade(name: &str) -> SimpleArchiveCollection {
         SimpleArchiveCollection::new(
-            CollectionName::new(name).unwrap(),
+            name.to_owned(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         )
     }

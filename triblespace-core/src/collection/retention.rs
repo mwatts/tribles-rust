@@ -219,9 +219,8 @@ mod tests {
     /// One named root under a fixed team of one.
     fn test_root(name: &str) -> Fragment {
         simplearchive_union::descriptor(
-            &crate::collection::records::CollectionName::new(name).unwrap(),
+            name,
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         )
     }

@@ -2255,9 +2255,8 @@ mod tests {
     #[test]
     fn simplearchive_union_validation_integrates_with_discovery_and_resolution() {
         let definition = simplearchive_union::descriptor(
-            &crate::collection::records::CollectionName::new("resolved").unwrap(),
+            "resolved",
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
             reach::private(),
         );
         let left = archive([row(1, 1, 1)]);

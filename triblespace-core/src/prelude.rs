@@ -39,7 +39,6 @@ pub use crate::blob::BlobEncoding;
 pub use crate::blob::IntoBlob;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
-pub use crate::collection::records::CollectionName;
 pub use crate::collection::{
     CapabilityPresentation, Collection, CollectionAdmission, CollectionSnapshot, CollectionStore,
     SimpleArchiveCollection, VerifyingKey,

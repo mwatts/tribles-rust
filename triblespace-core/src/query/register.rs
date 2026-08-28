@@ -998,8 +998,8 @@ mod tests {
     fn registers_share_a_law_and_differ_by_their_parameters() {
         use crate::collection::descriptor;
         use crate::collection::records::{
-            collection_name, collection_namespace, collection_recipe, collection_representation,
-            CollectionName, KIND_COLLECTION_DESCRIPTOR,
+            collection_authority, collection_name, collection_recipe, collection_representation,
+            KIND_COLLECTION_DESCRIPTOR,
         };
         // The law is one minted name, identical for every stated-order register.
         assert_eq!(
@@ -1015,14 +1015,13 @@ mod tests {
             identity: Id,
             order: Id,
         ) -> Fragment {
-            let name = CollectionName::new("register").unwrap();
             let representation: Inline<GenId> = representation.to_inline();
             let identity: Inline<GenId> = identity.to_inline();
             let order: Inline<GenId> = order.to_inline();
             crate::macros::entity! { _ @
                 crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-                collection_name: name.as_str(),
-                collection_namespace: team,
+                collection_name: "register".to_owned(),
+                collection_authority: team,
                 collection_representation: representation,
                 collection_recipe*: <StatedOrderV1 as crate::metadata::MetaDescribe>::describe(),
                 register_identity: identity,
@@ -1069,11 +1068,15 @@ mod tests {
         // register is over.
         assert_eq!(
             descriptor::argument(notes.facts(), register_identity.id()),
-            Some(<Id as crate::inline::IntoInline<GenId>>::to_inline(note_of.id()).raw),
+            Ok(Some(
+                <Id as crate::inline::IntoInline<GenId>>::to_inline(note_of.id()).raw
+            )),
         );
         assert_eq!(
             descriptor::argument(notes.facts(), register_orders.id()),
-            Some(<Id as crate::inline::IntoInline<GenId>>::to_inline(note_at.id()).raw),
+            Ok(Some(
+                <Id as crate::inline::IntoInline<GenId>>::to_inline(note_at.id()).raw
+            )),
         );
     }
 

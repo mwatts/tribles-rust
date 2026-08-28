@@ -195,7 +195,6 @@ mod tests {
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
-    use crate::collection::records::CollectionName;
     use crate::collection::{Collection, CollectionAdmission, CollectionHandle, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::trible::Fragment;
@@ -208,15 +207,7 @@ mod tests {
     #[test]
     fn collection_records_delegate_only_to_the_record_side() {
         let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let facts = descriptor::naming(
-            &CollectionName::new("hybrid").unwrap(),
-            team,
-            Some(team),
-            id(2),
-            id(3),
-            reach::private(),
-        )
-        .into_facts();
+        let facts = descriptor::naming("hybrid", team, id(2), id(3), reach::private()).into_facts();
         // Only the identity matters here; nothing resolves this descriptor.
         let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();
         let record = CollectionRecord::Merge(CollectionMerge::new(
@@ -269,7 +260,7 @@ mod tests {
     fn collection_publication_and_read_work_across_both_sides() {
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
         let signing_key = SigningKey::from_bytes(&[8; 32]);
-        let name = CollectionName::new("hybrid").unwrap();
+        let name = "hybrid";
         let team = signing_key.verifying_key();
         let target = Collection::new(
             &mut hybrid,
