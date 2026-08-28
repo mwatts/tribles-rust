@@ -212,6 +212,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the stateful `Collection<S>`/`CollectionAdmission` facade with
+  store-centric collection operations. `store.collection(fragment)` validates,
+  stores, and durably offers a descriptor's complete attachment closure;
+  `store.commit(handle, key, fragment)` publishes locally without conflating
+  storage with authorization; and `ticket`/`snapshot` admit the descriptor
+  authority plus explicitly presented delegated writers. `CollectionTicket`
+  now carries one canonical exact commit set for replay through
+  `store.materialize(&ticket)`. Descriptor handles are the collection values,
+  publication never flushes implicitly, and repeated commits remain
+  idempotent native records.
+
 - Advance collection descriptors to one authority-scoped epoch. Root and
   derived descriptors now carry exactly one local `collection_authority`;
   roots no longer carry a redundant namespace, and names use attached
@@ -221,9 +232,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reject absent, repeated, malformed, or off-entity authority rows.
 
 - Let maintained observed-set and LWW collection facades state source and
-  derived authority independently from their shared namespace. Open roots can
-  now use the same exact-ticket lifecycle as capability-gated roots without
-  hashing a nonexistent authority into the source descriptor.
+  derived authority independently. Every descriptor carries its authority
+  locally, so derived collection identity never depends on walking its source
+  or on ambient admission policy.
 
 - Bound the unified inventory/DHT outbound pool to 64 fully reciprocal
   CONNECT+SYNC_TEAM-authorized sessions with deterministic LRU residency.
