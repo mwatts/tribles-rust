@@ -1090,10 +1090,16 @@ mod tests {
 
     #[test]
     fn transcript_and_record_roots_are_golden() {
+        let collection_name_anchor = id_hex!("A2EEF06D4E1AA4B17B745AA2E8C37867");
         assert_eq!(
+            collection_name.raw(),
+            Attribute::<Handle<UTF8String>>::anchored(collection_name_anchor).raw(),
+            "the UTF-8 name attribute is derived from the minted anchor and encoding"
+        );
+        assert_ne!(
             collection_name.id(),
-            id_hex!("A2EEF06D4E1AA4B17B745AA2E8C37867"),
-            "the UTF-8 name attribute anchor is a minted wire identity"
+            collection_name_anchor,
+            "the anchored form must not pin the anchor as the attribute id"
         );
         let descriptor = crate::collection::descriptor::naming(
             "first",

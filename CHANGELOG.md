@@ -215,7 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Advance collection descriptors to one authority-scoped epoch. Root and
   derived descriptors now carry exactly one local `collection_authority`;
   roots no longer carry a redundant namespace, and names use attached
-  unbounded `UTF8String` blobs under the `trible genid`-minted attribute
+  unbounded `UTF8String` blobs under the `trible genid`-minted anchor
   `A2EEF06D4E1AA4B17B745AA2E8C37867`. Descriptor readers bind every known
   field to the tagged descriptor entity, reject ambiguous optional fields,
   and reject absent, repeated, malformed, or off-entity authority rows.
