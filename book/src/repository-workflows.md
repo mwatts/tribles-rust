@@ -23,13 +23,13 @@ merge or derivation equations provide reusable physical work.
   residency, demand, synchronized inventory, retention, nor authority.
 
 `MemoryRepo`, `Pile`, and the storage composition wrappers implement both the
-blob and native collection surfaces. `ObjectStoreRemote` exposes the equivalent
-asynchronous primitives and can be adapted to the synchronous collection facade
-through `Blocking`.
+blob and native collection surfaces. A collection is its descriptor handle;
+the store remains the sole owner of I/O, durability, and lifetime.
 
 ## Publish a root collection
 
-`Collection<S>` owns one backend, canonical descriptor, and signing identity:
+Register the descriptor once, then pass its returned handle to store
+operations:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
@@ -45,48 +45,40 @@ let team_key = SigningKey::generate(&mut OsRng);
 let writer = SigningKey::generate(&mut OsRng);
 let team = team_key.verifying_key();
 let writer_subject = writer.verifying_key();
-let name = CollectionName::new("models")?;
 let mut storage = MemoryRepo::default();
-let descriptor =
-    simplearchive_union::descriptor(&name, team, Some(team), reach::private());
-let target = descriptor.facts().clone().to_blob().get_handle();
+let models = storage.collection(simplearchive_union::descriptor(
+    "models",
+    team,
+    reach::private(),
+))?;
 let atom = CapabilityAtom::new(
     CapabilityAction::new(ACTION_WRITE),
-    CapabilityResource::from(target),
+    CapabilityResource::from(models),
 );
 let proof = CapabilityProofBundle::issue_root(
     &team_key,
     CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
     writer_subject,
 )?;
-let mut models = Collection::new(
-    storage,
-    &name,
-    team,
-    writer,
-    reach::private(),
-    CollectionAdmission::capability(
-        team,
-        vec![CapabilityPresentation::new(writer_subject, proof)],
-    ),
-);
+let presentation = CapabilityPresentation::new(writer_subject, proof);
 
-let commit = models.commit(entity! { metadata::name: "first-model" })?;
-let snapshot = models.snapshot()?;
+let commit = storage.commit(
+    models,
+    &writer,
+    entity! { metadata::name: "first-model" },
+)?;
+let snapshot = storage.snapshot(models, &[presentation.clone()])?;
 assert_eq!(snapshot.commits(), &[commit]);
-models.flush()?;
-let storage = models.into_storage();
+storage.flush()?;
 ```
 
-Capability admission stores the trust root in the descriptor and retains each
-expected leaf plus complete proof bundle in the facade. Each operation observes
-the clock once and verifies the bundle against that root, leaf, and exact
-`ACTION_WRITE` request for this descriptor before touching storage. Ordinary
-reads admit every explicitly presented leaf, so a foreign author remains
-visible when its proof is supplied. Invalid explicit evidence fails loud; an
-empty presentation set is a valid policy that admits nobody.
-`CollectionAdmission::Open` is the deliberate alternative which admits every
-strictly verified signer.
+Local publication deliberately performs no authorization check: the local
+store is a grow-only claim ledger, not an access-control boundary. Observation
+loads the mandatory authority from the descriptor. Commits self-signed by that
+authority are admitted directly; every delegated author needs an explicitly
+supplied proof for exact `ACTION_WRITE` on this descriptor. Each operation
+observes the clock once and verifies every presentation. Invalid explicit
+evidence fails loud rather than silently narrowing the result.
 
 The reach argument is explicit because it participates in collection identity.
 `reach::private()` declares no permissionless relay; `reach::public()` states
@@ -98,15 +90,14 @@ descriptors.
 
 ### What publication writes
 
-One `Collection::commit(fragment)` performs these semantic steps:
+One `store.commit(collection, signer, fragment)` performs these semantic steps:
 
-1. verify the facade's explicit admission evidence at one clock instant and
-   require the local signer to be admitted for exact `WRITE`;
-2. canonicalize and store the collection descriptor;
-3. store the fragment's attachments;
-4. encode facts as the canonical data `SimpleArchive`;
-5. encode metafacts as the mandatory canonical metadata `SimpleArchive`; and
-6. insert a signed `COMMIT` naming those exact three handles.
+1. fetch and exact-validate the already registered descriptor;
+2. store the fragment's attachments;
+3. encode facts as the canonical data `SimpleArchive`;
+4. encode metafacts as the mandatory canonical metadata `SimpleArchive`;
+5. durably offer those dependencies; and
+6. insert a signed `COMMIT` naming the descriptor, data, and metadata handles.
 
 Dependencies precede the record which gives them authority. Publication does
 not flush implicitly. Call `flush()` at the application's chosen durability
@@ -141,40 +132,34 @@ leaf.
 
 ## Known-prefix snapshots and exact tickets
 
-`Collection::snapshot()` observes one clock instant, verifies every explicit
-capability presentation, then discovers the exact strictly verified commits by
-the resulting subjects. Open admission accepts every strict signer instead. It
-opens one target reader and materializes only that admitted set. It returns
-facts, commits, and reader together so downstream code cannot accidentally pair
-one logical frontier with a different physical view.
+`store.snapshot(collection, presentations)` observes one clock instant,
+verifies every explicit capability presentation against the descriptor's
+authority, then discovers the exact strictly verified commits by the resulting
+subjects. It opens one target reader and materializes only that admitted set.
+It returns facts, a typed `CollectionTicket`, and reader together so downstream
+code cannot accidentally pair one logical frontier with a different physical
+view.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear on this call or a later
 call. Every selected commit is nevertheless present and valid in the returned
 snapshot, or the call fails instead of returning a partial set.
 
-`ticket()` performs the same admission check and target-record discovery, but
+`store.ticket(collection, presentations)` performs the same admission check and target-record discovery, but
 does not fetch or materialize the target collection's data and metadata blobs.
 Freeze a ticket when another component will select or build a representation:
 
 ```rust,ignore
-let ticket = models.ticket()?;
-
-let source = SimpleArchiveCollection::new(
-    name.clone(),
-    team,
-    models.admission().trust_root(),
-    reach::private(),
-);
-let snapshot = source.snapshot_exact(models.storage_mut(), &ticket)?;
+let ticket = storage.ticket(models, &[presentation])?;
+let facts = storage.materialize(&ticket)?;
 ```
 
-An exact-ticket facade does not need the publishing key. Ticket members may
-have different authors, but each must byte-match one resident strictly verified
-record for the exact descriptor. Commits in storage but absent from the ticket
-remain inert. Live membership policy is not supplied as an ambient callback:
-ordinary `ticket`, `snapshot`, and `materialize` all enforce the facade's same
-explicit admission value.
+Exact replay does not need a publishing key or re-run admission. Ticket members
+may have different authors, but each must byte-match one resident strictly
+verified record for the exact descriptor. Commits in storage but absent from
+the ticket remain inert. Call `snapshot` when admission and materialization
+should be one coherent operation; call `materialize(&ticket)` when replaying an
+already admitted exact frontier.
 
 ## Reuse merge work without changing meaning
 
@@ -213,19 +198,17 @@ The raw SuccinctArchive facade applies this model directly:
 ```rust,ignore
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 
-let trust_root = models.admission().trust_root();
 let succinct = SuccinctArchiveCollection::new(
-    name.clone(),
+    "models",
     team,
-    trust_root,
     reach::private(), // source reach, and therefore source identity
-    trust_root,
+    team,
     reach::private(), // target reach
 );
 
-let archive = succinct.ensure_exact(models.storage_mut(), &ticket)?;
-let same_archive = succinct.attach_exact(models.storage_mut(), &ticket)?;
-let compact_archive = succinct.compact_exact(models.storage_mut(), &ticket)?;
+let archive = succinct.ensure_exact(&mut storage, ticket.commits())?;
+let same_archive = succinct.attach_exact(&mut storage, ticket.commits())?;
+let compact_archive = succinct.compact_exact(&mut storage, ticket.commits())?;
 ```
 
 - `attach_exact` is read-only and requires a complete valid resident cover.

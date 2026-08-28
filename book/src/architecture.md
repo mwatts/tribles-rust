@@ -153,33 +153,33 @@ above it.
 
 ## Publishing and observing
 
-`Collection<S>` owns a storage backend, one canonical descriptor, one signing
-key, and one explicit admission policy. Open admission accepts every strictly
-verified signer and omits the descriptor's capability trust-root fact.
-Capability admission writes that exact trust root and retains owned
-`CapabilityPresentation`s in the facade. `Collection::commit(fragment)`
-observes the clock once, verifies every presentation's bundle for its expected
-leaf and exact `ACTION_WRITE` atom, and requires its signing key among those
-leaves before storing the descriptor, attachments, canonical data archive,
-canonical metadata archive, and signed native commit record. It performs no
-ambient proof lookup and does not flush implicitly; callers choose durability
-cadence with `Collection::flush` or the backend's explicit close operation.
+The collection value is its canonical descriptor handle. The descriptor
+carries one mandatory local authority, and the storage backend owns I/O and
+durability. `store.collection(descriptor_fragment)` registers and offers the
+descriptor's complete attachment closure. `store.commit(collection, signer,
+fragment)` then exact-validates that descriptor and publishes attachments,
+canonical data, canonical metadata, and the signed native record in dependency
+order. Local publication performs no authorization check and no implicit
+flush: authorization governs which resident claims another operation admits,
+not what a process may append to its own store.
 
 Reads are exact about what they observed, not magical about global time:
 
-- `ticket()` verifies explicit presentations and returns every exact verified
-  commit by the resulting subjects; this reads native records but not the
-  selected commits' data or metadata blobs;
-- `snapshot()` carries materialized facts, that exact admission-selected
-  commit set, and the target blob reader which validated them; and
-- exact-ticket facades let another consumer materialize a caller-selected
-  multi-author commit frontier without holding a publishing key.
+- `store.ticket(collection, presentations)` loads the descriptor authority,
+  admits its own strictly signed commits directly, verifies every explicit
+  delegated presentation, and returns one canonical `CollectionTicket` without
+  fetching member data;
+- `store.snapshot(collection, presentations)` performs that same admission and
+  carries materialized facts, the exact ticket, and the blob reader which
+  validated them; and
+- `store.materialize(&ticket)` exact-replays an already admitted multi-author
+  frontier without holding a publishing key or repeating capability policy.
 
 Each call observes one known prefix of an append-only store. A concurrent
 commit may appear now or on the next call, but a snapshot never
 combines facts from one admission frontier with commits from another. The
-facade's local signing key does not narrow reads: all explicitly presented
-subjects participate, or every strict signer in open mode.
+descriptor authority and every explicitly presented valid delegate participate;
+unpresented commits remain inert.
 
 ## Derived physical representations
 
