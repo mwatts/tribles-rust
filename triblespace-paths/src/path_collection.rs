@@ -14,7 +14,6 @@ use triblespace_core::collection::exact_derived::{
     ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
     ExactDerivedCollectionError,
 };
-use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     CollectionCommit, CollectionHandle, CollectionStore, VerifyingKey,
@@ -70,36 +69,36 @@ impl From<ExactDerivedCollectionError> for PathSummaryCollectionError {
 /// Canonical regular-path projection of one source `SimpleArchive` collection.
 #[derive(Clone, Debug)]
 pub struct PathSummaryCollection {
-    name: CollectionName,
-    namespace: VerifyingKey,
-    source_authority: Option<VerifyingKey>,
+    name: String,
+    source_authority: VerifyingKey,
     automaton: Automaton,
     source_reach: Fragment,
+    authority: VerifyingKey,
     reach: Fragment,
 }
 
 impl PathSummaryCollection {
     /// Construct the canonical path projection for one named root and
     /// `automaton`.
-    /// `namespace`, `source_authority`, and `source_reach` complete the root's
-    /// identity; `reach` is this projection's own. A path summary over private
+    /// `source_authority` and `source_reach` complete the root's identity;
+    /// `authority` and `reach` belong to this projection. A path summary over private
     /// material can be a perfectly reasonable thing to publish, and a private
     /// summary over published material an equally reasonable thing to keep, so
     /// neither answer is derived from the other.
     pub fn new(
-        name: CollectionName,
-        namespace: VerifyingKey,
-        source_authority: Option<VerifyingKey>,
+        name: impl Into<String>,
+        source_authority: VerifyingKey,
         automaton: Automaton,
         source_reach: Fragment,
+        authority: VerifyingKey,
         reach: Fragment,
     ) -> Self {
         Self {
-            name,
-            namespace,
+            name: name.into(),
             source_authority,
             automaton,
             source_reach,
+            authority,
             reach,
         }
     }
@@ -115,18 +114,18 @@ impl PathSummaryCollection {
     }
 
     /// Name of the root collection this projection is taken over.
-    pub fn name(&self) -> &CollectionName {
-        &self.name
+    pub fn name(&self) -> &str {
+        self.name.as_str()
     }
 
-    /// Public-key namespace naming the root collection being projected.
-    pub fn namespace(&self) -> VerifyingKey {
-        self.namespace
-    }
-
-    /// Optional capability trust root declared by the source collection.
-    pub fn source_authority(&self) -> Option<VerifyingKey> {
+    /// Mandatory capability trust root declared by the source collection.
+    pub fn source_authority(&self) -> VerifyingKey {
         self.source_authority
+    }
+
+    /// Mandatory capability trust root declared by this projection.
+    pub fn authority(&self) -> VerifyingKey {
+        self.authority
     }
 
     /// Fixed automaton whose fingerprint participates in collection identity.
@@ -138,7 +137,6 @@ impl PathSummaryCollection {
     pub fn source_descriptor(&self) -> Fragment {
         simplearchive_union::descriptor(
             &self.name,
-            self.namespace,
             self.source_authority,
             self.source_reach.clone(),
         )
@@ -154,6 +152,7 @@ impl PathSummaryCollection {
         path_summary_union::descriptor(
             self.source_collection(),
             &self.automaton,
+            self.authority,
             self.reach.clone(),
         )
     }

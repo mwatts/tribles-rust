@@ -15,11 +15,10 @@ use quote::{quote, ToTokens};
 
 use std::path::Path;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use hex::FromHex;
 
-use triblespace_core::collection::records::CollectionName;
-use triblespace_core::collection::{Collection, CollectionAdmission};
+use triblespace_core::collection::{simplearchive_union, CollectionStoreExt};
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
@@ -90,31 +89,27 @@ fn metadata_signing_key() -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&bytes))
 }
 
-fn parse_collection_name(value: &str) -> Option<CollectionName> {
-    CollectionName::new(value).ok()
-}
-
 fn publish_metadata(
     pile_path: &Path,
-    collection_name: &CollectionName,
-    collection_namespace: VerifyingKey,
+    collection_name: &str,
     signing_key: SigningKey,
     fragment: Fragment,
 ) {
-    let pile = match Pile::open(pile_path) {
+    let mut pile = match Pile::open(pile_path) {
         Ok(pile) => pile,
         Err(_) => return,
     };
-    let mut collection = Collection::new(
-        pile,
+    let descriptor = simplearchive_union::descriptor(
         collection_name,
-        collection_namespace,
-        signing_key,
+        signing_key.verifying_key(),
         reach::private(),
-        CollectionAdmission::Open,
     );
-    let _ = collection.commit(fragment);
-    let _ = collection.close();
+    let Ok(collection) = pile.collection(descriptor) else {
+        let _ = pile.close();
+        return;
+    };
+    let _ = pile.commit(collection, &signing_key, fragment);
+    let _ = pile.close();
 }
 
 struct MetadataContext {
@@ -151,19 +146,10 @@ where
         _ => return,
     };
 
-    let collection_name = match parse_collection_name(&name_value) {
-        Some(name) => name,
-        None => return,
-    };
-
     let signing_key = match metadata_signing_key() {
         Some(key) => key,
         None => return,
     };
-
-    // The instrumentation pile is written by exactly one key, which also
-    // scopes the local collection's name.
-    let collection_namespace = signing_key.verifying_key();
 
     let span = invocation_span(input);
     let mut fragment = Fragment::empty();
@@ -204,12 +190,11 @@ where
     extra(&mut context);
 
     // Build the complete self-contained fragment before opening storage. The
-    // collection facade then publishes exactly one immutable COMMIT; there is
+    // collection store then publishes exactly one immutable COMMIT; there is
     // no mutable branch head, parent selection, push, or retry protocol here.
     publish_metadata(
         Path::new(&pile_path),
-        &collection_name,
-        collection_namespace,
+        &name_value,
         signing_key,
         context.fragment,
     );

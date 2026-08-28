@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::core::collection::{reach, Collection, CollectionAdmission};
+use crate::core::collection::{reach, simplearchive_union, CollectionHandle, CollectionStoreExt};
 use crate::core::metadata;
 use crate::core::repo::pile::{Pile, ReadError};
 use crate::prelude::blobencodings::UTF8String;
@@ -164,13 +164,36 @@ struct ThreadTelemetry {
 }
 
 struct TelemetryInner {
-    collection: Mutex<Option<Collection<Pile>>>,
+    destination: Mutex<Option<TelemetryDestination>>,
     batches: ThreadLocal<Arc<Mutex<ThreadTelemetry>>>,
     registry: Mutex<Vec<Arc<Mutex<ThreadTelemetry>>>>,
     session: Id,
     base: Instant,
     flush_interval: Duration,
     shutdown: AtomicBool,
+}
+
+struct TelemetryDestination {
+    pile: Pile,
+    collection: CollectionHandle,
+    signing_key: SigningKey,
+}
+
+impl TelemetryDestination {
+    fn commit(&mut self, fragment: Fragment) -> Result<(), String> {
+        self.pile
+            .commit(self.collection, &self.signing_key, fragment)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.pile.flush().map_err(|error| format!("{error:?}"))
+    }
+
+    fn close(self) -> Result<(), String> {
+        self.pile.close().map_err(|error| format!("{error:?}"))
+    }
 }
 
 fn self_describing(mut batch: Fragment) -> Fragment {
@@ -244,13 +267,11 @@ impl TelemetryInner {
             return;
         }
 
-        let mut collection_guard = self.collection.lock().expect("telemetry collection lock");
-        if let Some(collection) = collection_guard.as_mut() {
+        let mut destination_guard = self.destination.lock().expect("telemetry destination lock");
+        if let Some(destination) = destination_guard.as_mut() {
             if let Err(e) = publish_pending(state, |batch| {
-                collection
-                    .commit(batch)
-                    .map_err(|error| format!("{error:?}"))?;
-                collection.flush().map_err(|error| format!("{error:?}"))
+                destination.commit(batch)?;
+                destination.flush()
             }) {
                 log::warn!("telemetry flush failed: {e:?}");
                 return;
@@ -555,13 +576,11 @@ impl Telemetry {
         let pile_path = PathBuf::from(pile_path);
 
         let collection_name = std::env::var(ENV_TELEMETRY_COLLECTION_NAME).ok()?;
-        let collection_name = match CollectionName::new(collection_name.trim()) {
-            Ok(name) => name,
-            Err(error) => {
-                log::warn!("TELEMETRY_COLLECTION_NAME is not a collection name: {error}");
-                return None;
-            }
-        };
+        let collection_name = collection_name.trim();
+        if collection_name.is_empty() {
+            log::warn!("TELEMETRY_COLLECTION_NAME is empty; telemetry is disabled");
+            return None;
+        }
 
         let flush_ms = std::env::var(ENV_TELEMETRY_FLUSH_MS)
             .ok()
@@ -585,19 +604,27 @@ impl Telemetry {
             return None;
         }
 
-        // The sink generates its own namespace and signing key per session.
-        // Telemetry is process-local, so its collection explicitly admits
-        // every strictly signed commit instead of publishing authority state.
+        // The sink generates its own authority and signing key per session.
+        // Its descriptor carries that authority directly.
         let signing_key = SigningKey::generate(&mut OsRng);
-        let namespace = signing_key.verifying_key();
-        let mut collection = Collection::new(
-            pile,
-            &collection_name,
-            namespace,
-            signing_key,
+        let descriptor = simplearchive_union::descriptor(
+            collection_name,
+            signing_key.verifying_key(),
             reach::private(),
-            CollectionAdmission::Open,
         );
+        let collection = match pile.collection(descriptor) {
+            Ok(collection) => collection,
+            Err(error) => {
+                log::warn!("telemetry descriptor registration failed: {error:?}");
+                let _ = pile.close();
+                return None;
+            }
+        };
+        let mut destination = TelemetryDestination {
+            pile,
+            collection,
+            signing_key,
+        };
 
         // Commit session start entity.
         let session_entity = ExclusiveId::force_ref(&session_id);
@@ -609,13 +636,13 @@ impl Telemetry {
             schema::name: session_name,
             schema::begin_ns: 0u64,
         };
-        if collection.commit(self_describing(init)).is_err() || collection.flush().is_err() {
-            let _ = collection.close();
+        if destination.commit(self_describing(init)).is_err() || destination.flush().is_err() {
+            let _ = destination.close();
             return None;
         }
 
         let inner = Arc::new(TelemetryInner {
-            collection: Mutex::new(Some(collection)),
+            destination: Mutex::new(Some(destination)),
             batches: ThreadLocal::new(),
             registry: Mutex::new(Vec::new()),
             session: session_id,
@@ -658,17 +685,15 @@ impl Drop for Telemetry {
         let registry = self.inner.registry.lock().expect("telemetry registry lock");
         for state_arc in registry.iter() {
             let mut state = state_arc.lock().expect("telemetry thread state lock");
-            let mut collection_guard = self
+            let mut destination_guard = self
                 .inner
-                .collection
+                .destination
                 .lock()
-                .expect("telemetry collection lock");
-            if let Some(collection) = collection_guard.as_mut() {
+                .expect("telemetry destination lock");
+            if let Some(destination) = destination_guard.as_mut() {
                 if let Err(e) = publish_pending(&mut state, |batch| {
-                    collection
-                        .commit(batch)
-                        .map_err(|error| format!("{error:?}"))?;
-                    collection.flush().map_err(|error| format!("{error:?}"))
+                    destination.commit(batch)?;
+                    destination.flush()
                 }) {
                     log::warn!("telemetry shutdown flush failed: {e:?}");
                 }
@@ -685,16 +710,16 @@ impl Drop for Telemetry {
             schema::duration_ns: end_ns,
         };
 
-        let mut collection_guard = self
+        let mut destination_guard = self
             .inner
-            .collection
+            .destination
             .lock()
-            .expect("telemetry collection lock");
-        if let Some(mut collection) = collection_guard.take() {
-            if let Err(e) = collection.commit(self_describing(end)) {
+            .expect("telemetry destination lock");
+        if let Some(mut destination) = destination_guard.take() {
+            if let Err(e) = destination.commit(self_describing(end)) {
                 log::warn!("telemetry session end commit failed: {e:?}");
             }
-            if let Err(e) = collection.close() {
+            if let Err(e) = destination.close() {
                 log::warn!("telemetry pile close failed: {e:?}");
             }
         }

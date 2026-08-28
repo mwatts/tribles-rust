@@ -16,7 +16,6 @@
 
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
-use ed25519_dalek::VerifyingKey;
 use std::error::Error;
 use std::fmt;
 #[cfg(test)]
@@ -28,7 +27,7 @@ use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::simplearchive_union::{self, TRIBLE_SET_UNION_RECIPE_V1};
 use triblespace_core::collection::{
-    CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
+    CollectionData, CollectionDerive, CollectionHandle, CollectionMerge, VerifyingKey,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
