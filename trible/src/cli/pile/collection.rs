@@ -918,7 +918,6 @@ mod tests {
     use std::collections::BTreeSet;
     use triblespace_core::blob::{IntoBlob, MemoryBlobStore};
     use triblespace_core::collection::reach;
-    use triblespace_core::collection::records::CollectionName;
     use triblespace_core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use triblespace_core::id::fucid;
     use triblespace_core::repo::BlobStorePut;
@@ -930,14 +929,11 @@ mod tests {
     /// descriptor blob, never the entity id inside it.
     #[test]
     fn show_decodes_a_descriptor_addressed_by_its_blob_handle() {
-        let name = CollectionName::new("inspected").unwrap();
-        let namespace = SigningKey::from_bytes(&[7; 32]).verifying_key();
         let authority = SigningKey::from_bytes(&[8; 32]).verifying_key();
         let representation = <SimpleArchive as MetaDescribe>::id();
         let fragment = descriptor::naming(
-            &name,
-            namespace,
-            Some(authority),
+            "inspected",
+            authority,
             representation,
             TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
@@ -945,6 +941,9 @@ mod tests {
         let entity_id = fragment.root().expect("the descriptor has one root");
 
         let mut store = MemoryBlobStore::new();
+        let expected_name = store
+            .put::<UTF8String, _>("inspected".to_owned())
+            .expect("store descriptor name");
         let handle: CollectionHandle = store
             .put::<SimpleArchive, _>(fragment.into_facts().to_blob())
             .expect("store descriptor");
@@ -956,13 +955,12 @@ mod tests {
 
         let reader = store.reader().expect("reader");
         let blob: Blob<SimpleArchive> = reader.get(handle).expect("read descriptor blob");
-        assert_eq!(blob.bytes.len(), 384, "six tribles at 64 bytes each");
+        assert_eq!(blob.bytes.len(), 320, "five tribles at 64 bytes each");
 
         let decoded = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob)
             .expect("decode descriptor");
-        assert_eq!(descriptor::name(&decoded).unwrap().unwrap(), name);
-        assert_eq!(descriptor::namespace(&decoded).unwrap().unwrap(), namespace);
-        assert_eq!(descriptor::authority(&decoded).unwrap().unwrap(), authority);
+        assert_eq!(descriptor::name(&decoded).unwrap().unwrap(), expected_name);
+        assert_eq!(descriptor::authority(&decoded).unwrap(), authority);
         assert_eq!(
             descriptor::representation(&decoded).unwrap(),
             representation
@@ -977,13 +975,18 @@ mod tests {
         let facts: TribleSet = reader
             .get::<TribleSet, SimpleArchive>(handle)
             .expect("unarchive descriptor");
-        assert_eq!(facts.len(), 6);
+        assert_eq!(facts.len(), 5);
         let entities: BTreeSet<Id> = facts.iter().map(|t| *t.e()).collect();
         assert_eq!(
             entities,
             BTreeSet::from([entity_id]),
-            "all six tribles hang off one intrinsic entity"
+            "all descriptor tribles hang off one intrinsic entity"
         );
+
+        assert!(matches!(
+            anchor(&Fields::load(&reader, handle)),
+            Anchor::Root(Ok(name)) if name == "inspected"
+        ));
     }
 
     /// `show` must accept the handle in both shapes; `blob inspect` rejects
@@ -1053,20 +1056,26 @@ mod tests {
     }
 
     /// Build one descriptor's decoded fields the way `list` sees them.
-    fn root(name: &str, namespace_seed: u8) -> Fields {
-        let name = CollectionName::new(name).expect("legal name");
-        let namespace = SigningKey::from_bytes(&[namespace_seed; 32]).verifying_key();
-        Fields::Decoded(
-            descriptor::naming(
-                &name,
-                namespace,
-                Some(namespace),
+    fn root(name: &str, authority_seed: u8) -> Fields {
+        let authority = SigningKey::from_bytes(&[authority_seed; 32]).verifying_key();
+        Fields::Decoded {
+            facts: descriptor::naming(
+                name,
+                authority,
                 <SimpleArchive as MetaDescribe>::id(),
                 TRIBLE_SET_UNION_RECIPE_V1,
                 reach::private(),
             )
             .into_facts(),
-        )
+            name: Ok(Some(name.to_owned())),
+        }
+    }
+
+    fn anchorless(facts: TribleSet) -> Fields {
+        Fields::Decoded {
+            facts,
+            name: Ok(None),
+        }
     }
 
     fn row(handle_byte: u8, fields: Fields) -> Enumerated {
@@ -1085,41 +1094,36 @@ mod tests {
         let mut rows = vec![
             row(9, Fields::Missing),
             row(3, root("wiki", 7)),
-            row(4, Fields::Decoded(TribleSet::new())),
+            row(4, anchorless(TribleSet::new())),
             row(1, root("compass", 7)),
         ];
         rows.sort_by_key(sort_key);
         let order: Vec<u8> = rows.iter().map(|row| row.handle.raw[0]).collect();
-        assert_eq!(order, vec![1, 3, 4, 9], "compass, wiki, bare, missing");
+        assert_eq!(order, vec![1, 3, 4, 9], "compass, wiki, malformed, missing");
     }
 
-    /// A collection name and a descriptor handle are disjoint spellings: a
-    /// name is at most 32 bytes of `[a-z0-9-]` starting with a letter, and a
-    /// handle is 64 hex characters, which fails both the length and the start
-    /// rule. So one argument can carry either without a flag to say which.
+    /// UTF-8 names can look exactly like handles. Explicit prefixes resolve
+    /// that real ambiguity without restricting what a collection may be named.
     #[test]
-    fn a_handle_can_never_be_mistaken_for_a_name() {
+    fn explicit_prefixes_disambiguate_a_hex_shaped_name() {
         let hex = "1c1362fbde47aacdfe3ec872a61b5ff270ef57c30f97ef36511adb1e3536edd2";
-        assert!(CollectionName::new(hex).is_err());
-        assert!(CollectionName::new(&format!("blake3:{hex}")).is_err());
-
-        let rows = vec![row(3, root("wiki", 7))];
+        let rows = vec![row(3, root(hex, 7)), row(4, root("wiki", 7))];
+        assert!(resolve(&rows, hex).is_err(), "bare spelling is ambiguous");
         assert_eq!(
-            resolve(&rows, hex).expect("resolves as a handle"),
+            resolve(&rows, &format!("blake3:{hex}")).expect("explicit handle"),
             parse_collection_handle(hex).expect("parses as a handle")
         );
         assert_eq!(
-            resolve(&rows, "wiki").expect("resolves as a name"),
+            resolve(&rows, &format!("name:{hex}")).expect("explicit name"),
             rows[0].handle
         );
+        assert_eq!(resolve(&rows, "wiki").unwrap(), rows[1].handle);
     }
 
-    /// A name identifies a collection within one namespace, so two namespaces
-    /// may both have a `wiki` in one pile. That is not a lookup failure to
-    /// paper over with a first match — it is an ambiguity the operator has to
-    /// break.
+    /// A name is scoped by descriptor authority, so two authorities may both
+    /// have a `wiki`. Lookup must not paper that over with a first match.
     #[test]
-    fn a_name_shared_by_two_namespaces_refuses_to_resolve() {
+    fn a_name_shared_by_two_authorities_refuses_to_resolve() {
         let rows = vec![row(3, root("wiki", 7)), row(5, root("wiki", 9))];
         let err = resolve(&rows, "wiki").expect_err("ambiguous");
         let text = err.to_string();
@@ -1138,33 +1142,22 @@ mod tests {
         assert!(text.contains("compass"), "{text}");
     }
 
-    /// The 46 unnamed collections in a live pile are not descriptors that say
-    /// nothing — they carry the opaque scope anchor naming replaced. Reporting
-    /// that as "no anchor" would describe the reader's vocabulary rather than
-    /// the descriptor, and would hide the very reason naming exists.
+    /// Current descriptors require exactly one root name or derived source.
+    /// Historical shapes remain visible as malformed, not silently promoted
+    /// through a compatibility interpretation.
     #[test]
-    fn a_pre_naming_descriptor_is_reported_as_scoped_not_as_empty() {
+    fn a_descriptor_without_a_current_anchor_is_reported_as_malformed() {
         use triblespace_core::metadata;
         use triblespace_core::prelude::entity;
-        use triblespace_core::trible::Fragment;
 
-        // The retired attribute is gone from the library, so the fixture is
-        // assembled from raw parts the same way a pile's bytes are.
-        let bare: Fragment = entity! {
+        let bare = entity! {
             metadata::tag: triblespace_core::collection::records::KIND_COLLECTION_DESCRIPTOR,
-        };
-        let bare = bare.into_facts();
-        assert!(!carries_retired_scope(&bare));
-        assert!(matches!(anchor(&Fields::Decoded(bare)), Anchor::Bare));
-
-        let named = root("wiki", 7);
-        let Fields::Decoded(named) = named else {
-            unreachable!("decoded")
-        };
-        assert!(
-            !carries_retired_scope(&named),
-            "a named root carries no scope"
-        );
+        }
+        .into_facts();
+        assert!(matches!(
+            anchor(&anchorless(bare)),
+            Anchor::Unreadable(message) if message.contains("neither collection_name nor collection_source")
+        ));
     }
 
     /// A derive names only its target, and `log` filters records by the same
