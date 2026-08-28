@@ -184,17 +184,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `trible pile migrate <pile> branch-to-collection` as the generic,
   same-pile bridge from one legacy `Repository` branch to a native
   `SimpleArchive` union collection. The command requires the target collection
-  name, public-key namespace, and signing key explicitly; admission is open
-  unless an independent `--authority` trust root is supplied. A delegated
-  signer designates one exact local `--proof`, while a signer equal to the
-  trust root may bootstrap its own deterministic WRITE/Invoke claim and proof.
-  The command validates the branch head, complete reachable commit history, and
-  target admission before writing; preserves each authored commit's exact
-  `repo::content` and `metadata::archive`; skips verified contentless merges;
-  resolves both current and historical branch-name encodings; stores accepted
-  claim blobs and native proofs directly; and reports every
-  source-to-target mapping, including deterministic many-to-one collapse and
-  idempotent replays.
+  name and signing key; its mandatory descriptor authority defaults to that
+  signer and may be overridden explicitly. The command validates the branch
+  head and complete reachable commit history before registering the target,
+  then publishes locally without conflating storage with admission. It
+  preserves each authored commit's exact `repo::content` and
+  `metadata::archive`, skips verified contentless merges, resolves both current
+  and historical branch-name encodings, and reports every source-to-target
+  mapping, including deterministic many-to-one collapse and idempotent replays.
 
 - Add paired direct team proofs to `trible team`. `create` stores keyless
   founder CONNECT and SYNC_TEAM claims with native `K0 (S C K)+` proofs;

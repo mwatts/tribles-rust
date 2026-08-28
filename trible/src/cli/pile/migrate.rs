@@ -41,10 +41,10 @@ pub enum Command {
     ///
     /// This is deliberately a same-pile migration: one frozen pin observation
     /// selects the head, a later append-only blob snapshot validates everything
-    /// it reaches, and only then are native records appended to that pile. A
-    /// An omitted authority makes admission explicitly open. An authority-root
-    /// signer may bootstrap its own exact WRITE proof; any other signer must
-    /// designate an existing exact proof.
+    /// it reaches, and only then are native records appended to that pile. The
+    /// target authority defaults to the migration signer. Choosing a different
+    /// authority is allowed, but admission of the resulting commits then needs
+    /// an exact WRITE presentation when the collection is read.
     BranchToCollection {
         /// Legacy branch to migrate, by exact name or 32-hex-character id.
         #[arg(long)]
@@ -52,16 +52,9 @@ pub enum Command {
         /// Immutable name of the target root collection.
         #[arg(long)]
         collection_name: String,
-        /// Public-key namespace used only to name the target collection.
-        #[arg(long)]
-        namespace: String,
-        /// Optional capability trust root. Omit for explicitly open admission.
+        /// Capability trust root. Defaults to the migration signer.
         #[arg(long)]
         authority: Option<String>,
-        /// Exact WRITE proof id. Requires --authority; omit only when the
-        /// signing key itself is the authority root.
-        #[arg(long, requires = "authority")]
-        proof: Option<String>,
         /// Durable target signing-key file (64-hex-character seed).
         #[arg(long)]
         signing_key: PathBuf,
@@ -96,19 +89,9 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
         Command::BranchToCollection {
             branch,
             collection_name,
-            namespace,
             authority,
-            proof,
             signing_key,
-        } => branch_to_collection::run(
-            pile_path,
-            branch,
-            collection_name,
-            namespace,
-            authority,
-            proof,
-            signing_key,
-        ),
+        } => branch_to_collection::run(pile_path, branch, collection_name, authority, signing_key),
         Command::SeedArtifactOffers { dry_run } => seed_artifact_offers(&pile_path, dry_run),
         Command::Run { migration, dry_run } => {
             match migration {

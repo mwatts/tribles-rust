@@ -3,9 +3,9 @@
 //! A collection is identified by the blake3 handle of its *descriptor blob*,
 //! not by the entity id inside that blob. The descriptor is an ordinary
 //! canonical `SimpleArchive` of one intrinsic entity: the
-//! `KIND_COLLECTION_DESCRIPTOR` tag, an anchor — `name` + `namespace` for a
-//! root, `source` for a derivation — plus an optional local capability
-//! authority, the blob `representation`, the join `recipe`, and whatever
+//! `KIND_COLLECTION_DESCRIPTOR` tag, an anchor — `name` for a root, `source`
+//! for a derivation — plus its mandatory capability authority, the blob
+//! `representation`, the join `recipe`, and whatever
 //! arguments its recipe carries.
 //!
 //! Without this module the only way to look at one was
@@ -15,11 +15,11 @@
 //! and retention use, so the CLI view can never drift from the semantics.
 //!
 //! Names are what the listing leads with. A root carries the name it is known
-//! by inside its namespace, and that name — not the 64 hex characters of its
+//! by under its authority, and that name — not the 64 hex characters of its
 //! descriptor handle — is what an operator came to read. Every subcommand that
-//! takes a collection therefore accepts either spelling; the two can never be
-//! confused, because a name is `[a-z0-9-]{1,32}` starting with a letter and a
-//! handle is 64 hex characters.
+//! takes a collection therefore accepts either spelling. `blake3:` and `name:`
+//! prefixes disambiguate the unusual case where an arbitrary UTF-8 name itself
+//! looks like a bare handle.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -28,10 +28,11 @@ use std::path::PathBuf;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::descriptor;
-use triblespace_core::collection::records::{CollectionHandle, CollectionName, CollectionRecord};
+use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::store::CollectionStore;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
@@ -68,7 +69,7 @@ pub enum Command {
         /// Also show the descriptor blob's size and storage timestamp.
         #[arg(long)]
         metadata: bool,
-        /// Print handles, namespace keys, and authority keys in full.
+        /// Print handles and authority keys in full.
         #[arg(long)]
         long: bool,
     },
@@ -81,8 +82,8 @@ pub enum Command {
     Show {
         /// Path to the pile file to read.
         pile: PathBuf,
-        /// Collection name, or descriptor handle with or without the
-        /// `blake3:` prefix.
+        /// Collection name, or descriptor handle. Use `name:` or `blake3:`
+        /// to disambiguate a name that itself looks like a handle.
         collection: String,
     },
     /// List the commit, merge, and derive records that name one collection.
@@ -93,8 +94,8 @@ pub enum Command {
     Log {
         /// Path to the pile file to read.
         pile: PathBuf,
-        /// Collection name, or descriptor handle with or without the
-        /// `blake3:` prefix.
+        /// Collection name, or descriptor handle. Use `name:` or `blake3:`
+        /// to disambiguate a name that itself looks like a handle.
         collection: String,
         /// Maximum records to print; `0` prints all of them.
         #[arg(long, default_value_t = 25)]
@@ -262,7 +263,10 @@ fn referenced_collections(pile: &mut Pile) -> Result<BTreeMap<CollectionHandle, 
 
 /// The descriptor facts, or why they could not be read.
 enum Fields {
-    Decoded(TribleSet),
+    Decoded {
+        facts: TribleSet,
+        name: Result<Option<String>, String>,
+    },
     Missing,
     Undecodable(String),
 }
@@ -274,14 +278,30 @@ impl Fields {
             Err(_) => return Fields::Missing,
         };
         match <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) {
-            Ok(facts) => Fields::Decoded(facts),
+            Ok(facts) => {
+                let name = match descriptor::name(&facts) {
+                    Ok(Some(handle)) => reader
+                        .get::<Blob<UTF8String>, UTF8String>(handle)
+                        .map_err(|error| format!("read collection name attachment: {error}"))
+                        .and_then(|name| {
+                            std::str::from_utf8(&name.bytes)
+                                .map(|name| Some(name.to_owned()))
+                                .map_err(|error| {
+                                    format!("decode collection name attachment: {error}")
+                                })
+                        }),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                };
+                Fields::Decoded { facts, name }
+            }
             Err(e) => Fields::Undecodable(format!("{e:?}")),
         }
     }
 
     fn facts(&self) -> Option<&TribleSet> {
         match self {
-            Fields::Decoded(facts) => Some(facts),
+            Fields::Decoded { facts, .. } => Some(facts),
             _ => None,
         }
     }
@@ -299,74 +319,40 @@ struct Enumerated {
     fields: Fields,
 }
 
-/// What a descriptor is anchored to. A root is named within a namespace, a
-/// derivation is anchored by the collection it derives from, and a descriptor
-/// that claims neither is neither — the listing says so rather than demanding
-/// one.
+/// What a descriptor is anchored to. A root is named under its authority and
+/// a derivation is anchored by the collection it derives from.
 enum Anchor {
-    Root {
-        /// `Err` when the stored name is not a legal collection name.
-        name: Result<CollectionName, String>,
-        namespace: Option<Result<String, String>>,
-    },
+    Root(Result<String, String>),
     Derived(CollectionHandle),
-    /// Anchored by the opaque scope id that naming replaced.
-    RetiredScope,
-    Bare,
     Unreadable(String),
 }
 
-/// The anchor a root carried before roots were named.
-///
-/// `collection_scope` was a minted opaque id. It discriminated roots
-/// correctly and told a reader nothing: every faculty kept its scope as a hex
-/// constant in its own source, so "which collection is this?" was answerable
-/// only by someone holding the code. That is the complaint naming exists to
-/// answer, and the library deleted the attribute along with the semantics
-/// when `collection_name` + `collection_team` first replaced it. Current
-/// descriptors use the distinct `collection_namespace` anchor instead.
-///
-/// A pile keeps what it was written with, so a reader still meets it — 46 of
-/// the 69 collections in a live pile are anchored this way. Recognizing the
-/// id here is the display layer naming a constant it does not implement,
-/// exactly as `recipe_name` names a recipe it does not run: it lets the
-/// listing say *why* a row has no name instead of reporting the absence as if
-/// the descriptor were empty. Nothing here gives the attribute meaning again.
-///
-/// The value is not invented: it is the literal from the declaration deleted
-/// in commit 0ea2a50b, itself minted with `trible genid` on 2026-08-07.
-const RETIRED_COLLECTION_SCOPE: [u8; 16] = [
-    0xD3, 0x41, 0x88, 0x73, 0xC7, 0x03, 0x92, 0xE3, 0xAD, 0xAA, 0x05, 0xC0, 0x0E, 0x11, 0xA5, 0x83,
-];
-
-fn carries_retired_scope(facts: &TribleSet) -> bool {
-    facts
-        .iter()
-        .any(|trible| <[u8; 16]>::from(*trible.a()) == RETIRED_COLLECTION_SCOPE)
-}
-
 fn anchor(fields: &Fields) -> Anchor {
-    let facts = match fields {
-        Fields::Decoded(facts) => facts,
+    let (facts, loaded_name) = match fields {
+        Fields::Decoded { facts, name } => (facts, name),
         Fields::Missing => return Anchor::Unreadable("descriptor blob not in pile".to_owned()),
         Fields::Undecodable(e) => {
             return Anchor::Unreadable(format!("descriptor undecodable: {e}"))
         }
     };
-    if let Some(source) = descriptor::source(facts) {
-        return Anchor::Derived(source);
+    match descriptor::source(facts) {
+        Ok(Some(source)) => {
+            if matches!(descriptor::name(facts), Ok(Some(_))) {
+                return Anchor::Unreadable(
+                    "descriptor carries both collection_name and collection_source".to_owned(),
+                );
+            }
+            return Anchor::Derived(source);
+        }
+        Ok(None) => {}
+        Err(error) => return Anchor::Unreadable(error.to_string()),
     }
-    match descriptor::name(facts) {
-        Some(name) => Anchor::Root {
-            name: name.map_err(|e| e.to_string()),
-            namespace: descriptor::namespace(facts).map(|namespace| {
-                namespace
-                    .map(|namespace| hex::encode_upper(namespace.to_bytes()))
-                    .map_err(|e| e.to_string())
-            }),
-        },
-        None if carries_retired_scope(facts) => Anchor::RetiredScope,
-        None => Anchor::Bare,
+    match loaded_name {
+        Ok(Some(name)) => Anchor::Root(Ok(name.clone())),
+        Ok(None) => Anchor::Unreadable(
+            "descriptor carries neither collection_name nor collection_source".to_owned(),
+        ),
+        Err(error) => Anchor::Root(Err(error.clone())),
     }
 }
 
@@ -375,12 +361,10 @@ fn anchor(fields: &Fields) -> Anchor {
 /// handle so a listing is stable across runs.
 fn sort_key(row: &Enumerated) -> (u8, String, [u8; 32]) {
     match anchor(&row.fields) {
-        Anchor::Root { name: Ok(name), .. } => (0, name.as_str().to_owned(), row.handle.raw),
-        Anchor::Root { name: Err(_), .. } => (1, String::new(), row.handle.raw),
+        Anchor::Root(Ok(name)) => (0, name, row.handle.raw),
+        Anchor::Root(Err(_)) => (1, String::new(), row.handle.raw),
         Anchor::Derived(source) => (2, handle_hex(source), row.handle.raw),
-        Anchor::RetiredScope => (3, String::new(), row.handle.raw),
-        Anchor::Bare => (4, String::new(), row.handle.raw),
-        Anchor::Unreadable(_) => (5, String::new(), row.handle.raw),
+        Anchor::Unreadable(_) => (3, String::new(), row.handle.raw),
     }
 }
 
@@ -403,22 +387,39 @@ fn enumerate(pile: &mut Pile) -> Result<Vec<Enumerated>> {
 
 /// Resolve what an operator typed to a collection in this pile.
 ///
-/// A name and a handle can never be confused: a name is at most 32 bytes of
-/// `[a-z0-9-]` starting with a letter, and a handle is 64 hex characters. So
-/// the dispatch needs no flag — whichever spelling parses is the one meant.
+/// Explicit prefixes are authoritative. For an unprefixed reference, an exact
+/// name wins unless it also parses as a different handle, in which case the
+/// operator must disambiguate.
 fn resolve(rows: &[Enumerated], reference: &str) -> Result<CollectionHandle> {
     let reference = reference.trim();
-    let Ok(name) = CollectionName::new(reference) else {
+    if reference.starts_with("blake3:") {
         return parse_collection_handle(reference);
+    }
+    let (name, explicit_name) = match reference.strip_prefix("name:") {
+        Some(name) => (name, true),
+        None => (reference, false),
     };
 
     let matches: Vec<CollectionHandle> = rows
         .iter()
-        .filter(|row| {
-            matches!(anchor(&row.fields), Anchor::Root { name: Ok(found), .. } if found == name)
-        })
+        .filter(|row| matches!(anchor(&row.fields), Anchor::Root(Ok(found)) if found == name))
         .map(|row| row.handle)
         .collect();
+
+    if !explicit_name {
+        if let Ok(handle) = parse_collection_handle(reference) {
+            match matches.as_slice() {
+                [] => return Ok(handle),
+                [named] if *named == handle => return Ok(handle),
+                _ => {
+                    return Err(anyhow!(
+                        "{reference:?} is both a collection name and a bare handle; use \
+                         `name:{reference}` or `blake3:{reference}`"
+                    ))
+                }
+            }
+        }
+    }
 
     match matches.as_slice() {
         [only] => Ok(*only),
@@ -426,25 +427,25 @@ fn resolve(rows: &[Enumerated], reference: &str) -> Result<CollectionHandle> {
             let known: Vec<String> = rows
                 .iter()
                 .filter_map(|row| match anchor(&row.fields) {
-                    Anchor::Root { name: Ok(name), .. } => Some(name.as_str().to_owned()),
+                    Anchor::Root(Ok(name)) => Some(name),
                     _ => None,
                 })
                 .collect();
             if known.is_empty() {
                 Err(anyhow!(
-                    "no collection named {name} in this pile; it references no named collections \
+                    "no collection named {name:?} in this pile; it references no named collections \
                      at all. `pile collection list` shows what it does reference"
                 ))
             } else {
                 Err(anyhow!(
-                    "no collection named {name} in this pile; it has: {}",
+                    "no collection named {name:?} in this pile; it has: {}",
                     known.join(", ")
                 ))
             }
         }
         many => Err(anyhow!(
-            "{} collections in this pile are named {name} — a name identifies a collection only \
-             within one namespace, and these disagree. Pass one of the handles instead:\n{}",
+            "{} collections in this pile are named {name:?} under different authorities. Pass one \
+             of the handles instead:\n{}",
             many.len(),
             many.iter()
                 .map(|handle| format!("  {}", handle_hex(*handle)))
@@ -527,7 +528,7 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
             let mut cells = vec![
                 row.refs.total().to_string(),
                 abbrev(&handle_hex(row.handle), long),
-                match row.fields.facts().and_then(descriptor::authority) {
+                match row.fields.facts().map(descriptor::authority) {
                     Some(Ok(authority)) => abbrev(&hex::encode_upper(authority.to_bytes()), long),
                     Some(Err(error)) => format!("<invalid: {error}>"),
                     None => "-".to_owned(),
@@ -565,21 +566,13 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         let mut named: Vec<Vec<String>> = Vec::new();
         let mut derived: Vec<Vec<String>> = Vec::new();
         let mut anchorless: Vec<(String, Vec<String>)> = Vec::new();
-        let mut scoped = 0usize;
         for row in &rows {
             match anchor(&row.fields) {
-                Anchor::Root { name, namespace } => {
-                    let mut cells = vec![
-                        match &name {
-                            Ok(name) => name.as_str().to_owned(),
-                            Err(e) => format!("<invalid: {e}>"),
-                        },
-                        match &namespace {
-                            Some(Ok(namespace)) => abbrev(namespace, long),
-                            Some(Err(e)) => format!("<invalid: {e}>"),
-                            None => "-".to_owned(),
-                        },
-                    ];
+                Anchor::Root(name) => {
+                    let mut cells = vec![match &name {
+                        Ok(name) => name.clone(),
+                        Err(e) => format!("<invalid: {e}>"),
+                    }];
                     cells.extend(tail(row));
                     named.push(cells);
                 }
@@ -587,16 +580,6 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
                     let mut cells = vec![abbrev(&handle_hex(source), long)];
                     cells.extend(tail(row));
                     derived.push(cells);
-                }
-                // A descriptor that decoded but claims no anchor needs no
-                // explanation beyond the section heading. One that could not
-                // be read at all does, and says so in its own column.
-                Anchor::RetiredScope => {
-                    scoped += 1;
-                    anchorless.push(("pre-naming scope anchor".to_owned(), tail(row)));
-                }
-                Anchor::Bare => {
-                    anchorless.push((String::new(), tail(row)));
                 }
                 Anchor::Unreadable(why) => {
                     anchorless.push((why, tail(row)));
@@ -609,8 +592,7 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         let summary: Vec<String> = [
             (named.len(), "named"),
             (derived.len(), "derived"),
-            (scoped, "pre-naming"),
-            (anchorless.len() - scoped, "without a readable anchor"),
+            (anchorless.len(), "without a readable anchor"),
         ]
         .into_iter()
         .filter(|(count, _)| *count > 0)
@@ -644,9 +626,9 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
 
         if !named.is_empty() {
             println!();
-            let mut headers = vec!["NAME", "NAMESPACE"];
+            let mut headers = vec!["NAME"];
             headers.extend(tail_headers.iter().copied());
-            let mut aligns = vec![Align::Left, Align::Left];
+            let mut aligns = vec![Align::Left];
             aligns.extend(tail_aligns.iter().map(|align| match align {
                 Align::Left => Align::Left,
                 Align::Right => Align::Right,
@@ -740,35 +722,21 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
         let descriptor = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob.clone())
             .map_err(|e| anyhow!("decode collection descriptor: {e:?}"))?;
         println!("entity id:      {:X}", descriptor::entity(&descriptor)?);
-        match anchor(&Fields::Decoded(descriptor.clone())) {
-            Anchor::Root { name, namespace } => {
-                match name {
-                    Ok(name) => println!("name:           {name}"),
-                    Err(e) => println!("name:           <invalid: {e}>"),
-                }
-                match namespace {
-                    Some(Ok(namespace)) => println!("namespace:      {namespace}"),
-                    Some(Err(e)) => println!("namespace:      <invalid: {e}>"),
-                    None => println!("namespace:      <none>"),
-                }
-            }
+        let fields = Fields::load(&reader, handle);
+        match anchor(&fields) {
+            Anchor::Root(Ok(name)) => println!("name:           {name}"),
+            Anchor::Root(Err(e)) => println!("name:           <invalid: {e}>"),
             Anchor::Derived(source) => {
                 println!("source:         {}", handle_hex(source));
             }
-            Anchor::RetiredScope => println!(
-                "anchor:         retired `collection_scope` — this descriptor predates naming, \n\
-                 \x20               so it has no name to be listed under"
-            ),
-            Anchor::Bare => println!("anchor:         <none>"),
             Anchor::Unreadable(why) => println!("anchor:         <{why}>"),
         }
         match descriptor::authority(&descriptor) {
-            Some(Ok(authority)) => println!(
+            Ok(authority) => println!(
                 "authority:      {}",
                 hex::encode_upper(authority.to_bytes())
             ),
-            Some(Err(error)) => println!("authority:      <invalid: {error}>"),
-            None => println!("authority:      <none>"),
+            Err(error) => println!("authority:      <invalid: {error}>"),
         }
         println!(
             "representation: {}",
@@ -847,7 +815,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
 
         print!("collection: blake3:{}", handle_hex(handle));
         match anchor(&row.fields) {
-            Anchor::Root { name: Ok(name), .. } => print!("  ({name})"),
+            Anchor::Root(Ok(name)) => print!("  ({name})"),
             Anchor::Derived(source) => print!("  (derived from {})", handle_hex(source)),
             _ => {}
         }

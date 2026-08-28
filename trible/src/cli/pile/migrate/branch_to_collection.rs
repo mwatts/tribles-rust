@@ -16,17 +16,10 @@ use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-    CapabilityProofId, CapabilityRequest, CapabilityResource,
-};
-use triblespace_core::clock;
 use triblespace_core::collection::reach;
-use triblespace_core::collection::records::CollectionName;
+use triblespace_core::collection::records::CollectionHandle;
 use triblespace_core::collection::simplearchive_union::{self, PreparedCollectionCommit};
-use triblespace_core::collection::{
-    CapabilityPresentation, CollectionAdmission, CollectionCommit, ACTION_WRITE,
-};
+use triblespace_core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::shortstring::ShortString;
@@ -51,75 +44,30 @@ struct MigrationReport {
     unique_targets: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TargetAdmissionRequest {
-    Open,
-    Capability {
-        trust_root: VerifyingKey,
-        proof: Option<CapabilityProofId>,
-    },
-}
-
-impl TargetAdmissionRequest {
-    fn from_options(
-        authority: Option<VerifyingKey>,
-        proof: Option<CapabilityProofId>,
-    ) -> Result<Self> {
-        match (authority, proof) {
-            (None, None) => Ok(Self::Open),
-            (Some(trust_root), proof) => Ok(Self::Capability { trust_root, proof }),
-            (None, Some(_)) => bail!("--proof requires --authority"),
-        }
-    }
-
-    fn trust_root(self) -> Option<VerifyingKey> {
-        match self {
-            Self::Open => None,
-            Self::Capability { trust_root, .. } => Some(trust_root),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AuthorizedTarget {
-    admission: CollectionAdmission,
-    proof: Option<CapabilityProofId>,
-}
-
 pub(super) fn run(
     pile_path: PathBuf,
     branch: String,
     collection_name: String,
-    namespace: String,
     authority: Option<String>,
-    proof: Option<String>,
     signing_key: PathBuf,
 ) -> Result<()> {
-    let name = CollectionName::new(&collection_name)
-        .map_err(|error| anyhow!("invalid target collection name {collection_name:?}: {error}"))?;
-    let namespace = crate::cli::team::parse_public_key(&namespace, "namespace")?;
+    let signer = load_signing_key(&Some(signing_key))?;
     let authority = authority
         .as_deref()
         .map(|value| crate::cli::team::parse_public_key(value, "authority"))
-        .transpose()?;
-    let proof = proof
-        .as_deref()
-        .map(crate::cli::team::parse_proof_id)
-        .transpose()?;
-    let admission = TargetAdmissionRequest::from_options(authority, proof)?;
-    let signer = load_signing_key(&Some(signing_key))?;
+        .transpose()?
+        .unwrap_or_else(|| signer.verifying_key());
 
     let mut pile = super::super::open_refreshed(&pile_path)?;
-    let result = migrate(&mut pile, &branch, &name, namespace, admission, &signer);
+    let result = migrate(&mut pile, &branch, &collection_name, authority, &signer);
     let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
-    let (report, mappings, authorized) = result?;
+    let (report, mappings, collection) = result?;
     close?;
     print_report(
         &pile_path,
-        &name,
-        namespace,
-        authorized.admission.trust_root(),
-        authorized.proof,
+        &collection_name,
+        collection,
+        authority,
         signer.verifying_key(),
         report,
         &mappings,
@@ -130,14 +78,13 @@ pub(super) fn run(
 fn migrate(
     pile: &mut Pile,
     branch_reference: &str,
-    name: &CollectionName,
-    namespace: VerifyingKey,
-    admission: TargetAdmissionRequest,
+    name: &str,
+    authority: VerifyingKey,
     signer: &SigningKey,
 ) -> Result<(
     MigrationReport,
     Vec<(CommitHandle, CollectionCommit)>,
-    AuthorizedTarget,
+    CollectionHandle,
 )> {
     // Freeze the mutable names first, then take one append-only blob view.
     // A concurrent append may enter the later reader, but cannot change the
@@ -152,28 +99,25 @@ fn migrate(
     let head = validate_branch_head(&reader, branch, &branch_meta)?;
     // Migrated history stays put. A legacy branch carried no notion of reach,
     // so declaring one here would be inventing a decision on the user's behalf
-    // about data they wrote before the question existed. `reach::private()`
-    // writes no reach fact, so reach does not independently rename the target;
-    // its explicit namespace and authority still participate in descriptor
-    // identity. Publishing migrated material stays a deliberate re-commit into
-    // a differently named collection.
-    let descriptor =
-        simplearchive_union::descriptor(name, namespace, admission.trust_root(), reach::private());
+    // about data they wrote before the question existed. Publishing migrated
+    // material stays a deliberate re-commit into a private named collection.
+    let descriptor = simplearchive_union::descriptor(name, authority, reach::private());
     let (reachable, contentless_merges, prepared) = match head {
         Some(head) => prepare_reachable(&reader, head, &descriptor)?,
         None => (0, 0, Vec::new()),
     };
     let authored = prepared.len();
 
-    // Preparation above performs no I/O. Once every reachable node has
-    // passed, establish the target writer's exact admission before publishing
-    // any target dependency or record. Exact repeats naturally converge
-    // through the content-addressed blob and collection stores.
-    let authorized = authorize_target_writer(pile, &descriptor, admission, signer)?;
+    // Preparation above performs no I/O. Register the complete descriptor
+    // closure only after every reachable legacy node has passed validation;
+    // local publication deliberately performs no admission check.
+    let collection = pile
+        .collection(descriptor)
+        .map_err(|error| anyhow!("register target collection: {error}"))?;
     let mut mappings = Vec::with_capacity(authored);
     for (source, prepared) in prepared {
         let staged = prepared
-            .stage(pile, signer)
+            .stage_for(pile, collection, signer)
             .map_err(|error| anyhow!("stage native collection commit: {error}"))?;
         let commit = staged
             .finalize()
@@ -195,64 +139,7 @@ fn migrate(
         contentless_merges,
         unique_targets,
     };
-    Ok((report, mappings, authorized))
-}
-
-fn authorize_target_writer(
-    pile: &mut Pile,
-    descriptor: &triblespace_core::trible::Fragment,
-    requested: TargetAdmissionRequest,
-    signer: &SigningKey,
-) -> Result<AuthorizedTarget> {
-    let TargetAdmissionRequest::Capability { trust_root, proof } = requested else {
-        return Ok(AuthorizedTarget {
-            admission: CollectionAdmission::Open,
-            proof: None,
-        });
-    };
-
-    let target =
-        triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
-            .get_handle();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(target),
-    );
-    let bundle = match proof {
-        Some(proof) => crate::cli::team::load_capability_bundle(pile, proof)?,
-        None if signer.verifying_key() == trust_root => CapabilityProofBundle::issue_root(
-            signer,
-            CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-            signer.verifying_key(),
-        )
-        .map_err(|error| anyhow!("issue target WRITE proof: {error}"))?,
-        None => {
-            bail!(
-                "--authority without --proof can bootstrap only when the migration signer is the authority root"
-            )
-        }
-    };
-
-    // One clock observation governs the complete admission boundary. Nothing
-    // in the target collection has been staged yet.
-    let instant = clock::epoch_now();
-    bundle
-        .verify(
-            trust_root,
-            instant,
-            signer.verifying_key(),
-            CapabilityRequest::new(atom, CapabilityMode::Invoke),
-        )
-        .map_err(|error| anyhow!("target WRITE proof rejected: {error}"))?;
-    crate::cli::team::store_capability_bundle(pile, &bundle)?;
-    let proof = bundle.proof().id();
-    Ok(AuthorizedTarget {
-        admission: CollectionAdmission::capability(
-            trust_root,
-            vec![CapabilityPresentation::new(signer.verifying_key(), bundle)],
-        ),
-        proof: Some(proof),
-    })
+    Ok((report, mappings, collection))
 }
 
 fn resolve_branch(
@@ -493,10 +380,9 @@ fn handle_hex(handle: ArchiveHandle) -> String {
 
 fn print_report(
     pile_path: &PathBuf,
-    name: &CollectionName,
-    namespace: VerifyingKey,
-    authority: Option<VerifyingKey>,
-    proof: Option<CapabilityProofId>,
+    name: &str,
+    collection: CollectionHandle,
+    authority: VerifyingKey,
     signer: VerifyingKey,
     report: MigrationReport,
     mappings: &[(CommitHandle, CollectionCommit)],
@@ -511,19 +397,8 @@ fn print_report(
             .unwrap_or_else(|| "<none>".to_owned())
     );
     println!("collection name: {name}");
-    println!("namespace: {}", hex::encode_upper(namespace.to_bytes()));
-    println!(
-        "authority: {}",
-        authority
-            .map(|key| hex::encode_upper(key.to_bytes()))
-            .unwrap_or_else(|| "<open>".to_owned())
-    );
-    println!(
-        "write proof: {}",
-        proof
-            .map(|handle| hex::encode_upper(handle.raw))
-            .unwrap_or_else(|| "<none>".to_owned())
-    );
+    println!("authority: {}", hex::encode_upper(authority.to_bytes()));
+    println!("collection: blake3:{}", hex::encode(collection.raw));
     println!("target signer: {}", hex::encode_upper(signer.to_bytes()));
     println!("SOURCE COMMIT                                                     TARGET COMMIT");
     for (source, target) in mappings {
