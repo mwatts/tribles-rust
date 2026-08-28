@@ -725,7 +725,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
 
         use crate::blob::encodings::utf8string::UTF8String;
-        use crate::collection::{simplearchive_union, Collection, CollectionAdmission};
+        use crate::collection::{simplearchive_union, CollectionStoreExt};
         use crate::repo::{BlobStoreGet, BlobStoreKeep};
 
         let mut repo = MemoryRepo::default();
@@ -736,16 +736,8 @@ mod tests {
         let team = key.verifying_key();
         let descriptor = simplearchive_union::descriptor(name, team, reach::private());
         let collection = identity_for_tests(&descriptor);
-        let commit = Collection::new(
-            &mut repo,
-            &name,
-            team,
-            key,
-            reach::private(),
-            CollectionAdmission::Open,
-        )
-        .commit(fragment)
-        .unwrap();
+        assert_eq!(repo.collection(descriptor).unwrap(), collection);
+        let commit = repo.commit(collection, &key, fragment).unwrap();
         let orphan = repo.put::<UTF8String, _>("orphan".to_owned()).unwrap();
 
         repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());

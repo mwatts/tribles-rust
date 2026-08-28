@@ -195,7 +195,9 @@ mod tests {
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
-    use crate::collection::{Collection, CollectionAdmission, CollectionHandle, CollectionMerge};
+    use crate::collection::{
+        simplearchive_union, CollectionHandle, CollectionMerge, CollectionStoreExt,
+    };
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::trible::Fragment;
     use ed25519_dalek::SigningKey;
@@ -262,31 +264,22 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[8; 32]);
         let name = "hybrid";
         let team = signing_key.verifying_key();
-        let target = Collection::new(
-            &mut hybrid,
-            &name,
-            team,
-            signing_key.clone(),
-            reach::private(),
-            CollectionAdmission::Open,
-        )
-        .collection();
-        let mut collection = Collection::new(
-            hybrid,
-            &name,
-            team,
-            signing_key,
-            reach::private(),
-            CollectionAdmission::Open,
-        );
+        let target = hybrid
+            .collection(simplearchive_union::descriptor(
+                name,
+                team,
+                reach::private(),
+            ))
+            .unwrap();
 
-        let commit = collection.commit(Fragment::empty()).unwrap();
-        assert_eq!(collection.materialize().unwrap().len(), 0);
-        assert_eq!(commit.collection(), collection.collection());
-        assert!(collection.storage().blobs.blobs.len() >= 2);
-        let storage = collection.storage_mut();
+        let commit = hybrid
+            .commit(target, &signing_key, Fragment::empty())
+            .unwrap();
+        assert_eq!(hybrid.snapshot(target, &[]).unwrap().facts().len(), 0);
+        assert_eq!(commit.collection(), target);
+        assert!(hybrid.blobs.blobs.len() >= 2);
         assert_eq!(
-            storage
+            hybrid
                 .records
                 .records()
                 .unwrap()
@@ -297,7 +290,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(storage.blobs.records().unwrap().count(), 0);
+        assert_eq!(hybrid.blobs.records().unwrap().count(), 0);
     }
 
     #[test]
