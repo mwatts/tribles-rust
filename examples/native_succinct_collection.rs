@@ -6,10 +6,9 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
-use triblespace::core::collection::CollectionAdmission;
+use triblespace::core::collection::{reach, simplearchive_union, CollectionStoreExt};
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
-use triblespace_core::collection::reach;
 
 fn main() {
     let tmp = tempfile::tempdir().expect("tmp dir");
@@ -19,45 +18,42 @@ fn main() {
     let mut pile = Pile::open(&path).expect("open pile");
     pile.refresh().expect("load pile");
 
-    // A root collection is anchored by a name within a public-key namespace.
-    // This local example explicitly uses open signer admission.
-    let name = CollectionName::new("literature").expect("legal collection name");
+    // A root collection is the handle of a self-contained descriptor. Its
+    // mandatory authority participates in that content identity.
+    let name = "literature";
     let signing_key = SigningKey::generate(&mut OsRng);
-    let namespace = signing_key.verifying_key();
-    let mut collection = Collection::new(
-        pile,
-        &name,
-        namespace,
-        signing_key,
-        reach::private(),
-        CollectionAdmission::Open,
-    );
+    let authority = signing_key.verifying_key();
+    let source_reach = reach::private();
+    let collection = pile
+        .collection(simplearchive_union::descriptor(
+            name,
+            authority,
+            source_reach.clone(),
+        ))
+        .expect("register source collection");
 
     // Each fragment is one independent signed collection member. Omitting an
     // explicit entity id makes every person intrinsic to their facts.
     for name in ["Ada", "Grace", "Barbara"] {
-        collection
-            .commit(entity! { literature::firstname: name })
-            .expect("publish person");
+        pile.commit(
+            collection,
+            &signing_key,
+            entity! { literature::firstname: name },
+        )
+        .expect("publish person");
     }
 
     // Freeze the exact admitted target frontier. ticket() reads collection
     // records, but not these commits' data or metadata blobs.
-    let ticket = collection.ticket().expect("discover exact ticket");
+    let ticket = pile.ticket(collection, &[]).expect("discover exact ticket");
     assert_eq!(ticket.len(), 3);
 
     // Build any missing canonical raw Succinct shards and their exact Rank9
     // fibers, then query the admitted physical cover directly.
-    let succinct = SuccinctArchiveCollection::new(
-        name.clone(),
-        namespace,
-        None,
-        reach::private(),
-        None,
-        reach::private(),
-    );
+    let succinct =
+        SuccinctArchiveCollection::new(name, authority, source_reach, authority, reach::private());
     let archive = succinct
-        .ensure_exact(collection.storage_mut(), &ticket)
+        .ensure_exact(&mut pile, ticket.commits())
         .expect("ensure exact Succinct projection");
     let mut names: Vec<String> = find!(
         name: Inline<_>,
@@ -70,5 +66,5 @@ fn main() {
     println!("queried exact Succinct ticket: {names:?}");
     assert_eq!(names, ["Ada", "Barbara", "Grace"]);
 
-    collection.into_storage().close().expect("close pile");
+    pile.close().expect("close pile");
 }
