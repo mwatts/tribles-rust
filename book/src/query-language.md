@@ -681,6 +681,24 @@ frame — where the light-cone argument says currency belongs anyway. The
 resulting `ObservedIndex` implements the same `RegisterOrder` trait, so moving a
 call from live probes to the maintained index changes its cost and nothing else.
 
+[`collection::lww_register`](triblespace::core::collection::lww_register) is
+the maintained counterpart for a stated last-write-wins register. Its target
+element keeps the identity and order fact halves in separate canonical row sets.
+That detail is essential: the two facts for one state may arrive in different
+source commits, so deriving only already-complete coordinates would not commute
+with source union. Once an exact target cover is joined, `LwwIndex` pairs the
+sets and selects the greatest `(order, state-id)` coordinate for every register.
+It implements `RegisterOrder`, and therefore substitutes for
+`StatedOrder::tiebreak_by_id()` at read time.
+
+The maintained LWW form makes one validity contract explicit: within an exact
+ticket, a state which has both halves has at most one well-formed identity and
+at most one order value under the descriptor's attributes. Incomplete states
+remain incomparable even if the present half is multivalued. The row sets
+retain those values so a later counterpart exposes rather than hides a
+conflict, including one split across source commits. Order bytes must use an
+order-preserving encoding, just as they must for the live `StatedOrder`.
+
 ## Recursive traversal
 
 Queries in this chapter all have a fixed number of clauses, which means a fixed

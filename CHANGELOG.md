@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an exact maintained last-write-wins register collection. Its canonical
+  projection keeps state identity and raw order facts as two independently
+  unionable row sets, so the derivation remains a join homomorphism when those
+  facts are split across source commits. Attachment pairs complete coordinates
+  and indexes the greatest `(order, state-id)` per register; missing halves
+  remain incomparable even when an unrelated half is multivalued, while a
+  completed conflicting coordinate fails a documented single-coordinate
+  contract instead of depending on iteration order.
+
 - Make `SuccinctArchiveView` continuation reuse directly observable through a
   last-successful-work report. It distinguishes newly admitted from retained
   commits and counts the actual raw validation, derivation, and join calls made
@@ -202,6 +211,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   during sampling.
 
 ### Changed
+
+- Let maintained observed-set and LWW collection facades state source and
+  derived authority independently from their shared namespace. Open roots can
+  now use the same exact-ticket lifecycle as capability-gated roots without
+  hashing a nonexistent authority into the source descriptor.
 
 - Bound the unified inventory/DHT outbound pool to 64 fully reciprocal
   CONNECT+SYNC_TEAM-authorized sessions with deterministic LRU residency.

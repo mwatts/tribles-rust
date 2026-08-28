@@ -23,6 +23,8 @@ pub mod discovery;
 pub mod exact_derived;
 /// Explicit size-tiered maintenance for exact canonical target covers.
 pub mod exact_target_compaction;
+/// Maintained stated last-write-wins registers over exact source tickets.
+pub mod lww_register;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.
 pub mod observed_union;

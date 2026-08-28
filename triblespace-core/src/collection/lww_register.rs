@@ -1,0 +1,1216 @@
+//! Maintained last-write-wins registers over stated identity and order facts.
+//!
+//! [`StatedOrder`](crate::query::register::StatedOrder) resolves a register
+//! directly from a fact source. That is the right zero-setup path, but every
+//! read repeats the joins from a state to its identity and order value. This
+//! module projects exactly those two columns into an exact derived collection
+//! and builds an [`LwwIndex`](crate::collection::lww_register::LwwIndex) when a
+//! reader attaches a ticket.
+//!
+//! # Why the maintained element contains both fact halves
+//!
+//! A state's identity and order facts need not be in the same source commit.
+//! Deriving only complete coordinates from each commit would therefore not be
+//! a join homomorphism:
+//!
+//! ```text
+//! derive({ state --identity--> register }) = empty
+//! derive({ state --order-----> key      }) = empty
+//! derive(their union)                    = one coordinate
+//! ```
+//!
+//! The target element instead contains two canonical sorted row sets, one of
+//! state/register pairs and one of state/raw-order pairs. Its join is set
+//! union. Pairing the halves and selecting the greatest `(key, state-id)`
+//! happens only after the exact target cover has been joined. Consequently:
+//!
+//! ```text
+//! project(C1 union C2) = project(C1) join project(C2)
+//! ```
+//!
+//! even when every coordinate is partitioned across commits. The maintained
+//! bytes are still smaller than the source projection (80 bytes for a complete
+//! state rather than two 64-byte tribles), and unrelated facts disappear.
+//!
+//! # Data contract
+//!
+//! Within one exact source ticket, a state which asserts both halves may assert
+//! at most one well-formed identity and at most one order value under the
+//! descriptor's two attributes. Repeating the same fact is harmless set
+//! idempotence. Distinct values are retained by the union law and rejected when
+//! attachment discovers that the state has become a complete coordinate.
+//! Multiplicity on an incomplete state is harmless open-world data: it remains
+//! retained and incomparable unless the missing half later arrives. Missing
+//! halves therefore match
+//! [`StatedOrder`](crate::query::register::StatedOrder). Malformed `GenId`
+//! identity values are ignored, also matching the live query's typed
+//! projection.
+//!
+//! LWW is total among complete states: keys compare as raw inline bytes and
+//! equal keys are broken by state id. The order attribute must therefore use
+//! an order-preserving encoding, the same contract as
+//! [`StatedOrder::tiebreak_by_id`](crate::query::register::StatedOrder::tiebreak_by_id).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+
+use anybytes::Bytes;
+use ed25519_dalek::VerifyingKey;
+
+use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::{Blob, BlobEncoding};
+use crate::collection::records::CollectionName;
+use crate::id::{ExclusiveId, Id};
+use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
+use crate::metadata::MetaDescribe;
+use crate::query::register::{register_identity, register_orders, RegisterOrder};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
+use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
+
+use super::exact_derived::{
+    ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
+    ExactDerivedCollectionError,
+};
+use super::records::{
+    collection_authority, collection_reach, collection_recipe, collection_representation,
+    collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+};
+use super::{simplearchive_union, CollectionCommit, CollectionStore};
+
+const ID_LEN: usize = 16;
+const KEY_LEN: usize = 32;
+const HEADER_LEN: usize = 16;
+const IDENTITY_ROW_LEN: usize = ID_LEN * 2;
+const ORDER_ROW_LEN: usize = ID_LEN + KEY_LEN;
+
+type RawId = [u8; ID_LEN];
+type RawKey = [u8; KEY_LEN];
+
+/// Canonical projection of the two fact halves needed by a stated LWW register.
+///
+/// The first 16 bytes are two big-endian `u64` counts: identity rows followed
+/// by order rows. Identity rows are `state[16] || register[16]`; order rows are
+/// `state[16] || key[32]`. Each section is strictly increasing by its complete
+/// row. Repeating a state with a distinct value is retained so target join is
+/// total and remains a plain set union; attachment enforces uniqueness only
+/// when both halves make that state a coordinate.
+pub struct LwwRegisterBlob;
+
+impl BlobEncoding for LwwRegisterBlob {}
+
+impl MetaDescribe for LwwRegisterBlob {
+    fn describe() -> Fragment {
+        // Minted with `trible genid` on 2026-08-28.
+        let id: Id = id_hex!("AE6E7C26F39480D80E0162A362F80085");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name: "lww-register-projection-v1",
+            metadata::description: "Canonical projection for maintained stated last-write-wins registers. The payload is two strictly sorted row sets: state with register identity, then state with raw order key. Keeping both halves independently makes projection commute with source union even when a state's facts are split across commits. Readers pair unique complete coordinates and choose the greatest (key, state-id) per register.",
+            metadata::tag: metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
+/// Failure to decode, derive, or join a canonical LWW register projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LwwRegisterError {
+    /// A payload's declared row counts do not match its byte length.
+    BadLength {
+        /// Expected length computed from the header.
+        expected: usize,
+        /// Actual payload length.
+        actual: usize,
+    },
+    /// Header arithmetic exceeded the platform's addressable size.
+    CountOverflow,
+    /// An identity section is not strictly increasing by complete row.
+    IdentityOrder,
+    /// An order-key section is not strictly increasing by complete row.
+    KeyOrder,
+    /// A target row names the nil state id.
+    NilState,
+    /// An identity row names the nil register id.
+    NilRegister,
+    /// One state asserts two distinct register identities.
+    ConflictingIdentity(RawId),
+    /// One state asserts two distinct order values.
+    ConflictingOrder(RawId),
+}
+
+impl fmt::Display for LwwRegisterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadLength { expected, actual } => write!(
+                formatter,
+                "LWW register projection declares {expected} bytes but contains {actual}"
+            ),
+            Self::CountOverflow => {
+                formatter.write_str("LWW register projection row counts overflow address space")
+            }
+            Self::IdentityOrder => {
+                formatter.write_str("LWW register identity rows are not strictly sorted")
+            }
+            Self::KeyOrder => {
+                formatter.write_str("LWW register order rows are not strictly sorted")
+            }
+            Self::NilState => formatter.write_str("LWW register projection contains a nil state"),
+            Self::NilRegister => {
+                formatter.write_str("LWW register projection contains a nil register identity")
+            }
+            Self::ConflictingIdentity(state) => write!(
+                formatter,
+                "state {} asserts distinct LWW register identities",
+                hex::encode_upper(state)
+            ),
+            Self::ConflictingOrder(state) => write!(
+                formatter,
+                "state {} asserts distinct LWW order values",
+                hex::encode_upper(state)
+            ),
+        }
+    }
+}
+
+impl Error for LwwRegisterError {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Projection {
+    identities: BTreeSet<(RawId, RawId)>,
+    orders: BTreeSet<(RawId, RawKey)>,
+}
+
+impl Projection {
+    fn union(mut self, other: Self) -> Self {
+        self.identities.extend(other.identities);
+        self.orders.extend(other.orders);
+        self
+    }
+
+    fn encode(self) -> Blob<LwwRegisterBlob> {
+        let identity_count =
+            u64::try_from(self.identities.len()).expect("usize identity count fits in u64");
+        let order_count = u64::try_from(self.orders.len()).expect("usize order count fits in u64");
+        let mut bytes = Vec::with_capacity(
+            HEADER_LEN
+                + self.identities.len() * IDENTITY_ROW_LEN
+                + self.orders.len() * ORDER_ROW_LEN,
+        );
+        bytes.extend_from_slice(&identity_count.to_be_bytes());
+        bytes.extend_from_slice(&order_count.to_be_bytes());
+        for (state, register) in self.identities {
+            bytes.extend_from_slice(&state);
+            bytes.extend_from_slice(&register);
+        }
+        for (state, key) in self.orders {
+            bytes.extend_from_slice(&state);
+            bytes.extend_from_slice(&key);
+        }
+        Blob::new(Bytes::from_source(bytes))
+    }
+}
+
+fn checked_payload_len(identity_count: usize, order_count: usize) -> Option<usize> {
+    HEADER_LEN
+        .checked_add(identity_count.checked_mul(IDENTITY_ROW_LEN)?)?
+        .checked_add(order_count.checked_mul(ORDER_ROW_LEN)?)
+}
+
+fn decode_projection(blob: &Blob<LwwRegisterBlob>) -> Result<Projection, LwwRegisterError> {
+    let bytes = blob.bytes.as_ref();
+    if bytes.len() < HEADER_LEN {
+        return Err(LwwRegisterError::BadLength {
+            expected: HEADER_LEN,
+            actual: bytes.len(),
+        });
+    }
+    let identity_count = usize::try_from(u64::from_be_bytes(
+        bytes[0..8].try_into().expect("eight-byte identity count"),
+    ))
+    .map_err(|_| LwwRegisterError::CountOverflow)?;
+    let order_count = usize::try_from(u64::from_be_bytes(
+        bytes[8..16].try_into().expect("eight-byte order count"),
+    ))
+    .map_err(|_| LwwRegisterError::CountOverflow)?;
+    let expected =
+        checked_payload_len(identity_count, order_count).ok_or(LwwRegisterError::CountOverflow)?;
+    if bytes.len() != expected {
+        return Err(LwwRegisterError::BadLength {
+            expected,
+            actual: bytes.len(),
+        });
+    }
+
+    let identity_end = HEADER_LEN + identity_count * IDENTITY_ROW_LEN;
+    let mut projection = Projection::default();
+    let mut previous_identity = None;
+    for row in bytes[HEADER_LEN..identity_end].chunks_exact(IDENTITY_ROW_LEN) {
+        let state: RawId = row[0..ID_LEN].try_into().expect("16-byte state id");
+        let register: RawId = row[ID_LEN..IDENTITY_ROW_LEN]
+            .try_into()
+            .expect("16-byte register id");
+        if state == [0; ID_LEN] {
+            return Err(LwwRegisterError::NilState);
+        }
+        if register == [0; ID_LEN] {
+            return Err(LwwRegisterError::NilRegister);
+        }
+        let current = (state, register);
+        if previous_identity.is_some_and(|prior| prior >= current) {
+            return Err(LwwRegisterError::IdentityOrder);
+        }
+        previous_identity = Some(current);
+        projection.identities.insert(current);
+    }
+
+    let mut previous_order = None;
+    for row in bytes[identity_end..].chunks_exact(ORDER_ROW_LEN) {
+        let state: RawId = row[0..ID_LEN].try_into().expect("16-byte state id");
+        let key: RawKey = row[ID_LEN..ORDER_ROW_LEN]
+            .try_into()
+            .expect("32-byte order key");
+        if state == [0; ID_LEN] {
+            return Err(LwwRegisterError::NilState);
+        }
+        let current = (state, key);
+        if previous_order.is_some_and(|prior| prior >= current) {
+            return Err(LwwRegisterError::KeyOrder);
+        }
+        previous_order = Some(current);
+        projection.orders.insert(current);
+    }
+    Ok(projection)
+}
+
+/// Validate one canonical maintained LWW register element.
+pub fn validate_element(blob: &Blob<LwwRegisterBlob>) -> Result<(), LwwRegisterError> {
+    decode_projection(blob).map(|_| ())
+}
+
+/// The canonical empty maintained LWW register element.
+pub fn empty() -> Blob<LwwRegisterBlob> {
+    Projection::default().encode()
+}
+
+fn genid_value(raw: &[u8]) -> Option<RawId> {
+    if raw[0..ID_LEN] != [0; ID_LEN] {
+        return None;
+    }
+    let id: RawId = raw[ID_LEN..KEY_LEN].try_into().expect("16-byte GenId tail");
+    (id != [0; ID_LEN]).then_some(id)
+}
+
+/// Project one source archive into the two canonical stated-register row sets.
+///
+/// Well-formed identities and raw order values are collected independently;
+/// no atomic-entity assumption is made. Distinct values remain distinct target
+/// rows so derivation commutes with arbitrary source partitioning. Attachment
+/// rejects them only if both halves make that state a complete coordinate.
+pub fn derive_element(
+    source: &Blob<SimpleArchive>,
+    identity: Id,
+    orders: Id,
+) -> Result<Blob<LwwRegisterBlob>, LwwRegisterError> {
+    let bytes = source.bytes.as_ref();
+    if bytes.len() % TRIBLE_LEN != 0 {
+        let expected = bytes.len() - (bytes.len() % TRIBLE_LEN);
+        return Err(LwwRegisterError::BadLength {
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    let mut projection = Projection::default();
+    for trible in bytes.chunks_exact(TRIBLE_LEN) {
+        let state: RawId = trible[E_START..E_START + ID_LEN]
+            .try_into()
+            .expect("16-byte entity id");
+        let attribute = &trible[A_START..A_START + ID_LEN];
+        let value = &trible[V_START..V_START + KEY_LEN];
+        if attribute == &identity[..] {
+            if let Some(register) = genid_value(value) {
+                projection.identities.insert((state, register));
+            }
+        }
+        if attribute == &orders[..] {
+            projection
+                .orders
+                .insert((state, value.try_into().expect("32-byte inline order value")));
+        }
+    }
+    Ok(projection.encode())
+}
+
+/// Canonical join of two maintained LWW register elements.
+pub fn join(
+    low: &Blob<LwwRegisterBlob>,
+    high: &Blob<LwwRegisterBlob>,
+) -> Result<Blob<LwwRegisterBlob>, LwwRegisterError> {
+    Ok(decode_projection(low)?
+        .union(decode_projection(high)?)
+        .encode())
+}
+
+/// Construct the maintained LWW register descriptor for one source collection.
+///
+/// The target's optional authority is explicit and independent of its source.
+pub fn descriptor(
+    source: CollectionHandle,
+    identity: Id,
+    orders: Id,
+    authority: Option<VerifyingKey>,
+    reach: Fragment,
+) -> Fragment {
+    let identity = crate::inline::IntoInline::to_inline(identity);
+    let orders = crate::inline::IntoInline::to_inline(orders);
+    entity! { _ @
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_source: source,
+        collection_authority?: authority,
+        collection_representation*: <LwwRegisterBlob as MetaDescribe>::describe(),
+        collection_recipe*: <LwwRegisterV1 as MetaDescribe>::describe(),
+        register_identity: identity,
+        register_orders: orders,
+        collection_reach*: reach,
+    }
+}
+
+/// Canonical maintained LWW-register law, version 1.
+///
+/// Minted with `trible genid` on 2026-08-28. The two attribute arguments live
+/// on the descriptor rather than being folded into this law's identity.
+pub const LWW_REGISTER_RECIPE_V1: Id = id_hex!("A0EC3C0B80D0CB91012E547311C5CF2A");
+
+/// The maintained LWW-register law as a describable type.
+pub struct LwwRegisterV1;
+
+impl MetaDescribe for LwwRegisterV1 {
+    fn describe() -> Fragment {
+        let id: Id = LWW_REGISTER_RECIPE_V1;
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name: "lww-register-v1",
+            metadata::description: "Exact maintained projection for a stated last-write-wins register. Source union projects to the union of two row sets keyed first by state: identity and raw order. The sets stay separate so facts split across source commits join correctly. At attachment, unique complete coordinates choose the greatest (order, state-id) per identity; incomplete states remain incomparable. Takes descriptor arguments `register_identity` and `register_orders`.",
+            metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
+
+/// An attached last-write-wins index over one exact source ticket.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LwwIndex {
+    coordinates: BTreeMap<RawId, (RawId, RawKey)>,
+    winners: BTreeMap<RawId, (RawKey, RawId)>,
+    unresolved: usize,
+}
+
+impl LwwIndex {
+    /// Decode one complete canonical projection and select each register's winner.
+    pub fn decode(blob: &Blob<LwwRegisterBlob>) -> Result<Self, LwwRegisterError> {
+        let projection = decode_projection(blob)?;
+        Self::from_projection(projection)
+    }
+
+    fn from_projection(projection: Projection) -> Result<Self, LwwRegisterError> {
+        let mut identities = BTreeMap::<RawId, Vec<RawId>>::new();
+        for (state, register) in projection.identities {
+            identities.entry(state).or_default().push(register);
+        }
+        let mut orders = BTreeMap::<RawId, Vec<RawKey>>::new();
+        for (state, key) in projection.orders {
+            orders.entry(state).or_default().push(key);
+        }
+        let states: BTreeSet<RawId> = identities.keys().chain(orders.keys()).copied().collect();
+        let mut index = Self::default();
+        for state in states {
+            let Some(registers) = identities.get(&state) else {
+                index.unresolved += 1;
+                continue;
+            };
+            let Some(keys) = orders.get(&state) else {
+                index.unresolved += 1;
+                continue;
+            };
+            if registers.len() != 1 {
+                return Err(LwwRegisterError::ConflictingIdentity(state));
+            }
+            if keys.len() != 1 {
+                return Err(LwwRegisterError::ConflictingOrder(state));
+            }
+            let register = registers[0];
+            let key = keys[0];
+            index.coordinates.insert(state, (register, key));
+            let candidate = (key, state);
+            index
+                .winners
+                .entry(register)
+                .and_modify(|winner| {
+                    if candidate > *winner {
+                        *winner = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+        Ok(index)
+    }
+
+    /// Number of complete state coordinates in the index.
+    pub fn len(&self) -> usize {
+        self.coordinates.len()
+    }
+
+    /// Whether the index has no complete state coordinates.
+    pub fn is_empty(&self) -> bool {
+        self.coordinates.is_empty()
+    }
+
+    /// Number of registers with at least one complete state.
+    pub fn register_count(&self) -> usize {
+        self.winners.len()
+    }
+
+    /// Number of projected states missing either identity or order.
+    pub fn unresolved_count(&self) -> usize {
+        self.unresolved
+    }
+
+    /// The total-order winner for `register`, if it has a complete state.
+    pub fn winner(&self, register: Id) -> Option<Id> {
+        let raw: RawId = register[..].try_into().expect("id is 16 bytes");
+        self.winners
+            .get(&raw)
+            .map(|(_, state)| Id::new(*state).expect("indexed states are non-nil"))
+    }
+}
+
+impl RegisterOrder for LwwIndex {
+    fn dominated(&self, state: Id) -> bool {
+        let raw: RawId = state[..].try_into().expect("id is 16 bytes");
+        let Some((register, _)) = self.coordinates.get(&raw) else {
+            return false;
+        };
+        self.winners
+            .get(register)
+            .is_some_and(|(_, winner)| *winner != raw)
+    }
+}
+
+/// Exact maintained LWW projection of one named root collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LwwRegisterCollection {
+    name: CollectionName,
+    namespace: VerifyingKey,
+    source_authority: Option<VerifyingKey>,
+    identity: Id,
+    orders: Id,
+    source_reach: Fragment,
+    authority: Option<VerifyingKey>,
+    reach: Fragment,
+}
+
+impl LwwRegisterCollection {
+    /// Construct a maintained LWW register over one named root collection.
+    ///
+    /// `source_authority` must match the root descriptor exactly, while
+    /// `authority` independently controls this derived collection. Either may
+    /// be open (`None`) regardless of the other.
+    pub fn new(
+        name: CollectionName,
+        namespace: VerifyingKey,
+        source_authority: Option<VerifyingKey>,
+        identity: Id,
+        orders: Id,
+        source_reach: Fragment,
+        authority: Option<VerifyingKey>,
+        reach: Fragment,
+    ) -> Self {
+        Self {
+            name,
+            namespace,
+            source_authority,
+            identity,
+            orders,
+            source_reach,
+            authority,
+            reach,
+        }
+    }
+
+    /// Name of the source root collection.
+    pub fn name(&self) -> &CollectionName {
+        &self.name
+    }
+
+    /// Public-key namespace which scopes the source root's name.
+    pub fn namespace(&self) -> VerifyingKey {
+        self.namespace
+    }
+
+    /// Optional capability trust root declared by the source descriptor.
+    pub fn source_authority(&self) -> Option<VerifyingKey> {
+        self.source_authority
+    }
+
+    /// Optional capability trust root declared by this derived collection.
+    pub fn authority(&self) -> Option<VerifyingKey> {
+        self.authority
+    }
+
+    /// Attribute which states register identity.
+    pub fn identity(&self) -> Id {
+        self.identity
+    }
+
+    /// Attribute which states raw order values.
+    pub fn orders(&self) -> Id {
+        self.orders
+    }
+
+    /// How far the source collection may travel.
+    pub fn source_reach(&self) -> &Fragment {
+        &self.source_reach
+    }
+
+    /// How far this derived collection may travel.
+    pub fn reach(&self) -> &Fragment {
+        &self.reach
+    }
+
+    /// Canonical source `SimpleArchive` collection descriptor.
+    pub fn source_descriptor(&self) -> Fragment {
+        simplearchive_union::descriptor(
+            &self.name,
+            self.namespace,
+            self.source_authority,
+            self.source_reach.clone(),
+        )
+    }
+
+    /// Identity of the source collection.
+    pub fn source_collection(&self) -> CollectionHandle {
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.source_descriptor().into_facts())
+            .get_handle()
+    }
+
+    /// Canonical target collection descriptor.
+    pub fn descriptor(&self) -> Fragment {
+        descriptor(
+            self.source_collection(),
+            self.identity,
+            self.orders,
+            self.authority,
+            self.reach.clone(),
+        )
+    }
+
+    /// Attach an already resident exact projection for `ticket`.
+    pub fn attach_exact<S>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+    ) -> Result<LwwIndex, LwwRegisterCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Reader: BlobStoreMeta,
+    {
+        let cover = self.kernel().attach_exact(store, ticket, self)?;
+        self.index_from_cover(cover)
+    }
+
+    /// Ensure and attach the exact projection for `ticket`.
+    pub fn ensure_exact<S>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+    ) -> Result<LwwIndex, LwwRegisterCollectionError>
+    where
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S::Reader: BlobStoreMeta,
+    {
+        let cover = self.kernel().ensure_exact(store, ticket, self)?;
+        self.index_from_cover(cover)
+    }
+
+    fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, LwwRegisterBlob> {
+        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
+    }
+
+    fn index_from_cover(
+        &self,
+        cover: ExactCover<LwwRegisterBlob>,
+    ) -> Result<LwwIndex, LwwRegisterCollectionError> {
+        let mut combined = Projection::default();
+        for segment in cover.into_blobs() {
+            combined = combined
+                .union(decode_projection(&segment).map_err(LwwRegisterCollectionError::Algebra)?);
+        }
+        LwwIndex::from_projection(combined).map_err(LwwRegisterCollectionError::Algebra)
+    }
+}
+
+/// Failure to attach or construct one exact maintained LWW ticket.
+#[derive(Debug)]
+pub enum LwwRegisterCollectionError {
+    /// Exact-ticket authority, resolution, construction, or storage failed.
+    Collection(ExactDerivedCollectionError),
+    /// Canonical projection construction or joining failed.
+    Algebra(LwwRegisterError),
+}
+
+impl fmt::Display for LwwRegisterCollectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Collection(source) => source.fmt(formatter),
+            Self::Algebra(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for LwwRegisterCollectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Collection(source) => Some(source),
+            Self::Algebra(source) => Some(source),
+        }
+    }
+}
+
+impl From<ExactDerivedCollectionError> for LwwRegisterCollectionError {
+    fn from(source: ExactDerivedCollectionError) -> Self {
+        Self::Collection(source)
+    }
+}
+
+impl ExactDerivedAlgebra<SimpleArchive, LwwRegisterBlob> for LwwRegisterCollection {
+    fn validate_source(
+        &self,
+        descriptor: &Fragment,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<(), ExactAlgebraError> {
+        if *descriptor != self.source_descriptor() {
+            return Err(ExactAlgebraError::Fatal(
+                "source descriptor does not match this LWW register collection".to_owned(),
+            ));
+        }
+        simplearchive_union::validate_element(source)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &Fragment,
+        target: &Blob<LwwRegisterBlob>,
+    ) -> Result<(), ExactAlgebraError> {
+        if *descriptor != self.descriptor() {
+            return Err(ExactAlgebraError::Fatal(
+                "target descriptor does not match this LWW register collection".to_owned(),
+            ));
+        }
+        validate_element(target).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn join_source(
+        &self,
+        low: &Blob<SimpleArchive>,
+        high: &Blob<SimpleArchive>,
+    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
+        simplearchive_union::join(low, high)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn derive(
+        &self,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<LwwRegisterBlob>, ExactAlgebraError> {
+        derive_element(source, self.identity, self.orders)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn join_target(
+        &self,
+        low: &Blob<LwwRegisterBlob>,
+        high: &Blob<LwwRegisterBlob>,
+    ) -> Result<Blob<LwwRegisterBlob>, ExactAlgebraError> {
+        join(low, high).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collection::reach;
+    use crate::inline::encodings::time::{i128_to_ordered_be, NsTAIInterval};
+    use crate::inline::Inline;
+    use crate::prelude::*;
+    use crate::query::register::{resolve, StatedOrder};
+    use crate::repo::memoryrepo::MemoryRepo;
+    use crate::trible::TribleSet;
+    use std::collections::BTreeSet;
+
+    attributes! {
+        "46D95EBAB8D5D0E9103148B35731065C" as state_of: crate::inline::encodings::genid::GenId;
+        "3B7AD155842AE30B164A311858D4D9A6" as written_at: NsTAIInterval;
+    }
+
+    fn at(nanos: i128) -> Inline<NsTAIInterval> {
+        let bound = i128_to_ordered_be(nanos);
+        let mut raw = [0u8; KEY_LEN];
+        raw[0..16].copy_from_slice(&bound);
+        raw[16..32].copy_from_slice(&bound);
+        Inline::new(raw)
+    }
+
+    fn identity(state: &ExclusiveId, register: &ExclusiveId) -> TribleSet {
+        entity! { state @ state_of: register }.into()
+    }
+
+    fn order(state: &ExclusiveId, nanos: i128) -> TribleSet {
+        entity! { state @ written_at: at(nanos) }.into()
+    }
+
+    fn coordinate(state: &ExclusiveId, register: &ExclusiveId, nanos: i128) -> TribleSet {
+        let mut facts = identity(state, register);
+        facts += order(state, nanos);
+        facts
+    }
+
+    fn archive(facts: &TribleSet) -> Blob<SimpleArchive> {
+        facts.clone().to_blob()
+    }
+
+    fn project(facts: &TribleSet) -> Blob<LwwRegisterBlob> {
+        derive_element(&archive(facts), state_of.id(), written_at.id()).expect("valid projection")
+    }
+
+    #[test]
+    fn split_identity_and_order_facts_form_a_coordinate_only_after_join() {
+        let register = ufoid();
+        let state = ufoid();
+        let identities = identity(&state, &register);
+        let orders = order(&state, 42);
+
+        let left = project(&identities);
+        let right = project(&orders);
+        assert_eq!(LwwIndex::decode(&left).unwrap().len(), 0);
+        assert_eq!(LwwIndex::decode(&right).unwrap().len(), 0);
+
+        let combined = join(&left, &right).expect("projection row sets join");
+        let index = LwwIndex::decode(&combined).expect("joined index decodes");
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.winner(*register), Some(*state));
+
+        let mut union = identities;
+        union += orders;
+        assert_eq!(combined.bytes.as_ref(), project(&union).bytes.as_ref());
+    }
+
+    #[test]
+    fn every_three_way_partition_has_the_same_byte_exact_projection() {
+        let register = ufoid();
+        let other_register = ufoid();
+        let first = ufoid();
+        let second = ufoid();
+        let elsewhere = ufoid();
+        let facts = [
+            identity(&first, &register),
+            order(&first, 1),
+            identity(&second, &register),
+            order(&second, 2),
+            identity(&elsewhere, &other_register),
+            order(&elsewhere, 3),
+        ];
+        let mut complete = TribleSet::new();
+        for fact in &facts {
+            complete += fact.clone();
+        }
+        let direct = project(&complete);
+
+        // 3^6 partitions include every way of separating each state's two
+        // halves while keeping every source fact in exactly one shard.
+        for mut assignment in 0usize..3usize.pow(facts.len() as u32) {
+            let mut shards = [TribleSet::new(), TribleSet::new(), TribleSet::new()];
+            for fact in &facts {
+                let shard = assignment % 3;
+                assignment /= 3;
+                shards[shard] += fact.clone();
+            }
+            let joined = join(
+                &join(&project(&shards[0]), &project(&shards[1])).unwrap(),
+                &project(&shards[2]),
+            )
+            .unwrap();
+            assert_eq!(joined.bytes.as_ref(), direct.bytes.as_ref());
+        }
+    }
+
+    #[test]
+    fn target_join_is_associative_commutative_idempotent_with_empty_unit() {
+        let register = ufoid();
+        let a = ufoid();
+        let b = ufoid();
+        let c = ufoid();
+        let pa = project(&identity(&a, &register));
+        let pb = project(&order(&a, 1));
+        let pc = project(&coordinate(&b, &register, 2));
+        let duplicate = project(&coordinate(&c, &register, 3));
+
+        let ab = join(&pa, &pb).unwrap();
+        assert_eq!(
+            join(&pa, &pb).unwrap().bytes.as_ref(),
+            join(&pb, &pa).unwrap().bytes.as_ref(),
+            "commutative"
+        );
+        assert_eq!(
+            join(&ab, &ab).unwrap().bytes.as_ref(),
+            ab.bytes.as_ref(),
+            "idempotent"
+        );
+        assert_eq!(
+            join(&ab, &empty()).unwrap().bytes.as_ref(),
+            ab.bytes.as_ref(),
+            "empty unit"
+        );
+        let left = join(&join(&ab, &pc).unwrap(), &duplicate).unwrap();
+        let right = join(&ab, &join(&pc, &duplicate).unwrap()).unwrap();
+        assert_eq!(left.bytes.as_ref(), right.bytes.as_ref(), "associative");
+    }
+
+    #[test]
+    fn attached_order_matches_live_stated_order_on_valid_data() {
+        let register = ufoid();
+        let other_register = ufoid();
+        let early = ufoid();
+        let tied_low = ufoid();
+        let tied_high = ufoid();
+        let elsewhere = ufoid();
+        let identity_only = ufoid();
+        let order_only = ufoid();
+        let mut facts = TribleSet::new();
+        facts += coordinate(&early, &register, 1);
+        facts += coordinate(&tied_low, &register, 9);
+        facts += coordinate(&tied_high, &register, 9);
+        facts += coordinate(&elsewhere, &other_register, 50);
+        facts += identity(&identity_only, &register);
+        facts += order(&order_only, 99);
+        let candidates = [
+            *early,
+            *tied_low,
+            *tied_high,
+            *elsewhere,
+            *identity_only,
+            *order_only,
+        ];
+
+        let index = LwwIndex::decode(&project(&facts)).unwrap();
+        let live = StatedOrder::<_, NsTAIInterval>::new(&facts, state_of.id(), written_at.id())
+            .tiebreak_by_id();
+        assert_eq!(resolve(&index, candidates), resolve(&live, candidates));
+        assert_eq!(
+            index.winner(*register),
+            Some((*tied_low).max(*tied_high)),
+            "equal keys break toward the greatest state id"
+        );
+        assert_eq!(index.winner(*other_register), Some(*elsewhere));
+        assert_eq!(index.unresolved_count(), 2);
+        assert_eq!(
+            resolve(&index, [*identity_only, *order_only]),
+            [*identity_only, *order_only]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "missing coordinates remain incomparable"
+        );
+    }
+
+    #[test]
+    fn malformed_genid_identity_is_ignored_like_the_live_typed_order() {
+        let state = ufoid();
+        let mut raw = [0u8; TRIBLE_LEN];
+        raw[E_START..E_START + ID_LEN].copy_from_slice(&state[..]);
+        raw[A_START..A_START + ID_LEN].copy_from_slice(&state_of.id()[..]);
+        raw[V_START..V_START + KEY_LEN].fill(0x7f);
+        let malformed = Trible::force_raw(raw).expect("entity and attribute are non-nil");
+        let mut facts = TribleSet::new();
+        facts.insert(&malformed);
+        facts += order(&state, 99);
+
+        let index = LwwIndex::decode(&project(&facts)).unwrap();
+        let live = StatedOrder::<_, NsTAIInterval>::new(&facts, state_of.id(), written_at.id())
+            .tiebreak_by_id();
+        assert_eq!(resolve(&index, [*state]), resolve(&live, [*state]));
+        assert_eq!(index.unresolved_count(), 1);
+    }
+
+    #[test]
+    fn conflicts_are_retained_until_a_state_has_both_halves() {
+        let one = ufoid();
+        let two = ufoid();
+        let state = ufoid();
+        let left = project(&identity(&state, &one));
+        let right = project(&identity(&state, &two));
+        let identities = join(&left, &right).unwrap();
+        assert_eq!(
+            identities.bytes.as_ref(),
+            join(&right, &left).unwrap().bytes.as_ref()
+        );
+        let mut identity_union = identity(&state, &one);
+        identity_union += identity(&state, &two);
+        assert_eq!(
+            identities.bytes.as_ref(),
+            project(&identity_union).bytes.as_ref()
+        );
+        assert_eq!(
+            LwwIndex::decode(&identities).unwrap().unresolved_count(),
+            1,
+            "identity-only multiplicity is unrelated open-world data"
+        );
+        let complete = join(&identities, &project(&order(&state, 1))).unwrap();
+        assert_eq!(
+            LwwIndex::decode(&complete),
+            Err(LwwRegisterError::ConflictingIdentity(
+                (*state)[..].try_into().unwrap()
+            ))
+        );
+
+        let first = project(&order(&state, 1));
+        let second = project(&order(&state, 2));
+        let orders = join(&first, &second).unwrap();
+        let mut order_union = order(&state, 1);
+        order_union += order(&state, 2);
+        assert_eq!(orders.bytes.as_ref(), project(&order_union).bytes.as_ref());
+        assert_eq!(
+            LwwIndex::decode(&orders).unwrap().unresolved_count(),
+            1,
+            "order-only multiplicity is unrelated open-world data"
+        );
+        let complete = join(&project(&identity(&state, &one)), &orders).unwrap();
+        assert_eq!(
+            LwwIndex::decode(&complete),
+            Err(LwwRegisterError::ConflictingOrder(
+                (*state)[..].try_into().unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn descriptor_carries_both_register_arguments() {
+        use crate::collection::descriptor as descriptor_facts;
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let source = crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+            simplearchive_union::descriptor(
+                &CollectionName::new("source").unwrap(),
+                key,
+                Some(key),
+                reach::private(),
+            )
+            .into_facts(),
+        )
+        .get_handle();
+        let stated = descriptor(
+            source,
+            state_of.id(),
+            written_at.id(),
+            Some(key),
+            reach::private(),
+        );
+        assert_eq!(
+            descriptor_facts::argument(stated.facts(), register_identity.id()),
+            Some(
+                <Id as crate::inline::IntoInline<crate::inline::encodings::genid::GenId>>::to_inline(
+                    state_of.id(),
+                )
+                .raw,
+            )
+        );
+        assert_eq!(
+            descriptor_facts::argument(stated.facts(), register_orders.id()),
+            Some(
+                <Id as crate::inline::IntoInline<crate::inline::encodings::genid::GenId>>::to_inline(
+                    written_at.id(),
+                )
+                .raw,
+            )
+        );
+        assert_ne!(
+            stated,
+            descriptor(
+                source,
+                metadata::tag.id(),
+                written_at.id(),
+                Some(key),
+                reach::private(),
+            )
+        );
+    }
+
+    #[test]
+    fn open_source_and_derived_descriptors_omit_authority_exactly() {
+        use crate::collection::descriptor as descriptor_facts;
+
+        let namespace = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key();
+        let name = CollectionName::new("open-lww-source").unwrap();
+        let collection = LwwRegisterCollection::new(
+            name.clone(),
+            namespace,
+            None,
+            state_of.id(),
+            written_at.id(),
+            reach::private(),
+            None,
+            reach::private(),
+        );
+
+        assert_eq!(
+            collection.source_descriptor(),
+            simplearchive_union::descriptor(&name, namespace, None, reach::private())
+        );
+        assert!(descriptor_facts::authority(collection.source_descriptor().facts()).is_none());
+        assert!(descriptor_facts::authority(collection.descriptor().facts()).is_none());
+
+        let gated_target = LwwRegisterCollection::new(
+            name.clone(),
+            namespace,
+            None,
+            state_of.id(),
+            written_at.id(),
+            reach::private(),
+            Some(namespace),
+            reach::private(),
+        );
+        assert!(descriptor_facts::authority(gated_target.source_descriptor().facts()).is_none());
+        assert_eq!(
+            descriptor_facts::authority(gated_target.descriptor().facts())
+                .transpose()
+                .unwrap(),
+            Some(namespace)
+        );
+
+        let gated_source = LwwRegisterCollection::new(
+            name,
+            namespace,
+            Some(namespace),
+            state_of.id(),
+            written_at.id(),
+            reach::private(),
+            None,
+            reach::private(),
+        );
+        assert_eq!(
+            descriptor_facts::authority(gated_source.source_descriptor().facts())
+                .transpose()
+                .unwrap(),
+            Some(namespace)
+        );
+        assert!(descriptor_facts::authority(gated_source.descriptor().facts()).is_none());
+    }
+
+    #[test]
+    fn exact_collection_lifecycle_joins_fact_halves_from_distinct_commits() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let team = signing_key.verifying_key();
+        let collection = LwwRegisterCollection::new(
+            CollectionName::new("maintained-lww").unwrap(),
+            team,
+            Some(team),
+            state_of.id(),
+            written_at.id(),
+            reach::private(),
+            Some(team),
+            reach::private(),
+        );
+        let register = ufoid();
+        let state = ufoid();
+        let identity_data = archive(&identity(&state, &register));
+        let order_data = archive(&order(&state, 42));
+        let metadata = TribleSet::new().to_blob();
+        let mut store = MemoryRepo::default();
+        let identity_commit = simplearchive_union::publish_commit(
+            &mut store,
+            &collection.source_descriptor(),
+            &identity_data,
+            &metadata,
+            &signing_key,
+        )
+        .unwrap();
+        let order_commit = simplearchive_union::publish_commit(
+            &mut store,
+            &collection.source_descriptor(),
+            &order_data,
+            &metadata,
+            &signing_key,
+        )
+        .unwrap();
+        let ticket = [identity_commit, order_commit];
+
+        let ensured = collection.ensure_exact(&mut store, &ticket).unwrap();
+        assert_eq!(ensured.winner(*register), Some(*state));
+        assert_eq!(
+            collection
+                .attach_exact(&mut store, &ticket)
+                .unwrap()
+                .winner(*register),
+            Some(*state)
+        );
+    }
+
+    #[test]
+    fn malformed_target_bytes_are_rejected() {
+        let ragged = Blob::<LwwRegisterBlob>::new(Bytes::from_source(vec![0u8; HEADER_LEN - 1]));
+        assert_eq!(
+            validate_element(&ragged),
+            Err(LwwRegisterError::BadLength {
+                expected: HEADER_LEN,
+                actual: HEADER_LEN - 1,
+            })
+        );
+
+        let state = ufoid();
+        let register = ufoid();
+        let canonical = project(&identity(&state, &register));
+        let mut bytes = canonical.bytes.as_ref().to_vec();
+        bytes.extend_from_slice(&[0]);
+        let extended = Blob::<LwwRegisterBlob>::new(Bytes::from_source(bytes));
+        assert!(matches!(
+            validate_element(&extended),
+            Err(LwwRegisterError::BadLength { .. })
+        ));
+
+        let nil_state = Projection {
+            identities: BTreeSet::from([([0; ID_LEN], [1; ID_LEN])]),
+            orders: BTreeSet::new(),
+        }
+        .encode();
+        assert_eq!(
+            validate_element(&nil_state),
+            Err(LwwRegisterError::NilState)
+        );
+
+        let nil_register = Projection {
+            identities: BTreeSet::from([([1; ID_LEN], [0; ID_LEN])]),
+            orders: BTreeSet::new(),
+        }
+        .encode();
+        assert_eq!(
+            validate_element(&nil_register),
+            Err(LwwRegisterError::NilRegister)
+        );
+
+        let mut descending = Vec::new();
+        descending.extend_from_slice(&2u64.to_be_bytes());
+        descending.extend_from_slice(&0u64.to_be_bytes());
+        descending.extend_from_slice(&[2; ID_LEN]);
+        descending.extend_from_slice(&[3; ID_LEN]);
+        descending.extend_from_slice(&[1; ID_LEN]);
+        descending.extend_from_slice(&[3; ID_LEN]);
+        let descending = Blob::<LwwRegisterBlob>::new(Bytes::from_source(descending));
+        assert_eq!(
+            validate_element(&descending),
+            Err(LwwRegisterError::IdentityOrder)
+        );
+
+        let overflowing = Blob::<LwwRegisterBlob>::new(Bytes::from_source(vec![0xff; HEADER_LEN]));
+        assert_eq!(
+            validate_element(&overflowing),
+            Err(LwwRegisterError::CountOverflow)
+        );
+    }
+}

@@ -35,7 +35,9 @@
 //!
 //! # What it costs the reader
 //!
-//! [`ObservedIndex`] implements [`RegisterOrder`], so it is a drop-in for
+//! [`ObservedIndex`](crate::collection::observed_union::ObservedIndex)
+//! implements [`RegisterOrder`](crate::query::register::RegisterOrder), so it
+//! is a drop-in for
 //! [`ObservationOrder`](crate::query::register::ObservationOrder) in
 //! [`resolve`](crate::query::register::resolve),
 //! [`sole`](crate::query::register::sole) and
@@ -45,10 +47,10 @@
 //!
 //! # Identity
 //!
-//! The observed attribute participates in the collection's recipe id, the
-//! way a path collection's automaton fingerprint does: two registers over
-//! the same dataset but different edges are distinct collections, and cannot
-//! be confused for one another's cache.
+//! The observed attribute is a canonical descriptor argument, the way a path
+//! collection carries its automaton fingerprint: two registers over the same
+//! dataset but different edges are distinct collections, and cannot be
+//! confused for one another's maintained artifacts.
 
 use crate::collection::records::CollectionName;
 use ed25519_dalek::VerifyingKey;
@@ -331,12 +333,14 @@ impl RegisterOrder for ObservedIndex {
 
 /// Canonical observed-set projection of one source `SimpleArchive`
 /// collection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedSetCollection {
     name: CollectionName,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
+    source_authority: Option<VerifyingKey>,
     observes: Id,
     source_reach: Fragment,
+    authority: Option<VerifyingKey>,
     reach: Fragment,
 }
 
@@ -346,18 +350,26 @@ impl ObservedSetCollection {
     /// `source_reach` completes the root's identity; `reach` is this
     /// projection's own. A derivation never inherits its source's reach --
     /// see [`reach::travels`](crate::collection::reach::travels).
+    /// `source_authority` must likewise match the root descriptor exactly;
+    /// `authority` independently declares the derived collection's trust
+    /// root. Either collection may be open (`None`) without forcing the other
+    /// to be open.
     pub fn new(
         name: CollectionName,
-        team: VerifyingKey,
+        namespace: VerifyingKey,
+        source_authority: Option<VerifyingKey>,
         observes: Id,
         source_reach: Fragment,
+        authority: Option<VerifyingKey>,
         reach: Fragment,
     ) -> Self {
         Self {
             name,
-            team,
+            namespace,
+            source_authority,
             observes,
             source_reach,
+            authority,
             reach,
         }
     }
@@ -377,9 +389,19 @@ impl ObservedSetCollection {
         &self.name
     }
 
-    /// Team owning the root collection this projection is taken over.
-    pub fn team(&self) -> VerifyingKey {
-        self.team
+    /// Public-key namespace which scopes the source root's name.
+    pub fn namespace(&self) -> VerifyingKey {
+        self.namespace
+    }
+
+    /// Optional capability trust root declared by the source descriptor.
+    pub fn source_authority(&self) -> Option<VerifyingKey> {
+        self.source_authority
+    }
+
+    /// Optional capability trust root declared by this derived collection.
+    pub fn authority(&self) -> Option<VerifyingKey> {
+        self.authority
     }
 
     /// The observation attribute this collection reads.
@@ -391,8 +413,8 @@ impl ObservedSetCollection {
     pub fn source_descriptor(&self) -> Fragment {
         simplearchive_union::descriptor(
             &self.name,
-            self.team,
-            Some(self.team),
+            self.namespace,
+            self.source_authority,
             self.source_reach.clone(),
         )
     }
@@ -408,7 +430,7 @@ impl ObservedSetCollection {
         descriptor(
             self.source_collection(),
             self.observes,
-            Some(self.team),
+            self.authority,
             self.reach.clone(),
         )
     }
@@ -694,6 +716,64 @@ mod tests {
         facts += edge(&b, &a);
         let other = derive_element(&archive(&facts), metadata::tag.id()).expect("derives");
         assert!(other.bytes.as_ref().is_empty());
+    }
+
+    #[test]
+    fn open_source_and_derived_descriptors_omit_authority_exactly() {
+        use crate::collection::descriptor as descriptor_facts;
+
+        let namespace = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let name = CollectionName::new("open-observed-source").unwrap();
+        let collection = ObservedSetCollection::new(
+            name.clone(),
+            namespace,
+            None,
+            metadata::supersedes.id(),
+            reach::private(),
+            None,
+            reach::private(),
+        );
+
+        assert_eq!(
+            collection.source_descriptor(),
+            simplearchive_union::descriptor(&name, namespace, None, reach::private())
+        );
+        assert!(descriptor_facts::authority(collection.source_descriptor().facts()).is_none());
+        assert!(descriptor_facts::authority(collection.descriptor().facts()).is_none());
+
+        let gated_target = ObservedSetCollection::new(
+            name.clone(),
+            namespace,
+            None,
+            metadata::supersedes.id(),
+            reach::private(),
+            Some(namespace),
+            reach::private(),
+        );
+        assert!(descriptor_facts::authority(gated_target.source_descriptor().facts()).is_none());
+        assert_eq!(
+            descriptor_facts::authority(gated_target.descriptor().facts())
+                .transpose()
+                .unwrap(),
+            Some(namespace)
+        );
+
+        let gated_source = ObservedSetCollection::new(
+            name,
+            namespace,
+            Some(namespace),
+            metadata::supersedes.id(),
+            reach::private(),
+            None,
+            reach::private(),
+        );
+        assert_eq!(
+            descriptor_facts::authority(gated_source.source_descriptor().facts())
+                .transpose()
+                .unwrap(),
+            Some(namespace)
+        );
+        assert!(descriptor_facts::authority(gated_source.descriptor().facts()).is_none());
     }
 
     #[test]

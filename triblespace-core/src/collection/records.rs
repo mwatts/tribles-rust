@@ -1288,6 +1288,7 @@ mod tests {
 
 #[cfg(test)]
 mod recipe_description_tests {
+    use crate::collection::lww_register::LwwRegisterV1;
     use crate::collection::observed_union::ObservedUnionV1;
     use crate::collection::simplearchive_union::TribleSetUnionV1;
     use crate::collection::succinctarchive_union::{
@@ -1324,6 +1325,10 @@ mod recipe_description_tests {
         check::<ObservedUnionV1>(
             crate::collection::observed_union::OBSERVED_UNION_RECIPE_V1,
             "observed-union-v1",
+        );
+        check::<LwwRegisterV1>(
+            crate::collection::lww_register::LWW_REGISTER_RECIPE_V1,
+            "lww-register-v1",
         );
         check::<StatedOrderV1>(
             crate::query::register::STATED_ORDER_RECIPE_V1,
