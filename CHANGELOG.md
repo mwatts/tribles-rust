@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `SuccinctArchiveCollection::exact_view()` for maintaining one admitted
+  in-process query view across exact ticket observations. Unchanged support
+  performs no storage I/O, monotone additions run ordinary exact admission only
+  over the signed delta and union immutable shards, and shrinking observations
+  rebuild. The continuation is ephemeral and advances only after complete
+  success; it creates no receipts, revision tokens, or alternate trust path.
+
 - Add `exact_ticket_additions` as the pure continuation boundary between two
   exact collection observations. It canonicalizes complete commit sets,
   returns newly observed signed support only when the previous ticket remains

@@ -1,26 +1,31 @@
 //! Evolving-ticket maintenance benchmark for canonical Succinct collections.
 //!
-//! This benchmark compares the two real public maintenance operations on
+//! This benchmark compares the three real public maintenance operations on
 //! geometrically growing exact tickets:
 //!
 //! - `ensure_exact`: canonical raw Succinct derivation plus Rank9 fibers.
+//! - `exact_view().ensure`: retain already-admitted immutable shards and run
+//!   ordinary exact admission only over newly signed support.
 //! - `compact_exact`: the same exact completion plus deterministic dyadic
 //!   raw-target compaction and Rank9 fibers for the selected cover.
 //!
-//! Each operation gets an independent warm store, a source-identical cold
+//! Stateless operations get an independent warm store, a source-identical cold
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
-//! source commits are appended outside the timers. Store deltas quantify new
-//! durable state avoided by an evolved store; a bench-local algebra wrapper
-//! then performs one untimed, zero-write raw admission to expose algebra work
-//! that store totals hide.
+//! maintained view gets its own evolving store and immediate no-op. Source
+//! commits are appended outside the timers. Store deltas quantify new durable
+//! state; a bench-local algebra wrapper performs one untimed, zero-write raw
+//! re-admission for stateless arms to expose replay work that store totals hide.
+//! The maintained view is intentionally not replayed after timing: that would
+//! measure the stateless operation it exists to avoid, not its actual work.
 //! No scan or diagnostic touches a measured store before its first timed call
 //! at a checkpoint, and the immediate no-op remains adjacent to that call.
 //!
 //! Final relations are materialized outside the timers into canonical
 //! contiguous SimpleArchive bytes. Their cached content handles must match the
-//! exact source prefix and the corresponding warm/cold/no-op arms. Physical
-//! cover identities are reported but need not match: optional evidence may
-//! choose another exact cover without changing the logical relation.
+//! exact source prefix and the corresponding warm/cold/no-op arms. Stateless
+//! raw-cover identities and maintained-view segment counts are reported, but
+//! physical covers need not match: optional evidence may choose another exact
+//! cover without changing the logical relation.
 //!
 //! Usage:
 //!
@@ -45,7 +50,9 @@ use triblespace_core::collection::exact_derived::{
     ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
 };
 use triblespace_core::collection::reach;
-use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
+use triblespace_core::collection::succinctarchive_union::{
+    SuccinctArchiveCollection, SuccinctArchiveView,
+};
 use triblespace_core::collection::{
     CollectionAdmission, CollectionCommit, CollectionHandle, CollectionRecord, CollectionStore,
 };
@@ -308,6 +315,8 @@ enum Arm {
     EnsureWarm,
     EnsureCold,
     EnsureNoop,
+    ViewAdvance,
+    ViewNoop,
     CompactWarm,
     CompactCold,
     CompactNoop,
@@ -319,6 +328,8 @@ impl Arm {
             Self::EnsureWarm => "ensure-warm",
             Self::EnsureCold => "ensure-cold",
             Self::EnsureNoop => "ensure-noop",
+            Self::ViewAdvance => "view-advance",
+            Self::ViewNoop => "view-noop",
             Self::CompactWarm => "compact-warm",
             Self::CompactCold => "compact-cold",
             Self::CompactNoop => "compact-noop",
@@ -334,9 +345,18 @@ struct Sample {
     basis_rows: u64,
     elapsed: Duration,
     work: StoreShape,
-    algebra_calls: AlgebraCalls,
+    diagnostic: Diagnostic,
     relation: RelationIdentity,
-    cover: CoverIdentity,
+    cover_members: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Diagnostic {
+    Raw {
+        calls: AlgebraCalls,
+        cover: CoverIdentity,
+    },
+    NotMeasured,
 }
 
 struct TimedOperation {
@@ -413,9 +433,9 @@ fn finish_sample(
     basis_rows: u64,
     timed: TimedOperation,
     work: StoreShape,
-    diagnostic: (AlgebraCalls, CoverIdentity),
+    diagnostic: Option<(AlgebraCalls, CoverIdentity)>,
 ) -> Sample {
-    let (algebra_calls, cover) = diagnostic;
+    let cover_members = timed.union.segment_count() as u64;
     let relation = relation_identity(timed.union.iter());
     Sample {
         arm,
@@ -424,9 +444,12 @@ fn finish_sample(
         basis_rows,
         elapsed: timed.elapsed,
         work,
-        algebra_calls,
+        diagnostic: match diagnostic {
+            Some((calls, cover)) => Diagnostic::Raw { calls, cover },
+            None => Diagnostic::NotMeasured,
+        },
         relation,
-        cover,
+        cover_members,
     }
 }
 
@@ -475,7 +498,7 @@ fn run_warm_pair(
         context.newly_supported_rows,
         timed_warm,
         warm_work,
-        diagnostic,
+        Some(diagnostic),
     );
     assert_eq!(warm.relation, context.expected);
 
@@ -485,7 +508,7 @@ fn run_warm_pair(
         context.total_rows,
         timed_noop,
         StoreShape::default(),
-        diagnostic,
+        Some(diagnostic),
     );
     assert_eq!(noop.relation, context.expected);
     ([warm, noop], after)
@@ -507,7 +530,7 @@ fn run_cold(
         context.total_rows,
         timed,
         after.difference(before),
-        diagnostic,
+        Some(diagnostic),
     );
     assert_eq!(cold.relation, context.expected);
     cold
@@ -536,6 +559,72 @@ fn run_operation_family(
         (warm_pair, warm_after, cold)
     };
     (vec![warm_pair[0], cold, warm_pair[1]], warm_after)
+}
+
+fn time_exact_view(
+    view: &mut SuccinctArchiveView,
+    store: &mut MemoryRepo,
+    ticket: &[CollectionCommit],
+) -> TimedOperation {
+    let start = Instant::now();
+    let union = view
+        .ensure(store, ticket)
+        .expect("advance maintained exact Succinct view");
+    let elapsed = start.elapsed();
+    black_box(union.segment_count());
+    TimedOperation { elapsed, union }
+}
+
+fn run_exact_view_pair(
+    view: &mut SuccinctArchiveView,
+    store: &mut MemoryRepo,
+    context: &RunContext<'_>,
+    before: StoreShape,
+) -> ([Sample; 2], StoreShape) {
+    let timed_advance = time_exact_view(view, store, context.ticket);
+    let revision_after_advance = store
+        .store_revision()
+        .expect("snapshot revision between view advance and no-op");
+    let offers_after_advance = store
+        .offers_snapshot()
+        .expect("snapshot offers between view advance and no-op");
+
+    let timed_noop = time_exact_view(view, store, context.ticket);
+    assert!(
+        store
+            .store_revision()
+            .expect("snapshot revision after view no-op")
+            == revision_after_advance,
+        "an unchanged exact view changed sync-visible storage",
+    );
+    assert_eq!(
+        store
+            .offers_snapshot()
+            .expect("snapshot offers after view no-op"),
+        offers_after_advance,
+        "an unchanged exact view published an artifact offer",
+    );
+
+    let after = store_shape(store, context.collections);
+    let advance = finish_sample(
+        Arm::ViewAdvance,
+        context,
+        context.newly_supported_rows,
+        timed_advance,
+        after.difference(before),
+        None,
+    );
+    let noop = finish_sample(
+        Arm::ViewNoop,
+        context,
+        context.total_rows,
+        timed_noop,
+        StoreShape::default(),
+        None,
+    );
+    assert_eq!(advance.relation, context.expected);
+    assert_eq!(noop.relation, context.expected);
+    ([advance, noop], after)
 }
 
 fn geometric_checkpoints(commits: usize) -> Vec<usize> {
@@ -617,7 +706,9 @@ fn run_iteration(
     let mut cold_ensure_source = new_source_collection();
     let mut cold_compact_source = new_source_collection();
     let mut warm_ensure = new_source_collection();
+    let mut exact_view_source = new_source_collection();
     let mut warm_compact = new_source_collection();
+    let mut exact_view = succinct.exact_view();
     let exact = ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob>::new(
         succinct.source_descriptor(),
         succinct.descriptor(),
@@ -631,8 +722,9 @@ fn run_iteration(
     let mut published = 0usize;
     let mut previous_rows = 0u64;
     let mut expected = TribleSet::new();
-    let mut samples = Vec::with_capacity(checkpoints.len() * 6);
+    let mut samples = Vec::with_capacity(checkpoints.len() * 8);
     let mut ensure_derived_shape = StoreShape::default();
+    let mut view_derived_shape = StoreShape::default();
     let mut compact_derived_shape = StoreShape::default();
     for &checkpoint in checkpoints {
         for chunk in &chunks[published..checkpoint] {
@@ -644,6 +736,7 @@ fn run_iteration(
                     &mut cold_ensure_source,
                     &mut cold_compact_source,
                     &mut warm_ensure,
+                    &mut exact_view_source,
                     &mut warm_compact,
                 ],
             );
@@ -673,6 +766,7 @@ fn run_iteration(
         let mut cold_ensure = cold_ensure_source.storage().clone();
         let mut cold_compact = cold_compact_source.storage().clone();
         let ensure_before = source_shape.plus(ensure_derived_shape);
+        let view_before = source_shape.plus(view_derived_shape);
         let compact_before = source_shape.plus(compact_derived_shape);
         if iteration.is_multiple_of(2) {
             let (family, warm_after) = run_operation_family(
@@ -685,6 +779,15 @@ fn run_iteration(
             );
             samples.extend(family);
             ensure_derived_shape = warm_after.difference(source_shape);
+
+            let (pair, after) = run_exact_view_pair(
+                &mut exact_view,
+                exact_view_source.storage_mut(),
+                &context,
+                view_before,
+            );
+            samples.extend(pair);
+            view_derived_shape = after.difference(source_shape);
 
             let (family, warm_after) = run_operation_family(
                 iteration,
@@ -707,6 +810,15 @@ fn run_iteration(
             );
             samples.extend(family);
             compact_derived_shape = warm_after.difference(source_shape);
+
+            let (pair, after) = run_exact_view_pair(
+                &mut exact_view,
+                exact_view_source.storage_mut(),
+                &context,
+                view_before,
+            );
+            samples.extend(pair);
+            view_derived_shape = after.difference(source_shape);
 
             let (family, warm_after) = run_operation_family(
                 iteration,
@@ -727,11 +839,11 @@ fn run_iteration(
 struct Aggregate {
     elapsed_ns: Vec<u128>,
     work: Option<StoreShape>,
-    algebra_calls: Option<AlgebraCalls>,
+    diagnostic: Option<Diagnostic>,
     total_rows: u64,
     basis_rows: u64,
     relation: Option<RelationIdentity>,
-    cover: Option<CoverIdentity>,
+    cover_members: u64,
 }
 
 impl Aggregate {
@@ -741,24 +853,31 @@ impl Aggregate {
             None => self.work = Some(sample.work),
             Some(expected) => assert_eq!(expected, sample.work, "store work changed across runs"),
         }
-        match self.algebra_calls {
-            None => self.algebra_calls = Some(sample.algebra_calls),
+        match self.diagnostic {
+            None => self.diagnostic = Some(sample.diagnostic),
             Some(expected) => assert_eq!(
-                expected, sample.algebra_calls,
-                "algebra work changed across runs",
+                expected, sample.diagnostic,
+                "diagnostic work changed across runs",
             ),
         }
         if self.total_rows == 0 {
             self.total_rows = sample.total_rows;
             self.basis_rows = sample.basis_rows;
             self.relation = Some(sample.relation);
-            self.cover = Some(sample.cover);
+            self.cover_members = sample.cover_members;
         } else {
             assert_eq!(self.total_rows, sample.total_rows);
             assert_eq!(self.basis_rows, sample.basis_rows);
             assert_eq!(self.relation, Some(sample.relation));
-            assert_eq!(self.cover, Some(sample.cover));
+            assert_eq!(self.cover_members, sample.cover_members);
         }
+    }
+}
+
+fn raw_cover(aggregate: &Aggregate) -> CoverIdentity {
+    match aggregate.diagnostic.expect("diagnostic observation") {
+        Diagnostic::Raw { cover, .. } => cover,
+        Diagnostic::NotMeasured => panic!("arm has no raw-cover diagnostic"),
     }
 }
 
@@ -853,6 +972,8 @@ fn main() {
         Arm::EnsureWarm,
         Arm::EnsureCold,
         Arm::EnsureNoop,
+        Arm::ViewAdvance,
+        Arm::ViewNoop,
         Arm::CompactWarm,
         Arm::CompactCold,
         Arm::CompactNoop,
@@ -872,13 +993,13 @@ fn main() {
                 elapsed as f64 / 1_000_000.0,
                 elapsed as f64 / aggregate.basis_rows.max(1) as f64,
                 aggregate.basis_rows,
-                aggregate.cover.expect("cover identity").members,
+                aggregate.cover_members,
             );
         }
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 derives; algebra=vs/vt/d/js/jt calls and cumulative argument MiB in one untimed zero-write raw re-admission"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 derives; stateless algebra=vs/vt/d/js/jt calls and cumulative argument MiB in one untimed zero-write raw re-admission"
     );
     println!(
         "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>26} {:>10}",
@@ -897,9 +1018,23 @@ fn main() {
         for arm in arms {
             let aggregate = &aggregates[&(checkpoint, arm)];
             let work = aggregate.work.expect("store work");
-            let calls = aggregate.algebra_calls.expect("algebra calls");
+            let (calls, argument_mib) = match aggregate.diagnostic.expect("diagnostic observation")
+            {
+                Diagnostic::Raw { calls, .. } => (
+                    format!(
+                        "{}/{}/{}/{}/{}",
+                        calls.validate_source,
+                        calls.validate_target,
+                        calls.derive,
+                        calls.join_source,
+                        calls.join_target,
+                    ),
+                    format!("{:.2}", calls.input_bytes as f64 / (1024.0 * 1024.0)),
+                ),
+                Diagnostic::NotMeasured => ("not replayed".to_owned(), "-".to_owned()),
+            };
             println!(
-                "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>26} {:>10.2}",
+                "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>26} {:>10}",
                 checkpoint,
                 arm.label(),
                 work.blobs,
@@ -908,15 +1043,8 @@ fn main() {
                 work.raw_derives,
                 work.raw_merges,
                 work.rank9_derives,
-                format!(
-                    "{}/{}/{}/{}/{}",
-                    calls.validate_source,
-                    calls.validate_target,
-                    calls.derive,
-                    calls.join_source,
-                    calls.join_target,
-                ),
-                calls.input_bytes as f64 / (1024.0 * 1024.0),
+                calls,
+                argument_mib,
             );
             assert_eq!(work.commits, 0, "measured operation wrote a COMMIT");
             assert_eq!(
@@ -936,20 +1064,13 @@ fn main() {
         for arm in arms {
             assert_eq!(aggregates[&(checkpoint, arm)].relation, Some(relation));
         }
-        let ensure_warm = aggregates[&(checkpoint, Arm::EnsureWarm)]
-            .cover
-            .expect("ensure warm cover");
-        let ensure_cold = aggregates[&(checkpoint, Arm::EnsureCold)]
-            .cover
-            .expect("ensure cold cover");
-        let compact_warm = aggregates[&(checkpoint, Arm::CompactWarm)]
-            .cover
-            .expect("compact warm cover");
-        let compact_cold = aggregates[&(checkpoint, Arm::CompactCold)]
-            .cover
-            .expect("compact cold cover");
+        let ensure_warm = raw_cover(&aggregates[&(checkpoint, Arm::EnsureWarm)]);
+        let ensure_cold = raw_cover(&aggregates[&(checkpoint, Arm::EnsureCold)]);
+        let compact_warm = raw_cover(&aggregates[&(checkpoint, Arm::CompactWarm)]);
+        let compact_cold = raw_cover(&aggregates[&(checkpoint, Arm::CompactCold)]);
+        let view_members = aggregates[&(checkpoint, Arm::ViewAdvance)].cover_members;
         println!(
-            "  commits={checkpoint:<7} rows={:<9} logical={} ensure-physical={} ({}/{}) compact-physical={} ({}/{})",
+            "  commits={checkpoint:<7} rows={:<9} logical={} ensure-physical={} ({}/{}) view-members={} compact-physical={} ({}/{})",
             relation.rows,
             short_hash(&relation.hash),
             if ensure_warm.hash == ensure_cold.hash {
@@ -959,6 +1080,7 @@ fn main() {
             },
             ensure_warm.members,
             ensure_cold.members,
+            view_members,
             if compact_warm.hash == compact_cold.hash {
                 "same"
             } else {

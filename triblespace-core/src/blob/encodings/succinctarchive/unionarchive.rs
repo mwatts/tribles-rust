@@ -64,6 +64,19 @@ impl<U> UnionArchive<U> {
         segments.extend(additional);
         Self::new(segments)
     }
+
+    /// Return the logical union of two immutable physical covers.
+    ///
+    /// This is a shallow operation: archives retain their shared backing
+    /// bytes and only the shard list is copied. Equal or overlapping shards
+    /// need not be recognized here because every observation path applies set
+    /// semantics across the resulting cover.
+    pub fn union(&self, other: &Self) -> Self
+    where
+        SuccinctArchive<U>: Clone,
+    {
+        self.with_segments(other.segments.iter().cloned())
+    }
 }
 
 impl<U> UnionArchive<U>
@@ -515,6 +528,28 @@ mod tests {
         assert_eq!(extended.segment_count(), 2);
         assert_eq!(original.iter().count(), first.len());
         assert_eq!(extended.iter().count(), first.len() + second.len());
+    }
+
+    #[test]
+    fn immutable_cover_union_is_logically_idempotent() {
+        let ada = ufoid();
+        let grace = ufoid();
+        let mut first = TribleSet::new();
+        first += entity! { &ada @ literature::firstname: "Ada" };
+        let mut second = first.clone();
+        second += entity! { &grace @ literature::firstname: "Grace" };
+
+        let left = UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(&first)]);
+        let right = UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(&second)]);
+        let joined = left.union(&right);
+
+        assert_eq!(left.segment_count(), 1);
+        assert_eq!(right.segment_count(), 1);
+        assert_eq!(joined.segment_count(), 2);
+        assert_eq!(
+            joined.iter().collect::<Vec<_>>(),
+            second.iter_ordered().copied().collect::<Vec<_>>()
+        );
     }
 
     #[test]

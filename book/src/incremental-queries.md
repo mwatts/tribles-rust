@@ -92,11 +92,16 @@ Advance the saved ticket only after the complete fallible fold succeeds, as the
 example does, to make a failed fold retry the same support.
 
 The two pattern inputs need not share a representation. The runnable example
-(`cargo run --example collection_pattern_changes`) queries the full current
-ticket through a reused or freshly maintained `SuccinctArchive` cover while
-attaching only the added support as a cheap `SimpleArchive`-backed `TribleSet`.
-Exact-ticket attachment ensures that commits first observed after `current`
-cannot leak into either view merely because their blobs are already resident.
+(`cargo run --example collection_pattern_changes`) keeps a
+`SuccinctArchiveCollection::exact_view()`. An unchanged ticket reuses its
+owned, already-admitted immutable archive without storage access. For a strict
+extension, the view runs ordinary exact admission only over the added commits
+and unions those shards with its previous archive; a shrinking observation
+rebuilds. The independent consumption checkpoint still controls the cheap
+`SimpleArchive`-backed change set, so a failed consumer retries the same delta
+even though constructing the full view already succeeded. Exact tickets ensure
+that commits first observed after `current` cannot leak into either input merely
+because their blobs are already resident.
 
 Commit support is deliberately not an exact fact difference. A new commit may
 repeat a fact already present, and that new witness may legitimately make a

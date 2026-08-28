@@ -20,6 +20,9 @@ use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
     SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError, UnionArchive,
 };
+use crate::collection::discovery::{
+    canonicalize_exact_ticket, exact_ticket_additions, ExactTicketAdvanceError,
+};
 use crate::collection::exact_derived::{
     ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
 };
@@ -107,7 +110,103 @@ pub struct SuccinctArchiveCollection {
     reach: Fragment,
 }
 
+/// One in-process Succinct view maintained across exact ticket observations.
+///
+/// Every retained shard was admitted by an earlier ordinary
+/// [`SuccinctArchiveCollection::ensure_exact`] call. When the next ticket is a
+/// monotone extension, only its newly signed support is admitted and the two
+/// immutable covers are unioned. An unchanged ticket performs no storage I/O;
+/// a shrinking ticket rebuilds from the new exact observation.
+///
+/// This is continuation state, not durable authority or a cache receipt. It
+/// deliberately retains the physical shards already returned to the caller,
+/// exactly as any long-lived query source may do.
+#[derive(Clone)]
+pub struct SuccinctArchiveView {
+    collection: SuccinctArchiveCollection,
+    ticket: Vec<CollectionCommit>,
+    archive: Option<UnionArchive<OrderedUniverse>>,
+}
+
+impl SuccinctArchiveView {
+    fn new(collection: SuccinctArchiveCollection) -> Self {
+        Self {
+            collection,
+            ticket: Vec::new(),
+            archive: None,
+        }
+    }
+
+    /// Exact support represented by the current archive.
+    pub fn ticket(&self) -> &[CollectionCommit] {
+        &self.ticket
+    }
+
+    /// Current queryable archive, if the first observation has succeeded.
+    pub fn archive(&self) -> Option<&UnionArchive<OrderedUniverse>> {
+        self.archive.as_ref()
+    }
+
+    /// Ensure and retain the exact view for the current ticket.
+    ///
+    /// State advances only after every derivation, Rank9 attachment, and
+    /// logical union succeeds. Retrying after an error therefore observes the
+    /// same previous checkpoint.
+    pub fn ensure<S>(
+        &mut self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
+    where
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S::Reader: BlobStoreMeta,
+    {
+        if ticket == self.ticket.as_slice() {
+            if let Some(previous) = &self.archive {
+                return Ok(previous.clone());
+            }
+        }
+        let current = canonicalize_exact_ticket(ticket, self.collection.source_collection())
+            .map_err(|error| {
+                SuccinctArchiveCollectionError::Exact(ExactDerivedCollectionError::InvalidTicket(
+                    error.to_string(),
+                ))
+            })?;
+        let next = match self.archive.as_ref() {
+            None => self.collection.ensure_exact(store, &current)?,
+            Some(previous) => match exact_ticket_additions(
+                self.collection.source_collection(),
+                &self.ticket,
+                &current,
+            ) {
+                Ok(additions) if additions.is_empty() => previous.clone(),
+                Ok(additions) => {
+                    let delta = self.collection.ensure_exact(store, &additions)?;
+                    previous.union(&delta)
+                }
+                Err(ExactTicketAdvanceError::ResetRequired { .. }) => {
+                    self.collection.ensure_exact(store, &current)?
+                }
+                Err(error) => {
+                    return Err(SuccinctArchiveCollectionError::Exact(
+                        ExactDerivedCollectionError::InvalidTicket(error.to_string()),
+                    ));
+                }
+            },
+        };
+
+        self.ticket = current;
+        self.archive = Some(next.clone());
+        Ok(next)
+    }
+}
+
 impl SuccinctArchiveCollection {
+    /// Create an empty in-process continuation for this exact projection.
+    pub fn exact_view(&self) -> SuccinctArchiveView {
+        SuccinctArchiveView::new(self.clone())
+    }
+
     /// Construct the canonical Succinct projection for one named root.
     ///
     /// Two reaches, because a derivation and its source are two collections
@@ -1742,6 +1841,175 @@ mod tests {
             assert_eq!(attached.segment_count(), 1);
             assert_eq!(attached.iter().count(), 0);
         }
+    }
+
+    #[test]
+    fn exact_view_reuses_unchanged_support_without_storage_io() {
+        let name = CollectionName::new("maintained").unwrap();
+        let collection = SuccinctArchiveCollection::new(
+            name.clone(),
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+            Some(test_team()),
+            reach::private(),
+        );
+        let mut store = CollectionOnly::default();
+        let expected = facts([(1, 3)]);
+        let source = put_data(&mut store, &expected);
+        let commit = signed_commit(&mut store, &name, 1, &source);
+        publish(&mut store, commit);
+
+        let mut maintained = collection.exact_view();
+        let first = maintained.ensure(&mut store, &[commit]).unwrap();
+        assert_eq!(attached_facts(&first), expected);
+        assert_eq!(maintained.ticket(), &[commit]);
+
+        let repeated = maintained.ensure(&mut PanicStore, &[commit]).unwrap();
+        assert_eq!(attached_facts(&repeated), expected);
+        assert_eq!(maintained.ticket(), &[commit]);
+    }
+
+    #[test]
+    fn exact_view_preserves_set_semantics_for_duplicate_support() {
+        let name = CollectionName::new("maintained-overlap").unwrap();
+        let collection = SuccinctArchiveCollection::new(
+            name.clone(),
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+            Some(test_team()),
+            reach::private(),
+        );
+        let mut store = CollectionOnly::default();
+        let expected = facts([(1, 3)]);
+        let source = put_data(&mut store, &expected);
+        let first = signed_commit(&mut store, &name, 1, &source);
+        let second = signed_commit(&mut store, &name, 2, &source);
+        publish(&mut store, first);
+        publish(&mut store, second);
+
+        let mut maintained = collection.exact_view();
+        maintained.ensure(&mut store, &[first]).unwrap();
+        let grown = maintained.ensure(&mut store, &[first, second]).unwrap();
+
+        assert_eq!(attached_facts(&grown), expected);
+        assert_eq!(maintained.ticket().len(), 2);
+    }
+
+    #[test]
+    fn exact_view_unions_additions_and_rebuilds_after_shrink() {
+        let name = CollectionName::new("maintained-growth").unwrap();
+        let collection = SuccinctArchiveCollection::new(
+            name.clone(),
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+            Some(test_team()),
+            reach::private(),
+        );
+        let mut store = CollectionOnly::default();
+        let left_facts = facts([(1, 3)]);
+        let right_facts = facts([(2, 4)]);
+        let left = put_data(&mut store, &left_facts);
+        let right = put_data(&mut store, &right_facts);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
+        publish(&mut store, first);
+        publish(&mut store, second);
+
+        let mut maintained = collection.exact_view();
+        maintained.ensure(&mut store, &[first]).unwrap();
+        let grown = maintained.ensure(&mut store, &[second, first]).unwrap();
+        assert_eq!(
+            attached_facts(&grown),
+            left_facts.clone() + right_facts.clone()
+        );
+        let mut full_ticket = vec![first, second];
+        full_ticket.sort_unstable_by_key(CollectionCommit::id);
+        assert_eq!(maintained.ticket(), full_ticket);
+
+        let shrunk = maintained.ensure(&mut store, &[second]).unwrap();
+        assert_eq!(attached_facts(&shrunk), right_facts);
+        assert_eq!(maintained.ticket(), &[second]);
+    }
+
+    #[test]
+    fn exact_view_does_not_advance_on_invalid_ticket_shape() {
+        let name = CollectionName::new("maintained-errors").unwrap();
+        let collection = SuccinctArchiveCollection::new(
+            name.clone(),
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+            Some(test_team()),
+            reach::private(),
+        );
+        let mut store = CollectionOnly::default();
+        let expected = facts([(1, 3)]);
+        let source = put_data(&mut store, &expected);
+        let commit = signed_commit(&mut store, &name, 1, &source);
+        publish(&mut store, commit);
+
+        let mut maintained = collection.exact_view();
+        maintained.ensure(&mut store, &[commit]).unwrap();
+        let foreign_name = CollectionName::new("foreign").unwrap();
+        let foreign = signed_commit(&mut store, &foreign_name, 2, &source);
+
+        assert!(matches!(
+            maintained.ensure(&mut store, &[commit, foreign]),
+            Err(SuccinctArchiveCollectionError::Exact(
+                ExactDerivedCollectionError::InvalidTicket(_)
+            ))
+        ));
+        assert_eq!(maintained.ticket(), &[commit]);
+        assert_eq!(
+            attached_facts(maintained.archive().expect("previous archive remains")),
+            expected
+        );
+    }
+
+    #[test]
+    fn exact_view_does_not_advance_when_delta_admission_fails() {
+        let name = CollectionName::new("maintained-admission-failure").unwrap();
+        let collection = SuccinctArchiveCollection::new(
+            name.clone(),
+            test_team(),
+            Some(test_team()),
+            reach::private(),
+            Some(test_team()),
+            reach::private(),
+        );
+        let mut base = CollectionOnly::default();
+        let left_facts = facts([(1, 3)]);
+        let right_facts = facts([(2, 4)]);
+        let left = put_data(&mut base, &left_facts);
+        let right = put_data(&mut base, &right_facts);
+        let first = signed_commit(&mut base, &name, 1, &left);
+        let second = signed_commit(&mut base, &name, 2, &right);
+        publish(&mut base, first);
+        publish(&mut base, second);
+
+        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
+        let mut maintained = collection.exact_view();
+        maintained.ensure(&mut store, &[first]).unwrap();
+
+        store.fail_rank9_put = true;
+        assert!(matches!(
+            maintained.ensure(&mut store, &[first, second]),
+            Err(SuccinctArchiveCollectionError::Rank9(
+                super::super::Rank9FiberError::Storage { .. }
+            ))
+        ));
+        assert_eq!(maintained.ticket(), &[first]);
+        assert_eq!(
+            attached_facts(maintained.archive().expect("previous archive remains")),
+            left_facts
+        );
+
+        store.fail_rank9_put = false;
+        let retried = maintained.ensure(&mut store, &[first, second]).unwrap();
+        assert_eq!(attached_facts(&retried), left_facts + right_facts);
     }
 
     #[test]

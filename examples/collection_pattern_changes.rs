@@ -8,7 +8,9 @@ use std::io;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
+use triblespace::core::collection::succinctarchive_union::{
+    SuccinctArchiveCollection, SuccinctArchiveView,
+};
 use triblespace::core::collection::{
     exact_ticket_additions, reach, Collection, CollectionAdmission, CollectionCommit,
     CollectionName, SimpleArchiveCollection,
@@ -21,17 +23,17 @@ use triblespace::prelude::*;
 fn observe(
     collection: &mut Collection<MemoryRepo>,
     simple: &SimpleArchiveCollection,
-    succinct: &SuccinctArchiveCollection,
+    full_view: &mut SuccinctArchiveView,
     checkpoint: &mut Vec<CollectionCommit>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let current = collection.ticket()?;
     let added = exact_ticket_additions(simple.collection(), checkpoint, &current)?;
 
-    // Physical covers are independent of continuation state: the full view
-    // reuses or creates Succinct shards, while the small support delta remains
-    // a cheap SimpleArchive-backed TribleSet.
-    let full = succinct.ensure_exact(collection.storage_mut(), &current)?;
+    // The full view retains its already-admitted immutable Succinct shards and
+    // admits only new support. The small SimpleArchive delta stays independent
+    // because it drives the change query and advances only after consumption.
+    let full = full_view.ensure(collection.storage_mut(), &current)?;
     let changed = simple.attach_exact(collection.storage_mut(), &added)?;
 
     let mut titles = Vec::new();
@@ -90,11 +92,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         None,
         reach::private(),
     );
+    let mut full_view = succinct.exact_view();
     let mut checkpoint = Vec::new();
 
-    let first = observe(&mut collection, &simple, &succinct, &mut checkpoint, |_| {
-        Ok(())
-    })?;
+    let first = observe(
+        &mut collection,
+        &simple,
+        &mut full_view,
+        &mut checkpoint,
+        |_| Ok(()),
+    )?;
     assert_eq!(first, ["Dune"]);
 
     collection.commit(entity! {
@@ -103,20 +110,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
 
     let before_failure = checkpoint.clone();
-    let failed = observe(&mut collection, &simple, &succinct, &mut checkpoint, |_| {
-        Err(io::Error::other("simulated consumer failure").into())
-    });
+    let failed = observe(
+        &mut collection,
+        &simple,
+        &mut full_view,
+        &mut checkpoint,
+        |_| Err(io::Error::other("simulated consumer failure").into()),
+    );
     assert!(failed.is_err());
     assert_eq!(checkpoint, before_failure);
 
-    let retry = observe(&mut collection, &simple, &succinct, &mut checkpoint, |_| {
-        Ok(())
-    })?;
+    let retry = observe(
+        &mut collection,
+        &simple,
+        &mut full_view,
+        &mut checkpoint,
+        |_| Ok(()),
+    )?;
     assert_eq!(retry, ["Dune Messiah"]);
 
-    let unchanged = observe(&mut collection, &simple, &succinct, &mut checkpoint, |_| {
-        Ok(())
-    })?;
+    let unchanged = observe(
+        &mut collection,
+        &simple,
+        &mut full_view,
+        &mut checkpoint,
+        |_| Ok(()),
+    )?;
     assert!(unchanged.is_empty());
 
     println!("incremental titles: {first:?}, then {retry:?}");
