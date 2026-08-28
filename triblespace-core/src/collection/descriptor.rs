@@ -6,27 +6,28 @@
 //! blob whose handle is the collection identity. There is no wrapper type, so
 //! reading one is an ordinary query over ordinary facts.
 //!
-//! Nothing here validates shape. A descriptor may carry attributes this binary
-//! has never heard of: they are arguments to a recipe it does not implement,
-//! they travel through untouched, and classifying them is nobody's business
-//! but that recipe's. By convention a root carries [`collection_name`] and
-//! [`collection_namespace`] while a derived collection carries
-//! [`collection_source`] instead. Either kind may independently declare an
-//! optional [`collection_authority`]; authority is never inferred by walking
-//! the source chain. These are recipe conventions, not generic shape checks.
+//! A descriptor may carry attributes this binary has never heard of: they are
+//! arguments to a recipe it does not implement, they travel through untouched,
+//! and classifying them is nobody's business but that recipe's. A root carries
+//! [`collection_name`] while a derived collection carries
+//! [`collection_source`] instead. Both carry exactly one local
+//! [`collection_authority`]; authority is never inferred by walking the source
+//! chain. Readers first locate the one tagged descriptor entity, then bind
+//! every field lookup to that exact entity so embedded descriptions cannot
+//! accidentally satisfy descriptor shape.
 
 use ed25519_dalek::VerifyingKey;
 
 use itertools::Itertools;
 
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
-use crate::inline::encodings::shortstring::ShortString;
-use crate::inline::{Inline, IntoInline, RawInline};
+use crate::inline::encodings::hash::Handle;
+use crate::inline::{Inline, InlineEncoding, IntoInline, RawInline};
 use crate::metadata;
 use crate::prelude::{entity, find, pattern};
 use crate::query::TriblePattern;
-use crate::temp;
 use crate::trible::{Fragment, TribleSet};
 
 // Reach arrives here as a builder argument; only the tests name a
@@ -34,9 +35,9 @@ use crate::trible::{Fragment, TribleSet};
 #[cfg(test)]
 use super::reach;
 use super::records::{
-    collection_authority, collection_name, collection_namespace, collection_reach,
-    collection_recipe, collection_representation, collection_source, CollectionHandle,
-    CollectionName, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_name, collection_reach, collection_recipe,
+    collection_representation, collection_source, CollectionHandle, RecordDecodeError,
+    KIND_COLLECTION_DESCRIPTOR,
 };
 
 /// Build a root descriptor that names its representation and recipe without
@@ -59,18 +60,16 @@ use super::records::{
 /// writes nothing, and a future law with arguments needs no change to this
 /// signature to state them.
 pub fn naming(
-    name: &CollectionName,
-    namespace: VerifyingKey,
-    authority: Option<VerifyingKey>,
+    name: &str,
+    authority: VerifyingKey,
     representation: Id,
     recipe: Id,
     reach: Fragment,
 ) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_name: name.as_str(),
-        collection_namespace: namespace,
-        collection_authority?: authority,
+        collection_name: name.to_owned(),
+        collection_authority: authority,
         collection_representation: representation,
         collection_recipe: recipe,
         collection_reach*: reach,
@@ -104,10 +103,11 @@ pub fn entity(facts: &TribleSet) -> Result<Id, RecordDecodeError> {
 
 /// Blob representation carried by the elements of this collection.
 pub fn representation(facts: &TribleSet) -> Result<Id, RecordDecodeError> {
+    let descriptor = entity(facts)?;
     exactly_one(
         find!(
             (v: Id?),
-            pattern!(facts, [{ _?e @ collection_representation: ?v }])
+            pattern!(facts, [{ descriptor @ collection_representation: ?v }])
         )
         .map(|(v,)| v),
         "collection_representation",
@@ -120,8 +120,9 @@ pub fn representation(facts: &TribleSet) -> Result<Id, RecordDecodeError> {
 /// This names the *law*. Its arguments, if any, are further attributes on the
 /// same entity; see [`argument`].
 pub fn recipe(facts: &TribleSet) -> Result<Id, RecordDecodeError> {
+    let descriptor = entity(facts)?;
     exactly_one(
-        find!((v: Id?), pattern!(facts, [{ _?e @ collection_recipe: ?v }])).map(|(v,)| v),
+        find!((v: Id?), pattern!(facts, [{ descriptor @ collection_recipe: ?v }])).map(|(v,)| v),
         "collection_recipe",
     )?
     .map_err(|_| RecordDecodeError::InvalidId("collection_recipe"))
@@ -131,65 +132,46 @@ pub fn recipe(facts: &TribleSet) -> Result<Id, RecordDecodeError> {
 ///
 /// A root has no source and answers `None`; that is not a failure, it is what
 /// being a root means.
-pub fn source(facts: &TribleSet) -> Option<CollectionHandle> {
-    find!(
-        (v: CollectionHandle),
-        pattern!(facts, [{ _?e @ collection_source: ?v }])
+pub fn source(facts: &TribleSet) -> Result<Option<CollectionHandle>, RecordDecodeError> {
+    let descriptor = entity(facts)?;
+    at_most_one(
+        find!(
+            (v: CollectionHandle),
+            pattern!(facts, [{ descriptor @ collection_source: ?v }])
+        )
+        .map(|(v,)| v),
+        "collection_source",
     )
-    .map(|(v,)| v)
-    .next()
 }
 
-/// The name a root collection is known by within its namespace.
+/// Handle of the UTF-8 name carried by a root collection.
 ///
 /// A derived collection has no name of its own and answers `None`: its anchor
 /// is its source, and its name is whatever that source is called.
-pub fn name(facts: &TribleSet) -> Option<Result<CollectionName, RecordDecodeError>> {
-    let raw: Inline<ShortString> = find!(
-        (v: Inline<ShortString>),
-        pattern!(facts, [{ _?e @ collection_name: ?v }])
-    )
-    .map(|(v,)| v)
-    .next()?;
-    Some(
-        raw.try_from_inline::<String>()
-            .map_err(|_| RecordDecodeError::InvalidId("collection_name"))
-            .and_then(|text| {
-                CollectionName::new(&text)
-                    .map_err(|_| RecordDecodeError::InvalidId("collection_name"))
-            }),
+pub fn name(facts: &TribleSet) -> Result<Option<Inline<Handle<UTF8String>>>, RecordDecodeError> {
+    let descriptor = entity(facts)?;
+    at_most_one(
+        find!(
+            (v: Inline<Handle<UTF8String>>),
+            pattern!(facts, [{ descriptor @ collection_name: ?v }])
+        )
+        .map(|(v,)| v),
+        "collection_name",
     )
 }
 
-/// Public-key namespace which distinguishes root collection names.
+/// External capability trust root declared by this descriptor.
 ///
-/// Derived descriptors carry no namespace: their exact source handle is their
-/// identity anchor instead.
-pub fn namespace(facts: &TribleSet) -> Option<Result<VerifyingKey, RecordDecodeError>> {
-    let key = find!(
-        (v: VerifyingKey?),
-        pattern!(facts, [{ _?e @ collection_namespace: ?v }])
-    )
-    .map(|(v,)| v)
-    .next()?;
-    Some(key.map_err(|_| RecordDecodeError::InvalidId("collection_namespace")))
-}
-
-/// Optional external capability trust root declared by this descriptor.
-///
-/// This lookup is deliberately local. A derived descriptor either names its
-/// own authority or has none; the source descriptor cannot silently supply
-/// one. Namespace and authority therefore have distinct semantic roles, while
-/// both remain identity-bearing facts in the descriptor's content handle.
-/// Locality also avoids making authorization depend on source residency.
-pub fn authority(facts: &TribleSet) -> Option<Result<VerifyingKey, RecordDecodeError>> {
-    let key = find!(
-        (v: VerifyingKey?),
-        pattern!(facts, [{ _?e @ collection_authority: ?v }])
-    )
-    .map(|(v,)| v)
-    .next()?;
-    Some(key.map_err(|_| RecordDecodeError::InvalidId("collection_authority")))
+/// Exactly one authority row must occur in the complete descriptor archive,
+/// and it must hang from the one tagged descriptor entity. Looking up the row
+/// globally before checking its subject makes a smuggled authority on an
+/// embedded description fail closed instead of being ignored. A derived
+/// descriptor names its authority directly; source walking never supplies it.
+pub fn authority(facts: &TribleSet) -> Result<VerifyingKey, RecordDecodeError> {
+    let raw: Inline<crate::inline::encodings::ed25519::ED25519PublicKey> =
+        exactly_one_descriptor_inline(facts, &collection_authority, "collection_authority")?;
+    raw.try_from_inline::<VerifyingKey>()
+        .map_err(|_| RecordDecodeError::InvalidId("collection_authority"))
 }
 
 /// Look up one recipe argument by attribute.
@@ -197,14 +179,35 @@ pub fn authority(facts: &TribleSet) -> Option<Result<VerifyingKey, RecordDecodeE
 /// The attribute is a runtime id because the recipe that minted it is the only
 /// thing that knows what it means; this reads the raw bytes and hands them
 /// back for that recipe to interpret.
-pub fn argument(facts: &TribleSet, attribute: Id) -> Option<RawInline> {
+pub fn argument(facts: &TribleSet, attribute: Id) -> Result<Option<RawInline>, RecordDecodeError> {
+    let descriptor: Inline<GenId> = entity(facts)?.to_inline();
     let attribute: Inline<GenId> = attribute.to_inline();
-    find!(
-        (v: Inline<GenId>),
-        temp!((e), facts.pattern::<GenId>(e, attribute, v))
+    at_most_one(
+        find!(
+            (v: Inline<GenId>),
+            facts.pattern::<GenId>(descriptor, attribute, v)
+        )
+        .map(|(v,)| v.raw),
+        "recipe argument",
     )
-    .map(|(v,)| v.raw)
-    .next()
+}
+
+/// Decode one required single-valued field and require that it belongs to the
+/// exact tagged descriptor entity.
+fn exactly_one_descriptor_inline<S: InlineEncoding>(
+    facts: &TribleSet,
+    attribute: &crate::attribute::Attribute<S>,
+    field: &'static str,
+) -> Result<Inline<S>, RecordDecodeError> {
+    let descriptor = entity(facts)?;
+    let fact = exactly_one(
+        facts.iter().filter(|fact| fact.a() == &attribute.id()),
+        field,
+    )?;
+    if fact.e() != &descriptor {
+        return Err(RecordDecodeError::FieldOnWrongEntity(field));
+    }
+    Ok(*fact.v::<S>())
 }
 
 /// `Itertools::exactly_one`, saying which field the rows came from.
@@ -227,24 +230,30 @@ fn exactly_one<T>(
     })
 }
 
-/// A root descriptor under one fixed test namespace and authority, named by
-/// `name`.
+/// Decode an optional single-valued field without accepting an arbitrary
+/// first match from malformed input.
+fn at_most_one<T>(
+    mut rows: impl Iterator<Item = T>,
+    field: &'static str,
+) -> Result<Option<T>, RecordDecodeError> {
+    let Some(first) = rows.next() else {
+        return Ok(None);
+    };
+    if rows.next().is_some() {
+        return Err(RecordDecodeError::RepeatedField(field));
+    }
+    Ok(Some(first))
+}
+
+/// A root descriptor under one fixed test authority, named by `name`.
 ///
 /// Tests overwhelmingly want "some collection, distinct from that other one".
-/// Spelling that as a name under a fixed namespace keeps the distinction
-/// readable in the test itself, which is the whole reason a name replaced an
-/// opaque scope id.
+/// Spelling that as a name under a fixed authority keeps the distinction
+/// readable in the test itself.
 #[cfg(test)]
 pub(crate) fn named_for_tests(name: &str, representation: Id, recipe: Id) -> Fragment {
     let root = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]).verifying_key();
-    naming(
-        &CollectionName::new(name).expect("test collection name"),
-        root,
-        Some(root),
-        representation,
-        recipe,
-        reach::private(),
-    )
+    naming(name, root, representation, recipe, reach::private())
 }
 
 /// Content identity of a descriptor, for tests that have no store.
@@ -274,22 +283,23 @@ mod tests {
 
     use super::*;
     use crate::blob::encodings::simplearchive::SimpleArchive;
+    use crate::blob::encodings::utf8string::UTF8String;
     use crate::collection::records::{collection_authority, collection_source};
     use crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
+    use crate::inline::encodings::ed25519::ED25519PublicKey;
     use crate::metadata;
+    use crate::repo::{BlobStore, BlobStoreGet};
+    use crate::trible::Trible;
+
+    use anybytes::View;
 
     fn team_key(byte: u8) -> ed25519_dalek::VerifyingKey {
         SigningKey::from_bytes(&[byte; 32]).verifying_key()
     }
 
-    fn root(
-        name: &str,
-        namespace: ed25519_dalek::VerifyingKey,
-        authority: Option<ed25519_dalek::VerifyingKey>,
-    ) -> Fragment {
+    fn root(name: &str, authority: ed25519_dalek::VerifyingKey) -> Fragment {
         naming(
-            &CollectionName::new(name).unwrap(),
-            namespace,
+            name,
             authority,
             <SimpleArchive as crate::metadata::MetaDescribe>::id(),
             TRIBLE_SET_UNION_RECIPE_V1,
@@ -297,75 +307,157 @@ mod tests {
         )
     }
 
-    fn derived(source_of: &Fragment, authority: Option<ed25519_dalek::VerifyingKey>) -> Fragment {
+    fn derived(source_of: &Fragment, authority: ed25519_dalek::VerifyingKey) -> Fragment {
         crate::prelude::entity! {
             metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
             collection_source: identity_for_tests(source_of),
-            collection_authority?: authority,
+            collection_authority: authority,
         }
     }
 
     #[test]
-    fn roots_separate_identity_namespace_from_optional_authority() {
-        let namespace_key = team_key(3);
+    fn roots_carry_a_mandatory_local_authority() {
         let trust_root = team_key(4);
-        let fragment = root("ledger", namespace_key, Some(trust_root));
+        let fragment = root("ledger", trust_root);
 
-        assert_eq!(
-            namespace(fragment.facts()),
-            Some(Ok(namespace_key)),
-            "the root identity namespace is read directly"
-        );
-        assert_eq!(
-            authority(fragment.facts()),
-            Some(Ok(trust_root)),
-            "authority is a distinct descriptor field"
-        );
+        assert_eq!(authority(fragment.facts()), Ok(trust_root));
     }
 
     #[test]
     fn derived_authority_is_local_and_never_inherited() {
         let root_authority = team_key(5);
         let derived_authority = team_key(6);
-        let base = root("ledger", team_key(7), Some(root_authority));
-        let ungoverned = derived(&base, None);
-        let governed = derived(&base, Some(derived_authority));
+        let base = root("ledger", root_authority);
+        let governed = derived(&base, derived_authority);
 
-        assert_eq!(namespace(ungoverned.facts()), None);
-        assert_eq!(authority(ungoverned.facts()), None);
-        assert_eq!(authority(governed.facts()), Some(Ok(derived_authority)));
+        assert_eq!(authority(base.facts()), Ok(root_authority));
+        assert_eq!(authority(governed.facts()), Ok(derived_authority));
     }
 
     #[test]
-    fn authority_participates_in_descriptor_identity_but_is_optional() {
-        let namespace_key = team_key(8);
-        let trust_root = team_key(9);
-        let name = CollectionName::new("ledger").unwrap();
+    fn authority_participates_in_descriptor_identity() {
+        let first = root("ledger", team_key(8));
+        let second = root("ledger", team_key(9));
 
-        let ungoverned = naming(
-            &name,
-            namespace_key,
-            None,
-            crate::id::id_hex!("11111111111111111111111111111111"),
-            crate::id::id_hex!("22222222222222222222222222222222"),
-            reach::private(),
-        );
-        let governed = naming(
-            &name,
-            namespace_key,
-            Some(trust_root),
-            crate::id::id_hex!("11111111111111111111111111111111"),
-            crate::id::id_hex!("22222222222222222222222222222222"),
-            reach::private(),
-        );
+        assert_ne!(identity_for_tests(&first), identity_for_tests(&second));
+        assert_eq!(first.facts().len(), second.facts().len());
+    }
 
-        assert_eq!(authority(ungoverned.facts()), None);
-        assert_eq!(authority(governed.facts()), Some(Ok(trust_root)));
-        assert_ne!(
-            identity_for_tests(&ungoverned),
-            identity_for_tests(&governed)
+    #[test]
+    fn name_is_unbounded_utf8_and_its_attachment_stays_with_the_fragment() {
+        let expected = "a root collection name deliberately longer than thirty-two bytes 🦊";
+        let fragment = root(expected, team_key(10));
+        let handle = name(fragment.facts())
+            .expect("valid descriptor")
+            .expect("root descriptor has a name");
+
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().expect("memory blob reader");
+        let actual: View<str> = reader
+            .get::<View<str>, UTF8String>(handle)
+            .expect("the name bytes travel with the descriptor fragment");
+        assert_eq!(&*actual, expected);
+    }
+
+    #[test]
+    fn duplicate_optional_name_is_rejected() {
+        let mut fragment = root("ledger", team_key(10));
+        let descriptor = fragment.root().expect("descriptor root");
+        let second = fragment.put::<UTF8String, _>("another name".to_owned());
+        fragment
+            .facts_mut()
+            .insert(&Trible::force(&descriptor, &collection_name.id(), &second));
+
+        assert_eq!(
+            name(fragment.facts()),
+            Err(RecordDecodeError::RepeatedField("collection_name"))
         );
-        assert_eq!(ungoverned.facts().len() + 1, governed.facts().len());
+    }
+
+    #[test]
+    fn duplicate_optional_source_is_rejected() {
+        let base = root("ledger", team_key(10));
+        let mut fragment = derived(&base, team_key(11));
+        let descriptor = fragment.root().expect("descriptor root");
+        let second = Inline::<Handle<SimpleArchive>>::new([0x42; 32]);
+        fragment.facts_mut().insert(&Trible::force(
+            &descriptor,
+            &collection_source.id(),
+            &second,
+        ));
+
+        assert_eq!(
+            source(fragment.facts()),
+            Err(RecordDecodeError::RepeatedField("collection_source"))
+        );
+    }
+
+    #[test]
+    fn missing_authority_is_rejected() {
+        let fragment = crate::prelude::entity! {
+            metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
+        };
+        assert_eq!(
+            authority(fragment.facts()),
+            Err(RecordDecodeError::MissingField("collection_authority"))
+        );
+    }
+
+    #[test]
+    fn duplicate_authority_is_rejected() {
+        let mut fragment = root("ledger", team_key(11));
+        let descriptor = fragment.root().expect("descriptor root");
+        let second: Inline<ED25519PublicKey> = team_key(12).to_inline();
+        fragment.facts_mut().insert(&Trible::force(
+            &descriptor,
+            &collection_authority.id(),
+            &second,
+        ));
+
+        assert_eq!(
+            authority(fragment.facts()),
+            Err(RecordDecodeError::RepeatedField("collection_authority"))
+        );
+    }
+
+    #[test]
+    fn malformed_authority_is_rejected() {
+        let mut fragment = crate::prelude::entity! {
+            metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
+        };
+        let descriptor = fragment.root().expect("descriptor root");
+        let mut raw = [0_u8; 32];
+        raw[0] = 2;
+        let malformed = Inline::<ED25519PublicKey>::new(raw);
+        fragment.facts_mut().insert(&Trible::force(
+            &descriptor,
+            &collection_authority.id(),
+            &malformed,
+        ));
+
+        assert_eq!(
+            authority(fragment.facts()),
+            Err(RecordDecodeError::InvalidId("collection_authority"))
+        );
+    }
+
+    #[test]
+    fn off_entity_authority_is_rejected() {
+        let mut fragment = crate::prelude::entity! {
+            metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
+        };
+        let other = crate::id::id_hex!("13131313131313131313131313131313");
+        let key: Inline<ED25519PublicKey> = team_key(13).to_inline();
+        fragment
+            .facts_mut()
+            .insert(&Trible::force(&other, &collection_authority.id(), &key));
+
+        assert_eq!(
+            authority(fragment.facts()),
+            Err(RecordDecodeError::FieldOnWrongEntity(
+                "collection_authority"
+            ))
+        );
     }
 
     /// Declaring reach is a rename, which is the entire point.
@@ -380,19 +472,10 @@ mod tests {
     #[test]
     fn declaring_reach_makes_a_different_collection() {
         let team = team_key(9);
-        let name = CollectionName::new("ledger").unwrap();
-        let private = crate::collection::simplearchive_union::descriptor(
-            &name,
-            team,
-            Some(team),
-            reach::private(),
-        );
-        let public = crate::collection::simplearchive_union::descriptor(
-            &name,
-            team,
-            Some(team),
-            reach::public(),
-        );
+        let private =
+            crate::collection::simplearchive_union::descriptor("ledger", team, reach::private());
+        let public =
+            crate::collection::simplearchive_union::descriptor("ledger", team, reach::public());
 
         assert_ne!(identity_for_tests(&private), identity_for_tests(&public));
         assert_eq!(private.facts().len() + 1, public.facts().len());
@@ -402,23 +485,14 @@ mod tests {
     #[test]
     fn reach_is_read_from_the_descriptor_and_absence_refuses() {
         let team = team_key(10);
-        let name = CollectionName::new("ledger").unwrap();
 
-        let private = crate::collection::simplearchive_union::descriptor(
-            &name,
-            team,
-            Some(team),
-            reach::private(),
-        );
+        let private =
+            crate::collection::simplearchive_union::descriptor("ledger", team, reach::private());
         assert_eq!(reach::declared(private.facts()), None);
         assert!(!reach::travels(private.facts()));
 
-        let public = crate::collection::simplearchive_union::descriptor(
-            &name,
-            team,
-            Some(team),
-            reach::public(),
-        );
+        let public =
+            crate::collection::simplearchive_union::descriptor("ledger", team, reach::public());
         assert_eq!(reach::declared(public.facts()), Some(reach::PUBLIC));
         assert!(reach::travels(public.facts()));
     }
@@ -476,37 +550,28 @@ mod tests {
     #[test]
     fn a_derived_collection_declares_reach_independently_of_its_source() {
         let team = team_key(11);
-        let name = CollectionName::new("ledger").unwrap();
 
-        let private_root = crate::collection::simplearchive_union::descriptor(
-            &name,
-            team,
-            Some(team),
-            reach::private(),
-        );
+        let private_root =
+            crate::collection::simplearchive_union::descriptor("ledger", team, reach::private());
         let private_root_handle = identity_for_tests(&private_root);
 
         // A public derivation of a private source.
         let public_index = crate::collection::succinctarchive_union::descriptor(
             private_root_handle,
-            Some(team),
+            team,
             reach::public(),
         );
         assert!(!reach::travels(private_root.facts()));
         assert!(reach::travels(public_index.facts()));
 
-        let public_root = crate::collection::simplearchive_union::descriptor(
-            &name,
-            team,
-            Some(team),
-            reach::public(),
-        );
+        let public_root =
+            crate::collection::simplearchive_union::descriptor("ledger", team, reach::public());
         let public_root_handle = identity_for_tests(&public_root);
 
         // And a private derivation of a public source.
         let private_index = crate::collection::succinctarchive_union::descriptor(
             public_root_handle,
-            Some(team),
+            team,
             reach::private(),
         );
         assert!(reach::travels(public_root.facts()));

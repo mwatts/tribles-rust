@@ -79,9 +79,10 @@ pub fn public() -> Fragment {
 /// declaring twice all answer `None`: each is a descriptor that has not
 /// stated a single reach, and [`travels`] treats them alike.
 pub fn declared(facts: &TribleSet) -> Option<Id> {
+    let descriptor = super::descriptor::entity(facts).ok()?;
     let mut rows = find!(
         (v: Id?),
-        pattern!(facts, [{ _?e @ collection_reach: ?v }])
+        pattern!(facts, [{ descriptor @ collection_reach: ?v }])
     )
     .map(|(v,)| v);
     let first = rows.next()?.ok()?;
@@ -94,7 +95,7 @@ pub fn declared(facts: &TribleSet) -> Option<Id> {
 /// Whether this collection may be relayed to a peer.
 ///
 /// **Read the collection's own descriptor and nothing else.** Authority is
-/// likewise a local optional descriptor field; neither property walks
+/// likewise a local mandatory descriptor field; neither property walks
 /// [`collection_source`](crate::collection::records::collection_source). A
 /// derived collection declares its own reach or has none. Inheriting would be wrong
 /// in both directions. A derivation can expose what its source did not -- an

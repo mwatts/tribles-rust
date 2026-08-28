@@ -353,12 +353,12 @@ pub fn join(
 
 /// Construct the maintained LWW register descriptor for one source collection.
 ///
-/// The target's optional authority is explicit and independent of its source.
+/// The target's mandatory authority is explicit and independent of its source.
 pub fn descriptor(
     source: CollectionHandle,
     identity: Id,
     orders: Id,
-    authority: Option<VerifyingKey>,
+    authority: VerifyingKey,
     reach: Fragment,
 ) -> Fragment {
     let identity = crate::inline::IntoInline::to_inline(identity);
@@ -366,7 +366,7 @@ pub fn descriptor(
     entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
-        collection_authority?: authority,
+        collection_authority: authority,
         collection_representation*: <LwwRegisterBlob as MetaDescribe>::describe(),
         collection_recipe*: <LwwRegisterV1 as MetaDescribe>::describe(),
         register_identity: identity,
@@ -996,39 +996,33 @@ mod tests {
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
         let source = crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor(
-                &CollectionName::new("source").unwrap(),
-                key,
-                Some(key),
-                reach::private(),
-            )
-            .into_facts(),
+            simplearchive_union::descriptor("source", key, reach::private()).into_facts(),
         )
         .get_handle();
         let stated = descriptor(
             source,
             state_of.id(),
             written_at.id(),
-            Some(key),
+            key,
             reach::private(),
         );
         assert_eq!(
             descriptor_facts::argument(stated.facts(), register_identity.id()),
-            Some(
+            Ok(Some(
                 <Id as crate::inline::IntoInline<crate::inline::encodings::genid::GenId>>::to_inline(
                     state_of.id(),
                 )
                 .raw,
-            )
+            ))
         );
         assert_eq!(
             descriptor_facts::argument(stated.facts(), register_orders.id()),
-            Some(
+            Ok(Some(
                 <Id as crate::inline::IntoInline<crate::inline::encodings::genid::GenId>>::to_inline(
                     written_at.id(),
                 )
                 .raw,
-            )
+            ))
         );
         assert_ne!(
             stated,
@@ -1036,7 +1030,7 @@ mod tests {
                 source,
                 metadata::tag.id(),
                 written_at.id(),
-                Some(key),
+                key,
                 reach::private(),
             )
         );

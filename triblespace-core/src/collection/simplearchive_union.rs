@@ -3,7 +3,7 @@
 //! elements.
 //!
 //! This is the first concrete production collection kind. A collection pairs
-//! a name within a public-key namespace with the existing `SimpleArchive`
+//! a UTF-8 name and mandatory authority with the existing `SimpleArchive`
 //! representation and the
 //! [`TRIBLE_SET_UNION_RECIPE_V1`](crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1)
 //! semantic recipe. Every element is an exact, canonical EAV-ordered stream of
@@ -27,9 +27,8 @@ use crate::prelude::entity;
 use ed25519_dalek::VerifyingKey;
 
 use super::records::{
-    collection_authority, collection_name, collection_namespace, collection_reach,
-    collection_recipe, collection_representation, CollectionName, RecordDecodeError,
-    KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_name, collection_reach, collection_recipe,
+    collection_representation, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -404,30 +403,23 @@ where
     }
 }
 
-/// Describe this collection kind as a root named within a namespace.
+/// Describe this collection kind as a named root under one authority.
 ///
 /// This is the one home for what a `SimpleArchive` set-union collection *is*:
 /// that representation, that recipe. Everything else about a particular
-/// collection -- which one it is -- is the name and namespace passed in.
-/// `authority` is an optional capability trust root with a distinct semantic
-/// role; when present, it is nevertheless an identity-bearing descriptor fact.
+/// collection -- which one it is -- is the name and authority passed in.
+/// Authority is mandatory and participates directly in descriptor identity.
 ///
 /// It returns the facts, not a handle. Getting a handle means putting the
 /// blob, and `put` gives you the handle back, so a stored descriptor is a
 /// side effect of naming one rather than a second thing to remember. Hashing
 /// a descriptor you never stored would leave a phantom collection: records
 /// that reference it, and nothing that can decode what they reference.
-pub fn descriptor(
-    name: &CollectionName,
-    namespace: VerifyingKey,
-    authority: Option<VerifyingKey>,
-    reach: Fragment,
-) -> Fragment {
+pub fn descriptor(name: &str, authority: VerifyingKey, reach: Fragment) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_name: name.as_str(),
-        collection_namespace: namespace,
-        collection_authority?: authority,
+        collection_name: name.to_owned(),
+        collection_authority: authority,
         collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
         collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
         collection_reach*: reach,
@@ -976,6 +968,7 @@ where
 }
 
 fn validate_descriptor(descriptor: &Fragment) -> Result<(), SimpleArchiveUnionValidationError> {
+    descriptor_facts::authority(descriptor.facts())?;
     let expected_representation = <SimpleArchive as MetaDescribe>::id();
     let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {
@@ -1154,7 +1147,6 @@ mod tests {
     use crate::blob::encodings::utf8string::UTF8String;
     use crate::blob::{BlobEncoding, IntoBlob};
     use crate::collection::descriptor::identity_for_tests;
-    use crate::collection::records::CollectionName;
     use crate::collection::{
         discover_collection_records, empty_metadata_handle, plan_collection_retention,
         resolve_collection_semantics, CollectionClaimValidation, CollectionDerive,
@@ -1173,12 +1165,7 @@ mod tests {
 
     /// One named root of this collection kind.
     fn root(name: &str) -> Fragment {
-        super::descriptor(
-            &CollectionName::new(name).unwrap(),
-            test_team(),
-            Some(test_team()),
-            reach::private(),
-        )
+        super::descriptor(name, test_team(), reach::private())
     }
 
     /// The same anchor as `root("first")`, but naming a different
@@ -1186,9 +1173,8 @@ mod tests {
     /// does not accept.
     fn test_naming(representation: Id, recipe: Id) -> Fragment {
         crate::collection::descriptor::naming(
-            &CollectionName::new("first").unwrap(),
+            "first",
             test_team(),
-            Some(test_team()),
             representation,
             recipe,
             reach::private(),
@@ -2208,30 +2194,16 @@ mod tests {
             id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45")
         );
         assert_eq!(
-            crate::collection::descriptor::name(descriptor.facts())
-                .unwrap()
-                .unwrap()
-                .as_str(),
-            "first"
-        );
-        assert_eq!(
-            crate::collection::descriptor::namespace(descriptor.facts())
-                .unwrap()
-                .unwrap(),
+            crate::collection::descriptor::authority(descriptor.facts()).unwrap(),
             test_team()
         );
-        // The descriptor entity is intrinsic in its own attributes, so the
-        // root moves only when those attributes move.
-        assert_eq!(
-            descriptor.root().unwrap(),
-            id_hex!("8A286DB5010DCBB0CCD84470A8E6C85A")
-        );
-        // The handle pins the whole current descriptor: namespace, optional
-        // authority, reach, and the travelling schema and law descriptions.
-        assert_eq!(
-            identity_for_tests(&descriptor).raw,
-            hex!("54F139C7A5E46DBD3FB62768279800782357B5C953DEE4F9C578B6F91796B931")
-        );
+        let name = crate::collection::descriptor::name(descriptor.facts())
+            .unwrap()
+            .unwrap();
+        let mut blobs = descriptor.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let name: View<str> = reader.get(name).unwrap();
+        assert_eq!(&*name, "first");
         assert_eq!(
             IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle(),
             identity_for_tests(&descriptor)

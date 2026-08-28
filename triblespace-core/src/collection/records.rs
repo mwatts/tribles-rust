@@ -24,6 +24,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 #[cfg(test)]
 use crate::attribute::Attribute;
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::Blob;
 use crate::id::Id;
 use crate::id_hex;
@@ -32,7 +33,6 @@ use crate::inline::encodings::genid::GenId;
 #[cfg(test)]
 use crate::inline::encodings::genid::IdParseError;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
-use crate::inline::encodings::shortstring::ShortString;
 use crate::inline::Inline;
 #[cfg(test)]
 use crate::inline::InlineEncoding;
@@ -88,10 +88,11 @@ pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B
 
 /// Byte length of a canonical bare root collection-descriptor `SimpleArchive`.
 ///
-/// Five facts: the kind tag, the name and namespace that anchor the root, and
-/// the representation and recipe it names. A descriptor that carries an
-/// authority root, embeds its representation's and recipe's own descriptions,
-/// or carries recipe arguments is longer.
+/// Five facts: the kind tag, name, mandatory authority, representation, and
+/// recipe. A descriptor that embeds its representation's and recipe's own
+/// descriptions, declares reach, or carries recipe arguments is longer. The
+/// name's UTF-8 bytes are a separate attachment and do not contribute rows to
+/// the archive.
 pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
@@ -107,38 +108,21 @@ pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
 pub const COLLECTION_RECORD_ID_DOMAIN: &[u8] = b"triblespace.collection.record.id";
 
 attributes! {
-    /// The name a *root* collection is known by within its namespace.
+    /// The human-readable name of a root collection.
     ///
-    /// Half of a root's anchor; see [`collection_namespace`] for the other half.
-    /// Together they replaced an opaque minted scope id, which discriminated
-    /// roots correctly but told a reader nothing: every faculty carried its
-    /// scope as a hex constant in its own source, so "which collection is
-    /// this?" was answerable only by someone holding the code.
+    /// The UTF-8 bytes live in an attachment so the identity has no arbitrary
+    /// 32-byte ceiling. The collection's mandatory authority provides the
+    /// globally unique scope; the name is descriptive identity within it, not
+    /// a second authorization mechanism.
     ///
-    /// The name is part of the identity, so it does not change. A rename is a
-    /// new collection, reached by deriving from the old one. Mutable labels
-    /// are ordinary facts published *about* a collection and are free to
-    /// disagree; this one is the address.
+    /// Anchor minted with `trible genid` on 2026-08-28:
+    /// `A2EEF06D4E1AA4B17B745AA2E8C37867`.
+    "A2EEF06D4E1AA4B17B745AA2E8C37867" as pub collection_name: Handle<UTF8String>;
+    /// External capability trust root for this exact collection.
     ///
-    /// Minted with `trible genid` on 2026-08-20.
-    "436A04C372CBBFBD9C619CF50F59C4A1" unsafe as pub collection_name: ShortString;
-    /// Public-key namespace which distinguishes root collection names.
-    ///
-    /// This is the other half of a root's identity anchor. It is only a
-    /// namespace: it says which `collection_name` vocabulary the root belongs
-    /// to, not who may write, read, relay, or delegate for the collection.
-    ///
-    /// This is the narrowed meaning of the published `collection_team` wire
-    /// field. Renaming the Rust symbol must not rename every collection on
-    /// disk, so its exact byte identity remains pinned while authority moves
-    /// to the separate optional field below.
-    "6C1ED6495491E32FEBB9FDD4EE5E8907" unsafe as pub collection_namespace: ED25519PublicKey;
-    /// Optional external capability trust root for this exact collection.
-    ///
-    /// Authority is not an identity namespace and is not inherited through
-    /// [`collection_source`]. Every descriptor that wants an authority policy
-    /// names its trust root directly; absence means the descriptor declares no
-    /// external capability root at this layer.
+    /// Every descriptor names exactly one authority directly. It is not
+    /// inherited through [`collection_source`], and the authority key itself
+    /// is the sovereign signer while delegates prove exact collection rights.
     ///
     /// Anchor minted with `trible genid` on 2026-08-24:
     /// `7C31D328E9C369CCB6049D05CC8E8C77`.
@@ -241,7 +225,10 @@ pub enum RecordDecodeError {
     MissingField(&'static str),
     /// A single-valued field occurred more than once.
     RepeatedField(&'static str),
-    /// A `GenId` field had a noncanonical or nil inline representation.
+    /// A descriptor field occurred on an entity other than the tagged
+    /// descriptor entity.
+    FieldOnWrongEntity(&'static str),
+    /// A typed descriptor field had a noncanonical inline representation.
     InvalidId(&'static str),
     /// A dense record had no kind byte or the wrong payload length.
     InvalidLength { expected: usize, actual: usize },
@@ -258,6 +245,9 @@ impl fmt::Display for RecordDecodeError {
             Self::MissingField(field) => write!(f, "collection record is missing {field}"),
             Self::RepeatedField(field) => {
                 write!(f, "collection record contains repeated {field}")
+            }
+            Self::FieldOnWrongEntity(field) => {
+                write!(f, "collection record contains {field} on another entity")
             }
             Self::InvalidId(field) => write!(f, "collection record contains invalid {field}"),
             Self::InvalidLength { expected, actual } => write!(
@@ -308,105 +298,6 @@ impl fmt::Display for CommitVerificationError {
 }
 
 impl Error for CommitVerificationError {}
-
-/// A collection name that is legal as part of an identity.
-///
-/// Names are compared byte for byte, because that is what hashing a
-/// descriptor does. So `compass`, `Compass` and `compass ` would be three
-/// different collections that a person reads as one. The charset exists to
-/// make that class of accident unrepresentable rather than merely unlikely:
-/// lowercase ASCII letters, digits and `-`, starting with a letter, ending
-/// with a letter or digit, at most 32 bytes.
-///
-/// It rejects rather than normalises. Silently lowercasing what a caller
-/// wrote would mean the stored identity is not the one they typed, and the
-/// whole reason a name replaced an opaque scope id was so that what is stored
-/// can be read back and recognised.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct CollectionName(String);
-
-/// Why a string cannot be a [`CollectionName`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InvalidCollectionName {
-    /// The name was empty.
-    Empty,
-    /// The name exceeded the 32 bytes a `ShortString` holds inline.
-    TooLong {
-        /// Length of the offending name, in bytes.
-        len: usize,
-    },
-    /// The name did not begin with a lowercase ASCII letter.
-    BadStart,
-    /// The name did not end with a lowercase ASCII letter or digit.
-    BadEnd,
-    /// The name contained a byte outside `[a-z0-9-]`.
-    BadByte {
-        /// The offending byte.
-        byte: u8,
-    },
-}
-
-impl fmt::Display for InvalidCollectionName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => write!(f, "collection name is empty"),
-            Self::TooLong { len } => {
-                write!(f, "collection name is {len} bytes, the maximum is 32")
-            }
-            Self::BadStart => write!(
-                f,
-                "collection name must start with a lowercase ASCII letter"
-            ),
-            Self::BadEnd => write!(
-                f,
-                "collection name must end with a lowercase ASCII letter or digit"
-            ),
-            Self::BadByte { byte } => write!(
-                f,
-                "collection name may only contain [a-z0-9-]; found byte {byte:#04X}"
-            ),
-        }
-    }
-}
-
-impl Error for InvalidCollectionName {}
-
-impl CollectionName {
-    /// Accept a string as a collection name, or say exactly why it is not one.
-    pub fn new(text: &str) -> Result<Self, InvalidCollectionName> {
-        let bytes = text.as_bytes();
-        let Some(&first) = bytes.first() else {
-            return Err(InvalidCollectionName::Empty);
-        };
-        if bytes.len() > 32 {
-            return Err(InvalidCollectionName::TooLong { len: bytes.len() });
-        }
-        if !first.is_ascii_lowercase() {
-            return Err(InvalidCollectionName::BadStart);
-        }
-        let last = bytes[bytes.len() - 1];
-        if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
-            return Err(InvalidCollectionName::BadEnd);
-        }
-        for &byte in bytes {
-            if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-') {
-                return Err(InvalidCollectionName::BadByte { byte });
-            }
-        }
-        Ok(Self(text.to_owned()))
-    }
-
-    /// The name as written, which is also the name as stored.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CollectionName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// Signed exogenous membership assertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -960,47 +851,33 @@ mod tests {
         SigningKey::from_bytes(&[7; 32])
     }
 
-    /// A root is named by its name *and* namespace. Authority has a distinct
-    /// semantic role, but as a descriptor fact it still participates in the
-    /// content identity, as do representation and recipe.
+    /// A root is named under one mandatory authority. Name, authority,
+    /// representation, and recipe all participate in descriptor identity.
     #[test]
     fn collection_descriptor_is_anchor_specific_and_roundtrips() {
         use crate::collection::descriptor;
 
-        let namespace = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let other_namespace = SigningKey::from_bytes(&[2; 32]).verifying_key();
-        let authority = SigningKey::from_bytes(&[3; 32]).verifying_key();
-        let name = CollectionName::new("first").unwrap();
-        let other_name = CollectionName::new("second").unwrap();
+        let authority = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let other_authority = SigningKey::from_bytes(&[2; 32]).verifying_key();
 
-        let a =
-            descriptor::naming(&name, namespace, None, id(2), id(3), reach::private()).into_facts();
+        let a_fragment = descriptor::naming("first", authority, id(2), id(3), reach::private());
+        let expected_name = descriptor::name(a_fragment.facts()).unwrap().unwrap();
+        let a = a_fragment.into_facts();
         let renamed =
-            descriptor::naming(&other_name, namespace, None, id(2), id(3), reach::private())
+            descriptor::naming("second", authority, id(2), id(3), reach::private()).into_facts();
+        let reauthorized =
+            descriptor::naming("first", other_authority, id(2), id(3), reach::private())
                 .into_facts();
-        let renamespaced =
-            descriptor::naming(&name, other_namespace, None, id(2), id(3), reach::private())
-                .into_facts();
-        let governed = descriptor::naming(
-            &name,
-            namespace,
-            Some(authority),
-            id(2),
-            id(3),
-            reach::private(),
-        )
-        .into_facts();
         let other_representation =
-            descriptor::naming(&name, namespace, None, id(4), id(3), reach::private()).into_facts();
+            descriptor::naming("first", authority, id(4), id(3), reach::private()).into_facts();
         let other_recipe =
-            descriptor::naming(&name, namespace, None, id(2), id(4), reach::private()).into_facts();
+            descriptor::naming("first", authority, id(2), id(4), reach::private()).into_facts();
 
         let handle = |facts: &TribleSet| {
             <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
         };
         assert_ne!(handle(&a), handle(&renamed));
-        assert_ne!(handle(&a), handle(&renamespaced));
-        assert_ne!(handle(&a), handle(&governed));
+        assert_ne!(handle(&a), handle(&reauthorized));
         assert_ne!(handle(&a), handle(&other_representation));
         assert_ne!(handle(&a), handle(&other_recipe));
 
@@ -1016,11 +893,10 @@ mod tests {
 
         assert_eq!(
             descriptor::name(&a).unwrap().unwrap(),
-            name,
+            expected_name,
             "the anchor reads back as what was written"
         );
-        assert_eq!(descriptor::namespace(&a).unwrap().unwrap(), namespace);
-        assert_eq!(descriptor::authority(&a), None);
+        assert_eq!(descriptor::authority(&a), Ok(authority));
     }
 
     #[test]
@@ -1215,14 +1091,13 @@ mod tests {
     #[test]
     fn transcript_and_record_roots_are_golden() {
         assert_eq!(
-            collection_namespace.id(),
-            id_hex!("6C1ED6495491E32FEBB9FDD4EE5E8907"),
-            "the namespace rename must preserve published descriptor bytes"
+            collection_name.id(),
+            id_hex!("A2EEF06D4E1AA4B17B745AA2E8C37867"),
+            "the UTF-8 name attribute anchor is a minted wire identity"
         );
         let descriptor = crate::collection::descriptor::naming(
-            &CollectionName::new("first").unwrap(),
+            "first",
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            None,
             id(2),
             id(3),
             reach::private(),
@@ -1235,17 +1110,9 @@ mod tests {
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
         let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
 
-        // Pin the historical bare-root shape. Renaming `collection_team` to
-        // `collection_namespace` preserves these bytes; adding authority
-        // deliberately adds a fact and produces a distinct identity.
-        assert_eq!(
-            crate::collection::descriptor::entity(&descriptor).unwrap(),
-            id_hex!("D3942D72389636880F528243079C24DF")
-        );
-        assert_eq!(
-            descriptor_blob.get_handle().raw,
-            hex!("27BDE8E0150DCEC4F5330DF88D12EAEE0E1B174AA59AB6F2E10A3F9B20B8B8D7")
-        );
+        // Pin the bare-root row count. The descriptor/entity/blob identities
+        // deliberately moved in this epoch: namespace was removed, authority
+        // became mandatory, and the name became a UTF-8 blob handle.
         assert_eq!(
             descriptor_blob.bytes.len() as u64,
             COLLECTION_DESCRIPTOR_ARCHIVE_LEN

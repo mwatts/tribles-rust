@@ -340,22 +340,17 @@ impl Error for SuccinctArchiveUnionValidationError {
 /// Describe the raw SuccinctArchive collection derived from one source.
 ///
 /// A derivation is anchored by the collection it is computed from, so this
-/// takes that source's handle and carries no name or namespace of its own.
-/// Authority is local: the target either names its own trust root or declares
-/// none. When present, that fact changes the target descriptor's content
-/// handle just like every other descriptor fact.
+/// takes that source's handle and carries no name of its own. Authority is
+/// mandatory and local: the target names its own trust root rather than
+/// inheriting one from the source.
 ///
 /// This intentionally reuses the SimpleArchive collection's set-union recipe.
 /// Representation, not recipe proliferation, distinguishes the two lattices.
-pub fn descriptor(
-    source: CollectionHandle,
-    authority: Option<VerifyingKey>,
-    reach: Fragment,
-) -> Fragment {
+pub fn descriptor(source: CollectionHandle, authority: VerifyingKey, reach: Fragment) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
-        collection_authority?: authority,
+        collection_authority: authority,
         collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
         collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
         collection_reach*: reach,
@@ -406,12 +401,13 @@ pub fn validate_derive(
             .get_handle();
     // The target names its source by handle, so this checks the lineage
     // itself rather than a label both sides could independently claim.
-    match descriptor_facts::source(target_descriptor.facts()) {
+    let actual_source = descriptor_facts::source(target_descriptor.facts())?;
+    match actual_source {
         Some(source) if source == source_collection => {}
         _ => {
             return Err(SuccinctArchiveUnionValidationError::WrongSource {
                 expected: source_collection,
-                actual: descriptor_facts::source(target_descriptor.facts()),
+                actual: actual_source,
             })
         }
     }
@@ -480,6 +476,7 @@ fn validate_descriptor_parts(
     descriptor: &Fragment,
     expected_representation: Id,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
+    descriptor_facts::authority(descriptor.facts())?;
     let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {
         return Err(SuccinctArchiveUnionValidationError::WrongRepresentation {
@@ -544,18 +541,16 @@ mod tests {
 
     use crate::blob::IntoBlob;
     use crate::collection::descriptor::identity_for_tests;
-    use crate::collection::records::CollectionName;
     use crate::collection::simplearchive_union;
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
+    fn authority() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[1; 32]).verifying_key()
+    }
+
     /// The named `SimpleArchive` root these tests derive from.
     fn raw_root(name: &str) -> Fragment {
-        simplearchive_union::descriptor(
-            &CollectionName::new(name).unwrap(),
-            SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            Some(SigningKey::from_bytes(&[1; 32]).verifying_key()),
-            reach::private(),
-        )
+        simplearchive_union::descriptor(name, authority(), reach::private())
     }
 
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {
@@ -590,20 +585,24 @@ mod tests {
     #[test]
     fn the_index_derives_from_the_raw_collection_under_the_same_law() {
         let source = raw_root("first");
-        let target = descriptor(identity_for_tests(&source), None, reach::private());
+        let target = descriptor(identity_for_tests(&source), authority(), reach::private());
 
         // The target points at exactly this source, and carries no anchor of
         // its own: what it derives from is what anchors it.
         assert_eq!(
             crate::collection::descriptor::source(target.facts()),
-            Some(identity_for_tests(&source))
+            Ok(Some(identity_for_tests(&source)))
         );
         assert!(
-            crate::collection::descriptor::name(target.facts()).is_none(),
+            crate::collection::descriptor::name(target.facts())
+                .unwrap()
+                .is_none(),
             "a derivation needs no anchor"
         );
         assert!(
-            crate::collection::descriptor::source(source.facts()).is_none(),
+            crate::collection::descriptor::source(source.facts())
+                .unwrap()
+                .is_none(),
             "the raw collection is a root"
         );
         // A derivation of the same shape over different data is a different
@@ -612,7 +611,7 @@ mod tests {
             identity_for_tests(&target),
             identity_for_tests(&descriptor(
                 identity_for_tests(&raw_root("second")),
-                None,
+                authority(),
                 reach::private()
             ))
         );
@@ -641,7 +640,7 @@ mod tests {
         let source_descriptor = raw_root("first");
         let target_descriptor = descriptor(
             identity_for_tests(&raw_root("first")),
-            None,
+            authority(),
             reach::private(),
         );
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
@@ -686,7 +685,7 @@ mod tests {
         let source_descriptor = raw_root("first");
         let target_descriptor = descriptor(
             identity_for_tests(&raw_root("first")),
-            None,
+            authority(),
             reach::private(),
         );
         let shared = row(3, 10, 40);
@@ -740,7 +739,7 @@ mod tests {
         let source_descriptor = raw_root("first");
         let target_descriptor = descriptor(
             identity_for_tests(&raw_root("first")),
-            None,
+            authority(),
             reach::private(),
         );
         let input = archive([row(1, 9, 3)]);
@@ -786,7 +785,7 @@ mod tests {
         let source_descriptor = raw_root("first");
         let target_descriptor = descriptor(
             identity_for_tests(&raw_root("first")),
-            None,
+            authority(),
             reach::private(),
         );
         let input = archive([row(1, 9, 3)]);

@@ -243,18 +243,18 @@ pub fn join(
 
 /// Construct the observed-set collection for one source and edge.
 ///
-/// The target's optional authority is explicit and independent of its source.
+/// The target's mandatory authority is explicit and independent of its source.
 pub fn descriptor(
     source: CollectionHandle,
     observes: Id,
-    authority: Option<VerifyingKey>,
+    authority: VerifyingKey,
     reach: Fragment,
 ) -> Fragment {
     let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
     let fragment = entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
-        collection_authority?: authority,
+        collection_authority: authority,
         collection_representation*: <ObservedSetBlob as MetaDescribe>::describe(),
         collection_recipe*: <ObservedUnionV1 as MetaDescribe>::describe(),
         register_observes: observes,
@@ -683,30 +683,30 @@ mod tests {
 
     #[test]
     fn the_observed_attribute_participates_in_collection_identity() {
+        let authority = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         let root = |name: &str| {
             crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-                simplearchive_union::descriptor(
-                    &crate::collection::records::CollectionName::new(name).unwrap(),
-                    ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
-                    Some(ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key()),
-                    reach::private(),
-                )
-                .into_facts(),
+                simplearchive_union::descriptor(name, authority, reach::private()).into_facts(),
             )
             .get_handle()
         };
         let source = root("source");
         assert_ne!(
-            descriptor(source, metadata::supersedes.id(), None, reach::private()),
-            descriptor(source, metadata::tag.id(), None, reach::private()),
+            descriptor(
+                source,
+                metadata::supersedes.id(),
+                authority,
+                reach::private()
+            ),
+            descriptor(source, metadata::tag.id(), authority, reach::private()),
             "two registers over different edges are different collections"
         );
         // A derived collection carries no anchor of its own; two derivations
         // of the same shape differ exactly when their sources differ.
         let other = root("other-source");
         assert_ne!(
-            descriptor(source, metadata::tag.id(), None, reach::private()),
-            descriptor(other, metadata::tag.id(), None, reach::private()),
+            descriptor(source, metadata::tag.id(), authority, reach::private()),
+            descriptor(other, metadata::tag.id(), authority, reach::private()),
             "the same derivation over different sources is a different collection"
         );
         // ... and the derivation genuinely reads the attribute it is told to.
