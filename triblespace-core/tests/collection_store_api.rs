@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::{BlobEncoding, IntoBlob};
+use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
     CapabilityResource,
@@ -24,7 +24,8 @@ use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::entity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStore, BlobStorePut,
+    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStore, BlobStoreGet,
+    BlobStorePut,
 };
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -176,6 +177,66 @@ fn registration_offers_the_complete_descriptor_closure_once() {
         assert!(offers.contains(attachment));
     }
     assert_eq!(store.puts_for(collection), 1);
+}
+
+#[test]
+fn direct_stage_retains_descriptor_attachments_and_publishes_commit_last() {
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
+    use triblespace_core::collection::descriptor;
+
+    let signer = SigningKey::from_bytes(&[11; 32]);
+    let collection_descriptor = simplearchive_union::descriptor(
+        "direct-stage-name",
+        signer.verifying_key(),
+        reach::private(),
+    );
+    let name = descriptor::name(collection_descriptor.facts())
+        .unwrap()
+        .expect("root descriptor name");
+    let collection: Inline<Handle<SimpleArchive>> =
+        collection_descriptor.facts().clone().to_blob().get_handle();
+    let empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
+    let prepared = simplearchive_union::prepare_commit(&collection_descriptor, &empty, &empty)
+        .expect("prepare direct commit");
+    let mut store = CountingRepo::default();
+
+    let mut staged = prepared.stage(&mut store, &signer).unwrap();
+    let commit = *staged.commit();
+    assert!(staged
+        .store_mut()
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, Infallible>>()
+        .unwrap()
+        .is_empty());
+    staged.finalize().unwrap();
+
+    let name_put = store
+        .events
+        .iter()
+        .position(|event| matches!(event, StoreEvent::Put(raw) if *raw == name.raw))
+        .expect("name attachment put");
+    let descriptor_put = store
+        .events
+        .iter()
+        .position(|event| matches!(event, StoreEvent::Put(raw) if *raw == collection.raw))
+        .expect("descriptor put");
+    let insert = store
+        .events
+        .iter()
+        .position(|event| matches!(event, StoreEvent::Insert(id) if *id == commit.id()))
+        .expect("commit insert");
+    assert!(name_put < descriptor_put && descriptor_put < insert);
+
+    let reader = store.reader().unwrap();
+    let stored_name: Blob<UTF8String> = reader.get(name).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&stored_name.bytes).unwrap(),
+        "direct-stage-name"
+    );
+    let offers = store.offers_snapshot().unwrap();
+    assert!(offers.contains(name.transmute()));
+    assert!(offers.contains(collection.transmute()));
 }
 
 #[test]
