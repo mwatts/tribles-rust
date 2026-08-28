@@ -268,6 +268,47 @@ impl PreparedCollectionCommit {
     where
         S: BlobStorePut + CollectionStore + ArtifactOfferStore,
     {
+        let collection =
+            crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor.facts().clone())
+                .get_handle();
+        self.stage_inner(store, collection, true, signing_key)
+    }
+
+    /// Stage element dependencies against an already registered descriptor.
+    ///
+    /// Unlike [`stage`](Self::stage), this does not write the descriptor again.
+    /// It first binds `collection` to the prepared descriptor's canonical
+    /// identity, then writes embedded fragment blobs, data, and metadata before
+    /// signing. The descriptor and its attachment closure must already have
+    /// been registered and offered by the caller.
+    pub fn stage_for<'store, S>(
+        self,
+        store: &'store mut S,
+        collection: CollectionHandle,
+        signing_key: &SigningKey,
+    ) -> Result<
+        StagedCollectionCommit<'store, S>,
+        PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
+    >
+    where
+        S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+    {
+        self.stage_inner(store, collection, false, signing_key)
+    }
+
+    fn stage_inner<'store, S>(
+        self,
+        store: &'store mut S,
+        mut collection: CollectionHandle,
+        put_descriptor: bool,
+        signing_key: &SigningKey,
+    ) -> Result<
+        StagedCollectionCommit<'store, S>,
+        PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
+    >
+    where
+        S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+    {
         let Self {
             embedded,
             descriptor,
@@ -276,11 +317,22 @@ impl PreparedCollectionCommit {
         } = self;
 
         let mut store = OfferCapture::new(store);
-        let collection: CollectionHandle = store
-            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-                descriptor.into_facts(),
-            ))
-            .map_err(PublicationError::DependencyPut)?;
+        if put_descriptor {
+            collection = store
+                .put::<SimpleArchive, _>(descriptor.into_facts())
+                .map_err(PublicationError::DependencyPut)?;
+        } else {
+            let expected = crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts())
+                .get_handle();
+            if collection != expected {
+                return Err(PublicationError::Validation(
+                    SimpleArchiveUnionValidationError::WrongCollection {
+                        expected,
+                        actual: collection,
+                    },
+                ));
+            }
+        }
         for blob in embedded {
             store
                 .put::<UnknownBlob, _>(blob)

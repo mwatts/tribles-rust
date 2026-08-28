@@ -511,7 +511,7 @@ impl LwwRegisterCollection {
     /// `source_authority` must match the root descriptor exactly, while
     /// `authority` independently controls this derived collection.
     pub fn new(
-        name: String,
+        name: impl Into<String>,
         source_authority: VerifyingKey,
         identity: Id,
         orders: Id,
@@ -520,7 +520,7 @@ impl LwwRegisterCollection {
         reach: Fragment,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
             source_authority,
             identity,
             orders,
@@ -532,7 +532,7 @@ impl LwwRegisterCollection {
 
     /// Name of the source root collection.
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     /// Mandatory capability trust root declared by the source descriptor.

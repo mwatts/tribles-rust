@@ -7,17 +7,16 @@
 //! signatures, descriptor, data, and mandatory metadata are all checked before
 //! facts are returned.
 
-use ed25519_dalek::VerifyingKey;
-
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
 #[cfg(test)]
 use crate::collection::reach;
+use ed25519_dalek::VerifyingKey;
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 
-use crate::collection::api::{Collection, CollectionSnapshot};
+use crate::collection::api::{snapshot_from_observation, CollectionSnapshot, CollectionTicket};
 use crate::collection::discovery::{
     canonicalize_exact_ticket, discover_collection_records_for_collection_ticket,
     validate_exact_ticket,
@@ -47,9 +46,9 @@ impl SimpleArchiveCollection {
     /// `reach` is not decoration on a read facade: it is part of the
     /// descriptor this facade hashes, so a facade that names the wrong reach
     /// names a different collection and matches no ticket.
-    pub fn new(name: String, authority: VerifyingKey, reach: Fragment) -> Self {
+    pub fn new(name: impl Into<String>, authority: VerifyingKey, reach: Fragment) -> Self {
         Self {
-            name,
+            name: name.into(),
             authority,
             reach,
         }
@@ -62,10 +61,10 @@ impl SimpleArchiveCollection {
 
     /// Human-readable name of this root collection.
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
-    /// Mandatory external capability trust root in this descriptor.
+    /// Mandatory capability trust root in this descriptor.
     pub fn authority(&self) -> VerifyingKey {
         self.authority
     }
@@ -131,7 +130,7 @@ impl SimpleArchiveCollection {
     /// and only those commits can authorize the returned facts even if the
     /// reader physically contains later or otherwise unselected blobs.
     /// An empty ticket still opens and returns a reader, matching
-    /// [`crate::collection::Collection::snapshot`].
+    /// [`crate::collection::CollectionStoreExt::snapshot`].
     pub fn snapshot_exact<S>(
         &self,
         store: &mut S,
@@ -173,22 +172,23 @@ impl SimpleArchiveCollection {
     {
         let descriptor = self.descriptor();
         let collection = self.collection();
-        if commits.is_empty() {
-            return Collection::<S>::snapshot_from_observation(
+        let ticket = CollectionTicket::from_canonical(collection, commits);
+        if ticket.is_empty() {
+            return snapshot_from_observation(
                 store,
                 &descriptor,
                 DiscoveredCollectionRecords::default(),
-                commits,
+                ticket,
             );
         }
 
-        let requested: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
+        let requested: BTreeSet<_> = ticket.commits().iter().map(CollectionCommit::id).collect();
         let discovered =
             discover_collection_records_for_collection_ticket(store, &requested, collection)
                 .map_err(CollectionMaterializationError::Discovery)?;
-        validate_exact_ticket(&discovered, &commits)
+        validate_exact_ticket(&discovered, ticket.commits())
             .map_err(CollectionMaterializationError::ExactTicket)?;
-        Collection::<S>::snapshot_from_observation(store, &descriptor, discovered, commits)
+        snapshot_from_observation(store, &descriptor, discovered, ticket)
     }
 }
 

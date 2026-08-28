@@ -386,18 +386,18 @@ impl SuccinctArchiveCollection {
     /// source and a private index over a public one are both ordinary things
     /// to want, and an index can expose what its source did not, so the two
     /// are stated separately rather than derived from one another.
-    /// `source_authority` and `authority` are likewise independent descriptor
+    /// `source_authority` and `authority` are independent mandatory descriptor
     /// facts: the former must exactly match the root ticket, while the latter
     /// governs the raw Succinct and Rank9 derived family.
     pub fn new(
-        name: String,
+        name: impl Into<String>,
         source_authority: VerifyingKey,
         source_reach: Fragment,
         authority: VerifyingKey,
         reach: Fragment,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
             source_authority,
             source_reach,
             authority,
@@ -417,7 +417,7 @@ impl SuccinctArchiveCollection {
 
     /// Name of the root collection this projection is taken over.
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     /// Mandatory capability trust root declared by the source descriptor.

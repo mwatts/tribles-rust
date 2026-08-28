@@ -351,7 +351,7 @@ impl ObservedSetCollection {
     /// `source_authority` must match the root descriptor exactly; `authority`
     /// independently declares the derived collection's mandatory trust root.
     pub fn new(
-        name: String,
+        name: impl Into<String>,
         source_authority: VerifyingKey,
         observes: Id,
         source_reach: Fragment,
@@ -359,7 +359,7 @@ impl ObservedSetCollection {
         reach: Fragment,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
             source_authority,
             observes,
             source_reach,
@@ -380,7 +380,7 @@ impl ObservedSetCollection {
 
     /// Name of the root collection this projection is taken over.
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     /// Mandatory capability trust root declared by the source descriptor.
