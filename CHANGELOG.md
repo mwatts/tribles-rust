@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an end-to-end incremental collection-query benchmark comparing full
+  re-query with `pattern_changes!` maintenance over source-identical exact
+  Succinct views. It measures one fixed-size commit observation, including
+  view admission and application result-set maintenance, while checking raw
+  rows, accumulated results, tickets, and checkpoints at every step.
+
 - Add `SuccinctArchiveCollection::exact_view()` for maintaining one admitted
   in-process query view across exact ticket observations. Unchanged support
   performs no storage I/O, monotone additions run ordinary exact admission only

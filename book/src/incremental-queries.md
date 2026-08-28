@@ -112,6 +112,25 @@ When an ingestion API already returns its newly produced fragment, using that
 fragment's facts directly is cheaper than rematerializing a ticket subset. The
 ticket pattern is useful across process boundaries or after reopening storage.
 
+The `incremental_collection_queries` benchmark measures this complete
+maintenance loop against a full re-query over the same evolving source data:
+
+```text
+cargo bench --bench incremental_collection_queries -- \
+  --commits 64 --books-per-commit 256 --warmup 1 --iters 4
+```
+
+Each observation includes advancing the exact Succinct view and maintaining
+the application's result set. Publication, ticket discovery, and fixture
+construction remain outside the timer. The benchmark checks raw row counts,
+projection-level set equality, consumer checkpoints, and exact view tickets at
+every commit; geometric checkpoints affect reporting only, not observation.
+Its fixture projects every query variable and gives every book a unique
+binding, so those equality checks do not imply projected-set semantics for
+arbitrary queries. The between-observation checks deliberately favor strong
+invariants over pristine cache state; read the output as warm-trace maintenance
+latency rather than isolated cold-call latency.
+
 ## Monotonicity and CALM
 
 Removed results are not tracked. Facts and collection commits are monotone:

@@ -153,3 +153,7 @@ harness = false
 [[bench]]
 name = "collection_evolution"
 harness = false
+
+[[bench]]
+name = "incremental_collection_queries"
+harness = false
