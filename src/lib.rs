@@ -111,20 +111,15 @@ mod readme_example {
 
     #[test]
     fn readme_example() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::core::collection::{reach, CollectionAdmission};
+        use crate::core::collection::{reach, simplearchive_union};
 
-        let storage = MemoryRepo::default();
+        let mut storage = MemoryRepo::default();
         let key = SigningKey::generate(&mut OsRng);
-        let namespace = key.verifying_key();
-        let name = CollectionName::new("library")?;
-        let mut library = Collection::new(
-            storage,
-            &name,
-            namespace,
-            key,
+        let library = storage.collection(simplearchive_union::descriptor(
+            "library",
+            key.verifying_key(),
             reach::private(),
-            CollectionAdmission::Open,
-        );
+        ))?;
 
         let mut initial = entity! {
             literature::firstname: "Frank",
@@ -139,9 +134,9 @@ mod readme_example {
             literature::quote: quote,
         };
 
-        library.commit(initial)?;
+        storage.commit(library, &key, initial)?;
 
-        let snapshot = library.snapshot()?;
+        let snapshot = storage.snapshot(library, &[])?;
         let catalog = snapshot.facts();
         let title = "Dune";
 
@@ -166,16 +161,24 @@ mod readme_example {
 
         // Independent commits coexist and materialize by set union. There is
         // no mutable head to race and no conflict-resolution loop to write.
-        library.commit(entity! {
-            literature::firstname: "Francis",
-            literature::lastname: "Bacon",
-        })?;
-        library.commit(entity! {
-            literature::firstname: "Franklin",
-            literature::lastname: "Roosevelt",
-        })?;
+        storage.commit(
+            library,
+            &key,
+            entity! {
+                literature::firstname: "Francis",
+                literature::lastname: "Bacon",
+            },
+        )?;
+        storage.commit(
+            library,
+            &key,
+            entity! {
+                literature::firstname: "Franklin",
+                literature::lastname: "Roosevelt",
+            },
+        )?;
 
-        let catalog = library.materialize()?;
+        let catalog = storage.snapshot(library, &[])?.into_facts();
         let mut names: Vec<String> = find!(
             first: String,
             pattern!(&catalog, [{ _?author @ literature::firstname: ?first }])

@@ -54,7 +54,7 @@ the facts that reference it.
 ```rust
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::collection::reach;
+use triblespace::core::collection::{reach, simplearchive_union};
 use triblespace::prelude::*;
 
 mod literature {
@@ -78,17 +78,12 @@ mod literature {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = SigningKey::generate(&mut OsRng);
-    let namespace = key.verifying_key();
-    let name = CollectionName::new("library")?;
-    let storage = MemoryRepo::default();
-    let mut library = Collection::new(
-        storage,
-        &name,
-        namespace,
-        key.clone(),
+    let mut storage = MemoryRepo::default();
+    let library = storage.collection(simplearchive_union::descriptor(
+        "library",
+        key.verifying_key(),
         reach::private(),
-        CollectionAdmission::Open,
-    );
+    ))?;
 
     let author = entity! {
         literature::firstname: "Frank",
@@ -104,9 +99,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut import = author;
     import += book;
-    library.commit(import)?;
+    storage.commit(library, &key, import)?;
 
-    let snapshot = library.snapshot()?;
+    let snapshot = storage.snapshot(library, &[])?;
     let title = "Dune";
     for (first, last, quote) in find!(
         (first: String, last: String, quote),
@@ -130,16 +125,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-This example chooses `CollectionAdmission::Open`, so every strictly verified
-signer for the exact descriptor is visible and the local signer may publish.
-Capability admission instead accepts only explicitly supplied root-to-leaf
-proofs for exact `ACTION_WRITE` under the descriptor's optional capability
-trust root; it never scans storage for ambient grants. The descriptor's
-public-key namespace names the collection and does not authorize a signer.
-Identical retries deduplicate by intrinsic record identity,
-distinct commits coexist, and a snapshot materializes every admitted author's
-union. Call `Collection::flush` when an application needs an explicit
-durability barrier.
+The descriptor's mandatory authority participates in the collection identity
+and is admitted directly. Other strictly verified signers become visible only
+when `snapshot` receives explicit root-to-leaf proofs for exact `ACTION_WRITE`
+on this descriptor handle; it never scans storage for ambient grants.
+Identical retries deduplicate by intrinsic record identity, distinct commits
+coexist, and a snapshot materializes every admitted author's union. Call the
+store's `flush` operation when an application needs an explicit durability
+barrier.
 
 The [Getting Started](https://triblespace.github.io/triblespace-rs/getting-started.html)
 chapter breaks the example down, while [Collection
