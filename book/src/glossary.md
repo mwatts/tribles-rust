@@ -79,20 +79,20 @@ map elements into another collection through a canonical homomorphism. A
 collection has no distinguished head.
 
 ### Collection Admission
-The explicit signer policy held by a high-level `Collection` facade. Open
-admission accepts every strictly verified signer. Capability admission accepts
-only expected leaf keys whose owned proof bundles verify at one clock instant
-against its trust root and exact `ACTION_WRITE`/collection atom. An empty
-capability presentation set admits nobody.
+The read-time signer decision performed by `store.ticket` and
+`store.snapshot`. The descriptor authority is admitted directly; each
+additional expected leaf must carry an explicit proof bundle which verifies at
+one clock instant against that authority and the exact
+`ACTION_WRITE`/collection atom. An empty presentation set therefore admits the
+descriptor authority alone.
 
 ### Collection Descriptor
-A canonical `SimpleArchive` describing a collection's root name and public-key
-namespace or exact derived source, optional capability trust root, element
-representation, join recipe, and reach law. Its content handle is the
-`CollectionHandle`, so every native record which names a collection can resolve
-its meaning through the ordinary blob store. Open facade admission omits the
-trust-root fact; capability admission writes exactly its trust root. A derived
-descriptor never inherits namespace or trust through its source.
+A canonical `SimpleArchive` describing a collection's UTF-8 root name or exact
+derived source, mandatory descriptor-local authority, element representation,
+join recipe, and reach law. Its content handle is the `CollectionHandle`, so
+every native record which names a collection can resolve its meaning through
+the ordinary blob store. A derived descriptor states its own authority and
+never inherits one through its source.
 
 ### Collection Store
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is

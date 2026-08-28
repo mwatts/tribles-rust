@@ -73,7 +73,7 @@ use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
-use triblespace_core::collection::CollectionAdmission;
+use triblespace_core::collection::{simplearchive_union, CollectionStoreExt};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
@@ -669,13 +669,13 @@ struct BuildShape {
     raw_bytes: usize,
 }
 
-fn benchmark_name() -> CollectionName {
-    CollectionName::new("portable-succinct-benchmark").expect("legal collection name")
+fn benchmark_name() -> &'static str {
+    "portable-succinct-benchmark"
 }
 
-/// The public-key namespace shared by the benchmark's source and projection.
+/// The descriptor authority shared by the benchmark's source and projection.
 /// Fixed so every iteration exercises byte-identical descriptors and records.
-fn benchmark_namespace() -> VerifyingKey {
+fn benchmark_authority() -> VerifyingKey {
     SigningKey::from_bytes(&[0x5A; 32]).verifying_key()
 }
 
@@ -743,13 +743,12 @@ fn main() {
     // that returns a query-ready exact cover. Source signing/publication is an
     // admission setup cost, not part of Succinct construction.
     let name = benchmark_name();
-    let namespace = benchmark_namespace();
+    let authority = benchmark_authority();
     let succinct = SuccinctArchiveCollection::new(
-        name.clone(),
-        namespace,
-        None,
+        name,
+        authority,
         reach::private(),
-        None,
+        authority,
         reach::private(),
     );
     let signing_key = SigningKey::from_bytes(&[0x5A; 32]);
@@ -760,21 +759,24 @@ fn main() {
         let mut ident: Option<BuildShape> = None;
         for i in 0..(build_warmup + build_iters) {
             let recording = i >= build_warmup;
-            let mut source = Collection::new(
-                MemoryRepo::default(),
-                &name,
-                namespace,
-                signing_key.clone(),
-                reach::private(),
-                CollectionAdmission::Open,
-            );
+            let mut store = MemoryRepo::default();
+            let source = store
+                .collection(simplearchive_union::descriptor(
+                    name,
+                    authority,
+                    reach::private(),
+                ))
+                .expect("register source collection");
             for chunk in &chunks {
-                source
-                    .commit(Fragment::from(chunk.content.clone()))
+                store
+                    .commit(source, &signing_key, Fragment::from(chunk.content.clone()))
                     .expect("publish source chunk");
             }
-            let ticket = source.ticket().expect("freeze exact source ticket");
-            let mut store = source.into_storage();
+            let ticket = store
+                .ticket(source, &[])
+                .expect("freeze exact source ticket")
+                .commits()
+                .to_vec();
 
             let t = Instant::now();
             let union = succinct

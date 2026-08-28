@@ -516,21 +516,6 @@ mod instrumentation_tests {
     use triblespace_core::trible::TribleSet;
 
     #[test]
-    fn collection_name_accepts_only_legal_names() {
-        assert_eq!(
-            parse_collection_name("macro-metadata")
-                .as_ref()
-                .map(CollectionName::as_str),
-            Some("macro-metadata")
-        );
-        assert_eq!(parse_collection_name(""), None);
-        assert_eq!(parse_collection_name("Macro-Metadata"), None);
-        assert_eq!(parse_collection_name("macro metadata"), None);
-        assert_eq!(parse_collection_name("-macro"), None);
-        assert_eq!(parse_collection_name("macro-"), None);
-    }
-
-    #[test]
     fn attribute_metadata_joins_the_invocation_fragment_with_its_attachments() {
         let invocation_entity = fucid();
         let mut fragment = Fragment::empty();
@@ -596,17 +581,11 @@ mod instrumentation_tests {
             invocation::source_tokens: attachment
         };
 
-        let name = CollectionName::new("macro-metadata").unwrap();
+        let name = "macro-metadata";
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let namespace = signing_key.verifying_key();
-        publish_metadata(
-            &path,
-            &name,
-            namespace,
-            signing_key.clone(),
-            fragment.clone(),
-        );
-        publish_metadata(&path, &name, namespace, signing_key, fragment);
+        let authority = signing_key.verifying_key();
+        publish_metadata(&path, name, signing_key.clone(), fragment.clone());
+        publish_metadata(&path, name, signing_key, fragment);
 
         let mut pile = Pile::open(&path).unwrap();
         let records = CollectionStore::records(&mut pile)
@@ -619,7 +598,7 @@ mod instrumentation_tests {
             "one target commit is the only native record"
         );
         let expected_descriptor =
-            collection::simplearchive_union::descriptor(&name, namespace, None, reach::private())
+            collection::simplearchive_union::descriptor(name, authority, reach::private())
                 .into_facts();
         let target =
             triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(expected_descriptor.clone())

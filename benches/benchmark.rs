@@ -15,7 +15,7 @@ use triblespace::core::blob::encodings::succinctarchive::CachedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::CompressedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::collection::{reach, Collection, CollectionAdmission, CollectionName};
+use triblespace::core::collection::{reach, simplearchive_union, CollectionStoreExt};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::BlobStorePut;
 
@@ -955,18 +955,16 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
     // validate and union the complete admitted frontier.
     for &n_commits in &[10usize, 100, 1000] {
         let entities_per_commit = 100;
-        let storage = MemoryRepo::default();
+        let mut storage = MemoryRepo::default();
         let signing_key = SigningKey::generate(&mut OsRng);
-        let namespace = signing_key.verifying_key();
-        let name = CollectionName::new("materialize-bench").expect("valid collection name");
-        let mut collection = Collection::new(
-            storage,
-            &name,
-            namespace,
-            signing_key,
-            reach::private(),
-            CollectionAdmission::Open,
-        );
+        let authority = signing_key.verifying_key();
+        let collection = storage
+            .collection(simplearchive_union::descriptor(
+                "materialize-bench",
+                authority,
+                reach::private(),
+            ))
+            .expect("register benchmark collection");
 
         let mut total_tribles: u64 = 0;
         for _ in 0..n_commits {
@@ -986,14 +984,18 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
                 };
             }
             total_tribles += commit_data.len() as u64;
-            collection
-                .commit(commit_data.into())
+            storage
+                .commit(collection, &signing_key, commit_data.into())
                 .expect("publish collection commit");
         }
 
         group.throughput(Throughput::Elements(total_tribles));
         group.bench_function(BenchmarkId::new("materialize", n_commits), |b| {
-            b.iter(|| collection.materialize().expect("materialize collection"));
+            b.iter(|| {
+                storage
+                    .snapshot(collection, &[])
+                    .expect("materialize collection")
+            });
         });
     }
 

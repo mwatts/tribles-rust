@@ -26,7 +26,6 @@ use triblespace_core::collection::descriptor;
 use triblespace_core::collection::exact_derived::{
     ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
 };
-use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionRecord,
     CollectionStore, simplearchive_union,
@@ -196,15 +195,11 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
         let mut client_store = empty_store();
 
         // Only the identity matters here; the descriptor is never stored.
-        let descriptor = simplearchive_union::descriptor(
-            &CollectionName::new("lazy").unwrap(),
-            key(0xF1).verifying_key(),
-            Some(key(0xF1).verifying_key()),
-            reach::private(),
-        )
-        .into_facts()
-        .to_blob()
-        .get_handle();
+        let descriptor =
+            simplearchive_union::descriptor("lazy", key(0xF1).verifying_key(), reach::private())
+                .into_facts()
+                .to_blob()
+                .get_handle();
         let a = Inline::new([1; 32]);
         let b = Inline::new([2; 32]);
         let result = Inline::new([3; 32]);
@@ -357,16 +352,11 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
         let namespace = key(0xD3).verifying_key();
         let team_root = root.verifying_key();
 
-        let source_descriptor = simplearchive_union::descriptor(
-            &CollectionName::new("network-empty-source").unwrap(),
-            namespace,
-            None,
-            reach::private(),
-        );
+        let source_descriptor =
+            simplearchive_union::descriptor("network-empty-source", namespace, reach::private());
         let target_descriptor = descriptor::naming(
-            &CollectionName::new("network-empty-target").unwrap(),
+            "network-empty-target",
             namespace,
-            None,
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
@@ -466,16 +456,11 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
         let serving_team = key(0xE1).verifying_key();
         let conflicting_team = key(0xE2).verifying_key();
         let namespace = key(0xE3).verifying_key();
-        let source_descriptor = simplearchive_union::descriptor(
-            &CollectionName::new("scope-conflict-source").unwrap(),
-            namespace,
-            None,
-            reach::private(),
-        );
+        let source_descriptor =
+            simplearchive_union::descriptor("scope-conflict-source", namespace, reach::private());
         let target_descriptor = descriptor::naming(
-            &CollectionName::new("scope-conflict-target").unwrap(),
+            "scope-conflict-target",
             namespace,
-            None,
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
@@ -554,16 +539,11 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
         let namespace = key(0xD4).verifying_key();
         let team_root = root.verifying_key();
 
-        let source_descriptor = simplearchive_union::descriptor(
-            &CollectionName::new("network-cover-source").unwrap(),
-            namespace,
-            None,
-            reach::private(),
-        );
+        let source_descriptor =
+            simplearchive_union::descriptor("network-cover-source", namespace, reach::private());
         let target_descriptor = descriptor::naming(
-            &CollectionName::new("network-cover-target").unwrap(),
+            "network-cover-target",
             namespace,
-            None,
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),

@@ -209,6 +209,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Port the remaining benchmark, path/network test, macro-instrumentation, and
+  benchmark-ledger callers to the store-centric collection API with mandatory
+  descriptor authority. The tribleset benchmark results ledger now uses one
+  fixed deliberately public authority key, preserving its prior pile-local
+  open trust boundary while giving every run one canonical authority-bearing
+  descriptor and ordinary `snapshot` admission.
+
 - Replace the stateful `Collection<S>`/`CollectionAdmission` facade with
   store-centric collection operations. `store.collection(fragment)` validates,
   stores, and durably offers a descriptor's complete attachment closure;
@@ -281,25 +288,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headers and Yard operation WANTs with PATCH indexes. Canonical PATCH
   traversal preserves their byte order, while Yard no longer sorts the full
   request vector when enumerating already-canonical keys.
-
-- Replace the high-level `Collection` facade's ambient, store-enumerated
-  authority resolution with explicit admission. `CollectionAdmission::Open`
-  admits every strictly verified signer; capability admission accepts owned
-  `CapabilityPresentation`s pairing an expected leaf with a complete proof
-  bundle, and fails loud unless every bundle verifies at one operation-wide
-  clock instant against its trust root and exact `ACTION_WRITE`/collection atom.
-  The admission choice determines the
-  descriptor's optional authority fact, empty capability admission denies all
-  writes and yields an empty ticket, and newly supplied proofs can expose
-  already-resident foreign commits without publishing new collection state.
-  `ACTION_WRITE` now lives in `collection`, and the obsolete enumerable
-  authority resolver has been removed entirely. Exact `SimpleArchive`,
-  Succinct-derived, and regular-path facades now carry namespace and optional
-  source/target authorities independently, so tickets from both open and
-  capability-governed roots preserve descriptor identity through derivation.
-  Built-in examples, telemetry, macro instrumentation, and benchmarks select
-  open local admission directly instead of publishing synthetic team-of-one
-  authority grants.
 
 - Split a collection descriptor's public-key namespace from its optional
   capability authority. Roots are named by `collection_name` plus

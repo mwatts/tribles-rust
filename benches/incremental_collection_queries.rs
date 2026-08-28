@@ -39,7 +39,8 @@ use triblespace::core::collection::succinctarchive_union::{
     SuccinctArchiveCollection, SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    exact_ticket_additions, reach, CollectionCommit, SimpleArchiveCollection,
+    exact_ticket_additions, reach, simplearchive_union, CollectionCommit, CollectionStoreExt,
+    SimpleArchiveCollection,
 };
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
@@ -58,8 +59,8 @@ struct Fixture {
     succinct: SuccinctArchiveCollection,
 }
 
-fn benchmark_name() -> CollectionName {
-    CollectionName::new("incremental-query-benchmark").expect("legal collection name")
+fn benchmark_name() -> &'static str {
+    "incremental-query-benchmark"
 }
 
 fn benchmark_key() -> SigningKey {
@@ -68,24 +69,30 @@ fn benchmark_key() -> SigningKey {
 
 fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     let signing_key = benchmark_key();
-    let namespace = signing_key.verifying_key();
+    let authority = signing_key.verifying_key();
     let name = benchmark_name();
-    let mut collection = Collection::new(
-        MemoryRepo::default(),
-        &name,
-        namespace,
-        signing_key,
-        reach::private(),
-        CollectionAdmission::Open,
-    );
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection(simplearchive_union::descriptor(
+            name,
+            authority,
+            reach::private(),
+        ))
+        .expect("register benchmark collection");
 
     let author = entity! {
         literature::firstname: "Frank",
         literature::lastname: "Herbert",
     };
     let author_id = author.root().expect("intrinsic author id");
-    collection.commit(author).expect("publish seed author");
-    let seed_ticket = collection.ticket().expect("freeze seed ticket");
+    store
+        .commit(collection, &signing_key, author)
+        .expect("publish seed author");
+    let seed_ticket = store
+        .ticket(collection, &[])
+        .expect("freeze seed ticket")
+        .commits()
+        .to_vec();
     assert_eq!(seed_ticket.len(), 1);
 
     let mut tickets = Vec::with_capacity(commits);
@@ -111,23 +118,30 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
             ));
             fragment += entity;
         }
-        collection.commit(fragment).expect("publish book commit");
-        tickets.push(collection.ticket().expect("freeze exact ticket"));
+        store
+            .commit(collection, &signing_key, fragment)
+            .expect("publish book commit");
+        tickets.push(
+            store
+                .ticket(collection, &[])
+                .expect("freeze exact ticket")
+                .commits()
+                .to_vec(),
+        );
         expected_batches.push(expected);
     }
 
-    let simple = SimpleArchiveCollection::new(name.clone(), namespace, None, reach::private());
+    let simple = SimpleArchiveCollection::new(name, authority, reach::private());
     let succinct = SuccinctArchiveCollection::new(
         name,
-        namespace,
-        None,
+        authority,
         reach::private(),
-        None,
+        authority,
         reach::private(),
     );
 
     Fixture {
-        store: collection.into_storage(),
+        store,
         seed_ticket,
         tickets,
         expected_batches,

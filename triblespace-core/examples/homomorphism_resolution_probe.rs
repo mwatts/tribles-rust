@@ -7,7 +7,6 @@ use triblespace_core::collection::reach;
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::descriptor;
-use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
@@ -70,24 +69,8 @@ fn build(
 
     let signing_key = SigningKey::from_bytes(&[7; 32]);
     let team = signing_key.verifying_key();
-    let source = descriptor::naming(
-        &CollectionName::new("source").unwrap(),
-        team,
-        Some(team),
-        id(2),
-        id(3),
-        reach::private(),
-    )
-    .into_facts();
-    let target = descriptor::naming(
-        &CollectionName::new("target").unwrap(),
-        team,
-        Some(team),
-        id(5),
-        id(6),
-        reach::private(),
-    )
-    .into_facts();
+    let source = descriptor::naming("source", team, id(2), id(3), reach::private()).into_facts();
+    let target = descriptor::naming("target", team, id(5), id(6), reach::private()).into_facts();
     let source_collection: CollectionHandle =
         IntoBlob::<SimpleArchive>::to_blob(source.clone()).get_handle();
     let target_collection: CollectionHandle =

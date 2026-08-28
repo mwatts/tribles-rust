@@ -4,7 +4,6 @@ use triblespace_core::collection::reach;
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::IntoBlob;
-use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     simplearchive_union, CollectionCommit, CollectionRecord, CollectionStore,
 };
@@ -92,14 +91,14 @@ fn canonical_expression_construction_stabilizes_automaton_fingerprints() {
 fn compiled_expression_roundtrips_through_native_collection_and_query_constraint() {
     let expression = PathExpr::from(Step::Forward(metadata::tag.id().into())).plus();
     let signing_key = SigningKey::from_bytes(&[17; 32]);
-    let namespace = signing_key.verifying_key();
-    let name = CollectionName::new("graph").unwrap();
+    let authority = signing_key.verifying_key();
+    let name = "graph";
     let paths = PathSummaryCollection::new(
-        name.clone(),
-        namespace,
-        None,
+        name,
+        authority,
         expression.compile(),
         reach::private(),
+        authority,
         reach::private(),
     );
     let mut store = MemoryRepo::default();
@@ -111,7 +110,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
         .unwrap();
     let source = store
         .put::<SimpleArchive, _>(
-            simplearchive_union::descriptor(&name, namespace, None, reach::private())
+            simplearchive_union::descriptor(name, authority, reach::private())
                 .into_facts()
                 .to_blob(),
         )

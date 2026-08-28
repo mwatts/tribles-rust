@@ -361,13 +361,24 @@ mod tests {
         triblespace_core::id::Id::new([byte; 16]).unwrap()
     }
 
-    /// The public-key namespace shared by the test source collections.
-    fn test_namespace() -> VerifyingKey {
+    /// The descriptor authority shared by ordinary test collections.
+    fn test_authority() -> VerifyingKey {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
-    fn test_name(name: &str) -> CollectionName {
-        CollectionName::new(name).unwrap()
+    fn test_name(name: &str) -> String {
+        name.to_owned()
+    }
+
+    fn test_paths(name: String, automaton: Automaton) -> PathSummaryCollection {
+        PathSummaryCollection::new(
+            name,
+            test_authority(),
+            automaton,
+            reach::private(),
+            test_authority(),
+            reach::private(),
+        )
     }
 
     /// These tests only need an identity to file records under; the
@@ -402,7 +413,7 @@ mod tests {
 
     fn signed_commit(
         store: &mut CollectionOnly,
-        name: &CollectionName,
+        name: &str,
         key: u8,
         data: &Blob<SimpleArchive>,
     ) -> CollectionCommit {
@@ -413,8 +424,7 @@ mod tests {
             &SigningKey::from_bytes(&[key; 32]),
             collection_of(&simplearchive_union::descriptor(
                 name,
-                test_namespace(),
-                None,
+                test_authority(),
                 reach::private(),
             )),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
@@ -435,32 +445,35 @@ mod tests {
     }
 
     #[test]
-    fn source_authority_is_explicit_and_participates_in_both_identities() {
+    fn source_and_target_authorities_are_mandatory_and_independent() {
         let name = test_name("c9");
-        let namespace = test_namespace();
-        let trust_root = SigningKey::from_bytes(&[2; 32]).verifying_key();
-        let open = PathSummaryCollection::new(
+        let source_authority = test_authority();
+        let target_authority = SigningKey::from_bytes(&[2; 32]).verifying_key();
+        let other_source_authority = SigningKey::from_bytes(&[3; 32]).verifying_key();
+        let collection = PathSummaryCollection::new(
             name.clone(),
-            namespace,
-            None,
+            source_authority,
             plus(),
             reach::private(),
+            target_authority,
             reach::private(),
         );
-        let governed = PathSummaryCollection::new(
+        let other_source = PathSummaryCollection::new(
             name,
-            namespace,
-            Some(trust_root),
+            other_source_authority,
             plus(),
             reach::private(),
+            target_authority,
             reach::private(),
         );
 
-        assert_eq!(open.namespace(), namespace);
-        assert_eq!(open.source_authority(), None);
-        assert_eq!(governed.source_authority(), Some(trust_root));
-        assert_ne!(open.source_collection(), governed.source_collection());
-        assert_ne!(open.collection(), governed.collection());
+        assert_eq!(collection.source_authority(), source_authority);
+        assert_eq!(collection.authority(), target_authority);
+        assert_ne!(
+            collection.source_collection(),
+            other_source.source_collection()
+        );
+        assert_ne!(collection.collection(), other_source.collection());
     }
 
     #[test]
@@ -480,14 +493,7 @@ mod tests {
         }
 
         let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
-        let paths = PathSummaryCollection::new(
-            test_name("c9"),
-            test_namespace(),
-            None,
-            automaton.clone(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(test_name("c9"), automaton.clone());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
         bytes.extend_from_slice(&automaton.state_count().to_le_bytes());
@@ -505,14 +511,7 @@ mod tests {
     #[test]
     fn empty_ticket_is_local_bottom_and_writes_nothing() {
         let mut store = CollectionOnly::default();
-        let paths = PathSummaryCollection::new(
-            test_name("c9"),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(test_name("c9"), plus());
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
         let index = paths.ensure_exact(&mut store, &[]).unwrap();
@@ -524,14 +523,7 @@ mod tests {
     #[test]
     fn missing_then_ensure_closes_cross_fragment_path() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -553,14 +545,7 @@ mod tests {
     #[test]
     fn old_ticket_ignores_later_commit_and_its_cache_equation() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -592,14 +577,7 @@ mod tests {
     #[test]
     fn duplicate_data_provenance_shares_one_derive() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let data = put_data(&mut store, &edge(1, 2));
         let first = signed_commit(&mut store, &name, 1, &data);
@@ -623,14 +601,7 @@ mod tests {
     #[test]
     fn derive_before_commit_is_inert_then_becomes_live() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let source = put_data(&mut store, &edge(1, 2));
         let commit = signed_commit(&mut store, &name, 7, &source);
@@ -657,14 +628,7 @@ mod tests {
     #[test]
     fn resident_source_merge_is_lowered_once() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -699,14 +663,7 @@ mod tests {
     #[test]
     fn source_cover_can_overlap_an_already_supported_root() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -759,14 +716,7 @@ mod tests {
     #[test]
     fn existing_target_merge_is_the_single_physical_member() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -810,14 +760,7 @@ mod tests {
     #[test]
     fn absent_source_bytes_report_the_commit() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(
-            name.clone(),
-            test_namespace(),
-            None,
-            plus(),
-            reach::private(),
-            reach::private(),
-        );
+        let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
         let absent = edge(1, 2).to_blob();
         let metadata = store

@@ -283,7 +283,6 @@ inspect and migrate that evidence without restoring the old publication API.
 trible pile migrate data.pile branch-to-collection \
   --branch legacy-events \
   --collection-name events \
-  --namespace <64-hex-character-ed25519-public-key> \
   --signing-key ./writer.key
 ```
 
@@ -294,38 +293,31 @@ DAG, and converts each authored node into a native commit using its exact
 to the canonical empty archive. Contentless merge wrappers are validated but do
 not become members.
 
-`--namespace` contributes only to the target descriptor's identity. With no
-further options the target uses `CollectionAdmission::Open`; the namespace key
-does not implicitly authorize, admit, or identify the signing key.
+With no further options the target descriptor's mandatory authority is the
+migration signing key. The resulting commits are therefore admitted directly
+by ordinary `ticket` and `snapshot` calls.
 
-To migrate into a capability-guarded target, name its independent trust root
-and the signing key's exact local proof:
+To register the migrated collection under a different authority, name that
+trust root explicitly:
 
 ```text
 trible pile migrate data.pile branch-to-collection \
   --branch legacy-events \
   --collection-name events \
-  --namespace <64-hex-character-ed25519-public-key> \
   --authority <64-hex-character-ed25519-public-key> \
-  --proof <64-hex-character-proof-id> \
   --signing-key ./writer.key
 ```
 
-The command loads that one native proof by its BLAKE3 ID, loads only the claim
-blobs named by the proof, and verifies its trust root, signer leaf,
-`ACTION_WRITE`, exact target descriptor resource, and minimum Invoke mode at
-one shared instant. It does not choose a path by scanning keys or claims.
-`--proof` therefore requires `--authority`.
+Local publication remains unconditional, so this form still writes commits
+signed by the migration key. A later read admits them only when the caller
+supplies an exact root-to-signer `ACTION_WRITE` presentation for the resulting
+descriptor handle. The migration command does not invent, scan for, or store
+that delegation.
 
-The one bootstrap case is explicit: when the migration signing key is itself
-`--authority`, the proof may be omitted. The command issues one deterministic
-root `WRITE`/Invoke claim and proof in memory, verifies it through the same
-boundary, then stores the claim blob and native proof. A delegated signer must
-supply a proof.
-
-The complete source DAG and target admission are validated before any target
-descriptor, dependency, claim blob, proof record, or commit is published. An
-authorization failure therefore leaves the target untouched.
+The complete source DAG and every prepared target element are validated before
+the target descriptor, dependency, or commit is published. Storage failures
+remain backend errors; authorization is deliberately deferred to reads rather
+than treated as permission to append locally.
 
 Legacy wrapper parents, messages, timestamps, authors, and signatures are not
 silently reinterpreted as application metadata. Two source nodes with identical

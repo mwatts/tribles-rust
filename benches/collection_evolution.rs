@@ -56,7 +56,8 @@ use triblespace_core::collection::succinctarchive_union::{
     SuccinctArchiveCollection, SuccinctArchiveView, SuccinctArchiveViewWork,
 };
 use triblespace_core::collection::{
-    CollectionAdmission, CollectionCommit, CollectionHandle, CollectionRecord, CollectionStore,
+    simplearchive_union, CollectionCommit, CollectionHandle, CollectionRecord, CollectionStore,
+    CollectionStoreExt,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
@@ -689,30 +690,37 @@ fn make_chunk(commit: usize, rows: usize) -> TribleSet {
     chunk
 }
 
-fn benchmark_name() -> CollectionName {
-    CollectionName::new("evolving-succinct-benchmark").expect("legal collection name")
+fn benchmark_name() -> &'static str {
+    "evolving-succinct-benchmark"
 }
 
-fn benchmark_namespace() -> ed25519_dalek::VerifyingKey {
+fn benchmark_authority() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[0x71; 32]).verifying_key()
 }
 
-fn new_source_collection() -> Collection<MemoryRepo> {
-    Collection::new(
-        MemoryRepo::default(),
-        &benchmark_name(),
-        benchmark_namespace(),
-        SigningKey::from_bytes(&[0x71; 32]),
-        reach::private(),
-        CollectionAdmission::Open,
-    )
+fn new_source_store(source: CollectionHandle) -> MemoryRepo {
+    let mut store = MemoryRepo::default();
+    let registered = store
+        .collection(simplearchive_union::descriptor(
+            benchmark_name(),
+            benchmark_authority(),
+            reach::private(),
+        ))
+        .expect("register benchmark source collection");
+    assert_eq!(registered, source);
+    store
 }
 
-fn publish_same_chunk(chunk: &TribleSet, collections: &mut [&mut Collection<MemoryRepo>]) {
+fn publish_same_chunk(
+    chunk: &TribleSet,
+    source: CollectionHandle,
+    signing_key: &SigningKey,
+    stores: &mut [&mut MemoryRepo],
+) {
     let mut expected = None;
-    for collection in collections {
-        let commit = collection
-            .commit(Fragment::from(chunk.clone()))
+    for store in stores {
+        let commit = store
+            .commit(source, signing_key, Fragment::from(chunk.clone()))
             .expect("publish source commit");
         match expected {
             None => expected = Some(commit),
@@ -732,12 +740,6 @@ fn run_iteration(
     checkpoints: &[usize],
     succinct: &SuccinctArchiveCollection,
 ) -> Vec<Sample> {
-    let mut source_accounting = new_source_collection();
-    let mut cold_ensure_source = new_source_collection();
-    let mut cold_compact_source = new_source_collection();
-    let mut warm_ensure = new_source_collection();
-    let mut exact_view_source = new_source_collection();
-    let mut warm_compact = new_source_collection();
     let mut exact_view = succinct.exact_view();
     let exact = ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob>::new(
         succinct.source_descriptor(),
@@ -748,6 +750,13 @@ fn run_iteration(
         raw: succinct.collection(),
         rank9: succinct.rank9_collection(),
     };
+    let signing_key = SigningKey::from_bytes(&[0x71; 32]);
+    let mut source_accounting = new_source_store(collections.source);
+    let mut cold_ensure_source = new_source_store(collections.source);
+    let mut cold_compact_source = new_source_store(collections.source);
+    let mut warm_ensure = new_source_store(collections.source);
+    let mut exact_view_source = new_source_store(collections.source);
+    let mut warm_compact = new_source_store(collections.source);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;
@@ -761,6 +770,8 @@ fn run_iteration(
             expected.union(chunk.clone());
             publish_same_chunk(
                 chunk,
+                collections.source,
+                &signing_key,
                 &mut [
                     &mut source_accounting,
                     &mut cold_ensure_source,
@@ -774,10 +785,12 @@ fn run_iteration(
         published = checkpoint;
 
         let ticket = source_accounting
-            .ticket()
-            .expect("freeze accounting source ticket");
+            .ticket(collections.source, &[])
+            .expect("freeze accounting source ticket")
+            .commits()
+            .to_vec();
         assert_eq!(ticket.len(), checkpoint);
-        let source_shape = store_shape(source_accounting.storage_mut(), &collections);
+        let source_shape = store_shape(&mut source_accounting, &collections);
 
         let total_rows = expected.len() as u64;
         let newly_supported_rows = total_rows - previous_rows;
@@ -793,8 +806,8 @@ fn run_iteration(
             collections: &collections,
         };
 
-        let mut cold_ensure = cold_ensure_source.storage().clone();
-        let mut cold_compact = cold_compact_source.storage().clone();
+        let mut cold_ensure = cold_ensure_source.clone();
+        let mut cold_compact = cold_compact_source.clone();
         let ensure_before = source_shape.plus(ensure_derived_shape);
         let view_before = source_shape.plus(view_derived_shape);
         let compact_before = source_shape.plus(compact_derived_shape);
@@ -802,7 +815,7 @@ fn run_iteration(
             let (family, warm_after) = run_operation_family(
                 iteration,
                 Operation::Ensure,
-                warm_ensure.storage_mut(),
+                &mut warm_ensure,
                 &mut cold_ensure,
                 &context,
                 [ensure_before, source_shape],
@@ -812,7 +825,7 @@ fn run_iteration(
 
             let (pair, after) = run_exact_view_pair(
                 &mut exact_view,
-                exact_view_source.storage_mut(),
+                &mut exact_view_source,
                 &context,
                 view_before,
             );
@@ -822,7 +835,7 @@ fn run_iteration(
             let (family, warm_after) = run_operation_family(
                 iteration,
                 Operation::Compact,
-                warm_compact.storage_mut(),
+                &mut warm_compact,
                 &mut cold_compact,
                 &context,
                 [compact_before, source_shape],
@@ -833,7 +846,7 @@ fn run_iteration(
             let (family, warm_after) = run_operation_family(
                 iteration,
                 Operation::Compact,
-                warm_compact.storage_mut(),
+                &mut warm_compact,
                 &mut cold_compact,
                 &context,
                 [compact_before, source_shape],
@@ -843,7 +856,7 @@ fn run_iteration(
 
             let (pair, after) = run_exact_view_pair(
                 &mut exact_view,
-                exact_view_source.storage_mut(),
+                &mut exact_view_source,
                 &context,
                 view_before,
             );
@@ -853,7 +866,7 @@ fn run_iteration(
             let (family, warm_after) = run_operation_family(
                 iteration,
                 Operation::Ensure,
-                warm_ensure.storage_mut(),
+                &mut warm_ensure,
                 &mut cold_ensure,
                 &context,
                 [ensure_before, source_shape],
@@ -968,10 +981,9 @@ fn main() {
         .collect();
     let succinct = SuccinctArchiveCollection::new(
         benchmark_name(),
-        benchmark_namespace(),
-        None,
+        benchmark_authority(),
         reach::private(),
-        None,
+        benchmark_authority(),
         reach::private(),
     );
     println!(

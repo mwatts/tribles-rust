@@ -159,25 +159,28 @@ multiplicity through their other witnesses.
 
 ## Persist through the native collection algebra
 
-A durable path index is identified only by its source collection — a name
-within a team — and one automaton:
+A durable path index is identified by the exact source descriptor, one
+automaton, and its own descriptor authority and reach:
 
 ```rust,ignore
-use triblespace::prelude::CollectionName;
+use triblespace::core::collection::reach;
 use triblespace_paths::PathSummaryCollection;
 
 let path_collection = PathSummaryCollection::new(
-    CollectionName::new("social")?,
-    team,
+    "social",
+    source_authority,
     friend_automaton.clone(),
+    source_reach,
+    index_authority,
+    reach::private(),
 );
 
 // `ticket` is the exact byte-identical set of signed source
 // CollectionCommit records selected by the caller.
-let paths = path_collection.ensure_exact(&mut store, &ticket)?;
+let paths = path_collection.ensure_exact(&mut store, ticket.commits())?;
 
 // Read-only consumers can require an already resident exact cover.
-let same_paths = path_collection.attach_exact(&mut store, &ticket)?;
+let same_paths = path_collection.attach_exact(&mut store, ticket.commits())?;
 ```
 
 Both methods require only `BlobStore + CollectionStore`. The exact source
@@ -186,7 +189,7 @@ hooks, and range planning.
 
 The ticket is the authority boundary. Every commit must:
 
-- name the canonical `SimpleArchive` union collection for the supplied scope;
+- name the canonical authority-bearing `SimpleArchive` source descriptor;
 - byte-match one strictly self-signed record discovered in the store; and
 - name resident canonical source data.
 

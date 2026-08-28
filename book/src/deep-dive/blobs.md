@@ -46,9 +46,9 @@ assert_eq!(article.facts().len(), 1);
 ```
 
 Composing fragments with `+=` unions their facts, metafacts, exported IDs, and
-attachments. `Collection::commit(fragment)` copies those attachments before it
-publishes the signed commit which refers to them. There is no separate staging
-manifest to keep in sync.
+attachments. `store.commit(collection, &signing_key, fragment)` copies those
+attachments before it publishes the signed commit which refers to them. There
+is no separate staging manifest to keep in sync.
 
 ## Put and get explicitly when needed
 

@@ -120,14 +120,14 @@ A collection descriptor is an ordinary `TribleSet`, encoded as a canonical
 `SimpleArchive`. Its content handle is the `CollectionHandle`. A root descriptor
 normally states:
 
-- a human-readable name within a public-key namespace;
-- an optional capability trust root;
+- a human-readable UTF-8 name;
+- one mandatory descriptor-local authority;
 - the element representation;
 - the join recipe; and
 - a reach law governing permissionless relay.
 
 A derived descriptor names its source collection, the homomorphism recipe, and
-its own optional capability trust root. Trust never inherits from the source.
+its own mandatory authority. Authority never inherits from the source.
 Descriptions of the representation and recipe travel in the same archive, so a
 record naming the descriptor remains interpretable without a separate registry
 entry.
