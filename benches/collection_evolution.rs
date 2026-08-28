@@ -15,7 +15,9 @@
 //! commits are appended outside the timers. Store deltas quantify new durable
 //! state; a bench-local algebra wrapper performs one untimed, zero-write raw
 //! re-admission for stateless arms to expose replay work that store totals hide.
-//! The maintained view is intentionally not replayed after timing: that would
+//! The maintained view reports the raw algebra calls made during its timed
+//! observation, so continuation reuse is measured rather than inferred from
+//! durable writes. It is intentionally not replayed after timing: that would
 //! measure the stateless operation it exists to avoid, not its actual work.
 //! No scan or diagnostic touches a measured store before its first timed call
 //! at a checkpoint, and the immediate no-op remains adjacent to that call.
@@ -51,7 +53,7 @@ use triblespace_core::collection::exact_derived::{
 };
 use triblespace_core::collection::reach;
 use triblespace_core::collection::succinctarchive_union::{
-    SuccinctArchiveCollection, SuccinctArchiveView,
+    SuccinctArchiveCollection, SuccinctArchiveView, SuccinctArchiveViewWork,
 };
 use triblespace_core::collection::{
     CollectionAdmission, CollectionCommit, CollectionHandle, CollectionRecord, CollectionStore,
@@ -352,11 +354,11 @@ struct Sample {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Diagnostic {
-    Raw {
+    StatelessReplay {
         calls: AlgebraCalls,
         cover: CoverIdentity,
     },
-    NotMeasured,
+    ViewActual(SuccinctArchiveViewWork),
 }
 
 struct TimedOperation {
@@ -433,7 +435,7 @@ fn finish_sample(
     basis_rows: u64,
     timed: TimedOperation,
     work: StoreShape,
-    diagnostic: Option<(AlgebraCalls, CoverIdentity)>,
+    diagnostic: Diagnostic,
 ) -> Sample {
     let cover_members = timed.union.segment_count() as u64;
     let relation = relation_identity(timed.union.iter());
@@ -444,10 +446,7 @@ fn finish_sample(
         basis_rows,
         elapsed: timed.elapsed,
         work,
-        diagnostic: match diagnostic {
-            Some((calls, cover)) => Diagnostic::Raw { calls, cover },
-            None => Diagnostic::NotMeasured,
-        },
+        diagnostic,
         relation,
         cover_members,
     }
@@ -498,7 +497,10 @@ fn run_warm_pair(
         context.newly_supported_rows,
         timed_warm,
         warm_work,
-        Some(diagnostic),
+        Diagnostic::StatelessReplay {
+            calls: diagnostic.0,
+            cover: diagnostic.1,
+        },
     );
     assert_eq!(warm.relation, context.expected);
 
@@ -508,7 +510,10 @@ fn run_warm_pair(
         context.total_rows,
         timed_noop,
         StoreShape::default(),
-        Some(diagnostic),
+        Diagnostic::StatelessReplay {
+            calls: diagnostic.0,
+            cover: diagnostic.1,
+        },
     );
     assert_eq!(noop.relation, context.expected);
     ([warm, noop], after)
@@ -530,7 +535,10 @@ fn run_cold(
         context.total_rows,
         timed,
         after.difference(before),
-        Some(diagnostic),
+        Diagnostic::StatelessReplay {
+            calls: diagnostic.0,
+            cover: diagnostic.1,
+        },
     );
     assert_eq!(cold.relation, context.expected);
     cold
@@ -582,6 +590,15 @@ fn run_exact_view_pair(
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
     let timed_advance = time_exact_view(view, store, context.ticket);
+    let advance_work = view
+        .last_work()
+        .expect("successful view advance records actual work");
+    assert_eq!(advance_work.ticket_commits, context.ticket.len());
+    assert_eq!(
+        advance_work.admitted_commits + advance_work.reused_commits,
+        context.ticket.len(),
+        "view support accounting must cover the exact ticket",
+    );
     let revision_after_advance = store
         .store_revision()
         .expect("snapshot revision between view advance and no-op");
@@ -590,6 +607,19 @@ fn run_exact_view_pair(
         .expect("snapshot offers between view advance and no-op");
 
     let timed_noop = time_exact_view(view, store, context.ticket);
+    let noop_work = view
+        .last_work()
+        .expect("successful view no-op records actual work");
+    assert_eq!(
+        noop_work,
+        SuccinctArchiveViewWork {
+            ticket_commits: context.ticket.len(),
+            admitted_commits: 0,
+            reused_commits: context.ticket.len(),
+            ..SuccinctArchiveViewWork::default()
+        },
+        "an identical exact-view ticket must not replay raw proof work",
+    );
     assert!(
         store
             .store_revision()
@@ -612,7 +642,7 @@ fn run_exact_view_pair(
         context.newly_supported_rows,
         timed_advance,
         after.difference(before),
-        None,
+        Diagnostic::ViewActual(advance_work),
     );
     let noop = finish_sample(
         Arm::ViewNoop,
@@ -620,7 +650,7 @@ fn run_exact_view_pair(
         context.total_rows,
         timed_noop,
         StoreShape::default(),
-        None,
+        Diagnostic::ViewActual(noop_work),
     );
     assert_eq!(advance.relation, context.expected);
     assert_eq!(noop.relation, context.expected);
@@ -876,8 +906,8 @@ impl Aggregate {
 
 fn raw_cover(aggregate: &Aggregate) -> CoverIdentity {
     match aggregate.diagnostic.expect("diagnostic observation") {
-        Diagnostic::Raw { cover, .. } => cover,
-        Diagnostic::NotMeasured => panic!("arm has no raw-cover diagnostic"),
+        Diagnostic::StatelessReplay { cover, .. } => cover,
+        Diagnostic::ViewActual(_) => panic!("view arm has no stateless raw-cover replay"),
     }
 }
 
@@ -999,10 +1029,10 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 derives; stateless algebra=vs/vt/d/js/jt calls and cumulative argument MiB in one untimed zero-write raw re-admission"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 derives; algebra=vs/vt/d/js/jt calls and cumulative argument MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
     );
     println!(
-        "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>26} {:>10}",
+        "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
         "commits",
         "arm",
         "+B",
@@ -1011,6 +1041,7 @@ fn main() {
         "+D",
         "+M",
         "+R",
+        "support",
         "algebra vs/vt/d/js/jt",
         "arg-MiB",
     );
@@ -1018,23 +1049,35 @@ fn main() {
         for arm in arms {
             let aggregate = &aggregates[&(checkpoint, arm)];
             let work = aggregate.work.expect("store work");
-            let (calls, argument_mib) = match aggregate.diagnostic.expect("diagnostic observation")
-            {
-                Diagnostic::Raw { calls, .. } => (
-                    format!(
-                        "{}/{}/{}/{}/{}",
-                        calls.validate_source,
-                        calls.validate_target,
-                        calls.derive,
-                        calls.join_source,
-                        calls.join_target,
+            let (support, calls, argument_mib) =
+                match aggregate.diagnostic.expect("diagnostic observation") {
+                    Diagnostic::StatelessReplay { calls, .. } => (
+                        "replay/full".to_owned(),
+                        format!(
+                            "{}/{}/{}/{}/{}",
+                            calls.validate_source,
+                            calls.validate_target,
+                            calls.derive,
+                            calls.join_source,
+                            calls.join_target,
+                        ),
+                        format!("{:.2}", calls.input_bytes as f64 / (1024.0 * 1024.0)),
                     ),
-                    format!("{:.2}", calls.input_bytes as f64 / (1024.0 * 1024.0)),
-                ),
-                Diagnostic::NotMeasured => ("not replayed".to_owned(), "-".to_owned()),
-            };
+                    Diagnostic::ViewActual(work) => (
+                        format!("{}/{}", work.admitted_commits, work.reused_commits),
+                        format!(
+                            "{}/{}/{}/{}/{}",
+                            work.validate_source,
+                            work.validate_target,
+                            work.derive,
+                            work.join_source,
+                            work.join_target,
+                        ),
+                        format!("{:.2}", work.input_bytes as f64 / (1024.0 * 1024.0)),
+                    ),
+                };
             println!(
-                "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>26} {:>10}",
+                "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
                 checkpoint,
                 arm.label(),
                 work.blobs,
@@ -1043,6 +1086,7 @@ fn main() {
                 work.raw_derives,
                 work.raw_merges,
                 work.rank9_derives,
+                support,
                 calls,
                 argument_mib,
             );

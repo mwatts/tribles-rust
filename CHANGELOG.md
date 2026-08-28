@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Make `SuccinctArchiveView` continuation reuse directly observable through a
+  last-successful-work report. It distinguishes newly admitted from retained
+  commits and counts the actual raw validation, derivation, and join calls made
+  by that observation. The evolving-collection benchmark now labels its
+  stateless post-timing proof replay separately from maintained-view work,
+  proving that an identical ticket performs zero algebra/storage work and a
+  monotone extension admits only its signed delta.
+
 - Add an end-to-end incremental collection-query benchmark comparing full
   re-query with `pattern_changes!` maintenance over source-identical exact
   Succinct views. It measures one fixed-size commit observation, including

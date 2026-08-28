@@ -12,6 +12,7 @@
 
 use ed25519_dalek::VerifyingKey;
 
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 
@@ -110,6 +111,127 @@ pub struct SuccinctArchiveCollection {
     reach: Fragment,
 }
 
+/// Exact work performed by one successful [`SuccinctArchiveView::ensure`].
+///
+/// The ticket fields make continuation reuse explicit. Raw algebra counters
+/// report actual calls made while admitting this observation; they are not
+/// inferred from newly persisted artifacts, which may already exist. Input
+/// bytes count every argument presented to those calls, including both inputs
+/// of a join.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SuccinctArchiveViewWork {
+    /// Canonical commits represented after the call.
+    pub ticket_commits: usize,
+    /// Commits whose exact evidence was admitted by this call.
+    pub admitted_commits: usize,
+    /// Previously admitted commits reused without replaying their proof work.
+    pub reused_commits: usize,
+    /// Canonical source-element validations.
+    pub validate_source: u64,
+    /// Canonical target-element validations.
+    pub validate_target: u64,
+    /// Canonical source joins.
+    pub join_source: u64,
+    /// Canonical source-to-target derivations.
+    pub derive: u64,
+    /// Canonical target joins.
+    pub join_target: u64,
+    /// Cumulative bytes supplied to raw algebra calls.
+    pub input_bytes: u64,
+}
+
+impl SuccinctArchiveViewWork {
+    fn with_support(ticket_commits: usize, admitted_commits: usize, reused_commits: usize) -> Self {
+        Self {
+            ticket_commits,
+            admitted_commits,
+            reused_commits,
+            ..Self::default()
+        }
+    }
+}
+
+struct MeasuredSuccinctAlgebra<'a> {
+    inner: &'a SuccinctArchiveCollection,
+    work: Cell<SuccinctArchiveViewWork>,
+}
+
+impl<'a> MeasuredSuccinctAlgebra<'a> {
+    fn new(inner: &'a SuccinctArchiveCollection, work: SuccinctArchiveViewWork) -> Self {
+        Self {
+            inner,
+            work: Cell::new(work),
+        }
+    }
+
+    fn bump(&self, update: impl FnOnce(&mut SuccinctArchiveViewWork)) {
+        let mut work = self.work.get();
+        update(&mut work);
+        self.work.set(work);
+    }
+}
+
+impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for MeasuredSuccinctAlgebra<'_> {
+    fn validate_source(
+        &self,
+        descriptor: &Fragment,
+        source: &crate::blob::Blob<SimpleArchive>,
+    ) -> Result<(), ExactAlgebraError> {
+        self.bump(|work| {
+            work.validate_source += 1;
+            work.input_bytes += source.bytes.len() as u64;
+        });
+        self.inner.validate_source(descriptor, source)
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &Fragment,
+        target: &crate::blob::Blob<SuccinctArchiveBlob>,
+    ) -> Result<(), ExactAlgebraError> {
+        self.bump(|work| {
+            work.validate_target += 1;
+            work.input_bytes += target.bytes.len() as u64;
+        });
+        self.inner.validate_target(descriptor, target)
+    }
+
+    fn join_source(
+        &self,
+        low: &crate::blob::Blob<SimpleArchive>,
+        high: &crate::blob::Blob<SimpleArchive>,
+    ) -> Result<crate::blob::Blob<SimpleArchive>, ExactAlgebraError> {
+        self.bump(|work| {
+            work.join_source += 1;
+            work.input_bytes += low.bytes.len() as u64 + high.bytes.len() as u64;
+        });
+        self.inner.join_source(low, high)
+    }
+
+    fn derive(
+        &self,
+        source: &crate::blob::Blob<SimpleArchive>,
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
+        self.bump(|work| {
+            work.derive += 1;
+            work.input_bytes += source.bytes.len() as u64;
+        });
+        self.inner.derive(source)
+    }
+
+    fn join_target(
+        &self,
+        low: &crate::blob::Blob<SuccinctArchiveBlob>,
+        high: &crate::blob::Blob<SuccinctArchiveBlob>,
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
+        self.bump(|work| {
+            work.join_target += 1;
+            work.input_bytes += low.bytes.len() as u64 + high.bytes.len() as u64;
+        });
+        self.inner.join_target(low, high)
+    }
+}
+
 /// One in-process Succinct view maintained across exact ticket observations.
 ///
 /// Every retained shard was admitted by an earlier ordinary
@@ -126,6 +248,7 @@ pub struct SuccinctArchiveView {
     collection: SuccinctArchiveCollection,
     ticket: Vec<CollectionCommit>,
     archive: Option<UnionArchive<OrderedUniverse>>,
+    last_work: Option<SuccinctArchiveViewWork>,
 }
 
 impl SuccinctArchiveView {
@@ -134,6 +257,7 @@ impl SuccinctArchiveView {
             collection,
             ticket: Vec::new(),
             archive: None,
+            last_work: None,
         }
     }
 
@@ -145,6 +269,13 @@ impl SuccinctArchiveView {
     /// Current queryable archive, if the first observation has succeeded.
     pub fn archive(&self) -> Option<&UnionArchive<OrderedUniverse>> {
         self.archive.as_ref()
+    }
+
+    /// Work performed by the last successful observation.
+    ///
+    /// A failed call leaves both the retained view and this report unchanged.
+    pub fn last_work(&self) -> Option<SuccinctArchiveViewWork> {
+        self.last_work
     }
 
     /// Ensure and retain the exact view for the current ticket.
@@ -163,7 +294,13 @@ impl SuccinctArchiveView {
     {
         if ticket == self.ticket.as_slice() {
             if let Some(previous) = &self.archive {
-                return Ok(previous.clone());
+                let previous = previous.clone();
+                self.last_work = Some(SuccinctArchiveViewWork::with_support(
+                    self.ticket.len(),
+                    0,
+                    self.ticket.len(),
+                ));
+                return Ok(previous);
             }
         }
         let current = canonicalize_exact_ticket(ticket, self.collection.source_collection())
@@ -172,20 +309,33 @@ impl SuccinctArchiveView {
                     error.to_string(),
                 ))
             })?;
-        let next = match self.archive.as_ref() {
-            None => self.collection.ensure_exact(store, &current)?,
+        let (next, work) = match self.archive.as_ref() {
+            None => {
+                let work = SuccinctArchiveViewWork::with_support(current.len(), current.len(), 0);
+                self.ensure_measured(store, &current, work)?
+            }
             Some(previous) => match exact_ticket_additions(
                 self.collection.source_collection(),
                 &self.ticket,
                 &current,
             ) {
-                Ok(additions) if additions.is_empty() => previous.clone(),
+                Ok(additions) if additions.is_empty() => (
+                    previous.clone(),
+                    SuccinctArchiveViewWork::with_support(current.len(), 0, self.ticket.len()),
+                ),
                 Ok(additions) => {
-                    let delta = self.collection.ensure_exact(store, &additions)?;
-                    previous.union(&delta)
+                    let work = SuccinctArchiveViewWork::with_support(
+                        current.len(),
+                        additions.len(),
+                        self.ticket.len(),
+                    );
+                    let (delta, work) = self.ensure_measured(store, &additions, work)?;
+                    (previous.union(&delta), work)
                 }
                 Err(ExactTicketAdvanceError::ResetRequired { .. }) => {
-                    self.collection.ensure_exact(store, &current)?
+                    let work =
+                        SuccinctArchiveViewWork::with_support(current.len(), current.len(), 0);
+                    self.ensure_measured(store, &current, work)?
                 }
                 Err(error) => {
                     return Err(SuccinctArchiveCollectionError::Exact(
@@ -197,7 +347,28 @@ impl SuccinctArchiveView {
 
         self.ticket = current;
         self.archive = Some(next.clone());
+        self.last_work = Some(work);
         Ok(next)
+    }
+
+    fn ensure_measured<S>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+        work: SuccinctArchiveViewWork,
+    ) -> Result<
+        (UnionArchive<OrderedUniverse>, SuccinctArchiveViewWork),
+        SuccinctArchiveCollectionError,
+    >
+    where
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S::Reader: BlobStoreMeta,
+    {
+        let algebra = MeasuredSuccinctAlgebra::new(&self.collection, work);
+        let archive = self
+            .collection
+            .ensure_exact_with_algebra(store, ticket, &algebra)?;
+        Ok((archive, algebra.work.get()))
     }
 }
 
@@ -356,7 +527,21 @@ impl SuccinctArchiveCollection {
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(store, ticket, self)?;
+        self.ensure_exact_with_algebra(store, ticket, self)
+    }
+
+    fn ensure_exact_with_algebra<S, A>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+        algebra: &A,
+    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
+    where
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S::Reader: BlobStoreMeta,
+        A: ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> + ?Sized,
+    {
+        let cover = self.kernel().ensure_exact(store, ticket, algebra)?;
         if cover.is_empty() {
             return self.empty_archive();
         }
@@ -1864,10 +2049,21 @@ mod tests {
         let first = maintained.ensure(&mut store, &[commit]).unwrap();
         assert_eq!(attached_facts(&first), expected);
         assert_eq!(maintained.ticket(), &[commit]);
+        let first_work = maintained.last_work().expect("first observation work");
+        assert_eq!(first_work.ticket_commits, 1);
+        assert_eq!(first_work.admitted_commits, 1);
+        assert_eq!(first_work.reused_commits, 0);
+        assert!(first_work.validate_source > 0);
+        assert!(first_work.derive > 0);
 
         let repeated = maintained.ensure(&mut PanicStore, &[commit]).unwrap();
         assert_eq!(attached_facts(&repeated), expected);
         assert_eq!(maintained.ticket(), &[commit]);
+        assert_eq!(
+            maintained.last_work(),
+            Some(SuccinctArchiveViewWork::with_support(1, 0, 1)),
+            "an identical ticket performs no raw proof or derivation work",
+        );
     }
 
     #[test]
@@ -1920,10 +2116,21 @@ mod tests {
 
         let mut maintained = collection.exact_view();
         maintained.ensure(&mut store, &[first]).unwrap();
+        let first_work = maintained.last_work().expect("first observation work");
+        remove_blob(&mut store, left.get_handle());
+        drop(left);
         let grown = maintained.ensure(&mut store, &[second, first]).unwrap();
         assert_eq!(
             attached_facts(&grown),
             left_facts.clone() + right_facts.clone()
+        );
+        let grown_work = maintained.last_work().expect("extension work");
+        assert_eq!(grown_work.ticket_commits, 2);
+        assert_eq!(grown_work.admitted_commits, 1);
+        assert_eq!(grown_work.reused_commits, 1);
+        assert_eq!(
+            grown_work.derive, first_work.derive,
+            "one-commit extension admits only its delta",
         );
         let mut full_ticket = vec![first, second];
         full_ticket.sort_unstable_by_key(CollectionCommit::id);
@@ -1953,6 +2160,7 @@ mod tests {
 
         let mut maintained = collection.exact_view();
         maintained.ensure(&mut store, &[commit]).unwrap();
+        let successful_work = maintained.last_work();
         let foreign_name = CollectionName::new("foreign").unwrap();
         let foreign = signed_commit(&mut store, &foreign_name, 2, &source);
 
@@ -1963,6 +2171,7 @@ mod tests {
             ))
         ));
         assert_eq!(maintained.ticket(), &[commit]);
+        assert_eq!(maintained.last_work(), successful_work);
         assert_eq!(
             attached_facts(maintained.archive().expect("previous archive remains")),
             expected
@@ -1993,6 +2202,7 @@ mod tests {
         let mut store = FaultStore::new(base.repo, collection.rank9_collection());
         let mut maintained = collection.exact_view();
         maintained.ensure(&mut store, &[first]).unwrap();
+        let successful_work = maintained.last_work();
 
         store.fail_rank9_put = true;
         assert!(matches!(
@@ -2002,6 +2212,7 @@ mod tests {
             ))
         ));
         assert_eq!(maintained.ticket(), &[first]);
+        assert_eq!(maintained.last_work(), successful_work);
         assert_eq!(
             attached_facts(maintained.archive().expect("previous archive remains")),
             left_facts
