@@ -201,7 +201,7 @@ the chosen backend rather than collection policy.
 - `store.commit` publishes one signed, independent member without conflating
   local storage with network authorization.
 - `store.snapshot` returns one coherent known-prefix view admitted by the
-  descriptor authority and explicit delegated proofs.
+  descriptor authority and valid resident delegation proofs.
 - Replicas converge by unioning records; they never elect a branch head.
 - Derived indexes are reproducible collection images, not alternate authority.
 

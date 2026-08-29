@@ -952,9 +952,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies every resident delegation proof for exact WRITE access to that
   descriptor, then returns the distinct payload handles named by admitted
   strict claims. Invalid, expired, irrelevant, and incomplete proof candidates
-  grant nothing. It reads no member data or metadata blobs. Cover, snapshot,
-  and materialization therefore share one multi-author known-prefix payload
-  frontier rather than treating a publishing key as ambient authority.
+  grant nothing. It reads proof-claim blobs, but no collection-member data or
+  commit-metadata blobs. Cover, snapshot, and materialization therefore share
+  one multi-author known-prefix payload frontier rather than treating a
+  publishing key as ambient authority.
 
 - **Path summaries now form a native typed collection algebra.** A source
   `SimpleArchive` collection can be lowered through an automaton-specific
