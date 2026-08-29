@@ -28,7 +28,7 @@ fn observe(
     checkpoint: &mut Option<Cover<SimpleArchive>>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    let current = store.cover(collection, &[])?;
+    let current = store.cover(collection)?;
     let added = match checkpoint.as_ref() {
         Some(previous) => current.additions_since(previous)?,
         None => current.clone(),

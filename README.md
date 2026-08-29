@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     import += book;
     storage.commit(library, &key, import)?;
 
-    let snapshot = storage.snapshot(library, &[])?;
+    let snapshot = storage.snapshot(library)?;
     let title = "Dune";
     for (first, last, quote) in find!(
         (first: String, last: String, quote),

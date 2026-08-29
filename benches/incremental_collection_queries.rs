@@ -88,7 +88,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     store
         .commit(collection, &signing_key, author)
         .expect("publish seed author");
-    let seed_cover = store.cover(collection, &[]).expect("freeze seed cover");
+    let seed_cover = store.cover(collection).expect("freeze seed cover");
     assert_eq!(seed_cover.len(), 1);
 
     let mut covers = Vec::with_capacity(commits);
@@ -117,7 +117,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         store
             .commit(collection, &signing_key, fragment)
             .expect("publish book commit");
-        covers.push(store.cover(collection, &[]).expect("freeze exact cover"));
+        covers.push(store.cover(collection).expect("freeze exact cover"));
         expected_batches.push(expected);
     }
 

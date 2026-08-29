@@ -1,5 +1,6 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
+use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::{
     CollectionRecord, CollectionRecordSelector, CollectionStore, MappingEvidence,
     MappingEvidenceSelector, MappingEvidenceStore,
@@ -9,6 +10,7 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
+use crate::repo::CapabilityProofStore;
 use crate::repo::StorageFlush;
 use crate::repo::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 use crate::repo::{WantRequest, WantStore};
@@ -164,6 +166,34 @@ where
     }
 }
 
+impl<B, R> CapabilityProofStore for HybridStore<B, R>
+where
+    R: CapabilityProofStore,
+{
+    type ProofsError = R::ProofsError;
+    type InsertError = R::InsertError;
+    type ProofIter<'a>
+        = R::ProofIter<'a>
+    where
+        B: 'a,
+        R: 'a;
+
+    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        self.records.proofs()
+    }
+
+    fn proof(
+        &mut self,
+        id: CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        self.records.proof(id)
+    }
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        self.records.insert_proof(proof)
+    }
+}
+
 impl<B, R> MappingEvidenceStore for HybridStore<B, R>
 where
     R: MappingEvidenceStore,
@@ -313,7 +343,7 @@ mod tests {
         let commit = hybrid
             .commit(target, &signing_key, Fragment::empty())
             .unwrap();
-        assert_eq!(hybrid.snapshot(target, &[]).unwrap().facts().len(), 0);
+        assert_eq!(hybrid.snapshot(target).unwrap().facts().len(), 0);
         assert_eq!(commit.collection(), target.handle());
         assert!(hybrid.blobs.blobs.len() >= 2);
         assert_eq!(

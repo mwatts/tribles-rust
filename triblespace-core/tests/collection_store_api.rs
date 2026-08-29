@@ -6,25 +6,26 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-    CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+    CapabilityProofBundle, CapabilityProofId, CapabilityResource, CapabilityValidity,
 };
 use triblespace_core::collection::records::{
     collection_authority, collection_name, collection_representation, KIND_COLLECTION_DESCRIPTOR,
 };
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    reach, CapabilityPresentation, Collection, CollectionRecord, CollectionRecordSelector,
-    CollectionStore, CollectionStoreExt, ACTION_WRITE,
+    reach, Collection, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::entity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{
     ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStore, BlobStoreGet,
-    BlobStorePut,
+    BlobStorePut, CapabilityProofStore,
 };
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -106,6 +107,27 @@ impl CollectionStore for CountingRepo {
     }
 }
 
+impl CapabilityProofStore for CountingRepo {
+    type ProofsError = <MemoryRepo as CapabilityProofStore>::ProofsError;
+    type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
+    type ProofIter<'a> = <MemoryRepo as CapabilityProofStore>::ProofIter<'a>;
+
+    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        self.inner.proofs()
+    }
+
+    fn proof(
+        &mut self,
+        id: CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        self.inner.proof(id)
+    }
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        self.inner.insert_proof(proof)
+    }
+}
+
 impl ArtifactOfferStore for CountingRepo {
     type OfferError = <MemoryRepo as ArtifactOfferStore>::OfferError;
 
@@ -133,24 +155,36 @@ fn fragment(entity: u8) -> Fragment {
     Fragment::from(facts)
 }
 
-fn write_presentation(
+fn store_write_proof<S>(
+    store: &mut S,
     authority: &SigningKey,
     writer: VerifyingKey,
     collection: Collection<SimpleArchive>,
-) -> CapabilityPresentation {
+) where
+    S: BlobStorePut + CapabilityProofStore,
+{
     let atom = CapabilityAtom::new(
         CapabilityAction::new(ACTION_WRITE),
         CapabilityResource::from(collection.handle()),
     );
-    CapabilityPresentation::new(
+    let bundle = CapabilityProofBundle::issue_root(
+        authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
         writer,
-        CapabilityProofBundle::issue_root(
-            authority,
-            CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-            writer,
-        )
-        .unwrap(),
     )
+    .unwrap();
+    store_proof_bundle(store, bundle);
+}
+
+fn store_proof_bundle<S>(store: &mut S, bundle: CapabilityProofBundle)
+where
+    S: BlobStorePut + CapabilityProofStore,
+{
+    let (proof, claims) = bundle.into_parts();
+    for claim in claims {
+        store.put::<SimpleArchive, _>(claim).unwrap();
+    }
+    store.insert_proof(proof).unwrap();
 }
 
 #[test]
@@ -332,18 +366,18 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
         .unwrap();
 
     let delegated = store.commit(collection, &delegate, fragment(2)).unwrap();
-    assert!(store.cover(collection, &[]).unwrap().is_empty());
+    assert!(store.cover(collection).unwrap().is_empty());
 
     let root = store.commit(collection, &authority, fragment(1)).unwrap();
-    let authority_cover = store.cover(collection, &[]).unwrap();
+    let authority_cover = store.cover(collection).unwrap();
     assert_eq!(authority_cover.collection(), collection);
     assert_eq!(
         authority_cover.members().collect::<Vec<_>>(),
         vec![Handle::<SimpleArchive>::from_hash(root.data())]
     );
 
-    let proof = write_presentation(&authority, delegate.verifying_key(), collection);
-    let cover_before_duplicate = store.cover(collection, &[proof.clone()]).unwrap();
+    store_write_proof(&mut store, &authority, delegate.verifying_key(), collection);
+    let cover_before_duplicate = store.cover(collection).unwrap();
     assert_eq!(cover_before_duplicate.len(), 2);
 
     // A second authorized signer may attest the same payload with a distinct
@@ -352,7 +386,7 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     assert_ne!(duplicate.id(), root.id());
     assert_eq!(duplicate.data(), root.data());
 
-    let cover = store.cover(collection, &[proof.clone()]).unwrap();
+    let cover = store.cover(collection).unwrap();
     assert_eq!(cover, cover_before_duplicate);
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.len(), 2);
@@ -373,7 +407,7 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
         BTreeSet::from([root.id(), delegated.id(), duplicate.id()]),
     );
 
-    let snapshot = store.snapshot(collection, &[proof]).unwrap();
+    let snapshot = store.snapshot(collection).unwrap();
     let mut expected = fragment(1).into_facts();
     expected += fragment(2).into_facts();
     assert_eq!(snapshot.facts(), &expected);
@@ -383,11 +417,14 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
 }
 
 #[test]
-fn invalid_explicit_presentation_fails_loud() {
+fn invalid_resident_proof_grants_nothing_without_poisoning_valid_evidence() {
     let authority = SigningKey::from_bytes(&[5; 32]);
-    let delegate = SigningKey::from_bytes(&[6; 32]);
-    let other_delegate = SigningKey::from_bytes(&[16; 32]);
-    let mut store = CountingRepo::default();
+    let wrong_resource = SigningKey::from_bytes(&[6; 32]);
+    let valid_delegate = SigningKey::from_bytes(&[16; 32]);
+    let missing_claim = SigningKey::from_bytes(&[19; 32]);
+    let expired = SigningKey::from_bytes(&[20; 32]);
+    let invalid_signature = SigningKey::from_bytes(&[21; 32]);
+    let mut store = MemoryRepo::default();
     let collection = store
         .collection::<SimpleArchive>(simplearchive_union::descriptor(
             "target",
@@ -402,14 +439,133 @@ fn invalid_explicit_presentation_fails_loud() {
             reach::private(),
         ))
         .unwrap();
-    let wrong = write_presentation(&authority, delegate.verifying_key(), other);
-    let valid = write_presentation(&authority, other_delegate.verifying_key(), collection);
+    let valid_commit = store
+        .commit(collection, &valid_delegate, fragment(1))
+        .unwrap();
+    store
+        .commit(collection, &wrong_resource, fragment(2))
+        .unwrap();
+    store
+        .commit(collection, &missing_claim, fragment(3))
+        .unwrap();
+    store.commit(collection, &expired, fragment(4)).unwrap();
+    store
+        .commit(collection, &invalid_signature, fragment(5))
+        .unwrap();
 
-    assert!(matches!(
-        store.cover(collection, &[valid, wrong]),
-        Err(triblespace_core::collection::CollectionCoverError::Admission(error))
-            if error.presentation() == 1
-    ));
+    store_write_proof(
+        &mut store,
+        &authority,
+        wrong_resource.verifying_key(),
+        other,
+    );
+    store_write_proof(
+        &mut store,
+        &authority,
+        valid_delegate.verifying_key(),
+        collection,
+    );
+
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(collection.handle()),
+    );
+    let missing_bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(
+            atom,
+            CapabilityMode::Invoke,
+            Some(
+                CapabilityValidity::new(
+                    hifitime::Epoch::from_tai_seconds(0.0),
+                    hifitime::Epoch::from_tai_seconds(1_000_000_000_000.0),
+                )
+                .unwrap(),
+            ),
+        ),
+        missing_claim.verifying_key(),
+    )
+    .unwrap();
+    store.insert_proof(missing_bundle.into_parts().0).unwrap();
+
+    let expired_validity = CapabilityValidity::new(
+        hifitime::Epoch::from_tai_seconds(0.0),
+        hifitime::Epoch::from_tai_seconds(1.0),
+    )
+    .unwrap();
+    let expired_bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, Some(expired_validity)),
+        expired.verifying_key(),
+    )
+    .unwrap();
+    store_proof_bundle(&mut store, expired_bundle);
+
+    let tampered_bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        invalid_signature.verifying_key(),
+    )
+    .unwrap();
+    let (proof, claims) = tampered_bundle.into_parts();
+    let mut proof_bytes = proof.into_bytes();
+    proof_bytes[32] ^= 0x80;
+    let tampered = CapabilityProof::from_bytes(&proof_bytes).unwrap();
+    store_proof_bundle(&mut store, CapabilityProofBundle::new(tampered, claims));
+
+    let cover = store.cover(collection).unwrap();
+    assert_eq!(
+        cover.members().collect::<Vec<_>>(),
+        vec![Handle::<SimpleArchive>::from_hash(valid_commit.data())]
+    );
+}
+
+#[test]
+fn pile_reopen_discovers_resident_delegation_proof_and_claims() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("automatic-collection-auth.pile");
+    std::fs::File::create(&path).unwrap();
+
+    let authority = SigningKey::from_bytes(&[17; 32]);
+    let delegate = SigningKey::from_bytes(&[18; 32]);
+    let mut pile = Pile::open(&path).unwrap();
+    let collection = pile
+        .collection::<SimpleArchive>(simplearchive_union::descriptor(
+            "reopen-auth",
+            authority.verifying_key(),
+            reach::private(),
+        ))
+        .unwrap();
+    let committed = pile.commit(collection, &delegate, fragment(3)).unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(collection.handle()),
+    );
+    let bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        delegate.verifying_key(),
+    )
+    .unwrap();
+    let (proof, claims) = bundle.into_parts();
+    for claim in claims {
+        pile.put::<SimpleArchive, _>(claim).unwrap();
+    }
+    pile.insert_proof(proof).unwrap();
+    pile.close().unwrap();
+
+    let mut reopened = Pile::open(&path).unwrap();
+    reopened.refresh().unwrap();
+    let cover = reopened.cover(collection).unwrap();
+    assert_eq!(
+        cover.members().collect::<Vec<_>>(),
+        vec![Handle::<SimpleArchive>::from_hash(committed.data())]
+    );
+    assert_eq!(
+        reopened.snapshot(collection).unwrap().facts(),
+        &fragment(3).into_facts()
+    );
+    reopened.close().unwrap();
 }
 
 #[test]

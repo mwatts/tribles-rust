@@ -774,7 +774,7 @@ fn main() {
                     .commit(source, &signing_key, Fragment::from(chunk.content.clone()))
                     .expect("publish source chunk");
             }
-            let cover = store.cover(source, &[]).expect("freeze exact source cover");
+            let cover = store.cover(source).expect("freeze exact source cover");
 
             let t = Instant::now();
             let union = succinct

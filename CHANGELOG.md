@@ -256,7 +256,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stores, and durably offers a descriptor's complete attachment closure;
   `store.commit(handle, key, fragment)` publishes locally without conflating
   storage with authorization; and `cover`/`snapshot` admit the descriptor
-  authority plus explicitly presented delegated writers. `Cover` carries one
+  authority plus delegated writers authorized by resident proofs. `Cover`
+  carries one
   canonical exact payload set for replay through `store.materialize(&cover)`.
   Descriptor handles are the collection values,
   publication never flushes implicitly, and repeated commits remain
@@ -947,12 +948,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   candidate.
 
 - **Ordinary collections expose authority-resolved exact covers.**
-  `store.cover(collection, presentations)` verifies the descriptor authority
-  and every explicit delegated presentation, then returns the distinct payload
-  handles named by admitted strict claims. It reads no member data or metadata
-  blobs. Cover, snapshot, and materialization therefore share one multi-author
-  known-prefix payload frontier rather than treating a publishing key as
-  ambient authority.
+  `store.cover(collection)` admits the descriptor authority directly and
+  verifies every resident delegation proof for exact WRITE access to that
+  descriptor, then returns the distinct payload handles named by admitted
+  strict claims. Invalid, expired, irrelevant, and incomplete proof candidates
+  grant nothing. It reads no member data or metadata blobs. Cover, snapshot,
+  and materialization therefore share one multi-author known-prefix payload
+  frontier rather than treating a publishing key as ambient authority.
 
 - **Path summaries now form a native typed collection algebra.** A source
   `SimpleArchive` collection can be lowered through an automaton-specific
@@ -1056,8 +1058,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also reports the count and boundary offsets of inert legacy V3 collection
   evidence and opaque records.
 - **Ordinary collections now expose coherent authority-aware known-prefix
-  snapshots.** `store.snapshot(collection, presentations)` verifies the
-  descriptor authority and explicit delegations, discovers admitted payloads,
+  snapshots.** `store.snapshot(collection)` admits the descriptor authority
+  and valid resident delegations, discovers admitted payloads,
   and returns the materialized facts, exact cover, and target blob reader as
   one value. Later physically visible blobs cannot alter that authority
   frontier, preventing derived indexes from mixing an old fact view with a

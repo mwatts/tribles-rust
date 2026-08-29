@@ -123,7 +123,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     );
     store.insert(CollectionRecord::Commit(commit)).unwrap();
 
-    let cover = store.cover(source, &[]).unwrap();
+    let cover = store.cover(source).unwrap();
     let index = paths.ensure_exact(&mut store, &cover).unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));

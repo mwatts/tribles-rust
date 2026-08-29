@@ -136,7 +136,7 @@ append order is never an implicit winner.
 ## 6. Read one coherent snapshot
 
 ```rust,ignore
-let snapshot = storage.snapshot(library, &[])?;
+let snapshot = storage.snapshot(library)?;
 let title = "Dune";
 
 for (first, last, quote) in find!(
@@ -158,16 +158,16 @@ for (first, last, quote) in find!(
 }
 ```
 
-`snapshot()` admits the descriptor authority plus explicitly supplied
-delegated presentations at one clock instant. It opens one target blob-reader
+`snapshot()` admits the descriptor authority plus writers authorized by
+resident delegation proofs at one clock instant. It opens one target blob-reader
 view and materializes facts solely from the resulting exact payload cover. The
 returned `Snapshot<SimpleArchive, TribleSet, R>` keeps the logical fact view,
 its typed `Cover<SimpleArchive>`, and reader together. A concurrent commit may
 appear on this call or a later call, but physically visible blobs from an
 unobserved commit cannot leak into the snapshot's admitted set.
 
-Use `storage.cover(library, presentations)` when only the exact payload
-frontier is needed. It verifies presentations and scans native collection
+Use `storage.cover(library)` when only the exact payload frontier is needed. It
+discovers and verifies resident proofs, then scans native collection
 records, but it does not fetch or materialize member blobs. Duplicate signed
 claims for one payload collapse to one cover member; authorship, signatures,
 and metadata currently known to the store are reported separately by

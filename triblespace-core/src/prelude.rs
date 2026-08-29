@@ -40,10 +40,9 @@ pub use crate::blob::IntoBlob;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
 pub use crate::collection::{
-    CapabilityPresentation, Collection, CollectionEncoding, CollectionStore, CollectionStoreExt,
-    Cover, CoverAttachment, FactCover, FactSnapshot, MappingEvidence, MappingEvidenceSelector,
-    MappingEvidenceStore, MappingHandle, SimpleArchiveCollection, Snapshot, TryFromCover,
-    VerifyingKey,
+    Collection, CollectionEncoding, CollectionStore, CollectionStoreExt, Cover, CoverAttachment,
+    FactCover, FactSnapshot, MappingEvidence, MappingEvidenceSelector, MappingEvidenceStore,
+    MappingHandle, SimpleArchiveCollection, Snapshot, TryFromCover, VerifyingKey,
 };
 pub use crate::id::fucid;
 pub use crate::id::genid;

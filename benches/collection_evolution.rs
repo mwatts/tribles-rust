@@ -741,7 +741,7 @@ fn run_iteration(
         published = checkpoint;
 
         let cover = source_accounting
-            .cover(source, &[])
+            .cover(source)
             .expect("freeze accounting source cover");
         assert_eq!(cover.len(), checkpoint);
         let source_shape = store_shape(&mut source_accounting, &collections);

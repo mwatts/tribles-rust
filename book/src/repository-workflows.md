@@ -51,6 +51,7 @@ use triblespace::core::capability::{
 use triblespace::core::{
     blob::encodings::simplearchive::SimpleArchive,
     collection::{reach, simplearchive_union, ACTION_WRITE},
+    repo::CapabilityProofStore,
 };
 use triblespace::prelude::*;
 
@@ -68,19 +69,23 @@ let atom = CapabilityAtom::new(
     CapabilityAction::new(ACTION_WRITE),
     CapabilityResource::from(models),
 );
-let proof = CapabilityProofBundle::issue_root(
+let bundle = CapabilityProofBundle::issue_root(
     &team_key,
     CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
     writer_subject,
 )?;
-let presentation = CapabilityPresentation::new(writer_subject, proof);
+let (proof, claims) = bundle.into_parts();
+for claim in claims {
+    storage.put::<SimpleArchive, _>(claim)?;
+}
+storage.insert_proof(proof)?;
 
 let commit = storage.commit(
     models,
     &writer,
     entity! { metadata::name: "first-model" },
 )?;
-let snapshot = storage.snapshot::<TribleSet, _>(models, &[presentation.clone()])?;
+let snapshot = storage.snapshot::<TribleSet, _>(models)?;
 assert!(snapshot
     .cover()
     .contains(Handle::<SimpleArchive>::from_hash(commit.data())));
@@ -90,10 +95,11 @@ storage.flush()?;
 Local publication deliberately performs no authorization check: the local
 store is a grow-only claim ledger, not an access-control boundary. Observation
 loads the mandatory authority from the descriptor. Commits self-signed by that
-authority are admitted directly; every delegated author needs an explicitly
-supplied proof for exact `ACTION_WRITE` on this descriptor. Each operation
-observes the clock once and verifies every presentation. Invalid explicit
-evidence fails loud rather than silently narrowing the result.
+authority are admitted directly; every delegated author needs a resident proof
+for exact `ACTION_WRITE` on this descriptor. Each operation observes the clock
+once and verifies every matching proof. Invalid, expired, irrelevant, or
+incomplete candidate evidence grants nothing; inability to enumerate the proof
+store remains an error.
 
 The reach argument is explicit because it participates in collection identity.
 `reach::private()` declares no permissionless relay; `reach::public()` states
@@ -148,9 +154,10 @@ cannot suppress an explicit cover member.
 
 ## Known-prefix snapshots and covers
 
-`store.snapshot(collection, presentations)` observes one clock instant,
-verifies every explicit capability presentation against the descriptor's
-authority, then discovers strictly verified commits by the resulting subjects.
+`store.snapshot(collection)` observes one clock instant, discovers resident
+capability proofs rooted at the descriptor authority, and verifies them against
+the exact collection write request before discovering commits by the resulting
+subjects.
 Their distinct data handles form a `Cover<E>`. It opens one target reader and
 constructs a logical view from only that payload set. The returned
 `Snapshot<E, V, R>` keeps the logical view `V`, exact cover, and reader together
@@ -165,12 +172,12 @@ call. Every cover member was nevertheless admitted and its payload validated
 for the returned snapshot, or the call fails instead of returning a partial
 set.
 
-`store.cover(collection, presentations)` performs the same admission check and
+`store.cover(collection)` performs the same admission check and
 record discovery, but does not fetch or materialize member blobs. Freeze a
 cover when another component will select or build a representation:
 
 ```rust,ignore
-let cover = storage.cover(models, &[presentation])?;
+let cover = storage.cover(models)?;
 let facts = storage.materialize(&cover)?;
 ```
 
@@ -349,8 +356,8 @@ trible pile migrate data.pile branch-to-collection \
 ```
 
 Local publication remains unconditional, so this form still writes commits
-signed by the migration key. A later read admits them only when the caller
-supplies an exact root-to-signer `ACTION_WRITE` presentation for the resulting
+signed by the migration key. A later read admits them only when the store holds
+an exact root-to-signer `ACTION_WRITE` proof for the resulting
 descriptor handle. The migration command does not invent, scan for, or store
 that delegation.
 

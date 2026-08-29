@@ -221,12 +221,12 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
     use triblespace_core::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource,
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+        CapabilityProofBundle, CapabilityProofId, CapabilityResource,
     };
     use triblespace_core::collection::{
-        CapabilityPresentation, CollectionCommit, CollectionDerive, CollectionMerge,
-        CollectionRecord, CollectionStoreExt, ACTION_WRITE,
+        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStoreExt,
+        ACTION_WRITE,
     };
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::encodings::hash::Handle;
@@ -234,7 +234,7 @@ mod tests {
     use triblespace_core::metadata;
     use triblespace_core::prelude::entity;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::BlobStorePut;
+    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore};
     use triblespace_core::trible::TribleSet;
 
     use crate::{Step, Transition};
@@ -281,6 +281,27 @@ mod tests {
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.0.insert(record)
+        }
+    }
+
+    impl CapabilityProofStore for CollectionOnly {
+        type ProofsError = <MemoryRepo as CapabilityProofStore>::ProofsError;
+        type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
+        type ProofIter<'a> = <MemoryRepo as CapabilityProofStore>::ProofIter<'a>;
+
+        fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+            self.0.proofs()
+        }
+
+        fn proof(
+            &mut self,
+            id: CapabilityProofId,
+        ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+            self.0.proof(id)
+        }
+
+        fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+            self.0.insert_proof(proof)
         }
     }
 
@@ -401,21 +422,20 @@ mod tests {
             CapabilityAction::new(ACTION_WRITE),
             CapabilityResource::from(collection.handle()),
         );
-        let presentations: Vec<_> = writers
-            .into_iter()
-            .map(|writer| {
-                CapabilityPresentation::new(
-                    writer,
-                    CapabilityProofBundle::issue_root(
-                        &authority,
-                        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-                        writer,
-                    )
-                    .unwrap(),
-                )
-            })
-            .collect();
-        store.cover(collection, &presentations).unwrap()
+        for writer in writers {
+            let bundle = CapabilityProofBundle::issue_root(
+                &authority,
+                CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+                writer,
+            )
+            .unwrap();
+            let (proof, claims) = bundle.into_parts();
+            for claim in claims {
+                store.put::<SimpleArchive, _>(claim).unwrap();
+            }
+            store.insert_proof(proof).unwrap();
+        }
+        store.cover(collection).unwrap()
     }
 
     fn records(store: &mut CollectionOnly) -> Vec<CollectionRecord> {
@@ -488,7 +508,7 @@ mod tests {
             .unwrap();
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
-        let cover = store.cover(collection, &[]).unwrap();
+        let cover = store.cover(collection).unwrap();
         let index = paths.ensure_exact(&mut store, &cover).unwrap();
         assert_eq!(index.accepted_pair_count(), 0);
         assert_eq!(store.0.blobs.len(), blobs);

@@ -46,7 +46,7 @@ fn main() {
 
     // Freeze the exact admitted target frontier. cover() reads collection
     // records, but not these commits' data or metadata blobs.
-    let cover = pile.cover(collection, &[]).expect("discover exact cover");
+    let cover = pile.cover(collection).expect("discover exact cover");
     assert_eq!(cover.len(), 3);
 
     // Build any missing canonical raw Succinct shards and their exact Rank9

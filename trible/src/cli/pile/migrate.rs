@@ -44,7 +44,8 @@ pub enum Command {
     /// it reaches, and only then are native records appended to that pile. The
     /// target authority defaults to the migration signer. Choosing a different
     /// authority is allowed, but admission of the resulting commits then needs
-    /// an exact WRITE presentation when the collection is read.
+    /// a resident proof granting the signer exact WRITE access to the
+    /// collection.
     BranchToCollection {
         /// Legacy branch to migrate, by exact name or 32-hex-character id.
         #[arg(long)]

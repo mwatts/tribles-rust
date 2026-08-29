@@ -93,10 +93,10 @@ produce them rather than accepting caller-forged hash sets.
 ### Collection Admission
 The read-time signer decision performed by `store.cover` and
 `store.snapshot`. The descriptor authority is admitted directly; each
-additional expected leaf must carry an explicit proof bundle which verifies at
-one clock instant against that authority and the exact
-`ACTION_WRITE`/collection atom. An empty presentation set therefore admits the
-descriptor authority alone.
+resident proof rooted at that authority is considered at one clock instant for
+the exact `ACTION_WRITE`/collection atom. Every valid proof admits its leaf;
+invalid, expired, irrelevant, or incomplete candidates grant nothing without
+poisoning other evidence.
 
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's UTF-8 root name or exact

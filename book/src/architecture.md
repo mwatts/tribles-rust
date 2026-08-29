@@ -42,13 +42,13 @@ committed facts from which it can be rebuilt.
 
 Who may make that signed assertion can be proven without making storage a
 policy oracle. A capability-guarded descriptor names an external trust root,
-while the facade owns explicit presentations pairing an expected leaf key with
-a complete `K0 (S C K)+` proof bundle. The native proof binds each issuer,
+while the facade discovers resident `K0 (S C K)+` proofs rooted there. The
+native proof binds each issuer,
 exact keyless claim handle, and delegate key; the ordered claim blobs carry the
 action/resource, mode, validity, and parent-claim restrictions. Ordinary
 collection operations verify the resulting meet directly at one clock
-instant. Holding a signing key or finding a proof in storage grants nothing by
-itself.
+instant against exact `ACTION_WRITE` on the descriptor. Merely finding an
+unverified or irrelevant proof in storage grants nothing.
 
 ## Architectural layers
 
@@ -169,11 +169,11 @@ not what a process may append to its own store.
 
 Reads are exact about what they observed, not magical about global time:
 
-- `store.cover(collection, presentations)` loads the descriptor authority,
-  admits its own strictly signed commits directly, verifies every explicit
-  delegated presentation, and returns one canonical typed payload `Cover<E>`
+- `store.cover(collection)` loads the descriptor authority, admits its own
+  strictly signed commits directly, discovers and verifies resident delegation
+  proofs, and returns one canonical typed payload `Cover<E>`
   without fetching member data;
-- `store.snapshot(collection, presentations)` performs that same admission and
+- `store.snapshot(collection)` performs that same admission and
   carries a `TryFromCover<E>` logical value, the exact cover, and the blob
   reader which validated them; and
 - `store.materialize(&cover)` exact-replays an already admitted multi-author
@@ -187,8 +187,8 @@ payload does not change the cover or repeat data work.
 Each call observes one known prefix of an append-only store. A concurrent
 commit may appear now or on the next call, but a snapshot never
 combines facts from one admission frontier with payloads from another. The
-descriptor authority and every explicitly presented valid delegate participate;
-unpresented commits remain inert.
+descriptor authority and every delegate authorized by a valid resident proof
+participate; unauthorized commits remain inert.
 
 ## Derived physical representations
 

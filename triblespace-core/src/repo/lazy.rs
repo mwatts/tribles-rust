@@ -90,12 +90,14 @@ use anybytes::Bytes;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
+use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::{
     CollectionRecord, CollectionRecordSelector, CollectionStore, MappingEvidence,
     MappingEvidenceSelector, MappingEvidenceStore,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
+use crate::repo::CapabilityProofStore;
 
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
@@ -446,6 +448,35 @@ where
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.store.lock().expect("store mutex").insert(record)
+    }
+}
+
+impl<S> CapabilityProofStore for Lazy<S>
+where
+    S: BlobStore + BlobStorePut + CapabilityProofStore + WantStore + StorageFlush + Send + 'static,
+{
+    type ProofsError = S::ProofsError;
+    type InsertError = S::InsertError;
+    type ProofIter<'a>
+        = std::vec::IntoIter<Result<CapabilityProof, S::ProofsError>>
+    where
+        S: 'a;
+
+    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        let mut store = self.store.lock().expect("store mutex");
+        let proofs: Vec<Result<CapabilityProof, S::ProofsError>> = store.proofs()?.collect();
+        Ok(proofs.into_iter())
+    }
+
+    fn proof(
+        &mut self,
+        id: CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        self.store.lock().expect("store mutex").proof(id)
+    }
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        self.store.lock().expect("store mutex").insert_proof(proof)
     }
 }
 

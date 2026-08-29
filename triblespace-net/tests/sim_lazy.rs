@@ -28,12 +28,11 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::{
-    ACTION_WRITE, CapabilityPresentation, CollectionCommit, CollectionData, CollectionDerive,
-    CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
-    CollectionOperationError, CollectionRecord, CollectionStore, CollectionStoreExt,
-    KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING, collection_authority, collection_mapping,
-    collection_reach, collection_representation, collection_source, mapping_algorithm,
-    simplearchive_union,
+    ACTION_WRITE, CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding,
+    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError,
+    CollectionRecord, CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR,
+    KIND_COLLECTION_MAPPING, collection_authority, collection_mapping, collection_reach,
+    collection_representation, collection_source, mapping_algorithm, simplearchive_union,
 };
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
@@ -47,7 +46,8 @@ use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, WantRequest, WantStore,
+    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, CapabilityProofStore, WantRequest,
+    WantStore,
 };
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
@@ -81,24 +81,29 @@ where
     Handle::<E>::to_hash(blob.get_handle())
 }
 
-fn write_presentation(
+fn store_write_proof<S>(
+    store: &mut S,
     authority: &ed25519_dalek::SigningKey,
     writer: ed25519_dalek::VerifyingKey,
     collection: CollectionHandle,
-) -> CapabilityPresentation {
+) where
+    S: BlobStorePut + CapabilityProofStore,
+{
     let atom = CapabilityAtom::new(
         CapabilityAction::new(ACTION_WRITE),
         CapabilityResource::from(collection),
     );
-    CapabilityPresentation::new(
+    let bundle = CapabilityProofBundle::issue_root(
+        authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
         writer,
-        CapabilityProofBundle::issue_root(
-            authority,
-            CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-            writer,
-        )
-        .unwrap(),
     )
+    .unwrap();
+    let (proof, claims) = bundle.into_parts();
+    for claim in claims {
+        store.put::<SimpleArchive, _>(claim).unwrap();
+    }
+    store.insert_proof(proof).unwrap();
 }
 
 fn derive_test_target(source: &Blob<SimpleArchive>) -> Blob<NetworkTestBlob> {
@@ -446,7 +451,7 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
         let source_collection = client_store
             .collection(lifecycle.source_descriptor().clone())
             .unwrap();
-        let source_cover = client_store.cover(source_collection, &[]).unwrap();
+        let source_cover = client_store.cover(source_collection).unwrap();
 
         let lower_a = Blob::<NetworkTestBlob>::new(vec![0x31].into());
         let lower_b = Blob::<NetworkTestBlob>::new(vec![0x32].into());
@@ -563,12 +568,13 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
             metadata,
         );
         serving.insert(CollectionRecord::Commit(commit)).unwrap();
-        let presentation = write_presentation(
+        store_write_proof(
+            &mut serving,
             &key(0xE3),
             key(0xE4).verifying_key(),
             source_collection.handle(),
         );
-        let source_cover = serving.cover(source_collection, &[presentation]).unwrap();
+        let source_cover = serving.cover(source_collection).unwrap();
 
         let mut conflicting = Pile::open(&conflicting_path).unwrap();
         conflicting.bind_store_scope(conflicting_team).unwrap();
@@ -667,19 +673,15 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             })
             .collect();
         let authority = key(0xD4);
-        let presentations: Vec<_> = [key(0x91), key(0x92)]
-            .into_iter()
-            .map(|writer| {
-                write_presentation(
-                    &authority,
-                    writer.verifying_key(),
-                    source_collection.handle(),
-                )
-            })
-            .collect();
-        let source_cover = client_store
-            .cover(source_collection, &presentations)
-            .unwrap();
+        for writer in [key(0x91), key(0x92)] {
+            store_write_proof(
+                &mut client_store,
+                &authority,
+                writer.verifying_key(),
+                source_collection.handle(),
+            );
+        }
+        let source_cover = client_store.cover(source_collection).unwrap();
         assert_eq!(source_cover.len(), commits.len());
 
         let mut server_store = empty_store();

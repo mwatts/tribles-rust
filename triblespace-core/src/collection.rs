@@ -1,7 +1,7 @@
 //! Canonical records, discovery, and semantic resolution for typed collections.
 //!
 //! Wire decoding and strict self-signature checks remain structural. Production
-//! [resolution](crate::collection::resolution) admits only caller-authorized,
+//! [resolution](crate::collection::resolution) admits only authorized,
 //! representation-validated claims. The larger generic oracle remains
 //! test-only: it exercises algebraic laws rather than serving as another
 //! runtime implementation.

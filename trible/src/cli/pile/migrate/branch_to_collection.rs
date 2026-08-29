@@ -539,7 +539,7 @@ mod tests {
         expected_union += fact(2);
         expected_union += fact(3);
         let materialized = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
         assert_eq!(materialized.facts(), &expected_union);
 
@@ -577,8 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_authority_does_not_block_publication_but_needs_a_presentation_to_read() -> Result<()>
-    {
+    fn distinct_authority_does_not_block_publication_but_needs_delegation_to_read() -> Result<()> {
         let (file, _) = frozen_fixture()?;
         let path = file.path().to_path_buf();
         let signer = key(12);
@@ -590,8 +589,8 @@ mod tests {
 
         assert!(!mappings.is_empty(), "migration still publishes locally");
         assert!(pile
-            .cover(collection, &[])
-            .map_err(|error| anyhow!("read unpresented cover: {error}"))?
+            .cover(collection)
+            .map_err(|error| anyhow!("read unauthorized cover: {error}"))?
             .is_empty());
         assert!(pile
             .records()?
@@ -665,7 +664,7 @@ mod tests {
         assert_eq!(data_target.metadata(), empty_metadata);
 
         let materialized = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
         assert_eq!(materialized.facts(), &fact(9));
         pile.close()?;

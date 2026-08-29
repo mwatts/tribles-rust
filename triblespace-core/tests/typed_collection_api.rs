@@ -43,11 +43,11 @@ fn generic_simplearchive_collection_round_trips_typed_views() {
         expected_member
     );
 
-    let cover = store.cover(collection, &[]).unwrap();
+    let cover = store.cover(collection).unwrap();
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![expected_member]);
 
-    let snapshot = store.snapshot::<TribleSet, _>(collection, &[]).unwrap();
+    let snapshot = store.snapshot::<TribleSet, _>(collection).unwrap();
     assert_eq!(snapshot.cover(), &cover);
     assert_eq!(snapshot.facts(), &expected);
 
@@ -98,11 +98,11 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     store
         .commit(target, &authority, DescribedSuccinct(raw))
         .unwrap();
-    let cover = store.cover(target, &[]).unwrap();
+    let cover = store.cover(target).unwrap();
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
 
     let snapshot = store
-        .snapshot::<UnionArchive<OrderedUniverse>, _>(target, &[])
+        .snapshot::<UnionArchive<OrderedUniverse>, _>(target)
         .unwrap();
     assert_eq!(snapshot.cover(), &cover);
     assert_eq!(snapshot.value().iter().collect::<TribleSet>(), expected);

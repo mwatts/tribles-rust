@@ -136,7 +136,7 @@ mod readme_example {
 
         storage.commit(library, &key, initial)?;
 
-        let snapshot = storage.snapshot(library, &[])?;
+        let snapshot = storage.snapshot(library)?;
         let catalog = snapshot.facts();
         let title = "Dune";
 
@@ -178,7 +178,7 @@ mod readme_example {
             },
         )?;
 
-        let catalog = storage.snapshot(library, &[])?.into_facts();
+        let catalog = storage.snapshot(library)?.into_facts();
         let mut names: Vec<String> = find!(
             first: String,
             pattern!(&catalog, [{ _?author @ literature::firstname: ?first }])
