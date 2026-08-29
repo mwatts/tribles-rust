@@ -11,19 +11,19 @@ use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 
-use super::{Collection, CollectionLattice, Cover};
+use super::{Collection, CollectionEncoding, Cover};
 
 /// Freshly validated bytes attached to one exact semantic cover.
 ///
 /// This is transient materialization state, not another durable record or a
 /// second kind of cover.  The cover remains the identity passed between
 /// collection stages; attached blobs merely avoid rereading selected members.
-pub struct CoverAttachment<L: CollectionLattice> {
+pub struct CoverAttachment<L: CollectionEncoding> {
     cover: Cover<L>,
-    members: Vec<(Inline<Handle<L::Encoding>>, Blob<L::Encoding>)>,
+    members: Vec<(Inline<Handle<L>>, Blob<L>)>,
 }
 
-impl<L: CollectionLattice> CoverAttachment<L> {
+impl<L: CollectionEncoding> CoverAttachment<L> {
     pub(crate) fn empty(collection: Collection<L>) -> Self {
         Self {
             cover: Cover::from_members(collection, []),
@@ -31,10 +31,7 @@ impl<L: CollectionLattice> CoverAttachment<L> {
         }
     }
 
-    pub(crate) fn from_parts(
-        cover: Cover<L>,
-        members: Vec<(Inline<Handle<L::Encoding>>, Blob<L::Encoding>)>,
-    ) -> Self {
+    pub(crate) fn from_parts(cover: Cover<L>, members: Vec<(Inline<Handle<L>>, Blob<L>)>) -> Self {
         Self { cover, members }
     }
 
@@ -54,17 +51,17 @@ impl<L: CollectionLattice> CoverAttachment<L> {
     }
 
     /// Borrow the ordered physical members.
-    pub fn members(&self) -> &[(Inline<Handle<L::Encoding>>, Blob<L::Encoding>)] {
+    pub fn members(&self) -> &[(Inline<Handle<L>>, Blob<L>)] {
         &self.members
     }
 
     /// Consume the ordered physical members.
-    pub fn into_members(self) -> Vec<(Inline<Handle<L::Encoding>>, Blob<L::Encoding>)> {
+    pub fn into_members(self) -> Vec<(Inline<Handle<L>>, Blob<L>)> {
         self.members
     }
 
     /// Consume just the ordered blobs.
-    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<L::Encoding>> {
+    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<L>> {
         self.members.into_iter().map(|(_, blob)| blob)
     }
 }
@@ -74,7 +71,7 @@ impl<L: CollectionLattice> CoverAttachment<L> {
 /// This is deliberately cover-aware rather than a blanket blob conversion:
 /// some values eagerly join members, while others retain mmap-backed shards
 /// and answer queries over the union without constructing one monolith.
-pub trait TryFromCover<L: CollectionLattice>: Sized {
+pub trait TryFromCover<L: CollectionEncoding>: Sized {
     /// Failure to construct the logical view from already validated members.
     type Error: Error + Send + Sync + 'static;
 

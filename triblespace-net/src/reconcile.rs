@@ -263,8 +263,7 @@ fn want_request_for_record(record: CollectionRecord) -> Option<WantRequest> {
             Some(WantRequest::merge(merge.collection(), low, high))
         }
         CollectionRecord::Derive(derive) => {
-            let (input, _) = derive.mapping();
-            Some(WantRequest::derive(derive.target(), input))
+            Some(WantRequest::derive(derive.collection(), derive.input()))
         }
     }
 }

@@ -77,9 +77,10 @@ representation. The handle of a descriptor archive is therefore the
 collection's identity; the handle of a data archive is one collection element.
 
 SuccinctArchive and other query-oriented formats are also typed blobs. Their
-collection recipes define canonical merge and derivation operations, so a
-validated derived artifact can be cached or forgotten without changing the
-authority of the signed source commits.
+collection encodings define canonical joins, while mappings define canonical
+cross-encoding transformations. A validated derived artifact can therefore be
+cached or forgotten without changing the authority of the signed source
+commits.
 
 ## Conservative references
 

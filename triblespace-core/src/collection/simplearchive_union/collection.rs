@@ -73,7 +73,7 @@ impl SimpleArchiveCollection {
     /// This is the read side: the facade is not storing anything, it is
     /// naming the collection a cover must match. A write path takes its
     /// handle from what `put` returns instead.
-    pub fn collection(&self) -> Collection<super::SimpleArchiveUnion> {
+    pub fn collection(&self) -> Collection<super::SimpleArchive> {
         Collection::from_descriptor(&self.descriptor())
             .expect("SimpleArchiveCollection constructs its own typed descriptor")
     }

@@ -8,19 +8,21 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
-use crate::blob::{IntoBlob, TryFromBlob};
+use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::descriptor;
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
 use crate::collection::simplearchive_union;
 use crate::collection::CollectionCommit;
-use crate::id::ExclusiveId;
+use crate::id::{ExclusiveId, Id};
+use crate::id_hex;
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::MemoryRepo;
-use crate::repo::{BlobStoreList, BlobStorePut};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut};
 use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 macro_rules! inert_test_offers {
@@ -53,80 +55,81 @@ inert_test_offers!(
     LossyStore,
 );
 
-fn id(byte: u8) -> Id {
-    Id::new([byte; 16]).unwrap()
-}
-
 /// The one team every collection in these tests belongs to.
 fn test_team() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[1; 32]).verifying_key()
 }
 
-fn source_root() -> Fragment {
-    simplearchive_union::descriptor("source", test_team(), reach::private())
-}
+/// Test-only SimpleArchive-compatible source encoding. It is deliberately
+/// distinct from the production encoding so planning tests can instrument its
+/// join without changing production semantics.
+///
+/// Minted with `trible genid` on 2026-08-29.
+const TEST_SOURCE_ENCODING_V1: Id = id_hex!("75CA73E3F88BFE4C680115DD992EC807");
 
-/// Test-only recipe for the `SimpleArchive || 0xA5` target representation.
-struct TestTargetUnionV1;
+struct TestSourceBlob;
 
-impl MetaDescribe for TestTargetUnionV1 {
+impl BlobEncoding for TestSourceBlob {}
+
+impl MetaDescribe for TestSourceBlob {
     fn describe() -> Fragment {
-        let recipe = id(0xE1);
-        crate::macros::entity! { ExclusiveId::force_ref(&recipe) @
-            crate::metadata::name: "exact-derived-test-target-union-v1",
-            crate::metadata::tag: crate::metadata::KIND_COLLECTION_RECIPE,
+        let id = TEST_SOURCE_ENCODING_V1;
+        crate::macros::entity! { ExclusiveId::force_ref(&id) @
+            crate::metadata::name: "exact-derived-test-source-v1",
+            crate::metadata::description: "Test-only canonical SimpleArchive-compatible source encoding with observable joins.",
+            crate::metadata::tag: crate::metadata::KIND_BLOB_ENCODING,
         }
     }
 }
 
-/// Test-only recipe for the `(SimpleArchive || 0xA5) || 0xB6` target.
-struct SecondTestTargetUnionV1;
-
-impl MetaDescribe for SecondTestTargetUnionV1 {
-    fn describe() -> Fragment {
-        let recipe = id(0xE2);
-        crate::macros::entity! { ExclusiveId::force_ref(&recipe) @
-            crate::metadata::name: "exact-derived-second-test-target-union-v1",
-            crate::metadata::tag: crate::metadata::KIND_COLLECTION_RECIPE,
-        }
-    }
-}
-
-/// The source lattice is deliberately distinct from the production marker so
-/// planning tests can observe source joins without changing production code.
-struct TestSourceUnion;
-
-impl CollectionLattice for TestSourceUnion {
-    type Encoding = SimpleArchive;
-    type Recipe = simplearchive_union::TribleSetUnionV1;
-
+impl CollectionEncoding for TestSourceBlob {
     fn validate_member(
-        descriptor: &Fragment,
-        member: &Blob<Self::Encoding>,
-    ) -> Result<(), CollectionLatticeError> {
-        simplearchive_union::SimpleArchiveUnion::validate_member(descriptor, member)
+        _descriptor: &Fragment,
+        member: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
+        simplearchive_union::validate_element(member.as_transmute::<SimpleArchive>())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 
-    fn merge_members(
-        descriptor: &Fragment,
-        low: &Blob<Self::Encoding>,
-        high: &Blob<Self::Encoding>,
-    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+    fn join_members(
+        _descriptor: &Fragment,
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
         SELECTIVE_POLICY.with(|policy| {
             if let Some(policy) = policy.borrow().as_ref() {
                 policy
                     .source_attempts
                     .lock()
                     .unwrap()
-                    .push(SelectiveAlgebra::pair(low, high));
+                    .push(SelectiveMapping::pair(low, high));
             }
         });
-        simplearchive_union::SimpleArchiveUnion::merge_members(descriptor, low, high)
+        simplearchive_union::join(
+            low.as_transmute::<SimpleArchive>(),
+            high.as_transmute::<SimpleArchive>(),
+        )
+        .map(Blob::transmute::<TestSourceBlob>)
+        .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 }
 
+fn source_descriptor(name: &str) -> Fragment {
+    crate::macros::entity! {
+        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
+        crate::collection::collection_name: name.to_owned(),
+        crate::collection::collection_authority: test_team(),
+        crate::collection::collection_representation*: <TestSourceBlob as MetaDescribe>::describe(),
+        crate::collection::collection_reach*: reach::private(),
+    }
+}
+
+fn source_root() -> Fragment {
+    source_descriptor("source")
+}
+
 #[derive(Clone, Default)]
-struct SelectiveAlgebra {
+struct SelectiveMapping {
     capacity_derives: BTreeSet<CollectionData>,
     fatal_derives: BTreeSet<CollectionData>,
     capacity_target_pairs: BTreeSet<(CollectionData, CollectionData)>,
@@ -136,7 +139,7 @@ struct SelectiveAlgebra {
     target_attempts: Arc<Mutex<Vec<(CollectionData, CollectionData)>>>,
 }
 
-impl SelectiveAlgebra {
+impl SelectiveMapping {
     fn pair<T: BlobEncoding>(low: &Blob<T>, high: &Blob<T>) -> (CollectionData, CollectionData)
     where
         Handle<T>: InlineEncoding,
@@ -148,43 +151,57 @@ impl SelectiveAlgebra {
 }
 
 thread_local! {
-    /// Per-test instrumentation for lattice-owned joins. Test worker threads
+    /// Per-test instrumentation for encoding-owned joins. Test worker threads
     /// may run these cases concurrently, so a process-global switch would be
     /// both racy and capable of changing another test's semantics.
-    static SELECTIVE_POLICY: RefCell<Option<SelectiveAlgebra>> = const { RefCell::new(None) };
+    static SELECTIVE_POLICY: RefCell<Option<SelectiveMapping>> = const { RefCell::new(None) };
 }
 
-struct TestTargetUnion;
+/// Test-only canonical `SimpleArchive || 0xA5` encoding.
+/// Minted with `trible genid` on 2026-08-29.
+const TEST_TARGET_ENCODING_V1: Id = id_hex!("39B18B6D13B2B1872F2394EF6588F1B5");
 
-impl CollectionLattice for TestTargetUnion {
-    type Encoding = UnknownBlob;
-    type Recipe = TestTargetUnionV1;
+struct TestTargetBlob;
 
+impl BlobEncoding for TestTargetBlob {}
+
+impl MetaDescribe for TestTargetBlob {
+    fn describe() -> Fragment {
+        let id = TEST_TARGET_ENCODING_V1;
+        crate::macros::entity! { ExclusiveId::force_ref(&id) @
+            crate::metadata::name: "exact-derived-test-target-v1",
+            crate::metadata::description: "Test-only canonical encoding formed by appending 0xA5 to a test source archive.",
+            crate::metadata::tag: crate::metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
+impl CollectionEncoding for TestTargetBlob {
     fn validate_member(
         _descriptor: &Fragment,
-        member: &Blob<Self::Encoding>,
-    ) -> Result<(), CollectionLatticeError> {
+        member: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
         validate_test_target(member)
     }
 
-    fn merge_members(
+    fn join_members(
         _descriptor: &Fragment,
-        low: &Blob<Self::Encoding>,
-        high: &Blob<Self::Encoding>,
-    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
         let injected = SELECTIVE_POLICY.with(|policy| {
             let policy = policy.borrow();
             let Some(policy) = policy.as_ref() else {
                 return None;
             };
-            let pair = SelectiveAlgebra::pair(low, high);
+            let pair = SelectiveMapping::pair(low, high);
             policy.target_attempts.lock().unwrap().push(pair);
             if policy.fatal_target_pairs.contains(&pair) {
-                Some(CollectionLatticeError::Fatal(
+                Some(CollectionOperationError::Fatal(
                     "injected fatal target join".to_owned(),
                 ))
             } else if policy.capacity_target_pairs.contains(&pair) {
-                Some(CollectionLatticeError::Capacity(
+                Some(CollectionOperationError::Capacity(
                     "injected target capacity".to_owned(),
                 ))
             } else {
@@ -198,30 +215,45 @@ impl CollectionLattice for TestTargetUnion {
     }
 }
 
-struct SecondTestTargetUnion;
+/// Test-only canonical `(SimpleArchive || 0xA5) || 0xB6` encoding.
+/// Minted with `trible genid` on 2026-08-29.
+const SECOND_TEST_TARGET_ENCODING_V1: Id = id_hex!("9318ADD9A6257CB8973AC8BE806D12EC");
 
-impl CollectionLattice for SecondTestTargetUnion {
-    type Encoding = UnknownBlob;
-    type Recipe = SecondTestTargetUnionV1;
+struct SecondTestTargetBlob;
 
+impl BlobEncoding for SecondTestTargetBlob {}
+
+impl MetaDescribe for SecondTestTargetBlob {
+    fn describe() -> Fragment {
+        let id = SECOND_TEST_TARGET_ENCODING_V1;
+        crate::macros::entity! { ExclusiveId::force_ref(&id) @
+            crate::metadata::name: "exact-derived-second-test-target-v1",
+            crate::metadata::description: "Test-only canonical encoding formed by appending 0xB6 to an exact-derived test target.",
+            crate::metadata::tag: crate::metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
+impl CollectionEncoding for SecondTestTargetBlob {
     fn validate_member(
         _descriptor: &Fragment,
-        member: &Blob<Self::Encoding>,
-    ) -> Result<(), CollectionLatticeError> {
+        member: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
         validate_second_test_target(member)
     }
 
-    fn merge_members(
+    fn join_members(
         _descriptor: &Fragment,
-        low: &Blob<Self::Encoding>,
-        high: &Blob<Self::Encoding>,
-    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
         validate_second_test_target(low)?;
         validate_second_test_target(high)?;
         let low =
-            Blob::<UnknownBlob>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
-        let high =
-            Blob::<UnknownBlob>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
+            Blob::<TestTargetBlob>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
+        let high = Blob::<TestTargetBlob>::new(
+            high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into(),
+        );
         let joined = join_test_targets(&low, &high)?;
         let mut bytes = joined.bytes.as_ref().to_vec();
         bytes.push(0xB6);
@@ -229,37 +261,92 @@ impl CollectionLattice for SecondTestTargetUnion {
     }
 }
 
-fn validate_test_target(target: &Blob<UnknownBlob>) -> Result<(), CollectionLatticeError> {
+fn validate_test_target(target: &Blob<TestTargetBlob>) -> Result<(), CollectionOperationError> {
     let Some(source) = target.bytes.as_ref().strip_suffix(&[0xA5]) else {
-        return Err(CollectionLatticeError::Fatal(
+        return Err(CollectionOperationError::Fatal(
             "test target lacks its canonical suffix".to_owned(),
         ));
     };
     simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
-        .map_err(|error| CollectionLatticeError::Fatal(error.to_string()))
+        .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
 }
 
 fn join_test_targets(
-    low: &Blob<UnknownBlob>,
-    high: &Blob<UnknownBlob>,
-) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+    low: &Blob<TestTargetBlob>,
+    high: &Blob<TestTargetBlob>,
+) -> Result<Blob<TestTargetBlob>, CollectionOperationError> {
     validate_test_target(low)?;
     validate_test_target(high)?;
     let low = Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
     let high =
         Blob::<SimpleArchive>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
     let joined = simplearchive_union::join(&low, &high)
-        .map_err(|error| CollectionLatticeError::Fatal(error.to_string()))?;
+        .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+    let joined = joined.transmute::<TestSourceBlob>();
     Ok(derive(&joined).unwrap())
 }
 
-fn validate_second_test_target(target: &Blob<UnknownBlob>) -> Result<(), CollectionLatticeError> {
+fn validate_second_test_target(
+    target: &Blob<SecondTestTargetBlob>,
+) -> Result<(), CollectionOperationError> {
     let Some(source) = target.bytes.as_ref().strip_suffix(&[0xB6]) else {
-        return Err(CollectionLatticeError::Fatal(
+        return Err(CollectionOperationError::Fatal(
             "second test target lacks its canonical suffix".to_owned(),
         ));
     };
     validate_test_target(&Blob::new(source.to_vec().into()))
+}
+
+/// Test-only parameter-free source-to-target mapping algorithm.
+/// Minted with `trible genid` on 2026-08-29.
+const TEST_SUFFIX_MAPPING_V1: Id = id_hex!("70D406F7483E8A1D384354D0AFD0D717");
+
+struct TestSuffixMappingV1;
+
+impl MetaDescribe for TestSuffixMappingV1 {
+    fn describe() -> Fragment {
+        let id = TEST_SUFFIX_MAPPING_V1;
+        crate::macros::entity! { ExclusiveId::force_ref(&id) @
+            crate::metadata::name: "exact-derived-test-suffix-mapping-v1",
+            crate::metadata::description: "Test-only canonical mapping that appends 0xA5 to a test source archive.",
+            crate::metadata::tag: crate::metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+fn test_suffix_mapping_fragment() -> Fragment {
+    crate::macros::entity! {
+        crate::metadata::tag: crate::collection::KIND_COLLECTION_MAPPING,
+        crate::collection::mapping_algorithm*: <TestSuffixMappingV1 as MetaDescribe>::describe(),
+    }
+}
+
+/// Test-only parameter-free target-to-second-target mapping algorithm.
+/// Minted with `trible genid` on 2026-08-29.
+const SECOND_TEST_SUFFIX_MAPPING_V1: Id = id_hex!("4B671CE9A7CF6F2AEC3AD5F9B2A59FBC");
+
+/// Extrinsic replacement used to prove mapping-entity id substitution is
+/// operationally inert. Minted with `trible genid` on 2026-08-29.
+const SUBSTITUTED_MAPPING_ENTITY: Id = id_hex!("DE3EB767EC428155B4E3526ABFFFD991");
+
+struct SecondTestSuffixMappingV1;
+
+impl MetaDescribe for SecondTestSuffixMappingV1 {
+    fn describe() -> Fragment {
+        let id = SECOND_TEST_SUFFIX_MAPPING_V1;
+        crate::macros::entity! { ExclusiveId::force_ref(&id) @
+            crate::metadata::name: "exact-derived-second-test-suffix-mapping-v1",
+            crate::metadata::description: "Test-only canonical mapping that appends 0xB6 to an exact-derived test target.",
+            crate::metadata::tag: crate::metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+fn second_test_suffix_mapping_fragment() -> Fragment {
+    crate::macros::entity! {
+        crate::metadata::tag: crate::collection::KIND_COLLECTION_MAPPING,
+        crate::collection::mapping_algorithm*: <SecondTestSuffixMappingV1 as MetaDescribe>::describe(),
+    }
 }
 
 fn target_root(source: CollectionHandle) -> Fragment {
@@ -267,8 +354,8 @@ fn target_root(source: CollectionHandle) -> Fragment {
         crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
         crate::collection::collection_source: source,
         crate::collection::collection_authority: test_team(),
-        crate::collection::collection_representation: <UnknownBlob as MetaDescribe>::id(),
-        crate::collection::collection_recipe: <TestTargetUnionV1 as MetaDescribe>::id(),
+        crate::collection::collection_representation*: <TestTargetBlob as MetaDescribe>::describe(),
+        crate::collection::collection_mapping*: test_suffix_mapping_fragment(),
         crate::collection::collection_reach*: reach::private(),
     }
 }
@@ -278,39 +365,84 @@ fn second_target_root(source: CollectionHandle) -> Fragment {
         crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
         crate::collection::collection_source: source,
         crate::collection::collection_authority: test_team(),
-        crate::collection::collection_representation: <UnknownBlob as MetaDescribe>::id(),
-        crate::collection::collection_recipe: <SecondTestTargetUnionV1 as MetaDescribe>::id(),
+        crate::collection::collection_representation*: <SecondTestTargetBlob as MetaDescribe>::describe(),
+        crate::collection::collection_mapping*: second_test_suffix_mapping_fragment(),
         crate::collection::collection_reach*: reach::private(),
     }
 }
 
-fn kernel() -> ExactDerivedCollection<TestSourceUnion, TestTargetUnion, TestAlgebra> {
+fn substitute_mapping_entity(target: Fragment, replacement: Id) -> Fragment {
+    let descriptor_root = target.root().expect("target descriptor root");
+    let mapping = descriptor::mapping(target.facts())
+        .expect("valid mapping link")
+        .expect("derived target has a mapping");
+    let (_, facts, metafacts, blobs) = target.into_parts();
+    let mut substituted = TribleSet::new();
+    for fact in facts.iter() {
+        let mut raw = fact.data;
+        if fact.e() == &mapping {
+            raw[..16].copy_from_slice(&replacement[..]);
+        }
+        if fact.a() == &crate::collection::collection_mapping.id()
+            && raw[32..48] == [0; 16]
+            && raw[48..64] == mapping[..]
+        {
+            raw[48..64].copy_from_slice(&replacement[..]);
+        }
+        substituted.insert(
+            &Trible::force_raw(raw).expect("entity substitution preserves non-nil trible ids"),
+        );
+    }
+    Fragment::rooted_from_parts(descriptor_root, substituted, metafacts, blobs)
+}
+
+fn kernel() -> ExactDerivedCollection<TestSourceBlob, TestTargetBlob, TestSuffixMapping> {
     let source = source_root();
-    let source_collection = Collection::<TestSourceUnion>::from_descriptor(&source).unwrap();
+    let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
     ExactDerivedCollection::new(source, target_root(source_collection.handle())).unwrap()
 }
 
-fn selective_kernel(
-    algebra: SelectiveAlgebra,
-) -> ExactDerivedCollection<TestSourceUnion, TestTargetUnion, SelectiveAlgebra> {
+#[test]
+fn mapping_entity_id_substitution_preserves_binding_semantics() {
     let source = source_root();
-    let source_collection = Collection::<TestSourceUnion>::from_descriptor(&source).unwrap();
-    ExactDerivedCollection::with_homomorphism(
+    let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
+    let canonical = target_root(source_collection.handle());
+    let original_mapping = descriptor::mapping(canonical.facts()).unwrap().unwrap();
+    let substituted = substitute_mapping_entity(canonical, SUBSTITUTED_MAPPING_ENTITY);
+
+    assert_ne!(original_mapping, SUBSTITUTED_MAPPING_ENTITY);
+    assert_eq!(
+        descriptor::mapping(substituted.facts()),
+        Ok(Some(SUBSTITUTED_MAPPING_ENTITY))
+    );
+    assert_eq!(
+        descriptor::mapping_algorithm(substituted.facts()),
+        Ok(Some(TEST_SUFFIX_MAPPING_V1))
+    );
+    ExactDerivedCollection::<TestSourceBlob, TestTargetBlob, TestSuffixMapping>::new(
         source,
-        target_root(source_collection.handle()),
-        algebra,
+        substituted,
     )
-    .unwrap()
+    .expect("binding depends on mapping facts, not intrinsic-id minting history");
 }
 
-fn second_kernel() -> ExactDerivedCollection<TestTargetUnion, SecondTestTargetUnion, SecondAlgebra>
-{
+fn selective_kernel(
+    mapping: SelectiveMapping,
+) -> ExactDerivedCollection<TestSourceBlob, TestTargetBlob, SelectiveMapping> {
+    let source = source_root();
+    let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
+    ExactDerivedCollection::with_mapping(source, target_root(source_collection.handle()), mapping)
+        .unwrap()
+}
+
+fn second_kernel(
+) -> ExactDerivedCollection<TestTargetBlob, SecondTestTargetBlob, SecondTestSuffixMapping> {
     let source = kernel().target_descriptor().clone();
-    let source_collection = Collection::<TestTargetUnion>::from_descriptor(&source).unwrap();
+    let source_collection = Collection::<TestTargetBlob>::from_descriptor(&source).unwrap();
     ExactDerivedCollection::new(source, second_target_root(source_collection.handle())).unwrap()
 }
 
-struct SelectivePolicyGuard(Option<SelectiveAlgebra>);
+struct SelectivePolicyGuard(Option<SelectiveMapping>);
 
 impl Drop for SelectivePolicyGuard {
     fn drop(&mut self) {
@@ -321,14 +453,14 @@ impl Drop for SelectivePolicyGuard {
 }
 
 fn with_selective<R>(
-    algebra: &SelectiveAlgebra,
+    mapping: &SelectiveMapping,
     operation: impl FnOnce(
-        &ExactDerivedCollection<TestSourceUnion, TestTargetUnion, SelectiveAlgebra>,
+        &ExactDerivedCollection<TestSourceBlob, TestTargetBlob, SelectiveMapping>,
     ) -> R,
 ) -> R {
-    let previous = SELECTIVE_POLICY.with(|policy| policy.replace(Some(algebra.clone())));
+    let previous = SELECTIVE_POLICY.with(|policy| policy.replace(Some(mapping.clone())));
     let _guard = SelectivePolicyGuard(previous);
-    let kernel = selective_kernel(algebra.clone());
+    let kernel = selective_kernel(mapping.clone());
     operation(&kernel)
 }
 
@@ -339,12 +471,12 @@ fn row(entity: u8, value: u8) -> Trible {
     Trible::force_raw(raw).unwrap()
 }
 
-fn archive(rows: impl IntoIterator<Item = (u8, u8)>) -> Blob<SimpleArchive> {
+fn archive(rows: impl IntoIterator<Item = (u8, u8)>) -> Blob<TestSourceBlob> {
     let mut set = TribleSet::new();
     for (entity, value) in rows {
         set.insert(&row(entity, value));
     }
-    set.to_blob()
+    IntoBlob::<SimpleArchive>::to_blob(set).transmute()
 }
 
 fn data<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData
@@ -355,69 +487,75 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TestAlgebra;
+struct TestSuffixMapping;
 
-impl CollectionHomomorphism<TestSourceUnion, TestTargetUnion> for TestAlgebra {
-    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+impl CollectionMapping<TestSourceBlob, TestTargetBlob> for TestSuffixMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        require_mapping(target, TEST_SUFFIX_MAPPING_V1, "test suffix")?;
         Ok(Self)
     }
 
     fn map(
         &self,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+        source: &Blob<TestSourceBlob>,
+    ) -> Result<Blob<TestTargetBlob>, CollectionOperationError> {
         Ok(derive(source).unwrap())
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SecondAlgebra;
+struct SecondTestSuffixMapping;
 
-impl CollectionHomomorphism<TestTargetUnion, SecondTestTargetUnion> for SecondAlgebra {
-    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+impl CollectionMapping<TestTargetBlob, SecondTestTargetBlob> for SecondTestSuffixMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        require_mapping(target, SECOND_TEST_SUFFIX_MAPPING_V1, "second test suffix")?;
         Ok(Self)
     }
 
-    fn map(&self, source: &Blob<UnknownBlob>) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+    fn map(
+        &self,
+        source: &Blob<TestTargetBlob>,
+    ) -> Result<Blob<SecondTestTargetBlob>, CollectionOperationError> {
         let mut bytes = source.bytes.as_ref().to_vec();
         bytes.push(0xB6);
         Ok(Blob::new(bytes.into()))
     }
 }
 
-struct IdentityAlgebra;
+struct IdentityMapping;
 
-impl CollectionHomomorphism<TestSourceUnion, TestSourceUnion> for IdentityAlgebra {
-    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+impl CollectionMapping<TestSourceBlob, TestSourceBlob> for IdentityMapping {
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionOperationError> {
         Ok(Self)
     }
 
     fn map(
         &self,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SimpleArchive>, CollectionLatticeError> {
+        source: &Blob<TestSourceBlob>,
+    ) -> Result<Blob<TestSourceBlob>, CollectionOperationError> {
         Ok(source.clone())
     }
 }
 
-impl CollectionHomomorphism<TestSourceUnion, TestTargetUnion> for SelectiveAlgebra {
-    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+impl CollectionMapping<TestSourceBlob, TestTargetBlob> for SelectiveMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        require_mapping(target, TEST_SUFFIX_MAPPING_V1, "test suffix")?;
         Ok(Self::default())
     }
 
     fn map(
         &self,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+        source: &Blob<TestSourceBlob>,
+    ) -> Result<Blob<TestTargetBlob>, CollectionOperationError> {
         let input = data(source);
         self.derive_attempts.lock().unwrap().push(input);
         if self.fatal_derives.contains(&input) {
-            return Err(CollectionLatticeError::Fatal(
+            return Err(CollectionOperationError::Fatal(
                 "injected fatal derive".to_owned(),
             ));
         }
         if self.capacity_derives.contains(&input) {
-            return Err(CollectionLatticeError::Capacity(
+            return Err(CollectionOperationError::Capacity(
                 "injected derive capacity".to_owned(),
             ));
         }
@@ -425,14 +563,30 @@ impl CollectionHomomorphism<TestSourceUnion, TestTargetUnion> for SelectiveAlgeb
     }
 }
 
-fn derive(source: &Blob<SimpleArchive>) -> Result<Blob<UnknownBlob>, Infallible> {
+fn require_mapping(
+    target: &Fragment,
+    expected: Id,
+    label: &str,
+) -> Result<(), CollectionOperationError> {
+    let actual = descriptor::mapping_algorithm(target.facts())
+        .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+    if actual == Some(expected) {
+        return Ok(());
+    }
+    Err(CollectionOperationError::Fatal(format!(
+        "{label} mapping algorithm {:?} does not match {expected:X}",
+        actual.map(|id| format!("{id:X}")),
+    )))
+}
+
+fn derive(source: &Blob<TestSourceBlob>) -> Result<Blob<TestTargetBlob>, Infallible> {
     let mut bytes = source.bytes.as_ref().to_vec();
     bytes.push(0xA5);
     Ok(Blob::new(bytes.into()))
 }
 
-fn source_commit(store: &mut MemoryRepo, key: u8, blob: &Blob<SimpleArchive>) -> CollectionCommit {
-    store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+fn source_commit(store: &mut MemoryRepo, key: u8, blob: &Blob<TestSourceBlob>) -> CollectionCommit {
+    store.put::<TestSourceBlob, _>(blob.clone()).unwrap();
     let metadata = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
         .unwrap();
@@ -446,19 +600,19 @@ fn source_commit(store: &mut MemoryRepo, key: u8, blob: &Blob<SimpleArchive>) ->
     commit
 }
 
-fn source_cover(commits: &[CollectionCommit]) -> Cover<TestSourceUnion> {
+fn source_cover(commits: &[CollectionCommit]) -> Cover<TestSourceBlob> {
     Cover::from_members(
         kernel().source_collection(),
         commits
             .iter()
             .map(CollectionCommit::data)
-            .map(Handle::<SimpleArchive>::from_hash),
+            .map(Handle::<TestSourceBlob>::from_hash),
     )
 }
 
-fn publish_derive(store: &mut MemoryRepo, input: &Blob<SimpleArchive>) -> Blob<UnknownBlob> {
+fn publish_derive(store: &mut MemoryRepo, input: &Blob<TestSourceBlob>) -> Blob<TestTargetBlob> {
     let output = derive(input).unwrap();
-    store.put::<UnknownBlob, _>(output.clone()).unwrap();
+    store.put::<TestTargetBlob, _>(output.clone()).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
             kernel().target_collection().handle(),
@@ -471,11 +625,11 @@ fn publish_derive(store: &mut MemoryRepo, input: &Blob<SimpleArchive>) -> Blob<U
 
 fn publish_source_merge(
     store: &mut MemoryRepo,
-    low: &Blob<SimpleArchive>,
-    high: &Blob<SimpleArchive>,
-) -> Blob<SimpleArchive> {
-    let result = simplearchive_union::join(low, high).unwrap();
-    store.put::<SimpleArchive, _>(result.clone()).unwrap();
+    low: &Blob<TestSourceBlob>,
+    high: &Blob<TestSourceBlob>,
+) -> Blob<TestSourceBlob> {
+    let result = join_test_sources(low, high);
+    store.put::<TestSourceBlob, _>(result.clone()).unwrap();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
             kernel().source_collection().handle(),
@@ -487,6 +641,18 @@ fn publish_source_merge(
     result
 }
 
+fn join_test_sources(
+    low: &Blob<TestSourceBlob>,
+    high: &Blob<TestSourceBlob>,
+) -> Blob<TestSourceBlob> {
+    simplearchive_union::join(
+        low.as_transmute::<SimpleArchive>(),
+        high.as_transmute::<SimpleArchive>(),
+    )
+    .unwrap()
+    .transmute()
+}
+
 fn derived_inputs(store: &mut MemoryRepo) -> Vec<CollectionData> {
     store
         .records()
@@ -494,9 +660,9 @@ fn derived_inputs(store: &mut MemoryRepo) -> Vec<CollectionData> {
         .map(Result::unwrap)
         .filter_map(|record| match record {
             CollectionRecord::Derive(claim)
-                if claim.target() == kernel().target_collection().handle() =>
+                if claim.collection() == kernel().target_collection().handle() =>
             {
-                Some(claim.mapping().0)
+                Some(claim.input())
             }
             _ => None,
         })
@@ -561,10 +727,9 @@ fn empty_cover_performs_no_store_operation() {
 #[test]
 fn empty_cover_still_belongs_to_one_exact_collection() {
     let mut store = PanicStore;
-    let foreign_descriptor =
-        simplearchive_union::descriptor("foreign", test_team(), reach::private());
+    let foreign_descriptor = source_descriptor("foreign");
     let foreign_collection =
-        Collection::<TestSourceUnion>::from_descriptor(&foreign_descriptor).unwrap();
+        Collection::<TestSourceBlob>::from_descriptor(&foreign_descriptor).unwrap();
     let foreign = Cover::from_members(foreign_collection, []);
     for result in [
         kernel().attach_exact(&mut store, &foreign),
@@ -742,16 +907,50 @@ fn complete_probe_ensure_performs_zero_writes() {
 }
 
 #[test]
+fn ensure_publishes_the_complete_descriptor_attachment_closure() {
+    let exact = kernel();
+    let source = archive([(1, 3)]);
+    let mut store = MemoryRepo::default();
+    source_commit(&mut store, 1, &source);
+    let source_cover = Cover::from_members(exact.source_collection(), [source.get_handle()]);
+
+    exact.ensure_exact(&mut store, &source_cover).unwrap();
+
+    let reader = store.reader().unwrap();
+    for descriptor in [exact.source_descriptor(), exact.target_descriptor()] {
+        let stored_descriptor: Blob<SimpleArchive> = reader
+            .get(
+                crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
+                    .get_handle(),
+            )
+            .expect("descriptor archive is resident");
+        assert_eq!(
+            stored_descriptor.bytes,
+            crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone(),).bytes
+        );
+
+        let mut embedded = descriptor.blobs().clone();
+        let embedded_reader = embedded.reader().unwrap();
+        for (handle, expected) in embedded_reader {
+            let actual: Blob<UnknownBlob> = reader
+                .get(handle)
+                .expect("every descriptor attachment is resident");
+            assert_eq!(actual.bytes, expected.bytes);
+        }
+    }
+}
+
+#[test]
 fn compacted_source_cover_reuses_resident_decomposition_images() {
     let a = archive([(1, 3)]);
     let b = archive([(2, 4)]);
     let mut inner = MemoryRepo::default();
-    inner.put::<SimpleArchive, _>(a.clone()).unwrap();
-    inner.put::<SimpleArchive, _>(b.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
     let c = publish_source_merge(&mut inner, &a, &b);
     let fa = publish_derive(&mut inner, &a);
     let fb = publish_derive(&mut inner, &b);
-    let algebra = SelectiveAlgebra::default();
+    let algebra = SelectiveMapping::default();
     let mut store = CountingStore {
         inner,
         ..CountingStore::default()
@@ -777,12 +976,12 @@ fn compacted_source_capacity_falls_back_to_resident_decomposition_inputs() {
     let a = archive([(1, 3)]);
     let b = archive([(2, 4)]);
     let mut inner = MemoryRepo::default();
-    inner.put::<SimpleArchive, _>(a.clone()).unwrap();
-    inner.put::<SimpleArchive, _>(b.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
     let c = publish_source_merge(&mut inner, &a, &b);
-    let algebra = SelectiveAlgebra {
+    let algebra = SelectiveMapping {
         capacity_derives: BTreeSet::from([data(&c)]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -816,11 +1015,11 @@ fn complete_direct_image_does_not_expand_source_decompositions() {
     let a = archive([(1, 3)]);
     let b = archive([(2, 4)]);
     let mut inner = MemoryRepo::default();
-    inner.put::<SimpleArchive, _>(a.clone()).unwrap();
-    inner.put::<SimpleArchive, _>(b.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
     let c = publish_source_merge(&mut inner, &a, &b);
     let fc = publish_derive(&mut inner, &c);
-    let algebra = SelectiveAlgebra::default();
+    let algebra = SelectiveMapping::default();
     let mut store = CountingStore {
         inner,
         ..CountingStore::default()
@@ -844,7 +1043,7 @@ fn complete_direct_image_does_not_expand_source_decompositions() {
 fn unrelated_optional_result_metadata_failure_is_inert() {
     let source = archive([(1, 3)]);
     let mut inner = MemoryRepo::default();
-    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(source.clone()).unwrap();
     let target = publish_derive(&mut inner, &source);
     let unrelated = Inline::<Hash<Blake3>>::new([0x73; 32]);
     inner
@@ -879,7 +1078,7 @@ fn unrelated_optional_result_metadata_failure_is_inert() {
 fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
     let c = archive([(9, 9)]);
     let mut inner = MemoryRepo::default();
-    inner.put::<SimpleArchive, _>(c.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(c.clone()).unwrap();
     let missing_a = Inline::<Hash<Blake3>>::new([0x31; 32]);
     let missing_b = Inline::<Hash<Blake3>>::new([0x42; 32]);
     inner
@@ -890,7 +1089,7 @@ fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
             data(&c),
         )))
         .unwrap();
-    let algebra = SelectiveAlgebra::default();
+    let algebra = SelectiveMapping::default();
     let mut store = CountingStore {
         inner,
         ..CountingStore::default()
@@ -915,7 +1114,7 @@ fn forged_reverse_decomposition_cannot_supply_a_cover() {
     let c = archive([(9, 9)]);
     let mut inner = MemoryRepo::default();
     for source in [&a, &b, &c] {
-        inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+        inner.put::<TestSourceBlob, _>(source.clone()).unwrap();
     }
     inner
         .insert(CollectionRecord::Merge(CollectionMerge::new(
@@ -927,7 +1126,7 @@ fn forged_reverse_decomposition_cannot_supply_a_cover() {
         .unwrap();
     publish_derive(&mut inner, &a);
     publish_derive(&mut inner, &b);
-    let algebra = SelectiveAlgebra::default();
+    let algebra = SelectiveMapping::default();
     let mut store = CountingStore {
         inner,
         ..CountingStore::default()
@@ -969,7 +1168,7 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
                 record,
                 CollectionRecord::Commit(commit)
                     if commit.collection() == kernel().target_collection().handle()
-                        && commit.data() == Handle::<UnknownBlob>::to_hash(first_member)
+                        && commit.data() == Handle::<TestTargetBlob>::to_hash(first_member)
             )),
         "the first algebra result must remain unsigned equation evidence",
     );
@@ -1011,9 +1210,9 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
         source_commit(&mut inner, 2, &b),
     ];
     let upper = publish_source_merge(&mut inner, &a, &b);
-    let algebra = SelectiveAlgebra {
+    let algebra = SelectiveMapping {
         capacity_derives: BTreeSet::from([data(&upper)]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1056,9 +1255,9 @@ fn capacity_source_replan_is_global_across_overlapping_uppers() {
     } else {
         (&v, &u, &a)
     };
-    let algebra = SelectiveAlgebra {
+    let algebra = SelectiveMapping {
         capacity_derives: BTreeSet::from([data(blocked_upper)]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1093,9 +1292,9 @@ fn terminal_source_capacity_is_repeatable_and_zero_write() {
     let source = archive([(1, 3)]);
     let mut inner = MemoryRepo::default();
     let commit = source_commit(&mut inner, 1, &source);
-    let algebra = SelectiveAlgebra {
+    let algebra = SelectiveMapping {
         capacity_derives: BTreeSet::from([data(&source)]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1127,9 +1326,9 @@ fn mixed_terminal_capacity_publishes_no_prepared_sibling() {
         source_commit(&mut inner, 1, &first),
         source_commit(&mut inner, 2, &second),
     ];
-    let algebra = SelectiveAlgebra {
+    let algebra = SelectiveMapping {
         capacity_derives: BTreeSet::from([data(blocked)]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1156,9 +1355,9 @@ fn fatal_source_construction_is_not_capacity_fallback() {
     let source = archive([(1, 3)]);
     let mut inner = MemoryRepo::default();
     let commit = source_commit(&mut inner, 1, &source);
-    let algebra = SelectiveAlgebra {
+    let algebra = SelectiveMapping {
         fatal_derives: BTreeSet::from([data(&source)]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1359,7 +1558,7 @@ fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
         .collect()
 }
 
-fn joined_cover(cover: &CoverAttachment<TestTargetUnion>) -> Blob<UnknownBlob> {
+fn joined_cover(cover: &CoverAttachment<TestTargetBlob>) -> Blob<TestTargetBlob> {
     let mut members = cover.members().iter();
     let mut joined = members
         .next()
@@ -1372,28 +1571,28 @@ fn joined_cover(cover: &CoverAttachment<TestTargetUnion>) -> Blob<UnknownBlob> {
     joined
 }
 
-fn cover_ids(cover: &CoverAttachment<TestTargetUnion>) -> Vec<CollectionData> {
+fn cover_ids(cover: &CoverAttachment<TestTargetBlob>) -> Vec<CollectionData> {
     cover
         .members()
         .iter()
-        .map(|(handle, _)| Handle::<UnknownBlob>::to_hash(*handle))
+        .map(|(handle, _)| Handle::<TestTargetBlob>::to_hash(*handle))
         .collect()
 }
 
 fn target_handles(
     data: impl IntoIterator<Item = CollectionData>,
-) -> BTreeSet<Inline<Handle<UnknownBlob>>> {
+) -> BTreeSet<Inline<Handle<TestTargetBlob>>> {
     data.into_iter()
-        .map(Handle::<UnknownBlob>::from_hash)
+        .map(Handle::<TestTargetBlob>::from_hash)
         .collect()
 }
 
 fn target_ids(
-    handles: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
+    handles: impl IntoIterator<Item = Inline<Handle<TestTargetBlob>>>,
 ) -> Vec<CollectionData> {
     handles
         .into_iter()
-        .map(Handle::<UnknownBlob>::to_hash)
+        .map(Handle::<TestTargetBlob>::to_hash)
         .collect()
 }
 
@@ -1423,10 +1622,9 @@ fn compaction_collapses_same_tier_and_returns_an_exact_tier_stable_cover() {
     let expected_source = sources
         .iter()
         .skip(1)
-        .try_fold(sources[0].clone(), |joined, source| {
-            simplearchive_union::join(&joined, source)
-        })
-        .unwrap();
+        .fold(sources[0].clone(), |joined, source| {
+            join_test_sources(&joined, source)
+        });
     assert_eq!(
         joined_cover(&cover).bytes,
         derive(&expected_source).unwrap().bytes
@@ -1452,11 +1650,11 @@ fn target_capacity_retires_only_low() {
         .map(|source| derive(source).unwrap())
         .collect();
     targets.sort_unstable_by_key(data);
-    let first_pair = SelectiveAlgebra::pair(&targets[0], &targets[1]);
-    let second_pair = SelectiveAlgebra::pair(&targets[1], &targets[2]);
-    let algebra = SelectiveAlgebra {
+    let first_pair = SelectiveMapping::pair(&targets[0], &targets[1]);
+    let second_pair = SelectiveMapping::pair(&targets[1], &targets[2]);
+    let algebra = SelectiveMapping {
         capacity_target_pairs: BTreeSet::from([first_pair]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1502,11 +1700,11 @@ fn fatal_late_target_join_publishes_no_staged_prefix() {
         .map(|source| derive(source).unwrap())
         .collect();
     targets.sort_unstable_by_key(data);
-    let first_pair = SelectiveAlgebra::pair(&targets[0], &targets[1]);
-    let fatal_pair = SelectiveAlgebra::pair(&targets[2], &targets[3]);
-    let algebra = SelectiveAlgebra {
+    let first_pair = SelectiveMapping::pair(&targets[0], &targets[1]);
+    let fatal_pair = SelectiveMapping::pair(&targets[2], &targets[3]);
+    let algebra = SelectiveMapping {
         fatal_target_pairs: BTreeSet::from([fatal_pair]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1546,10 +1744,10 @@ fn capacity_stable_target_collision_is_repeatable_and_zero_write() {
         .iter()
         .map(|source| derive(source).unwrap())
         .collect();
-    let capacity_pair = SelectiveAlgebra::pair(&targets[0], &targets[1]);
-    let algebra = SelectiveAlgebra {
+    let capacity_pair = SelectiveMapping::pair(&targets[0], &targets[1]);
+    let algebra = SelectiveMapping {
         capacity_target_pairs: BTreeSet::from([capacity_pair]),
-        ..SelectiveAlgebra::default()
+        ..SelectiveMapping::default()
     };
     let mut store = CountingStore {
         inner,
@@ -1613,7 +1811,7 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof()
     }
     let wrong = derive(&archive([(9, 9)])).unwrap();
     store
-        .put::<UnknownBlob, _>(Blob::<UnknownBlob>::with_handle(
+        .put::<TestTargetBlob, _>(Blob::<TestTargetBlob>::with_handle(
             wrong.bytes,
             old_upper.get_handle(),
         ))
@@ -1848,9 +2046,9 @@ fn join_and_put_failures_publish_no_target_merge() {
         .collect();
     let join_cover = source_cover(&join_commits);
     let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let algebra = SelectiveAlgebra {
-        fatal_target_pairs: BTreeSet::from([SelectiveAlgebra::pair(&targets[0], &targets[1])]),
-        ..SelectiveAlgebra::default()
+    let algebra = SelectiveMapping {
+        fatal_target_pairs: BTreeSet::from([SelectiveMapping::pair(&targets[0], &targets[1])]),
+        ..SelectiveMapping::default()
     };
     assert!(matches!(
         with_selective(&algebra, |kernel| {
@@ -1904,8 +2102,7 @@ fn discarded_merge_insert_stalls_instead_of_looping() {
 
 struct LossyStore {
     inner: MemoryRepo,
-    puts: usize,
-    discard_put: usize,
+    discard: CollectionData,
 }
 
 impl BlobStorePut for LossyStore {
@@ -1917,9 +2114,8 @@ impl BlobStorePut for LossyStore {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        self.puts += 1;
         let blob = item.to_blob();
-        if self.puts == self.discard_put {
+        if Handle::<S>::to_hash(blob.get_handle()) == self.discard {
             Ok(blob.get_handle())
         } else {
             self.inner.put(blob)
@@ -1958,11 +2154,10 @@ fn fresh_reprobe_rejects_a_lossy_output_put() {
     let source = archive([(1, 3)]);
     let mut inner = MemoryRepo::default();
     let commit = source_commit(&mut inner, 1, &source);
-    // Completion writes source descriptor, target descriptor, then output.
+    let output = derive(&source).unwrap();
     let mut store = LossyStore {
         inner,
-        puts: 0,
-        discard_put: 3,
+        discard: data(&output),
     };
     let source_cover = source_cover(&[commit]);
     match kernel().ensure_exact(&mut store, &source_cover) {
@@ -2039,7 +2234,7 @@ fn offered_upper_is_selected_as_one_remote_cover_member() {
         ExactAttachPlan::Ready(_) => panic!("nonresident offered upper was already ready"),
     }
 
-    store.put::<UnknownBlob, _>(upper.clone()).unwrap();
+    store.put::<TestTargetBlob, _>(upper.clone()).unwrap();
     match kernel()
         .probe_exact(&mut store, &source_cover, &offered)
         .unwrap()
@@ -2094,7 +2289,7 @@ fn unavailable_offered_upper_replans_to_offered_lower_cover() {
     let expected: Vec<_> = offered
         .iter()
         .copied()
-        .map(Handle::<UnknownBlob>::to_hash)
+        .map(Handle::<TestTargetBlob>::to_hash)
         .collect();
     match kernel()
         .probe_exact(&mut store, &source_cover, &offered)
@@ -2104,7 +2299,7 @@ fn unavailable_offered_upper_replans_to_offered_lower_cover() {
         ExactAttachPlan::Ready(_) => panic!("nonresident offered lowers were already ready"),
     }
     for target in targets {
-        store.put::<UnknownBlob, _>(target).unwrap();
+        store.put::<TestTargetBlob, _>(target).unwrap();
     }
     match kernel()
         .probe_exact(&mut store, &source_cover, &offered)
@@ -2128,7 +2323,7 @@ fn offered_upper_does_not_displace_a_complete_resident_lower_cover() {
         .collect();
     let source_cover = source_cover(&commits);
     for (source, target) in sources.iter().zip(&targets) {
-        store.put::<UnknownBlob, _>(target.clone()).unwrap();
+        store.put::<TestTargetBlob, _>(target.clone()).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
                 kernel().target_collection().handle(),
@@ -2212,7 +2407,7 @@ fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
         .collect();
     let source_cover = source_cover(&commits);
     for (source, target) in sources.iter().zip(&targets) {
-        store.put::<UnknownBlob, _>(target.clone()).unwrap();
+        store.put::<TestTargetBlob, _>(target.clone()).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
                 kernel().target_collection().handle(),
@@ -2231,7 +2426,7 @@ fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
         .unwrap();
     let wrong = derive(&archive([(9, 9)])).unwrap();
     store
-        .put::<UnknownBlob, _>(Blob::<UnknownBlob>::with_handle(
+        .put::<TestTargetBlob, _>(Blob::<TestTargetBlob>::with_handle(
             wrong.bytes,
             upper.get_handle(),
         ))
@@ -2262,11 +2457,11 @@ fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
     let source = archive([(1, 3)]);
     let expected = derive(&source).unwrap();
     let wrong = archive([(9, 9)]);
-    let forged = Blob::<UnknownBlob>::with_handle(wrong.bytes.clone(), expected.get_handle());
+    let forged = Blob::<TestTargetBlob>::with_handle(wrong.bytes.clone(), expected.get_handle());
     let mut store = MemoryRepo::default();
     let commit = source_commit(&mut store, 1, &source);
     let source_cover = source_cover(&[commit]);
-    store.put::<UnknownBlob, _>(forged).unwrap();
+    store.put::<TestTargetBlob, _>(forged).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
             kernel().target_collection().handle(),
@@ -2291,12 +2486,12 @@ fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
 fn ungrounded_source_superset_cannot_escape_the_cover() {
     let a = archive([(1, 3)]);
     let c = archive([(3, 5)]);
-    let ac = simplearchive_union::join(&a, &c).unwrap();
+    let ac = join_test_sources(&a, &c);
     let mut store = MemoryRepo::default();
     let commit = source_commit(&mut store, 1, &a);
     let source_cover = source_cover(&[commit]);
-    store.put::<SimpleArchive, _>(c.clone()).unwrap();
-    store.put::<SimpleArchive, _>(ac.clone()).unwrap();
+    store.put::<TestSourceBlob, _>(c.clone()).unwrap();
+    store.put::<TestSourceBlob, _>(ac.clone()).unwrap();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
             kernel().source_collection().handle(),
@@ -2313,7 +2508,7 @@ fn ungrounded_source_superset_cannot_escape_the_cover() {
         .unwrap()
         .map(Result::unwrap)
         .filter_map(|record| match record {
-            CollectionRecord::Derive(claim) => Some(claim.mapping().0),
+            CollectionRecord::Derive(claim) => Some(claim.input()),
             _ => None,
         })
         .collect();
@@ -2325,11 +2520,10 @@ fn typed_lifecycle_rejects_a_lying_source_descriptor() {
     let lying_source = descriptor::naming(
         "source",
         test_team(),
-        <UnknownBlob as MetaDescribe>::id(),
-        id(99),
+        <TestTargetBlob as MetaDescribe>::id(),
         reach::private(),
     );
-    let result = ExactDerivedCollection::<TestSourceUnion, TestTargetUnion, TestAlgebra>::new(
+    let result = ExactDerivedCollection::<TestSourceBlob, TestTargetBlob, TestSuffixMapping>::new(
         lying_source,
         kernel().target_descriptor().clone(),
     );
@@ -2342,7 +2536,7 @@ fn typed_lifecycle_rejects_a_lying_source_descriptor() {
 #[test]
 fn identity_descriptor_pair_is_rejected() {
     let descriptor = source_root();
-    let result = ExactDerivedCollection::<TestSourceUnion, TestSourceUnion, IdentityAlgebra>::new(
+    let result = ExactDerivedCollection::<TestSourceBlob, TestSourceBlob, IdentityMapping>::new(
         descriptor.clone(),
         descriptor,
     );

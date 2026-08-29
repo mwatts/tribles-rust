@@ -58,23 +58,22 @@
 //! identity it lacks, an attribute meaning *the status of goal G*, after
 //! which no scope is wanted: a note is simply not in that register.
 //!
-//! # Identity lives on the collection, not at the call site
+//! # Materialized identity lives in the mapping, not at the call site
 //!
 //! Which attribute carries identity and which carries order is a property
-//! of the *register*, never of the question a reader asks. Both are carried
-//! as tribles on the collection descriptor, alongside a recipe id that names
-//! the law -- [`STATED_ORDER_RECIPE_V1`] -- and nothing else. Two registers
-//! over the same dataset but different attributes are therefore distinct
-//! collections, because the descriptor's content differs and so does its
-//! handle; they cannot be confused for one another's cache.
+//! of a materialized register, never of the question a reader asks. The
+//! source-to-register mapping carries both attributes as ordinary tribles.
+//! Its intrinsic id therefore distinguishes two registers over the same
+//! source while leaving the shared mapping algorithm independently named and
+//! inspectable.
 //!
-//! An earlier design hashed the two attributes *into* the recipe id. That
-//! made the digest the only carrier of the pair: nothing stored them, so no
-//! reader could recover which attributes a register was over. The same
+//! An earlier design hashed the two attributes *into* an opaque mapping id.
+//! That made the digest the only carrier of the pair: nothing stored them, so
+//! no reader could recover which attributes a register was over. The same
 //! correction applies to
 //! [`observed_union`](crate::collection::observed_union)'s observed edge and
-//! to a path collection's automaton fingerprint, both of which are now
-//! descriptor arguments too.
+//! to a path collection's automaton: both are parameters of content-derived
+//! mapping entities embedded in their target descriptors.
 //!
 //! What is left at the call site is the frame — which commits the reader
 //! holds — and nothing else.
@@ -467,26 +466,6 @@ where
     pub fn end(&self) -> End {
         self.end
     }
-
-    /// The identity of this measure of domination.
-    ///
-    /// Both attributes fold in, because both are the register: swap either
-    /// one and the answer to "which states are current" is a different
-    /// answer about a different thing. This is the same construction
-    /// [`observed_union`](crate::collection::observed_union) uses for its
-    /// observation edge and a path collection uses for its automaton
-    /// fingerprint, and it is what lets several `current` lattices over
-    /// one dataset coexist without sharing a cache.
-    ///
-    /// [`End`] and the tie-break are deliberately *not* folded in. They
-    /// choose which end of this coordinate system a reader wants and how
-    /// finely it is cut; the coordinate system is the same one either way.
-    /// A maintained artifact that is specific to one end — as
-    /// [`observed_union`](crate::collection::observed_union)'s dominated
-    /// set is to [`End::Last`] — has to say so in its own descriptor.
-    pub fn recipe() -> Id {
-        STATED_ORDER_RECIPE_V1
-    }
 }
 
 crate::macros::attributes! {
@@ -498,32 +477,6 @@ crate::macros::attributes! {
     ///
     /// Minted with `trible genid` on 2026-08-19.
     "435F580DA18908BAEB4EB675557E0BFD" as pub register_orders: GenId;
-}
-
-/// The stated-order law: an identity attribute plus a total order attribute.
-///
-/// This names the law only. *Which* attributes carry identity and order are
-/// parameters on the collection descriptor, not folded into this id. Hashing
-/// them in would leave the digest as the sole carrier of arguments that are
-/// stored nowhere, so a reader could never recover what the register means
-/// from the pile alone.
-///
-/// Minted with `trible genid` on 2026-08-19.
-pub const STATED_ORDER_RECIPE_V1: Id = crate::id_hex!("6DD9E3F484DDDFF83BAC505ED33C8394");
-
-/// The stated-order law, as a describable type.
-pub struct StatedOrderV1;
-
-impl crate::metadata::MetaDescribe for StatedOrderV1 {
-    fn describe() -> crate::trible::Fragment {
-        let id: Id = STATED_ORDER_RECIPE_V1;
-        crate::macros::entity! {
-            crate::id::ExclusiveId::force_ref(&id) @
-                crate::metadata::name: "stated-order-v1",
-                crate::metadata::description: "A register whose states are ordered by a stated value rather than by observation. One state dominates another when they share an identity and its order value is greater, so the resolution is the set of states nothing beats: a single winner when the order is total, a tie when it is not. Takes two arguments, carried as tribles on the collection descriptor: `register_identity`, the attribute saying two states are about the same thing, and `register_orders`, the attribute carrying the order. Identity and order are separate because an order value alone carries no identity.",
-                crate::metadata::tag: crate::metadata::KIND_COLLECTION_RECIPE,
-        }
-    }
 }
 
 impl<P, K> StatedOrder<'_, P, K>
@@ -742,7 +695,7 @@ mod tests {
         /// The register that is *the status of* a subject — an identity, and
         /// a different one from `note_of` even on the same subject.
         "3DE10799440A0C3D4B40261E7089DCAD" as status_of: crate::inline::encodings::genid::GenId;
-        /// A second order attribute, so the recipe can be shown to depend
+        /// A second order attribute, so the mapping can be shown to depend
         /// on both halves and not just the identity.
         "641C46439161BDA3F7EE8ED412AD5DEF" as other_clock: NsTAIInterval;
     }
@@ -983,101 +936,6 @@ mod tests {
         let order = StatedOrder::<_, NsTAIInterval>::new(&facts, status_of.id(), note_at.id())
             .tiebreak_by_id();
         assert_eq!(sole(&order, [*status]), Resolution::Sole(*status));
-    }
-
-    /// Two registers over one dataset share the *law* and are told apart by
-    /// its arguments. The arguments live on the collection descriptor as
-    /// ordinary tribles, so the descriptor's handle separates them while the
-    /// recipe id stays a readable name for what kind of register this is.
-    ///
-    /// This replaces an earlier design in which the pair of attributes was
-    /// hashed into the recipe id itself. That made the digest the only carrier
-    /// of the pair: nothing stored them, so no reader could recover which
-    /// attributes a register was over.
-    #[test]
-    fn registers_share_a_law_and_differ_by_their_parameters() {
-        use crate::collection::descriptor;
-        use crate::collection::records::{
-            collection_authority, collection_name, collection_recipe, collection_representation,
-            KIND_COLLECTION_DESCRIPTOR,
-        };
-        // The law is one minted name, identical for every stated-order register.
-        assert_eq!(
-            StatedOrder::<TribleSet, NsTAIInterval>::recipe(),
-            STATED_ORDER_RECIPE_V1
-        );
-
-        let team = ed25519_dalek::SigningKey::from_bytes(&[19; 32]).verifying_key();
-        let representation = *ufoid();
-        fn describe(
-            team: ed25519_dalek::VerifyingKey,
-            representation: Id,
-            identity: Id,
-            order: Id,
-        ) -> Fragment {
-            let representation: Inline<GenId> = representation.to_inline();
-            let identity: Inline<GenId> = identity.to_inline();
-            let order: Inline<GenId> = order.to_inline();
-            crate::macros::entity! { _ @
-                crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-                collection_name: "register".to_owned(),
-                collection_authority: team,
-                collection_representation: representation,
-                collection_recipe*: <StatedOrderV1 as crate::metadata::MetaDescribe>::describe(),
-                register_identity: identity,
-                register_orders: order,
-            }
-        }
-
-        let notes = describe(team, representation, note_of.id(), note_at.id());
-        let statuses = describe(team, representation, status_of.id(), note_at.id());
-        assert_ne!(
-            descriptor::identity_for_tests(&notes),
-            descriptor::identity_for_tests(&statuses),
-            "two registers over the same order attribute must be two collections"
-        );
-        // Swapping the order attribute is as much a different register as
-        // swapping the identity.
-        assert_ne!(
-            descriptor::identity_for_tests(&notes),
-            descriptor::identity_for_tests(&describe(
-                team,
-                representation,
-                note_of.id(),
-                other_clock.id()
-            ))
-        );
-        // And it is a function of the pair, not of the call.
-        assert_eq!(
-            descriptor::identity_for_tests(&notes),
-            descriptor::identity_for_tests(&describe(
-                team,
-                representation,
-                note_of.id(),
-                note_at.id()
-            ))
-        );
-        // The law itself is shared, not per-register.
-        assert_eq!(
-            descriptor::recipe(notes.facts()).unwrap(),
-            descriptor::recipe(statuses.facts()).unwrap()
-        );
-
-        // The point of the change: the arguments are recoverable from the
-        // descriptor. A reader holding only the pile can say what this
-        // register is over.
-        assert_eq!(
-            descriptor::argument(notes.facts(), register_identity.id()),
-            Ok(Some(
-                <Id as crate::inline::IntoInline<GenId>>::to_inline(note_of.id()).raw
-            )),
-        );
-        assert_eq!(
-            descriptor::argument(notes.facts(), register_orders.id()),
-            Ok(Some(
-                <Id as crate::inline::IntoInline<GenId>>::to_inline(note_at.id()).raw
-            )),
-        );
     }
 
     #[test]

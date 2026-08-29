@@ -648,7 +648,6 @@ mod tests {
         let descriptor = named_for_tests(
             &format!("tagged-{tag}"),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
-            Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),
         );
         CollectionRecord::Merge(CollectionMerge::new(
             identity_for_tests(&descriptor),

@@ -17,15 +17,15 @@ use std::error::Error;
 use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
+use crate::blob::encodings::succinctarchive::SuccinctArchiveRank9IndexBlob;
 use crate::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
-    UnionArchive,
+    OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, UnionArchive,
 };
 use crate::collection::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
-use crate::collection::records::collection_authority;
 use crate::collection::simplearchive_union;
 use crate::collection::CoverAdvanceError;
 use crate::trible::Fragment;
@@ -33,25 +33,21 @@ use crate::trible::Fragment;
 // particular one.
 #[cfg(test)]
 use crate::collection::reach;
-use crate::collection::records::{
-    collection_recipe, collection_representation, collection_source, KIND_COLLECTION_DESCRIPTOR,
-};
 #[cfg(test)]
-use crate::collection::CollectionLattice;
+use crate::collection::CollectionEncoding;
 use crate::collection::{
-    CollectionHandle, CollectionHomomorphism, CollectionLatticeError, CollectionStore,
-    CoverAttachment, FactCover, TryFromCover,
+    CollectionHandle, CollectionMapping, CollectionOperationError, CollectionStore,
+    CoverAttachment, FactCover, MappingEvidenceStore, TryFromCover,
 };
-use crate::metadata::MetaDescribe;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
 use super::rank9_fiber::Rank9Fiber;
 
-impl TryFromCover<super::SuccinctArchiveUnion> for UnionArchive<OrderedUniverse> {
+impl TryFromCover<super::SuccinctArchiveBlob> for UnionArchive<OrderedUniverse> {
     type Error = super::Rank9FiberError;
 
     fn try_from_cover(
-        attachment: CoverAttachment<super::SuccinctArchiveUnion>,
+        attachment: CoverAttachment<super::SuccinctArchiveBlob>,
     ) -> Result<Self, Self::Error> {
         let mut segments = Vec::with_capacity(attachment.len().max(1));
         for (handle, raw) in attachment.into_members() {
@@ -135,8 +131,9 @@ impl From<super::Rank9FiberError> for SuccinctArchiveCollectionError {
 ///
 /// The opaque source cover is the operation's value boundary. Returned query
 /// sources preserve the deterministic resident physical cover as Succinct shards.
-/// Persisted Rank9 `DERIVE` records are optional one-to-one fibers over that
-/// cover: they add no authority, retention, target merges, or shard selection.
+/// Persisted Rank9 mapping evidence is an optional one-to-one accelerator over
+/// that cover: it adds no authority, retention, target lattice, or shard
+/// selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccinctArchiveCollection {
     name: String,
@@ -149,8 +146,9 @@ pub struct SuccinctArchiveCollection {
 /// Exact work performed by one successful [`SuccinctArchiveView::ensure`].
 ///
 /// The cover fields make continuation reuse explicit. The derivation counters
-/// report actual source-to-target maps made while materializing this
-/// observation; validation and join belong to the typed lattices themselves.
+/// report actual source-to-target mapping operations made while materializing
+/// this observation; validation and join belong to the typed encodings
+/// themselves.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SuccinctArchiveViewWork {
     /// Distinct payload members represented after the call.
@@ -177,12 +175,12 @@ impl SuccinctArchiveViewWork {
 }
 
 struct MeasuredSuccinctHomomorphism {
-    inner: super::SimpleArchiveToSuccinctArchive,
+    inner: super::SimpleToSuccinctMapping,
     work: Cell<SuccinctArchiveViewWork>,
 }
 
 impl MeasuredSuccinctHomomorphism {
-    fn new(inner: super::SimpleArchiveToSuccinctArchive, work: SuccinctArchiveViewWork) -> Self {
+    fn new(inner: super::SimpleToSuccinctMapping, work: SuccinctArchiveViewWork) -> Self {
         Self {
             inner,
             work: Cell::new(work),
@@ -196,12 +194,10 @@ impl MeasuredSuccinctHomomorphism {
     }
 }
 
-impl CollectionHomomorphism<simplearchive_union::SimpleArchiveUnion, super::SuccinctArchiveUnion>
-    for MeasuredSuccinctHomomorphism
-{
-    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+impl CollectionMapping<SimpleArchive, super::SuccinctArchiveBlob> for MeasuredSuccinctHomomorphism {
+    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         Ok(Self::new(
-            super::SimpleArchiveToSuccinctArchive::bind(source, target)?,
+            super::SimpleToSuccinctMapping::bind(source, target)?,
             SuccinctArchiveViewWork::default(),
         ))
     }
@@ -209,7 +205,7 @@ impl CollectionHomomorphism<simplearchive_union::SimpleArchiveUnion, super::Succ
     fn map(
         &self,
         source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, CollectionLatticeError> {
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, CollectionOperationError> {
         self.bump(|work| {
             work.derive += 1;
             work.input_bytes += source.bytes.len() as u64;
@@ -275,7 +271,7 @@ impl SuccinctArchiveView {
         current: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore + MappingEvidenceStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         if self.cover.as_ref() == Some(current) {
@@ -341,17 +337,17 @@ impl SuccinctArchiveView {
         SuccinctArchiveCollectionError,
     >
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore + MappingEvidenceStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let source = self.collection.source_descriptor();
         let target = self.collection.descriptor();
-        let inner = super::SimpleArchiveToSuccinctArchive::bind(&source, &target)
+        let inner = super::SimpleToSuccinctMapping::bind(&source, &target)
             .map_err(|error| ExactDerivedCollectionError::Resolution(error.to_string()))?;
         let measured = MeasuredSuccinctHomomorphism::new(inner, work);
-        let kernel = ExactDerivedCollection::with_homomorphism(source, target, measured)?;
+        let kernel = ExactDerivedCollection::with_mapping(source, target, measured)?;
         let target_cover = kernel.ensure_exact(store, cover)?;
-        let work = kernel.homomorphism().work.get();
+        let work = kernel.mapping().work.get();
         let archive = if target_cover.is_empty() {
             self.collection.empty_archive()?
         } else {
@@ -378,7 +374,8 @@ impl SuccinctArchiveCollection {
     /// are stated separately rather than derived from one another.
     /// `source_authority` and `authority` are independent mandatory descriptor
     /// facts: the former must exactly match the root cover, while the latter
-    /// governs the raw Succinct and Rank9 derived family.
+    /// governs the raw Succinct collection. Rank9 cache evidence is unsigned
+    /// and carries no authority of its own.
     pub fn new(
         name: impl Into<String>,
         source_authority: VerifyingKey,
@@ -445,32 +442,6 @@ impl SuccinctArchiveCollection {
         crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts()).get_handle()
     }
 
-    /// Identity of the Rank9 fiber over that cover.
-    pub fn rank9_collection(&self) -> CollectionHandle {
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.rank9_descriptor().into_facts())
-            .get_handle()
-    }
-
-    /// ABI-, format-, and builder-version-qualified lifted Rank9 collection.
-    ///
-    /// Its representation remains the detached Rank9 blob encoding. The recipe
-    /// fixes every canonical-byte determinant for this build, making the map
-    /// from one raw member to one Rank9 member functional. Algebraically the
-    /// target join is `i(a) join i(b) = i(a join b)`; this facade never produces
-    /// target `MERGE` records because constructing that join needs the raw
-    /// dependencies named by the sidecars.
-    pub fn rank9_descriptor(&self) -> Fragment {
-        let representation = <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id();
-        let recipe = super::current_rank9_lifted_union_recipe();
-        crate::prelude::entity! {
-            crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_source: self.collection(),
-            collection_authority: self.authority,
-            collection_representation: representation,
-            collection_recipe: recipe,
-        }
-    }
-
     /// Attach the exact resident Succinct cover for `source_cover` without writing.
     ///
     /// An empty cover returns one authority-free process-local empty shard;
@@ -481,7 +452,7 @@ impl SuccinctArchiveCollection {
         source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore,
+        S: BlobStore + CollectionStore + MappingEvidenceStore,
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.attach_exact(store, source_cover)?;
@@ -494,10 +465,10 @@ impl SuccinctArchiveCollection {
     /// Ensure missing raw derivations and attach the exact sharded cover.
     ///
     /// Completion writes raw outputs first, then ensures one persisted Rank9
-    /// sidecar and ordinary `DERIVE` for each member of that fixed selected raw
-    /// cover. Every newly claimed endpoint precedes the first new Rank9
-    /// equation, no flush occurs, and the exact expected pairs are strictly
-    /// re-read through a fresh reader.
+    /// sidecar and native mapping-evidence equation for each member of that
+    /// fixed selected raw cover. Rank9 remains an accelerator rather than a
+    /// collection, and the exact expected pairs are strictly re-read through a
+    /// fresh reader.
     /// An empty cover has the same local-only behavior as [`Self::attach_exact`].
     pub fn ensure_exact<S>(
         &self,
@@ -505,7 +476,7 @@ impl SuccinctArchiveCollection {
         source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore + MappingEvidenceStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;
@@ -527,7 +498,7 @@ impl SuccinctArchiveCollection {
         source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore + MappingEvidenceStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
         let kernel = self.kernel()?;
@@ -542,9 +513,9 @@ impl SuccinctArchiveCollection {
         &self,
     ) -> Result<
         ExactDerivedCollection<
-            simplearchive_union::SimpleArchiveUnion,
-            super::SuccinctArchiveUnion,
-            super::SimpleArchiveToSuccinctArchive,
+            SimpleArchive,
+            super::SuccinctArchiveBlob,
+            super::SimpleToSuccinctMapping,
         >,
         ExactDerivedCollectionError,
     > {
@@ -552,7 +523,7 @@ impl SuccinctArchiveCollection {
     }
 
     fn rank9_fiber(&self) -> Rank9Fiber {
-        Rank9Fiber::new(self.descriptor(), self.rank9_descriptor())
+        Rank9Fiber::new(self.descriptor())
     }
 
     fn empty_archive(
@@ -579,8 +550,6 @@ mod tests {
     use std::any::TypeId;
     use std::collections::BTreeSet;
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     use ed25519_dalek::SigningKey;
 
@@ -588,15 +557,15 @@ mod tests {
     use crate::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
     use crate::collection::descriptor::{self, identity_for_tests};
     use crate::collection::{
-        collection_physical_cover, discover_collection_records, resolve_collection_semantics,
-        Collection, CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
-        CollectionMerge, CollectionRecord,
+        Collection, CollectionCommit, CollectionData, CollectionDerive, CollectionMerge,
+        CollectionRecord, MappingEvidence, MappingEvidenceSelector,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
+    use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::{Pile, WantRewritePolicy};
-    use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, RetentionRoots};
+    use crate::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, RetentionRoots};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
     /// The one team every collection in these tests belongs to.
@@ -639,10 +608,6 @@ mod tests {
             descriptor::authority(collection.descriptor().facts()),
             Ok(target_authority)
         );
-        assert_eq!(
-            descriptor::authority(collection.rank9_descriptor().facts()),
-            Ok(target_authority)
-        );
     }
 
     #[test]
@@ -650,11 +615,11 @@ mod tests {
         let collection = test_collection("first");
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0u8; 1]));
         assert!(matches!(
-            super::super::SuccinctArchiveUnion::validate_member(
+            super::super::SuccinctArchiveBlob::validate_member(
                 &collection.descriptor(),
                 &malformed,
             ),
-            Err(CollectionLatticeError::Fatal(_))
+            Err(CollectionOperationError::Fatal(_))
         ));
     }
 
@@ -742,6 +707,31 @@ mod tests {
         }
     }
 
+    impl MappingEvidenceStore for CollectionOnly {
+        type EvidenceError = <MemoryRepo as MappingEvidenceStore>::EvidenceError;
+        type InsertError = <MemoryRepo as MappingEvidenceStore>::InsertError;
+        type EvidenceIter<'a>
+            = <MemoryRepo as MappingEvidenceStore>::EvidenceIter<'a>
+        where
+            Self: 'a;
+
+        fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+            self.repo.evidence()
+        }
+
+        fn select_evidence(
+            &mut self,
+            selectors: &BTreeSet<MappingEvidenceSelector>,
+        ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
+            self.repo.select_evidence(selectors)
+        }
+
+        fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
+            self.inserts += 1;
+            self.repo.insert_evidence(evidence)
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct InjectedFailure(&'static str);
 
@@ -753,110 +743,37 @@ mod tests {
 
     impl std::error::Error for InjectedFailure {}
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct FaultReader {
-        inner: <MemoryRepo as BlobStore>::Reader,
-        metadata_failure: Option<CollectionData>,
-    }
-
-    impl BlobStoreMeta for FaultReader {
-        type MetaError = InjectedFailure;
-
-        fn metadata<E>(
-            &self,
-            handle: Inline<Handle<E>>,
-        ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
-        where
-            E: BlobEncoding + 'static,
-            Handle<E>: InlineEncoding,
-        {
-            if self.metadata_failure.map(|data| data.raw) == Some(handle.raw) {
-                return Err(InjectedFailure("injected metadata failure"));
-            }
-            self.inner.metadata(handle).map_err(|never| match never {})
-        }
-    }
-
-    impl BlobStoreGet for FaultReader {
-        type GetError<E: std::error::Error + Send + Sync + 'static> =
-            <<MemoryRepo as BlobStore>::Reader as BlobStoreGet>::GetError<E>;
-
-        fn get<T, E>(
-            &self,
-            handle: Inline<Handle<E>>,
-        ) -> Result<T, Self::GetError<<T as TryFromBlob<E>>::Error>>
-        where
-            E: BlobEncoding + 'static,
-            T: TryFromBlob<E>,
-            Handle<E>: InlineEncoding,
-        {
-            self.inner.get(handle)
-        }
-    }
-
-    impl BlobStoreList for FaultReader {
-        type Iter<'a>
-            = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Iter<'a>
-        where
-            Self: 'a;
-        type Err = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Err;
-
-        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
-            self.inner.blobs()
-        }
-
-        fn contains_blob<E>(&self, handle: Inline<Handle<E>>) -> Result<bool, Self::Err>
-        where
-            E: BlobEncoding + 'static,
-            Handle<E>: InlineEncoding,
-        {
-            self.inner.contains_blob(handle)
-        }
-    }
-
     struct FaultStore {
         repo: MemoryRepo,
-        rank9_target: crate::collection::CollectionHandle,
-        rank9_metadata_failure: Option<CollectionData>,
+        rank9_mapping: crate::collection::MappingHandle,
         fail_rank9_put: bool,
         drop_rank9_put: bool,
         replace_rank9_on_put: Option<CollectionData>,
-        drop_rank9_claim: bool,
-        fail_rank9_claim_at: Option<usize>,
-        rank9_claim_attempts: usize,
+        drop_rank9_evidence: bool,
+        fail_rank9_evidence_at: Option<usize>,
+        rank9_evidence_attempts: usize,
         puts: usize,
         inserts: usize,
     }
 
     impl FaultStore {
-        fn new(repo: MemoryRepo, rank9_target: crate::collection::CollectionHandle) -> Self {
+        fn new(repo: MemoryRepo, rank9_mapping: crate::collection::MappingHandle) -> Self {
             Self {
                 repo,
-                rank9_target,
-                rank9_metadata_failure: None,
+                rank9_mapping,
                 fail_rank9_put: false,
                 drop_rank9_put: false,
                 replace_rank9_on_put: None,
-                drop_rank9_claim: false,
-                fail_rank9_claim_at: None,
-                rank9_claim_attempts: 0,
+                drop_rank9_evidence: false,
+                fail_rank9_evidence_at: None,
+                rank9_evidence_attempts: 0,
                 puts: 0,
                 inserts: 0,
             }
         }
 
-        fn reset_writes(&mut self) {
-            self.puts = 0;
-            self.inserts = 0;
-            self.rank9_claim_attempts = 0;
-        }
-
-        fn writes(&self) -> (usize, usize) {
-            (self.puts, self.inserts)
-        }
-
-        fn is_rank9_claim(&self, record: &CollectionRecord) -> bool {
-            matches!(record, CollectionRecord::Derive(claim) if claim.target() == self.rank9_target)
+        fn is_rank9_evidence(&self, evidence: MappingEvidence) -> bool {
+            evidence.mapping() == self.rank9_mapping
         }
     }
 
@@ -898,14 +815,11 @@ mod tests {
     }
 
     impl BlobStore for FaultStore {
-        type Reader = FaultReader;
+        type Reader = <MemoryRepo as BlobStore>::Reader;
         type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
 
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            Ok(FaultReader {
-                inner: self.repo.reader()?,
-                metadata_failure: self.rank9_metadata_failure,
-            })
+            self.repo.reader()
         }
     }
 
@@ -923,18 +837,46 @@ mod tests {
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.inserts += 1;
-            if self.is_rank9_claim(&record) {
-                self.rank9_claim_attempts += 1;
-                if self.fail_rank9_claim_at == Some(self.rank9_claim_attempts) {
-                    return Err(InjectedFailure("injected Rank9 DERIVE failure"));
+            self.repo
+                .insert(record)
+                .expect("memory record insert is infallible");
+            Ok(())
+        }
+    }
+
+    impl MappingEvidenceStore for FaultStore {
+        type EvidenceError = <MemoryRepo as MappingEvidenceStore>::EvidenceError;
+        type InsertError = InjectedFailure;
+        type EvidenceIter<'a>
+            = <MemoryRepo as MappingEvidenceStore>::EvidenceIter<'a>
+        where
+            Self: 'a;
+
+        fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+            self.repo.evidence()
+        }
+
+        fn select_evidence(
+            &mut self,
+            selectors: &BTreeSet<MappingEvidenceSelector>,
+        ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
+            self.repo.select_evidence(selectors)
+        }
+
+        fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
+            self.inserts += 1;
+            if self.is_rank9_evidence(evidence) {
+                self.rank9_evidence_attempts += 1;
+                if self.fail_rank9_evidence_at == Some(self.rank9_evidence_attempts) {
+                    return Err(InjectedFailure("injected Rank9 evidence failure"));
                 }
-                if self.drop_rank9_claim {
+                if self.drop_rank9_evidence {
                     return Ok(());
                 }
             }
             self.repo
-                .insert(record)
-                .expect("memory record insert is infallible");
+                .insert_evidence(evidence)
+                .expect("memory evidence insert is infallible");
             Ok(())
         }
     }
@@ -946,179 +888,6 @@ mod tests {
         where
             I: IntoIterator<Item = crate::repo::ArtifactHandle>,
         {
-            self.repo.offer_all(handles)
-        }
-
-        fn offers_snapshot(
-            &mut self,
-        ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
-            self.repo.offers_snapshot()
-        }
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum FiberWriteEvent {
-        Put(TypeId, CollectionData),
-        Insert(CollectionRecord),
-    }
-
-    struct GuardReader {
-        inner: <MemoryRepo as BlobStore>::Reader,
-        live: Arc<AtomicUsize>,
-    }
-
-    impl Clone for GuardReader {
-        fn clone(&self) -> Self {
-            self.live.fetch_add(1, Ordering::SeqCst);
-            Self {
-                inner: self.inner.clone(),
-                live: Arc::clone(&self.live),
-            }
-        }
-    }
-
-    impl Drop for GuardReader {
-        fn drop(&mut self) {
-            self.live.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    impl PartialEq for GuardReader {
-        fn eq(&self, other: &Self) -> bool {
-            self.inner == other.inner && Arc::ptr_eq(&self.live, &other.live)
-        }
-    }
-
-    impl Eq for GuardReader {}
-
-    impl BlobStoreMeta for GuardReader {
-        type MetaError = <<MemoryRepo as BlobStore>::Reader as BlobStoreMeta>::MetaError;
-
-        fn metadata<E>(
-            &self,
-            handle: Inline<Handle<E>>,
-        ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
-        where
-            E: BlobEncoding + 'static,
-            Handle<E>: InlineEncoding,
-        {
-            self.inner.metadata(handle)
-        }
-    }
-
-    impl BlobStoreGet for GuardReader {
-        type GetError<E: std::error::Error + Send + Sync + 'static> =
-            <<MemoryRepo as BlobStore>::Reader as BlobStoreGet>::GetError<E>;
-
-        fn get<T, E>(
-            &self,
-            handle: Inline<Handle<E>>,
-        ) -> Result<T, Self::GetError<<T as TryFromBlob<E>>::Error>>
-        where
-            E: BlobEncoding + 'static,
-            T: TryFromBlob<E>,
-            Handle<E>: InlineEncoding,
-        {
-            self.inner.get(handle)
-        }
-    }
-
-    impl BlobStoreList for GuardReader {
-        type Iter<'a>
-            = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Iter<'a>
-        where
-            Self: 'a;
-        type Err = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Err;
-
-        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
-            self.inner.blobs()
-        }
-
-        fn contains_blob<E>(&self, handle: Inline<Handle<E>>) -> Result<bool, Self::Err>
-        where
-            E: BlobEncoding + 'static,
-            Handle<E>: InlineEncoding,
-        {
-            self.inner.contains_blob(handle)
-        }
-    }
-
-    struct GuardStore {
-        repo: MemoryRepo,
-        live: Arc<AtomicUsize>,
-        events: Vec<FiberWriteEvent>,
-    }
-
-    impl GuardStore {
-        fn assert_no_reader(&self) {
-            assert_eq!(
-                self.live.load(Ordering::SeqCst),
-                0,
-                "Rank9 publication wrote while an old reader was live",
-            );
-        }
-    }
-
-    impl BlobStorePut for GuardStore {
-        type PutError = <MemoryRepo as BlobStorePut>::PutError;
-
-        fn put<E, T>(&mut self, item: T) -> Result<Inline<Handle<E>>, Self::PutError>
-        where
-            E: BlobEncoding + 'static,
-            T: IntoBlob<E>,
-            Handle<E>: InlineEncoding,
-        {
-            self.assert_no_reader();
-            let blob = item.to_blob();
-            self.events.push(FiberWriteEvent::Put(
-                TypeId::of::<E>(),
-                Handle::<E>::to_hash(blob.get_handle()),
-            ));
-            self.repo.put(blob)
-        }
-    }
-
-    impl BlobStore for GuardStore {
-        type Reader = GuardReader;
-        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
-
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            let inner = self.repo.reader()?;
-            self.live.fetch_add(1, Ordering::SeqCst);
-            Ok(GuardReader {
-                inner,
-                live: Arc::clone(&self.live),
-            })
-        }
-    }
-
-    impl CollectionStore for GuardStore {
-        type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
-        type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-        type RecordIter<'a>
-            = <MemoryRepo as CollectionStore>::RecordIter<'a>
-        where
-            Self: 'a;
-
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            self.repo.records()
-        }
-
-        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-            self.assert_no_reader();
-            self.events.push(FiberWriteEvent::Insert(record));
-            self.repo.insert(record)
-        }
-    }
-
-    impl crate::repo::ArtifactOfferStore for GuardStore {
-        type OfferError = <MemoryRepo as crate::repo::ArtifactOfferStore>::OfferError;
-
-        fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
-        where
-            I: IntoIterator<Item = crate::repo::ArtifactHandle>,
-        {
-            self.assert_no_reader();
             self.repo.offer_all(handles)
         }
 
@@ -1164,6 +933,20 @@ mod tests {
 
         fn insert(&mut self, _: CollectionRecord) -> Result<(), Self::InsertError> {
             panic!("empty Succinct cover inserted a record")
+        }
+    }
+
+    impl MappingEvidenceStore for PanicStore {
+        type EvidenceError = Infallible;
+        type InsertError = Infallible;
+        type EvidenceIter<'a> = std::vec::IntoIter<Result<MappingEvidence, Infallible>>;
+
+        fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+            panic!("empty Succinct cover scanned mapping evidence")
+        }
+
+        fn insert_evidence(&mut self, _: MappingEvidence) -> Result<(), Self::InsertError> {
+            panic!("empty Succinct cover inserted mapping evidence")
         }
     }
 
@@ -1246,9 +1029,7 @@ mod tests {
         commits: &[CollectionCommit],
     ) -> FactCover {
         FactCover::from_members(
-            Collection::<simplearchive_union::SimpleArchiveUnion>::from_handle(
-                collection.source_collection(),
-            ),
+            Collection::<SimpleArchive>::from_handle(collection.source_collection()),
             commits
                 .iter()
                 .map(|commit| Handle::<SimpleArchive>::from_hash(commit.data())),
@@ -1257,9 +1038,7 @@ mod tests {
 
     fn empty_source_cover(collection: &SuccinctArchiveCollection) -> FactCover {
         FactCover::from_members(
-            Collection::<simplearchive_union::SimpleArchiveUnion>::from_handle(
-                collection.source_collection(),
-            ),
+            Collection::<SimpleArchive>::from_handle(collection.source_collection()),
             [],
         )
     }
@@ -1273,35 +1052,35 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .filter_map(|record| match record {
-                CollectionRecord::Derive(claim) if claim.target() == collection.collection() => {
-                    Some(claim)
-                }
-                _ => None,
-            })
-            .collect();
-        claims.sort_by_key(CollectionDerive::mapping);
-        claims
-    }
-
-    fn rank9_derives<S: CollectionStore>(
-        store: &mut S,
-        collection: &SuccinctArchiveCollection,
-    ) -> Vec<CollectionDerive> {
-        let mut claims: Vec<_> = store
-            .records()
-            .unwrap()
-            .map(Result::unwrap)
-            .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.rank9_collection() =>
+                    if claim.collection() == collection.collection() =>
                 {
                     Some(claim)
                 }
                 _ => None,
             })
             .collect();
-        claims.sort_by_key(CollectionDerive::mapping);
+        claims.sort_by_key(|claim| (claim.input(), claim.output()));
         claims
+    }
+
+    fn rank9_mapping_handle() -> crate::collection::MappingHandle {
+        super::super::rank9_mapping_fragment()
+            .facts()
+            .clone()
+            .to_blob()
+            .get_handle()
+    }
+
+    fn rank9_evidence<S>(store: &mut S) -> Vec<MappingEvidence>
+    where
+        S: MappingEvidenceStore,
+        S::EvidenceError: fmt::Debug,
+    {
+        let selectors = BTreeSet::from([MappingEvidenceSelector::Mapping(rank9_mapping_handle())]);
+        let mut evidence = store.select_evidence(&selectors).unwrap();
+        evidence.sort_by_key(|evidence| (evidence.input(), evidence.output()));
+        evidence
     }
 
     fn remove_blob<E>(store: &mut CollectionOnly, handle: Inline<Handle<E>>)
@@ -1375,205 +1154,49 @@ mod tests {
     }
 
     #[test]
-    fn rank9_descriptor_is_abi_profile_separated_and_wrong_recipe_is_inert() {
-        let collection = test_collection("c7");
-        let current = collection.rank9_descriptor();
-        let recipes = [
-            super::super::RANK9_LIFTED_UNION_RECIPE_V1_32_LE,
-            super::super::RANK9_LIFTED_UNION_RECIPE_V1_32_BE,
-            super::super::RANK9_LIFTED_UNION_RECIPE_V1_64_LE,
-            super::super::RANK9_LIFTED_UNION_RECIPE_V1_64_BE,
+    fn rank9_mapping_is_abi_profile_separated() {
+        let algorithms = [
+            super::super::RANK9_MAPPING_V1_32_LE,
+            super::super::RANK9_MAPPING_V1_32_BE,
+            super::super::RANK9_MAPPING_V1_64_LE,
+            super::super::RANK9_MAPPING_V1_64_BE,
         ];
-        assert_eq!(
-            descriptor::representation(&current).unwrap(),
-            <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
-        );
-        assert_eq!(
-            descriptor::recipe(&current).unwrap(),
-            super::super::current_rank9_lifted_union_recipe(),
-        );
-        #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
-        assert_eq!(descriptor::recipe(&current), recipes[0]);
-        #[cfg(all(target_pointer_width = "32", target_endian = "big"))]
-        assert_eq!(descriptor::recipe(&current), recipes[1]);
-        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-        assert_eq!(descriptor::recipe(&current).unwrap(), recipes[2]);
-        #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-        assert_eq!(descriptor::recipe(&current), recipes[3]);
-        assert_ne!(
-            descriptor::recipe(&current),
-            descriptor::recipe(&collection.descriptor())
-        );
-        assert_eq!(recipes.into_iter().collect::<BTreeSet<_>>().len(), 4);
-        let descriptors: BTreeSet<_> = recipes
-            .into_iter()
-            .map(|recipe| {
-                identity_for_tests(&crate::prelude::entity! {
-                    crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-                    collection_source: collection.collection(),
-                    collection_representation:
-                        <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
-                    collection_recipe: recipe,
-                })
-            })
-            .collect();
-        assert_eq!(descriptors.len(), 4);
-
-        let (collection, mut store, commit, expected, raw) = one_raw_fixture(8);
-        let sidecar = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
-        store
-            .put::<SuccinctArchiveRank9IndexBlob, _>(sidecar.clone())
-            .unwrap();
-        let wrong_recipe = recipes
-            .into_iter()
-            .find(|recipe| *recipe != descriptor::recipe(&current).unwrap())
-            .unwrap();
-        let wrong_target = crate::prelude::entity! {
-            crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_source: collection.collection(),
-            collection_representation: <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
-            collection_recipe: wrong_recipe,
+        let mapping_for = |algorithm| {
+            let description = if algorithm == super::super::RANK9_MAPPING_V1_32_LE {
+                super::super::Rank9MappingV1_32Le::describe()
+            } else if algorithm == super::super::RANK9_MAPPING_V1_32_BE {
+                super::super::Rank9MappingV1_32Be::describe()
+            } else if algorithm == super::super::RANK9_MAPPING_V1_64_LE {
+                super::super::Rank9MappingV1_64Le::describe()
+            } else {
+                super::super::Rank9MappingV1_64Be::describe()
+            };
+            crate::prelude::entity! {
+                crate::metadata::tag: crate::collection::records::KIND_COLLECTION_MAPPING,
+                crate::collection::records::mapping_algorithm*: description,
+            }
         };
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                identity_for_tests(&wrong_target),
-                data(&raw),
-                data(&sidecar),
-            )))
-            .unwrap();
-        store.reset_writes();
-
-        let attached = collection
-            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
-            .unwrap();
-        assert_eq!(attached_facts(&attached), expected);
-        assert_eq!(store.writes(), (0, 0));
-        assert!(rank9_derives(&mut store, &collection).is_empty());
+        let current_algorithm = super::super::current_rank9_mapping_algorithm();
+        let current = super::super::rank9_mapping_fragment();
+        assert_eq!(current.facts(), mapping_for(current_algorithm).facts());
+        assert_eq!(algorithms.into_iter().collect::<BTreeSet<_>>().len(), 4);
+        assert_eq!(
+            algorithms
+                .into_iter()
+                .map(|algorithm| IntoBlob::<SimpleArchive>::to_blob(
+                    mapping_for(algorithm).into_facts(),
+                )
+                .get_handle())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4,
+        );
     }
 
     #[test]
-    fn real_lifted_rank9_derives_close_the_commuting_square() {
-        let name = "c9".to_owned();
-        let collection = SuccinctArchiveCollection::new(
-            name.clone(),
-            test_team(),
-            reach::private(),
-            test_team(),
-            reach::private(),
-        );
-        let a = facts([(1, 3)]).to_blob();
-        let b = facts([(2, 4)]).to_blob();
-        let raw_a = super::super::derive_element(&a).unwrap();
-        let raw_b = super::super::derive_element(&b).unwrap();
-        let raw_ab = super::super::join(&raw_a, &raw_b).unwrap();
-        let rank_a = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw_a.clone()).unwrap();
-        let rank_b = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw_b.clone()).unwrap();
-        let rank_ab =
-            SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw_ab.clone()).unwrap();
-        for (raw, rank9) in [
-            (raw_a.clone(), rank_a.clone()),
-            (raw_b.clone(), rank_b.clone()),
-            (raw_ab.clone(), rank_ab.clone()),
-        ] {
-            SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, rank9).unwrap();
-        }
-
-        let metadata = TribleSet::new().to_blob().get_handle();
-        let first = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[1; 32]),
-            collection.source_collection(),
-            data(&a),
-            metadata,
-        );
-        let second = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[2; 32]),
-            collection.source_collection(),
-            data(&b),
-            metadata,
-        );
-        let mut store = MemoryRepo::default();
-        for record in [
-            CollectionRecord::Commit(first),
-            CollectionRecord::Commit(second),
-            CollectionRecord::Derive(CollectionDerive::new(
-                collection.collection(),
-                data(&a),
-                data(&raw_a),
-            )),
-            CollectionRecord::Derive(CollectionDerive::new(
-                collection.collection(),
-                data(&b),
-                data(&raw_b),
-            )),
-            CollectionRecord::Merge(CollectionMerge::new(
-                collection.collection(),
-                data(&raw_a),
-                data(&raw_b),
-                data(&raw_ab),
-            )),
-            CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_collection(),
-                data(&raw_a),
-                data(&rank_a),
-            )),
-            CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_collection(),
-                data(&raw_b),
-                data(&rank_b),
-            )),
-            CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_collection(),
-                data(&raw_ab),
-                data(&rank_ab),
-            )),
-        ] {
-            store.insert(record).unwrap();
-        }
-        assert!(!store.records().unwrap().map(Result::unwrap).any(|record| {
-            matches!(record, CollectionRecord::Merge(claim)
-                if claim.collection() == collection.rank9_collection())
-        }));
-        let discovered = discover_collection_records(&mut store).unwrap();
-        let authorized = BTreeSet::from([first.id(), second.id()]);
-        let resolution = resolve_collection_semantics::<(), Infallible, _>(
-            &discovered,
-            // Two hops: the raw SuccinctArchive collection derives from
-            // the SimpleArchive one, and the Rank9 sidecar from the raw.
-            &std::collections::BTreeMap::from([
-                (collection.collection(), collection.source_collection()),
-                (collection.rank9_collection(), collection.collection()),
-            ]),
-            &authorized,
-            |_| Ok(CollectionClaimValidation::Accepted),
-        )
-        .unwrap();
-        let semantics = resolution.semantics();
-        let rank9_collection = collection.rank9_collection();
-        let expected_frontier = BTreeSet::from([data(&rank_ab)]);
-        assert_eq!(
-            semantics.frontier(rank9_collection),
-            Some(&expected_frontier)
-        );
-        assert_eq!(
-            semantics.supporting_commit_ids(rank9_collection, data(&rank_ab)),
-            authorized,
-        );
-        let resident = BTreeSet::from([data(&rank_a), data(&rank_b), data(&rank_ab)]);
-        let physical = collection_physical_cover(semantics, rank9_collection, &resident);
-        assert_eq!(physical.cover, expected_frontier);
-        assert!(physical.missing.is_empty());
-    }
-
-    #[test]
-    fn ensured_fibers_are_one_to_one_deterministic_exact_and_zero_write_when_complete() {
-        let name = "c10".to_owned();
-        let collection = SuccinctArchiveCollection::new(
-            name.clone(),
-            test_team(),
-            reach::private(),
-            test_team(),
-            reach::private(),
-        );
+    fn ensured_rank9_evidence_is_exact_complete_and_zero_write_when_resident() {
+        let name = "rank9-evidence".to_owned();
+        let collection = test_collection(&name);
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
@@ -1587,24 +1210,34 @@ mod tests {
         let ensured = collection
             .ensure_exact(&mut store, &source_cover(&collection, &[second, first]))
             .unwrap();
-        assert_eq!(ensured.segment_count(), 2);
+        assert_eq!(
+            ensured.segment_count(),
+            2,
+            "the raw cover shape is preserved"
+        );
         assert_eq!(attached_facts(&ensured), left_facts + right_facts);
-        let raw_claims = raw_derives(&mut store, &collection);
-        let rank9_claims = rank9_derives(&mut store, &collection);
-        let raw_outputs: BTreeSet<_> = raw_claims.iter().map(|claim| claim.mapping().1).collect();
-        let rank9_inputs: BTreeSet<_> =
-            rank9_claims.iter().map(|claim| claim.mapping().0).collect();
-        assert_eq!(raw_outputs, rank9_inputs);
-        assert_eq!(rank9_claims.len(), 2);
+        let evidence = rank9_evidence(&mut store);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(
+            raw_derives(&mut store, &collection)
+                .iter()
+                .map(CollectionDerive::output)
+                .collect::<BTreeSet<_>>(),
+            evidence
+                .iter()
+                .map(|evidence| evidence.input())
+                .collect::<BTreeSet<_>>(),
+        );
+
         let reader = store.reader().unwrap();
-        for claim in &rank9_claims {
-            let (raw_data, rank9_data) = claim.mapping();
+        for evidence in &evidence {
+            assert_eq!(evidence.mapping(), rank9_mapping_handle());
             let raw: Blob<SuccinctArchiveBlob> = reader
-                .get(Handle::<SuccinctArchiveBlob>::from_hash(raw_data))
+                .get(Handle::<SuccinctArchiveBlob>::from_hash(evidence.input()))
                 .unwrap();
             let rank9: Blob<SuccinctArchiveRank9IndexBlob> = reader
                 .get(Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(
-                    rank9_data,
+                    evidence.output(),
                 ))
                 .unwrap();
             assert_eq!(
@@ -1612,6 +1245,17 @@ mod tests {
                 raw.get_handle(),
             );
             SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, rank9).unwrap();
+        }
+        let mapping = super::super::rank9_mapping_fragment();
+        let mapping_blob: Blob<SimpleArchive> = reader.get(rank9_mapping_handle()).unwrap();
+        assert_eq!(
+            TribleSet::try_from_blob(mapping_blob).unwrap(),
+            mapping.facts().clone(),
+        );
+        let mut attachments = mapping.blobs().clone();
+        for (handle, expected) in attachments.reader().unwrap() {
+            let actual: Blob<UnknownBlob> = reader.get(handle).unwrap();
+            assert_eq!(actual.bytes, expected.bytes);
         }
         drop(reader);
 
@@ -1621,95 +1265,21 @@ mod tests {
             .unwrap();
         assert_eq!(attached.segment_count(), 2);
         assert_eq!(store.writes(), (0, 0));
-        store.reset_writes();
-        let repeated = collection
+        collection
             .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
-        assert_eq!(repeated.segment_count(), 2);
         assert_eq!(store.writes(), (0, 0));
-        assert_eq!(rank9_derives(&mut store, &collection), rank9_claims);
+        assert_eq!(rank9_evidence(&mut store), evidence);
     }
 
     #[test]
-    fn absent_corrupt_and_source_mismatched_rank9_evidence_falls_back_without_writes() {
-        let (collection, mut store, commit, expected, raw) = one_raw_fixture(11);
-        let attached = collection
-            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
-            .unwrap();
-        assert_eq!(attached_facts(&attached), expected);
-        assert_eq!(store.writes(), (0, 0));
-
-        let malformed = Blob::<SuccinctArchiveRank9IndexBlob>::new(Bytes::from(b"bad".to_vec()));
-        store
-            .put::<SuccinctArchiveRank9IndexBlob, _>(malformed.clone())
-            .unwrap();
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_collection(),
-                data(&raw),
-                data(&malformed),
-            )))
-            .unwrap();
-        store.reset_writes();
-        let attached = collection
-            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
-            .unwrap();
-        assert_eq!(attached_facts(&attached), expected);
-        assert_eq!(store.writes(), (0, 0));
-
-        let (other_collection, mut other_store, other_commit, other_expected, other_raw) =
-            one_raw_fixture(12);
-        let foreign_source = facts([(9, 7)]).to_blob();
-        let foreign_raw = super::super::derive_element(&foreign_source).unwrap();
-        assert_ne!(data(&other_raw), data(&foreign_raw));
-        let foreign = SuccinctArchive::<OrderedUniverse>::build_rank9_index(foreign_raw).unwrap();
-        other_store
-            .put::<SuccinctArchiveRank9IndexBlob, _>(foreign.clone())
-            .unwrap();
-        other_store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                other_collection.rank9_collection(),
-                data(&other_raw),
-                data(&foreign),
-            )))
-            .unwrap();
-        other_store.reset_writes();
-        let attached = other_collection
-            .attach_exact(
-                &mut other_store,
-                &source_cover(&other_collection, &[other_commit]),
-            )
-            .unwrap();
-        assert_eq!(attached_facts(&attached), other_expected);
-        assert_eq!(other_store.writes(), (0, 0));
-    }
-
-    #[test]
-    fn optional_rank9_metadata_failure_falls_back_to_transient_attachment() {
-        let (collection, mut base, commit, expected, raw) = one_raw_fixture(31);
-        let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
-        base.put::<SuccinctArchiveRank9IndexBlob, _>(canonical.clone())
-            .unwrap();
-        base.insert(CollectionRecord::Derive(CollectionDerive::new(
-            collection.rank9_collection(),
-            data(&raw),
-            data(&canonical),
-        )))
-        .unwrap();
-        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
-        store.rank9_metadata_failure = Some(data(&canonical));
-
-        let attached = collection
-            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
-            .unwrap();
-
-        assert_eq!(attached_facts(&attached), expected);
-        assert_eq!(store.writes(), (0, 0));
-    }
-
-    #[test]
-    fn ambiguous_evidence_is_attach_inert_but_canonical_ensure_is_zero_write() {
+    fn bad_or_ambiguous_evidence_is_a_cache_miss_and_ensure_repairs() {
         let (collection, mut store, commit, expected, raw) = one_raw_fixture(13);
+        crate::collection::descriptor::put_closure(
+            &mut store,
+            &super::super::rank9_mapping_fragment(),
+        )
+        .unwrap();
         let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
         let bogus = Blob::<SuccinctArchiveRank9IndexBlob>::new(Bytes::from(b"bogus".to_vec()));
         for sidecar in [&canonical, &bogus] {
@@ -1717,11 +1287,11 @@ mod tests {
                 .put::<SuccinctArchiveRank9IndexBlob, _>(sidecar.clone())
                 .unwrap();
             store
-                .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.rank9_collection(),
+                .insert_evidence(MappingEvidence::new(
+                    rank9_mapping_handle(),
                     data(&raw),
                     data(sidecar),
-                )))
+                ))
                 .unwrap();
         }
         store.reset_writes();
@@ -1730,90 +1300,28 @@ mod tests {
             .attach_exact(&mut store, &source_cover(&collection, &[commit]))
             .unwrap();
         assert_eq!(attached_facts(&attached), expected);
-        assert_eq!(store.writes(), (0, 0));
-        store.reset_writes();
+        assert_eq!(store.writes(), (0, 0), "attach never repairs cache state");
+
         let ensured = collection
             .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
             .unwrap();
         assert_eq!(attached_facts(&ensured), expected);
-        assert_eq!(store.writes(), (0, 0));
-        assert_eq!(rank9_derives(&mut store, &collection).len(), 2);
-    }
+        assert!(store.writes().0 > 0 && store.writes().1 > 0);
+        assert_eq!(rank9_evidence(&mut store).len(), 2);
 
-    #[test]
-    fn missing_canonical_endpoint_is_repaired_with_idempotent_derive_reinsertion() {
-        let (collection, mut store, commit, expected, raw) = one_raw_fixture(14);
-        let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
-        store
-            .put::<SuccinctArchiveRank9IndexBlob, _>(canonical.clone())
-            .unwrap();
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_collection(),
-                data(&raw),
-                data(&canonical),
-            )))
-            .unwrap();
-        remove_blob(&mut store, canonical.get_handle());
+        let sidecar = canonical.get_handle();
+        remove_blob(&mut store, sidecar);
         store.reset_writes();
-
-        let attached = collection
-            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
-            .unwrap();
-        assert_eq!(attached_facts(&attached), expected);
-        assert_eq!(store.writes(), (0, 0));
-        let repaired = collection
+        collection
             .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
             .unwrap();
-        assert_eq!(attached_facts(&repaired), expected);
-        assert_eq!(store.writes(), (3, 1));
-        assert_eq!(rank9_derives(&mut store, &collection).len(), 1);
-        let reader = store.reader().unwrap();
-        assert!(reader.contains_blob(canonical.get_handle()).unwrap());
+        assert!(store.reader().unwrap().contains_blob(sidecar).unwrap());
     }
 
     #[test]
-    fn corrupt_canonical_endpoint_is_repaired_with_idempotent_derive_reinsertion() {
-        let (collection, mut base, commit, expected, raw) = one_raw_fixture(21);
-        let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
-        base.put::<SuccinctArchiveRank9IndexBlob, _>(canonical.clone())
-            .unwrap();
-        base.insert(CollectionRecord::Derive(CollectionDerive::new(
-            collection.rank9_collection(),
-            data(&raw),
-            data(&canonical),
-        )))
-        .unwrap();
-        remove_blob(&mut base, canonical.get_handle());
-        base.repo.blobs.insert(Blob::with_handle(
-            Bytes::from(b"corrupt canonical sidecar".to_vec()),
-            canonical.get_handle(),
-        ));
-        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
-        store.replace_rank9_on_put = Some(data(&canonical));
-
-        let attached = collection
-            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
-            .unwrap();
-        assert_eq!(attached_facts(&attached), expected);
-        assert_eq!(store.writes(), (0, 0));
-        let repaired = collection
-            .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
-            .unwrap();
-        assert_eq!(attached_facts(&repaired), expected);
-        assert_eq!(store.writes(), (3, 1));
-        assert_eq!(rank9_derives(&mut store, &collection).len(), 1);
-        let reader = store.reader().unwrap();
-        let resident: Blob<SuccinctArchiveRank9IndexBlob> =
-            reader.get(canonical.get_handle()).unwrap();
-        assert_eq!(data(&resident), data(&canonical));
-        SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, resident).unwrap();
-    }
-
-    #[test]
-    fn endpoint_failure_precedes_and_prevents_rank9_derive_publication() {
+    fn failed_sidecar_put_never_publishes_mapping_evidence() {
         let (collection, base, commit, _, _) = one_raw_fixture(15);
-        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
+        let mut store = FaultStore::new(base.repo, rank9_mapping_handle());
         store.fail_rank9_put = true;
         assert!(matches!(
             collection.ensure_exact(&mut store, &source_cover(&collection, &[commit])),
@@ -1821,180 +1329,13 @@ mod tests {
                 super::super::Rank9FiberError::Storage { .. }
             ))
         ));
-        assert!(rank9_derives(&mut store, &collection).is_empty());
+        assert!(rank9_evidence(&mut store).is_empty());
     }
 
     #[test]
-    fn fresh_verification_rejects_dropped_sidecar_and_dropped_claim() {
-        let (collection, base, commit, _, _) = one_raw_fixture(16);
-        let mut dropped_sidecar = FaultStore::new(base.repo, collection.rank9_collection());
-        dropped_sidecar.drop_rank9_put = true;
-        assert!(matches!(
-            collection.ensure_exact(&mut dropped_sidecar, &source_cover(&collection, &[commit]),),
-            Err(SuccinctArchiveCollectionError::Rank9(
-                super::super::Rank9FiberError::IncompletePublication { .. }
-            ))
-        ));
-        assert_eq!(rank9_derives(&mut dropped_sidecar, &collection).len(), 1);
-
-        let (collection, base, commit, _, raw) = one_raw_fixture(17);
-        let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw).unwrap();
-        let mut dropped_claim = FaultStore::new(base.repo, collection.rank9_collection());
-        dropped_claim.drop_rank9_claim = true;
-        assert!(matches!(
-            collection.ensure_exact(&mut dropped_claim, &source_cover(&collection, &[commit]),),
-            Err(SuccinctArchiveCollectionError::Rank9(
-                super::super::Rank9FiberError::IncompletePublication { .. }
-            ))
-        ));
-        assert!(rank9_derives(&mut dropped_claim, &collection).is_empty());
-        let reader = dropped_claim.reader().unwrap();
-        assert!(reader.contains_blob(canonical.get_handle()).unwrap());
-    }
-
-    #[test]
-    fn partial_claim_publication_retries_to_exactly_one_claim_per_member() {
-        let name = "c18".to_owned();
-        let collection = SuccinctArchiveCollection::new(
-            name.clone(),
-            test_team(),
-            reach::private(),
-            test_team(),
-            reach::private(),
-        );
-        let mut base = CollectionOnly::default();
-        let left = put_data(&mut base, &facts([(1, 3)]));
-        let right = put_data(&mut base, &facts([(2, 4)]));
-        let first = signed_commit(&mut base, &name, 1, &left);
-        let second = signed_commit(&mut base, &name, 2, &right);
-        publish(&mut base, first);
-        publish(&mut base, second);
-        let cover = collection
-            .kernel()
-            .unwrap()
-            .ensure_exact(&mut base, &source_cover(&collection, &[first, second]))
-            .unwrap();
-        assert_eq!(cover.len(), 2);
-        drop(cover);
-        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
-        store.fail_rank9_claim_at = Some(2);
-
-        assert!(matches!(
-            collection.ensure_exact(&mut store, &source_cover(&collection, &[first, second]),),
-            Err(SuccinctArchiveCollectionError::Rank9(
-                super::super::Rank9FiberError::Storage { .. }
-            ))
-        ));
-        assert_eq!(rank9_derives(&mut store, &collection).len(), 1);
-        store.fail_rank9_claim_at = None;
-        store.reset_writes();
-        let retried = collection
-            .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
-            .unwrap();
-        assert_eq!(retried.segment_count(), 2);
-        assert_eq!(rank9_derives(&mut store, &collection).len(), 2);
-        assert_eq!(store.inserts, 1);
-        store.reset_writes();
-        collection
-            .ensure_exact(&mut store, &source_cover(&collection, &[second, first]))
-            .unwrap();
-        assert_eq!(store.writes(), (0, 0));
-    }
-
-    #[test]
-    fn rank9_publication_drops_readers_and_orders_all_endpoints_before_claims() {
-        let name = "c19".to_owned();
-        let collection = SuccinctArchiveCollection::new(
-            name.clone(),
-            test_team(),
-            reach::private(),
-            test_team(),
-            reach::private(),
-        );
-        let mut base = CollectionOnly::default();
-        let left = put_data(&mut base, &facts([(1, 3)]));
-        let right = put_data(&mut base, &facts([(2, 4)]));
-        let first = signed_commit(&mut base, &name, 1, &left);
-        let second = signed_commit(&mut base, &name, 2, &right);
-        publish(&mut base, first);
-        publish(&mut base, second);
-        let cover = collection
-            .kernel()
-            .unwrap()
-            .ensure_exact(&mut base, &source_cover(&collection, &[first, second]))
-            .unwrap();
-        assert_eq!(cover.len(), 2);
-        drop(cover);
-        let live = Arc::new(AtomicUsize::new(0));
-        let mut store = GuardStore {
-            repo: base.repo,
-            live: Arc::clone(&live),
-            events: Vec::new(),
-        };
-
-        let attached = collection
-            .ensure_exact(&mut store, &source_cover(&collection, &[second, first]))
-            .unwrap();
-        assert_eq!(attached.segment_count(), 2);
-        assert_eq!(live.load(Ordering::SeqCst), 0);
-        let first_claim = store
-            .events
-            .iter()
-            .position(|event| {
-                matches!(event, FiberWriteEvent::Insert(CollectionRecord::Derive(claim))
-                    if claim.target() == collection.rank9_collection())
-            })
-            .expect("fiber publication emits a Rank9 DERIVE");
-        let sidecar_puts: Vec<_> = store
-            .events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                FiberWriteEvent::Put(encoding, data)
-                    if *encoding == TypeId::of::<SuccinctArchiveRank9IndexBlob>() =>
-                {
-                    Some((index, *data))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(sidecar_puts.len(), 2);
-        assert!(sidecar_puts.iter().all(|(index, _)| *index < first_claim));
-        let raw_descriptor = Handle::<SimpleArchive>::to_hash(collection.collection());
-        let rank9_descriptor = Handle::<SimpleArchive>::to_hash(collection.rank9_collection());
-        for descriptor in [raw_descriptor, rank9_descriptor] {
-            assert!(store.events[..first_claim].iter().any(
-                |event| matches!(event, FiberWriteEvent::Put(_, data) if *data == descriptor)
-            ));
-        }
-        assert!(!store.events[first_claim..]
-            .iter()
-            .any(|event| matches!(event, FiberWriteEvent::Put(_, _))));
-        let claim_inputs: Vec<_> = store.events[first_claim..]
-            .iter()
-            .filter_map(|event| match event {
-                FiberWriteEvent::Insert(CollectionRecord::Derive(claim))
-                    if claim.target() == collection.rank9_collection() =>
-                {
-                    Some(claim.mapping().0)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(claim_inputs.len(), 2);
-        assert!(claim_inputs.windows(2).all(|pair| pair[0] < pair[1]));
-    }
-
-    #[test]
-    fn compaction_builds_only_the_selected_raw_cover_fiber_and_no_rank9_merge() {
-        let name = "c20".to_owned();
-        let collection = SuccinctArchiveCollection::new(
-            name.clone(),
-            test_team(),
-            reach::private(),
-            test_team(),
-            reach::private(),
-        );
+    fn compaction_builds_evidence_only_for_the_selected_raw_cover() {
+        let name = "rank9-compaction".to_owned();
+        let collection = test_collection(&name);
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &facts([(1, 3)]));
         let right = put_data(&mut store, &facts([(2, 4)]));
@@ -2002,21 +1343,20 @@ mod tests {
         let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
-        let cover = collection
+        let raw_cover = collection
             .kernel()
             .unwrap()
             .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
-        assert_eq!(cover.len(), 2);
-        drop(cover);
-        assert!(rank9_derives(&mut store, &collection).is_empty());
+        assert_eq!(raw_cover.len(), 2);
+        assert!(rank9_evidence(&mut store).is_empty());
 
         let compacted = collection
             .compact_exact(&mut store, &source_cover(&collection, &[second, first]))
             .unwrap();
         assert_eq!(compacted.segment_count(), 1);
-        let rank9_claims = rank9_derives(&mut store, &collection);
-        assert_eq!(rank9_claims.len(), 1);
+        let evidence = rank9_evidence(&mut store);
+        assert_eq!(evidence.len(), 1);
         let merged_raw = records(&mut store)
             .into_iter()
             .find_map(|record| match record {
@@ -2026,11 +1366,7 @@ mod tests {
                 _ => None,
             })
             .expect("compaction publishes one selected raw merge");
-        assert_eq!(rank9_claims[0].mapping().0, merged_raw);
-        assert!(!records(&mut store).into_iter().any(|record| {
-            matches!(record, CollectionRecord::Merge(claim)
-                if claim.collection() == collection.rank9_collection())
-        }));
+        assert_eq!(evidence[0].input(), merged_raw);
     }
 
     #[test]
@@ -2229,7 +1565,7 @@ mod tests {
         publish(&mut base, first);
         publish(&mut base, second);
 
-        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
+        let mut store = FaultStore::new(base.repo, rank9_mapping_handle());
         let mut maintained = collection.exact_view();
         let first_cover = source_cover(&collection, &[first]);
         let full_cover = source_cover(&collection, &[first, second]);
@@ -2278,8 +1614,10 @@ mod tests {
         let mappings: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
-                CollectionRecord::Derive(claim) if claim.target() == collection.collection() => {
-                    Some(claim.mapping())
+                CollectionRecord::Derive(claim)
+                    if claim.collection() == collection.collection() =>
+                {
+                    Some((claim.input(), claim.output()))
                 }
                 _ => None,
             })
@@ -2321,18 +1659,22 @@ mod tests {
             .unwrap();
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
         assert_eq!(attached.segment_count(), 2);
-        let derived_outputs: Vec<_> = records(&mut store)
+        let mut derived_outputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.collection()
-                        || claim.target() == collection.rank9_collection() =>
+                    if claim.collection() == collection.collection() =>
                 {
-                    Some(claim.mapping().1.transmute())
+                    Some(claim.output().transmute())
                 }
                 _ => None,
             })
             .collect();
+        derived_outputs.extend(
+            rank9_evidence(&mut store)
+                .into_iter()
+                .map(|evidence| evidence.output().transmute()),
+        );
         let offers = store.offers_snapshot().unwrap();
         assert!(!derived_outputs.is_empty());
         assert!(derived_outputs
@@ -2405,7 +1747,7 @@ mod tests {
             .into_iter()
             .filter(|record| {
                 matches!(record, CollectionRecord::Derive(claim)
-                if claim.target() == collection.collection())
+                if claim.collection() == collection.collection())
             })
             .count();
         assert_eq!(derives, 1);
@@ -2452,8 +1794,10 @@ mod tests {
         let inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
-                CollectionRecord::Derive(claim) if claim.target() == collection.collection() => {
-                    Some(claim.mapping().0)
+                CollectionRecord::Derive(claim)
+                    if claim.collection() == collection.collection() =>
+                {
+                    Some(claim.input())
                 }
                 _ => None,
             })
@@ -2672,8 +2016,10 @@ mod tests {
         let derive_inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
-                CollectionRecord::Derive(claim) if claim.target() == collection.collection() => {
-                    Some(claim.mapping().0)
+                CollectionRecord::Derive(claim)
+                    if claim.collection() == collection.collection() =>
+                {
+                    Some(claim.input())
                 }
                 _ => None,
             })
@@ -2761,13 +2107,13 @@ mod tests {
             .ensure_exact(&mut source_store, &source_cover(&collection, &commits))
             .unwrap();
         assert_eq!(ensured.segment_count(), 1);
-        let rank9_claims = rank9_derives(&mut source_store, &collection);
-        assert_eq!(rank9_claims.len(), 1);
-        assert_eq!(rank9_claims[0].mapping().0, data(&succinct_abc));
+        let expected_evidence = rank9_evidence(&mut source_store);
+        assert_eq!(expected_evidence.len(), 1);
+        assert_eq!(expected_evidence[0].input(), data(&succinct_abc));
         let rank9_handle =
-            Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(rank9_claims[0].mapping().1);
-        let rank9_descriptor =
-            IntoBlob::<SimpleArchive>::to_blob(collection.rank9_descriptor().into_facts());
+            Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(expected_evidence[0].output());
+        let rank9_mapping =
+            IntoBlob::<SimpleArchive>::to_blob(super::super::rank9_mapping_fragment().into_facts());
         source_store.flush().unwrap();
 
         let mut roots = RetentionRoots::new();
@@ -2794,13 +2140,10 @@ mod tests {
         assert!(!reader
             .contains_blob(target_descriptor.get_handle())
             .unwrap());
-        assert!(!reader.contains_blob(rank9_descriptor.get_handle()).unwrap());
+        assert!(!reader.contains_blob(rank9_mapping.get_handle()).unwrap());
         assert!(!reader.contains_blob(rank9_handle).unwrap());
         drop(reader);
-        assert_eq!(
-            rank9_derives(&mut retained_store, &collection),
-            rank9_claims
-        );
+        assert_eq!(rank9_evidence(&mut retained_store), expected_evidence);
 
         let before = std::fs::metadata(&retained_path).unwrap().len();
         let attached = collection
@@ -2815,10 +2158,7 @@ mod tests {
         assert_eq!(ensured.segment_count(), 1);
         let repaired = std::fs::metadata(&retained_path).unwrap().len();
         assert!(repaired > before);
-        assert_eq!(
-            rank9_derives(&mut retained_store, &collection),
-            rank9_claims
-        );
+        assert_eq!(rank9_evidence(&mut retained_store), expected_evidence);
         let repeated = collection
             .ensure_exact(&mut retained_store, &source_cover(&collection, &commits))
             .unwrap();
@@ -2829,10 +2169,10 @@ mod tests {
         assert!(!reader.contains_blob(ab.get_handle()).unwrap());
         assert!(!reader.contains_blob(succinct_ab.get_handle()).unwrap());
         assert!(!reader.contains_blob(succinct_c.get_handle()).unwrap());
-        assert!(reader
+        assert!(!reader
             .contains_blob(target_descriptor.get_handle())
             .unwrap());
-        assert!(reader.contains_blob(rank9_descriptor.get_handle()).unwrap());
+        assert!(reader.contains_blob(rank9_mapping.get_handle()).unwrap());
         assert!(reader.contains_blob(rank9_handle).unwrap());
         drop(reader);
         retained_store.close().unwrap();
@@ -2912,8 +2252,10 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .filter_map(|record| match record {
-                CollectionRecord::Derive(claim) if claim.target() == collection.collection() => {
-                    Some(claim.mapping().0)
+                CollectionRecord::Derive(claim)
+                    if claim.collection() == collection.collection() =>
+                {
+                    Some(claim.input())
                 }
                 _ => None,
             })

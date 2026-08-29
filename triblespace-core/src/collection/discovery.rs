@@ -17,11 +17,11 @@ use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::Inline;
 
 use super::{
-    CollectionCommit, CollectionDerive, CollectionHandle, CollectionLattice, CollectionMerge,
+    CollectionCommit, CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMerge,
     CollectionRecord, CollectionRecordSelector, CollectionStore, CommitVerificationError, Cover,
 };
 
-/// Failure to use one opaque payload cover with an exact collection recipe.
+/// Failure to use one opaque payload cover with its exact collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExactCoverError {
     /// The cover belongs to another collection descriptor.
@@ -166,8 +166,8 @@ where
 /// semantic view. Commits enter the accepted result only after strict
 /// self-signature verification. This establishes authorship, not
 /// authorization; callers still choose which signing keys may introduce
-/// membership roots. Representation-specific `MERGE` and `DERIVE` validation
-/// likewise remains the resolver callback's responsibility.
+/// membership roots. Encoding-specific `MERGE` validation and mapping-specific
+/// `DERIVE` validation likewise remain the resolver callback's responsibility.
 pub fn discover_collection_records<S>(
     store: &mut S,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
@@ -199,9 +199,9 @@ where
 /// Discover the source/target equations that may realize one exact source
 /// cover.
 ///
-/// The cover already crossed admission or validated collection algebra when
-/// it was constructed. Replaying it therefore needs equations, not another
-/// signature scan over provenance claims for the same payloads.
+/// The cover already crossed admission or validated collection operations
+/// when it was constructed. Replaying it therefore needs equations, not
+/// another signature scan over provenance claims for the same payloads.
 pub(crate) fn discover_collection_records_for_derived_cover<S, L>(
     store: &mut S,
     cover: &Cover<L>,
@@ -209,7 +209,7 @@ pub(crate) fn discover_collection_records_for_derived_cover<S, L>(
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
-    L: CollectionLattice,
+    L: CollectionEncoding,
 {
     let source = cover.collection().handle();
     let mut selectors = BTreeSet::new();
@@ -229,7 +229,7 @@ pub(crate) fn discover_collection_equations_for_cover<S, L>(
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
-    L: CollectionLattice,
+    L: CollectionEncoding,
 {
     let selectors = BTreeSet::from([CollectionRecordSelector::MergeCollection(
         cover.collection().handle(),
@@ -245,7 +245,7 @@ pub(crate) fn discover_collection_claims_for_cover<S, L>(
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
-    L: CollectionLattice,
+    L: CollectionEncoding,
 {
     let selectors: BTreeSet<_> = cover
         .data_members()
@@ -261,7 +261,7 @@ fn discover_collection_records_for_cover_selectors<S, L>(
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
-    L: CollectionLattice,
+    L: CollectionEncoding,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
@@ -499,7 +499,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::collection::simplearchive_union::SimpleArchiveUnion;
     use crate::collection::{empty_metadata_handle, Collection, CollectionData, FactCover};
     use crate::inline::encodings::hash::Handle;
     use crate::inline::Inline;
@@ -547,7 +546,7 @@ mod tests {
         Inline::new([byte; 32])
     }
 
-    fn collection(byte: u8) -> Collection<SimpleArchiveUnion> {
+    fn collection(byte: u8) -> Collection<SimpleArchive> {
         Collection::from_handle(Inline::new([byte; 32]))
     }
 

@@ -226,8 +226,8 @@ fn plan_artifact_offers(
             }
             CollectionRecord::Derive(derive) => {
                 plan.derives += 1;
-                let (_, output) = derive.mapping();
-                direct_roots.insert(derive.target().transmute());
+                let (_, output) = (derive.input(), derive.output());
+                direct_roots.insert(derive.collection().transmute());
                 direct_roots.insert(Handle::<UnknownBlob>::from_hash(output));
             }
         }

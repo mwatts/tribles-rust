@@ -5,9 +5,8 @@ use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::collection::simplearchive_union::{self, SimpleArchiveUnion};
-use triblespace_core::collection::succinctarchive_union::{self, SuccinctArchiveUnion};
 use triblespace_core::collection::{reach, CollectionStoreExt};
+use triblespace_core::collection::{simplearchive_union, succinctarchive_union};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Encodes;
 use triblespace_core::metadata::Describe;
@@ -33,7 +32,7 @@ fn generic_simplearchive_collection_round_trips_typed_views() {
     let expected_member = expected.clone().to_blob().get_handle();
     let mut store = MemoryRepo::default();
 
-    let collection = store.collection::<SimpleArchiveUnion>(descriptor).unwrap();
+    let collection = store.collection::<SimpleArchive>(descriptor).unwrap();
     assert_eq!(collection.handle(), descriptor_handle);
 
     let commit = store
@@ -82,14 +81,14 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     let mut store = MemoryRepo::default();
 
     let source = store
-        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
+        .collection::<SimpleArchive>(simplearchive_union::descriptor(
             "typed-api-source",
             authority.verifying_key(),
             reach::private(),
         ))
         .unwrap();
     let target = store
-        .collection::<SuccinctArchiveUnion>(succinctarchive_union::descriptor(
+        .collection::<SuccinctArchiveBlob>(succinctarchive_union::descriptor(
             source.handle(),
             authority.verifying_key(),
             reach::private(),

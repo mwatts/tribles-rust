@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let handle = pile.put::<SuccinctBM25Blob, _>(&idx)?;
             // Persist the handle as a typed ordinary trible under a
             // well-known anchor id (see below), or derive it through an
-            // explicit collection recipe.
+            // explicit derived-collection mapping.
             persist_index_handle(&mut pile, handle)?;
         }
         Cmd::Query { text } => {
@@ -176,7 +176,7 @@ by design. The `Refresh` command:
 2. Builds a fresh `SuccinctBM25Index`.
 3. `put`s the blob — the returned handle is the index's hash.
 4. Publishes the typed handle as an ordinary trible, or records the derivation
-   through an explicit collection recipe.
+   through an explicit derived-collection mapping.
 
 If nothing changed between refreshes, step 3 returns the same
 handle because content-addressing: the pile's blob-dedup layer
@@ -257,7 +257,7 @@ on every call.
 ## Open questions for faculty authors
 
 - **Where does the handle live?** Direct callers may publish a typed handle as
-  an ordinary trible. Maintained projections should use a collection recipe so
+  an ordinary trible. Maintained projections should use a derived collection so
   source authority, exact-cover evidence, and artifact lifetime remain explicit
   rather than ambient branch-head state.
 

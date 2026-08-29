@@ -36,7 +36,7 @@
 //!
 //! Within one exact source cover, a state which asserts both halves may assert
 //! at most one well-formed identity and at most one order value under the
-//! descriptor's two attributes. Repeating the same fact is harmless set
+//! mapping's two attributes. Repeating the same fact is harmless set
 //! idempotence. Distinct values are retained by the union law and rejected when
 //! attachment discovers that the state has become a complete coordinate.
 //! Multiplicity on an incomplete state is harmless open-world data: it remains
@@ -73,13 +73,13 @@ use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use super::records::{
-    collection_authority, collection_reach, collection_recipe, collection_representation,
-    collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_mapping, collection_reach, collection_representation,
+    collection_source, mapping_algorithm, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    KIND_COLLECTION_MAPPING,
 };
 use super::{
-    simplearchive_union::{self, SimpleArchiveUnion},
-    CollectionHomomorphism, CollectionLattice, CollectionLatticeError, CollectionStore,
-    CoverAttachment, FactCover, TryFromCover,
+    simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
+    CollectionStore, CoverAttachment, FactCover, TryFromCover,
 };
 
 const ID_LEN: usize = 16;
@@ -363,54 +363,57 @@ pub fn descriptor(
     authority: VerifyingKey,
     reach: Fragment,
 ) -> Fragment {
-    let identity = crate::inline::IntoInline::to_inline(identity);
-    let orders = crate::inline::IntoInline::to_inline(orders);
     entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
         collection_authority: authority,
         collection_representation*: <LwwRegisterBlob as MetaDescribe>::describe(),
-        collection_recipe*: <LwwRegisterV1 as MetaDescribe>::describe(),
-        register_identity: identity,
-        register_orders: orders,
+        collection_mapping*: mapping_fragment(identity, orders),
         collection_reach*: reach,
     }
 }
 
-/// Canonical maintained LWW-register law, version 1.
+/// Canonical stated-register coordinate projection algorithm, version 1.
 ///
-/// Minted with `trible genid` on 2026-08-28. The two attribute arguments live
-/// on the descriptor rather than being folded into this law's identity.
-pub const LWW_REGISTER_RECIPE_V1: Id = id_hex!("A0EC3C0B80D0CB91012E547311C5CF2A");
+/// Minted with `trible genid` on 2026-08-29.
+pub const REGISTER_COORDINATES_MAPPING_V1: Id = id_hex!("A013A3EE9E5F439BF77F6393058B5BD8");
 
-/// The maintained LWW-register law as a describable type.
-pub struct LwwRegisterV1;
+/// Self-description of the canonical register-coordinate projection.
+pub struct RegisterCoordinatesMappingV1;
 
-impl MetaDescribe for LwwRegisterV1 {
+impl MetaDescribe for RegisterCoordinatesMappingV1 {
     fn describe() -> Fragment {
-        let id: Id = LWW_REGISTER_RECIPE_V1;
+        let id: Id = REGISTER_COORDINATES_MAPPING_V1;
         entity! { ExclusiveId::force_ref(&id) @
-            metadata::name: "lww-register-v1",
-            metadata::description: "Exact maintained projection for a stated last-write-wins register. Source union projects to the union of two row sets keyed first by state: identity and raw order. The sets stay separate so facts split across source commits join correctly. At attachment, unique complete coordinates choose the greatest (order, state-id) per identity; incomplete states remain incomparable. Takes descriptor arguments `register_identity` and `register_orders`.",
-            metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+            metadata::name: "register-coordinates-v1",
+            metadata::description: "Canonical projection from a SimpleArchive fact set to the two sorted row sets needed by a stated last-write-wins register: state-to-identity and state-to-raw-order. The mapping preserves set union even when the two facts are split across source members; its concrete mapping entity carries `register_identity` and `register_orders`.",
+            metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The canonical LWW projection representation under its union law.
-pub struct LwwRegisterUnion;
+fn mapping_fragment(identity: Id, orders: Id) -> Fragment {
+    let identity = crate::inline::IntoInline::to_inline(identity);
+    let orders = crate::inline::IntoInline::to_inline(orders);
+    entity! { _ @
+        metadata::tag: KIND_COLLECTION_MAPPING,
+        mapping_algorithm*: <RegisterCoordinatesMappingV1 as MetaDescribe>::describe(),
+        register_identity: identity,
+        register_orders: orders,
+    }
+}
 
-fn register_attributes(descriptor: &Fragment) -> Result<(Id, Id), CollectionLatticeError> {
+fn register_attributes(descriptor: &Fragment) -> Result<(Id, Id), CollectionOperationError> {
     let parse = |attribute, name| {
-        let raw = crate::collection::descriptor::argument(descriptor.facts(), attribute)
-            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?
+        let raw = crate::collection::descriptor::mapping_argument(descriptor.facts(), attribute)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
             .ok_or_else(|| {
-                CollectionLatticeError::Fatal(format!("LWW register descriptor is missing {name}"))
+                CollectionOperationError::Fatal(format!("LWW register mapping is missing {name}"))
             })?;
         Inline::<GenId>::new(raw)
             .try_from_inline::<Id>()
             .map_err(|source| {
-                CollectionLatticeError::Fatal(format!(
+                CollectionOperationError::Fatal(format!(
                     "LWW register descriptor has an invalid {name}: {source:?}"
                 ))
             })
@@ -421,57 +424,51 @@ fn register_attributes(descriptor: &Fragment) -> Result<(Id, Id), CollectionLatt
     ))
 }
 
-impl CollectionLattice for LwwRegisterUnion {
-    type Encoding = LwwRegisterBlob;
-    type Recipe = LwwRegisterV1;
-
-    fn validate_arguments(descriptor: &Fragment) -> Result<(), CollectionLatticeError> {
-        let source = crate::collection::descriptor::source(descriptor.facts())
-            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?;
-        if source.is_none() {
-            return Err(CollectionLatticeError::Fatal(
-                "LWW register descriptor is missing its source collection".to_owned(),
-            ));
-        }
-
-        register_attributes(descriptor).map(|_| ())
-    }
-
+impl CollectionEncoding for LwwRegisterBlob {
     fn validate_member(
         _descriptor: &Fragment,
-        member: &Blob<Self::Encoding>,
-    ) -> Result<(), CollectionLatticeError> {
-        validate_element(member).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+        member: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
+        validate_element(member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn merge_members(
+    fn join_members(
         _descriptor: &Fragment,
-        low: &Blob<Self::Encoding>,
-        high: &Blob<Self::Encoding>,
-    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
-        join(low, high).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
+        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
 /// Bound projection from facts to the two canonical LWW coordinate halves.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ProjectLwwRegister {
+pub struct RegisterCoordinatesMapping {
     identity: Id,
     orders: Id,
 }
 
-impl CollectionHomomorphism<SimpleArchiveUnion, LwwRegisterUnion> for ProjectLwwRegister {
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+impl CollectionMapping<SimpleArchive, LwwRegisterBlob> for RegisterCoordinatesMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         let (identity, orders) = register_attributes(target)?;
+        let actual = crate::collection::descriptor::mapping_algorithm(target.facts())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        if actual != Some(REGISTER_COORDINATES_MAPPING_V1) {
+            return Err(CollectionOperationError::Fatal(format!(
+                "LWW register mapping algorithm {:?} does not match register-coordinates algorithm {REGISTER_COORDINATES_MAPPING_V1:X}",
+                actual.map(|id| format!("{id:X}")),
+            )));
+        }
         Ok(Self { identity, orders })
     }
 
     fn map(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<LwwRegisterBlob>, CollectionLatticeError> {
+    ) -> Result<Blob<LwwRegisterBlob>, CollectionOperationError> {
         derive_element(source, self.identity, self.orders)
-            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -574,10 +571,10 @@ impl RegisterOrder for LwwIndex {
     }
 }
 
-impl TryFromCover<LwwRegisterUnion> for LwwIndex {
+impl TryFromCover<LwwRegisterBlob> for LwwIndex {
     type Error = LwwRegisterError;
 
-    fn try_from_cover(attachment: CoverAttachment<LwwRegisterUnion>) -> Result<Self, Self::Error> {
+    fn try_from_cover(attachment: CoverAttachment<LwwRegisterBlob>) -> Result<Self, Self::Error> {
         let mut combined = Projection::default();
         for segment in attachment.into_blobs() {
             combined = combined.union(decode_projection(&segment)?);
@@ -715,7 +712,7 @@ impl LwwRegisterCollection {
     fn kernel(
         &self,
     ) -> Result<
-        ExactDerivedCollection<SimpleArchiveUnion, LwwRegisterUnion, ProjectLwwRegister>,
+        ExactDerivedCollection<SimpleArchive, LwwRegisterBlob, RegisterCoordinatesMapping>,
         ExactDerivedCollectionError,
     > {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
@@ -1012,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_carries_both_register_arguments() {
+    fn descriptor_carries_canonical_register_mapping() {
         use crate::collection::descriptor as descriptor_facts;
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
@@ -1028,7 +1025,7 @@ mod tests {
             reach::private(),
         );
         assert_eq!(
-            descriptor_facts::argument(stated.facts(), register_identity.id()),
+            descriptor_facts::mapping_argument(stated.facts(), register_identity.id()),
             Ok(Some(
                 <Id as crate::inline::IntoInline<crate::inline::encodings::genid::GenId>>::to_inline(
                     state_of.id(),
@@ -1037,7 +1034,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            descriptor_facts::argument(stated.facts(), register_orders.id()),
+            descriptor_facts::mapping_argument(stated.facts(), register_orders.id()),
             Ok(Some(
                 <Id as crate::inline::IntoInline<crate::inline::encodings::genid::GenId>>::to_inline(
                     written_at.id(),
@@ -1054,6 +1051,10 @@ mod tests {
                 key,
                 reach::private(),
             )
+        );
+        assert_eq!(
+            descriptor_facts::mapping_algorithm(stated.facts()),
+            Ok(Some(REGISTER_COORDINATES_MAPPING_V1))
         );
     }
 

@@ -27,7 +27,7 @@ via [anybytes] and [jerky]:
 
 The authoritative schema identities live in each marker type's
 `MetaDescribe` implementation. A format rotation must also rotate any
-persisted typed attribute or collection recipe that routes handles to that
+persisted typed attribute or collection mapping that routes handles to that
 reader; changing the metadata ID does not create a new Rust type or perform a
 runtime check.
 

@@ -3,14 +3,15 @@
 //! A descriptor is an ordinary [`TribleSet`]: the facts of one
 //! [`entity!`](crate::macros::entity), stored as a
 //! [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive)
-//! blob whose handle is the collection identity. There is no wrapper type, so
-//! reading one is an ordinary query over ordinary facts.
+//! blob whose handle is the collection identity. The descriptor names its
+//! encoding directly, and reading one is an ordinary query over ordinary
+//! facts.
 //!
-//! A descriptor may carry attributes this binary has never heard of: they are
-//! arguments to a recipe it does not implement, they travel through untouched,
-//! and classifying them is nobody's business but that recipe's. A root carries
-//! [`collection_name`] while a derived collection carries
-//! [`collection_source`] instead. Both carry exactly one local
+//! A root carries [`collection_name`] while a derived collection carries
+//! [`collection_source`] and one concrete [`collection_mapping`]
+//! instance instead. Mapping parameters hang from that mapping entity, not
+//! from the collection descriptor, so the conversion remains independently
+//! identifiable and queryable. Both kinds carry exactly one local
 //! [`collection_authority`]; authority is never inferred by walking the source
 //! chain. Readers first locate the one tagged descriptor entity, then bind
 //! every field lookup to that exact entity so embedded descriptions cannot
@@ -20,7 +21,10 @@ use ed25519_dalek::VerifyingKey;
 
 use itertools::Itertools;
 
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
+use crate::blob::encodings::UnknownBlob;
+use crate::blob::Blob;
 use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
@@ -28,6 +32,7 @@ use crate::inline::{Inline, InlineEncoding, IntoInline, RawInline};
 use crate::metadata;
 use crate::prelude::{entity, find, pattern};
 use crate::query::TriblePattern;
+use crate::repo::{BlobStore, BlobStorePut};
 use crate::trible::{Fragment, TribleSet};
 
 // Reach arrives here as a builder argument; only the tests name a
@@ -35,20 +40,54 @@ use crate::trible::{Fragment, TribleSet};
 #[cfg(test)]
 use super::reach;
 use super::records::{
-    collection_authority, collection_name, collection_reach, collection_recipe,
-    collection_representation, collection_source, CollectionHandle, RecordDecodeError,
-    KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_mapping, collection_name, collection_reach,
+    collection_representation, collection_source, mapping_algorithm as mapping_algorithm_attribute,
+    CollectionHandle, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
 };
 
-/// Build a root descriptor that names its representation and recipe without
-/// describing them.
+/// Retired `collection_recipe` attribute, minted with `trible genid` on
+/// 2026-08-07. It remains only as a rejection marker: accepting an old recipe
+/// descriptor as a recipe-free encoding descriptor would silently reinterpret
+/// its identity and laws.
+const OBSOLETE_COLLECTION_RECIPE: Id = crate::id::id_hex!("5D338C58D897B969BE1AE0956CCFE301");
+
+/// Store one descriptor archive and every blob carried by its self-contained
+/// Fragment, returning the canonical descriptor handle.
 ///
-/// A collection kind normally writes its own descriptor as a visible
-/// `entity!` beside the recipe that reads it; see
+/// The descriptor identity covers only its fact archive. Names and embedded
+/// self-descriptions may reference separate blobs, so publishing facts alone
+/// would leave a descriptor whose shape validates but whose descriptions
+/// cannot be read. Callers normally pass an [`OfferCapture`](crate::repo::OfferCapture)
+/// so the complete closure is advertised at the following semantic record.
+pub(crate) fn put_closure<S>(
+    store: &mut S,
+    descriptor: &Fragment,
+) -> Result<CollectionHandle, S::PutError>
+where
+    S: BlobStorePut,
+{
+    let mut blobs = descriptor.blobs().clone();
+    let mut embedded: Vec<Blob<UnknownBlob>> = blobs
+        .reader()
+        .expect("MemoryBlobStore::reader is infallible")
+        .into_iter()
+        .map(|(_, blob)| blob)
+        .collect();
+    embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
+    for blob in embedded {
+        store.put::<UnknownBlob, _>(blob)?;
+    }
+    store.put::<SimpleArchive, _>(descriptor.facts().clone())
+}
+
+/// Build a root descriptor that names its encoding without describing it.
+///
+/// A collection encoding normally writes its own descriptor as a visible
+/// `entity!`; see
 /// [`simplearchive_union::descriptor`](crate::collection::simplearchive_union::descriptor),
-/// which additionally embeds both self-descriptions so a stranger holding the
-/// one blob can say what the collection is. This is the bare generic form,
-/// for callers holding only ids.
+/// which additionally embeds the encoding's self-description so a stranger
+/// holding the one blob can say what the collection is. This is the bare
+/// generic form, for callers holding only ids.
 ///
 /// `reach` is a fragment rather than a flag, and it is required rather than
 /// defaulted. Required, because reach used to be a separate signed grant that
@@ -63,7 +102,6 @@ pub fn naming(
     name: &str,
     authority: VerifyingKey,
     representation: Id,
-    recipe: Id,
     reach: Fragment,
 ) -> Fragment {
     entity! {
@@ -71,7 +109,28 @@ pub fn naming(
         collection_name: name.to_owned(),
         collection_authority: authority,
         collection_representation: representation,
-        collection_recipe: recipe,
+        collection_reach*: reach,
+    }
+}
+
+/// Build a derived descriptor around one concrete mapping instance.
+///
+/// The mapping Fragment is spread into the same descriptor archive. Its root
+/// is linked from the descriptor and all algorithm descriptions, parameters,
+/// and attachments therefore travel with the collection identity.
+pub fn deriving(
+    source: CollectionHandle,
+    authority: VerifyingKey,
+    representation: Id,
+    mapping: Fragment,
+    reach: Fragment,
+) -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_source: source,
+        collection_authority: authority,
+        collection_representation: representation,
+        collection_mapping*: mapping,
         collection_reach*: reach,
     }
 }
@@ -79,7 +138,7 @@ pub fn naming(
 /// The entity the descriptor's own attributes hang off.
 ///
 /// A descriptor archive holds more than one entity: the descriptor, plus the
-/// embedded self-descriptions of its representation and its recipe. The
+/// embedded self-descriptions of its encoding and mapping. The
 /// descriptor is the one tagged [`KIND_COLLECTION_DESCRIPTOR`].
 ///
 /// This is not the collection identity. That is the handle of the stored
@@ -115,17 +174,48 @@ pub fn representation(facts: &TribleSet) -> Result<Id, RecordDecodeError> {
     .map_err(|_| RecordDecodeError::InvalidId("collection_representation"))
 }
 
-/// Canonical recipe governing construction and merge for this collection.
+/// Concrete mapping instance carried by a derived collection.
 ///
-/// This names the *law*. Its arguments, if any, are further attributes on the
-/// same entity; see [`argument`].
-pub fn recipe(facts: &TribleSet) -> Result<Id, RecordDecodeError> {
+/// Root collections answer `None`. A derived collection names exactly one
+/// mapping entity. Canonical builders normally derive its id from its concrete
+/// parameters, but readers accept the equivalent extrinsic-id substitution.
+pub fn mapping(facts: &TribleSet) -> Result<Option<Id>, RecordDecodeError> {
     let descriptor = entity(facts)?;
-    exactly_one(
-        find!((v: Id?), pattern!(facts, [{ descriptor @ collection_recipe: ?v }])).map(|(v,)| v),
-        "collection_recipe",
+    at_most_one(
+        find!(
+            (v: Id?),
+            pattern!(facts, [{ descriptor @ collection_mapping: ?v }])
+        )
+        .map(|(v,)| v),
+        "collection_mapping",
     )?
-    .map_err(|_| RecordDecodeError::InvalidId("collection_recipe"))
+    .map(|value| value.map_err(|_| RecordDecodeError::InvalidId("collection_mapping")))
+    .transpose()
+}
+
+/// Algorithm named by the concrete mapping instance, if this is derived.
+pub fn mapping_algorithm(facts: &TribleSet) -> Result<Option<Id>, RecordDecodeError> {
+    let Some(mapping) = mapping(facts)? else {
+        return Ok(None);
+    };
+    let kind: Inline<GenId> = KIND_COLLECTION_MAPPING.to_inline();
+    if !facts.iter().any(|fact| {
+        fact.e() == &mapping && fact.a() == &metadata::tag.id() && fact.v::<GenId>() == &kind
+    }) {
+        return Err(RecordDecodeError::MissingField(
+            "mapping metadata::tag KIND_COLLECTION_MAPPING",
+        ));
+    }
+    exactly_one(
+        find!(
+            (v: Id?),
+            pattern!(facts, [{ mapping @ mapping_algorithm_attribute: ?v }])
+        )
+        .map(|(v,)| v),
+        "mapping_algorithm",
+    )?
+    .map(Some)
+    .map_err(|_| RecordDecodeError::InvalidId("mapping_algorithm"))
 }
 
 /// The collection this one derives from, if it derives from one.
@@ -174,21 +264,78 @@ pub fn authority(facts: &TribleSet) -> Result<VerifyingKey, RecordDecodeError> {
         .map_err(|_| RecordDecodeError::InvalidId("collection_authority"))
 }
 
-/// Look up one recipe argument by attribute.
+/// Validate the representation-independent shape shared by every collection
+/// descriptor and return its local authority.
 ///
-/// The attribute is a runtime id because the recipe that minted it is the only
-/// thing that knows what it means; this reads the raw bytes and hands them
-/// back for that recipe to interpret.
+/// A root is named and has no source mapping. A derived collection is unnamed
+/// and carries both its source and one concrete mapping. Encoding-specific
+/// context is deliberately left to [`CollectionEncoding::validate_descriptor`]
+/// at the typed boundary.
+pub fn validate(facts: &TribleSet) -> Result<VerifyingKey, RecordDecodeError> {
+    let descriptor = entity(facts)?;
+    if facts
+        .iter()
+        .any(|fact| fact.e() == &descriptor && fact.a() == &OBSOLETE_COLLECTION_RECIPE)
+    {
+        return Err(RecordDecodeError::ObsoleteField("collection_recipe"));
+    }
+    representation(facts)?;
+    let name = name(facts)?;
+    let source = source(facts)?;
+    let mapping = mapping(facts)?;
+    match (name, source, mapping) {
+        (Some(_), None, None) => {}
+        (None, Some(_), Some(_)) => {
+            mapping_algorithm(facts)?;
+        }
+        (None, None, None) => {
+            return Err(RecordDecodeError::MissingField(
+                "collection_name or collection_source with collection_mapping",
+            ));
+        }
+        _ => {
+            return Err(RecordDecodeError::RepeatedField(
+                "collection shape (root name or derived source/mapping)",
+            ));
+        }
+    }
+    authority(facts)
+}
+
+/// Look up one descriptor argument by attribute.
+///
+/// This remains useful for reach laws whose arguments belong to the
+/// descriptor itself. Source-to-target parameters use [`mapping_argument`].
 pub fn argument(facts: &TribleSet, attribute: Id) -> Result<Option<RawInline>, RecordDecodeError> {
-    let descriptor: Inline<GenId> = entity(facts)?.to_inline();
+    argument_on(facts, entity(facts)?, attribute, "descriptor argument")
+}
+
+/// Look up one concrete mapping parameter by attribute.
+pub fn mapping_argument(
+    facts: &TribleSet,
+    attribute: Id,
+) -> Result<Option<RawInline>, RecordDecodeError> {
+    let Some(mapping) = mapping(facts)? else {
+        return Ok(None);
+    };
+    argument_on(facts, mapping, attribute, "mapping argument")
+}
+
+fn argument_on(
+    facts: &TribleSet,
+    subject: Id,
+    attribute: Id,
+    field: &'static str,
+) -> Result<Option<RawInline>, RecordDecodeError> {
+    let subject: Inline<GenId> = subject.to_inline();
     let attribute: Inline<GenId> = attribute.to_inline();
     at_most_one(
         find!(
             (v: Inline<GenId>),
-            facts.pattern::<GenId>(descriptor, attribute, v)
+            facts.pattern::<GenId>(subject, attribute, v)
         )
         .map(|(v,)| v.raw),
-        "recipe argument",
+        field,
     )
 }
 
@@ -251,9 +398,9 @@ fn at_most_one<T>(
 /// Spelling that as a name under a fixed authority keeps the distinction
 /// readable in the test itself.
 #[cfg(test)]
-pub(crate) fn named_for_tests(name: &str, representation: Id, recipe: Id) -> Fragment {
+pub(crate) fn named_for_tests(name: &str, representation: Id) -> Fragment {
     let root = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]).verifying_key();
-    naming(name, root, representation, recipe, reach::private())
+    naming(name, root, representation, reach::private())
 }
 
 /// Content identity of a descriptor, for tests that have no store.
@@ -285,7 +432,6 @@ mod tests {
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::utf8string::UTF8String;
     use crate::collection::records::{collection_authority, collection_source};
-    use crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use crate::inline::encodings::ed25519::ED25519PublicKey;
     use crate::metadata;
     use crate::repo::{BlobStore, BlobStoreGet};
@@ -302,7 +448,6 @@ mod tests {
             name,
             authority,
             <SimpleArchive as crate::metadata::MetaDescribe>::id(),
-            TRIBLE_SET_UNION_RECIPE_V1,
             reach::private(),
         )
     }
@@ -341,6 +486,29 @@ mod tests {
 
         assert_ne!(identity_for_tests(&first), identity_for_tests(&second));
         assert_eq!(first.facts().len(), second.facts().len());
+    }
+
+    #[test]
+    fn retired_recipe_descriptors_are_not_reinterpreted_as_encoding_descriptors() {
+        let mut fragment = root("legacy", team_key(12));
+        let descriptor = fragment.root().expect("descriptor root");
+        let value: Inline<GenId> = crate::collection::records::KIND_COLLECTION_MAPPING.to_inline();
+        fragment.facts_mut().insert(&Trible::force(
+            &descriptor,
+            &OBSOLETE_COLLECTION_RECIPE,
+            &value,
+        ));
+
+        assert_eq!(
+            validate(fragment.facts()),
+            Err(RecordDecodeError::ObsoleteField("collection_recipe"))
+        );
+        assert!(matches!(
+            crate::collection::Collection::<SimpleArchive>::from_descriptor(&fragment),
+            Err(crate::collection::CollectionTypeError::Malformed(
+                RecordDecodeError::ObsoleteField("collection_recipe")
+            ))
+        ));
     }
 
     #[test]

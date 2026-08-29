@@ -45,14 +45,13 @@ use super::discovery::{
     discover_collection_claims_for_cover, discover_collection_equations_for_cover, ExactCoverError,
 };
 use super::simplearchive_union::FactViewError;
-use super::simplearchive_union::SimpleArchiveUnion;
 use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionFunctionalConflict,
-    CollectionHandle, CollectionLattice, CollectionLatticeError, CollectionResolutionError,
-    CollectionStore, CollectionTypeError, CollectionValidationRequest, CoverAttachment,
-    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, ACTION_WRITE,
+    CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
+    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
+    CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
+    CoverAttachment, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, ACTION_WRITE,
 };
 
 /// One owned proof together with the exact leaf subject it is expected to
@@ -213,8 +212,7 @@ where
 /// Failure to register and advertise a self-contained collection descriptor.
 #[derive(Debug)]
 pub enum CollectionRegistrationError<PutError, OfferError> {
-    /// The descriptor names a representation or recipe other than the
-    /// requested typed collection lattice.
+    /// The descriptor names another encoding or invalid encoding context.
     WrongType(CollectionTypeError),
     /// Descriptor facts did not have the mandatory generic shape.
     InvalidDescriptor(RecordDecodeError),
@@ -289,17 +287,17 @@ where
 /// Members are content identities, not signatures. Several commits may attest
 /// the same member with different authors or metadata without changing this
 /// value. The private constructor makes a `Cover` an opaque result of
-/// admission or validated collection algebra rather than a caller-forged set
-/// of hashes.
-pub struct Cover<L: CollectionLattice> {
+/// admission or validated collection operations rather than a caller-forged
+/// set of hashes.
+pub struct Cover<L: CollectionEncoding> {
     collection: Collection<L>,
     members: PATCH<32, IdentitySchema, (), Blake3Merkle>,
 }
 
-impl<L: CollectionLattice> Cover<L> {
+impl<L: CollectionEncoding> Cover<L> {
     pub(crate) fn from_members(
         collection: Collection<L>,
-        members: impl IntoIterator<Item = Inline<Handle<L::Encoding>>>,
+        members: impl IntoIterator<Item = Inline<Handle<L>>>,
     ) -> Self {
         Self {
             collection,
@@ -333,14 +331,14 @@ impl<L: CollectionLattice> Cover<L> {
     }
 
     /// Canonical member identities in ascending byte order.
-    pub fn members(&self) -> impl ExactSizeIterator<Item = Inline<Handle<L::Encoding>>> + '_ {
+    pub fn members(&self) -> impl ExactSizeIterator<Item = Inline<Handle<L>>> + '_ {
         self.members
             .iter_ordered()
             .map(|member| Inline::new(*member))
     }
 
     /// Whether this cover contains one exact member identity.
-    pub fn contains(&self, member: Inline<Handle<L::Encoding>>) -> bool {
+    pub fn contains(&self, member: Inline<Handle<L>>) -> bool {
         self.members.get(&member.raw).is_some()
     }
 
@@ -390,7 +388,7 @@ impl<L: CollectionLattice> Cover<L> {
     }
 }
 
-impl<L: CollectionLattice> Clone for Cover<L> {
+impl<L: CollectionEncoding> Clone for Cover<L> {
     fn clone(&self) -> Self {
         Self {
             collection: self.collection,
@@ -399,7 +397,7 @@ impl<L: CollectionLattice> Clone for Cover<L> {
     }
 }
 
-impl<L: CollectionLattice> fmt::Debug for Cover<L> {
+impl<L: CollectionEncoding> fmt::Debug for Cover<L> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Cover")
@@ -409,16 +407,16 @@ impl<L: CollectionLattice> fmt::Debug for Cover<L> {
     }
 }
 
-impl<L: CollectionLattice> PartialEq for Cover<L> {
+impl<L: CollectionEncoding> PartialEq for Cover<L> {
     fn eq(&self, other: &Self) -> bool {
         self.collection == other.collection && self.members == other.members
     }
 }
 
-impl<L: CollectionLattice> Eq for Cover<L> {}
+impl<L: CollectionEncoding> Eq for Cover<L> {}
 
 /// Typed exact cover of the canonical fact collection.
-pub type FactCover = Cover<SimpleArchiveUnion>;
+pub type FactCover = Cover<SimpleArchive>;
 
 /// Failure to treat two covers as one additions-only continuation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -465,13 +463,13 @@ impl Error for CoverAdvanceError {}
 /// materialize those facts. The reader may contain physically available blobs
 /// published after record discovery, but those blobs acquire no semantic role
 /// unless their payloads are present in this snapshot's cover.
-pub struct Snapshot<L: CollectionLattice, V, R> {
+pub struct Snapshot<L: CollectionEncoding, V, R> {
     value: V,
     cover: Cover<L>,
     reader: R,
 }
 
-impl<L: CollectionLattice, V, R> Snapshot<L, V, R> {
+impl<L: CollectionEncoding, V, R> Snapshot<L, V, R> {
     /// Materialized logical value named by this snapshot's exact cover.
     pub fn value(&self) -> &V {
         &self.value
@@ -498,7 +496,7 @@ impl<L: CollectionLattice, V, R> Snapshot<L, V, R> {
     }
 }
 
-impl<R> Snapshot<SimpleArchiveUnion, TribleSet, R> {
+impl<R> Snapshot<SimpleArchive, TribleSet, R> {
     /// Materialized fact union named by this snapshot's exact payload cover.
     pub fn facts(&self) -> &TribleSet {
         self.value()
@@ -511,14 +509,14 @@ impl<R> Snapshot<SimpleArchiveUnion, TribleSet, R> {
 }
 
 /// Snapshot of the canonical SimpleArchive fact-union lattice.
-pub type FactSnapshot<R> = Snapshot<SimpleArchiveUnion, TribleSet, R>;
+pub type FactSnapshot<R> = Snapshot<SimpleArchive, TribleSet, R>;
 
 /// Failure to discover one exact admitted payload cover.
 #[derive(Debug)]
 pub enum CollectionCoverError<RecordsError, ReaderError, GetError> {
     /// The collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<ReaderError, GetError>),
-    /// The descriptor names another representation or lattice recipe.
+    /// The descriptor names another encoding or invalid encoding context.
     WrongType(CollectionTypeError),
     /// One explicitly supplied capability proof was invalid at this operation's
     /// single clock observation.
@@ -566,10 +564,10 @@ where
 pub enum CollectionCommitError<ReaderError, GetError, PutError, InsertError> {
     /// The named collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<ReaderError, GetError>),
-    /// The descriptor names another representation or lattice recipe.
+    /// The descriptor names another encoding or invalid encoding context.
     WrongType(CollectionTypeError),
     /// The encoded member is not a canonical element of the collection lattice.
-    InvalidMember(CollectionLatticeError),
+    InvalidMember(CollectionOperationError),
     /// A described attachment, member, or metadata archive could not be stored.
     DependencyPut(PutError),
     /// The signed visibility record could not be inserted after its dependencies.
@@ -629,7 +627,7 @@ where
 pub enum CollectionMaterializationError<RecordsError, ReaderError, GetError, ViewError> {
     /// One explicitly supplied capability proof was invalid.
     Admission(CollectionAdmissionError),
-    /// The descriptor names another representation or lattice recipe.
+    /// The descriptor names another encoding or invalid encoding context.
     WrongType(CollectionTypeError),
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
@@ -673,12 +671,12 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, GetError, Vie
         /// Backend fetch failure.
         source: GetError,
     },
-    /// A cover member failed exact lattice validation.
+    /// A cover member failed exact encoding validation.
     InvalidMember {
         /// Exact payload identity.
         member: CollectionData,
         /// Exact representation or identity diagnostic.
-        source: CollectionLatticeError,
+        source: CollectionOperationError,
     },
     /// Positively validated equations contradicted operation functionality.
     ResolutionConflict(Box<CollectionFunctionalConflict>),
@@ -828,36 +826,18 @@ where
 }
 
 fn validate_generic_descriptor(facts: &TribleSet) -> Result<VerifyingKey, RecordDecodeError> {
-    descriptor::entity(facts)?;
-    descriptor::representation(facts)?;
-    descriptor::recipe(facts)?;
-    match (descriptor::name(facts)?, descriptor::source(facts)?) {
-        (Some(_), None) | (None, Some(_)) => {}
-        (None, None) => {
-            return Err(RecordDecodeError::MissingField(
-                "collection_name or collection_source",
-            ));
-        }
-        (Some(_), Some(_)) => {
-            return Err(RecordDecodeError::RepeatedField(
-                "collection anchor (name/source)",
-            ));
-        }
-    }
-    descriptor::authority(facts)
+    descriptor::validate(facts)
 }
 
 fn register_collection<S>(
     store: &mut S,
     descriptor: Fragment,
-) -> Result<CollectionHandle, CollectionRegistrationError<S::PutError, S::OfferError>>
+) -> Result<(), CollectionRegistrationError<S::PutError, S::OfferError>>
 where
     S: BlobStorePut + ArtifactOfferStore,
 {
-    validate_generic_descriptor(descriptor.facts())
-        .map_err(CollectionRegistrationError::InvalidDescriptor)?;
     let name = descriptor::name(descriptor.facts())
-        .map_err(CollectionRegistrationError::InvalidDescriptor)?;
+        .expect("typed collection descriptor was structurally validated");
     let (_, facts, _, mut blobs) = descriptor.into_parts();
     if let Some(name) = name {
         let reader = blobs
@@ -866,7 +846,6 @@ where
         let valid = reader
             .get::<Blob<UTF8String>, UTF8String>(name)
             .ok()
-            .filter(|blob| Blob::<UTF8String>::new(blob.bytes.clone()).get_handle() == name)
             .and_then(|blob| blob.try_from_blob::<anybytes::View<str>>().ok())
             .is_some();
         if !valid {
@@ -894,7 +873,7 @@ where
             .put::<UnknownBlob, _>(blob)
             .map_err(CollectionRegistrationError::DependencyPut)?;
     }
-    let collection = capture
+    capture
         .put::<SimpleArchive, _>(facts)
         .map_err(CollectionRegistrationError::DependencyPut)?;
     if let Err(source) = capture.offer_pending() {
@@ -903,7 +882,7 @@ where
             artifacts: capture.pending().collect(),
         });
     }
-    Ok(collection)
+    Ok(())
 }
 
 struct LoadedCollectionDescriptor {
@@ -992,11 +971,11 @@ fn discover_admitted_cover_at<S, L>(
 >
 where
     S: BlobStore + CollectionStore,
-    L: CollectionLattice,
+    L: CollectionEncoding,
 {
     let loaded = load_collection_descriptor(store, collection.handle())
         .map_err(CollectionCoverError::Descriptor)?;
-    super::lattice::validate_descriptor_type::<L>(&loaded.fragment)
+    super::encoding::validate_descriptor_type::<L>(&loaded.fragment)
         .map_err(CollectionCoverError::WrongType)?;
     let admitted = admitted_subjects_at(
         loaded.authority,
@@ -1036,12 +1015,16 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         >,
     >
     where
-        L: CollectionLattice,
+        L: CollectionEncoding,
     {
-        let collection = Collection::<L>::from_descriptor(&descriptor)
-            .map_err(CollectionRegistrationError::WrongType)?;
-        let stored = register_collection(self, descriptor)?;
-        debug_assert_eq!(stored, collection.handle());
+        let collection =
+            Collection::<L>::from_descriptor(&descriptor).map_err(|source| match source {
+                CollectionTypeError::Malformed(source) => {
+                    CollectionRegistrationError::InvalidDescriptor(source)
+                }
+                source => CollectionRegistrationError::WrongType(source),
+            })?;
+        register_collection(self, descriptor)?;
         Ok(collection)
     }
 
@@ -1070,18 +1053,18 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         >,
     >
     where
-        L: CollectionLattice,
-        T: Describe + IntoBlob<L::Encoding>,
+        L: CollectionEncoding,
+        T: Describe + IntoBlob<L>,
     {
         let loaded = load_collection_descriptor(self, collection.handle())
             .map_err(CollectionCommitError::Descriptor)?;
-        super::lattice::validate_descriptor_type::<L>(&loaded.fragment)
+        super::encoding::validate_descriptor_type::<L>(&loaded.fragment)
             .map_err(CollectionCommitError::WrongType)?;
 
         // Description happens before the value is consumed by its encoding.
         // A Fragment description deliberately retains its shared blob store,
         // so data and metadata attachments travel through this one generic
-        // path without a representation-specific side channel.
+        // path without an encoding-specific side channel.
         let description = value.describe();
         let data = value.to_blob();
         L::validate_member(&loaded.fragment, &data)
@@ -1104,7 +1087,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
                 .map_err(CollectionCommitError::DependencyPut)?;
         }
         let data = store
-            .put::<L::Encoding, _>(data)
+            .put::<L, _>(data)
             .map_err(CollectionCommitError::DependencyPut)?;
         let metadata = store
             .put::<SimpleArchive, _>(metadata)
@@ -1112,7 +1095,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         let commit = CollectionCommit::sign(
             signing_key,
             collection.handle(),
-            Handle::<L::Encoding>::to_hash(data),
+            Handle::<L>::to_hash(data),
             metadata,
         );
         store
@@ -1140,7 +1123,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         >,
     >
     where
-        L: CollectionLattice,
+        L: CollectionEncoding,
     {
         let (_, _, cover) =
             discover_admitted_cover_at(self, collection, presentations, clock::epoch_now())?;
@@ -1163,7 +1146,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     >
     where
         <Self as BlobStore>::Reader: BlobStoreMeta,
-        L: CollectionLattice,
+        L: CollectionEncoding,
         V: TryFromCover<L>,
     {
         let (descriptor, discovered, cover) =
@@ -1192,7 +1175,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     >
     where
         <Self as BlobStore>::Reader: BlobStoreMeta,
-        L: CollectionLattice,
+        L: CollectionEncoding,
         V: TryFromCover<L>,
     {
         let collection = cover.collection();
@@ -1220,7 +1203,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         cover: &Cover<L>,
     ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<Self::RecordsError>>
     where
-        L: CollectionLattice,
+        L: CollectionEncoding,
     {
         let discovered = discover_collection_claims_for_cover(self, cover)?;
         Ok(discovered.commits().to_vec())
@@ -1253,7 +1236,7 @@ pub(crate) fn snapshot_from_observation<S, L, V>(
 where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
-    L: CollectionLattice,
+    L: CollectionEncoding,
     V: TryFromCover<L>,
 {
     let collection = cover.collection().handle();
@@ -1297,7 +1280,7 @@ where
     if decoded_descriptor != *descriptor.facts() {
         return Err(CollectionMaterializationError::DescriptorMismatch { collection });
     }
-    super::lattice::validate_descriptor_type::<L>(descriptor)
+    super::encoding::validate_descriptor_type::<L>(descriptor)
         .map_err(CollectionMaterializationError::WrongType)?;
 
     // Fetch and validate each cover payload exactly once. Claims, authorship,
@@ -1305,7 +1288,7 @@ where
     // provenance record or metadata blob is resident.
     let mut known = BTreeMap::new();
     for member_handle in cover.members() {
-        let member = Handle::<L::Encoding>::to_hash(member_handle);
+        let member = Handle::<L>::to_hash(member_handle);
         let blob = reader
             .get(member_handle)
             .map_err(|source| CollectionMaterializationError::MemberGet { member, source })?;
@@ -1342,10 +1325,7 @@ where
     let mut reverse_queue = VecDeque::new();
     for result in producers.keys().copied() {
         let resident = known.contains_key(&result)
-            || matches!(
-                reader.metadata(Handle::<L::Encoding>::from_hash(result)),
-                Ok(Some(_))
-            );
+            || matches!(reader.metadata(Handle::<L>::from_hash(result)), Ok(Some(_)));
         if resident {
             resident_results.insert(result);
             if reverse_seen.insert(result) {
@@ -1412,9 +1392,9 @@ where
         } else {
             match (known.get(&low), known.get(&high)) {
                 (Some(low_blob), Some(high_blob)) => {
-                    match L::merge_members(descriptor, low_blob, high_blob) {
+                    match L::join_members(descriptor, low_blob, high_blob) {
                         Ok(value) => {
-                            let expected = Handle::<L::Encoding>::to_hash(value.get_handle());
+                            let expected = Handle::<L>::to_hash(value.get_handle());
                             expected_hashes.insert(pair, expected);
                             joined = Some(value);
                             Some(expected)
@@ -1440,16 +1420,13 @@ where
                 if joined.is_none() {
                     joined = match (known.get(&low), known.get(&high)) {
                         (Some(low_blob), Some(high_blob)) => {
-                            L::merge_members(descriptor, low_blob, high_blob).ok()
+                            L::join_members(descriptor, low_blob, high_blob).ok()
                         }
                         _ => None,
                     };
                 }
                 if let Some(value) = joined {
-                    debug_assert_eq!(
-                        Handle::<L::Encoding>::to_hash(value.get_handle()),
-                        expected_data
-                    );
+                    debug_assert_eq!(Handle::<L>::to_hash(value.get_handle()), expected_data);
                     known.insert(expected_data, value);
                     true
                 } else {
@@ -1538,7 +1515,7 @@ where
         }
     }
 
-    let mut selected = BTreeMap::<CollectionData, Blob<L::Encoding>>::new();
+    let mut selected = BTreeMap::<CollectionData, Blob<L>>::new();
     let physical_cover = loop {
         let candidate = collection_physical_cover(semantics, collection, &resident);
         if !candidate.missing.is_empty() {
@@ -1553,12 +1530,12 @@ where
             if roots.contains(&data) || selected.contains_key(&data) {
                 continue;
             }
-            let handle = Handle::<L::Encoding>::from_hash(data);
-            let actual: Result<Blob<L::Encoding>, _> = reader.get(handle);
+            let handle = Handle::<L>::from_hash(data);
+            let actual: Result<Blob<L>, _> = reader.get(handle);
             match actual {
                 Ok(actual) => {
-                    let actual = Blob::<L::Encoding>::new(actual.bytes.clone());
-                    let actual_data = Handle::<L::Encoding>::to_hash(actual.get_handle());
+                    let actual = Blob::<L>::new(actual.bytes.clone());
+                    let actual_data = Handle::<L>::to_hash(actual.get_handle());
                     if actual_data == data && L::validate_member(descriptor, &actual).is_ok() {
                         selected.insert(data, actual);
                     } else {
@@ -1588,7 +1565,7 @@ where
                 .get(&data)
                 .expect("optional cover members were exact-validated")
         };
-        members.push((Handle::<L::Encoding>::from_hash(data), (*blob).clone()));
+        members.push((Handle::<L>::from_hash(data), (*blob).clone()));
     }
     let snapshot_cover = cover.clone();
     let value = V::try_from_cover(CoverAttachment::from_parts(cover, members))

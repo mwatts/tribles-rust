@@ -35,12 +35,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use triblespace::core::collection::simplearchive_union::SimpleArchiveUnion;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::succinctarchive_union::{
     SuccinctArchiveCollection, SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    reach, simplearchive_union, CollectionStoreExt, FactCover, SimpleArchiveCollection,
+    reach, simplearchive_union, CollectionStoreExt, Cover, SimpleArchiveCollection,
 };
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
@@ -52,8 +52,8 @@ type Row = (Entity, Entity, Title);
 #[derive(Clone)]
 struct Fixture {
     store: MemoryRepo,
-    seed_cover: FactCover,
-    covers: Vec<FactCover>,
+    seed_cover: Cover<SimpleArchive>,
+    covers: Vec<Cover<SimpleArchive>>,
     expected_batches: Vec<Vec<Row>>,
     simple: SimpleArchiveCollection,
     succinct: SuccinctArchiveCollection,
@@ -73,7 +73,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     let name = benchmark_name();
     let mut store = MemoryRepo::default();
     let collection = store
-        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
+        .collection::<SimpleArchive>(simplearchive_union::descriptor(
             name,
             authority,
             reach::private(),
@@ -161,7 +161,7 @@ impl FullState {
         }
     }
 
-    fn observe(&mut self, cover: &FactCover) -> Step {
+    fn observe(&mut self, cover: &Cover<SimpleArchive>) -> Step {
         let start = Instant::now();
         let full = self
             .view
@@ -193,7 +193,7 @@ impl FullState {
 struct IncrementalState {
     store: MemoryRepo,
     view: SuccinctArchiveView,
-    checkpoint: FactCover,
+    checkpoint: Cover<SimpleArchive>,
     results: BTreeSet<Row>,
 }
 
@@ -213,7 +213,7 @@ impl IncrementalState {
         }
     }
 
-    fn observe(&mut self, fixture: &Fixture, cover: &FactCover) -> Step {
+    fn observe(&mut self, fixture: &Fixture, cover: &Cover<SimpleArchive>) -> Step {
         let start = Instant::now();
         let added = cover
             .additions_since(&self.checkpoint)

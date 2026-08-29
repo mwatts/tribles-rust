@@ -1,7 +1,7 @@
 #![allow(clippy::type_complexity)]
 //! Content-addressed blob storage, complete capability proofs, collection
-//! records, positive peer-routing evidence, durable wants and artifact offers,
-//! and read-only access to legacy named-pin snapshots.
+//! records, unsigned mapping evidence, positive peer-routing evidence, durable
+//! wants and artifact offers, and read-only access to legacy named-pin snapshots.
 //!
 //! Collections are the mutable-history replacement. Legacy pin and commit
 //! encodings remain readable so existing piles can be migrated and retained,
@@ -95,13 +95,16 @@ impl StoreRevisionChanges {
     /// The local blob reader/access lease changed without necessarily changing
     /// resident blob membership.
     pub const BLOB_READER: Self = Self(1 << 4);
+    /// Unsigned mapping cache evidence may have changed.
+    pub const MAPPING_EVIDENCE: Self = Self(1 << 5);
     /// Every sync-visible component and the blob access lease may have changed.
     pub const ALL: Self = Self(
         Self::BLOBS.0
             | Self::COLLECTION_RECORDS.0
             | Self::CAPABILITY_PROOFS.0
             | Self::PEERS.0
-            | Self::BLOB_READER.0,
+            | Self::BLOB_READER.0
+            | Self::MAPPING_EVIDENCE.0,
     );
 
     /// Whether every bit in `change` is present.
@@ -127,7 +130,8 @@ impl StoreRevisionChanges {
 /// Equality only answers whether rebuilding a derived inventory can be
 /// skipped. Implementations may conservatively change the token when
 /// unrelated local state changes, but must change it whenever resident blobs,
-/// collection records, capability proofs, or peer evidence may have changed.
+/// collection records, mapping evidence, capability proofs, or peer evidence
+/// may have changed.
 ///
 /// File-backed implementations reobserve external appends before returning.
 /// This keeps an unchanged poll proportional to the storage boundary (for a

@@ -112,14 +112,14 @@ garbage-collection root.
 
 A collection is identified by the blake3 handle of its canonical descriptor
 blob — a `SimpleArchive` naming its root (`name` + public-key namespace) or
-derived source, optional local capability authority, representation, join
-recipe, and reach law, together with the representation and recipe
+derived source, mandatory local capability authority, representation, concrete
+mapping, and reach law, together with the encoding and mapping-algorithm
 descriptions.
 `pile blob inspect` sees only the encoded blob; these subcommands decode it.
 
-- `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded namespace/source anchor, local authority, representation, and recipe (known representation and recipe ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
+- `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded namespace/source anchor, local authority, representation, and mapping algorithm (known representation and algorithm ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
 - `pile collection show <PILE> <HANDLE>` — decode one descriptor, its anchor,
-  local authority, representation, recipe, reach law, and referencing record
+  local authority, representation, mapping, reach law, and referencing record
   counts. The handle is accepted with or without the `blake3:` prefix.
 
 ### Distributed pile sync

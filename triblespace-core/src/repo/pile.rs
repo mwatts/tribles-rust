@@ -51,8 +51,9 @@ use crate::blob::TryFromBlob;
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::selectors_match_record;
 use crate::collection::{
-    CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
-    CollectionRecordSelector, CollectionStore,
+    selectors_match_mapping_evidence, CollectionCommit, CollectionDerive, CollectionMerge,
+    CollectionRecord, CollectionRecordSelector, CollectionStore, MappingEvidence,
+    MappingEvidenceSelector, MappingEvidenceStore, MAPPING_EVIDENCE_BYTES_LEN,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -353,6 +354,7 @@ struct CapabilityProofIndexEntry {
 
 type PileBlobIndex = PATCH<32, IdentitySchema, IndexEntry, XorSip128>;
 type CollectionRecordIndex = PATCH<16, IdentitySchema, CollectionRecord, XorSip128>;
+type MappingEvidenceIndex = PATCH<16, IdentitySchema, MappingEvidence, XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
 type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
 type StoreScopeIndex = PATCH<32, IdentitySchema, (), XorSip128>;
@@ -1076,16 +1078,51 @@ struct CollectionDeriveRecordHeader {
 
 impl CollectionDeriveRecordHeader {
     fn new(record: &CollectionDerive) -> Self {
-        let (input, output) = record.mapping();
+        let (input, output) = (record.input(), record.output());
         Self {
             magic: FRAME_MAGIC,
             span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
             record_kind: record_kind::KIND_COLLECTION_DERIVE,
-            target: record.target().raw,
+            target: record.collection().raw,
             input: input.raw,
             output: output.raw,
             reserved: [0u8; 96],
         }
+    }
+}
+
+/// Unsigned mapping cache evidence: `64..160` mapping, input, output.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct MappingEvidenceRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    mapping: RawInline,
+    input: RawInline,
+    output: RawInline,
+    reserved: [u8; 96],
+}
+
+impl MappingEvidenceRecordHeader {
+    fn new(evidence: MappingEvidence) -> Self {
+        Self {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_MAPPING_EVIDENCE,
+            mapping: evidence.mapping().raw,
+            input: evidence.input().raw,
+            output: evidence.output().raw,
+            reserved: [0u8; 96],
+        }
+    }
+
+    fn evidence(&self) -> MappingEvidence {
+        let mut bytes = [0u8; MAPPING_EVIDENCE_BYTES_LEN];
+        bytes[..32].copy_from_slice(&self.mapping);
+        bytes[32..64].copy_from_slice(&self.input);
+        bytes[64..].copy_from_slice(&self.output);
+        MappingEvidence::from_bytes(bytes)
     }
 }
 
@@ -1153,6 +1190,7 @@ const _: () = {
     assert!(std::mem::size_of::<CollectionCommitHeaderV4>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeHeaderV4>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveHeaderV4>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<MappingEvidenceRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<EnvelopePrefixV1>() == 36);
     assert!(std::mem::size_of::<BlobHeaderEnvelopeV1>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<BranchHeaderEnvelopeV1>() == ENVELOPE_HEADER_LEN);
@@ -1316,6 +1354,11 @@ pub enum PileRecordContent {
     Collection {
         /// Canonically reconstructed semantic record.
         record: CollectionRecord,
+    },
+    /// One unsigned reusable mapping equation.
+    MappingEvidence {
+        /// Exact mapping/input/output evidence.
+        evidence: MappingEvidence,
     },
     /// One canonical complete capability proof stored inline in K(S,C,K)+
     /// order. Its content id is an exact-body index, not an authority token.
@@ -1628,6 +1671,21 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                         Inline::new(header.input),
                         Inline::new(header.output),
                     )),
+                },
+            })
+        }
+        record_kind::KIND_MAPPING_EVIDENCE => {
+            fixed_header()?;
+            let (header, _) =
+                MappingEvidenceRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if nonzero(&[&header.reserved[..]]) {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::MappingEvidence {
+                    evidence: header.evidence(),
                 },
             })
         }
@@ -2337,6 +2395,7 @@ enum Applied {
     WantRetract { request: WantRequest },
     ArtifactOffer,
     Collection { id: Id },
+    MappingEvidence { id: Id },
     CapabilityProof { id: CapabilityProofId },
     Peer { evidence: PeerEvidence },
     StoreScope { team: VerifyingKey },
@@ -2368,6 +2427,8 @@ pub struct Pile {
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     /// Immutable collection records keyed by their intrinsic entity id.
     collection_records: CollectionRecordIndex,
+    /// Unsigned mapping equations keyed by intrinsic evidence id.
+    mapping_evidence: MappingEvidenceIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
@@ -2546,6 +2607,7 @@ pub struct PileRevision {
     blobs: PileBlobIndex,
     reader: PileReaderRevision,
     collection_records: CollectionRecordIndex,
+    mapping_evidence: MappingEvidenceIndex,
     capability_proofs: CapabilityProofIndex,
     peers: PeerEvidenceIndex,
 }
@@ -2576,6 +2638,9 @@ impl PileRevision {
         if previous.collection_records != self.collection_records {
             changes = changes.union(super::StoreRevisionChanges::COLLECTION_RECORDS);
         }
+        if previous.mapping_evidence != self.mapping_evidence {
+            changes = changes.union(super::StoreRevisionChanges::MAPPING_EVIDENCE);
+        }
         if previous.capability_proofs != self.capability_proofs {
             changes = changes.union(super::StoreRevisionChanges::CAPABILITY_PROOFS);
         }
@@ -2599,6 +2664,7 @@ impl super::StoreRevision for Pile {
                 covered_len: self.applied_length,
             },
             collection_records: self.collection_records.clone(),
+            mapping_evidence: self.mapping_evidence.clone(),
             capability_proofs: self.capability_proofs.clone(),
             peers: self.peers.clone(),
         })
@@ -2831,6 +2897,56 @@ impl From<std::io::Error> for CollectionInsertError {
     }
 }
 
+/// Failure while appending immutable mapping evidence.
+#[derive(Debug)]
+pub enum MappingEvidenceInsertError {
+    /// Existing pile state could not be refreshed or decoded.
+    Read(ReadError),
+    /// The fixed record could not be appended or the file lock released.
+    Io(std::io::Error),
+    /// The intrinsic id already names different canonical fields.
+    IdCollision { id: Id },
+    /// Readback observed a record other than the exclusively appended one.
+    UnexpectedReadback,
+}
+
+impl std::fmt::Display for MappingEvidenceInsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(error) => write!(f, "failed to refresh mapping evidence: {error}"),
+            Self::Io(error) => write!(f, "failed to append mapping evidence: {error}"),
+            Self::IdCollision { id } => {
+                write!(f, "mapping evidence id {id:X} names different fields")
+            }
+            Self::UnexpectedReadback => {
+                f.write_str("mapping-evidence append read back an unexpected pile record")
+            }
+        }
+    }
+}
+
+impl Error for MappingEvidenceInsertError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::IdCollision { .. } | Self::UnexpectedReadback => None,
+        }
+    }
+}
+
+impl From<ReadError> for MappingEvidenceInsertError {
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl From<std::io::Error> for MappingEvidenceInsertError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 /// Failure while appending one canonical complete capability proof.
 #[derive(Debug)]
 pub enum CapabilityProofInsertError {
@@ -2976,6 +3092,7 @@ impl Pile {
             validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: CollectionRecordIndex::new(),
+            mapping_evidence: MappingEvidenceIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             peers: PeerEvidenceIndex::new(),
             artifact_offers: ArtifactOfferSnapshot::default(),
@@ -3144,6 +3261,20 @@ impl Pile {
                         .insert(&Entry::with_value(&id.raw(), record));
                 }
                 Applied::Collection { id }
+            }
+            PileRecordContent::MappingEvidence { evidence } => {
+                let id = evidence.id();
+                if let Some(existing) = self.mapping_evidence.get(&id.raw()) {
+                    if existing != &evidence {
+                        return Err(ReadError::CorruptPile {
+                            valid_length: start_offset,
+                        });
+                    }
+                } else {
+                    self.mapping_evidence
+                        .insert(&Entry::with_value(&id.raw(), evidence));
+                }
+                Applied::MappingEvidence { id }
             }
             PileRecordContent::CapabilityProof {
                 id,
@@ -3481,6 +3612,12 @@ pub struct PileCollectionRecordIter {
     lookup: CollectionRecordIndex,
 }
 
+/// Deterministic owned snapshot of the pile's mapping evidence.
+pub struct PileMappingEvidenceIter {
+    keys: crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, MappingEvidence, XorSip128>,
+    lookup: MappingEvidenceIndex,
+}
+
 /// Deterministic owned snapshot of the pile's complete capability proofs.
 pub struct PileCapabilityProofIter {
     mmap: Arc<MmapRaw>,
@@ -3549,6 +3686,20 @@ impl Iterator for PileCollectionRecordIter {
             .expect("collection key from PATCH snapshot must retain its value");
         debug_assert_eq!(record.id().raw(), key);
         Some(Ok(record))
+    }
+}
+
+impl Iterator for PileMappingEvidenceIter {
+    type Item = Result<MappingEvidence, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = self.keys.next()?;
+        let evidence = *self
+            .lookup
+            .get(&key)
+            .expect("mapping-evidence key from PATCH snapshot must retain its value");
+        debug_assert_eq!(evidence.id().raw(), key);
+        Some(Ok(evidence))
     }
 }
 
@@ -3715,6 +3866,83 @@ impl CollectionStore for Pile {
             match self.apply_next()? {
                 Some(Applied::Collection { id: applied }) if applied == id => Ok(()),
                 Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
+            }
+        })();
+        let unlock = self.file.unlock();
+        result?;
+        unlock?;
+        Ok(())
+    }
+}
+
+impl MappingEvidenceStore for Pile {
+    type EvidenceError = ReadError;
+    type InsertError = MappingEvidenceInsertError;
+    type EvidenceIter<'a> = PileMappingEvidenceIter;
+
+    fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+        self.refresh()?;
+        let keys = self.mapping_evidence.clone().into_iter_ordered();
+        Ok(PileMappingEvidenceIter {
+            keys,
+            lookup: self.mapping_evidence.clone(),
+        })
+    }
+
+    fn evidence_by_id(&mut self, id: Id) -> Result<Option<MappingEvidence>, Self::EvidenceError> {
+        self.refresh()?;
+        Ok(self.mapping_evidence.get(&id.raw()).copied())
+    }
+
+    fn select_evidence(
+        &mut self,
+        selectors: &BTreeSet<MappingEvidenceSelector>,
+    ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.refresh()?;
+        Ok(self
+            .mapping_evidence
+            .iter_ordered()
+            .map(|key| {
+                *self
+                    .mapping_evidence
+                    .get(key)
+                    .expect("mapping-evidence key from PATCH must retain its value")
+            })
+            .filter(|evidence| selectors_match_mapping_evidence(selectors, *evidence))
+            .collect())
+    }
+
+    fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
+        let id = evidence.id();
+        let header = MappingEvidenceRecordHeader::new(evidence);
+
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked()?;
+
+            if let Some(existing) = self.mapping_evidence.get(&id.raw()) {
+                return if existing == &evidence {
+                    Ok(())
+                } else {
+                    Err(MappingEvidenceInsertError::IdCollision { id })
+                };
+            }
+
+            self.dirty = true;
+            let written = self.file.write(header.as_bytes())?;
+            if written != ENVELOPE_HEADER_LEN {
+                return Err(MappingEvidenceInsertError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write complete mapping-evidence record",
+                )));
+            }
+
+            match self.apply_next()? {
+                Some(Applied::MappingEvidence { id: applied }) if applied == id => Ok(()),
+                Some(_) | None => Err(MappingEvidenceInsertError::UnexpectedReadback),
             }
         })();
         let unlock = self.file.unlock();
@@ -4165,6 +4393,7 @@ impl Pile {
                     Some(Applied::WantRetract { .. }) => {}
                     Some(Applied::ArtifactOffer) => {}
                     Some(Applied::Collection { .. }) => {}
+                    Some(Applied::MappingEvidence { .. }) => {}
                     Some(Applied::CapabilityProof { .. }) => {}
                     Some(Applied::Peer { .. }) => {}
                     Some(Applied::StoreScope { .. }) => {}
@@ -4452,6 +4681,8 @@ pub struct PileReframeStats {
     pub wants: usize,
     /// Collection-calculus records re-encoded.
     pub collection_records: usize,
+    /// Unsigned mapping equations re-encoded.
+    pub mapping_evidence: usize,
     /// Complete capability proofs re-encoded.
     pub capability_proofs: usize,
     /// Positive peer-routing facts re-encoded.
@@ -4486,6 +4717,8 @@ pub enum PileReframeError {
     Want(PileWriteError),
     /// A collection record could not be appended.
     Collection(CollectionInsertError),
+    /// Mapping evidence could not be appended.
+    MappingEvidence(MappingEvidenceInsertError),
     /// A complete capability proof could not be appended.
     CapabilityProof(CapabilityProofInsertError),
     /// Positive peer-routing evidence could not be appended.
@@ -4517,6 +4750,9 @@ impl std::fmt::Display for PileReframeError {
             Self::Collection(error) => {
                 write!(f, "failed to re-encode a collection record: {error}")
             }
+            Self::MappingEvidence(error) => {
+                write!(f, "failed to re-encode mapping evidence: {error}")
+            }
             Self::CapabilityProof(error) => {
                 write!(f, "failed to re-encode a capability proof: {error}")
             }
@@ -4544,6 +4780,7 @@ impl Error for PileReframeError {
             }
             Self::StoreScope(error) => Some(error),
             Self::Collection(error) => Some(error),
+            Self::MappingEvidence(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
             Self::SourcePayload { .. } | Self::DestinationNotEmpty { .. } => None,
@@ -4672,6 +4909,12 @@ pub fn reframe_into(
                     .map_err(PileReframeError::Collection)?;
                 stats.collection_records += 1;
             }
+            PileRecordContent::MappingEvidence { evidence } => {
+                destination
+                    .insert_evidence(evidence)
+                    .map_err(PileReframeError::MappingEvidence)?;
+                stats.mapping_evidence += 1;
+            }
             PileRecordContent::CapabilityProof {
                 data_offset,
                 data_len,
@@ -4727,6 +4970,8 @@ pub struct PileRewriteStats {
     pub wants: usize,
     /// Number of complete capability proofs preserved.
     pub capability_proofs: usize,
+    /// Number of unsigned mapping equations preserved.
+    pub mapping_evidence: usize,
     /// Number of positive peer-routing facts preserved.
     pub peer_evidence: usize,
     /// Number of positive local artifact offers preserved.
@@ -4762,6 +5007,8 @@ pub enum PileRewriteError {
     Want(PileWriteError),
     /// An immutable collection-algebra record could not be appended.
     Collection(CollectionInsertError),
+    /// Unsigned mapping evidence could not be appended.
+    MappingEvidence(MappingEvidenceInsertError),
     /// A complete capability proof could not be appended.
     CapabilityProof(CapabilityProofInsertError),
     /// Positive peer-routing evidence could not be appended.
@@ -4792,6 +5039,9 @@ impl std::fmt::Display for PileRewriteError {
             Self::Collection(error) => {
                 write!(f, "failed to preserve a collection record: {error}")
             }
+            Self::MappingEvidence(error) => {
+                write!(f, "failed to preserve mapping evidence: {error}")
+            }
             Self::CapabilityProof(error) => {
                 write!(f, "failed to preserve a capability proof: {error}")
             }
@@ -4813,6 +5063,7 @@ impl Error for PileRewriteError {
             }
             Self::StoreScope(error) => Some(error),
             Self::Collection(error) => Some(error),
+            Self::MappingEvidence(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
             Self::StrongPinConflict { .. } | Self::OpaqueRecords { .. } => None,
@@ -4872,6 +5123,7 @@ impl Pile {
         }
         let strong_pins = self.branches.clone();
         let collection_records = self.collection_records.clone();
+        let mapping_evidence = self.mapping_evidence.clone();
         let mut capability_proofs =
             Vec::with_capacity(self.capability_proofs.len().min(usize::MAX as u64) as usize);
         for key in self.capability_proofs.iter_ordered() {
@@ -4996,6 +5248,16 @@ impl Pile {
                 .map_err(PileRewriteError::Collection)?;
         }
 
+        let mapping_evidence_count = mapping_evidence.len() as usize;
+        for key in mapping_evidence.clone().into_iter_ordered() {
+            let evidence = *mapping_evidence
+                .get(&key)
+                .expect("mapping-evidence key from PATCH snapshot must retain its value");
+            destination
+                .insert_evidence(evidence)
+                .map_err(PileRewriteError::MappingEvidence)?;
+        }
+
         let capability_proof_count = capability_proofs.len();
         for proof in capability_proofs {
             destination
@@ -5038,6 +5300,7 @@ impl Pile {
             strong_pins: strong_pins.len() as usize,
             wants: preserved_wants,
             capability_proofs: capability_proof_count,
+            mapping_evidence: mapping_evidence_count,
             peer_evidence: peer_evidence_count,
             artifact_offers: artifact_offer_count,
             store_scope: store_scope.is_some(),
@@ -5089,6 +5352,102 @@ mod tests {
 
     fn artifact_handle(byte: u8) -> ArtifactHandle {
         ArtifactHandle::new([byte; 32])
+    }
+
+    fn mapping_evidence(mapping: u8, input: u8, output: u8) -> MappingEvidence {
+        MappingEvidence::new(
+            Inline::new([mapping; 32]),
+            Inline::new([input; 32]),
+            Inline::new([output; 32]),
+        )
+    }
+
+    #[test]
+    fn mapping_evidence_uses_one_exact_aligned_record_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "mapping-evidence.pile");
+        let evidence = mapping_evidence(1, 2, 3);
+        let mut pile = Pile::open(&path).unwrap();
+
+        pile.insert_evidence(evidence).unwrap();
+        pile.insert_evidence(evidence).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
+        pile.close().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..FRAME_MAGIC_LEN], &FRAME_MAGIC);
+        assert_eq!(
+            &bytes[FRAME_MAGIC_LEN..FRAME_MAGIC_LEN + 4],
+            &ENVELOPE_HEADER_BLOCKS.to_le_bytes()
+        );
+        assert_eq!(&bytes[32..64], &record_kind::KIND_MAPPING_EVIDENCE);
+        assert_eq!(&bytes[64..160], evidence.as_bytes());
+        assert!(bytes[160..].iter().all(|byte| *byte == 0));
+
+        let mut records = PileRecords::open(&path).unwrap();
+        assert!(matches!(
+            records.next().unwrap().unwrap().content,
+            PileRecordContent::MappingEvidence { evidence: decoded } if decoded == evidence
+        ));
+        assert!(records.next().is_none());
+
+        let mut reopened = Pile::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .evidence()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![evidence]
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn mapping_evidence_cat_is_set_union_and_preserves_conflicting_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = fresh_empty_pile_path(&dir, "mapping-left.pile");
+        let right_path = fresh_empty_pile_path(&dir, "mapping-right.pile");
+        let merged_path = fresh_empty_pile_path(&dir, "mapping-merged.pile");
+        let low = mapping_evidence(1, 2, 3);
+        let high = mapping_evidence(1, 2, 4);
+
+        let mut left = Pile::open(&left_path).unwrap();
+        left.insert_evidence(low).unwrap();
+        left.close().unwrap();
+        let mut right = Pile::open(&right_path).unwrap();
+        right.insert_evidence(high).unwrap();
+        right.insert_evidence(low).unwrap();
+        right.close().unwrap();
+
+        let mut merged = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&merged_path)
+            .unwrap();
+        merged
+            .write_all(&std::fs::read(&left_path).unwrap())
+            .unwrap();
+        merged
+            .write_all(&std::fs::read(&right_path).unwrap())
+            .unwrap();
+        drop(merged);
+
+        let mut pile = Pile::open(&merged_path).unwrap();
+        let mut expected = vec![low, high];
+        expected.sort_unstable_by_key(|evidence| evidence.id());
+        assert_eq!(
+            pile.evidence()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+        let selectors = BTreeSet::from([MappingEvidenceSelector::MappingInput(
+            low.mapping(),
+            low.input(),
+        )]);
+        assert_eq!(pile.select_evidence(&selectors).unwrap(), expected);
+        pile.close().unwrap();
     }
 
     #[test]
@@ -5698,6 +6057,8 @@ mod tests {
         for record in &collection_records {
             pile.insert(*record).unwrap();
         }
+        let evidence = mapping_evidence(7, 8, 9);
+        pile.insert_evidence(evidence).unwrap();
         pile.close().unwrap();
 
         let expected = [
@@ -5710,6 +6071,7 @@ mod tests {
             (record_kind::KIND_COLLECTION_COMMIT, 1),
             (record_kind::KIND_COLLECTION_MERGE, 1),
             (record_kind::KIND_COLLECTION_DERIVE, 1),
+            (record_kind::KIND_MAPPING_EVIDENCE, 1),
         ];
         let mut records = PileRecords::open(&path).unwrap();
         let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
@@ -5750,6 +6112,14 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
             sorted_collection_records(collection_records)
+        );
+        assert_eq!(
+            reopened
+                .evidence()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![evidence]
         );
         reopened.close().unwrap();
     }
@@ -5939,9 +6309,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "self-describing.pile");
         let mut pile = Pile::open(&path).unwrap();
-        // Fourteen description archives plus the deduplicated name, layout, and
+        // Fifteen description archives plus the deduplicated name, layout, and
         // attribute-metafact blobs they reference.
-        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 49);
+        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 52);
 
         let branch_id = Id::new([3; 16]).unwrap();
         pile.append_legacy_pin_for_test(branch_id, None, Some(Inline::new([4; 32])))
@@ -6050,13 +6420,13 @@ mod tests {
                     );
                 }
                 CollectionRecord::Derive(derive) => {
-                    let (input, output) = derive.mapping();
+                    let (input, output) = (derive.input(), derive.output());
                     header.copy_from_slice(
                         CollectionDeriveHeaderV4 {
                             magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V4,
                             // legacy fixture: V4 named a source, V5 does not
                             source: [0; 32],
-                            target: derive.target().raw,
+                            target: derive.collection().raw,
                             input: input.raw,
                             output: output.raw,
                             reserved: [0; 112],
@@ -6914,6 +7284,7 @@ mod tests {
                 strong_pins: 1,
                 wants: 1,
                 capability_proofs: 0,
+                mapping_evidence: 0,
                 peer_evidence: 0,
                 artifact_offers: 0,
                 store_scope: false,
@@ -6969,7 +7340,7 @@ mod tests {
         let forged_metadata = source
             .put::<SimpleArchive, _>(metadata_facts.to_blob())
             .unwrap();
-        let descriptor = named_for_tests("forged", collection_test_id(22), collection_test_id(23));
+        let descriptor = named_for_tests("forged", collection_test_id(22));
         let descriptor_handle = source
             .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
                 descriptor.into_facts(),
@@ -7123,8 +7494,7 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
             .unwrap();
 
-        let descriptor =
-            named_for_tests("retained", collection_test_id(11), collection_test_id(12));
+        let descriptor = named_for_tests("retained", collection_test_id(11));
         let descriptor_handle = source
             .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
                 descriptor.into_facts(),

@@ -31,8 +31,8 @@ current WRITE admission. For every strictly verified native `COMMIT`, the
 descriptor, signed data, and metadata handles are recursive roots, so all of
 their resident attachments remain owned. This conservatism matters because a
 later positive grant may activate an already-resident commit. The descriptor is
-the canonical collection anchor, representation,
-recipe, and reach description encoded as a `SimpleArchive`; its 32-byte content
+the canonical collection anchor, representation, optional source mapping, and
+reach description encoded as a `SimpleArchive`; its 32-byte content
 handle is the `CollectionHandle` carried by the commit. The native commit record
 is preserved by `CollectionStore` rather than represented as a blob root.
 Planning an explicitly selected authoritative view fails if any required
@@ -49,14 +49,15 @@ durable ownership. This boundary also means the strong planner needs neither a
 requested-view set nor persistent validation-verdict machinery: admitted
 strictly verified commits themselves determine the collections that are retained.
 
-Exact Succinct Rank9 fibers follow the same rule. Their raw-to-Rank9 `DERIVE`
-records may survive a conservative ledger rewrite, but neither the
-ABI-qualified Rank9 descriptor nor the source-bound sidecar becomes owned by
-that unsigned equation. A later `attach_exact` treats the missing fiber as a
-cache miss and rebuilds the query accelerator transiently without writes. A
-later `ensure_exact` republishes the canonical descriptor and sidecar, reuses
-the surviving claim instead of duplicating it, and freshly verifies the exact
-raw/sidecar pair. No Rank9-specific retention record or hidden root is needed.
+Exact Succinct Rank9 fibers follow the same rule through the separate
+`MappingEvidence` set. An unsigned `(mapping, raw, sidecar)` equation may
+survive a conservative ledger rewrite, but neither the ABI-qualified mapping
+fragment nor the source-bound sidecar becomes owned by it. A later
+`attach_exact` treats missing bytes as a cache miss and rebuilds the query
+accelerator transiently without writes. A later `ensure_exact` republishes the
+mapping closure and sidecar before idempotently reinserting the evidence, then
+freshly verifies the exact raw/sidecar pair. No Rank9 collection, descriptor,
+retention record, or hidden root is needed.
 
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` accept explicit policy roots in addition to the native collection

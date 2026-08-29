@@ -959,7 +959,7 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
         let signing_key = SigningKey::generate(&mut OsRng);
         let authority = signing_key.verifying_key();
         let collection = storage
-            .collection::<simplearchive_union::SimpleArchiveUnion>(simplearchive_union::descriptor(
+            .collection::<SimpleArchive>(simplearchive_union::descriptor(
                 "materialize-bench",
                 authority,
                 reach::private(),

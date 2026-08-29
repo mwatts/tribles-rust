@@ -47,10 +47,10 @@
 //!
 //! # Identity
 //!
-//! The observed attribute is a canonical descriptor argument, the way a path
-//! collection carries its automaton fingerprint: two registers over the same
-//! dataset but different edges are distinct collections, and cannot be
-//! confused for one another's maintained artifacts.
+//! The observed attribute is a canonical mapping parameter, the way a path
+//! collection carries its automaton: two registers over the same dataset but
+//! different edges are distinct mappings and therefore distinct collections,
+//! and cannot be confused for one another's maintained artifacts.
 
 use ed25519_dalek::VerifyingKey;
 
@@ -76,13 +76,13 @@ use crate::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use super::records::{
-    collection_authority, collection_reach, collection_recipe, collection_representation,
-    collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_mapping, collection_reach, collection_representation,
+    collection_source, mapping_algorithm, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    KIND_COLLECTION_MAPPING,
 };
 use super::{
-    simplearchive_union::{self, SimpleArchiveUnion},
-    CollectionHomomorphism, CollectionLattice, CollectionLatticeError, CollectionStore,
-    CoverAttachment, FactCover, TryFromCover,
+    simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
+    CollectionStore, CoverAttachment, FactCover, TryFromCover,
 };
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
@@ -250,112 +250,107 @@ pub fn descriptor(
     authority: VerifyingKey,
     reach: Fragment,
 ) -> Fragment {
-    let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
-    let fragment = entity! { _ @
+    entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
         collection_authority: authority,
         collection_representation*: <ObservedSetBlob as MetaDescribe>::describe(),
-        collection_recipe*: <ObservedUnionV1 as MetaDescribe>::describe(),
-        register_observes: observes,
+        collection_mapping*: mapping_fragment(observes),
         collection_reach*: reach,
-    };
-    fragment
+    }
 }
 
-/// The observed-union law.
+/// Canonical fact-to-observed-state mapping algorithm, version 1.
 ///
-/// This names the law only. Which attribute is observed is a parameter on the
-/// descriptor entity, not folded into this id: a digest of an unstored
-/// argument would make the collection's meaning unrecoverable from the pile.
-pub const OBSERVED_UNION_RECIPE_V1: Id = id_hex!("A808ECA30730EF0F1C7FD96F3FC7CB03");
+/// Minted with `trible genid` on 2026-08-29.
+pub const OBSERVE_STATES_MAPPING_V1: Id = id_hex!("B94F3B23CF0A6C08ADCF8EAF55C1AB0D");
 
-/// The observed-union law, as a describable type.
-pub struct ObservedUnionV1;
+/// Self-description of the canonical observed-state projection algorithm.
+pub struct ObserveStatesMappingV1;
 
-impl MetaDescribe for ObservedUnionV1 {
+impl MetaDescribe for ObserveStatesMappingV1 {
     fn describe() -> Fragment {
-        let id: Id = OBSERVED_UNION_RECIPE_V1;
+        let id: Id = OBSERVE_STATES_MAPPING_V1;
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "observed-union-v1",
-                metadata::description: "Union of the state ids observed over one attribute: the monotone half of register resolution. Readers subtract this set from their candidates to obtain the frontier, which is why the set itself only ever grows and merges by union. Takes one argument, carried as a trible on the collection descriptor: `register_observes`, the attribute whose observations are accumulated.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+                metadata::name: "observe-states-v1",
+                metadata::description: "Canonical projection from a SimpleArchive fact set to the sorted set of state ids observed over one fixed attribute. The mapping preserves set union; its concrete mapping entity carries `register_observes`.",
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The canonical observed-set representation under the observed-union law.
-pub struct ObservedSetUnion;
+fn mapping_fragment(observes: Id) -> Fragment {
+    let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
+    entity! { _ @
+        metadata::tag: KIND_COLLECTION_MAPPING,
+        mapping_algorithm*: <ObserveStatesMappingV1 as MetaDescribe>::describe(),
+        register_observes: observes,
+    }
+}
 
-fn observed_attribute(descriptor: &Fragment) -> Result<Id, CollectionLatticeError> {
-    let raw = crate::collection::descriptor::argument(descriptor.facts(), register_observes.id())
-        .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?
-        .ok_or_else(|| {
-            CollectionLatticeError::Fatal(
-                "observed-set descriptor is missing register_observes".to_owned(),
-            )
-        })?;
+fn observed_attribute(descriptor: &Fragment) -> Result<Id, CollectionOperationError> {
+    let raw =
+        crate::collection::descriptor::mapping_argument(descriptor.facts(), register_observes.id())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
+            .ok_or_else(|| {
+                CollectionOperationError::Fatal(
+                    "observed-set mapping is missing register_observes".to_owned(),
+                )
+            })?;
     Inline::<GenId>::new(raw)
         .try_from_inline::<Id>()
         .map_err(|source| {
-            CollectionLatticeError::Fatal(format!(
+            CollectionOperationError::Fatal(format!(
                 "observed-set descriptor has an invalid register_observes: {source:?}"
             ))
         })
 }
 
-impl CollectionLattice for ObservedSetUnion {
-    type Encoding = ObservedSetBlob;
-    type Recipe = ObservedUnionV1;
-
-    fn validate_arguments(descriptor: &Fragment) -> Result<(), CollectionLatticeError> {
-        let source = crate::collection::descriptor::source(descriptor.facts())
-            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?;
-        if source.is_none() {
-            return Err(CollectionLatticeError::Fatal(
-                "observed-set descriptor is missing its source collection".to_owned(),
-            ));
-        }
-
-        observed_attribute(descriptor).map(|_| ())
-    }
-
+impl CollectionEncoding for ObservedSetBlob {
     fn validate_member(
         _descriptor: &Fragment,
-        member: &Blob<Self::Encoding>,
-    ) -> Result<(), CollectionLatticeError> {
-        validate_element(member).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+        member: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
+        validate_element(member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn merge_members(
+    fn join_members(
         _descriptor: &Fragment,
-        low: &Blob<Self::Encoding>,
-        high: &Blob<Self::Encoding>,
-    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
-        join(low, high).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
+        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
 /// Bound projection from one fact-set member to its observed-state set.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ObserveStates {
+pub struct ObserveStatesMapping {
     observes: Id,
 }
 
-impl CollectionHomomorphism<SimpleArchiveUnion, ObservedSetUnion> for ObserveStates {
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
-        Ok(Self {
-            observes: observed_attribute(target)?,
-        })
+impl CollectionMapping<SimpleArchive, ObservedSetBlob> for ObserveStatesMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        let observes = observed_attribute(target)?;
+        let actual = crate::collection::descriptor::mapping_algorithm(target.facts())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        if actual != Some(OBSERVE_STATES_MAPPING_V1) {
+            return Err(CollectionOperationError::Fatal(format!(
+                "observed-set mapping algorithm {:?} does not match observe-states algorithm {OBSERVE_STATES_MAPPING_V1:X}",
+                actual.map(|id| format!("{id:X}")),
+            )));
+        }
+        Ok(Self { observes })
     }
 
     fn map(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<ObservedSetBlob>, CollectionLatticeError> {
+    ) -> Result<Blob<ObservedSetBlob>, CollectionOperationError> {
         derive_element(source, self.observes)
-            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -405,10 +400,10 @@ impl RegisterOrder for ObservedIndex {
     }
 }
 
-impl TryFromCover<ObservedSetUnion> for ObservedIndex {
+impl TryFromCover<ObservedSetBlob> for ObservedIndex {
     type Error = ObservedSetError;
 
-    fn try_from_cover(attachment: CoverAttachment<ObservedSetUnion>) -> Result<Self, Self::Error> {
+    fn try_from_cover(attachment: CoverAttachment<ObservedSetBlob>) -> Result<Self, Self::Error> {
         let mut joined = empty();
         for segment in attachment.into_blobs() {
             joined = join(&joined, &segment)?;
@@ -541,7 +536,7 @@ impl ObservedSetCollection {
     fn kernel(
         &self,
     ) -> Result<
-        ExactDerivedCollection<SimpleArchiveUnion, ObservedSetUnion, ObserveStates>,
+        ExactDerivedCollection<SimpleArchive, ObservedSetBlob, ObserveStatesMapping>,
         ExactDerivedCollectionError,
     > {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
@@ -696,6 +691,8 @@ mod tests {
 
     #[test]
     fn the_observed_attribute_participates_in_collection_identity() {
+        use crate::collection::descriptor as descriptor_facts;
+
         let authority = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         let root = |name: &str| {
             crate::blob::IntoBlob::<SimpleArchive>::to_blob(
@@ -704,13 +701,24 @@ mod tests {
             .get_handle()
         };
         let source = root("source");
+        let observed = descriptor(
+            source,
+            metadata::supersedes.id(),
+            authority,
+            reach::private(),
+        );
+        assert_eq!(
+            descriptor_facts::mapping_argument(observed.facts(), register_observes.id()),
+            Ok(Some(
+                <Id as crate::inline::IntoInline<GenId>>::to_inline(metadata::supersedes.id()).raw,
+            ))
+        );
+        assert_eq!(
+            descriptor_facts::mapping_algorithm(observed.facts()),
+            Ok(Some(OBSERVE_STATES_MAPPING_V1))
+        );
         assert_ne!(
-            descriptor(
-                source,
-                metadata::supersedes.id(),
-                authority,
-                reach::private()
-            ),
+            observed,
             descriptor(source, metadata::tag.id(), authority, reach::private()),
             "two registers over different edges are different collections"
         );

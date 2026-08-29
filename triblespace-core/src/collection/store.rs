@@ -51,8 +51,8 @@ fn collection_record_operation(record: CollectionRecord) -> Option<WantRequest> 
             Some(WantRequest::merge(record.collection(), low, high))
         }
         CollectionRecord::Derive(record) => {
-            let (input, _) = record.mapping();
-            Some(WantRequest::derive(record.target(), input))
+            let (input, _) = (record.input(), record.output());
+            Some(WantRequest::derive(record.collection(), input))
         }
     }
 }
@@ -76,7 +76,7 @@ pub(crate) fn selectors_match_record(
             ))
         }
         CollectionRecord::Derive(derive) => {
-            selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.target()))
+            selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.collection()))
                 || selectors.contains(&CollectionRecordSelector::Operation(
                     collection_record_operation(record).expect("DERIVE has an operation key"),
                 ))
@@ -273,7 +273,7 @@ mod tests {
             .iter()
             .find(|record| match record {
                 CollectionRecord::Derive(derive) => {
-                    derive.target() == target && derive.mapping().0 == data(10)
+                    derive.collection() == target && derive.input() == data(10)
                 }
                 _ => false,
             })
@@ -300,7 +300,7 @@ mod tests {
                 CollectionRecord::Commit(_) => record.id() == commit.id(),
                 CollectionRecord::Merge(merge) => merge.collection() == source,
                 CollectionRecord::Derive(derive) => {
-                    derive.target() == target && derive.mapping().0 == data(10)
+                    derive.collection() == target && derive.input() == data(10)
                 }
             })
             .collect();
@@ -348,7 +348,7 @@ mod tests {
 
         assert_eq!(selected.len(), 3);
         assert!(selected.iter().all(|record| match record {
-            CollectionRecord::Derive(derive) => derive.target() == target,
+            CollectionRecord::Derive(derive) => derive.collection() == target,
             _ => false,
         }));
     }

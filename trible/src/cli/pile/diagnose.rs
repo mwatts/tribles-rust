@@ -567,9 +567,9 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  result: {}", hex::encode_upper(merge.result().raw));
             }
             CollectionRecord::Derive(derive) => {
-                let (input, output) = derive.mapping();
+                let (input, output) = (derive.input(), derive.output());
                 println!("  classification: collection-derive");
-                println!("  target: {}", hex::encode_upper(derive.target().raw));
+                println!("  target: {}", hex::encode_upper(derive.collection().raw));
                 println!("  input: {}", hex::encode_upper(input.raw));
                 println!("  output: {}", hex::encode_upper(output.raw));
             }

@@ -5,8 +5,7 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::{
-    simplearchive_union::{self, SimpleArchiveUnion},
-    CollectionCommit, CollectionRecord, CollectionStore, CollectionStoreExt,
+    simplearchive_union, CollectionCommit, CollectionRecord, CollectionStore, CollectionStoreExt,
 };
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::hash::Handle;
@@ -110,7 +109,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
         .unwrap();
     let source = store
-        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
+        .collection::<SimpleArchive>(simplearchive_union::descriptor(
             name,
             authority,
             reach::private(),

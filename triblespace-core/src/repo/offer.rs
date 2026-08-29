@@ -11,7 +11,10 @@ use std::fmt::{self, Debug};
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob};
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::collection::{
+    CollectionRecord, CollectionRecordSelector, CollectionStore, MappingEvidence,
+    MappingEvidenceSelector, MappingEvidenceStore,
+};
 use crate::id::{id_hex, Id};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
@@ -316,6 +319,45 @@ where
     }
 }
 
+impl<S> MappingEvidenceStore for OfferCapture<S>
+where
+    S: MappingEvidenceStore + ArtifactOfferStore,
+{
+    type EvidenceError = S::EvidenceError;
+    type InsertError = OfferCaptureInsertError<S::OfferError, S::InsertError>;
+    type EvidenceIter<'a>
+        = S::EvidenceIter<'a>
+    where
+        Self: 'a;
+
+    fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+        self.inner.evidence()
+    }
+
+    fn evidence_by_id(&mut self, id: Id) -> Result<Option<MappingEvidence>, Self::EvidenceError> {
+        self.inner.evidence_by_id(id)
+    }
+
+    fn select_evidence(
+        &mut self,
+        selectors: &BTreeSet<MappingEvidenceSelector>,
+    ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
+        self.inner.select_evidence(selectors)
+    }
+
+    fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
+        if let Err(source) = self.offer_pending() {
+            return Err(OfferCaptureInsertError::Offer {
+                source,
+                artifacts: self.pending.iter().copied().collect(),
+            });
+        }
+        self.inner
+            .insert_evidence(evidence)
+            .map_err(OfferCaptureInsertError::Insert)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +407,7 @@ mod tests {
         Put(ArtifactHandle),
         Offer(Vec<ArtifactHandle>),
         Insert(Id),
+        InsertEvidence(Id),
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +426,7 @@ mod tests {
         events: Vec<ProbeEvent>,
         offers: ArtifactOfferSnapshot,
         records: Vec<CollectionRecord>,
+        evidence: Vec<MappingEvidence>,
         fail_offer: bool,
         fail_insert: bool,
     }
@@ -458,6 +502,34 @@ mod tests {
         }
     }
 
+    impl MappingEvidenceStore for ProbeStore {
+        type EvidenceError = Infallible;
+        type InsertError = ProbeError;
+        type EvidenceIter<'a>
+            = std::vec::IntoIter<Result<MappingEvidence, Infallible>>
+        where
+            Self: 'a;
+
+        fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+            Ok(self
+                .evidence
+                .clone()
+                .into_iter()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+
+        fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
+            self.events.push(ProbeEvent::InsertEvidence(evidence.id()));
+            if self.fail_insert {
+                return Err(ProbeError("insert"));
+            }
+            self.evidence.push(evidence);
+            Ok(())
+        }
+    }
+
     fn merge_record(byte: u8) -> CollectionRecord {
         let collection = CollectionHandle::new([byte; INLINE_LEN]);
         let data = |offset| CollectionData::new([byte.wrapping_add(offset); INLINE_LEN]);
@@ -488,6 +560,29 @@ mod tests {
             ]
         );
         assert!(capture.pending().next().is_none());
+    }
+
+    #[test]
+    fn capture_offers_mapping_output_before_evidence() {
+        let mut capture = OfferCapture::new(ProbeStore::default());
+        let output = capture
+            .put::<UnknownBlob, _>(blob(b"mapped output"))
+            .unwrap();
+        let evidence = MappingEvidence::new(
+            Inline::new([3; INLINE_LEN]),
+            CollectionData::new([4; INLINE_LEN]),
+            CollectionData::new(output.raw),
+        );
+        capture.insert_evidence(evidence).unwrap();
+
+        assert_eq!(
+            capture.inner().events,
+            vec![
+                ProbeEvent::Put(output),
+                ProbeEvent::Offer(vec![output]),
+                ProbeEvent::InsertEvidence(evidence.id()),
+            ]
+        );
     }
 
     #[test]

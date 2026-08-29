@@ -29,11 +29,14 @@ use triblespace_core::capability::{
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::{
     ACTION_WRITE, CapabilityPresentation, CollectionCommit, CollectionData, CollectionDerive,
-    CollectionHandle, CollectionHomomorphism, CollectionLattice, CollectionLatticeError,
-    CollectionMerge, CollectionRecord, CollectionStore, CollectionStoreExt,
-    KIND_COLLECTION_DESCRIPTOR, collection_authority, collection_reach, collection_recipe,
-    collection_representation, collection_source, simplearchive_union,
+    CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
+    CollectionOperationError, CollectionRecord, CollectionStore, CollectionStoreExt,
+    KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING, collection_authority, collection_mapping,
+    collection_reach, collection_representation, collection_source, mapping_algorithm,
+    simplearchive_union,
 };
+use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::id_hex;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -98,36 +101,52 @@ fn write_presentation(
     )
 }
 
-fn derive_test_target(source: &Blob<SimpleArchive>) -> Blob<UnknownBlob> {
+fn derive_test_target(source: &Blob<SimpleArchive>) -> Blob<NetworkTestBlob> {
     let mut bytes = source.bytes.as_ref().to_vec();
     bytes.push(0xA5);
     Blob::new(bytes.into())
 }
 
-struct NetworkTestTarget;
+/// Test-only canonical encoding for `SimpleArchive || 0xA5`.
+///
+/// Minted with `trible genid` on 2026-08-29.
+const NETWORK_TEST_ENCODING_V1: Id = id_hex!("224699625029586DB99F9126274AFAA6");
 
-impl CollectionLattice for NetworkTestTarget {
-    type Encoding = UnknownBlob;
-    type Recipe = simplearchive_union::TribleSetUnionV1;
+struct NetworkTestBlob;
 
+impl BlobEncoding for NetworkTestBlob {}
+
+impl MetaDescribe for NetworkTestBlob {
+    fn describe() -> Fragment {
+        let id = NETWORK_TEST_ENCODING_V1;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "network-test-suffixed-simplearchive-v1",
+                metadata::description: "Test-only canonical encoding formed by appending 0xA5 to one SimpleArchive.",
+                metadata::tag: metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
+impl CollectionEncoding for NetworkTestBlob {
     fn validate_member(
         _descriptor: &Fragment,
-        target: &Blob<UnknownBlob>,
-    ) -> Result<(), CollectionLatticeError> {
+        target: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
         let Some(source) = target.bytes.as_ref().strip_suffix(&[0xA5]) else {
-            return Err(CollectionLatticeError::Fatal(
+            return Err(CollectionOperationError::Fatal(
                 "network-test target lacks its canonical suffix".to_owned(),
             ));
         };
         simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
-            .map_err(|error| CollectionLatticeError::Fatal(error.to_string()))
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 
-    fn merge_members(
+    fn join_members(
         descriptor: &Fragment,
-        low: &Blob<UnknownBlob>,
-        high: &Blob<UnknownBlob>,
-    ) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
         Self::validate_member(descriptor, low)?;
         Self::validate_member(descriptor, high)?;
         let low =
@@ -136,23 +155,54 @@ impl CollectionLattice for NetworkTestTarget {
             Blob::<SimpleArchive>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
         simplearchive_union::join(&low, &high)
             .map(|joined| derive_test_target(&joined))
-            .map_err(|error| CollectionLatticeError::Fatal(error.to_string()))
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 }
 
-struct NetworkTestHomomorphism;
+/// Test-only parameter-free mapping algorithm from `SimpleArchive` to
+/// [`NetworkTestBlob`]. Minted with `trible genid` on 2026-08-29.
+const NETWORK_TEST_MAPPING_V1: Id = id_hex!("3583CB1905A2D1BC27821EC36FDD6B18");
 
-impl CollectionHomomorphism<simplearchive_union::SimpleArchiveUnion, NetworkTestTarget>
-    for NetworkTestHomomorphism
-{
-    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+struct NetworkTestMappingV1;
+
+impl MetaDescribe for NetworkTestMappingV1 {
+    fn describe() -> Fragment {
+        let id = NETWORK_TEST_MAPPING_V1;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "network-test-suffix-mapping-v1",
+                metadata::description: "Test-only canonical mapping that appends 0xA5 to a SimpleArchive.",
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+fn network_test_mapping_fragment() -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_MAPPING,
+        mapping_algorithm*: <NetworkTestMappingV1 as MetaDescribe>::describe(),
+    }
+}
+
+struct NetworkTestMapping;
+
+impl CollectionMapping<SimpleArchive, NetworkTestBlob> for NetworkTestMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        let actual = triblespace_core::collection::descriptor::mapping_algorithm(target.facts())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        if actual != Some(NETWORK_TEST_MAPPING_V1) {
+            return Err(CollectionOperationError::Fatal(format!(
+                "network-test mapping algorithm {:?} does not match {NETWORK_TEST_MAPPING_V1:X}",
+                actual.map(|id| format!("{id:X}")),
+            )));
+        }
         Ok(Self)
     }
 
     fn map(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+    ) -> Result<Blob<NetworkTestBlob>, CollectionOperationError> {
         Ok(derive_test_target(source))
     }
 }
@@ -170,8 +220,8 @@ fn network_target_descriptor(
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
         collection_authority: authority,
-        collection_representation*: <UnknownBlob as MetaDescribe>::describe(),
-        collection_recipe*: <simplearchive_union::TribleSetUnionV1 as MetaDescribe>::describe(),
+        collection_representation*: <NetworkTestBlob as MetaDescribe>::describe(),
+        collection_mapping*: network_test_mapping_fragment(),
         collection_reach*: reach::private(),
     }
 }
@@ -386,21 +436,21 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
             simplearchive_union::descriptor("network-empty-source", namespace, reach::private());
         let target_descriptor =
             network_target_descriptor(descriptor_handle(&source_descriptor), namespace);
-        let lifecycle = ExactDerivedCollection::<
-            simplearchive_union::SimpleArchiveUnion,
-            NetworkTestTarget,
-            NetworkTestHomomorphism,
-        >::new(source_descriptor.clone(), target_descriptor.clone())
-        .unwrap();
+        let lifecycle =
+            ExactDerivedCollection::<SimpleArchive, NetworkTestBlob, NetworkTestMapping>::new(
+                source_descriptor.clone(),
+                target_descriptor.clone(),
+            )
+            .unwrap();
         let mut client_store = empty_store();
         let source_collection = client_store
             .collection(lifecycle.source_descriptor().clone())
             .unwrap();
         let source_cover = client_store.cover(source_collection, &[]).unwrap();
 
-        let lower_a = Blob::<UnknownBlob>::new(vec![0x31].into());
-        let lower_b = Blob::<UnknownBlob>::new(vec![0x32].into());
-        let upper = Blob::<UnknownBlob>::new(vec![0x33].into());
+        let lower_a = Blob::<NetworkTestBlob>::new(vec![0x31].into());
+        let lower_b = Blob::<NetworkTestBlob>::new(vec![0x32].into());
+        let upper = Blob::<NetworkTestBlob>::new(vec![0x33].into());
         let marker = CollectionMerge::new(
             lifecycle.target_collection().handle(),
             collection_data(&lower_a),
@@ -488,12 +538,12 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
             simplearchive_union::descriptor("scope-conflict-source", namespace, reach::private());
         let target_descriptor =
             network_target_descriptor(descriptor_handle(&source_descriptor), namespace);
-        let lifecycle = ExactDerivedCollection::<
-            simplearchive_union::SimpleArchiveUnion,
-            NetworkTestTarget,
-            NetworkTestHomomorphism,
-        >::new(source_descriptor.clone(), target_descriptor.clone())
-        .unwrap();
+        let lifecycle =
+            ExactDerivedCollection::<SimpleArchive, NetworkTestBlob, NetworkTestMapping>::new(
+                source_descriptor.clone(),
+                target_descriptor.clone(),
+            )
+            .unwrap();
 
         let mut serving = Pile::open(&serving_path).unwrap();
         serving.bind_store_scope(serving_team).unwrap();
@@ -574,12 +624,12 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             simplearchive_union::descriptor("network-cover-source", namespace, reach::private());
         let target_descriptor =
             network_target_descriptor(descriptor_handle(&source_descriptor), namespace);
-        let lifecycle = ExactDerivedCollection::<
-            simplearchive_union::SimpleArchiveUnion,
-            NetworkTestTarget,
-            NetworkTestHomomorphism,
-        >::new(source_descriptor.clone(), target_descriptor.clone())
-        .unwrap();
+        let lifecycle =
+            ExactDerivedCollection::<SimpleArchive, NetworkTestBlob, NetworkTestMapping>::new(
+                source_descriptor.clone(),
+                target_descriptor.clone(),
+            )
+            .unwrap();
 
         let sources = [content_blob(0x71).0, content_blob(0x81).0];
         let targets = [
@@ -587,7 +637,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             derive_test_target(&sources[1]),
         ];
         let upper =
-            NetworkTestTarget::merge_members(&target_descriptor, &targets[0], &targets[1]).unwrap();
+            NetworkTestBlob::join_members(&target_descriptor, &targets[0], &targets[1]).unwrap();
 
         let mut client_store = empty_store();
         let source_collection = client_store
@@ -634,7 +684,9 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
 
         let mut server_store = empty_store();
         for target in &targets {
-            server_store.put::<UnknownBlob, _>(target.clone()).unwrap();
+            server_store
+                .put::<NetworkTestBlob, _>(target.clone())
+                .unwrap();
         }
         let derives: Vec<_> = sources
             .iter()

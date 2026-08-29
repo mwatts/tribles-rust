@@ -187,7 +187,7 @@ cover replaces ambient heads, commit-chain traversal, manifests, registered
 hooks, and range planning.
 
 The derivation selects a target `Cover` whose support equals the source cover;
-the same value type represents both lattice positions. The path recipe permits
+the same value type represents both lattice positions. The path mapping permits
 any validated combination of source merges, target merges, and derivations
 with that support, so route choice is not encoded as a cover mode.
 

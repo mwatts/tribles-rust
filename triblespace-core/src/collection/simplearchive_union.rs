@@ -2,11 +2,9 @@
 //! [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive)
 //! elements.
 //!
-//! This is the first concrete production collection kind. A collection pairs
-//! a UTF-8 name and mandatory authority with the existing `SimpleArchive`
-//! representation and the
-//! [`TRIBLE_SET_UNION_RECIPE_V1`](crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1)
-//! semantic recipe. Every element is an exact, canonical EAV-ordered stream of
+//! This is the first concrete production collection encoding. A collection
+//! pairs a UTF-8 name and mandatory authority with the existing
+//! `SimpleArchive` representation. Every element is an exact, canonical EAV-ordered stream of
 //! 64-byte tribles. Its join is ordinary set union, so canonical output bytes
 //! and their Blake3 identity are associative, commutative, and idempotent.
 //!
@@ -17,7 +15,6 @@
 //! equation until its three blobs are resident, then call
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
-use crate::id::ExclusiveId;
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
 #[cfg(test)]
@@ -27,8 +24,8 @@ use crate::prelude::entity;
 use ed25519_dalek::VerifyingKey;
 
 use super::records::{
-    collection_authority, collection_name, collection_reach, collection_recipe,
-    collection_representation, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_name, collection_reach, collection_representation,
+    RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -43,6 +40,7 @@ use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::id::Id;
+#[cfg(test)]
 use crate::id_hex;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
@@ -55,8 +53,8 @@ use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::descriptor as descriptor_facts;
 use super::{
-    CollectionCommit, CollectionData, CollectionHandle, CollectionLattice, CollectionLatticeError,
-    CollectionMerge, CollectionRecord, CollectionStore,
+    CollectionCommit, CollectionData, CollectionEncoding, CollectionHandle, CollectionMerge,
+    CollectionOperationError, CollectionRecord, CollectionStore,
 };
 
 mod collection;
@@ -64,55 +62,21 @@ mod materialize;
 pub use collection::*;
 pub use materialize::*;
 
-/// Canonical TribleSet set-union recipe, version 1.
-///
-/// This identifies the semantic law independently of its direct-stream
-/// implementation and of the collection's blob representation. Minted with
-/// `trible genid` on 2026-08-07.
-pub const TRIBLE_SET_UNION_RECIPE_V1: Id = id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45");
-
-/// The TribleSet set-union law, as a describable type.
-///
-/// A descriptor embeds this description rather than only the id above, so a
-/// reader holding the pile can learn what the law is without the code that
-/// minted it.
-pub struct TribleSetUnionV1;
-
-impl MetaDescribe for TribleSetUnionV1 {
-    fn describe() -> Fragment {
-        let id: Id = TRIBLE_SET_UNION_RECIPE_V1;
-        entity! {
-            ExclusiveId::force_ref(&id) @
-                metadata::name: "trible-set-union-v1",
-                metadata::description: "Set union of the tribles carried by a collection's elements. Associative, commutative and idempotent, so any two states have a least upper bound and merging is order-independent: a collection's value is the union over every element committed to it, and two replicas that have seen the same elements agree regardless of the order they arrived in. Takes no arguments.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
-        }
-    }
-}
-
-/// The canonical SimpleArchive representation of the trible-set union law.
-///
-/// The recipe is intentionally shared with the Succinct representation; this
-/// marker names their representation-and-law pair at the Rust API boundary.
-pub struct SimpleArchiveUnion;
-
-impl CollectionLattice for SimpleArchiveUnion {
-    type Encoding = SimpleArchive;
-    type Recipe = TribleSetUnionV1;
-
+impl CollectionEncoding for SimpleArchive {
     fn validate_member(
         _descriptor: &Fragment,
-        member: &Blob<Self::Encoding>,
-    ) -> Result<(), CollectionLatticeError> {
-        validate_element(member).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+        member: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
+        validate_element(member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn merge_members(
+    fn join_members(
         _descriptor: &Fragment,
-        low: &Blob<Self::Encoding>,
-        high: &Blob<Self::Encoding>,
-    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
-        join(low, high).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
+        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -147,8 +111,6 @@ pub enum SimpleArchiveUnionValidationError {
     Malformed(RecordDecodeError),
     /// The descriptor names another blob representation.
     WrongRepresentation { expected: Id, actual: Id },
-    /// The descriptor names another semantic recipe.
-    WrongRecipe { expected: Id, actual: Id },
     /// The record belongs to another collection descriptor.
     WrongCollection {
         expected: CollectionHandle,
@@ -176,10 +138,6 @@ impl fmt::Display for SimpleArchiveUnionValidationError {
             Self::WrongRepresentation { expected, actual } => write!(
                 f,
                 "collection representation {actual:X} does not match SimpleArchive {expected:X}"
-            ),
-            Self::WrongRecipe { expected, actual } => write!(
-                f,
-                "collection recipe {actual:X} does not match TribleSet union {expected:X}"
             ),
             Self::WrongCollection { expected, actual } => write!(
                 f,
@@ -498,8 +456,9 @@ where
 /// Describe this collection kind as a named root under one authority.
 ///
 /// This is the one home for what a `SimpleArchive` set-union collection *is*:
-/// that representation, that recipe. Everything else about a particular
-/// collection -- which one it is -- is the name and authority passed in.
+/// the encoding description names both its canonical bytes and intra-encoding
+/// join. Everything else about a particular collection -- which one it is --
+/// is the name and authority passed in.
 /// Authority is mandatory and participates directly in descriptor identity.
 ///
 /// It returns the facts, not a handle. Getting a handle means putting the
@@ -513,7 +472,6 @@ pub fn descriptor(name: &str, authority: VerifyingKey, reach: Fragment) -> Fragm
         collection_name: name.to_owned(),
         collection_authority: authority,
         collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
-        collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
         collection_reach*: reach,
     }
 }
@@ -1084,13 +1042,6 @@ fn validate_descriptor(descriptor: &Fragment) -> Result<(), SimpleArchiveUnionVa
             actual: representation,
         });
     }
-    let recipe = descriptor_facts::recipe(descriptor.facts())?;
-    if recipe != TRIBLE_SET_UNION_RECIPE_V1 {
-        return Err(SimpleArchiveUnionValidationError::WrongRecipe {
-            expected: TRIBLE_SET_UNION_RECIPE_V1,
-            actual: recipe,
-        });
-    }
     Ok(())
 }
 
@@ -1275,15 +1226,13 @@ mod tests {
         super::descriptor(name, test_team(), reach::private())
     }
 
-    /// The same anchor as `root("first")`, but naming a different
-    /// representation or recipe: a different collection of a shape this kind
-    /// does not accept.
-    fn test_naming(representation: Id, recipe: Id) -> Fragment {
+    /// The same anchor as `root("first")`, but naming a different physical
+    /// encoding: a collection this implementation does not accept.
+    fn test_naming(representation: Id) -> Fragment {
         crate::collection::descriptor::naming(
             "first",
             test_team(),
             representation,
-            recipe,
             reach::private(),
         )
     }
@@ -2163,7 +2112,7 @@ mod tests {
     fn publication_rejects_every_invalid_input_before_writing() {
         let (descriptor, data_blob, metadata, signing_key, _) = commit_fixture();
         let mut store = ProbeStore::default();
-        let wrong_descriptor = test_naming(id(8), TRIBLE_SET_UNION_RECIPE_V1);
+        let wrong_descriptor = test_naming(id(8));
         assert!(matches!(
             publish_commit(
                 &mut store,
@@ -2349,10 +2298,6 @@ mod tests {
         assert_eq!(
             <SimpleArchive as MetaDescribe>::id(),
             id_hex!("8F4A27C8581DADCBA1ADA8BA228069B6")
-        );
-        assert_eq!(
-            TRIBLE_SET_UNION_RECIPE_V1,
-            id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45")
         );
         assert_eq!(
             crate::collection::descriptor::authority(descriptor.facts()).unwrap(),
@@ -2544,16 +2489,10 @@ mod tests {
         );
         validate_commit(&descriptor, &commit, &blob).unwrap();
 
-        let wrong_representation = test_naming(id(9), TRIBLE_SET_UNION_RECIPE_V1);
+        let wrong_representation = test_naming(id(9));
         assert!(matches!(
             validate_commit(&wrong_representation, &commit, &blob),
             Err(SimpleArchiveUnionValidationError::WrongRepresentation { .. })
-        ));
-
-        let wrong_recipe = test_naming(<SimpleArchive as MetaDescribe>::id(), id(9));
-        assert!(matches!(
-            validate_commit(&wrong_recipe, &commit, &blob),
-            Err(SimpleArchiveUnionValidationError::WrongRecipe { .. })
         ));
 
         let other_descriptor = root("second");

@@ -13,16 +13,18 @@ merge or derivation equations provide reusable physical work.
 - **`CollectionStore`** — a grow-only set of native `COMMIT`, `MERGE`, and
   `DERIVE` records.
 - **Collection descriptor** — a canonical `SimpleArchive` which describes a
-  collection's anchor, element representation, join recipe, and reach law. Its
-  content handle is the `CollectionHandle`.
-- **`Collection<L>`** — a cheap descriptor handle whose Rust lattice type `L`
-  fixes both the member encoding and join recipe. Constructing it validates
-  that the runtime descriptor names exactly that pair.
-- **`Cover<L>`** — one typed collection identity plus a PATCH of distinct
-  `Handle<L::Encoding>` members selected for one read or derivation.
+  collection's anchor, member encoding, and reach law. A derived descriptor
+  additionally links one concrete mapping entity carrying its algorithm and
+  concrete parameters. The descriptor's content handle is the
+  `CollectionHandle`.
+- **`Collection<E>`** — a cheap descriptor handle whose
+  `CollectionEncoding` type `E` owns the canonical member bytes, validation,
+  and join. Constructing it validates that the runtime descriptor names `E`.
+- **`Cover<E>`** — one typed collection identity plus a PATCH of distinct
+  `Handle<E>` members selected for one read or derivation.
   Signatures, authors, and metadata remain queryable provenance, but are not
   coordinates of the value.
-- **`TryFromCover<L>`** — reconstruction of one logical value from validated
+- **`TryFromCover<E>`** — reconstruction of one logical view from validated
   physical members. A view may join eagerly or retain mmap-backed shards and
   query their union lazily.
 - **WANT** — an orthogonal local request for content or existing computation;
@@ -46,8 +48,9 @@ use triblespace::core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode,
     CapabilityProofBundle, CapabilityResource,
 };
-use triblespace::core::collection::{
-    reach, simplearchive_union::{self, SimpleArchiveUnion}, ACTION_WRITE,
+use triblespace::core::{
+    blob::encodings::simplearchive::SimpleArchive,
+    collection::{reach, simplearchive_union, ACTION_WRITE},
 };
 use triblespace::prelude::*;
 
@@ -56,7 +59,7 @@ let writer = SigningKey::generate(&mut OsRng);
 let team = team_key.verifying_key();
 let writer_subject = writer.verifying_key();
 let mut storage = MemoryRepo::default();
-let models = storage.collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
+let models = storage.collection::<SimpleArchive>(simplearchive_union::descriptor(
     "models",
     team,
     reach::private(),
@@ -106,7 +109,7 @@ One `store.commit(collection, signer, fragment)` performs these semantic steps:
 
 1. fetch and exact-validate the already registered descriptor;
 2. store the fragment's attachments;
-3. encode the value using the lattice's canonical member encoding;
+3. encode the value using `E`'s canonical member encoding;
 4. encode metafacts as the mandatory canonical metadata `SimpleArchive`;
 5. durably offer those dependencies; and
 6. insert a signed `COMMIT` naming the descriptor, data, and metadata handles.
@@ -130,28 +133,30 @@ DERIVE(target, input, output)                          //  96 bytes
 
 `COMMIT` is a signed exogenous assertion: no machine can recompute whether an
 author intended to publish a member. `MERGE` is an exact join equation within
-one collection. `DERIVE` is one observation of the join homomorphism described
-by its target descriptor; the target already names its source and recipe.
+one collection. `DERIVE` is one observation of the mapping linked by its
+target descriptor; that descriptor already names its source, mapping
+algorithm, and concrete mapping parameters.
 
 Merge inputs are canonically ordered and every record has an intrinsic ID over
 its kind and exact payload. `CollectionStore::insert` therefore implements set
 insertion rather than an update. Concatenating stores unions evidence.
 
 Unsigned equations are replaceable computation, not authority. A resolver
-admits them only when the declared recipe and content identities validate. An
-invalid or unavailable result is a cache miss and cannot suppress an explicit
-cover member.
+admits them only when the target encoding, declared mapping algorithm and
+parameters, and content identities validate. An invalid or unavailable result is a cache miss and
+cannot suppress an explicit cover member.
 
 ## Known-prefix snapshots and covers
 
 `store.snapshot(collection, presentations)` observes one clock instant,
 verifies every explicit capability presentation against the descriptor's
 authority, then discovers strictly verified commits by the resulting subjects.
-Their distinct data handles form a `Cover<L>`. It opens one target reader and
-materializes only that payload set. The returned `Snapshot<L, V, R>` keeps the
-logical value `V`, exact cover, and reader together so downstream code cannot
-accidentally pair one logical frontier with a different physical view. For a
-`SimpleArchiveUnion`, `V = TribleSet`; for a `SuccinctArchiveUnion`, `V` may be
+Their distinct data handles form a `Cover<E>`. It opens one target reader and
+constructs a logical view from only that payload set. The returned
+`Snapshot<E, V, R>` keeps the logical view `V`, exact cover, and reader together
+so downstream code cannot accidentally pair one logical frontier with a
+different physical view. For a
+`SimpleArchive`, `V = TribleSet`; for a `SuccinctArchiveBlob`, `V` may be
 an mmap-backed `UnionArchive` retaining all selected shards.
 
 This is a coherent **known-prefix** observation, not a global latest
@@ -201,7 +206,8 @@ never a second history or a new authority root.
 
 ## Derive another representation
 
-Suppose `f` is a canonical join homomorphism:
+Suppose `f` is a canonical join homomorphism, represented in the API by a
+`CollectionMapping<Source, Target>`:
 
 ```text
 f(a ⊔ b) = f(a) ⊔ f(b)
@@ -235,19 +241,22 @@ let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 - `compact_exact` performs explicit deterministic tiered merges for the same
   source cover.
 
-Every position uses the same `Cover<L>` shape, but its typed handles cannot be
-mixed across representations. `Cover<SimpleArchiveUnion>` contains only
-`Handle<SimpleArchive>`; `Cover<SuccinctArchiveUnion>` contains only
+Every position uses the same `Cover<E>` shape, but its typed handles cannot be
+mixed across representations. `Cover<SimpleArchive>` contains only
+`Handle<SimpleArchive>`; `Cover<SuccinctArchiveBlob>` contains only
 `Handle<SuccinctArchiveBlob>`. The target descriptor and its bound
-`CollectionHomomorphism<Source, Target>` determine route freedom: ordinary
+`CollectionMapping<Source, Target>` determine route freedom: ordinary
 Succinct derivation may choose any cheapest validated route whose support
 equals the source cover, while Rank9 consumes the exact immediate raw Succinct
 cover selected upstream. Exactness is a property of the map, not a mode bit or
 an untyped hash convention.
 
 None of them signs a replacement root, advances a head, flushes implicitly, or
-adds a special manifest. Rank9 fibers and [regular-path
-summaries](regular-path-indexes.md) use the same collection algebra.
+adds a special manifest. [Regular-path
+summaries](regular-path-indexes.md) use the collection algebra. Rank9 instead
+uses the smaller mapping-evidence substrate because its sidecar has no
+independent join: exact `(mapping, raw, sidecar)` equations are cache hints,
+not collection records.
 
 ## WANT missing content or computation
 
@@ -258,7 +267,7 @@ Sparse evidence discovery deliberately does not fetch commit dependencies.
 - `Merge(collection, low, high)` — discover an existing matching merge result;
   and
 - `Derive(target, input)` — discover an existing matching derivation; the
-  target descriptor already names the source collection and recipe.
+  target descriptor already names the source collection and concrete mapping.
 
 A reconciler may satisfy those questions from local workers or peers. The
 answer to an operation WANT is the ordinary native equation; obtaining its

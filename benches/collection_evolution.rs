@@ -13,7 +13,7 @@
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
-//! state; a bench-local homomorphism wrapper performs one untimed, zero-write
+//! state; a bench-local mapping wrapper performs one untimed, zero-write
 //! raw fresh attachment for stateless arms to expose replay work that store
 //! totals hide. The maintained view reports the canonical projection calls
 //! made during its timed observation, so continuation reuse is measured rather
@@ -52,55 +52,53 @@ use triblespace_core::blob::Blob;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::reach;
 use triblespace_core::collection::succinctarchive_union::{
-    SimpleArchiveToSuccinctArchive, SuccinctArchiveCollection, SuccinctArchiveUnion,
+    rank9_mapping_fragment, SimpleToSuccinctMapping, SuccinctArchiveCollection,
     SuccinctArchiveView, SuccinctArchiveViewWork,
 };
 use triblespace_core::collection::{
-    simplearchive_union, Collection, CollectionHandle, CollectionHomomorphism,
-    CollectionLatticeError, CollectionRecord, CollectionStore, CollectionStoreExt, CoverAttachment,
-    FactCover,
+    simplearchive_union, Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
+    CollectionRecord, CollectionStore, CollectionStoreExt, Cover, CoverAttachment,
+    MappingEvidenceStore, MappingHandle,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreList, StoreRevision};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct HomomorphismCalls {
+struct MappingCalls {
     derive: u64,
     input_bytes: u64,
 }
 
 thread_local! {
-    static HOMOMORPHISM_CALLS: Cell<HomomorphismCalls> =
-        const { Cell::new(HomomorphismCalls { derive: 0, input_bytes: 0 }) };
+    static MAPPING_CALLS: Cell<MappingCalls> =
+        const { Cell::new(MappingCalls { derive: 0, input_bytes: 0 }) };
 }
 
-fn reset_homomorphism_calls() {
-    HOMOMORPHISM_CALLS.set(HomomorphismCalls::default());
+fn reset_mapping_calls() {
+    MAPPING_CALLS.set(MappingCalls::default());
 }
 
-fn homomorphism_calls() -> HomomorphismCalls {
-    HOMOMORPHISM_CALLS.get()
+fn mapping_calls() -> MappingCalls {
+    MAPPING_CALLS.get()
 }
 
-struct CountingSuccinctHomomorphism {
-    inner: SimpleArchiveToSuccinctArchive,
+struct CountingSuccinctMapping {
+    inner: SimpleToSuccinctMapping,
 }
 
-impl CollectionHomomorphism<simplearchive_union::SimpleArchiveUnion, SuccinctArchiveUnion>
-    for CountingSuccinctHomomorphism
-{
-    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for CountingSuccinctMapping {
+    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         Ok(Self {
-            inner: SimpleArchiveToSuccinctArchive::bind(source, target)?,
+            inner: SimpleToSuccinctMapping::bind(source, target)?,
         })
     }
 
     fn map(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionLatticeError> {
-        HOMOMORPHISM_CALLS.with(|slot| {
+    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError> {
+        MAPPING_CALLS.with(|slot| {
             let mut calls = slot.get();
             calls.derive += 1;
             calls.input_bytes += source.bytes.len() as u64;
@@ -119,8 +117,7 @@ struct StoreShape {
     source_merges: u64,
     raw_derives: u64,
     raw_merges: u64,
-    rank9_derives: u64,
-    rank9_merges: u64,
+    rank9_evidence: u64,
     other_records: u64,
 }
 
@@ -134,8 +131,7 @@ impl StoreShape {
             source_merges: self.source_merges + other.source_merges,
             raw_derives: self.raw_derives + other.raw_derives,
             raw_merges: self.raw_merges + other.raw_merges,
-            rank9_derives: self.rank9_derives + other.rank9_derives,
-            rank9_merges: self.rank9_merges + other.rank9_merges,
+            rank9_evidence: self.rank9_evidence + other.rank9_evidence,
             other_records: self.other_records + other.other_records,
         }
     }
@@ -149,8 +145,7 @@ impl StoreShape {
             source_merges: self.source_merges - before.source_merges,
             raw_derives: self.raw_derives - before.raw_derives,
             raw_merges: self.raw_merges - before.raw_merges,
-            rank9_derives: self.rank9_derives - before.rank9_derives,
-            rank9_merges: self.rank9_merges - before.rank9_merges,
+            rank9_evidence: self.rank9_evidence - before.rank9_evidence,
             other_records: self.other_records - before.other_records,
         }
     }
@@ -159,7 +154,7 @@ impl StoreShape {
 struct Collections {
     source: CollectionHandle,
     raw: CollectionHandle,
-    rank9: CollectionHandle,
+    rank9_mapping: MappingHandle,
 }
 
 fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape {
@@ -172,19 +167,20 @@ fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape 
             CollectionRecord::Merge(merge) if merge.collection() == collections.source => {
                 shape.source_merges += 1;
             }
-            CollectionRecord::Derive(derive) if derive.target() == collections.raw => {
+            CollectionRecord::Derive(derive) if derive.collection() == collections.raw => {
                 shape.raw_derives += 1;
             }
             CollectionRecord::Merge(merge) if merge.collection() == collections.raw => {
                 shape.raw_merges += 1;
             }
-            CollectionRecord::Derive(derive) if derive.target() == collections.rank9 => {
-                shape.rank9_derives += 1;
-            }
-            CollectionRecord::Merge(merge) if merge.collection() == collections.rank9 => {
-                shape.rank9_merges += 1;
-            }
             _ => shape.other_records += 1,
+        }
+    }
+
+    for evidence in store.evidence().expect("enumerate mapping evidence") {
+        let evidence = evidence.expect("MemoryRepo mapping evidence is infallible");
+        if evidence.mapping() == collections.rank9_mapping {
+            shape.rank9_evidence += 1;
         }
     }
 
@@ -229,7 +225,7 @@ struct CoverIdentity {
     hash: [u8; 32],
 }
 
-fn cover_identity(cover: &CoverAttachment<SuccinctArchiveUnion>) -> CoverIdentity {
+fn cover_identity(cover: &CoverAttachment<SuccinctArchiveBlob>) -> CoverIdentity {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0u64;
     for (data, blob) in cover.members() {
@@ -254,7 +250,7 @@ impl Operation {
         self,
         succinct: &SuccinctArchiveCollection,
         store: &mut MemoryRepo,
-        cover: &FactCover,
+        cover: &Cover<SimpleArchive>,
     ) -> UnionArchive<OrderedUniverse> {
         match self {
             Self::Ensure => succinct
@@ -310,7 +306,7 @@ struct Sample {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Diagnostic {
     StatelessReplay {
-        calls: HomomorphismCalls,
+        calls: MappingCalls,
         cover: CoverIdentity,
     },
     ViewActual(SuccinctArchiveViewWork),
@@ -322,23 +318,19 @@ struct TimedOperation {
 }
 
 struct RunContext<'a> {
-    cover: &'a FactCover,
+    cover: &'a Cover<SimpleArchive>,
     total_rows: u64,
     newly_supported_rows: u64,
     expected: RelationIdentity,
     succinct: &'a SuccinctArchiveCollection,
-    exact: &'a ExactDerivedCollection<
-        simplearchive_union::SimpleArchiveUnion,
-        SuccinctArchiveUnion,
-        CountingSuccinctHomomorphism,
-    >,
+    exact: &'a ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob, CountingSuccinctMapping>,
     collections: &'a Collections,
 }
 
 fn time_operation(
     operation: Operation,
     store: &mut MemoryRepo,
-    cover: &FactCover,
+    cover: &Cover<SimpleArchive>,
     succinct: &SuccinctArchiveCollection,
 ) -> TimedOperation {
     let start = Instant::now();
@@ -350,17 +342,13 @@ fn time_operation(
 
 fn diagnose_raw(
     store: &mut MemoryRepo,
-    cover: &FactCover,
-    exact: &ExactDerivedCollection<
-        simplearchive_union::SimpleArchiveUnion,
-        SuccinctArchiveUnion,
-        CountingSuccinctHomomorphism,
-    >,
-) -> (HomomorphismCalls, CoverIdentity) {
+    cover: &Cover<SimpleArchive>,
+    exact: &ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob, CountingSuccinctMapping>,
+) -> (MappingCalls, CoverIdentity) {
     // This is outside the timer and must be a zero-write operation: it measures
     // the scratch proof graph needed to revalidate the exact raw cover now held
     // by this arm. The public Rank9 phase remains represented only by timing
-    // and its durable DERIVE/blob delta because fiber construction is
+    // and its durable mapping-evidence/blob delta because fiber construction is
     // intentionally private to the facade.
     let diagnostic_before = store
         .store_revision()
@@ -368,25 +356,25 @@ fn diagnose_raw(
     let offers_before = store
         .offers_snapshot()
         .expect("snapshot pre-diagnostic artifact offers");
-    reset_homomorphism_calls();
+    reset_mapping_calls();
     let raw_cover = exact
         .ensure_exact(store, cover)
         .expect("diagnose complete raw exact cover");
-    let projection_calls = homomorphism_calls();
+    let projection_calls = mapping_calls();
     let cover = cover_identity(&raw_cover);
     let diagnostic_after = store
         .store_revision()
         .expect("snapshot post-diagnostic store revision");
     assert!(
         diagnostic_after == diagnostic_before,
-        "post-operation raw homomorphism diagnostic wrote sync-visible storage"
+        "post-operation raw mapping diagnostic wrote sync-visible storage"
     );
     assert_eq!(
         store
             .offers_snapshot()
             .expect("snapshot post-diagnostic artifact offers"),
         offers_before,
-        "post-operation raw homomorphism diagnostic published an artifact offer"
+        "post-operation raw mapping diagnostic published an artifact offer"
     );
     (projection_calls, cover)
 }
@@ -534,7 +522,7 @@ fn run_operation_family(
 fn time_exact_view(
     view: &mut SuccinctArchiveView,
     store: &mut MemoryRepo,
-    cover: &FactCover,
+    cover: &Cover<SimpleArchive>,
 ) -> TimedOperation {
     let start = Instant::now();
     let union = view
@@ -659,7 +647,7 @@ fn benchmark_authority() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[0x71; 32]).verifying_key()
 }
 
-fn new_source_store(source: Collection<simplearchive_union::SimpleArchiveUnion>) -> MemoryRepo {
+fn new_source_store(source: Collection<SimpleArchive>) -> MemoryRepo {
     let mut store = MemoryRepo::default();
     let registered = store
         .collection(simplearchive_union::descriptor(
@@ -674,7 +662,7 @@ fn new_source_store(source: Collection<simplearchive_union::SimpleArchiveUnion>)
 
 fn publish_same_chunk(
     chunk: &TribleSet,
-    source: Collection<simplearchive_union::SimpleArchiveUnion>,
+    source: Collection<SimpleArchive>,
     signing_key: &SigningKey,
     stores: &mut [&mut MemoryRepo],
 ) {
@@ -702,17 +690,21 @@ fn run_iteration(
     succinct: &SuccinctArchiveCollection,
 ) -> Vec<Sample> {
     let mut exact_view = succinct.exact_view();
-    let exact = ExactDerivedCollection::<
-        simplearchive_union::SimpleArchiveUnion,
-        SuccinctArchiveUnion,
-        CountingSuccinctHomomorphism,
-    >::new(succinct.source_descriptor(), succinct.descriptor())
-    .expect("bind measured raw Succinct projection");
+    let exact =
+        ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob, CountingSuccinctMapping>::new(
+            succinct.source_descriptor(),
+            succinct.descriptor(),
+        )
+        .expect("bind measured raw Succinct projection");
     let source = exact.source_collection();
     let collections = Collections {
         source: source.handle(),
         raw: succinct.collection(),
-        rank9: succinct.rank9_collection(),
+        rank9_mapping: rank9_mapping_fragment()
+            .facts()
+            .clone()
+            .to_blob()
+            .get_handle(),
     };
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
     let mut source_accounting = new_source_store(source);
@@ -1003,7 +995,7 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 derives; maps=canonical source-to-target homomorphism calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 mapping evidence; maps=canonical source-to-target mapping calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
     );
     println!(
         "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
@@ -1045,7 +1037,7 @@ fn main() {
                 work.offers,
                 work.raw_derives,
                 work.raw_merges,
-                work.rank9_derives,
+                work.rank9_evidence,
                 support,
                 calls,
                 argument_mib,
@@ -1055,7 +1047,6 @@ fn main() {
                 work.source_merges, 0,
                 "measured operation compacted the source collection",
             );
-            assert_eq!(work.rank9_merges, 0, "Rank9 fibers must remain one-to-one");
             assert_eq!(work.other_records, 0, "unclassified record write");
         }
     }

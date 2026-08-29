@@ -69,10 +69,11 @@ use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::{
-    SimpleArchiveToSuccinctArchive, SuccinctArchiveCollection, SuccinctArchiveUnion,
+    SimpleToSuccinctMapping, SuccinctArchiveCollection,
 };
 use triblespace_core::collection::{simplearchive_union, CollectionStoreExt};
 use triblespace_core::inline::encodings::hash::Handle;
@@ -787,9 +788,9 @@ fn main() {
             // construction shape without charging validation a second time to
             // the build metric.
             let exact = ExactDerivedCollection::<
-                simplearchive_union::SimpleArchiveUnion,
-                SuccinctArchiveUnion,
-                SimpleArchiveToSuccinctArchive,
+                SimpleArchive,
+                SuccinctArchiveBlob,
+                SimpleToSuccinctMapping,
             >::new(succinct.source_descriptor(), succinct.descriptor())
             .expect("bind exact raw Succinct projection");
             let raw_cover = exact

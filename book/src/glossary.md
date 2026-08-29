@@ -75,22 +75,20 @@ another principal from silently becoming an admission decision.
 ### Collection
 A self-describing grow-only join semilattice. Signed commits introduce members;
 validated merge records describe joins within the lattice; derivation records
-map elements into another collection through a canonical homomorphism. A
-collection has no distinguished head. In Rust, `Collection<L>` is the cheap
-descriptor handle after the runtime representation and recipe have been
-validated against the lattice type `L`.
+map elements into another collection through a canonical mapping. A
+collection has no distinguished head. In Rust, `Collection<E>` is the cheap
+descriptor handle after the runtime member encoding has been validated against
+the `CollectionEncoding` type `E`.
 
 ### Cover
 One exact point in a collection lattice, represented by a typed collection
-descriptor and a PATCH set of distinct `Handle<L::Encoding>` payload handles.
-Signatures,
-authors, and metadata are optional provenance fibers queryable from the store,
-not part of cover identity or required for replay, so several claims over
-identical data collapse to one member. Distinct covers may have the same
+descriptor and a PATCH set of distinct `Handle<E>` payload handles.
+Signatures, authors, and metadata are optional provenance fibers queryable from
+the store, not part of cover identity or required for replay, so several claims
+over identical data collapse to one member. Distinct covers may have the same
 support: a validated merge can prove that `{a, b}` and `{a⊔b}` denote the same
-join. Cover construction is opaque;
-admission and validated collection algebra produce them rather than accepting
-caller-forged hash sets.
+join. Cover construction is opaque; admission and validated collection algebra
+produce them rather than accepting caller-forged hash sets.
 
 ### Collection Admission
 The read-time signer decision performed by `store.cover` and
@@ -102,21 +100,36 @@ descriptor authority alone.
 
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's UTF-8 root name or exact
-derived source, mandatory descriptor-local authority, element representation,
-join recipe, and reach law. Its content handle is the `CollectionHandle`, so
-every native record which names a collection can resolve its meaning through
-the ordinary blob store. A derived descriptor states its own authority and
-never inherits one through its source.
+derived source, mandatory descriptor-local authority, member encoding, and
+reach law. A derived descriptor also links one concrete mapping entity carrying
+its algorithm and parameters. Canonical builders normally use an intrinsic id,
+but an equivalent extrinsic-id substitution has the same meaning. Its content handle is
+the `CollectionHandle`, so every native record which names a collection can
+resolve its meaning through the ordinary blob store. A derived descriptor
+states its own authority and never inherits one through its source.
+
+### Collection Encoding
+A `BlobEncoding` with one canonical member validation rule and one canonical
+join, exposed by `CollectionEncoding`. The encoding is both the physical byte
+shape and its intra-collection join law, so the public type names that meaning
+directly.
+
+### Collection Mapping
+A parameterized source-to-target conversion exposed by
+`CollectionMapping<Source, Target>`. Its mapping entity is embedded in the
+target descriptor and names both a stable algorithm and its concrete
+parameters. The mathematical contract is a join homomorphism:
+`f(a ⊔ b) = f(a) ⊔ f(b)`.
 
 ### Collection Store
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
 idempotent by intrinsic record ID; combining two stores is set union.
 
 ### Collection Snapshot
-One coherent known-prefix observation `Snapshot<L, V, R>` containing a logical
-value `V`, the exact typed payload `Cover<L>` which names it, and the blob
-reader which validated its dependencies. `TryFromCover<L>` controls whether
-`V` eagerly joins member bytes or retains them as a lazy sharded view.
+One coherent known-prefix observation `Snapshot<E, V, R>` containing a logical
+view `V`, the exact typed payload `Cover<E>` which names it, and the blob reader
+which validated its dependencies. `TryFromCover<E>` controls whether `V`
+eagerly joins member bytes or retains them as a lazy sharded view.
 
 ### CONNECT
 The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
@@ -168,14 +181,21 @@ child fragments into parent entities, giving Merkle trees for free.
 
 ### Derive
 An unsigned exact equation mapping one source element into a derived collection.
-The target descriptor names both source and recipe, so the record needs only
-the target, input, and output identities. Derivations are reproducible cache
-evidence, not authority.
+The target descriptor names both source and concrete mapping, so the
+record needs only the target, input, and output identities. Derivations are
+reproducible cache evidence, not authority.
 
 ### Merge
 An unsigned exact equation `a ⊔ b = c` inside one collection. A validated merge
 result can replace its inputs in a physical cover without changing the logical
 value or creating new authority.
+
+### Mapping Evidence
+An unsigned cache equation `mapping(input) = output`, stored outside the
+collection-record algebra. `mapping` is the content handle of an ordinary
+queryable `SimpleArchive` mapping fragment. Every distinct output remains
+visible so the mapping implementation can validate or reject it; presence
+alone grants no authority, membership, uniqueness, or retention.
 
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.

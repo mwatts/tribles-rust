@@ -17,7 +17,7 @@ use triblespace_core::collection::exact_derived::{
     ExactAttachPlan, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use triblespace_core::collection::{
-    CollectionData, CollectionHomomorphism, CollectionLattice, CollectionRecord,
+    CollectionData, CollectionEncoding, CollectionMapping, CollectionRecord,
     CollectionRecordSelector, CollectionStore, Cover, CoverAttachment,
 };
 use triblespace_core::inline::InlineEncoding;
@@ -106,9 +106,9 @@ impl From<ExactDerivedCollectionError> for ExactDerivedSyncError {
 /// residency, and shrink after every attempted fetch. The operation therefore
 /// terminates even when every offer is stale. Exact fetches neither create
 /// durable [`WantStore`] entries nor change collection authority.
-pub async fn ensure_exact_derived<S, Source, Target, Homomorphism>(
+pub async fn ensure_exact_derived<S, Source, Target, Mapping>(
     peer: &mut Peer<S>,
-    lifecycle: &ExactDerivedCollection<Source, Target, Homomorphism>,
+    lifecycle: &ExactDerivedCollection<Source, Target, Mapping>,
     source_cover: &Cover<Source>,
 ) -> Result<CoverAttachment<Target>, ExactDerivedSyncError>
 where
@@ -124,11 +124,11 @@ where
         + Send
         + 'static,
     S::Reader: BlobStoreMeta,
-    Source: CollectionLattice,
-    Target: CollectionLattice,
-    Homomorphism: CollectionHomomorphism<Source, Target>,
-    Handle<Source::Encoding>: InlineEncoding,
-    Handle<Target::Encoding>: InlineEncoding,
+    Source: CollectionEncoding,
+    Target: CollectionEncoding,
+    Mapping: CollectionMapping<Source, Target>,
+    Handle<Source>: InlineEncoding,
+    Handle<Target>: InlineEncoding,
 {
     if source_cover.is_empty() {
         return lifecycle
@@ -156,9 +156,9 @@ where
             .filter_map(|record| match record {
                 CollectionRecord::Commit(_) => None,
                 CollectionRecord::Merge(merge) => Some(merge.result()),
-                CollectionRecord::Derive(derive) => Some(derive.mapping().1),
+                CollectionRecord::Derive(derive) => Some(derive.output()),
             })
-            .map(Handle::<Target::Encoding>::from_hash)
+            .map(Handle::<Target>::from_hash)
             .collect::<BTreeSet<_>>()
     };
 
@@ -188,7 +188,7 @@ where
                         offered.remove(&expected);
                         continue 'replan;
                     };
-                    let blob = Blob::<Target::Encoding>::new(Bytes::from(raw));
+                    let blob = Blob::<Target>::new(Bytes::from(raw));
                     let actual = blob.get_handle();
                     if actual != expected {
                         // `fetch_blob` already checks this. Keep the boundary
@@ -196,19 +196,13 @@ where
                         offered.remove(&expected);
                         continue 'replan;
                     }
-                    let landed =
-                        peer.store()
-                            .put::<Target::Encoding, _>(blob)
-                            .map_err(|error| {
-                                ExactDerivedSyncError::storage(
-                                    "land fetched target artifact",
-                                    error,
-                                )
-                            })?;
+                    let landed = peer.store().put::<Target, _>(blob).map_err(|error| {
+                        ExactDerivedSyncError::storage("land fetched target artifact", error)
+                    })?;
                     if landed != expected {
                         return Err(ExactDerivedSyncError::LandingIdentity {
-                            expected: Handle::<Target::Encoding>::to_hash(expected),
-                            actual: Handle::<Target::Encoding>::to_hash(landed),
+                            expected: Handle::<Target>::to_hash(expected),
+                            actual: Handle::<Target>::to_hash(landed),
                         });
                     }
                     // Local residency, freshly re-read by the next probe, now

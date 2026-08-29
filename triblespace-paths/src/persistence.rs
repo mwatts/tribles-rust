@@ -13,7 +13,7 @@ use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::{attributes, entity};
 use triblespace_core::trible::Fragment;
 
-use crate::{Automaton, PathSummary, Step};
+use crate::{Automaton, GraphEdge, PathError, PathSummary, Step};
 
 const HEADER_LEN: usize = 48;
 const FINGERPRINT_VERSION: u32 = 1;
@@ -33,13 +33,13 @@ attributes! {
     /// `trible genid` on 2026-08-29.
     "562D157447DBE25FE8E6DCB95C5A5AB4" as pub path_automaton_state_count: U256BE;
     /// Initial state of the canonical path automaton. Repeated on the
-    /// collection descriptor. Minted with `trible genid` on 2026-08-29.
+    /// concrete mapping entity. Minted with `trible genid` on 2026-08-29.
     "EE0D84553EB07FD3E75CD2709ED50E79" as pub path_automaton_initial_state: U256BE;
     /// Accepting state of the canonical path automaton. Repeated on the
-    /// collection descriptor. Minted with `trible genid` on 2026-08-29.
+    /// concrete mapping entity. Minted with `trible genid` on 2026-08-29.
     "4D10E8C83A816E1D888AD243B1DBD5C7" as pub path_automaton_accepting_state: U256BE;
     /// Intrinsic transition entity belonging to the canonical path automaton.
-    /// Repeated on the collection descriptor. Minted with `trible genid` on
+    /// Repeated on the concrete mapping entity. Minted with `trible genid` on
     /// 2026-08-29.
     "4828A5918A259F89038041053EA720CC" as pub path_automaton_transition: GenId;
     /// Source state of one path-automaton transition. Minted with
@@ -92,12 +92,17 @@ pub enum PathSummaryBlobError {
     ArcOutOfBounds,
     /// An arc's source/destination state pair is absent from the automaton.
     InvalidStatePair,
+    /// Two individually valid summaries could not be joined.
+    Join(PathError),
     /// A length or carrier calculation overflowed its representation.
     CapacityOverflow,
 }
 
 impl fmt::Display for PathSummaryBlobError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Join(source) = self {
+            return write!(f, "cannot join path summaries: {source}");
+        }
         let message = match self {
             Self::BadLength => "path-summary blob has an invalid length",
             Self::DifferentAutomaton => "path-summary blob belongs to a different automaton",
@@ -109,14 +114,28 @@ impl fmt::Display for PathSummaryBlobError {
             Self::ArcOutOfBounds => "path-summary arc is outside the product carrier",
             Self::InvalidStatePair => "path-summary arc uses an impossible automaton state pair",
             Self::CapacityOverflow => "path-summary dimensions overflow their representation",
+            Self::Join(_) => unreachable!("handled above"),
         };
         f.write_str(message)
     }
 }
 
-impl Error for PathSummaryBlobError {}
+impl Error for PathSummaryBlobError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Join(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl PathSummaryBlob {
+    /// Canonical bottom element for one fixed automaton.
+    pub fn empty(automaton: &Automaton) -> Blob<Self> {
+        let summary = PathSummary::from_edges(automaton.clone(), std::iter::empty::<GraphEdge>());
+        Self::encode(&summary).expect("the fixed empty path-summary construction cannot fail")
+    }
+
     /// Encode one canonical constructional summary.
     ///
     /// Product arcs use full-domain `u32` ordinals on disk. A persisted
@@ -214,6 +233,18 @@ impl PathSummaryBlob {
             return Err(PathSummaryBlobError::NoncanonicalDomain);
         }
         Ok(summary)
+    }
+
+    /// Compute the exact canonical join of two summaries for one automaton.
+    pub fn join(
+        left: &Blob<Self>,
+        right: &Blob<Self>,
+        automaton: &Automaton,
+    ) -> Result<Blob<Self>, PathSummaryBlobError> {
+        let left = Self::decode(left.clone(), automaton)?;
+        let right = Self::decode(right.clone(), automaton)?;
+        let joined = left.merge(&right).map_err(PathSummaryBlobError::Join)?;
+        Self::encode(&joined)
     }
 }
 
@@ -360,30 +391,6 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
         wire.extend_from_slice(&transition);
     }
     Inline::new(Blake3::digest(&wire))
-}
-
-/// The path-summary law.
-///
-/// This names the law only. *Which* automaton a summary is over is an argument
-/// carried canonically on the collection descriptor, not folded into this id.
-/// The fingerprint remains a compact integrity check, while the state and
-/// transition facts make the law recoverable from the descriptor itself.
-pub const PATH_SUMMARY_RECIPE_V1: Id =
-    triblespace_core::id_hex!("341216BFE738E2D82BFFF96F52E7FE06");
-
-/// The path-summary law, as a describable type.
-pub struct PathSummaryV1;
-
-impl MetaDescribe for PathSummaryV1 {
-    fn describe() -> Fragment {
-        let id: Id = PATH_SUMMARY_RECIPE_V1;
-        entity! {
-            ExclusiveId::force_ref(&id) @
-                metadata::name: "path-summary-v1",
-                metadata::description: "Summary of the vertex pairs connected by a fixed regular path automaton, unioned across a collection's elements. Union is associative, commutative and idempotent, so summaries merge without regard to order. The complete canonical epsilon-free automaton is carried as descriptor facts, with `path_automaton_fingerprint` as a compact integrity check. A different automaton is a different collection because it answers a different question.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
-        }
-    }
 }
 
 #[cfg(test)]

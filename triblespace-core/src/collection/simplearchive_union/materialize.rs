@@ -16,8 +16,6 @@ use crate::collection::{
     collection_physical_cover, CollectionData, CollectionSemantics, CoverAttachment, TryFromCover,
 };
 
-use super::SimpleArchiveUnion;
-
 /// Failure to form a logical fact union from an already validated exact cover.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactViewError {
@@ -44,12 +42,10 @@ impl Error for FactViewError {
     }
 }
 
-impl TryFromCover<SimpleArchiveUnion> for TribleSet {
+impl TryFromCover<SimpleArchive> for TribleSet {
     type Error = FactViewError;
 
-    fn try_from_cover(
-        attachment: CoverAttachment<SimpleArchiveUnion>,
-    ) -> Result<Self, Self::Error> {
+    fn try_from_cover(attachment: CoverAttachment<SimpleArchive>) -> Result<Self, Self::Error> {
         let members = attachment.into_members();
         match members.as_slice() {
             [] => Ok(TribleSet::new()),
@@ -79,7 +75,7 @@ impl TryFromCover<SimpleArchiveUnion> for TribleSet {
 /// Failure to materialize one resolved `SimpleArchive` union collection.
 #[derive(Debug)]
 pub enum MaterializationError<MetadataError, GetError> {
-    /// The supplied descriptor does not name this representation and recipe.
+    /// The supplied descriptor does not name this canonical encoding.
     Descriptor(SimpleArchiveUnionValidationError),
     /// Residency lookup failed for one semantic member.
     Metadata {
@@ -571,7 +567,7 @@ mod tests {
 
     #[test]
     fn wrong_descriptor_fails_before_store_access() {
-        let wrong = named_for_tests("first", id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
+        let wrong = named_for_tests("first", id(2));
         let reader = ProbeReader::default();
 
         assert!(matches!(

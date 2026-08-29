@@ -17,9 +17,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::reach;
-use triblespace_core::collection::simplearchive_union::{
-    self, PreparedCollectionCommit, SimpleArchiveUnion,
-};
+use triblespace_core::collection::simplearchive_union::{self, PreparedCollectionCommit};
 use triblespace_core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -85,7 +83,7 @@ fn migrate(
 ) -> Result<(
     MigrationReport,
     Vec<(CommitHandle, CollectionCommit)>,
-    Collection<SimpleArchiveUnion>,
+    Collection<SimpleArchive>,
 )> {
     // Freeze the mutable names first, then take one append-only blob view.
     // A concurrent append may enter the later reader, but cannot change the
@@ -382,7 +380,7 @@ fn handle_hex(handle: ArchiveHandle) -> String {
 fn print_report(
     pile_path: &PathBuf,
     name: &str,
-    collection: Collection<SimpleArchiveUnion>,
+    collection: Collection<SimpleArchive>,
     authority: VerifyingKey,
     signer: VerifyingKey,
     report: MigrationReport,

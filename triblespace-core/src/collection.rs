@@ -19,14 +19,16 @@ pub mod api;
 /// Reading one collection descriptor's facts.
 pub mod descriptor;
 pub mod discovery;
+/// Canonical collection encodings and join-preserving mappings.
+pub mod encoding;
 /// Shared exact-cover lifecycle for canonical derived collections.
 pub mod exact_derived;
 /// Explicit size-tiered maintenance for exact canonical target covers.
 pub mod exact_target_compaction;
-/// Typed lattice identities above representation-neutral collection records.
-pub mod lattice;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
+/// Unsigned reusable evidence for exact mapping computations.
+pub mod mapping_evidence;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.
 pub mod observed_union;
@@ -56,7 +58,8 @@ pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
 pub use discovery::*;
-pub use lattice::*;
+pub use encoding::*;
+pub use mapping_evidence::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;

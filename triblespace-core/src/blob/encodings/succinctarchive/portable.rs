@@ -33,7 +33,7 @@
 //! malformed raw structure and locally impossible code histograms, but it does
 //! not prove that changed-pair masks are derived from their rotations or that
 //! all six rotations encode the same trible set. The public attachment path
-//! passes the bytes through the collection recipe's exact canonical
+//! passes the bytes through the collection mapping's exact canonical
 //! derivation gate before constructing a query engine. Keeping that proof out
 //! of this layout module is deliberate. Public attachment decodes a candidate
 //! EAV source set, rebuilds the complete canonical payload, and requires exact

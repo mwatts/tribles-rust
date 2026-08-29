@@ -12,7 +12,10 @@ use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::selectors_match_record;
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::collection::{
+    selectors_match_mapping_evidence, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    MappingEvidence, MappingEvidenceSelector, MappingEvidenceStore,
+};
 use crate::id::ID_LEN;
 use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
@@ -28,6 +31,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 
 type CollectionRecordIndex = PATCH<ID_LEN, IdentitySchema, CollectionRecord, XorSip128>;
+type MappingEvidenceIndex = PATCH<ID_LEN, IdentitySchema, MappingEvidence, XorSip128>;
 type CapabilityProofIndex = PATCH<INLINE_LEN, IdentitySchema, CapabilityProof, XorSip128>;
 type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
 
@@ -46,6 +50,8 @@ pub struct MemoryRepo {
     pub wants: HashSet<WantRequest>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: CollectionRecordIndex,
+    /// Unsigned mapping equations keyed by intrinsic evidence id.
+    mapping_evidence: MappingEvidenceIndex,
     /// Canonical complete capability proofs keyed by exact-body content id.
     capability_proofs: CapabilityProofIndex,
     /// Positive peer-routing evidence keyed by its complete canonical body.
@@ -106,6 +112,7 @@ impl StoreScope for MemoryRepo {
 pub struct MemoryRepoRevision {
     blobs: MemoryBlobStore,
     collection_records: CollectionRecordIndex,
+    mapping_evidence: MappingEvidenceIndex,
     capability_proofs: CapabilityProofIndex,
     peer_evidence: PeerEvidenceIndex,
 }
@@ -118,6 +125,7 @@ impl StoreRevision for MemoryRepo {
         Ok(MemoryRepoRevision {
             blobs: self.blobs.clone(),
             collection_records: self.collection_records.clone(),
+            mapping_evidence: self.mapping_evidence.clone(),
             capability_proofs: self.capability_proofs.clone(),
             peer_evidence: self.peer_evidence.clone(),
         })
@@ -135,6 +143,9 @@ impl StoreRevision for MemoryRepo {
         }
         if previous.collection_records != current.collection_records {
             changes = changes.union(StoreRevisionChanges::COLLECTION_RECORDS);
+        }
+        if previous.mapping_evidence != current.mapping_evidence {
+            changes = changes.union(StoreRevisionChanges::MAPPING_EVIDENCE);
         }
         if previous.capability_proofs != current.capability_proofs {
             changes = changes.union(StoreRevisionChanges::CAPABILITY_PROOFS);
@@ -189,6 +200,27 @@ pub struct MemoryCollectionRecordIter {
     keys:
         crate::patch::PATCHIntoOrderedIterator<ID_LEN, IdentitySchema, CollectionRecord, XorSip128>,
     lookup: CollectionRecordIndex,
+}
+
+/// Deterministic persistent snapshot of in-memory mapping evidence.
+pub struct MemoryMappingEvidenceIter {
+    keys:
+        crate::patch::PATCHIntoOrderedIterator<ID_LEN, IdentitySchema, MappingEvidence, XorSip128>,
+    lookup: MappingEvidenceIndex,
+}
+
+impl Iterator for MemoryMappingEvidenceIter {
+    type Item = Result<MappingEvidence, Infallible>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = self.keys.next()?;
+        let evidence = *self
+            .lookup
+            .get(&key)
+            .expect("mapping-evidence key from PATCH snapshot must retain its value");
+        debug_assert_eq!(evidence.id().raw(), key);
+        Some(Ok(evidence))
+    }
 }
 
 impl Iterator for MemoryCollectionRecordIter {
@@ -255,6 +287,25 @@ pub enum MemoryCollectionInsertError {
     /// An infeasible intrinsic-id collision named different canonical bytes.
     IdCollision { id: Id },
 }
+
+/// Failure while inserting mapping evidence into [`MemoryRepo`].
+#[derive(Debug)]
+pub enum MemoryMappingEvidenceInsertError {
+    /// An infeasible intrinsic-id collision named different canonical bytes.
+    IdCollision { id: Id },
+}
+
+impl fmt::Display for MemoryMappingEvidenceInsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdCollision { id } => {
+                write!(f, "mapping evidence id {id} names different bytes")
+            }
+        }
+    }
+}
+
+impl Error for MemoryMappingEvidenceInsertError {}
 
 impl fmt::Display for MemoryCollectionInsertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -352,6 +403,58 @@ impl CollectionStore for MemoryRepo {
         }
         self.collection_records
             .insert(&Entry::with_value(&id.raw(), record));
+        Ok(())
+    }
+}
+
+impl MappingEvidenceStore for MemoryRepo {
+    type EvidenceError = Infallible;
+    type InsertError = MemoryMappingEvidenceInsertError;
+    type EvidenceIter<'a> = MemoryMappingEvidenceIter;
+
+    fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+        let keys = self.mapping_evidence.clone().into_iter_ordered();
+        Ok(MemoryMappingEvidenceIter {
+            keys,
+            lookup: self.mapping_evidence.clone(),
+        })
+    }
+
+    fn evidence_by_id(&mut self, id: Id) -> Result<Option<MappingEvidence>, Self::EvidenceError> {
+        Ok(self.mapping_evidence.get(&id.raw()).copied())
+    }
+
+    fn select_evidence(
+        &mut self,
+        selectors: &BTreeSet<MappingEvidenceSelector>,
+    ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .mapping_evidence
+            .iter_ordered()
+            .map(|key| {
+                *self
+                    .mapping_evidence
+                    .get(key)
+                    .expect("mapping-evidence key from PATCH must retain its value")
+            })
+            .filter(|evidence| selectors_match_mapping_evidence(selectors, *evidence))
+            .collect())
+    }
+
+    fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
+        let id = evidence.id();
+        if let Some(existing) = self.mapping_evidence.get(&id.raw()) {
+            return if existing == &evidence {
+                Ok(())
+            } else {
+                Err(MemoryMappingEvidenceInsertError::IdCollision { id })
+            };
+        }
+        self.mapping_evidence
+            .insert(&Entry::with_value(&id.raw(), evidence));
         Ok(())
     }
 }
@@ -473,6 +576,7 @@ mod tests {
     use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
 
+    use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::capability::{
         CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
         CapabilityResource,
@@ -590,16 +694,8 @@ mod tests {
 
     #[test]
     fn collection_records_are_idempotent_and_intrinsically_ordered() {
-        let descriptor = named_for_tests(
-            "merged",
-            Id::new([2; 16]).unwrap(),
-            Id::new([3; 16]).unwrap(),
-        );
-        let target = named_for_tests(
-            "derived",
-            Id::new([8; 16]).unwrap(),
-            Id::new([9; 16]).unwrap(),
-        );
+        let descriptor = named_for_tests("merged", Id::new([2; 16]).unwrap());
+        let target = named_for_tests("derived", Id::new([8; 16]).unwrap());
         let merge = CollectionRecord::Merge(CollectionMerge::new(
             identity_for_tests(&descriptor),
             Inline::new([4; 32]),
@@ -631,11 +727,7 @@ mod tests {
 
     #[test]
     fn collection_index_rejects_a_different_body_under_an_existing_key() {
-        let target = identity_for_tests(&named_for_tests(
-            "target",
-            Id::new([12; 16]).unwrap(),
-            Id::new([13; 16]).unwrap(),
-        ));
+        let target = identity_for_tests(&named_for_tests("target", Id::new([12; 16]).unwrap()));
         let expected = CollectionRecord::Derive(CollectionDerive::new(
             target,
             Inline::new([14; 32]),
@@ -661,21 +753,9 @@ mod tests {
 
     #[test]
     fn collection_primary_selection_answers_group_and_exact_conflicting_operations() {
-        let source = identity_for_tests(&named_for_tests(
-            "source",
-            Id::new([22; 16]).unwrap(),
-            Id::new([23; 16]).unwrap(),
-        ));
-        let target = identity_for_tests(&named_for_tests(
-            "target",
-            Id::new([25; 16]).unwrap(),
-            Id::new([26; 16]).unwrap(),
-        ));
-        let other = identity_for_tests(&named_for_tests(
-            "other",
-            Id::new([28; 16]).unwrap(),
-            Id::new([29; 16]).unwrap(),
-        ));
+        let source = identity_for_tests(&named_for_tests("source", Id::new([22; 16]).unwrap()));
+        let target = identity_for_tests(&named_for_tests("target", Id::new([25; 16]).unwrap()));
+        let other = identity_for_tests(&named_for_tests("other", Id::new([28; 16]).unwrap()));
         let input = Inline::new([30; 32]);
         let merge = CollectionRecord::Merge(CollectionMerge::new(
             source,
@@ -736,9 +816,8 @@ mod tests {
         let team = key.verifying_key();
         let descriptor = simplearchive_union::descriptor(name, team, reach::private());
         let expected_collection = identity_for_tests(&descriptor);
-        let collection: crate::collection::Collection<
-            crate::collection::simplearchive_union::SimpleArchiveUnion,
-        > = repo.collection(descriptor).unwrap();
+        let collection: crate::collection::Collection<SimpleArchive> =
+            repo.collection(descriptor).unwrap();
         assert_eq!(collection.handle(), expected_collection);
         let commit = repo.commit(collection, &key, fragment).unwrap();
         let orphan = repo.put::<UTF8String, _>("orphan".to_owned()).unwrap();
@@ -787,7 +866,6 @@ mod tests {
         let target = identity_for_tests(&named_for_tests(
             "revision-target",
             Id::new([71; 16]).unwrap(),
-            Id::new([72; 16]).unwrap(),
         ));
         repo.insert(CollectionRecord::Derive(CollectionDerive::new(
             target,

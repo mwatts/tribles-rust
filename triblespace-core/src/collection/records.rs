@@ -43,6 +43,10 @@ use crate::trible::{TribleSet, TRIBLE_LEN};
 ///
 /// Minted with `trible genid` on 2026-08-07.
 pub const KIND_COLLECTION_DESCRIPTOR: Id = id_hex!("C5E238729BB95FA4A55E3939B11B3C29");
+/// Tag identifying a concrete collection mapping instance.
+///
+/// Minted with `trible genid` on 2026-08-29.
+pub const KIND_COLLECTION_MAPPING: Id = id_hex!("8725AF624FE719B70289A67B21174FEA");
 /// Stable semantic kind of a signed `COMMIT(descriptor, data, metadata)` assertion.
 ///
 /// Minted with `trible genid` on 2026-08-11.
@@ -88,12 +92,12 @@ pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B
 
 /// Byte length of a canonical bare root collection-descriptor `SimpleArchive`.
 ///
-/// Five facts: the kind tag, name, mandatory authority, representation, and
-/// recipe. A descriptor that embeds its representation's and recipe's own
-/// descriptions, declares reach, or carries recipe arguments is longer. The
+/// Four facts: the kind tag, name, mandatory authority, and encoding. A
+/// descriptor that embeds its encoding's description or declares reach is
+/// longer. A derived descriptor additionally embeds one mapping instance. The
 /// name's UTF-8 bytes are a separate attachment and do not contribute rows to
 /// the archive.
-pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
+pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (4 * TRIBLE_LEN) as u64;
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a dense merge equation.
@@ -139,9 +143,23 @@ attributes! {
     /// Blob representation carried by the elements of this collection.
     /// Minted with `trible genid` on 2026-08-07.
     "620FA4F2B456357DCD1882E583B85CC3" unsafe as pub collection_representation: GenId;
-    /// Canonical recipe governing construction and merge for this collection.
-    /// Minted with `trible genid` on 2026-08-07.
-    "5D338C58D897B969BE1AE0956CCFE301" unsafe as pub collection_recipe: GenId;
+    /// Concrete mapping instance carried by a derived collection.
+    ///
+    /// The linked entity names one mapping algorithm and carries its concrete
+    /// parameters. Root collections omit this field; derived collections carry
+    /// it together with [`collection_source`].
+    /// Anchor minted with `trible genid` on 2026-08-29:
+    /// `D63BCA62411CA97CCF5DB2132EE57CDF`.
+    "D63BCA62411CA97CCF5DB2132EE57CDF" as pub collection_mapping: GenId;
+    /// Algorithm used by one concrete collection mapping instance.
+    ///
+    /// The algorithm entity is embedded through Fragment spread, keeping the
+    /// descriptor self-describing. Canonical builders derive the mapping id
+    /// from its concrete parameters, while readers validate these facts
+    /// directly so equivalent extrinsic ids remain valid.
+    /// Anchor minted with `trible genid` on 2026-08-29:
+    /// `AF43D02D710977411CA7DA164BDA5CD9`.
+    "AF43D02D710977411CA7DA164BDA5CD9" as pub mapping_algorithm: GenId;
     /// How far this collection may travel, by the id of a *reach law*.
     ///
     /// This is the descriptor's answer to "may these bytes be relayed?", and
@@ -153,14 +171,13 @@ attributes! {
     /// something after the fact is not forbidden but meaningless, because it
     /// would have to name a handle whose own descriptor refuses to travel.
     ///
-    /// Like [`collection_recipe`], this names a *law* rather than a value. A
+    /// This names a *law* rather than a value. A
     /// law admits an "I do not implement that" answer, which a boolean cannot:
     /// a reader meeting a mode it has never heard of denies rather than
     /// guesses, so the fail-closed rule extends to modes invented after this
     /// binary was built. Any arguments a richer mode needs -- an audience, a
     /// subset of a team -- are further attributes on this same entity, read
-    /// the way [`descriptor::argument`](crate::collection::descriptor::argument)
-    /// reads a recipe's.
+    /// through [`descriptor::argument`](crate::collection::descriptor::argument).
     ///
     /// The attribute is optional, and absence means *no reach*: a descriptor
     /// that predates this field, or declines to declare, does not travel. That
@@ -230,6 +247,8 @@ pub enum RecordDecodeError {
     FieldOnWrongEntity(&'static str),
     /// A typed descriptor field had a noncanonical inline representation.
     InvalidId(&'static str),
+    /// A retired descriptor field would be ambiguous under the current model.
+    ObsoleteField(&'static str),
     /// A dense record had no kind byte or the wrong payload length.
     InvalidLength { expected: usize, actual: usize },
     /// A tagged dense record used an unknown variant byte.
@@ -250,6 +269,9 @@ impl fmt::Display for RecordDecodeError {
                 write!(f, "collection record contains {field} on another entity")
             }
             Self::InvalidId(field) => write!(f, "collection record contains invalid {field}"),
+            Self::ObsoleteField(field) => {
+                write!(f, "collection record contains obsolete {field}")
+            }
             Self::InvalidLength { expected, actual } => write!(
                 f,
                 "collection record has {actual} bytes; expected exactly {expected}"
@@ -543,29 +565,34 @@ impl CollectionMerge {
     }
 }
 
-/// One unsigned exact observation of the canonical join homomorphism between
-/// two collection lattices.
+/// One unsigned exact observation of the canonical mapping from a source
+/// collection member to a target collection member.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionDerive {
     id: Id,
-    target: CollectionHandle,
+    collection: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
 }
 
 impl CollectionDerive {
-    /// Construct a canonical `DERIVE(target, input, output)` record.
+    /// Construct a canonical `DERIVE(collection, input, output)` record.
     ///
-    /// The target is named by descriptor handle, exactly as a commit names its
+    /// The output collection is named by descriptor handle, exactly as a commit names its
     /// collection, and that descriptor already says which collection is the
-    /// source and by what recipe. A derive therefore says *which instance* of
-    /// a mapping was computed, never *which mapping*.
-    pub fn new(target: CollectionHandle, input: CollectionData, output: CollectionData) -> Self {
-        let bytes = derive_bytes(target, input, output);
+    /// source and embeds the exact mapping facts. A derive therefore
+    /// says *which input/output equation* was computed, never restates the
+    /// mapping definition.
+    pub fn new(
+        collection: CollectionHandle,
+        input: CollectionData,
+        output: CollectionData,
+    ) -> Self {
+        let bytes = derive_bytes(collection, input, output);
         let id = collection_record_id(KIND_COLLECTION_DERIVE, &bytes);
         Self {
             id,
-            target,
+            collection,
             input,
             output,
         }
@@ -585,19 +612,24 @@ impl CollectionDerive {
         self.id
     }
 
-    /// Target collection.
-    pub fn target(&self) -> CollectionHandle {
-        self.target
+    /// Collection containing the output member.
+    pub fn collection(&self) -> CollectionHandle {
+        self.collection
     }
 
-    /// Source and target elements.
-    pub fn mapping(&self) -> (CollectionData, CollectionData) {
-        (self.input, self.output)
+    /// Source member mapped by this equation.
+    pub fn input(&self) -> CollectionData {
+        self.input
+    }
+
+    /// Target member produced by this equation.
+    pub fn output(&self) -> CollectionData {
+        self.output
     }
 
     /// Encode this equation into its exact dense 96-byte layout.
     pub fn to_bytes(&self) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
-        derive_bytes(self.target, self.input, self.output)
+        derive_bytes(self.collection, self.input, self.output)
     }
 }
 
@@ -846,7 +878,7 @@ mod tests {
     }
 
     /// A root is named under one mandatory authority. Name, authority,
-    /// representation, and recipe all participate in descriptor identity.
+    /// representation, and reach all participate in descriptor identity.
     #[test]
     fn collection_descriptor_is_anchor_specific_and_roundtrips() {
         use crate::collection::descriptor;
@@ -854,18 +886,16 @@ mod tests {
         let authority = SigningKey::from_bytes(&[1; 32]).verifying_key();
         let other_authority = SigningKey::from_bytes(&[2; 32]).verifying_key();
 
-        let a_fragment = descriptor::naming("first", authority, id(2), id(3), reach::private());
+        let a_fragment = descriptor::naming("first", authority, id(2), reach::private());
         let expected_name = descriptor::name(a_fragment.facts()).unwrap().unwrap();
         let a = a_fragment.into_facts();
-        let renamed =
-            descriptor::naming("second", authority, id(2), id(3), reach::private()).into_facts();
+        let renamed = descriptor::naming("second", authority, id(2), reach::private()).into_facts();
         let reauthorized =
-            descriptor::naming("first", other_authority, id(2), id(3), reach::private())
-                .into_facts();
+            descriptor::naming("first", other_authority, id(2), reach::private()).into_facts();
         let other_representation =
-            descriptor::naming("first", authority, id(4), id(3), reach::private()).into_facts();
-        let other_recipe =
-            descriptor::naming("first", authority, id(2), id(4), reach::private()).into_facts();
+            descriptor::naming("first", authority, id(4), reach::private()).into_facts();
+        let other_reach =
+            descriptor::naming("first", authority, id(2), reach::public()).into_facts();
 
         let handle = |facts: &TribleSet| {
             <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
@@ -873,7 +903,7 @@ mod tests {
         assert_ne!(handle(&a), handle(&renamed));
         assert_ne!(handle(&a), handle(&reauthorized));
         assert_ne!(handle(&a), handle(&other_representation));
-        assert_ne!(handle(&a), handle(&other_recipe));
+        assert_ne!(handle(&a), handle(&other_reach));
 
         // The descriptor is its own archive: encoding and decoding is the
         // identity, because there is no second model of it to drift.
@@ -1099,7 +1129,6 @@ mod tests {
             "first",
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
             id(2),
-            id(3),
             reach::private(),
         )
         .into_facts();
@@ -1154,22 +1183,20 @@ mod tests {
 }
 
 #[cfg(test)]
-mod recipe_description_tests {
-    use crate::collection::lww_register::LwwRegisterV1;
-    use crate::collection::observed_union::ObservedUnionV1;
-    use crate::collection::simplearchive_union::TribleSetUnionV1;
+mod mapping_algorithm_description_tests {
+    use crate::collection::lww_register::RegisterCoordinatesMappingV1;
+    use crate::collection::observed_union::ObserveStatesMappingV1;
     use crate::collection::succinctarchive_union::{
-        Rank9LiftedUnionV1_32Be, Rank9LiftedUnionV1_32Le, Rank9LiftedUnionV1_64Be,
-        Rank9LiftedUnionV1_64Le,
+        Rank9MappingV1_32Be, Rank9MappingV1_32Le, Rank9MappingV1_64Be, Rank9MappingV1_64Le,
+        SimpleToSuccinctMappingV1,
     };
     use crate::metadata::{self, MetaDescribe};
-    use crate::query::register::StatedOrderV1;
 
-    /// Every law describes itself, and the description is rooted at the id the
-    /// law was already minted under. A descriptor can therefore embed the
-    /// description without changing which law it names.
+    /// Every mapping algorithm describes itself under its minted identity.
+    /// Concrete, parameterized mapping entities embed these descriptions
+    /// without conflating the algorithm with one particular mapping.
     #[test]
-    fn every_recipe_describes_itself_under_its_own_id() {
+    fn every_mapping_algorithm_describes_itself_under_its_own_id() {
         fn check<L: MetaDescribe>(expected: crate::id::Id, name: &str) {
             let fragment = <L as MetaDescribe>::describe();
             assert_eq!(
@@ -1181,40 +1208,36 @@ mod recipe_description_tests {
             let kind = crate::collection::records::one_id_for_test(&facts, &metadata::tag);
             assert_eq!(
                 kind,
-                metadata::KIND_COLLECTION_RECIPE,
-                "{name} is not tagged as a collection recipe"
+                metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+                "{name} is not tagged as a collection mapping algorithm"
             );
         }
-        check::<TribleSetUnionV1>(
-            crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
-            "trible-set-union-v1",
+        check::<SimpleToSuccinctMappingV1>(
+            crate::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1,
+            "simple-to-succinct-v1",
         );
-        check::<ObservedUnionV1>(
-            crate::collection::observed_union::OBSERVED_UNION_RECIPE_V1,
-            "observed-union-v1",
+        check::<ObserveStatesMappingV1>(
+            crate::collection::observed_union::OBSERVE_STATES_MAPPING_V1,
+            "observe-states-v1",
         );
-        check::<LwwRegisterV1>(
-            crate::collection::lww_register::LWW_REGISTER_RECIPE_V1,
-            "lww-register-v1",
+        check::<RegisterCoordinatesMappingV1>(
+            crate::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1,
+            "register-coordinates-v1",
         );
-        check::<StatedOrderV1>(
-            crate::query::register::STATED_ORDER_RECIPE_V1,
-            "stated-order-v1",
-        );
-        check::<Rank9LiftedUnionV1_32Le>(
-            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_32_LE,
+        check::<Rank9MappingV1_32Le>(
+            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_32_LE,
             "rank9-32-le",
         );
-        check::<Rank9LiftedUnionV1_32Be>(
-            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_32_BE,
+        check::<Rank9MappingV1_32Be>(
+            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_32_BE,
             "rank9-32-be",
         );
-        check::<Rank9LiftedUnionV1_64Le>(
-            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_64_LE,
+        check::<Rank9MappingV1_64Le>(
+            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_64_LE,
             "rank9-64-le",
         );
-        check::<Rank9LiftedUnionV1_64Be>(
-            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_64_BE,
+        check::<Rank9MappingV1_64Be>(
+            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_64_BE,
             "rank9-64-be",
         );
     }

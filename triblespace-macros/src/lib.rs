@@ -18,6 +18,7 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use hex::FromHex;
 
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::{simplearchive_union, CollectionStoreExt};
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
@@ -104,8 +105,7 @@ fn publish_metadata(
         signing_key.verifying_key(),
         reach::private(),
     );
-    let Ok(collection) = pile.collection::<simplearchive_union::SimpleArchiveUnion>(descriptor)
-    else {
+    let Ok(collection) = pile.collection::<SimpleArchive>(descriptor) else {
         let _ = pile.close();
         return;
     };

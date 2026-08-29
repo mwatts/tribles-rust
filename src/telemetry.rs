@@ -175,7 +175,7 @@ struct TelemetryInner {
 
 struct TelemetryDestination {
     pile: Pile,
-    collection: Collection<simplearchive_union::SimpleArchiveUnion>,
+    collection: Collection<simplearchive_union::SimpleArchive>,
     signing_key: SigningKey,
 }
 

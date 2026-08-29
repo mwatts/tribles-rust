@@ -114,8 +114,9 @@ cannot conservatively mean “no effect”—requires a new frame magic instead.
 Concatenation is associative ordered composition, not universally commutative:
 WANT assertions/retractions and decoded legacy pins are right-biased logs.
 Opaque filtering is sound because it leaves the relative order of every known
-record unchanged; native collection, capability-proof, peer-evidence, and
-artifact-offer records additionally collapse to order-independent set union.
+record unchanged; native collection, mapping-evidence, capability-proof,
+peer-evidence, and artifact-offer records additionally collapse to
+order-independent set union.
 
 ### Compatibility surface: v0.46.4, and a reframe for everything else
 
@@ -198,8 +199,8 @@ refreshing state.
    and `memmap2` mapping. It does not read any records yet (and it does not
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
-   `applied_length`, and rebuilds the blob, collection-record, capability-proof,
-   peer-evidence, artifact-offer, WANT, and legacy pin-snapshot indices
+   `applied_length`, and rebuilds the blob, collection-record, mapping-evidence,
+   capability-proof, peer-evidence, artifact-offer, WANT, and legacy pin-snapshot indices
    in memory. It **fails loud** on a corrupt or torn record
    (`ReadError::CorruptPile { valid_length }`). It skips bounded unknown
    envelope kinds as opaque records and distinguishes an unknown legacy marker
@@ -433,23 +434,26 @@ The descriptor archive holds a descriptor entity carrying:
   root for this exact collection. Roots and derivations state it independently;
   source walking never supplies authority. As an ordinary descriptor fact it
   participates directly in the descriptor handle;
-- `collection_representation` and `collection_recipe`, naming the blob schema
-  and the construction/merge law;
-- any arguments the recipe takes, as ordinary tribles — which attribute an
-  observed set observes, which pair a register is ordered by, which automaton a
-  path summary is over.
+- `collection_representation`, naming the canonical member encoding. The
+  encoding owns validation and the intra-encoding join;
+- on a derivation, `collection_mapping`, linking a concrete mapping entity.
+  Canonical builders derive its id, but readers validate the entity's facts
+  rather than its minting history. It names one `mapping_algorithm` and carries its concrete
+  parameters as ordinary tribles — which attribute an observed set observes,
+  which pair a register is ordered by, or the complete automaton a path summary
+  uses.
 
-A recipe id names a *law* and never its arguments. Folding arguments into a
-derived recipe id would make that digest their only carrier, so a reader
-holding the pile could not recover what a collection means.
+A mapping algorithm id names the reusable computation, while the linked mapping
+entity names one parameterization of it. The complete descriptor archive—not a
+requirement that the entity id was intrinsically minted—binds those facts into
+the target collection identity. The parameters remain queryable rather than
+being hidden behind an opaque hash-only API.
 
-For the same reason the archive also carries the `describe` fragments of the
-representation and the recipe, so the descriptor states what its schema and its
-law *are* rather than only naming them. A bare id is legible only to someone
-who already holds the code that minted it, which is exactly the reader — a peer
-receiving a collection it has never seen — that most needs the answer. The
-descriptor entity's own attributes are unchanged by this: it names the same
-schema and the same law by the same ids, and keeps its intrinsic root.
+The archive may also carry the `describe` fragments of the encoding and mapping
+algorithm, so the descriptor states what its bytes and conversion *are* rather
+than only naming them. A bare id is legible only to someone who already holds
+the code that minted it, which is exactly the reader — a peer receiving a
+collection it has never seen — that most needs the answer.
 
 The magic markers below identify the compact pile representation. They are
 storage-envelope markers, distinct both from the stable semantic kind IDs used
@@ -462,6 +466,17 @@ these algebra records.
 | Commit | `A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59` (`CBF2CF97D52A3486E16C12D70D397C66`) | `64..96` descriptor handle, `96..128` data digest, `128..160` metadata handle, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
 | Merge | `0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379` (`9F5D028D4C423620D6957A5F726FA727`) | `64..96` descriptor handle, `96..128` lower input digest, `128..160` higher input digest, `160..192` result digest, `192..256` reserved zeros |
 | Derive | `7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36` (`ED6B46F7286D4556B076C17B79FD8315`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..256` reserved zeros |
+
+Mapping cache evidence is deliberately a separate grow-only relation, not a
+fourth `CollectionRecord` variant. A `MappingEvidence(mapping, input, output)`
+body is exactly 96 bytes: the mapping field is the BLAKE3 handle of its
+canonical `SimpleArchive` mapping fragment, followed by the input and output
+member digests. Its one-block pile kind is
+`1920A65638AF7ECA1FDB67D74F7769EB2AB95E98E9D191D325D43B1BB25FBD2F`
+(rooted at `8CDA7348DEC34BEBC11A32D550BAB7F6`), with the body in `64..160` and zeros
+through `256`. Every output observed for one `(mapping, input)` remains
+visible; evidence is unsigned cache metadata and grants no authority,
+collection membership, validity, uniqueness, or retention.
 
 Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
 corrupt rather than silently assigning meaning to a format extension. Merge

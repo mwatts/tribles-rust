@@ -9,11 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add typed collection lattices, covers, snapshots, and logical cover views.
-  Member handles retain their encoding through the public API; generic commit
-  and materialization work for non-`SimpleArchive` collections; and exact
-  derived lifecycles bind one source-to-target homomorphism instead of taking
-  a mutable five-operation callback bundle on every call.
+- Add `MappingEvidence(mapping, input, output)` as a separate unsigned,
+  grow-only cache-evidence relation. Its mapping is the content address of a
+  canonical `SimpleArchive` fragment; exact 96-byte equations retain every
+  observed output, use domain-separated intrinsic ids, and persist through
+  `MemoryRepo`, `Pile`, `Yard`, and the standard store wrappers without
+  becoming collection membership or authority.
+
+- Add direct typed collection encodings, covers, snapshots, and logical cover
+  views. `CollectionEncoding` attaches canonical validation and join directly
+  to the member encoding; `Collection<E>` and `Cover<E>` retain that encoding
+  through the public API; and generic commit and materialization work for
+  non-`SimpleArchive` collections. Derived descriptors link a concrete
+  mapping entity carrying its algorithm and concrete parameters, while exact
+  derived lifecycles bind one `CollectionMapping<Source, Target>` whose law is
+  a join homomorphism.
 
 - Add top-level `capability`, a direct authorization kernel. Keyless canonical
   `SimpleArchive` claims carry one exact action/resource atom, invoke/delegate

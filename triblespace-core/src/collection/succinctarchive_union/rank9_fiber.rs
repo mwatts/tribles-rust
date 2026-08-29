@@ -1,13 +1,10 @@
-//! Private one-to-one Rank9 fibers over an already selected raw exact cover.
+//! Private one-to-one Rank9 accelerators over an already selected raw cover.
 //!
-//! For one fixed ABI recipe, the target lattice is the image `i(a)` of the raw
-//! SuccinctArchive lattice. Each target blob embeds the exact raw handle and
-//! its join is defined by `i(a) join i(b) = i(a join b)`, so an ordinary
-//! `DERIVE` is truthful. This helper intentionally consumes the raw
-//! [`CoverAttachment`] selected by the authoritative lifecycle instead of running a
-//! second [`ExactDerivedCollection`](crate::collection::exact_derived::ExactDerivedCollection):
-//! raw collection members are derived cache artifacts and have no signed
-//! commits of their own.
+//! Rank9 is not a collection. It is a deterministic implementation detail of
+//! the raw [`SuccinctArchiveBlob`] view: one ABI-qualified mapping turns one raw
+//! member into one detached sidecar. [`MappingEvidence`] records cacheable
+//! observations of that mapping without granting the sidecars collection
+//! membership or inventing a second frontier.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -18,23 +15,20 @@ use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveError,
     SuccinctArchiveRank9IndexBlob, UnionArchive,
 };
-use crate::blob::{Blob, BlobEncoding};
+use crate::blob::encodings::UnknownBlob;
+use crate::blob::{Blob, BlobEncoding, IntoBlob};
 use crate::collection::{
-    CollectionData, CollectionDerive, CollectionHandle, CollectionRecord, CollectionRecordSelector,
-    CollectionStore, CoverAttachment,
+    CollectionData, CollectionHandle, CoverAttachment, MappingEvidence, MappingEvidenceSelector,
+    MappingEvidenceStore, MappingHandle,
 };
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
-use crate::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, OfferCapture,
-};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStorePut, OfferCapture};
 use crate::trible::{Fragment, TribleSet};
-
-use super::SuccinctArchiveUnion;
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
-/// Failure while attaching or publishing exact Rank9 fibers.
+/// Failure while attaching or publishing exact Rank9 accelerators.
 #[derive(Debug)]
 pub enum Rank9FiberError {
     /// A repository operation failed before optional evidence could be judged.
@@ -46,7 +40,7 @@ pub enum Rank9FiberError {
     },
     /// The supplied raw cover belongs to another collection descriptor.
     WrongRawCollection {
-        /// Raw collection this fiber indexes.
+        /// Raw collection this accelerator indexes.
         expected: CollectionHandle,
         /// Collection carried by the supplied cover.
         actual: CollectionHandle,
@@ -65,14 +59,12 @@ pub enum Rank9FiberError {
         /// Exact raw/Rank9 validation failure.
         source: SuccinctArchiveError,
     },
-    /// A descriptor put acknowledged a different content identity.
-    NonCanonicalDescriptorPut {
-        /// Which descriptor was being published.
-        role: &'static str,
-        /// Canonical descriptor identity.
-        expected: crate::collection::CollectionHandle,
+    /// A mapping-fragment put acknowledged a different content identity.
+    NonCanonicalMappingPut {
+        /// Canonical mapping-fragment identity.
+        expected: MappingHandle,
         /// Identity returned by the backend.
-        actual: crate::collection::CollectionHandle,
+        actual: MappingHandle,
     },
     /// A Rank9 put acknowledged a different content identity.
     NonCanonicalRank9Put {
@@ -121,16 +113,12 @@ impl fmt::Display for Rank9FiberError {
             ),
             Self::Build { raw, source } => write!(
                 f,
-                "build Rank9 fiber for raw member {}: {source}",
+                "build Rank9 accelerator for raw member {}: {source}",
                 hex::encode_upper(raw.raw),
             ),
-            Self::NonCanonicalDescriptorPut {
-                role,
-                expected,
-                actual,
-            } => write!(
+            Self::NonCanonicalMappingPut { expected, actual } => write!(
                 f,
-                "blob store returned {role} descriptor {} instead of {}",
+                "blob store returned Rank9 mapping {} instead of {}",
                 hex::encode_upper(actual.raw),
                 hex::encode_upper(expected.raw),
             ),
@@ -171,30 +159,23 @@ struct ProbedMember {
     raw_data: CollectionData,
     raw: Blob<SuccinctArchiveBlob>,
     output: Option<CollectionData>,
-    claim_present: bool,
     prepared: Option<Blob<SuccinctArchiveRank9IndexBlob>>,
     runtime: Option<SuccinctArchive<OrderedUniverse>>,
-}
-
-struct CanonicalCandidate {
-    output: CollectionData,
-    claim_present: bool,
-    prepared: Blob<SuccinctArchiveRank9IndexBlob>,
 }
 
 struct CandidateOutputs {
     first: CollectionData,
     ambiguous: bool,
-    canonical: Option<CanonicalCandidate>,
 }
 
 struct FiberProbe {
     members: Vec<ProbedMember>,
+    mapping_complete: bool,
 }
 
 impl FiberProbe {
     fn is_complete(&self) -> bool {
-        self.members.iter().all(|member| member.runtime.is_some())
+        self.mapping_complete && self.members.iter().all(|member| member.runtime.is_some())
     }
 
     fn into_archive(self) -> UnionArchive<OrderedUniverse> {
@@ -209,36 +190,32 @@ impl FiberProbe {
 
 #[derive(Clone)]
 pub(super) struct Rank9Fiber {
-    source: Fragment,
     source_collection: CollectionHandle,
-    target: Fragment,
-    target_collection: CollectionHandle,
+    mapping: Fragment,
+    mapping_handle: MappingHandle,
 }
 
 impl Rank9Fiber {
-    pub(super) fn new(source: Fragment, target: Fragment) -> Self {
-        let source_collection: CollectionHandle =
-            crate::blob::IntoBlob::<SimpleArchive>::to_blob(source.facts().clone()).get_handle();
-        let target_collection: CollectionHandle =
-            crate::blob::IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()).get_handle();
+    pub(super) fn new(source: Fragment) -> Self {
+        let source_collection = source.facts().clone().to_blob().get_handle();
+        let mapping = super::rank9_mapping_fragment();
+        let mapping_handle = mapping.facts().clone().to_blob().get_handle();
         Self {
-            source,
             source_collection,
-            target,
-            target_collection,
+            mapping,
+            mapping_handle,
         }
     }
 
-    /// Attach persisted fibers when unambiguous and exact; otherwise rebuild
-    /// that raw member's Rank9 runtime transiently without writing.
+    /// Attach unambiguous, valid persisted accelerators. Every cache miss is
+    /// rebuilt transiently and this method writes nothing.
     pub(super) fn attach<S>(
         &self,
         store: &mut S,
-        cover: CoverAttachment<SuccinctArchiveUnion>,
+        cover: CoverAttachment<SuccinctArchiveBlob>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
-        S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S: BlobStore + MappingEvidenceStore,
     {
         let probe = self.probe(store, cover, false)?;
         let mut segments = Vec::with_capacity(probe.members.len());
@@ -256,16 +233,15 @@ impl Rank9Fiber {
         Ok(UnionArchive::new(segments))
     }
 
-    /// Ensure one persisted exact Rank9 fiber for every member of this fixed
-    /// selected raw cover, then strictly re-read those same expected pairs.
+    /// Ensure one persisted exact Rank9 accelerator for every member of this
+    /// fixed raw cover, then strictly re-read those same expected pairs.
     pub(super) fn ensure<S>(
         &self,
         store: &mut S,
-        cover: CoverAttachment<SuccinctArchiveUnion>,
+        cover: CoverAttachment<SuccinctArchiveBlob>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S: BlobStore + MappingEvidenceStore + ArtifactOfferStore,
     {
         let probe = self.probe(store, cover, true)?;
         if probe.is_complete() {
@@ -273,16 +249,16 @@ impl Rank9Fiber {
         }
 
         let mut members = probe.members;
+        // Verification below deliberately reopens every endpoint, including
+        // members whose accelerator was already valid before this repair.
         for member in &mut members {
             member.runtime = None;
         }
 
         let mut capture = OfferCapture::new(store);
         let store = &mut capture;
-        self.publish_descriptor(store, "raw", self.source.clone(), self.source_collection)?;
-        self.publish_descriptor(store, "Rank9", self.target.clone(), self.target_collection)?;
+        self.publish_mapping_closure(store)?;
 
-        let mut claims = Vec::new();
         for member in &mut members {
             let Some(rank9) = member.prepared.take() else {
                 continue;
@@ -299,29 +275,26 @@ impl Rank9Fiber {
                     actual,
                 });
             }
-            if let Some(expected) = member.output {
-                debug_assert_eq!(output, expected, "fixed Rank9 recipe is functional");
-            }
             member.output = Some(output);
-            // Reinsert the exact DERIVE even when it already exists. Record
-            // insertion is idempotent, and it is the publication boundary
-            // through which an operation-scoped OfferCapture advertises a
-            // repaired sidecar before making that repair visible as complete.
-            claims.push(CollectionDerive::new(
-                self.target_collection,
-                member.raw_data,
-                output,
-            ));
-            member.claim_present = true;
         }
 
-        // Every stored endpoint precedes an idempotent equation insert. A
-        // failure above can leave only harmless orphan blobs, never a new
-        // claim naming bytes this attempt failed to store.
-        for claim in claims {
+        // OfferCapture advertises the complete mapping closure and every new
+        // sidecar before admitting the first equation. Re-inserting equations
+        // for already-valid pairs is idempotent and also flushes a repaired
+        // mapping closure when no sidecar itself needed repair.
+        for member in &members {
+            let output = member
+                .output
+                .expect("every ensured Rank9 member has one exact output");
             store
-                .insert(CollectionRecord::Derive(claim))
-                .map_err(|error| Rank9FiberError::storage("publish Rank9 DERIVE", error))?;
+                .insert_evidence(MappingEvidence::new(
+                    self.mapping_handle,
+                    member.raw_data,
+                    output,
+                ))
+                .map_err(|error| {
+                    Rank9FiberError::storage("publish Rank9 mapping evidence", error)
+                })?;
         }
 
         self.verify_published(store, members)
@@ -330,12 +303,11 @@ impl Rank9Fiber {
     fn probe<S>(
         &self,
         store: &mut S,
-        cover: CoverAttachment<SuccinctArchiveUnion>,
+        cover: CoverAttachment<SuccinctArchiveBlob>,
         ensure: bool,
     ) -> Result<FiberProbe, Rank9FiberError>
     where
-        S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S: BlobStore + MappingEvidenceStore,
     {
         if cover.cover().collection().handle() != self.source_collection {
             return Err(Rank9FiberError::WrongRawCollection {
@@ -348,11 +320,15 @@ impl Rank9Fiber {
             .into_iter()
             .map(|(data, raw)| (Handle::<SuccinctArchiveBlob>::to_hash(data), raw))
             .collect();
-        let raw_by_input: BTreeMap<_, _> = members.iter().map(|(data, raw)| (*data, raw)).collect();
-        let mut candidates = self.candidates(store, &raw_by_input, ensure)?;
+        let selectors = members
+            .iter()
+            .map(|(input, _)| MappingEvidenceSelector::MappingInput(self.mapping_handle, *input))
+            .collect();
+        let mut candidates = self.candidates(store, &selectors)?;
         let reader = store
             .reader()
-            .map_err(|error| Rank9FiberError::storage("open Rank9 fiber reader", error))?;
+            .map_err(|error| Rank9FiberError::storage("open Rank9 accelerator reader", error))?;
+        let mapping_complete = self.mapping_closure_is_complete(&reader);
 
         let mut probed = Vec::with_capacity(members.len());
         for (raw_data, raw) in members {
@@ -363,206 +339,144 @@ impl Rank9Fiber {
                     actual,
                 });
             }
-            let mut evidence = candidates.remove(&raw_data);
-            let unique = evidence
-                .as_ref()
+            let unique = candidates
+                .remove(&raw_data)
                 .and_then(|outputs| (!outputs.ambiguous).then_some(outputs.first));
-            let mut full_validation_attempted = false;
             let mut output = None;
-            let mut claim_present = false;
             let mut prepared = None;
             let mut runtime = None;
 
-            if let Some(candidate) = unique {
-                full_validation_attempted = true;
-                let claim = CollectionDerive::new(self.target_collection, raw_data, candidate);
-                if let Some(attached) = self.try_attach(&reader, raw_data, &raw, claim)? {
-                    output = Some(candidate);
-                    claim_present = true;
-                    runtime = Some(attached);
+            if mapping_complete {
+                if let Some(candidate) = unique {
+                    if let Some(attached) = self.try_attach(&reader, raw_data, &raw, candidate) {
+                        output = Some(candidate);
+                        runtime = Some(attached);
+                    }
                 }
             }
 
             if ensure && runtime.is_none() {
-                // Ambiguous evidence is never searched. Build once to learn the
-                // one canonical output for this fixed recipe, then validate at
-                // most that exact claimed endpoint. Retaining these bytes lets
-                // publication proceed after this reader is dropped without a
-                // second canonical build.
-                let canonical_candidate = evidence
-                    .as_mut()
-                    .and_then(|outputs| outputs.canonical.take());
-                let (canonical_blob, canonical, canonical_was_claimed) = if let Some(candidate) =
-                    canonical_candidate
-                {
-                    (
-                        candidate.prepared,
-                        candidate.output,
-                        candidate.claim_present,
-                    )
-                } else {
-                    let blob = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone())
-                        .map_err(|source| Rank9FiberError::Build {
+                // Missing, corrupt, source-mismatched, or ambiguous evidence
+                // is a cache miss. Rebuild the one canonical sidecar instead
+                // of choosing among claims supplied by the store.
+                let rank9 = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone())
+                    .map_err(|source| Rank9FiberError::Build {
                         raw: raw_data,
                         source,
                     })?;
-                    let output = fresh_data_identity(&blob);
-                    let claimed = evidence.as_ref().is_some_and(|outputs| {
-                        debug_assert!(!outputs.ambiguous);
-                        outputs.first == output
-                    });
-                    (blob, output, claimed)
-                };
-                claim_present = canonical_was_claimed;
-                output = Some(canonical);
-                if claim_present && !full_validation_attempted {
-                    let claim = CollectionDerive::new(self.target_collection, raw_data, canonical);
-                    runtime = self.try_attach(&reader, raw_data, &raw, claim)?;
-                }
-                if runtime.is_none() {
-                    prepared = Some(canonical_blob);
-                }
+                output = Some(fresh_data_identity(&rank9));
+                prepared = Some(rank9);
             }
             probed.push(ProbedMember {
                 raw_data,
                 raw,
                 output,
-                claim_present,
                 prepared,
                 runtime,
             });
         }
-        Ok(FiberProbe { members: probed })
+        Ok(FiberProbe {
+            members: probed,
+            mapping_complete,
+        })
     }
 
-    /// Enumerate records once and retain bounded evidence per selected input.
-    /// One first output plus an ambiguity bit suffices for attachment. Ensure
-    /// builds and retains the canonical sidecar as soon as a second distinct
-    /// output appears, so later records need only note whether that exact
-    /// output was claimed. This avoids both O(cover * records) work and memory
-    /// proportional to attacker-supplied distinct outputs.
-    fn candidates<S: CollectionStore>(
+    /// Retain only one first output plus an ambiguity bit per selected input.
+    /// This bounds memory even if a hostile store contains many equations for
+    /// the same input.
+    fn candidates<S: MappingEvidenceStore>(
         &self,
         store: &mut S,
-        raw_by_input: &BTreeMap<CollectionData, &Blob<SuccinctArchiveBlob>>,
-        ensure: bool,
+        selectors: &BTreeSet<MappingEvidenceSelector>,
     ) -> Result<BTreeMap<CollectionData, CandidateOutputs>, Rank9FiberError> {
+        let evidence = store
+            .select_evidence(selectors)
+            .map_err(|error| Rank9FiberError::storage("select Rank9 mapping evidence", error))?;
         let mut candidates = BTreeMap::<CollectionData, CandidateOutputs>::new();
-        let selectors = [CollectionRecordSelector::DeriveTarget(
-            self.target_collection,
-        )]
-        .into_iter()
-        .collect();
-        let records = store
-            .select_records(&selectors)
-            .map_err(|error| Rank9FiberError::storage("select Rank9 DERIVEs", error))?;
-        for record in records {
-            let CollectionRecord::Derive(claim) = record else {
-                continue;
-            };
-            let (input, output) = claim.mapping();
-            let Some(raw) = raw_by_input.get(&input) else {
-                continue;
-            };
-            if claim.target() != self.target_collection {
+        for evidence in evidence {
+            if evidence.mapping() != self.mapping_handle {
                 continue;
             }
-            let Some(outputs) = candidates.get_mut(&input) else {
-                candidates.insert(
-                    input,
-                    CandidateOutputs {
-                        first: output,
-                        ambiguous: false,
-                        canonical: None,
-                    },
-                );
-                continue;
-            };
-            if output == outputs.first {
-                continue;
-            }
-            if !outputs.ambiguous {
-                outputs.ambiguous = true;
-                if ensure {
-                    let prepared =
-                        SuccinctArchive::<OrderedUniverse>::build_rank9_index((*raw).clone())
-                            .map_err(|source| Rank9FiberError::Build { raw: input, source })?;
-                    let canonical = fresh_data_identity(&prepared);
-                    outputs.canonical = Some(CanonicalCandidate {
-                        output: canonical,
-                        claim_present: outputs.first == canonical || output == canonical,
-                        prepared,
-                    });
+            let input = evidence.input();
+            let output = evidence.output();
+            match candidates.get_mut(&input) {
+                None => {
+                    candidates.insert(
+                        input,
+                        CandidateOutputs {
+                            first: output,
+                            ambiguous: false,
+                        },
+                    );
                 }
-                continue;
-            }
-            if let Some(canonical) = &mut outputs.canonical {
-                canonical.claim_present |= output == canonical.output;
+                Some(outputs) if outputs.first != output => outputs.ambiguous = true,
+                Some(_) => {}
             }
         }
         Ok(candidates)
     }
 
-    fn try_attach<R>(
+    fn try_attach<R: BlobStoreGet>(
         &self,
         reader: &R,
         raw_data: CollectionData,
         raw: &Blob<SuccinctArchiveBlob>,
-        claim: CollectionDerive,
-    ) -> Result<Option<SuccinctArchive<OrderedUniverse>>, Rank9FiberError>
-    where
-        R: BlobStoreGet + BlobStoreMeta,
-    {
-        if claim.target() != self.target_collection {
-            return Ok(None);
-        }
-        let (input, output) = claim.mapping();
-        // `probe` freshly hashed `raw` against `raw_data` immediately before
-        // this call; bind the claim to that proof without hashing the same raw
-        // bytes a second time.
-        if input != raw_data {
-            return Ok(None);
-        }
-
+        output: CollectionData,
+    ) -> Option<SuccinctArchive<OrderedUniverse>> {
         let handle = Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(output);
-        let Ok(Some(_)) = reader.metadata(handle) else {
-            return Ok(None);
-        };
-        let Ok(rank9): Result<Blob<SuccinctArchiveRank9IndexBlob>, _> = reader.get(handle) else {
-            return Ok(None);
-        };
+        let rank9: Blob<SuccinctArchiveRank9IndexBlob> = reader.get(handle).ok()?;
         if fresh_data_identity(&rank9) != output {
-            return Ok(None);
+            return None;
         }
-        let Ok(source) = SuccinctArchiveRank9IndexBlob::source_handle(&rank9) else {
-            return Ok(None);
-        };
+        let source = SuccinctArchiveRank9IndexBlob::source_handle(&rank9).ok()?;
         if Handle::<SuccinctArchiveBlob>::to_hash(source) != raw_data {
-            return Ok(None);
+            return None;
         }
-        Ok(SuccinctArchive::from_blob_pair(raw.clone(), rank9).ok())
+        SuccinctArchive::from_blob_pair(raw.clone(), rank9).ok()
     }
 
-    fn publish_descriptor<S: BlobStore>(
+    fn publish_mapping_closure<S: BlobStorePut>(
         &self,
         store: &mut S,
-        role: &'static str,
-        descriptor: Fragment,
-        expected: CollectionHandle,
     ) -> Result<(), Rank9FiberError> {
-        let actual = store
-            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-                descriptor.into_facts(),
-            ))
-            .map_err(|error| Rank9FiberError::storage("store Rank9 descriptor", error))?;
-        if actual != expected {
-            return Err(Rank9FiberError::NonCanonicalDescriptorPut {
-                role,
-                expected,
+        let actual = crate::collection::descriptor::put_closure(store, &self.mapping)
+            .map_err(|error| Rank9FiberError::storage("store Rank9 mapping closure", error))?;
+        if actual != self.mapping_handle {
+            return Err(Rank9FiberError::NonCanonicalMappingPut {
+                expected: self.mapping_handle,
                 actual,
             });
         }
         Ok(())
+    }
+
+    fn mapping_closure_is_complete<R: BlobStoreGet>(&self, reader: &R) -> bool {
+        let Ok(blob): Result<Blob<SimpleArchive>, _> = reader.get(self.mapping_handle) else {
+            return false;
+        };
+        if blob.get_handle() != self.mapping_handle {
+            return false;
+        }
+        let Ok(facts) = <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(blob)
+        else {
+            return false;
+        };
+        if &facts != self.mapping.facts() {
+            return false;
+        }
+        let mut blobs = self.mapping.blobs().clone();
+        for (handle, expected) in blobs
+            .reader()
+            .expect("MemoryBlobStore::reader is infallible")
+        {
+            let Ok(actual): Result<Blob<UnknownBlob>, _> = reader.get(handle) else {
+                return false;
+            };
+            if actual.get_handle() != handle || actual.bytes != expected.bytes {
+                return false;
+            }
+        }
+        true
     }
 
     fn verify_published<S>(
@@ -571,42 +485,40 @@ impl Rank9Fiber {
         members: Vec<ProbedMember>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
-        S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S: BlobStore + MappingEvidenceStore,
     {
-        let expected_claims: BTreeMap<_, _> = members
+        let expected: Vec<_> = members
             .iter()
             .map(|member| {
-                let output = member
-                    .output
-                    .expect("every incomplete probe member is assigned before publication");
-                let claim = CollectionDerive::new(self.target_collection, member.raw_data, output);
-                (claim.id(), claim)
+                MappingEvidence::new(
+                    self.mapping_handle,
+                    member.raw_data,
+                    member
+                        .output
+                        .expect("published Rank9 member has an exact output"),
+                )
             })
             .collect();
-        let selectors = expected_claims
-            .keys()
-            .copied()
-            .map(CollectionRecordSelector::Id)
+        let selectors = expected
+            .iter()
+            .map(|evidence| MappingEvidenceSelector::Id(evidence.id()))
             .collect();
-        let mut found = BTreeSet::new();
-        let records = store.select_records(&selectors).map_err(|error| {
-            Rank9FiberError::storage("re-select published Rank9 DERIVEs", error)
-        })?;
-        for record in records {
-            if let CollectionRecord::Derive(claim) = record {
-                if expected_claims.get(&claim.id()) == Some(&claim) {
-                    found.insert(claim.id());
-                }
-            }
-        }
-        for (id, claim) in &expected_claims {
-            if !found.contains(id) {
-                let (raw, rank9) = claim.mapping();
+        let found: BTreeSet<_> = store
+            .select_evidence(&selectors)
+            .map_err(|error| {
+                Rank9FiberError::storage("re-select published Rank9 mapping evidence", error)
+            })?
+            .into_iter()
+            .collect();
+        for evidence in &expected {
+            if !found.contains(evidence) {
                 return Err(Rank9FiberError::IncompletePublication {
-                    raw,
-                    rank9: Some(rank9),
-                    reason: format!("expected DERIVE {id:X} is not resident"),
+                    raw: evidence.input(),
+                    rank9: Some(evidence.output()),
+                    reason: format!(
+                        "expected mapping evidence {} is not resident",
+                        evidence.id()
+                    ),
                 });
             }
         }
@@ -618,20 +530,14 @@ impl Rank9Fiber {
             .first()
             .expect("nonempty fixed cover reaches publication")
             .raw_data;
-        self.verify_descriptor(
-            &reader,
-            "raw",
-            &self.source,
-            self.source_collection,
-            raw_context,
-        )?;
-        self.verify_descriptor(
-            &reader,
-            "Rank9",
-            &self.target,
-            self.target_collection,
-            raw_context,
-        )?;
+        if !self.mapping_closure_is_complete(&reader) {
+            return Err(Rank9FiberError::IncompletePublication {
+                raw: raw_context,
+                rank9: None,
+                reason: "Rank9 mapping fragment or one of its attachments is not resident"
+                    .to_owned(),
+            });
+        }
 
         let mut segments = Vec::with_capacity(members.len());
         for member in members {
@@ -649,7 +555,7 @@ impl Rank9Fiber {
                 return Err(Rank9FiberError::IncompletePublication {
                     raw: member.raw_data,
                     rank9: Some(output),
-                    reason: "fresh raw endpoint hash does not match its DERIVE".to_owned(),
+                    reason: "fresh raw endpoint hash does not match its cover".to_owned(),
                 });
             }
 
@@ -666,7 +572,7 @@ impl Rank9Fiber {
                 return Err(Rank9FiberError::IncompletePublication {
                     raw: member.raw_data,
                     rank9: Some(output),
-                    reason: "fresh Rank9 endpoint hash does not match its DERIVE".to_owned(),
+                    reason: "fresh Rank9 endpoint hash does not match its evidence".to_owned(),
                 });
             }
             let source = SuccinctArchiveRank9IndexBlob::source_handle(&rank9).map_err(|error| {
@@ -694,36 +600,6 @@ impl Rank9Fiber {
             );
         }
         Ok(UnionArchive::new(segments))
-    }
-
-    fn verify_descriptor<R: BlobStoreGet>(
-        &self,
-        reader: &R,
-        role: &'static str,
-        expected: &Fragment,
-        collection: CollectionHandle,
-        raw: CollectionData,
-    ) -> Result<(), Rank9FiberError> {
-        let blob: Blob<SimpleArchive> =
-            reader
-                .get(collection)
-                .map_err(|error| Rank9FiberError::IncompletePublication {
-                    raw,
-                    rank9: None,
-                    reason: format!("expected {role} descriptor is not readable: {error}"),
-                })?;
-        let fresh = Blob::<SimpleArchive>::new(blob.bytes.clone());
-        let decoded =
-            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(fresh.clone())
-                .ok();
-        if fresh.get_handle() != collection || decoded.as_ref() != Some(expected.facts()) {
-            return Err(Rank9FiberError::IncompletePublication {
-                raw,
-                rank9: None,
-                reason: format!("fresh {role} descriptor is not canonical"),
-            });
-        }
-        Ok(())
     }
 }
 

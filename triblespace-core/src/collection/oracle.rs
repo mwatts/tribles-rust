@@ -6,11 +6,11 @@
 //! must validate that each element is canonical and each unsigned
 //! `MERGE`/`DERIVE` equation is exact. This generic fold cannot prove those
 //! properties from opaque ids. It computes their least membership closure,
-//! catches two outputs claimed for one canonical operation, closes declared
-//! join homomorphisms, and derives the known subsumption frontier.
-//! Homomorphisms are trusted, prevalidated direct descriptor laws; this model
-//! intentionally does not assume that an `S -> U -> T` path equals a separately
-//! declared `S -> T` map.
+//! catches two outputs claimed for one canonical operation, closes mappings
+//! under their declared join-homomorphism law, and derives the known
+//! subsumption frontier. Mappings are trusted and prevalidated from their
+//! descriptors; this model intentionally does not assume that an `S -> U -> T`
+//! path equals a separately declared `S -> T` mapping.
 //!
 //! Only committed data enters the typed lattice. Commit metadata and opaque
 //! authentication evidence remain provenance on the outside and accumulate by

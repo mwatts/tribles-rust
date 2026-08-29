@@ -3,7 +3,7 @@
 //! Discovery establishes canonical record structure and strict commit
 //! self-signatures. This module deliberately starts one layer later: the
 //! caller chooses whether membership roots come from authorized commits or an
-//! explicit payload cover, and supplies the concrete representation/recipe
+//! explicit payload cover, and supplies concrete encoding and mapping
 //! validation for every eligible claim. Only chosen roots and positively
 //! accepted equations participate in the least fixed point.
 //!
@@ -31,15 +31,16 @@ type DeriveOutput = (CollectionData, Id);
 /// One claim presented for concrete semantic validation.
 ///
 /// The claim carries its descriptor handle(s). The callback owns descriptor
-/// lookup, decoding, and validation as well as all representation-specific
-/// work, including loading and validating the bytes named by each endpoint.
+/// lookup, decoding, and validation as well as all encoding- and
+/// mapping-specific work, including loading and validating the bytes named by
+/// each endpoint.
 /// It returns [`CollectionClaimValidation::Pending`] when required blobs are
 /// absent. For `Derive`, the exact source and target collection handles
 /// identify the mapping; this generic layer imposes no additional scope
 /// relationship. Every accepted `Derive` belongs to the canonical
-/// source-to-target join homomorphism: mappings for the same exact collection
-/// pair preserve joins and therefore preserve the induced order. The callback
-/// is the trust boundary for those algebraic laws: this resolver diagnoses
+/// source-to-target mapping. Its join-homomorphism law preserves the induced
+/// order for the exact collection pair. The callback is the trust boundary
+/// for that law: this resolver diagnoses
 /// direct functional conflicts and conflicts completed by active commuting
 /// squares, but does not materialize every absorption equation or globally
 /// re-prove order consistency among accepted claims.
@@ -88,7 +89,7 @@ impl CollectionValidationRequest<'_> {
 pub enum CollectionClaimValidation<D> {
     /// The exact claim is semantically valid under its descriptor(s), including
     /// the collection's ACI join law and, for a derivation, the canonical
-    /// homomorphism law.
+    /// mapping law.
     Accepted,
     /// Validation cannot yet conclude, commonly because an endpoint is absent.
     Pending,
@@ -137,7 +138,8 @@ pub enum CollectionFunctionalConflict {
     /// One mapping assigns two outputs to the same input.
     ///
     /// The target names the mapping: its descriptor says which collection it
-    /// derives from and by what recipe, so a conflict is about one target.
+    /// derives from and embeds the concrete mapping, so a conflict is
+    /// about one target.
     Derive {
         /// Target collection.
         target: CollectionHandle,
@@ -301,7 +303,7 @@ impl CollectionSemantics {
         self.members.get(&collection)
     }
 
-    /// Maximal members under active merge and homomorphism lineage.
+    /// Maximal members under active merge and mapping lineage.
     pub fn frontier(&self, collection: CollectionHandle) -> Option<&BTreeSet<CollectionData>> {
         self.frontier.get(&collection)
     }
@@ -726,12 +728,15 @@ where
             }
         }
         for claim in &accepted_derives {
-            let (input, output) = claim.mapping();
-            let Some(source) = lineage.get(&claim.target()).copied() else {
+            let (input, output) = (claim.input(), claim.output());
+            let Some(source) = lineage.get(&claim.collection()).copied() else {
                 continue;
             };
             if contains_member(&members, source, input) {
-                changed |= members.entry(claim.target()).or_default().insert(output);
+                changed |= members
+                    .entry(claim.collection())
+                    .or_default()
+                    .insert(output);
             }
         }
         if !changed {
@@ -741,10 +746,10 @@ where
 
     // Which collection derives from which is a property of the target's
     // DESCRIPTOR, not of any record: a derivation is one canonical join
-    // homomorphism, and individual records are observations of that map. The
+    // mapping, and individual records are observations of that map. The
     // caller supplies the lineage because it is the party holding descriptors;
     // resolution reads records only. A caller that cannot name a target's
-    // source could not check the derivation either, since the recipe lives in
+    // source could not check the derivation either, since the mapping lives in
     // the same descriptor.
     let homomorphisms: BTreeSet<_> = lineage
         .iter()
@@ -768,10 +773,10 @@ where
     }
 
     for claim in &accepted_derives {
-        let (input, output) = claim.mapping();
+        let (input, output) = (claim.input(), claim.output());
         // A derive whose target declares no source has no mapping to be an
         // instance of, so it activates nothing.
-        let Some(source) = lineage.get(&claim.target()).copied() else {
+        let Some(source) = lineage.get(&claim.collection()).copied() else {
             activation_pending.insert(claim.id());
             continue;
         };
@@ -779,7 +784,7 @@ where
             activation_pending.insert(claim.id());
             continue;
         }
-        debug_assert!(contains_member(&members, claim.target(), output));
+        debug_assert!(contains_member(&members, claim.collection(), output));
         active_derives.insert(claim.id(), (**claim).clone());
     }
 
@@ -815,11 +820,11 @@ where
     }
 
     for claim in active_derives.values() {
-        let target = claim.target();
+        let target = claim.collection();
         let Some(source) = lineage.get(&target).copied() else {
             continue;
         };
-        let (input, output) = claim.mapping();
+        let (input, output) = (claim.input(), claim.output());
         semantics
             .derive_inputs_by_output
             .entry((target, output))
@@ -861,7 +866,7 @@ where
     })
 }
 
-/// Lift the sparse known order through every observed join homomorphism.
+/// Lift the sparse known order through every observed mapping.
 ///
 /// A mapped source member starts one witness. Unmapped successors carry that
 /// witness upward. At the next mapped successor, the corresponding target
@@ -870,7 +875,7 @@ where
 /// visit per source edge, while two mapped endpoints still discover the order
 /// relation across any number of unmapped intermediates.
 ///
-/// Target edges can themselves be sources for another homomorphism, so all
+/// Target edges can themselves be sources for another mapping, so all
 /// maps are revisited until no sparse edge is added. The graph remains a
 /// generating relation; its transitive closure is never materialized.
 fn close_homomorphic_order(
@@ -950,7 +955,7 @@ fn nearest_mapped_order_edges(
 
 /// Close active equations under the commuting-square law.
 ///
-/// For a homomorphism `f : S -> T`, a source equation `a join b = c`
+/// For a mapping `f : S -> T`, a source equation `a join b = c`
 /// completes either missing side of
 ///
 /// ```text
@@ -1081,9 +1086,9 @@ fn index_derive_outputs<'a>(
     let mut outputs: BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, Id>> =
         BTreeMap::new();
     for claim in derives {
-        let (input, output) = claim.mapping();
+        let (input, output) = (claim.input(), claim.output());
         outputs
-            .entry((claim.target(), input))
+            .entry((claim.collection(), input))
             .or_default()
             .entry(output)
             .and_modify(|record| *record = (*record).min(claim.id()))
@@ -1156,9 +1161,9 @@ fn check_functional(
         BTreeMap<CollectionData, Id>,
     > = BTreeMap::new();
     for claim in derives {
-        let (input, output) = claim.mapping();
+        let (input, output) = (claim.input(), claim.output());
         derive_outputs
-            .entry((claim.target(), input))
+            .entry((claim.collection(), input))
             .or_default()
             .entry(output)
             .and_modify(|record| *record = (*record).min(claim.id()))
@@ -1391,8 +1396,8 @@ mod tests {
 
     #[test]
     fn authorization_and_validator_status_are_distinct() {
-        let definition = named_for_tests("c1", id(2), id(3));
-        let missing_collection = named_for_tests("c9", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
+        let missing_collection = named_for_tests("c9", id(2));
         let authorized = commit(&definition, data(1), 1);
         let unauthorized = commit(&definition, data(2), 2);
         let missing_descriptor_commit = commit(&missing_collection, data(3), 3);
@@ -1436,7 +1441,7 @@ mod tests {
                     claim.collection() == identity_for_tests(&definition)
                 }
                 CollectionValidationRequest::Derive { claim } => {
-                    claim.target() == identity_for_tests(&definition)
+                    claim.collection() == identity_for_tests(&definition)
                 }
             };
             if claim == rejected_merge.id() {
@@ -1491,8 +1496,8 @@ mod tests {
 
     #[test]
     fn explicit_payload_roots_drive_merge_and_derive_closure_without_provenance() {
-        let source = named_for_tests("source", id(2), id(3));
-        let target = named_for_tests("target", id(4), id(5));
+        let source = named_for_tests("source", id(2));
+        let target = named_for_tests("target", id(4));
         let source_handle = identity_for_tests(&source);
         let target_handle = identity_for_tests(&target);
         let merge = CollectionMerge::new(source_handle, data(1), data(2), data(3));
@@ -1538,7 +1543,7 @@ mod tests {
 
     #[test]
     fn explicit_payload_roots_ignore_duplicate_commit_provenance() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let collection = identity_for_tests(&definition);
         let first = commit(&definition, data(1), 1);
         let duplicate = commit(&definition, data(1), 2);
@@ -1583,7 +1588,7 @@ mod tests {
 
     #[test]
     fn authorized_commit_resolution_still_tracks_claim_provenance() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let collection = identity_for_tests(&definition);
         let root = commit(&definition, data(1), 1);
         let records = discover(&[definition], &[root.clone()], &[], &[], false);
@@ -1624,7 +1629,7 @@ mod tests {
 
     #[test]
     fn callback_failure_names_the_claim_and_returns_no_snapshot() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let root = commit(&definition, data(1), 1);
         let records = discover(&[definition], &[root.clone()], &[], &[], false);
         let error = resolve_with_derive_lineage::<(), _, _>(
@@ -1645,10 +1650,10 @@ mod tests {
 
     #[test]
     fn alternating_merge_derive_merge_reaches_the_least_fixed_point() {
-        let raw = named_for_tests("c1", id(2), id(3));
+        let raw = named_for_tests("c1", id(2));
         // A deliberately different scope proves that the generic resolver does
         // not preempt the derivation validator's compatibility policy.
-        let rollup = named_for_tests("c9", id(4), id(5));
+        let rollup = named_for_tests("c9", id(4));
         let raw_one = commit(&raw, data(1), 1);
         let raw_two = commit(&raw, data(2), 2);
         let rollup_four = commit(&rollup, data(4), 3);
@@ -1707,8 +1712,8 @@ mod tests {
 
     #[test]
     fn derive_lifts_source_subsumption_without_a_target_merge() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge =
@@ -1751,8 +1756,8 @@ mod tests {
 
     #[test]
     fn derive_lifts_order_across_unmapped_source_members() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let commits = [
             commit(&source, data(1), 1),
             commit(&source, data(2), 2),
@@ -1792,8 +1797,8 @@ mod tests {
 
     #[test]
     fn derive_carries_incomparable_leaf_witnesses_through_unmapped_joins() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let commits = [
             commit(&source, data(1), 1),
             commit(&source, data(2), 2),
@@ -1840,9 +1845,9 @@ mod tests {
 
     #[test]
     fn lifted_order_reaches_a_second_homomorphism() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let middle = named_for_tests("c4", id(5), id(6));
-        let target = named_for_tests("c7", id(8), id(9));
+        let source = named_for_tests("c1", id(2));
+        let middle = named_for_tests("c4", id(5));
+        let target = named_for_tests("c7", id(8));
         let commits = [commit(&source, data(1), 1), commit(&source, data(2), 2)];
         let merges = [CollectionMerge::new(
             identity_for_tests(&source),
@@ -1886,8 +1891,8 @@ mod tests {
 
     #[test]
     fn homomorphic_square_supplies_target_physical_fallback() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge =
@@ -1932,8 +1937,8 @@ mod tests {
 
     #[test]
     fn target_merge_completes_the_reverse_side_of_the_square() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge =
@@ -1969,8 +1974,8 @@ mod tests {
 
     #[test]
     fn commuting_square_conflicts_are_rejected() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge =
@@ -2003,7 +2008,7 @@ mod tests {
 
     #[test]
     fn accepted_pending_merge_conflict_is_hard_and_permutation_independent() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let first =
             CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
         let second =
@@ -2038,8 +2043,8 @@ mod tests {
 
     #[test]
     fn derive_conflicts_are_functional_by_exact_collection_pair_and_input() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let first = CollectionDerive::new(identity_for_tests(&target), data(1), data(2));
         let second = CollectionDerive::new(identity_for_tests(&target), data(1), data(3));
         let records = discover(
@@ -2075,7 +2080,7 @@ mod tests {
 
     #[test]
     fn rejected_equations_do_not_conflict_or_activate() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let first =
             CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
         let second =
@@ -2108,7 +2113,7 @@ mod tests {
 
     #[test]
     fn pending_validation_and_authorization_growth_are_retried_monotonically() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let first = commit(&definition, data(1), 1);
         let second = commit(&definition, data(2), 2);
         let merge =
@@ -2168,7 +2173,7 @@ mod tests {
 
     #[test]
     fn idempotent_and_subsuming_merges_preserve_frontier_and_provenance() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let first = commit(&definition, data(1), 1);
         let same_data_other_commit = commit(&definition, data(1), 3);
         let second = commit(&definition, data(2), 2);
@@ -2221,7 +2226,7 @@ mod tests {
 
     #[test]
     fn payload_support_collapses_duplicate_commit_provenance() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let first = commit(&definition, data(1), 1);
         let same_payload_other_commit = commit(&definition, data(1), 2);
         let records = discover(
@@ -2253,8 +2258,8 @@ mod tests {
 
     #[test]
     fn payload_support_follows_active_merge_and_derive_producers() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let target_root = commit(&target, data(5), 3);
@@ -2288,7 +2293,7 @@ mod tests {
 
     #[test]
     fn physical_cover_reuses_overlaps_and_follows_nonresident_intermediates() {
-        let definition = named_for_tests("c1", id(2), id(3));
+        let definition = named_for_tests("c1", id(2));
         let commits: Vec<_> = [(1, 1), (2, 2), (4, 3), (8, 4)]
             .into_iter()
             .map(|(element, key)| commit(&definition, data(element), key))
@@ -2329,7 +2334,7 @@ mod tests {
 
     #[test]
     fn sparse_physical_cover_matches_pairwise_reference_including_cycles() {
-        let collection = identity_for_tests(&named_for_tests("c1", id(2), id(3)));
+        let collection = identity_for_tests(&named_for_tests("c1", id(2)));
         let elements = [data(1), data(2), data(3)];
         let members = BTreeSet::from(elements);
         let directed_edges: Vec<_> = elements
@@ -2380,7 +2385,7 @@ mod tests {
 
     #[test]
     fn many_independent_resident_members_cover_themselves() {
-        let collection = identity_for_tests(&named_for_tests("c1", id(2), id(3)));
+        let collection = identity_for_tests(&named_for_tests("c1", id(2)));
         let members: BTreeSet<_> = (1..=4_096).map(numbered_data).collect();
         let semantics = CollectionSemantics {
             members: BTreeMap::from([(collection, members.clone())]),
@@ -2399,8 +2404,8 @@ mod tests {
 
     #[test]
     fn derives_propagate_commit_provenance_but_never_substitute_physical_bytes() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c9", id(4), id(5));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c9", id(4));
         let root = commit(&source, data(1), 1);
         let derive = CollectionDerive::new(identity_for_tests(&target), data(1), data(2));
         let records = discover(
@@ -2448,8 +2453,8 @@ mod tests {
 
     #[test]
     fn supporting_commit_walk_handles_an_active_merge_derive_cycle() {
-        let source = named_for_tests("c1", id(2), id(3));
-        let target = named_for_tests("c4", id(5), id(6));
+        let source = named_for_tests("c1", id(2));
+        let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let merge = CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));

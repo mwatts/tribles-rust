@@ -1,11 +1,9 @@
 //! Canonical raw SuccinctArchive set union and its derivation from
 //! [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive).
 //!
-//! The SimpleArchive and raw SuccinctArchive collections use the same
-//! [`TRIBLE_SET_UNION_RECIPE_V1`](super::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1):
-//! the recipe names the set-union law, while the collection descriptor's
-//! representation field distinguishes their bytes. The canonical conversion
-//! is therefore a join homomorphism:
+//! SimpleArchive and raw SuccinctArchive each own canonical set union for
+//! their bytes. The concrete mapping between them witnesses that the
+//! canonical conversion preserves those joins:
 //!
 //! ```text
 //! succinct(a ∪ b) = succinct(a) ∪ succinct(b)
@@ -16,14 +14,14 @@
 //! authority to construction records. `DERIVE` and `MERGE` remain unsigned,
 //! reproducible evidence.
 
-use super::simplearchive_union::TribleSetUnionV1;
 use crate::id::ExclusiveId;
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
 use super::descriptor as descriptor_facts;
 use super::records::{
-    collection_authority, collection_reach, collection_recipe, collection_representation,
-    collection_source, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_mapping, collection_reach, collection_representation,
+    collection_source, mapping_algorithm, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
+    KIND_COLLECTION_MAPPING,
 };
 #[cfg(test)]
 use crate::collection::reach;
@@ -45,10 +43,9 @@ use crate::inline::encodings::hash::{Blake3, Hash};
 use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 
-use super::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
 use super::{
-    CollectionData, CollectionDerive, CollectionHandle, CollectionHomomorphism, CollectionLattice,
-    CollectionLatticeError, CollectionMerge,
+    CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping,
+    CollectionMerge, CollectionOperationError,
 };
 
 mod collection;
@@ -56,166 +53,229 @@ mod rank9_fiber;
 pub use collection::*;
 pub use rank9_fiber::Rank9FiberError;
 
-/// The canonical raw-SuccinctArchive representation of trible-set union.
-pub struct SuccinctArchiveUnion;
-
-impl CollectionLattice for SuccinctArchiveUnion {
-    type Encoding = SuccinctArchiveBlob;
-    type Recipe = TribleSetUnionV1;
-
+impl CollectionEncoding for SuccinctArchiveBlob {
     fn validate_member(
         _descriptor: &Fragment,
-        member: &Blob<Self::Encoding>,
-    ) -> Result<(), CollectionLatticeError> {
+        member: &Blob<Self>,
+    ) -> Result<(), CollectionOperationError> {
         SuccinctArchiveBlob::merge(std::slice::from_ref(member))
             .map(|_| ())
-            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn merge_members(
+    fn join_members(
         _descriptor: &Fragment,
-        low: &Blob<Self::Encoding>,
-        high: &Blob<Self::Encoding>,
-    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Blob<Self>, CollectionOperationError> {
         join(low, high).map_err(|source| match source {
             SuccinctArchiveRawMergeError::DomainTooWide
             | SuccinctArchiveRawMergeError::TooManyRows => {
-                CollectionLatticeError::Capacity(source.to_string())
+                CollectionOperationError::Capacity(source.to_string())
             }
             SuccinctArchiveRawMergeError::InvalidInput { .. }
             | SuccinctArchiveRawMergeError::Construction(_) => {
-                CollectionLatticeError::Fatal(source.to_string())
+                CollectionOperationError::Fatal(source.to_string())
             }
         })
     }
 }
 
-/// Canonical SimpleArchive-to-SuccinctArchive set-union homomorphism.
-pub struct SimpleArchiveToSuccinctArchive;
+/// Mapping algorithm for canonical SimpleArchive-to-SuccinctArchive conversion.
+///
+/// Minted with `trible genid` on 2026-08-29.
+pub const SIMPLE_TO_SUCCINCT_MAPPING_V1: Id = id_hex!("9C8CFEB097B0A336E09D506E8DD361C2");
 
-impl CollectionHomomorphism<super::simplearchive_union::SimpleArchiveUnion, SuccinctArchiveUnion>
-    for SimpleArchiveToSuccinctArchive
-{
-    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+/// Self-description of the parameter-free canonical conversion.
+pub struct SimpleToSuccinctMappingV1;
+
+impl MetaDescribe for SimpleToSuccinctMappingV1 {
+    fn describe() -> Fragment {
+        let id = SIMPLE_TO_SUCCINCT_MAPPING_V1;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "simple-to-succinct-v1",
+                metadata::description: "Canonical conversion from a SimpleArchive trible set to its raw SuccinctArchive encoding. The mapping preserves set union and has no parameters.",
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+fn mapping_fragment() -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_MAPPING,
+        mapping_algorithm*: <SimpleToSuccinctMappingV1 as MetaDescribe>::describe(),
+    }
+}
+
+/// Bound canonical SimpleArchive-to-SuccinctArchive mapping.
+pub struct SimpleToSuccinctMapping;
+
+impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for SimpleToSuccinctMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        let actual = descriptor_facts::mapping_algorithm(target.facts())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        let expected = Some(SIMPLE_TO_SUCCINCT_MAPPING_V1);
+        if actual != expected {
+            return Err(CollectionOperationError::Fatal(format!(
+                "succinct collection mapping algorithm {:?} does not match simple-to-succinct algorithm {}",
+                actual.map(|id| format!("{id:X}")),
+                format!("{:X}", expected.expect("mapping algorithm")),
+            )));
+        }
         Ok(Self)
     }
 
     fn map(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionLatticeError> {
+    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError> {
         derive_element(source).map_err(|source| match source {
             SuccinctArchiveRawBuildError::TooManyRows(_)
             | SuccinctArchiveRawBuildError::DomainTooWide(_) => {
-                CollectionLatticeError::Capacity(source.to_string())
+                CollectionOperationError::Capacity(source.to_string())
             }
             SuccinctArchiveRawBuildError::Source(_)
             | SuccinctArchiveRawBuildError::Construction(_) => {
-                CollectionLatticeError::Fatal(source.to_string())
+                CollectionOperationError::Fatal(source.to_string())
             }
         })
     }
 }
 
-/// Lifted Rank9-union recipe for 32-bit little-endian targets.
+/// Rank9 mapping algorithm for 32-bit little-endian targets.
 ///
 /// Minted with `trible genid` on 2026-08-14. The profile pins the current portable
 /// SuccinctArchive source schema, detached Rank9 format
 /// marker/version/flags, the canonical Rank9 builder and Jerky serialization
 /// epoch, pointer width, and byte order. Any change that can alter canonical
-/// sidecar bytes requires a newly minted recipe id.
-pub const RANK9_LIFTED_UNION_RECIPE_V1_32_LE: Id = id_hex!("0685616E15F332468977EB59BDA4EB9D");
+/// sidecar bytes requires a newly minted mapping id.
+pub const RANK9_MAPPING_V1_32_LE: Id = id_hex!("0685616E15F332468977EB59BDA4EB9D");
 
-/// Lifted Rank9-union recipe for 32-bit big-endian targets.
+/// Rank9 mapping algorithm for 32-bit big-endian targets.
 ///
 /// Minted with `trible genid` on 2026-08-14; see
-/// [`RANK9_LIFTED_UNION_RECIPE_V1_32_LE`] for the versioning contract.
-pub const RANK9_LIFTED_UNION_RECIPE_V1_32_BE: Id = id_hex!("154A792188583355B1CDAA9910E60748");
+/// [`RANK9_MAPPING_V1_32_LE`] for the versioning contract.
+pub const RANK9_MAPPING_V1_32_BE: Id = id_hex!("154A792188583355B1CDAA9910E60748");
 
-/// Lifted Rank9-union recipe for 64-bit little-endian targets.
+/// Rank9 mapping algorithm for 64-bit little-endian targets.
 ///
 /// Minted with `trible genid` on 2026-08-14; see
-/// [`RANK9_LIFTED_UNION_RECIPE_V1_32_LE`] for the versioning contract.
-pub const RANK9_LIFTED_UNION_RECIPE_V1_64_LE: Id = id_hex!("E4A77808BBF9E373244789F007E81261");
+/// [`RANK9_MAPPING_V1_32_LE`] for the versioning contract.
+pub const RANK9_MAPPING_V1_64_LE: Id = id_hex!("E4A77808BBF9E373244789F007E81261");
 
-/// Lifted Rank9-union recipe for 64-bit big-endian targets.
+/// Rank9 mapping algorithm for 64-bit big-endian targets.
 ///
 /// Minted with `trible genid` on 2026-08-14; see
-/// [`RANK9_LIFTED_UNION_RECIPE_V1_32_LE`] for the versioning contract.
-pub const RANK9_LIFTED_UNION_RECIPE_V1_64_BE: Id = id_hex!("A470EAEB76777091CE795D9B108C79D0");
+/// [`RANK9_MAPPING_V1_32_LE`] for the versioning contract.
+pub const RANK9_MAPPING_V1_64_BE: Id = id_hex!("A470EAEB76777091CE795D9B108C79D0");
 
-/// The lifted Rank9-union law for this ABI, as a describable type.
-pub struct Rank9LiftedUnionV1_32Le;
+/// The exact Rank9 mapping for this ABI, as a describable algorithm.
+// The historical name and description below participate in the content address
+// of `rank9_mapping_fragment()`. Their lifted-collection vocabulary is frozen
+// format identity, not the current model: Rank9 now publishes one-to-one
+// MappingEvidence and has no independent collection join.
+pub struct Rank9MappingV1_32Le;
 
-impl MetaDescribe for Rank9LiftedUnionV1_32Le {
+impl MetaDescribe for Rank9MappingV1_32Le {
     fn describe() -> Fragment {
-        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_LE;
+        let id: Id = RANK9_MAPPING_V1_32_LE;
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "rank9-lifted-union-v1-32-le",
                 metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 32-bit pointer width and little-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The lifted Rank9-union law for this ABI, as a describable type.
-pub struct Rank9LiftedUnionV1_32Be;
+/// The exact Rank9 mapping for this ABI, as a describable algorithm.
+pub struct Rank9MappingV1_32Be;
 
-impl MetaDescribe for Rank9LiftedUnionV1_32Be {
+impl MetaDescribe for Rank9MappingV1_32Be {
     fn describe() -> Fragment {
-        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_BE;
+        let id: Id = RANK9_MAPPING_V1_32_BE;
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "rank9-lifted-union-v1-32-be",
                 metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 32-bit pointer width and big-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The lifted Rank9-union law for this ABI, as a describable type.
-pub struct Rank9LiftedUnionV1_64Le;
+/// The exact Rank9 mapping for this ABI, as a describable algorithm.
+pub struct Rank9MappingV1_64Le;
 
-impl MetaDescribe for Rank9LiftedUnionV1_64Le {
+impl MetaDescribe for Rank9MappingV1_64Le {
     fn describe() -> Fragment {
-        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_LE;
+        let id: Id = RANK9_MAPPING_V1_64_LE;
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "rank9-lifted-union-v1-64-le",
                 metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 64-bit pointer width and little-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The lifted Rank9-union law for this ABI, as a describable type.
-pub struct Rank9LiftedUnionV1_64Be;
+/// The exact Rank9 mapping for this ABI, as a describable algorithm.
+pub struct Rank9MappingV1_64Be;
 
-impl MetaDescribe for Rank9LiftedUnionV1_64Be {
+impl MetaDescribe for Rank9MappingV1_64Be {
     fn describe() -> Fragment {
-        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_BE;
+        let id: Id = RANK9_MAPPING_V1_64_BE;
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "rank9-lifted-union-v1-64-be",
                 metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 64-bit pointer width and big-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
 #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
-const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_LE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_32_LE;
 #[cfg(all(target_pointer_width = "32", target_endian = "big"))]
-const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_BE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_32_BE;
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_LE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_64_LE;
 #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_BE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_64_BE;
 
-/// Recipe id for the exact Rank9 ABI supported by this build.
-pub const fn current_rank9_lifted_union_recipe() -> Id {
-    CURRENT_RANK9_LIFTED_UNION_RECIPE
+/// Mapping algorithm id for the exact Rank9 ABI supported by this build.
+pub const fn current_rank9_mapping_algorithm() -> Id {
+    CURRENT_RANK9_MAPPING
+}
+
+#[cfg(all(target_pointer_width = "32", target_endian = "little"))]
+fn current_rank9_mapping_description() -> Fragment {
+    Rank9MappingV1_32Le::describe()
+}
+#[cfg(all(target_pointer_width = "32", target_endian = "big"))]
+fn current_rank9_mapping_description() -> Fragment {
+    Rank9MappingV1_32Be::describe()
+}
+#[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+fn current_rank9_mapping_description() -> Fragment {
+    Rank9MappingV1_64Le::describe()
+}
+#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
+fn current_rank9_mapping_description() -> Fragment {
+    Rank9MappingV1_64Be::describe()
+}
+
+/// ABI-qualified mapping identity for raw SuccinctArchive members to detached
+/// Rank9 sidecars.
+///
+/// The fragment is ordinary queryable data. Its archived fact handle is used
+/// by [`MappingEvidence`](super::MappingEvidence); Rank9 itself is deliberately
+/// not exposed as another collection.
+pub fn rank9_mapping_fragment() -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_MAPPING,
+        mapping_algorithm*: current_rank9_mapping_description(),
+    }
 }
 
 /// A collection descriptor participating in a validation failure.
@@ -284,14 +344,14 @@ pub enum SuccinctArchiveUnionValidationError {
         /// Representation found in the descriptor.
         actual: Id,
     },
-    /// A descriptor names another semantic recipe.
-    WrongRecipe {
+    /// A derived descriptor names another mapping algorithm.
+    WrongMapping {
         /// Descriptor being checked.
         role: DescriptorRole,
-        /// Required union recipe.
+        /// Required mapping algorithm.
         expected: Id,
-        /// Recipe found in the descriptor.
-        actual: Id,
+        /// Mapping algorithm found in the descriptor.
+        actual: Option<Id>,
     },
     /// A record names another collection descriptor.
     WrongCollection {
@@ -345,13 +405,15 @@ impl fmt::Display for SuccinctArchiveUnionValidationError {
                 formatter,
                 "{role} collection representation {actual:X} does not match {expected:X}"
             ),
-            Self::WrongRecipe {
+            Self::WrongMapping {
                 role,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "{role} collection recipe {actual:X} does not match TribleSet union {expected:X}"
+                "{role} collection mapping algorithm {:?} does not match {}",
+                actual.map(|id| format!("{id:X}")),
+                format!("{expected:X}"),
             ),
             Self::WrongCollection {
                 role,
@@ -408,15 +470,13 @@ impl Error for SuccinctArchiveUnionValidationError {
 /// mandatory and local: the target names its own trust root rather than
 /// inheriting one from the source.
 ///
-/// This intentionally reuses the SimpleArchive collection's set-union recipe.
-/// Representation, not recipe proliferation, distinguishes the two lattices.
 pub fn descriptor(source: CollectionHandle, authority: VerifyingKey, reach: Fragment) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
         collection_authority: authority,
         collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
-        collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
+        collection_mapping*: mapping_fragment(),
         collection_reach*: reach,
     }
 }
@@ -475,9 +535,13 @@ pub fn validate_derive(
             })
         }
     }
-    validate_collection(DescriptorRole::Target, target_collection, claim.target())?;
+    validate_collection(
+        DescriptorRole::Target,
+        target_collection,
+        claim.collection(),
+    )?;
 
-    let (expected_input, expected_output) = claim.mapping();
+    let (expected_input, expected_output) = (claim.input(), claim.output());
     validate_endpoint(ElementRole::DeriveInput, expected_input, input)?;
     validate_endpoint(ElementRole::DeriveOutput, expected_output, output)?;
     let expected =
@@ -524,6 +588,7 @@ fn validate_source_descriptor(
         DescriptorRole::Source,
         descriptor,
         <SimpleArchive as MetaDescribe>::id(),
+        None,
     )
 }
 
@@ -532,6 +597,7 @@ fn validate_descriptor(descriptor: &Fragment) -> Result<(), SuccinctArchiveUnion
         DescriptorRole::Target,
         descriptor,
         <SuccinctArchiveBlob as MetaDescribe>::id(),
+        Some(SIMPLE_TO_SUCCINCT_MAPPING_V1),
     )
 }
 
@@ -539,6 +605,7 @@ fn validate_descriptor_parts(
     role: DescriptorRole,
     descriptor: &Fragment,
     expected_representation: Id,
+    expected_mapping: Option<Id>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     descriptor_facts::authority(descriptor.facts())?;
     let representation = descriptor_facts::representation(descriptor.facts())?;
@@ -549,12 +616,12 @@ fn validate_descriptor_parts(
             actual: representation,
         });
     }
-    let recipe = descriptor_facts::recipe(descriptor.facts())?;
-    if recipe != TRIBLE_SET_UNION_RECIPE_V1 {
-        return Err(SuccinctArchiveUnionValidationError::WrongRecipe {
+    let actual_mapping = descriptor_facts::mapping_algorithm(descriptor.facts())?;
+    if actual_mapping != expected_mapping {
+        return Err(SuccinctArchiveUnionValidationError::WrongMapping {
             role,
-            expected: TRIBLE_SET_UNION_RECIPE_V1,
-            actual: recipe,
+            expected: expected_mapping.unwrap_or(SIMPLE_TO_SUCCINCT_MAPPING_V1),
+            actual: actual_mapping,
         });
     }
     Ok(())
@@ -643,11 +710,10 @@ mod tests {
         }
     }
 
-    /// The indexed collection is the raw one's derivation: same law, different
-    /// representation, and it says so by naming its source rather than by
-    /// sharing a label with it.
+    /// The indexed collection is the raw one's derivation: a different
+    /// encoding connected by one explicit, concrete mapping.
     #[test]
-    fn the_index_derives_from_the_raw_collection_under_the_same_law() {
+    fn the_index_derives_from_the_raw_collection_through_its_mapping() {
         let source = raw_root("first");
         let target = descriptor(identity_for_tests(&source), authority(), reach::private());
 
@@ -681,12 +747,12 @@ mod tests {
         );
 
         assert_eq!(
-            crate::collection::descriptor::recipe(source.facts()),
-            crate::collection::descriptor::recipe(target.facts())
+            crate::collection::descriptor::mapping(source.facts()),
+            Ok(None)
         );
         assert_eq!(
-            crate::collection::descriptor::recipe(target.facts()).unwrap(),
-            TRIBLE_SET_UNION_RECIPE_V1
+            crate::collection::descriptor::mapping_algorithm(target.facts()),
+            Ok(Some(SIMPLE_TO_SUCCINCT_MAPPING_V1))
         );
         assert_eq!(
             crate::collection::descriptor::representation(source.facts()).unwrap(),

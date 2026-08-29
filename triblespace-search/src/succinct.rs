@@ -1730,7 +1730,7 @@ impl std::error::Error for SuccinctLoadError {}
 /// change mints a new id. The id participates in derived typed
 /// schemas, but it is not an in-band runtime guard and changing
 /// it does not create a new Rust marker type. Persisted
-/// typed attributes or collection recipes that route handles to this reader must
+/// typed attributes or collection mappings that route handles to this reader must
 /// rotate with it; see `docs/FACULTY_INTEGRATION.md`.
 ///
 /// Retired ids:
@@ -1818,7 +1818,7 @@ impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<SuccinctBM25Blob>
 /// change mints a new id. The id participates in derived typed
 /// schemas, but it is not an in-band runtime guard and changing
 /// it does not create a new Rust marker type. Persisted
-/// typed attributes or collection recipes that route handles to this reader must
+/// typed attributes or collection mappings that route handles to this reader must
 /// rotate with it; see `docs/FACULTY_INTEGRATION.md`.
 ///
 /// Retired ids (bytes routed under these identities must not be
@@ -2237,7 +2237,7 @@ mod tests {
     // Magic/version rejection tests retired along with the
     // fields themselves. Routing is now external: a breaking
     // layout rotates the marker id and every persisted typed
-    // typed attribute or collection recipe that can hand bytes to this reader.
+    // typed attribute or collection mapping that can hand bytes to this reader.
 
     #[test]
     fn succinct_bm25_rejects_truncation() {
@@ -2477,7 +2477,7 @@ mod tests {
 
     // Magic/version rejection tests retired. Routing is now
     // external: a breaking layout rotates the marker id and every
-    // persisted typed attribute or collection recipe that can hand bytes to
+    // persisted typed attribute or collection mapping that can hand bytes to
     // this reader.
 
     #[test]

@@ -34,7 +34,7 @@ ambient current value.
 A signed `COMMIT` says that an author places one element in a collection. An
 unsigned `MERGE` or `DERIVE` says that reproducible computation connected known
 elements. The former is irreducible authority; the latter is replaceable cache
-evidence which a reader validates under the collection's recipe.
+evidence which a reader validates under the collection's encoding and mapping.
 
 That separation is why a materialized index does not become ground truth merely
 because it is convenient, and why collecting an accelerator does not erase the
@@ -74,8 +74,9 @@ itself.
 ```
 
 The boundaries are deliberately narrow. Query constraints do not know how
-bytes were published. A collection recipe does not decide replication policy.
-A blob store does not infer authority from a handle it happens to contain.
+bytes were published. A collection encoding or mapping does not decide
+replication policy. A blob store does not infer authority from a handle it
+happens to contain.
 
 ## Tribles, sets, and fragments
 
@@ -122,15 +123,18 @@ normally states:
 
 - a human-readable UTF-8 name;
 - one mandatory descriptor-local authority;
-- the element representation;
-- the join recipe; and
+- the canonical member encoding; and
 - a reach law governing permissionless relay.
 
-A derived descriptor names its source collection, the homomorphism recipe, and
-its own mandatory authority. Authority never inherits from the source.
-Descriptions of the representation and recipe travel in the same archive, so a
-record naming the descriptor remains interpretable without a separate registry
-entry.
+A derived descriptor replaces the name with its source collection and one
+concrete mapping entity. Canonical builders derive that entity's id, while
+readers preserve the substitution rule by validating its algorithm and
+parameters instead of its minting history. The entity names a mapping algorithm
+and carries its concrete parameters as ordinary tribles. The target encoding and
+mandatory authority remain local to the derived descriptor; authority never
+inherits from the source. Descriptions of the encoding and mapping algorithm
+travel in the same archive, so a record naming the descriptor remains
+interpretable without a separate registry entry.
 
 `CollectionStore` contains three native record kinds:
 
@@ -138,13 +142,13 @@ entry.
 |---|---|---:|
 | `COMMIT(C, x, metadata, author, signature)` | The author asserts `x` as an independent member of `C`. | 192 bytes |
 | `MERGE(C, a, b, c)` | Under `C`'s join law, `a ⊔ b = c`. | 128 bytes |
-| `DERIVE(T, a, b)` | The homomorphism named by target `T` maps source element `a` to target element `b`. | 96 bytes |
+| `DERIVE(T, a, b)` | The mapping named by target `T` maps source element `a` to target element `b`. | 96 bytes |
 
 All three have intrinsic IDs derived from their exact canonical payload. A
 repeat insert is a no-op. `COMMIT` is signed because its assertion cannot be
 recomputed; `MERGE` and `DERIVE` are unsigned because correctness comes from
-the recipe and exact bytes, not the identity of the machine that performed the
-work.
+the encoding or mapping plus exact bytes, not the identity of the machine that
+performed the work.
 
 The algebra has no distinguished head. Several commits coexist, and the value
 of a selected collection view is the join of its admitted members. This makes a
@@ -167,10 +171,10 @@ Reads are exact about what they observed, not magical about global time:
 
 - `store.cover(collection, presentations)` loads the descriptor authority,
   admits its own strictly signed commits directly, verifies every explicit
-  delegated presentation, and returns one canonical typed payload `Cover<L>`
+  delegated presentation, and returns one canonical typed payload `Cover<E>`
   without fetching member data;
 - `store.snapshot(collection, presentations)` performs that same admission and
-  carries a `TryFromCover<L>` logical value, the exact cover, and the blob
+  carries a `TryFromCover<E>` logical value, the exact cover, and the blob
   reader which validated them; and
 - `store.materialize(&cover)` exact-replays an already admitted multi-author
   frontier without holding a publishing key or repeating capability policy.
@@ -188,10 +192,9 @@ unpresented commits remain inert.
 
 ## Derived physical representations
 
-The same collection can be projected into representations optimized for a
-particular task. A canonical SuccinctArchive collection, a Rank9 sidecar
-collection, or a regular-path summary is a derived lattice whose recipe is a
-join homomorphism:
+The same logical data can be projected into encodings optimized for a
+particular task. A canonical SuccinctArchive collection or a regular-path
+summary is connected to its source by a mapping which is a join homomorphism:
 
 ```text
 f(a ⊔ b) = f(a) ⊔ f(b)
@@ -202,13 +205,17 @@ and derive once, derive individual shards and merge their images, or reuse any
 validated mixture already present. An opaque source cover fixes the logical
 value while a resolver chooses a target cover with equal support.
 Different target covers may denote the same join, and every lattice position
-uses the same `Cover<L>` shape while retaining its own typed member handles.
+uses the same `Cover<E>` shape while retaining its own typed member handles.
 Missing derived artifacts are cache misses, not missing facts.
 
-Route freedom belongs to the collection recipe rather than to a flag on
-`Cover`: ordinary Succinct construction may reuse any validated equal-support
-route, while Rank9 consumes the exact immediate raw Succinct cover selected
-upstream.
+Route freedom belongs to the input collection expected by the mapping rather
+than to a flag on `Cover`: ordinary Succinct construction may reuse any
+validated equal-support route. Rank9 is deliberately narrower. A detached
+Rank9 sidecar cannot join without its raw archive, so it is an accelerator
+mapping over each exact immediate raw member, not another collection. Its
+separate `MappingEvidence(mapping, input, output)` relation records reusable
+cache work without manufacturing a descriptor, collection frontier, or
+authority surface.
 
 ## WANT is operational, not semantic
 

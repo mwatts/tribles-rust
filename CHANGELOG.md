@@ -9,15 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add a typed collection-lattice API above the representation-neutral wire
-  records. `Collection<L>` validates a descriptor's encoding and recipe,
-  `Cover<L>` carries only `Handle<L::Encoding>` members, and
-  `TryFromCover<L>` reconstructs either eager values or lazy mmap-backed
-  unions. Generic `store.commit`, `cover`, `snapshot`, and `materialize`
-  operations now work across encodings. Exact derivations bind one
-  `CollectionHomomorphism<Source, Target>` at construction; source/target
-  validation and joins live on their lattice types, so callers cannot swap a
-  runtime algebra between operations.
+- Add a native mapping-evidence substrate alongside collection records.
+  Content-addressed mapping fragments and exact input/output equations form a
+  separate grow-only set, so reusable computation evidence converges by union
+  while conflicting outputs remain visible for validation.
+
+- Add a typed collection API above the representation-neutral wire records.
+  `Collection<E>` validates a descriptor's canonical member encoding,
+  `Cover<E>` carries only `Handle<E>` members, and `TryFromCover<E>`
+  reconstructs either eager values or lazy mmap-backed unions. Generic
+  `store.commit`, `cover`, `snapshot`, and `materialize` operations now work
+  across encodings. Each `CollectionEncoding` owns its canonical validation
+  and join, while exact derivations bind one parameterized
+  `CollectionMapping<Source, Target>` whose ordinary trible fragment is
+  embedded in the target descriptor.
 
 - Add an exact maintained last-write-wins register collection. Its canonical
   projection keeps state identity and raw order facts as two independently
@@ -228,8 +233,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `store.cover`, snapshots, exact derivations, maintained Succinct views,
   paths, and network reuse now share this continuation type. Distinct covers
   may have equal support through validated merges; route freedom or exact
-  immediate-input requirements belong to the collection recipe, including
-  Rank9's exact raw-Succinct input. Exact derivation can reverse-ground a
+  immediate-input requirements belong to the input collection and mapping,
+  including Rank9's exact raw-Succinct input. Exact derivation can reverse-ground a
   compacted source member through freshly validated MERGE inputs, so `{c}` may
   reuse resident `{f(a), f(b)}` when `a join b = c`, while forged equations
   remain inert and fall back to direct construction. The same equivalence lets
@@ -532,41 +537,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a 16-byte legacy kind from a 32-byte resolvable one rather than flattening
   the two.
 
-- **A recipe names a law; its arguments live on the descriptor.** Four
-  collections derived a recipe id by hashing a minted algorithm id together
-  with its arguments into a phantom entity and using the digest —
-  `observed_union` with its observed attribute, the stated-order register with
-  its identity and order pair, path summaries with an automaton fingerprint,
-  and Archive BM25 downstream. Nothing ever resolved such an id; it was only
-  re-derived in-process and compared against another re-derivation of itself.
-  Deriving an id is fine as a convergence device — substitute a random one and
-  you get two collections where you wanted one, which is wasteful, not broken.
-  What is not fine is deriving it *instead of storing the fields*: the digest
-  becomes their only carrier, and a reader holding the pile cannot recover
-  what the collection means. Recipes are now minted names for laws only, and
-  the arguments are ordinary tribles on the descriptor entity. Two collections
-  differ exactly when their scope or source, representation, recipe, or
-  arguments differ — which is what the derived id was simulating, one layer
-  down and unreadably. `path_summary_recipe_id` and `register::recipe_id` are
-  removed; `PATH_SUMMARY_RECIPE_V1` and `STATED_ORDER_RECIPE_V1` name the laws.
-
-- **Descriptors carry their representation's and recipe's own descriptions.**
-  Naming a schema and a law by bare id leaves both opaque to anyone without the
-  code that minted them — which is exactly the reader who most needs the
-  answer, a peer receiving a collection it has never seen. Every law is now a
-  describable type under the new `metadata::KIND_COLLECTION_RECIPE`, and a
-  descriptor embeds those fragments. The descriptor *entity* is unchanged: it
-  names the same schema and law by the same ids and keeps its intrinsic root.
-  The archive around it grew, 256 bytes to 640 for a SimpleArchive union, and
-  with it the collection handle. Existing collections keep their old handles
-  and remain readable; new ones are written under the new shape.
+- **Encodings join; mappings map.** The intermediate recipe/lattice-wrapper
+  layer is removed. A `CollectionEncoding` is now the canonical blob shape
+  together with its validation and intra-encoding join, so collections are
+  typed directly as `Collection<SimpleArchive>`,
+  `Collection<SuccinctArchiveBlob>`, and so on. A derived descriptor instead
+  links one concrete mapping entity. Canonical builders derive its id from its
+  facts, but decoders obey the substitution rule and do not make that minting
+  history semantic. The entity names a reusable
+  mapping algorithm and carries its concrete parameters as ordinary tribles:
+  the observed attribute, register coordinate attributes, or complete path
+  automaton remain queryable while also participating in mapping and target
+  identity. The target embeds the encoding and mapping-algorithm descriptions,
+  and `CollectionMapping<Source, Target>` validates the declared algorithm and
+  parameters before computing any member. These descriptor identities never
+  shipped, so the old recipe shape and compatibility aliases are removed
+  outright.
 
 - **A derived collection is anchored by its source.** New `collection_source`
   names, by handle, the collection a derivation is computed from. The
   extrinsic anchor — a minted scope when this landed, a name within a team
   since — narrows to what it can honestly be: a property of a *root*, still
-  needed there because without it every root collection sharing a
-  representation and recipe would have one descriptor and one handle. The
+  needed there because without it every root collection sharing an encoding
+  would have one descriptor and one handle. The
   validators changed with it: they compared two descriptors' *scopes*, a label
   either side could claim independently, and now ask whether the target names
   this exact source descriptor. `ScopeMismatch` became unconstructible and is
@@ -713,26 +706,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact raw target cover as an owned sharded `UnionArchive`, preserving that
   cover's physical shape while attaching an exact Rank9 accelerator fiber to
   each selected raw member. The fiber uses an ABI-, format-, and
-  builder-version-qualified lifted collection whose join is defined by
-  `i(a) join i(b) = i(a join b)`, so ordinary raw-to-Rank9 `DERIVE` records are
-  truthful without introducing Rank9 `MERGE` records. Four explicitly minted
-  recipe ids distinguish 32/64-bit and little/big-endian profiles; the current
-  target selects exactly one. An empty cover performs no storage I/O and
-  receives one authority-free local empty query shard, whereas a signed commit
-  over empty source data still publishes ordinary provenance-bearing raw and
-  Rank9 `DERIVE` evidence.
+  builder-version-qualified mapping fragment. Four explicitly minted algorithm
+  ids distinguish 32/64-bit and little/big-endian profiles; the current target
+  selects exactly one. Because a sidecar cannot join without its raw archive,
+  Rank9 is not exposed as a second collection. Its exact
+  `MappingEvidence(mapping, raw, sidecar)` equations live in a separate
+  unsigned cache relation. An empty cover performs no storage I/O and receives
+  one authority-free local empty query shard, whereas a signed commit over
+  empty source data still publishes an ordinary raw `DERIVE` and Rank9 mapping
+  evidence for that admitted member.
 
-  Rank9 evidence is optional cache state, not a second authoritative derived
-  collection. Attachment scans the record ledger once, accepts at most one
+  Rank9 evidence is optional cache state, not a derived collection at all.
+  Attachment scans the mapping-evidence set once, accepts at most one
   distinct claimed output after fresh source/sidecar hashes, source-header,
   and exact pair validation, and otherwise rebuilds that member's runtime
-  transiently without writes. Ensuring publishes both descriptors and every
-  missing canonical sidecar before any new equation, then strictly re-reads
-  the exact expected raw/sidecar pairs and claims through a fresh reader. It
+  transiently without writes. Ensuring publishes the complete mapping-fragment
+  closure and every missing canonical sidecar before any new equation, then
+  strictly re-reads the exact expected raw/sidecar pairs and evidence through a
+  fresh reader. It
   adds no signed root, receipt, manifest, scheduler, retention root, flush, or
   Rank9 compactor. A complete probe performs no writes, and retries repair a
   collected or corrupt canonical endpoint without duplicating its existing
-  `DERIVE`.
+  mapping evidence.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
   garbage collection. Descriptor-typed lattice methods validate fixed
@@ -749,7 +744,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact fibers are resident.
 
   Lattice operations return
-  `CollectionLatticeError::{Fatal, Capacity}`. `Capacity` is reserved for
+  `CollectionOperationError::{Fatal, Capacity}`. `Capacity` is reserved for
   deterministic fixed-representation geometry, never transient allocation,
   I/O, or malformed persisted bytes. When a selected source upper exceeds that
   geometry, completion excludes it and globally replans the physical cover
@@ -1375,8 +1370,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure. `TELEMETRY_COLLECTION_SCOPE` replaces the former branch setting;
   telemetry no longer creates Repository/Workspace histories or CAS heads.
 
-- **Collection resolution now honors every `DERIVE` pair as a canonical join
-  homomorphism.** Source subsumption is lifted into target collections without
+- **Collection resolution now honors every `DERIVE` pair as an observation of
+  a canonical join homomorphism.** Source subsumption is lifted into target collections without
   requiring redundant target `MERGE` records, and active source/target
   commuting squares complete either missing equation. Implied target merges
   participate in physical-cover fallback, and incompatible explicit or implied

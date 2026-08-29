@@ -1,6 +1,9 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::collection::{
+    CollectionRecord, CollectionRecordSelector, CollectionStore, MappingEvidence,
+    MappingEvidenceSelector, MappingEvidenceStore,
+};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
@@ -161,6 +164,41 @@ where
     }
 }
 
+impl<B, R> MappingEvidenceStore for HybridStore<B, R>
+where
+    R: MappingEvidenceStore,
+{
+    type EvidenceError = R::EvidenceError;
+    type InsertError = R::InsertError;
+    type EvidenceIter<'a>
+        = R::EvidenceIter<'a>
+    where
+        B: 'a,
+        R: 'a;
+
+    fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
+        self.records.evidence()
+    }
+
+    fn evidence_by_id(
+        &mut self,
+        id: crate::id::Id,
+    ) -> Result<Option<MappingEvidence>, Self::EvidenceError> {
+        self.records.evidence_by_id(id)
+    }
+
+    fn select_evidence(
+        &mut self,
+        selectors: &BTreeSet<MappingEvidenceSelector>,
+    ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
+        self.records.select_evidence(selectors)
+    }
+
+    fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
+        self.records.insert_evidence(evidence)
+    }
+}
+
 impl<B, R> WantStore for HybridStore<B, R>
 where
     B: WantStore,
@@ -209,7 +247,7 @@ mod tests {
     #[test]
     fn collection_records_delegate_only_to_the_record_side() {
         let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let facts = descriptor::naming("hybrid", team, id(2), id(3), reach::private()).into_facts();
+        let facts = descriptor::naming("hybrid", team, id(2), reach::private()).into_facts();
         // Only the identity matters here; nothing resolves this descriptor.
         let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();
         let record = CollectionRecord::Merge(CollectionMerge::new(

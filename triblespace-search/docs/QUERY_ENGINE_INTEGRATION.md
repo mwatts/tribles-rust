@@ -284,7 +284,7 @@ let c = idx.matches(doc, &terms, 0.0);
 ```
 
 `idx` owns the data; `c` borrows it for the duration of the query pass. This is
-the direct native path. A collection-owned BM25 recipe may instead derive exact
+the direct native path. A collection-owned BM25 mapping may instead derive exact
 `PortableBM25Blob` elements; a later query attaches its selected cover, joins
 it once with `PortableBM25Index::merge`, and retains that canonical portable
 view.

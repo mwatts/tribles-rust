@@ -5,8 +5,8 @@
 //! canonical `SimpleArchive` of one intrinsic entity: the
 //! `KIND_COLLECTION_DESCRIPTOR` tag, an anchor — `name` for a root, `source`
 //! for a derivation — plus its mandatory capability authority, the blob
-//! `representation`, the join `recipe`, and whatever
-//! arguments its recipe carries.
+//! `representation`, and — for a derivation — its content-derived `mapping`,
+//! the mapping algorithm, and whatever parameters that mapping carries.
 //!
 //! Without this module the only way to look at one was
 //! `pile blob inspect <PILE> blake3:<HEX>`, which reports "256 bytes, Binary"
@@ -77,7 +77,7 @@ pub enum Command {
     ///
     /// Prints the descriptor handle (the collection identity), the intrinsic
     /// entity id inside the archive, the decoded anchor / representation /
-    /// recipe, every trible in the archive, and how many records in this pile
+    /// mapping, every trible in the archive, and how many records in this pile
     /// reference the collection.
     Show {
         /// Path to the pile file to read.
@@ -174,24 +174,29 @@ fn representation_name(id: Id) -> Option<&'static str> {
     }
 }
 
-/// Resolve a recipe id against the union recipes declared in core.
-fn recipe_name(id: Id) -> Option<&'static str> {
-    use triblespace_core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
+/// Resolve a mapping-algorithm id against the algorithms declared in core.
+fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
+    use triblespace_core::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1;
+    use triblespace_core::collection::observed_union::OBSERVE_STATES_MAPPING_V1;
     use triblespace_core::collection::succinctarchive_union::{
-        RANK9_LIFTED_UNION_RECIPE_V1_32_BE, RANK9_LIFTED_UNION_RECIPE_V1_32_LE,
-        RANK9_LIFTED_UNION_RECIPE_V1_64_BE, RANK9_LIFTED_UNION_RECIPE_V1_64_LE,
+        RANK9_MAPPING_V1_32_BE, RANK9_MAPPING_V1_32_LE, RANK9_MAPPING_V1_64_BE,
+        RANK9_MAPPING_V1_64_LE, SIMPLE_TO_SUCCINCT_MAPPING_V1,
     };
 
-    if id == TRIBLE_SET_UNION_RECIPE_V1 {
-        Some("TRIBLE_SET_UNION_RECIPE_V1")
-    } else if id == RANK9_LIFTED_UNION_RECIPE_V1_32_LE {
-        Some("RANK9_LIFTED_UNION_RECIPE_V1_32_LE")
-    } else if id == RANK9_LIFTED_UNION_RECIPE_V1_32_BE {
-        Some("RANK9_LIFTED_UNION_RECIPE_V1_32_BE")
-    } else if id == RANK9_LIFTED_UNION_RECIPE_V1_64_LE {
-        Some("RANK9_LIFTED_UNION_RECIPE_V1_64_LE")
-    } else if id == RANK9_LIFTED_UNION_RECIPE_V1_64_BE {
-        Some("RANK9_LIFTED_UNION_RECIPE_V1_64_BE")
+    if id == SIMPLE_TO_SUCCINCT_MAPPING_V1 {
+        Some("SIMPLE_TO_SUCCINCT_MAPPING_V1")
+    } else if id == RANK9_MAPPING_V1_32_LE {
+        Some("RANK9_MAPPING_V1_32_LE")
+    } else if id == RANK9_MAPPING_V1_32_BE {
+        Some("RANK9_MAPPING_V1_32_BE")
+    } else if id == RANK9_MAPPING_V1_64_LE {
+        Some("RANK9_MAPPING_V1_64_LE")
+    } else if id == RANK9_MAPPING_V1_64_BE {
+        Some("RANK9_MAPPING_V1_64_BE")
+    } else if id == OBSERVE_STATES_MAPPING_V1 {
+        Some("OBSERVE_STATES_MAPPING_V1")
+    } else if id == REGISTER_COORDINATES_MAPPING_V1 {
+        Some("REGISTER_COORDINATES_MAPPING_V1")
     } else {
         None
     }
@@ -206,7 +211,7 @@ fn named_id(id: Id, name: Option<&'static str>) -> String {
 
 /// The short column form: the schema's name if this binary implements it, and
 /// the bare id if it does not. An unknown id is not an error — a descriptor
-/// may name a recipe some other reader owns.
+/// may name an encoding or mapping algorithm some other reader owns.
 fn short_named_id(
     id: Result<Id, impl std::fmt::Debug>,
     name: fn(Id) -> Option<&'static str>,
@@ -215,6 +220,31 @@ fn short_named_id(
         Ok(id) => name(id)
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{id:X}")),
+        Err(_) => "<unreadable>".to_owned(),
+    }
+}
+
+/// The short column form for an optional id. Root collections have no mapping,
+/// while malformed descriptors remain visibly different from that valid
+/// absence.
+fn short_optional_id(id: Result<Option<Id>, impl std::fmt::Debug>, long: bool) -> String {
+    match id {
+        Ok(Some(id)) => abbrev(&format!("{id:X}"), long),
+        Ok(None) => "-".to_owned(),
+        Err(_) => "<unreadable>".to_owned(),
+    }
+}
+
+/// The short column form for an optional id whose known values have names.
+fn short_optional_named_id(
+    id: Result<Option<Id>, impl std::fmt::Debug>,
+    name: fn(Id) -> Option<&'static str>,
+) -> String {
+    match id {
+        Ok(Some(id)) => name(id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{id:X}")),
+        Ok(None) => "-".to_owned(),
         Err(_) => "<unreadable>".to_owned(),
     }
 }
@@ -254,7 +284,7 @@ fn referenced_collections(pile: &mut Pile) -> Result<BTreeMap<CollectionHandle, 
                 refs.entry(merge.collection()).or_default().merges += 1;
             }
             CollectionRecord::Derive(derive) => {
-                refs.entry(derive.target()).or_default().derives_into += 1;
+                refs.entry(derive.collection()).or_default().derives_into += 1;
             }
         }
     }
@@ -540,7 +570,14 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
                     None => "-".to_owned(),
                 },
                 match row.fields.facts() {
-                    Some(facts) => short_named_id(descriptor::recipe(facts), recipe_name),
+                    Some(facts) => short_optional_id(descriptor::mapping(facts), long),
+                    None => "-".to_owned(),
+                },
+                match row.fields.facts() {
+                    Some(facts) => short_optional_named_id(
+                        descriptor::mapping_algorithm(facts),
+                        mapping_algorithm_name,
+                    ),
                     None => "-".to_owned(),
                 },
             ];
@@ -610,10 +647,12 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
             "COLLECTION",
             "AUTHORITY",
             "REPRESENTATION",
-            "RECIPE",
+            "MAPPING",
+            "ALGORITHM",
         ];
         let mut tail_aligns = vec![
             Align::Right,
+            Align::Left,
             Align::Left,
             Align::Left,
             Align::Left,
@@ -745,13 +784,17 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
                 representation_name(descriptor::representation(&descriptor)?)
             )
         );
-        println!(
-            "recipe:         {}",
-            named_id(
-                descriptor::recipe(&descriptor)?,
-                recipe_name(descriptor::recipe(&descriptor)?)
-            )
-        );
+        match descriptor::mapping(&descriptor)? {
+            Some(mapping) => println!("mapping:        {mapping:X}"),
+            None => println!("mapping:        <none>"),
+        }
+        match descriptor::mapping_algorithm(&descriptor)? {
+            Some(algorithm) => println!(
+                "mapping algo:   {}",
+                named_id(algorithm, mapping_algorithm_name(algorithm))
+            ),
+            None => println!("mapping algo:   <none>"),
+        }
 
         let facts: TribleSet = reader
             .get::<TribleSet, SimpleArchive>(handle)
@@ -794,7 +837,7 @@ fn names_collection(record: &CollectionRecord, collection: CollectionHandle) -> 
     match record {
         CollectionRecord::Commit(commit) => commit.collection() == collection,
         CollectionRecord::Merge(merge) => merge.collection() == collection,
-        CollectionRecord::Derive(derive) => derive.target() == collection,
+        CollectionRecord::Derive(derive) => derive.collection() == collection,
     }
 }
 
@@ -871,7 +914,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                     );
                 }
                 CollectionRecord::Derive(derive) => {
-                    let (input, output) = derive.mapping();
+                    let (input, output) = (derive.input(), derive.output());
                     println!(
                         "derive  {:X}  input={}  output={}",
                         derive.id(),
@@ -905,7 +948,7 @@ fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<Co
                 out.insert(merge.collection());
             }
             CollectionRecord::Derive(derive) => {
-                out.insert(derive.target());
+                out.insert(derive.collection());
             }
         }
     }
@@ -918,8 +961,7 @@ mod tests {
     use std::collections::BTreeSet;
     use triblespace_core::blob::{IntoBlob, MemoryBlobStore};
     use triblespace_core::collection::reach;
-    use triblespace_core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
-    use triblespace_core::id::fucid;
+    use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1;
     use triblespace_core::repo::BlobStorePut;
 
     /// A descriptor built in-process must round-trip through exactly the path
@@ -931,13 +973,7 @@ mod tests {
     fn show_decodes_a_descriptor_addressed_by_its_blob_handle() {
         let authority = SigningKey::from_bytes(&[8; 32]).verifying_key();
         let representation = <SimpleArchive as MetaDescribe>::id();
-        let fragment = descriptor::naming(
-            "inspected",
-            authority,
-            representation,
-            TRIBLE_SET_UNION_RECIPE_V1,
-            reach::private(),
-        );
+        let fragment = descriptor::naming("inspected", authority, representation, reach::private());
         let entity_id = fragment.root().expect("the descriptor has one root");
 
         let mut store = MemoryBlobStore::new();
@@ -955,7 +991,7 @@ mod tests {
 
         let reader = store.reader().expect("reader");
         let blob: Blob<SimpleArchive> = reader.get(handle).expect("read descriptor blob");
-        assert_eq!(blob.bytes.len(), 320, "five tribles at 64 bytes each");
+        assert_eq!(blob.bytes.len(), 256, "four tribles at 64 bytes each");
 
         let decoded = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob)
             .expect("decode descriptor");
@@ -965,17 +1001,15 @@ mod tests {
             descriptor::representation(&decoded).unwrap(),
             representation
         );
-        assert_eq!(
-            descriptor::recipe(&decoded).unwrap(),
-            TRIBLE_SET_UNION_RECIPE_V1
-        );
+        assert_eq!(descriptor::mapping(&decoded).unwrap(), None);
+        assert_eq!(descriptor::mapping_algorithm(&decoded).unwrap(), None);
         assert_eq!(descriptor::entity(&decoded).unwrap(), entity_id);
 
         // The trible dump `show` prints comes from the same bytes.
         let facts: TribleSet = reader
             .get::<TribleSet, SimpleArchive>(handle)
             .expect("unarchive descriptor");
-        assert_eq!(facts.len(), 5);
+        assert_eq!(facts.len(), 4);
         let entities: BTreeSet<Id> = facts.iter().map(|t| *t.e()).collect();
         assert_eq!(
             entities,
@@ -1038,21 +1072,22 @@ mod tests {
     }
 
     #[test]
-    fn known_recipe_and_representation_ids_resolve_to_names() {
+    fn known_mapping_algorithm_and_representation_ids_resolve_to_names() {
         assert_eq!(
-            recipe_name(TRIBLE_SET_UNION_RECIPE_V1),
-            Some("TRIBLE_SET_UNION_RECIPE_V1")
+            mapping_algorithm_name(SIMPLE_TO_SUCCINCT_MAPPING_V1),
+            Some("SIMPLE_TO_SUCCINCT_MAPPING_V1")
         );
         assert_eq!(
             representation_name(<SimpleArchive as MetaDescribe>::id()),
             Some("SimpleArchive")
         );
-        assert_eq!(recipe_name(*fucid()), None);
+        let unknown = Id::new([0xFF; 16]).unwrap();
+        assert_eq!(mapping_algorithm_name(unknown), None);
         assert!(named_id(
-            TRIBLE_SET_UNION_RECIPE_V1,
-            recipe_name(TRIBLE_SET_UNION_RECIPE_V1)
+            SIMPLE_TO_SUCCINCT_MAPPING_V1,
+            mapping_algorithm_name(SIMPLE_TO_SUCCINCT_MAPPING_V1)
         )
-        .contains("6D64C5F4B9E9B73F57C5F8702AB7FE45"));
+        .contains("9C8CFEB097B0A336E09D506E8DD361C2"));
     }
 
     /// Build one descriptor's decoded fields the way `list` sees them.
@@ -1063,7 +1098,6 @@ mod tests {
                 name,
                 authority,
                 <SimpleArchive as MetaDescribe>::id(),
-                TRIBLE_SET_UNION_RECIPE_V1,
                 reach::private(),
             )
             .into_facts(),

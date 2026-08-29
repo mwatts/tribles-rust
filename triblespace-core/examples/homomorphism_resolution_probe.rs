@@ -11,7 +11,7 @@ use triblespace_core::collection::{
     discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
     CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore,
-    CollectionValidationRequest,
+    CollectionValidationRequest, KIND_COLLECTION_MAPPING,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
@@ -69,10 +69,21 @@ fn build(
 
     let signing_key = SigningKey::from_bytes(&[7; 32]);
     let team = signing_key.verifying_key();
-    let source = descriptor::naming("source", team, id(2), id(3), reach::private()).into_facts();
-    let target = descriptor::naming("target", team, id(5), id(6), reach::private()).into_facts();
+    let source = descriptor::naming("source", team, id(2), reach::private()).into_facts();
     let source_collection: CollectionHandle =
         IntoBlob::<SimpleArchive>::to_blob(source.clone()).get_handle();
+    let mapping_fragment = triblespace_core::prelude::entity! {
+        triblespace_core::metadata::tag: KIND_COLLECTION_MAPPING,
+        triblespace_core::collection::mapping_algorithm: id(6),
+    };
+    let target = descriptor::deriving(
+        source_collection,
+        team,
+        id(5),
+        mapping_fragment,
+        reach::private(),
+    )
+    .into_facts();
     let target_collection: CollectionHandle =
         IntoBlob::<SimpleArchive>::to_blob(target.clone()).get_handle();
     let leaf_data: Vec<_> = (0..leaves)

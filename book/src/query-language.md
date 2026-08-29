@@ -621,17 +621,20 @@ Then nothing needs narrowing, because a note is not in that register to begin
 with.
 
 **Which attribute carries identity and which carries order is a property of the
-register, not of the reader's question.** Both are carried as tribles on the
-collection descriptor, beside a recipe id that names the law and nothing else.
-Two registers over one dataset are therefore distinct collections -- their
-descriptors differ in content, so they differ in handle -- and cannot share a
-cache. What is left at the call site is the frame, and nothing else.
+register, not of the reader's question.** Both are carried as tribles on one
+concrete mapping entity embedded in the derived collection descriptor. That
+entity separately names the stable mapping algorithm, so its content-derived
+identity includes the concrete attribute pair without making the pair opaque.
+Two registers over one dataset are therefore distinct mappings and distinct
+collections -- their descriptors differ in content, so they differ in handle
+-- and cannot share a cache. What is left at the call site is the frame, and
+nothing else.
 
-An earlier design hashed the two attributes *into* the recipe id, as
-`observed_union` did with its observation edge and a path collection with its
-automaton fingerprint. That made the digest their only carrier: nothing stored
-the pair, so no reader could recover which attributes a register was over. All
-three now carry their arguments on the descriptor instead.
+An earlier design folded concrete parameters into an otherwise opaque
+algorithm id. The digest became their only carrier, so no reader could recover
+which attributes a register was over. The current shape stores parameters on
+the mapping entity itself; `observed_union`, `lww_register`, and other derived
+collections all use the same content-derived mechanism.
 
 An order composes into a query directly. `maximal` is a filter-only constraint:
 it estimates `usize::MAX` so the planner always sorts it last and a `pattern!`

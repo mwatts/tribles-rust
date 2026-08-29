@@ -13,26 +13,21 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::exact_derived::{
     ExactDerivedCollection, ExactDerivedCollectionError,
 };
-use triblespace_core::collection::simplearchive_union::{self, SimpleArchiveUnion};
+use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     CollectionHandle, CollectionStore, Cover, CoverAttachment, TryFromCover, VerifyingKey,
 };
 use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 use triblespace_core::trible::Fragment;
 
-use crate::path_summary_union::{
-    self, PathSummaryUnion, PathSummaryView, SimpleArchiveToPathSummary,
-};
+use crate::path_summary_union::{self, PathSummaryView, RegularPathMapping};
 use crate::{Automaton, PathError, PathIndex, PathSummaryBlob, PathSummaryBlobError};
-use path_summary_union::PathSummaryUnionError;
 
 /// Failure to validate, complete, or materialize one exact path cover.
 #[derive(Debug)]
 pub enum PathSummaryCollectionError {
     /// Exact-cover resolution, construction, or storage failed.
     Collection(ExactDerivedCollectionError),
-    /// Canonical path-summary construction failed.
-    Algebra(PathSummaryUnionError),
     /// A selected summary did not decode under the fixed automaton.
     Summary(PathSummaryBlobError),
     /// Closing the joined summary into the accepted endpoint relation failed.
@@ -43,7 +38,6 @@ impl fmt::Display for PathSummaryCollectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Collection(source) => source.fmt(f),
-            Self::Algebra(source) => source.fmt(f),
             Self::Summary(source) => source.fmt(f),
             Self::Index(source) => source.fmt(f),
         }
@@ -54,7 +48,6 @@ impl Error for PathSummaryCollectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Collection(source) => Some(source),
-            Self::Algebra(source) => Some(source),
             Self::Summary(source) => Some(source),
             Self::Index(source) => Some(source),
         }
@@ -167,7 +160,7 @@ impl PathSummaryCollection {
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<SimpleArchiveUnion>,
+        source_cover: &Cover<SimpleArchive>,
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore,
@@ -185,7 +178,7 @@ impl PathSummaryCollection {
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<SimpleArchiveUnion>,
+        source_cover: &Cover<SimpleArchive>,
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
@@ -198,7 +191,7 @@ impl PathSummaryCollection {
     fn kernel(
         &self,
     ) -> Result<
-        ExactDerivedCollection<SimpleArchiveUnion, PathSummaryUnion, SimpleArchiveToPathSummary>,
+        ExactDerivedCollection<SimpleArchive, PathSummaryBlob, RegularPathMapping>,
         ExactDerivedCollectionError,
     > {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
@@ -206,14 +199,14 @@ impl PathSummaryCollection {
 
     fn index_from_cover(
         &self,
-        cover: CoverAttachment<PathSummaryUnion>,
+        cover: CoverAttachment<PathSummaryBlob>,
     ) -> Result<PathIndex, PathSummaryCollectionError> {
         let cover = PathSummaryView::try_from_cover(cover)
             .expect("constructing a lazy path-summary view is infallible");
-        let mut joined = path_summary_union::empty(&self.automaton);
+        let mut joined = PathSummaryBlob::empty(&self.automaton);
         for segment in cover.into_blobs() {
-            joined = path_summary_union::join(&joined, &segment, &self.automaton)
-                .map_err(PathSummaryCollectionError::Algebra)?;
+            joined = PathSummaryBlob::join(&joined, &segment, &self.automaton)
+                .map_err(PathSummaryCollectionError::Summary)?;
         }
         let summary = PathSummaryBlob::decode(joined, &self.automaton)
             .map_err(PathSummaryCollectionError::Summary)?;
@@ -391,9 +384,9 @@ mod tests {
         store: &mut CollectionOnly,
         paths: &PathSummaryCollection,
         commits: impl IntoIterator<Item = CollectionCommit>,
-    ) -> Cover<SimpleArchiveUnion> {
+    ) -> Cover<SimpleArchive> {
         let collection = store
-            .collection::<SimpleArchiveUnion>(paths.source_descriptor())
+            .collection::<SimpleArchive>(paths.source_descriptor())
             .unwrap();
         assert_eq!(collection.handle(), paths.source_collection());
         let authority = SigningKey::from_bytes(&[1; 32]);
@@ -478,13 +471,11 @@ mod tests {
         bytes.extend_from_slice(&[2; 32]);
         let persisted = Blob::<PathSummaryBlob>::new(bytes.into());
         assert!(matches!(
-            <PathSummaryUnion as triblespace_core::collection::CollectionLattice>::validate_member(
+            <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::validate_member(
                 &paths.descriptor(),
                 &persisted,
             ),
-            Err(triblespace_core::collection::CollectionLatticeError::Fatal(
-                _
-            ))
+            Err(triblespace_core::collection::CollectionOperationError::Fatal(_))
         ));
     }
 
@@ -493,7 +484,7 @@ mod tests {
         let mut store = CollectionOnly::default();
         let paths = test_paths(test_name("c9"), plus());
         let collection = store
-            .collection::<SimpleArchiveUnion>(paths.source_descriptor())
+            .collection::<SimpleArchive>(paths.source_descriptor())
             .unwrap();
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
@@ -576,7 +567,7 @@ mod tests {
             .into_iter()
             .filter(|record| {
                 matches!(record, CollectionRecord::Derive(claim)
-                if claim.target() == paths.collection())
+                if claim.collection() == paths.collection())
             })
             .count();
         assert_eq!(derives, 1);
@@ -654,8 +645,8 @@ mod tests {
         let inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
-                CollectionRecord::Derive(claim) if claim.target() == paths.collection() => {
-                    Some(claim.mapping().0)
+                CollectionRecord::Derive(claim) if claim.collection() == paths.collection() => {
+                    Some(claim.input())
                 }
                 _ => None,
             })
@@ -703,8 +694,8 @@ mod tests {
         let mut inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
-                CollectionRecord::Derive(claim) if claim.target() == paths.collection() => {
-                    Some(claim.mapping().0)
+                CollectionRecord::Derive(claim) if claim.collection() == paths.collection() => {
+                    Some(claim.input())
                 }
                 _ => None,
             })
@@ -741,7 +732,7 @@ mod tests {
                 .unwrap();
         }
         let joined =
-            path_summary_union::join(&left_summary, &right_summary, paths.automaton()).unwrap();
+            PathSummaryBlob::join(&left_summary, &right_summary, paths.automaton()).unwrap();
         store.put::<PathSummaryBlob, _>(joined.clone()).unwrap();
         let joined_data = Handle::<PathSummaryBlob>::to_hash(joined.get_handle());
         store

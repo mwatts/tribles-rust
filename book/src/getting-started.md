@@ -45,14 +45,18 @@ attribute's exact historical bytes when its old identity cannot be re-derived.
 ## 3. Register a collection
 
 A root collection is identified by the content handle of its descriptor. The
-descriptor carries its UTF-8 name, mandatory authority, representation, join
-recipe, and reach law. The descriptor itself is an ordinary self-contained
-`Fragment`; its canonical content handle is the collection value:
+descriptor carries its UTF-8 name, mandatory authority, member encoding, and
+reach law. The encoding itself owns member validation and canonical join; a
+root needs no mapping. The descriptor is an ordinary self-contained
+`Fragment`; its canonical content handle is the collection identity:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::collection::{reach, simplearchive_union};
+use triblespace::core::{
+    blob::encodings::simplearchive::SimpleArchive,
+    collection::{reach, simplearchive_union, Collection},
+};
 use triblespace::prelude::*;
 
 let key = SigningKey::generate(&mut OsRng);
@@ -62,7 +66,7 @@ let descriptor = simplearchive_union::descriptor(
     key.verifying_key(),
     reach::private(),
 );
-let library = storage.collection(descriptor)?;
+let library: Collection<SimpleArchive> = storage.collection(descriptor)?;
 ```
 
 `reach::private()` declares no permissionless relay. Use `reach::public()` only
@@ -157,8 +161,8 @@ for (first, last, quote) in find!(
 `snapshot()` admits the descriptor authority plus explicitly supplied
 delegated presentations at one clock instant. It opens one target blob-reader
 view and materializes facts solely from the resulting exact payload cover. The
-returned `Snapshot<SimpleArchiveUnion, TribleSet, R>` keeps facts, its typed
-`Cover<SimpleArchiveUnion>`, and reader together. A concurrent commit may
+returned `Snapshot<SimpleArchive, TribleSet, R>` keeps the logical fact view,
+its typed `Cover<SimpleArchive>`, and reader together. A concurrent commit may
 appear on this call or a later call, but physically visible blobs from an
 unobserved commit cannot leak into the snapshot's admitted set.
 
@@ -191,8 +195,9 @@ the chosen backend rather than collection policy.
 
 - `entity!` builds intrinsic entities and carries required blobs.
 - `Fragment` is the self-contained publication value.
-- `Collection<L>` is a descriptor handle statically bound to its member
-  encoding and join law; the store owns all I/O.
+- `Collection<E>` is a descriptor handle statically bound to the
+  `CollectionEncoding` which owns its member bytes, validation, and join; the
+  store owns all I/O.
 - `store.commit` publishes one signed, independent member without conflating
   local storage with network authorization.
 - `store.snapshot` returns one coherent known-prefix view admitted by the

@@ -159,21 +159,28 @@ The crate also ships with these blob encodings:
   artifact without constructing query indexes, while
   `SuccinctArchiveBlob::merge` computes an exact-validated raw set union with
   no runtime or Rank9 attachment. For native collection caching, the detached
-  sidecar representation is further qualified by a lifted-union recipe that
-  pins the raw/sidecar format, canonical builder version, pointer width, and
-  byte order. Version 1 has separately minted 32/64-bit little/big-endian
-  recipe ids, with one selected by the compilation target; any canonical-byte
-  determinant change requires a new recipe id. Under that descriptor the
-  target lattice is defined as the image `i(a)` of the raw lattice and obeys
-  `i(a) join i(b) = i(a join b)`, so a raw-to-sidecar `DERIVE` remains an
-  ordinary truthful join homomorphism even though constructing a joined
-  sidecar requires its raw dependency. Pair admission freshly checks both
+  sidecar mapping is qualified by a mapping-algorithm id which pins the
+  raw/sidecar format, canonical builder version, pointer width, and byte order.
+  Version 1 has separately minted 32/64-bit little/big-endian algorithm ids,
+  with one selected by the compilation target; any canonical-byte determinant
+  change requires a new algorithm id. The content-derived mapping fragment
+  carrying that algorithm is the mapping identity in
+  `MappingEvidence(mapping, raw, sidecar)`. Rank9 is not a
+  `CollectionEncoding`: a sidecar cannot join without the raw archive it
+  indexes, so presenting it as an independent target collection would expose a
+  law its bytes cannot implement. Pair admission freshly checks both
   content hashes, the embedded source handle, native format fields, and the
   exact raw/index relationship. The Rank9-index validation pass is linear and
   does not allocate a replacement index; rebuilding the query runtime still
   allocates its runtime arena and views.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
+
+`BlobEncoding` says what bytes mean. `CollectionEncoding` is the stronger
+contract for formats used as collection members: the encoding itself owns
+canonical member validation and join. `SimpleArchive`, `SuccinctArchiveBlob`,
+and the maintained collection encodings implement that contract directly;
+there is no separate public lattice type to pair with them.
 
 ```rust
 use triblespace::core::metadata::MetaDescribe;
