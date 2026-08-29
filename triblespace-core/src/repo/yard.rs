@@ -23,18 +23,15 @@ use ed25519_dalek::VerifyingKey;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::{
-    CollectionRecord, CollectionRecordSelector, CollectionStore, MappingEvidence,
-    MappingEvidenceSelector, MappingEvidenceStore,
-};
+use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use super::pile::{
-    CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError,
-    MappingEvidenceInsertError, Pile, PileReader, PileRevision, PileWriteError, ReadError,
+    CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError, Pile, PileReader,
+    PileRevision, PileWriteError, ReadError,
 };
 use super::proof::CapabilityProofStore;
 use super::{
@@ -810,19 +807,6 @@ pub struct YardCollectionRecordIter {
     inner: std::collections::btree_map::IntoValues<Id, CollectionRecord>,
 }
 
-/// Deterministic owned snapshot of mapping evidence across all generations.
-pub struct YardMappingEvidenceIter {
-    inner: std::collections::btree_map::IntoValues<Id, MappingEvidence>,
-}
-
-impl Iterator for YardMappingEvidenceIter {
-    type Item = Result<MappingEvidence, YardMappingEvidenceError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Ok)
-    }
-}
-
 impl Iterator for YardCollectionRecordIter {
     type Item = Result<CollectionRecord, YardCollectionRecordsError>;
 
@@ -853,35 +837,6 @@ impl fmt::Display for YardCollectionRecordsError {
 }
 
 impl Error for YardCollectionRecordsError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Pile(error) => Some(error),
-            Self::IdCollision { .. } => None,
-        }
-    }
-}
-
-/// Failure while replaying the mapping-evidence union of a yard.
-#[derive(Debug)]
-pub enum YardMappingEvidenceError {
-    /// One generation could not refresh or decode its pile.
-    Pile(ReadError),
-    /// Two generations presented different equations under one intrinsic id.
-    IdCollision { id: Id },
-}
-
-impl fmt::Display for YardMappingEvidenceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pile(error) => write!(f, "failed to replay yard mapping evidence: {error}"),
-            Self::IdCollision { id } => {
-                write!(f, "mapping evidence id {id:X} names different fields")
-            }
-        }
-    }
-}
-
-impl Error for YardMappingEvidenceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Pile(error) => Some(error),
@@ -1066,78 +1021,6 @@ impl CollectionStore for Yard {
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.generations[0].active_mut().pile_mut().insert(record)
-    }
-}
-
-impl MappingEvidenceStore for Yard {
-    type EvidenceError = YardMappingEvidenceError;
-    type InsertError = MappingEvidenceInsertError;
-    type EvidenceIter<'a> = YardMappingEvidenceIter;
-
-    fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
-        let mut evidence = BTreeMap::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                let replay = segment
-                    .pile_mut()
-                    .evidence()
-                    .map_err(YardMappingEvidenceError::Pile)?;
-                for result in replay {
-                    let candidate = result.map_err(YardMappingEvidenceError::Pile)?;
-                    let id = candidate.id();
-                    match evidence.get(&id) {
-                        Some(existing) if existing != &candidate => {
-                            return Err(YardMappingEvidenceError::IdCollision { id });
-                        }
-                        Some(_) => {}
-                        None => {
-                            evidence.insert(id, candidate);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(YardMappingEvidenceIter {
-            inner: evidence.into_values(),
-        })
-    }
-
-    fn select_evidence(
-        &mut self,
-        selectors: &BTreeSet<MappingEvidenceSelector>,
-    ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
-        if selectors.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut evidence = BTreeMap::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                let selected = segment
-                    .pile_mut()
-                    .select_evidence(selectors)
-                    .map_err(YardMappingEvidenceError::Pile)?;
-                for candidate in selected {
-                    let id = candidate.id();
-                    match evidence.get(&id) {
-                        Some(existing) if existing != &candidate => {
-                            return Err(YardMappingEvidenceError::IdCollision { id });
-                        }
-                        Some(_) => {}
-                        None => {
-                            evidence.insert(id, candidate);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(evidence.into_values().collect())
-    }
-
-    fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
-        self.generations[0]
-            .active_mut()
-            .pile_mut()
-            .insert_evidence(evidence)
     }
 }
 
@@ -1528,11 +1411,6 @@ fn reclaim_generation(
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
-    let mapping_evidence = old_pile
-        .evidence()
-        .map_err(YardReclaimError::Pile)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(YardReclaimError::Pile)?;
     let capability_proofs = old_pile
         .proofs()
         .map_err(YardReclaimError::Pile)?
@@ -1565,11 +1443,6 @@ fn reclaim_generation(
         new_pile
             .insert(record)
             .map_err(YardReclaimError::CollectionRecord)?;
-    }
-    for evidence in mapping_evidence {
-        new_pile
-            .insert_evidence(evidence)
-            .map_err(YardReclaimError::MappingEvidence)?;
     }
     for proof in capability_proofs {
         new_pile
@@ -1754,8 +1627,6 @@ pub enum YardReclaimError {
     },
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
-    /// Mapping evidence could not be copied.
-    MappingEvidence(MappingEvidenceInsertError),
     CapabilityProof(CapabilityProofInsertError),
     /// Positive artifact offers could not be copied.
     Offer(PileWriteError),
@@ -1788,9 +1659,6 @@ impl fmt::Display for YardReclaimError {
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
             Self::CollectionRecord(err) => {
                 write!(f, "failed to copy a yard collection record: {err}")
-            }
-            Self::MappingEvidence(err) => {
-                write!(f, "failed to copy yard mapping evidence: {err}")
             }
             Self::CapabilityProof(err) => {
                 write!(f, "failed to copy a yard capability proof: {err}")

@@ -210,15 +210,27 @@ Missing derived artifacts are cache misses, not missing facts.
 
 Route freedom belongs to the input collection expected by the mapping rather
 than to a flag on `Cover`: ordinary Succinct construction may reuse any
-validated equal-support route. Rank9 is deliberately narrower. A detached
-Rank9 sidecar cannot join without its raw archive, so it is an accelerator
-mapping over each exact immediate raw member, not another collection. Its
-separate `MappingEvidence(mapping, input, output)` relation records reusable
-cache work without manufacturing a descriptor, collection frontier, or
-authority surface. The *pairs* do retain a useful construction algebra:
-`(a, R(a)) ⊔ (b, R(b)) = (a ⊔ b, R(a ⊔ b))`. This permits an implementation to
-reuse attached input accelerators while constructing the output pair, but does
-not imply a join on `R(a)` and `R(b)` in isolation.
+validated equal-support route. Rank9 acceleration is another ordinary derived
+collection, but its members are Merkle closures rather than monolithic blobs.
+`Rank9AcceleratedSuccinctArchiveBlob` is the ABI-qualified root encoding. Its
+first 32 bytes name the exact portable `SuccinctArchiveBlob` child whose
+Rank9/select structures it carries.
+
+`CollectionArtifact<E>` separates the durable root identity from the transient
+value needed to operate on it. Attaching an accelerated member resolves and
+validates its root, raw child, and query runtime once, then retains all three in
+one artifact. The raw-to-accelerated mapping is an ordinary `DERIVE`, and the
+join law applies to complete attached artifacts:
+
+```text
+(a, R(a)) ⊔ (b, R(b)) = (a ⊔ b, R(a ⊔ b))
+```
+
+The output raw child and accelerated root are published in dependency order
+before the semantic `DERIVE` or `MERGE` record. A root whose raw child is absent
+is an incomplete, nonresident closure; read-only attachment rejects that route,
+while ensuring may reconstruct the canonical artifact through another valid
+route or directly from its source.
 
 ## WANT is operational, not semantic
 

@@ -20,7 +20,10 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::blob::{Blob, BlobEncoding, IntoBlob};
+use crate::inline::encodings::hash::Handle;
+use crate::inline::InlineEncoding;
 use crate::metadata::MetaDescribe;
+use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut};
 use crate::trible::Fragment;
 
 use super::{descriptor, CollectionHandle, RecordDecodeError};
@@ -50,6 +53,50 @@ impl fmt::Display for CollectionOperationError {
 
 impl Error for CollectionOperationError {}
 
+/// One fully attached physical member of a collection encoding.
+///
+/// Most encodings are monolithic, so their artifact is simply the root
+/// [`Blob`] itself. Merkle encodings may instead retain the root, its resolved
+/// dependencies, and any runtime reconstructed while validating that closure.
+/// The transient attachment is deliberately not another durable record: its
+/// root remains the sole collection-member identity.
+pub trait CollectionArtifact<E>: Clone
+where
+    E: BlobEncoding,
+    Handle<E>: InlineEncoding,
+{
+    /// Canonical root blob whose content handle names this member.
+    fn root(&self) -> &Blob<E>;
+
+    /// Publish the complete artifact closure, dependencies before root.
+    ///
+    /// Implementations may harmlessly re-put already resident dependencies;
+    /// content addressing makes publication idempotent. Collection equations
+    /// are always inserted by the caller only after every artifact has been
+    /// published.
+    fn publish<S>(&self, store: &mut S) -> Result<(), S::PutError>
+    where
+        S: BlobStorePut;
+}
+
+impl<E> CollectionArtifact<E> for Blob<E>
+where
+    E: BlobEncoding,
+    Handle<E>: InlineEncoding,
+{
+    fn root(&self) -> &Blob<E> {
+        self
+    }
+
+    fn publish<S>(&self, store: &mut S) -> Result<(), S::PutError>
+    where
+        S: BlobStorePut,
+    {
+        store.put::<E, _>(self.clone())?;
+        Ok(())
+    }
+}
+
 /// One canonical join-semilattice carried by a blob encoding.
 ///
 /// The encoding is the physical shape *and* its intra-shape join law. This is
@@ -57,6 +104,9 @@ impl Error for CollectionOperationError {}
 /// collection member, while every `CollectionEncoding` has one unambiguous
 /// canonical join.
 pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
+    /// Fully validated, closure-attached runtime form of one member.
+    type Artifact: CollectionArtifact<Self>;
+
     /// Validate encoding-specific context carried by one descriptor.
     ///
     /// Most encodings need no context. An encoding whose canonical bytes are
@@ -67,18 +117,25 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
         Ok(())
     }
 
-    /// Validate one member independently of its provenance.
-    fn validate_member(
+    /// Resolve and validate one member independently of its provenance.
+    ///
+    /// The root bytes have already passed the blob store's content-address
+    /// boundary. A Merkle encoding may load children through `reader`; a
+    /// monolithic encoding normally ignores it and returns the root blob.
+    fn attach_member<R>(
         descriptor: &Fragment,
-        member: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError>;
+        member: Blob<Self>,
+        reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta;
 
     /// Compute the exact canonical join of two members.
     fn join_members(
         descriptor: &Fragment,
-        low: &Blob<Self>,
-        high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError>;
+        low: &Self::Artifact,
+        high: &Self::Artifact,
+    ) -> Result<Self::Artifact, CollectionOperationError>;
 }
 
 /// One parameterized mapping between collection encodings.
@@ -101,7 +158,7 @@ where
         Self: Sized;
 
     /// Compute the canonical target image of one source member.
-    fn map(&self, source: &Blob<Source>) -> Result<Blob<Target>, CollectionOperationError>;
+    fn map(&self, source: &Source::Artifact) -> Result<Target::Artifact, CollectionOperationError>;
 }
 
 /// A descriptor does not denote the encoding requested by its Rust type.

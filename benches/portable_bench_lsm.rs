@@ -13,8 +13,8 @@
 //!                 collection's exact payload cover OUTSIDE the timer. The timer then
 //!                 covers `SuccinctArchiveCollection::compact_exact`: exact
 //!                 source validation/derivation, canonical raw blob puts,
-//!                 deterministic dyadic target compaction, persisted Rank9
-//!                 fibers, equation publication, and final attachment. Source
+//!                 deterministic dyadic target compaction, ordinary raw-to-Rank9
+//!                 derivation, equation publication, and final attachment. Source
 //!                 serialization, signing, and publication are deliberately
 //!                 excluded. There is one fixed maintenance policy and no
 //!                 fanout, level, or planner tuning knob. An input pile is

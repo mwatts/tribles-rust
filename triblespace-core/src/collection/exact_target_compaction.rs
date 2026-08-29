@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, BlobStorePut, OfferCapture};
@@ -18,8 +17,9 @@ use crate::trible::Fragment;
 
 use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
 use super::{
-    CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
-    CollectionOperationError, CollectionRecord, CollectionStore, Cover, CoverAttachment,
+    CollectionArtifact, CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping,
+    CollectionMerge, CollectionOperationError, CollectionRecord, CollectionStore, Cover,
+    CoverAttachment,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -176,8 +176,8 @@ where
     }
 }
 
-fn target_tier<Target: CollectionEncoding>(blob: &Blob<Target>) -> u32 {
-    blob.bytes.len().max(1).ilog2()
+fn target_tier<Target: CollectionEncoding>(artifact: &Target::Artifact) -> u32 {
+    artifact.root().bytes.len().max(1).ilog2()
 }
 
 fn cover_identity<Target: CollectionEncoding>(
@@ -214,7 +214,7 @@ where
     Target: CollectionEncoding,
     Handle<Target>: InlineEncoding,
 {
-    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
+    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Target::Artifact>>::new();
     let mut locations = BTreeMap::<CollectionData, u32>::new();
     for (data, blob) in cover.members().iter().cloned() {
         let data = Handle::<Target>::to_hash(data);
@@ -223,7 +223,7 @@ where
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
-    let mut outputs = BTreeMap::<CollectionData, Blob<Target>>::new();
+    let mut outputs = BTreeMap::<CollectionData, Target::Artifact>::new();
     let mut claims = Vec::<CollectionMerge>::new();
     loop {
         let Some(tier) = tiers
@@ -256,7 +256,7 @@ where
                 continue;
             }
         };
-        let result_data = data_identity(&constructed);
+        let result_data = data_identity::<Target>(&constructed);
         let result = constructed;
         let claim = CollectionMerge::new(collection, low_data, high_data, result_data);
 
@@ -286,7 +286,7 @@ where
     super::descriptor::put_closure(store, &descriptor)
         .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
     for result in outputs.into_values() {
-        store.put::<Target, _>(result).map_err(|error| {
+        result.publish(store).map_err(|error| {
             ExactTargetCompactionError::storage("store compacted target", error)
         })?;
     }

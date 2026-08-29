@@ -27,8 +27,6 @@ pub mod exact_derived;
 pub mod exact_target_compaction;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
-/// Unsigned reusable evidence for exact mapping computations.
-pub mod mapping_evidence;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.
 pub mod observed_union;
@@ -59,7 +57,6 @@ pub use ed25519_dalek::VerifyingKey;
 pub use api::*;
 pub use discovery::*;
 pub use encoding::*;
-pub use mapping_evidence::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;

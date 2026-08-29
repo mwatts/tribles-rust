@@ -3,11 +3,11 @@
 //! This benchmark compares the three real public maintenance operations on
 //! geometrically growing exact covers:
 //!
-//! - `ensure_exact`: canonical raw Succinct derivation plus Rank9 fibers.
+//! - `ensure_exact`: canonical raw and Rank9-accelerated derivations.
 //! - `exact_view().ensure`: retain already-admitted immutable shards and run
 //!   ordinary exact admission only over newly signed support.
 //! - `compact_exact`: the same exact completion plus deterministic dyadic
-//!   raw-target compaction and Rank9 fibers for the selected cover.
+//!   raw-target compaction and the matching accelerated collection cover.
 //!
 //! Stateless operations get an independent warm store, a source-identical cold
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
@@ -52,13 +52,12 @@ use triblespace_core::blob::Blob;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::reach;
 use triblespace_core::collection::succinctarchive_union::{
-    rank9_mapping_fragment, SimpleToSuccinctMapping, SuccinctArchiveCollection,
-    SuccinctArchiveView, SuccinctArchiveViewWork,
+    SimpleToSuccinctMapping, SuccinctArchiveCollection, SuccinctArchiveView,
+    SuccinctArchiveViewWork,
 };
 use triblespace_core::collection::{
     simplearchive_union, Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
     CollectionRecord, CollectionStore, CollectionStoreExt, Cover, CoverAttachment,
-    MappingEvidenceStore, MappingHandle,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
@@ -117,7 +116,7 @@ struct StoreShape {
     source_merges: u64,
     raw_derives: u64,
     raw_merges: u64,
-    rank9_evidence: u64,
+    accelerated_records: u64,
     other_records: u64,
 }
 
@@ -131,7 +130,7 @@ impl StoreShape {
             source_merges: self.source_merges + other.source_merges,
             raw_derives: self.raw_derives + other.raw_derives,
             raw_merges: self.raw_merges + other.raw_merges,
-            rank9_evidence: self.rank9_evidence + other.rank9_evidence,
+            accelerated_records: self.accelerated_records + other.accelerated_records,
             other_records: self.other_records + other.other_records,
         }
     }
@@ -145,7 +144,7 @@ impl StoreShape {
             source_merges: self.source_merges - before.source_merges,
             raw_derives: self.raw_derives - before.raw_derives,
             raw_merges: self.raw_merges - before.raw_merges,
-            rank9_evidence: self.rank9_evidence - before.rank9_evidence,
+            accelerated_records: self.accelerated_records - before.accelerated_records,
             other_records: self.other_records - before.other_records,
         }
     }
@@ -154,7 +153,7 @@ impl StoreShape {
 struct Collections {
     source: CollectionHandle,
     raw: CollectionHandle,
-    rank9_mapping: MappingHandle,
+    accelerated: CollectionHandle,
 }
 
 fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape {
@@ -173,14 +172,13 @@ fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape 
             CollectionRecord::Merge(merge) if merge.collection() == collections.raw => {
                 shape.raw_merges += 1;
             }
+            CollectionRecord::Derive(derive) if derive.collection() == collections.accelerated => {
+                shape.accelerated_records += 1;
+            }
+            CollectionRecord::Merge(merge) if merge.collection() == collections.accelerated => {
+                shape.accelerated_records += 1;
+            }
             _ => shape.other_records += 1,
-        }
-    }
-
-    for evidence in store.evidence().expect("enumerate mapping evidence") {
-        let evidence = evidence.expect("MemoryRepo mapping evidence is infallible");
-        if evidence.mapping() == collections.rank9_mapping {
-            shape.rank9_evidence += 1;
         }
     }
 
@@ -347,9 +345,8 @@ fn diagnose_raw(
 ) -> (MappingCalls, CoverIdentity) {
     // This is outside the timer and must be a zero-write operation: it measures
     // the scratch proof graph needed to revalidate the exact raw cover now held
-    // by this arm. The public Rank9 phase remains represented only by timing
-    // and its durable mapping-evidence/blob delta because fiber construction is
-    // intentionally private to the facade.
+    // by this arm. The public accelerated phase remains represented by timing
+    // and its ordinary DERIVE/MERGE/blob delta.
     let diagnostic_before = store
         .store_revision()
         .expect("snapshot pre-diagnostic store revision");
@@ -693,18 +690,14 @@ fn run_iteration(
     let exact =
         ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob, CountingSuccinctMapping>::new(
             succinct.source_descriptor(),
-            succinct.descriptor(),
+            succinct.raw_descriptor(),
         )
         .expect("bind measured raw Succinct projection");
     let source = exact.source_collection();
     let collections = Collections {
         source: source.handle(),
-        raw: succinct.collection(),
-        rank9_mapping: rank9_mapping_fragment()
-            .facts()
-            .clone()
-            .to_blob()
-            .get_handle(),
+        raw: succinct.raw_collection(),
+        accelerated: succinct.collection(),
     };
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
     let mut source_accounting = new_source_store(source);
@@ -995,7 +988,7 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 mapping evidence; maps=canonical source-to-target mapping calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; maps=canonical source-to-target mapping calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
     );
     println!(
         "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
@@ -1006,7 +999,7 @@ fn main() {
         "+O",
         "+D",
         "+M",
-        "+R",
+        "+A",
         "support",
         "projection maps",
         "arg-MiB",
@@ -1037,7 +1030,7 @@ fn main() {
                 work.offers,
                 work.raw_derives,
                 work.raw_merges,
-                work.rank9_evidence,
+                work.accelerated_records,
                 support,
                 calls,
                 argument_mib,

@@ -10,7 +10,7 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
-use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
+use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::descriptor;
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
@@ -83,12 +83,19 @@ impl MetaDescribe for TestSourceBlob {
 }
 
 impl CollectionEncoding for TestSourceBlob {
-    fn validate_member(
+    type Artifact = Blob<Self>;
+
+    fn attach_member<R>(
         _descriptor: &Fragment,
-        member: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError> {
+        member: Blob<Self>,
+        _reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         simplearchive_union::validate_element(member.as_transmute::<SimpleArchive>())
-            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        Ok(member)
     }
 
     fn join_members(
@@ -177,11 +184,18 @@ impl MetaDescribe for TestTargetBlob {
 }
 
 impl CollectionEncoding for TestTargetBlob {
-    fn validate_member(
+    type Artifact = Blob<Self>;
+
+    fn attach_member<R>(
         _descriptor: &Fragment,
-        member: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError> {
-        validate_test_target(member)
+        member: Blob<Self>,
+        _reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
+        validate_test_target(&member)?;
+        Ok(member)
     }
 
     fn join_members(
@@ -235,11 +249,18 @@ impl MetaDescribe for SecondTestTargetBlob {
 }
 
 impl CollectionEncoding for SecondTestTargetBlob {
-    fn validate_member(
+    type Artifact = Blob<Self>;
+
+    fn attach_member<R>(
         _descriptor: &Fragment,
-        member: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError> {
-        validate_second_test_target(member)
+        member: Blob<Self>,
+        _reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
+        validate_second_test_target(&member)?;
+        Ok(member)
     }
 
     fn join_members(

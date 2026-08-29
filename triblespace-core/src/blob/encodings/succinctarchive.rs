@@ -351,30 +351,66 @@ impl SuccinctArchiveBlob {
 /// section table; unlike [`SuccinctArchiveBlob`], this representation is an
 /// explicitly replaceable accelerator rather than part of the archive's
 /// content identity.
-pub struct SuccinctArchiveRank9IndexBlob;
+pub struct Rank9AcceleratedSuccinctArchiveBlob;
 
-impl BlobEncoding for SuccinctArchiveRank9IndexBlob {}
+impl BlobEncoding for Rank9AcceleratedSuccinctArchiveBlob {}
 
-impl MetaDescribe for SuccinctArchiveRank9IndexBlob {
+/// Rank9-accelerated SuccinctArchive encoding for 32-bit little-endian targets.
+///
+/// Minted with `trible genid` on 2026-08-29. Encoding identity is
+/// ABI-qualified because the canonical root bytes contain native Rank9 words.
+pub const RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_32_LE: Id =
+    id_hex!("1597B627B9F5257C3BA2593E9AD21D5D");
+
+/// Rank9-accelerated SuccinctArchive encoding for 32-bit big-endian targets.
+pub const RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_32_BE: Id =
+    id_hex!("2B8E6864C14EBCCA42D864CCE9B3CA8D");
+
+/// Rank9-accelerated SuccinctArchive encoding for 64-bit little-endian targets.
+pub const RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_64_LE: Id =
+    id_hex!("5D034B396CCD0E39CADDAD7FDFEC45FC");
+
+/// Rank9-accelerated SuccinctArchive encoding for 64-bit big-endian targets.
+pub const RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_64_BE: Id =
+    id_hex!("0E0CC312AA0157D3377100D4010BEEAB");
+
+#[cfg(all(target_pointer_width = "32", target_endian = "little"))]
+const CURRENT_RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB: Id =
+    RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_32_LE;
+#[cfg(all(target_pointer_width = "32", target_endian = "big"))]
+const CURRENT_RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB: Id =
+    RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_32_BE;
+#[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+const CURRENT_RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB: Id =
+    RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_64_LE;
+#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
+const CURRENT_RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB: Id =
+    RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB_V1_64_BE;
+
+/// Encoding id for the exact native ABI supported by this build.
+pub const fn current_rank9_accelerated_succinctarchive_blob() -> Id {
+    CURRENT_RANK9_ACCELERATED_SUCCINCTARCHIVE_BLOB
+}
+
+impl MetaDescribe for Rank9AcceleratedSuccinctArchiveBlob {
     fn describe() -> Fragment {
-        // Minted with `trible genid` on 2026-07-13.
-        let id: Id = id_hex!("9F22887EAA90E13E646147353DFCDE06");
+        let id = current_rank9_accelerated_succinctarchive_blob();
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "succinctarchive-rank9-index",
-                metadata::description: "Native-ABI Rank9/select accelerator for one exact SuccinctArchiveBlob. The source archive handle occupies the first 32 bytes so reachability follows the dependency generically; the remaining versioned payload is replaceable and excluded from the raw archive's identity.",
+                metadata::name: "rank9-accelerated-succinctarchive",
+                metadata::description: "ABI-qualified accelerated SuccinctArchive member. Its Merkle root names one exact portable SuccinctArchiveBlob in the first 32 bytes and carries the canonical native Rank9/select payload for that source; the root and raw child together form one closure-attached collection artifact.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
 }
 
-impl SuccinctArchiveRank9IndexBlob {
+impl Rank9AcceleratedSuccinctArchiveBlob {
     /// Read the canonical raw-archive handle embedded at offset zero.
     ///
     /// This deliberately performs only the small, format-level header check
     /// needed to pair unordered manifest handles. Full native-ABI and Rank9
     /// validation remains the responsibility of
-    /// [`SuccinctArchive::from_blob_pair`].
+    /// [`SuccinctArchive::from_accelerated_parts`].
     pub fn source_handle(
         blob: &Blob<Self>,
     ) -> Result<Inline<Handle<SuccinctArchiveBlob>>, SuccinctArchiveError> {
@@ -667,7 +703,7 @@ pub struct SuccinctArchive<U> {
     /// Detached persisted Rank9/select accelerator bytes.
     rank9_index_bytes: Bytes,
     /// Cached identity of the detached Rank9/select accelerator bytes.
-    rank9_handle: Inline<Handle<SuccinctArchiveRank9IndexBlob>>,
+    rank9_handle: Inline<Handle<Rank9AcceleratedSuccinctArchiveBlob>>,
     /// The universe — maps integer codes to raw 32-byte values (the
     /// domain of all distinct values appearing in E, A, or V positions).
     pub domain: U,
@@ -3291,7 +3327,7 @@ where
         meta: SuccinctArchiveMeta<U::Meta>,
         runtime_bytes: Bytes,
         raw: Blob<SuccinctArchiveBlob>,
-        rank9: Blob<SuccinctArchiveRank9IndexBlob>,
+        rank9: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
     ) -> Result<Self, jerky::error::Error> {
         let source = raw.get_handle();
         let rank9_handle = rank9.get_handle();
@@ -3460,30 +3496,30 @@ where
     }
 
     /// Builds a queryable archive and returns its raw and Rank9 artifacts.
-    pub fn build_blob_pair(
+    pub fn build_accelerated_parts(
         source: &TribleSet,
     ) -> (
         Blob<SuccinctArchiveBlob>,
-        Blob<SuccinctArchiveRank9IndexBlob>,
+        Blob<Rank9AcceleratedSuccinctArchiveBlob>,
     )
     where
         U::Meta: Clone,
     {
         let archive: Self = source.into();
-        archive.to_blob_pair()
+        archive.to_accelerated_parts()
     }
 
     /// Returns the canonical raw archive and its detached, source-bound Rank9
     /// accelerator as two independently content-addressed blobs.
-    pub fn to_blob_pair(
+    pub fn to_accelerated_parts(
         &self,
     ) -> (
         Blob<SuccinctArchiveBlob>,
-        Blob<SuccinctArchiveRank9IndexBlob>,
+        Blob<Rank9AcceleratedSuccinctArchiveBlob>,
     ) {
         (
             Blob::with_handle(self.bytes.clone(), self.raw_handle),
-            self.rank9_blob(),
+            self.accelerated_root(),
         )
     }
 
@@ -3491,15 +3527,15 @@ where
     ///
     /// This is useful when the caller already owns the canonical raw blob and
     /// must persist the accelerator without hashing the raw bytes again.
-    pub fn rank9_blob(&self) -> Blob<SuccinctArchiveRank9IndexBlob> {
+    pub fn accelerated_root(&self) -> Blob<Rank9AcceleratedSuccinctArchiveBlob> {
         Blob::with_handle(self.rank9_index_bytes.clone(), self.rank9_handle)
     }
 
     /// Rebuilds only the detached Rank9 artifact for a canonical raw archive.
     /// The raw blob is exact-validated and its bytes/identity remain unchanged.
-    pub fn build_rank9_index(
+    pub fn build_accelerated_root(
         raw: Blob<SuccinctArchiveBlob>,
-    ) -> Result<Blob<SuccinctArchiveRank9IndexBlob>, SuccinctArchiveError> {
+    ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, SuccinctArchiveError> {
         let source = raw.get_handle();
         let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
         let index = build_runtime_rank9_index(&meta, &runtime_bytes, source)
@@ -3508,27 +3544,13 @@ where
     }
 
     /// Attaches an exact raw/index pair without rebuilding rank/select data.
-    pub fn from_blob_pair(
+    pub fn from_accelerated_parts(
         raw: Blob<SuccinctArchiveBlob>,
-        rank9: Blob<SuccinctArchiveRank9IndexBlob>,
+        rank9: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
     ) -> Result<Self, SuccinctArchiveError> {
         let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
         Self::from_runtime_bytes_with_rank9_indexes(meta, runtime_bytes, raw, rank9)
             .map_err(SuccinctArchiveError)
-    }
-
-    /// Store-facing pair attachment that reports a missing Rank9 artifact as
-    /// the same structured archive error as a malformed artifact.
-    pub fn from_optional_blob_pair(
-        raw: Blob<SuccinctArchiveBlob>,
-        rank9: Option<Blob<SuccinctArchiveRank9IndexBlob>>,
-    ) -> Result<Self, SuccinctArchiveError> {
-        let rank9 = rank9.ok_or_else(|| {
-            SuccinctArchiveError(invalid_rank9_metadata(
-                "missing SuccinctArchive Rank9 index blob",
-            ))
-        })?;
-        Self::from_blob_pair(raw, rank9)
     }
 }
 
@@ -4013,9 +4035,10 @@ mod tests {
     fn empty_portable_archive_and_detached_rank9_roundtrip() {
         let set = TribleSet::new();
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-        let (raw, rank9) = archive.to_blob_pair();
+        let (raw, rank9) = archive.to_accelerated_parts();
         let raw_only: SuccinctArchive<OrderedUniverse> = raw.clone().try_from_blob().unwrap();
-        let paired = SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, rank9).unwrap();
+        let paired =
+            SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, rank9).unwrap();
         assert_eq!(TribleSet::from(&raw_only), set);
         assert_eq!(TribleSet::from(&paired), set);
     }
@@ -4121,12 +4144,12 @@ mod tests {
 
     fn assert_detached_rank9_corruption_rejected(mutate: impl FnOnce(&mut Vec<u8>)) {
         let archive: SuccinctArchive<OrderedUniverse> = (&varied_knights()).into();
-        let (raw, rank9) = archive.to_blob_pair();
+        let (raw, rank9) = archive.to_accelerated_parts();
         let mut bytes = rank9.bytes.as_ref().to_vec();
         mutate(&mut bytes);
-        let corrupted = Blob::<SuccinctArchiveRank9IndexBlob>::new(Bytes::from_source(bytes));
+        let corrupted = Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(Bytes::from_source(bytes));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, corrupted)
+            SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, corrupted)
         }));
         assert!(matches!(result, Ok(Err(_))));
     }

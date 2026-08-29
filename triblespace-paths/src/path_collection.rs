@@ -204,7 +204,7 @@ impl PathSummaryCollection {
         let cover = PathSummaryView::try_from_cover(cover)
             .expect("constructing a lazy path-summary view is infallible");
         let mut joined = PathSummaryBlob::empty(&self.automaton);
-        for segment in cover.into_blobs() {
+        for segment in cover.into_artifacts() {
             joined = PathSummaryBlob::join(&joined, &segment, &self.automaton)
                 .map_err(PathSummaryCollectionError::Summary)?;
         }
@@ -490,10 +490,13 @@ mod tests {
         bytes.extend_from_slice(&[1; 32]);
         bytes.extend_from_slice(&[2; 32]);
         let persisted = Blob::<PathSummaryBlob>::new(bytes.into());
+        let mut store = CollectionOnly::default();
+        let reader = store.reader().unwrap();
         assert!(matches!(
-            <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::validate_member(
+            <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::attach_member(
                 &paths.descriptor(),
-                &persisted,
+                persisted,
+                &reader,
             ),
             Err(triblespace_core::collection::CollectionOperationError::Fatal(_))
         ));

@@ -189,6 +189,8 @@ fn transition_fragment(transition: &Transition) -> Fragment {
 /// Bind the canonical path-summary encoding to the automaton carried by each
 /// concrete descriptor's mapping fragment.
 impl CollectionEncoding for PathSummaryBlob {
+    type Artifact = Blob<Self>;
+
     fn validate_descriptor(descriptor: &Fragment) -> Result<(), CollectionOperationError> {
         let source = descriptor::source(descriptor.facts())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
@@ -200,14 +202,18 @@ impl CollectionEncoding for PathSummaryBlob {
         automaton_from_descriptor(descriptor).map(|_| ())
     }
 
-    fn validate_member(
+    fn attach_member<R>(
         descriptor: &Fragment,
-        member: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError> {
+        member: Blob<Self>,
+        _reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+    {
         let automaton = automaton_from_descriptor(descriptor)?;
         PathSummaryBlob::decode(member.clone(), &automaton)
-            .map(|_| ())
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        Ok(member)
     }
 
     fn join_members(
@@ -293,8 +299,8 @@ impl PathSummaryView {
     }
 
     /// Consume just the physical summary blobs without forcing their union.
-    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<PathSummaryBlob>> {
-        self.attachment.into_blobs()
+    pub fn into_artifacts(self) -> impl ExactSizeIterator<Item = Blob<PathSummaryBlob>> {
+        self.attachment.into_artifacts()
     }
 }
 

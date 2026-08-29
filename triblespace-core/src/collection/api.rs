@@ -47,9 +47,9 @@ use super::discovery::{
 use super::simplearchive_union::FactViewError;
 use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
-    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
-    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
+    resolve_collection_semantics_from_roots, Collection, CollectionArtifact,
+    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDiscoveryError,
+    CollectionEncoding, CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
     CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
     CoverAttachment, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, ACTION_WRITE,
 };
@@ -1019,6 +1019,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     where
         L: CollectionEncoding,
         T: Describe + IntoBlob<L>,
+        Self::Reader: BlobStoreMeta,
     {
         let loaded = load_collection_descriptor(self, collection.handle())
             .map_err(CollectionCommitError::Descriptor)?;
@@ -1028,10 +1029,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         // so data and metadata attachments travel through this one generic
         // path without an encoding-specific side channel.
         let description = value.describe();
-        let data = value.to_blob();
-        L::validate_member(&loaded.fragment, &data)
-            .map_err(CollectionCommitError::InvalidMember)?;
-
+        let data_root = value.to_blob();
         let (_, metadata_facts, _, mut described_blobs) = description.into_parts();
         let metadata: Blob<SimpleArchive> = metadata_facts.to_blob();
         let mut attachments: Vec<Blob<UnknownBlob>> = described_blobs
@@ -1048,16 +1046,27 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
                 .put::<UnknownBlob, _>(blob)
                 .map_err(CollectionCommitError::DependencyPut)?;
         }
-        let data = store
-            .put::<L, _>(data)
+        // Described attachments are now resident, so a Merkle member can
+        // attach its complete closure without an encoding-specific commit
+        // path. Publication is still repeated through the artifact to enforce
+        // dependency-before-root ordering at the semantic record boundary.
+        let reader = store.reader().map_err(|source| {
+            CollectionCommitError::Descriptor(CollectionDescriptorError::Reader(source))
+        })?;
+        let data = L::attach_member(&loaded.fragment, data_root, &reader)
+            .map_err(CollectionCommitError::InvalidMember)?;
+        drop(reader);
+
+        data.publish(&mut store)
             .map_err(CollectionCommitError::DependencyPut)?;
+        let data_handle = data.root().get_handle();
         let metadata = store
             .put::<SimpleArchive, _>(metadata)
             .map_err(CollectionCommitError::DependencyPut)?;
         let commit = CollectionCommit::sign(
             signing_key,
             collection.handle(),
-            Handle::<L>::to_hash(data),
+            Handle::<L>::to_hash(data_handle),
             metadata,
         );
         store
@@ -1233,9 +1242,9 @@ where
         let blob = reader
             .get(member_handle)
             .map_err(|source| CollectionMaterializationError::MemberGet { member, source })?;
-        L::validate_member(descriptor, &blob)
+        let artifact = L::attach_member(descriptor, blob, &reader)
             .map_err(|source| CollectionMaterializationError::InvalidMember { member, source })?;
-        known.insert(member, blob);
+        known.insert(member, artifact);
     }
     let roots: BTreeSet<_> = cover.data_members().collect();
     let explicit_roots: BTreeSet<_> = roots
@@ -1332,10 +1341,10 @@ where
             Some(expected)
         } else {
             match (known.get(&low), known.get(&high)) {
-                (Some(low_blob), Some(high_blob)) => {
-                    match L::join_members(descriptor, low_blob, high_blob) {
+                (Some(low_artifact), Some(high_artifact)) => {
+                    match L::join_members(descriptor, low_artifact, high_artifact) {
                         Ok(value) => {
-                            let expected = Handle::<L>::to_hash(value.get_handle());
+                            let expected = Handle::<L>::to_hash(value.root().get_handle());
                             expected_hashes.insert(pair, expected);
                             joined = Some(value);
                             Some(expected)
@@ -1361,14 +1370,17 @@ where
             } else {
                 if joined.is_none() {
                     joined = match (known.get(&low), known.get(&high)) {
-                        (Some(low_blob), Some(high_blob)) => {
-                            L::join_members(descriptor, low_blob, high_blob).ok()
+                        (Some(low_artifact), Some(high_artifact)) => {
+                            L::join_members(descriptor, low_artifact, high_artifact).ok()
                         }
                         _ => None,
                     };
                 }
                 if let Some(value) = joined {
-                    debug_assert_eq!(Handle::<L>::to_hash(value.get_handle()), expected_data);
+                    debug_assert_eq!(
+                        Handle::<L>::to_hash(value.root().get_handle()),
+                        expected_data,
+                    );
                     known.insert(expected_data, value);
                     true
                 } else {
@@ -1457,7 +1469,7 @@ where
         }
     }
 
-    let mut selected = BTreeMap::<CollectionData, Blob<L>>::new();
+    let mut selected = BTreeMap::<CollectionData, L::Artifact>::new();
     let physical_cover = loop {
         let candidate = collection_physical_cover(semantics, collection, &resident);
         if !candidate.missing.is_empty() {
@@ -1473,11 +1485,14 @@ where
                 continue;
             }
             let handle = Handle::<L>::from_hash(data);
-            let actual: Result<Blob<L>, _> = reader.get(handle);
-            match actual {
-                Ok(actual) => {
-                    selected.insert(data, actual);
-                }
+            let root: Result<Blob<L>, _> = reader.get(handle);
+            match root {
+                Ok(root) => match L::attach_member(descriptor, root, &reader) {
+                    Ok(actual) => {
+                        selected.insert(data, actual);
+                    }
+                    Err(_) => rejected.push(data),
+                },
                 Err(_) => rejected.push(data),
             }
         }

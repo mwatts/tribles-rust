@@ -91,10 +91,7 @@ use anybytes::Bytes;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::{
-    CollectionRecord, CollectionRecordSelector, CollectionStore, MappingEvidence,
-    MappingEvidenceSelector, MappingEvidenceStore,
-};
+use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
 use crate::repo::CapabilityProofStore;
@@ -477,48 +474,6 @@ where
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         self.store.lock().expect("store mutex").insert_proof(proof)
-    }
-}
-
-impl<S> MappingEvidenceStore for Lazy<S>
-where
-    S: BlobStore + BlobStorePut + MappingEvidenceStore + WantStore + StorageFlush + Send + 'static,
-{
-    type EvidenceError = S::EvidenceError;
-    type InsertError = S::InsertError;
-    type EvidenceIter<'a>
-        = std::vec::IntoIter<Result<MappingEvidence, S::EvidenceError>>
-    where
-        S: 'a;
-
-    fn evidence<'a>(&'a mut self) -> Result<Self::EvidenceIter<'a>, Self::EvidenceError> {
-        let mut store = self.store.lock().expect("store mutex");
-        let evidence: Vec<Result<MappingEvidence, S::EvidenceError>> = store.evidence()?.collect();
-        Ok(evidence.into_iter())
-    }
-
-    fn evidence_by_id(
-        &mut self,
-        id: crate::id::Id,
-    ) -> Result<Option<MappingEvidence>, Self::EvidenceError> {
-        self.store.lock().expect("store mutex").evidence_by_id(id)
-    }
-
-    fn select_evidence(
-        &mut self,
-        selectors: &BTreeSet<MappingEvidenceSelector>,
-    ) -> Result<Vec<MappingEvidence>, Self::EvidenceError> {
-        self.store
-            .lock()
-            .expect("store mutex")
-            .select_evidence(selectors)
-    }
-
-    fn insert_evidence(&mut self, evidence: MappingEvidence) -> Result<(), Self::InsertError> {
-        self.store
-            .lock()
-            .expect("store mutex")
-            .insert_evidence(evidence)
     }
 }
 

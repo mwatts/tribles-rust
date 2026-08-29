@@ -147,41 +147,38 @@ The crate also ships with these blob encodings:
 - `UTF8String` for arbitrarily long UTF‑8 strings.
 - `RawBytes` for opaque file-backed byte payloads.
 - `SimpleArchive` which stores a raw sequence of tribles.
-- `SuccinctArchiveBlob` which stores the [`SuccinctArchive` index
-  type](https://docs.rs/triblespace/latest/triblespace/core/blob/encodings/succinctarchive/struct.SuccinctArchive.html)
-  for offline queries. It contains only deterministic Ring/wavelet data and EOF
-  metadata. `SuccinctArchiveRank9IndexBlob` is the separately
-  content-addressed, source-bound native Rank9/select accelerator; its first 32
-  bytes identify the exact raw archive it indexes. The `SuccinctArchive`
-  helper exposes high-level iterators, returns both artifacts with
-  `to_blob_pair`, and attaches an existing pair with `from_blob_pair`.
-  `SuccinctArchiveBlob::build_from_simple_archive` derives the canonical raw
-  artifact without constructing query indexes, while
-  `SuccinctArchiveBlob::merge` computes an exact-validated raw set union with
-  no runtime or Rank9 attachment. For native collection caching, the detached
-  sidecar mapping is qualified by a mapping-algorithm id which pins the
-  raw/sidecar format, canonical builder version, pointer width, and byte order.
-  Version 1 has separately minted 32/64-bit little/big-endian algorithm ids,
-  with one selected by the compilation target; any canonical-byte determinant
-  change requires a new algorithm id. The content-derived mapping fragment
-  carrying that algorithm is the mapping identity in
-  `MappingEvidence(mapping, raw, sidecar)`. Rank9 is not a
-  `CollectionEncoding`: a sidecar cannot join without the raw archive it
-  indexes, so presenting it as an independent target collection would expose a
-  law its bytes cannot implement. Pair admission trusts the content identities
-  cached by `Blob`/`BlobStore`, then checks the embedded source handle, native
-  format fields, and exact raw/index structure without hashing either artifact
-  again. The Rank9-index validation pass is linear and does not allocate a
-  replacement index; rebuilding the query runtime still allocates its runtime
-  arena and views.
+- `SuccinctArchiveBlob` which stores the portable deterministic Ring/wavelet
+  data and EOF metadata for a SuccinctArchive set. It has no native query
+  indexes. `SuccinctArchiveBlob::build_from_simple_archive` derives this raw
+  member without constructing a query runtime, and
+  `SuccinctArchiveBlob::merge` computes its exact-validated set union.
+- `Rank9AcceleratedSuccinctArchiveBlob`, an ABI-qualified Merkle root encoding
+  for query-ready SuccinctArchive members. Its first 32 bytes name the exact
+  portable `SuccinctArchiveBlob` child; the remaining bytes carry canonical
+  native Rank9/select data for that child. Separate encoding and mapping ids
+  pin pointer width, byte order, the accelerated-root format, and the builder
+  epoch. A change that can alter canonical bytes requires a newly minted id.
+  Attaching validates the embedded child handle, native format, and exact
+  raw/index structure, then retains root, raw child, and reconstructed runtime
+  together as a `Rank9AcceleratedSuccinctArchiveArtifact`. This encoding is an
+  ordinary `CollectionEncoding`: its join consumes complete attached artifacts
+  and produces the same canonical accelerated root as mapping the raw union.
+  Raw-to-accelerated conversion is therefore an ordinary `DERIVE`, and joins
+  are ordinary `MERGE` records. Publication writes the raw child before its
+  Merkle root and writes both before the semantic record. If the raw child is
+  absent, the closure is nonresident and can be reconstructed rather than
+  treated as a usable accelerated member.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 
 `BlobEncoding` says what bytes mean. `CollectionEncoding` is the stronger
 contract for formats used as collection members: the encoding itself owns
-canonical member validation and join. `SimpleArchive`, `SuccinctArchiveBlob`,
-and the maintained collection encodings implement that contract directly;
-there is no separate public lattice type to pair with them.
+canonical member validation and join. Its `CollectionArtifact` may be the
+monolithic root blob or a transient closure containing resolved Merkle
+dependencies and runtime state. `SimpleArchive`, `SuccinctArchiveBlob`,
+`Rank9AcceleratedSuccinctArchiveBlob`, and the maintained collection encodings
+implement that contract directly; there is no separate public lattice type to
+pair with them.
 
 ```rust
 use triblespace::core::metadata::MetaDescribe;

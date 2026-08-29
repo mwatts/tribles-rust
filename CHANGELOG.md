@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add a native mapping-evidence substrate alongside collection records.
-  Content-addressed mapping fragments and exact input/output equations form a
-  separate grow-only set, so reusable computation evidence converges by union
-  while conflicting outputs remain visible for validation.
+- Add `CollectionArtifact<E>` as the transient attached form of one collection
+  member. Monolithic encodings use their root blob directly; Merkle encodings
+  can retain a root, its resolved dependencies, and a validated runtime while
+  preserving the root handle as the sole durable member identity. Publishing
+  an artifact writes dependencies before its root and writes the root before
+  the ordinary `DERIVE` or `MERGE` record.
 
 - Add a typed collection API above the representation-neutral wire records.
   `Collection<E>` validates a descriptor's canonical member encoding,
@@ -80,11 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make successful collection publication automatically emit durable OFFER
   intent before its semantic record. An operation-scoped capture facade covers
   signed COMMIT dependencies and Fragment attachments, SimpleArchive MERGE,
-  exact DERIVE and compaction, and Succinct raw/Rank9 artifacts. OFFER failure
-  withholds the semantic record with a deterministic retry-all batch; record
-  failure leaves only harmless grow-only offers. Staged commits expose only
-  the capturing facade, so intervening artifact writes cannot silently bypass
-  advertisement.
+  exact DERIVE and compaction, and Succinct raw/accelerated artifacts. OFFER
+  failure withholds the semantic record with a deterministic retry-all batch;
+  record failure leaves only harmless grow-only offers. Staged commits expose
+  only the capturing facade, so intervening artifact writes cannot silently
+  bypass advertisement.
 
 - Add `trible pile migrate <PILE> seed-artifact-offers [--dry-run]` as an
   explicit bridge for resident collection artifacts published before OFFER
@@ -241,8 +243,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capacity replanning replace a blocked compacted member with its resident
   lower shards. Resolution tries the explicit Cover path first and widens into
   reverse decompositions only when needed; unreadable optional inputs and
-  Rank9 fibers cannot poison an otherwise valid replay or turn speculative
-  misses into durable demand.
+  incomplete Merkle closures cannot poison an otherwise valid replay or turn
+  speculative misses into durable demand.
 
 - Port the remaining benchmark, path/network test, macro-instrumentation, and
   benchmark-ledger callers to the store-centric collection API with mandatory
@@ -669,12 +671,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the open-fact carry rule, and conservative blob scanning preserves
   any handles they name; no migration or compatibility reader is required for
   the unpublished API.
-- **Canonical raw Succinct archives now have one native exact-collection
-  lifecycle.** Its former branch-index recipe, raw/Rank9 artifact pair types,
-  and build/parse/attach helpers are removed. `SuccinctArchiveCollection` owns
-  exact completion, deterministic target compaction, sharded `UnionArchive`
-  queries, and optional Rank9 fibers. The unused branch-bound read wrapper and
-  snapshot type are also gone.
+- **Succinct archives now have one two-stage native exact-collection
+  lifecycle.** Its former branch-index recipe and branch-bound read wrappers
+  are removed. `SuccinctArchiveCollection` first derives and optionally
+  compacts portable `SuccinctArchiveBlob` members, then derives ordinary
+  `Rank9AcceleratedSuccinctArchiveBlob` members and exposes their sharded
+  `UnionArchive` query view.
 - **The SuccinctArchive example now follows the native collection lifecycle.**
   `native_succinct_collection` publishes intrinsic fragments as independent
   signed commits, freezes the admitted value as a payload cover, and queries an
@@ -685,10 +687,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The portable Succinct LSM benchmark now measures the native exact
   collection lifecycle.** Source chunks are published and their cover is
   discovered outside the timer; `build_exact` measures canonical raw
-  construction, deterministic target compaction, Rank9 fiber persistence, and
-  query-ready attachment as one fixed operation. The report replaces legacy
-  fanout/range/manifest counters with exact-cover, raw-cover, serialized-byte,
-  and physical-shard metrics
+  construction, deterministic target compaction, accelerated Merkle-artifact
+  publication, and query-ready attachment as one fixed operation. The report
+  replaces legacy fanout/range/manifest counters with exact-cover, raw-cover,
+  serialized-byte, and physical-shard metrics
   while retaining the union-versus-`TribleSet` query identity gates.
 - **The speculative adaptive Succinct rollup wrapper is gone.** Core retains
   the stateless `WaveletMatrixFreezeBackend` and
@@ -701,34 +703,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Derived collections now share one qualified exact-cover lifecycle.**
   `collection::exact_derived::ExactDerivedCollection` supplies strict cover
   discovery, payload validation, deterministic resident covers, residual
-  lowering, descriptors-before-outputs-before-`DERIVE` publication, and fresh
-  read-side revalidation without `PinStore` or an implicit flush. Regular paths
-  use this kernel, and the new `SuccinctArchiveCollection` facade returns the
-  exact raw target cover as an owned sharded `UnionArchive`, preserving that
-  cover's physical shape while attaching an exact Rank9 accelerator fiber to
-  each selected raw member. The fiber uses an ABI-, format-, and
-  builder-version-qualified mapping fragment. Four explicitly minted algorithm
-  ids distinguish 32/64-bit and little/big-endian profiles; the current target
-  selects exactly one. Because a sidecar cannot join without its raw archive,
-  Rank9 is not exposed as a second collection. Its exact
-  `MappingEvidence(mapping, raw, sidecar)` equations live in a separate
-  unsigned cache relation. An empty cover performs no storage I/O and receives
-  one authority-free local empty query shard, whereas a signed commit over
-  empty source data still publishes an ordinary raw `DERIVE` and Rank9 mapping
-  evidence for that admitted member.
+  lowering, descriptors-before-artifacts-before-`DERIVE` publication, and
+  read-side attachment without `PinStore` or an implicit flush. Regular paths
+  and both Succinct stages use this kernel. `SuccinctArchiveCollection` returns
+  the accelerated target cover as an owned sharded `UnionArchive`, preserving
+  its physical shape and already-validated runtimes.
 
-  Rank9 evidence is optional cache state, not a derived collection at all.
-  Attachment scans the mapping-evidence set once, accepts at most one
-  distinct claimed output after fresh source/sidecar hashes, source-header,
-  and exact pair validation, and otherwise rebuilds that member's runtime
-  transiently without writes. Ensuring publishes the complete mapping-fragment
-  closure and every missing canonical sidecar before any new equation, then
-  strictly re-reads the exact expected raw/sidecar pairs and evidence through a
-  fresh reader. It
-  adds no signed root, receipt, manifest, scheduler, retention root, flush, or
-  Rank9 compactor. A complete probe performs no writes, and retries repair a
-  collected or corrupt canonical endpoint without duplicating its existing
-  mapping evidence.
+  `Rank9AcceleratedSuccinctArchiveBlob` is an ordinary ABI-qualified
+  `CollectionEncoding` and a Merkle root: its first 32 bytes name the exact
+  portable raw `SuccinctArchiveBlob` child whose Rank9/select data it carries.
+  Four explicitly minted encoding ids and four mapping-algorithm ids distinguish
+  32/64-bit and little/big-endian profiles; the current target selects one of
+  each. The raw-to-accelerated stage is an ordinary `DERIVE`, and accelerated
+  joins are ordinary `MERGE` records. `CollectionArtifact` attaches the root,
+  raw child, and query runtime into one transient value, allowing pair-aware
+  joins without pretending the root bytes alone contain their portable input.
+  Publishing writes the raw child, then its root, then the semantic record.
+  Incomplete closures are nonresident and `ensure_exact` reconstructs them by a
+  usable lattice route rather than admitting partial state.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
   garbage collection. Descriptor-typed lattice methods validate fixed
@@ -736,13 +728,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resident source and target results, then reconstructs every candidate path
   forwards from explicit source-cover leaves. Computed
   intermediates have use-counted scratch lifetimes and are never persisted.
-  Selected optional artifacts are freshly hashed and representation-validated;
-  invalid cache bytes are removed and the deterministic physical cover is
-  recomputed. This adds neither receipts nor authority/retention records, and a
-  `attach_exact` remains write-free even after a retained Pile rewrite collects
-  intermediate proof blobs or optional Rank9 sidecars; `ensure_exact` repairs
-  only the missing canonical cache endpoints and is write-free again once the
-  exact fibers are resident.
+  Invalid or incomplete cache paths are ignored and the deterministic physical
+  cover is recomputed. This adds neither receipts nor authority/retention
+  records, and `attach_exact` remains write-free even after a retained Pile
+  rewrite collects intermediate cache blobs; `ensure_exact` repairs only the
+  missing canonical closure and is write-free again once it is resident.
 
   Lattice operations return
   `CollectionOperationError::{Fatal, Capacity}`. `Capacity` is reserved for
@@ -762,17 +752,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `collection::exact_target_compaction::compact_exact_target` producer and the
   thin `SuccinctArchiveCollection::compact_exact` facade. Its fixed policy
   repeatedly joins the two lowest content handles in the lowest colliding
-  dyadic serialized-byte tier, puts and verifies the target descriptor and all
-  canonical result blobs before topologically ordered unsigned `MERGE` records,
-  and freshly revalidates every published round under the same exact cover. A
+  dyadic serialized-byte tier, publishes the target descriptor and canonical
+  result artifacts before topologically ordered unsigned `MERGE` records, and
+  returns the resulting cover for the same source support. A
   capacity failure retires only the lower input for that planning round, so the
   higher input remains eligible for another deterministic pair and every
   attempt shrinks the active set. A no-claim round returns a capacity-stable
   cover (which may retain a tier collision) with zero writes. Repeated and
   concurrent work is content-addressed and idempotent; no flush, planner,
   manifest, receipt, retention root, background task, or authority record is
-  introduced. Rank9 fibers are built only for the final selected raw cover,
-  never for compacted-away leaves; each raw shard retains the explicit
+  introduced. Accelerated members are derived only for the final selected raw
+  cover, never for compacted-away leaves; each raw shard retains the explicit
   `u32::MAX` row/domain boundary.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen
@@ -1117,8 +1107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `32N - 16Z` bytes, never exceeds the ordered universe, and supports direct
   access and binary search without the former fragment dictionary, frequency
   pass, hash tables, or DAC decoding. Strict attachment checks pin its boundary,
-  section cardinalities, and ordering. Portable raw Succinct and detached
-  Rank9 artifacts remain byte-for-byte independent of this native runtime
+  section cardinalities, and ordering. Portable raw Succinct and accelerated
+  Merkle-root bytes remain byte-for-byte independent of this native runtime
   choice. The direct native `SuccinctBM25Blob`, whose bytes embed the runtime
   metadata, rotates to schema ID `7ECEC029EEE4CA89582599E83B0E9508`
   (minted with `trible genid` on 2026-08-08). The unused
@@ -1131,7 +1121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rotations through five stable counting-sort passes. It writes prefixes,
   pair-change masks, and minimal-width wavelet planes directly into the final
   portable allocation, constructs no PATCH indexes, Jerky runtime arena, or
-  Rank9 sidecar, and hashes the finished artifact exactly once.
+  accelerated root, and hashes the finished artifact exactly once.
 - **Canonical Succinct artifacts now merge directly as raw blobs.**
   `SuccinctArchiveBlob::merge` exact-validates every portable input without
   attaching a query runtime or Rank9 accelerator, unions and remaps their
@@ -1166,7 +1156,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte/hash goldens pin the representation. Attachment independently derives
   all prefixes, changed masks, and six rotations from the decoded EAV source
   ring and requires exact byte equality before rebuilding the native query
-  arena. Detached Rank9 data remains source-bound and can attach without
+  arena. An accelerated Merkle root remains source-bound and can attach without
   rebuilding rank/select structures. Native v1 serialization and parsing were
   removed rather than retained as a compatibility path, and the incompatible
   public format has a freshly minted schema ID.
@@ -2551,20 +2541,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   affine frontier after the first useful result. Ready planning retains each row's
   exact adaptive variable and proposing leaf, then cohorts only rows with the
   same action.
-- **Succinct archives separate canonical raw data from Rank9 acceleration.**
-  `SuccinctArchiveBlob` now ends after the deterministic Ring/wavelet sections
-  and EOF metadata, while `SuccinctArchiveRank9IndexBlob` carries the exact
-  native-ABI Rank9/select payloads as a replaceable artifact. Its source raw
-  handle occupies aligned offset zero for generic reachability; exact version,
-  ABI, relative-section, raw-source, rank/select, and source-handle validation
-  prevents mismatched or corrupt pairs from attaching. Direct, structural,
-  packed CPU, Jerky fallback, and accelerator-backed builders stream the two
-  blobs in parallel and preserve canonical raw parity without an index-sized
-  intermediate allocation. The blob encoding id
-  `9F22887EAA90E13E646147353DFCDE06` and format marker
-  `FEFF44EF2D61BD450FE254A0AAE8B4A5` were minted with `trible genid` on
-  2026-07-13. The unpublished embedded-suffix format and compatibility paths
-  were removed rather than retained as legacy surface.
+- **Succinct archives separate canonical raw data from ABI-qualified Rank9
+  acceleration.** `SuccinctArchiveBlob` ends after the deterministic
+  Ring/wavelet sections and EOF metadata, while
+  `Rank9AcceleratedSuccinctArchiveBlob` is the collection-member Merkle root
+  carrying native Rank9/select payloads. Its exact raw handle occupies the
+  first aligned 32 bytes for generic reachability; exact version, ABI,
+  relative-section, raw-source, rank/select, and source-handle validation
+  prevents mismatched closures from attaching. Direct and accelerator-backed
+  builders preserve canonical raw parity without an index-sized intermediate
+  allocation. Fresh per-ABI encoding and mapping identities replace the
+  unpublished former public name/id family with no compatibility aliases.
 - **Succinct archives expose decoded fixed-attribute AVE iteration.**
   `SuccinctArchive::iter_attribute_value_entities` yields one raw
   `(value, entity)` tuple per matching fact in byte-lexicographic AVE order.

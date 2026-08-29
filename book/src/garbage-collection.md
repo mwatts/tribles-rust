@@ -49,16 +49,20 @@ durable ownership. This boundary also means the strong planner needs neither a
 requested-view set nor persistent validation-verdict machinery: admitted
 strictly verified commits themselves determine the collections that are retained.
 
-Exact Succinct Rank9 fibers follow the same rule through the separate
-`MappingEvidence` set. An unsigned `(mapping, raw, sidecar)` equation may
-survive a conservative ledger rewrite, but neither the ABI-qualified mapping
-fragment nor the source-bound sidecar becomes owned by it. A later
-`attach_exact` treats missing bytes as a cache miss and rebuilds the query
-accelerator transiently without writes. A later `ensure_exact` republishes the
-mapping closure and sidecar before idempotently reinserting the evidence, then
-returns the retained validated runtime without a redundant read or hash pass.
-No Rank9 collection, descriptor,
-retention record, or hidden root is needed.
+Rank9 acceleration uses the same rule through ordinary collection records.
+`Rank9AcceleratedSuccinctArchiveBlob` is a Merkle root whose first 32 bytes name
+its portable raw `SuccinctArchiveBlob` child. A raw-to-accelerated `DERIVE` or
+accelerated `MERGE` may survive a conservative ledger rewrite, but the unsigned
+equation still manufactures no ownership. If policy retains the accelerated
+root, ordinary child traversal also retains its named raw child.
+
+Read-only attachment accepts only a complete resident closure and transiently
+retains the root, raw child, and validated query runtime as one
+`CollectionArtifact`. Missing root or child bytes make that route nonresident,
+not semantically false. A later `ensure_exact` reconstructs the canonical
+closure through a usable lattice route, publishes dependencies before the root,
+and inserts the ordinary semantic record last. No accelerator-specific
+retention relation or hidden root is involved.
 
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` accept explicit policy roots in addition to the native collection

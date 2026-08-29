@@ -34,32 +34,40 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    SuccinctArchiveBlob, SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
+    merge_ordered_archives, OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive,
+    SuccinctArchiveBlob, SuccinctArchiveError, SuccinctArchiveRawBuildError,
+    SuccinctArchiveRawMergeError,
 };
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
 use crate::id_hex;
 use crate::inline::encodings::hash::Handle;
-use crate::metadata::MetaDescribe;
+use crate::inline::Encodes;
+use crate::metadata::{Describe, MetaDescribe};
+use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut};
 
 use super::{
-    CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping,
-    CollectionMerge, CollectionOperationError,
+    CollectionArtifact, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
+    CollectionMapping, CollectionMerge, CollectionOperationError,
 };
 
 mod collection;
-mod rank9_fiber;
 pub use collection::*;
-pub use rank9_fiber::Rank9FiberError;
 
 impl CollectionEncoding for SuccinctArchiveBlob {
-    fn validate_member(
+    type Artifact = Blob<Self>;
+
+    fn attach_member<R>(
         _descriptor: &Fragment,
-        member: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError> {
-        SuccinctArchiveBlob::merge(std::slice::from_ref(member))
-            .map(|_| ())
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+        member: Blob<Self>,
+        _reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
+        SuccinctArchiveBlob::merge(std::slice::from_ref(&member))
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        Ok(member)
     }
 
     fn join_members(
@@ -77,6 +85,121 @@ impl CollectionEncoding for SuccinctArchiveBlob {
                 CollectionOperationError::Fatal(source.to_string())
             }
         })
+    }
+}
+
+/// One closure-attached accelerated SuccinctArchive collection member.
+///
+/// The accelerated root is the member identity. The portable raw child and
+/// validated runtime are retained with it so queries and joins need neither a
+/// second store lookup nor a rebuild of Rank9/select structures.
+#[derive(Clone)]
+pub struct Rank9AcceleratedSuccinctArchiveArtifact {
+    root: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
+    raw: Blob<SuccinctArchiveBlob>,
+    runtime: SuccinctArchive<OrderedUniverse>,
+}
+
+impl Rank9AcceleratedSuccinctArchiveArtifact {
+    /// Build one complete accelerated artifact from its portable raw member.
+    pub fn from_raw(raw: Blob<SuccinctArchiveBlob>) -> Result<Self, SuccinctArchiveError> {
+        let runtime: SuccinctArchive<OrderedUniverse> = raw.clone().try_from_blob()?;
+        let root = runtime.accelerated_root();
+        Ok(Self { root, raw, runtime })
+    }
+
+    fn from_parts(
+        raw: Blob<SuccinctArchiveBlob>,
+        root: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
+    ) -> Result<Self, SuccinctArchiveError> {
+        let runtime = SuccinctArchive::from_accelerated_parts(raw.clone(), root.clone())?;
+        Ok(Self { root, raw, runtime })
+    }
+
+    /// Validated query runtime retained with this attached Merkle closure.
+    pub fn runtime(&self) -> &SuccinctArchive<OrderedUniverse> {
+        &self.runtime
+    }
+
+    /// Portable child named by this member's root.
+    pub fn raw(&self) -> &Blob<SuccinctArchiveBlob> {
+        &self.raw
+    }
+}
+
+impl Describe for Rank9AcceleratedSuccinctArchiveArtifact {
+    fn describe(&self) -> Fragment {
+        let mut description = Fragment::empty();
+        description.blobs_mut().insert(self.raw.clone());
+        description
+    }
+}
+
+impl Encodes<Rank9AcceleratedSuccinctArchiveArtifact> for Rank9AcceleratedSuccinctArchiveBlob {
+    type Output = Blob<Self>;
+
+    fn encode(source: Rank9AcceleratedSuccinctArchiveArtifact) -> Self::Output {
+        source.root
+    }
+}
+
+impl Encodes<&Rank9AcceleratedSuccinctArchiveArtifact> for Rank9AcceleratedSuccinctArchiveBlob {
+    type Output = Blob<Self>;
+
+    fn encode(source: &Rank9AcceleratedSuccinctArchiveArtifact) -> Self::Output {
+        source.root.clone()
+    }
+}
+
+impl CollectionArtifact<Rank9AcceleratedSuccinctArchiveBlob>
+    for Rank9AcceleratedSuccinctArchiveArtifact
+{
+    fn root(&self) -> &Blob<Rank9AcceleratedSuccinctArchiveBlob> {
+        &self.root
+    }
+
+    fn publish<S>(&self, store: &mut S) -> Result<(), S::PutError>
+    where
+        S: BlobStorePut,
+    {
+        store.put::<SuccinctArchiveBlob, _>(self.raw.clone())?;
+        store.put::<Rank9AcceleratedSuccinctArchiveBlob, _>(self.root.clone())?;
+        Ok(())
+    }
+}
+
+impl CollectionEncoding for Rank9AcceleratedSuccinctArchiveBlob {
+    type Artifact = Rank9AcceleratedSuccinctArchiveArtifact;
+
+    fn attach_member<R>(
+        _descriptor: &Fragment,
+        member: Blob<Self>,
+        reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        let source = Self::source_handle(&member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        let raw = reader
+            .get::<Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(source)
+            .map_err(|source| {
+                CollectionOperationError::Fatal(format!(
+                    "accelerated SuccinctArchive raw child is not resident: {source}"
+                ))
+            })?;
+        Rank9AcceleratedSuccinctArchiveArtifact::from_parts(raw, member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    }
+
+    fn join_members(
+        _descriptor: &Fragment,
+        low: &Self::Artifact,
+        high: &Self::Artifact,
+    ) -> Result<Self::Artifact, CollectionOperationError> {
+        let runtime = merge_ordered_archives(&[low.runtime.clone(), high.runtime.clone()]);
+        let (raw, root) = runtime.to_accelerated_parts();
+        Ok(Rank9AcceleratedSuccinctArchiveArtifact { root, raw, runtime })
     }
 }
 
@@ -142,134 +265,89 @@ impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for SimpleToSuccinctM
     }
 }
 
-/// Rank9 sidecar mapping algorithm for 32-bit little-endian targets.
+/// Raw-to-accelerated mapping algorithm for 32-bit little-endian targets.
 ///
-/// Minted with `trible genid` on 2026-08-29. The profile pins the current portable
-/// SuccinctArchive source schema, detached Rank9 format
-/// marker/version/flags, the canonical Rank9 builder and Jerky serialization
-/// epoch, pointer width, and byte order. Any change that can alter canonical
-/// sidecar bytes requires a newly minted mapping id.
-pub const RANK9_SIDECAR_MAPPING_V1_32_LE: Id = id_hex!("6359769178CE0E7FBAFCC4CF5E96BF65");
+/// Minted with `trible genid` on 2026-08-29. The identity pins the portable
+/// source schema, accelerated-root format, canonical Rank9 builder, Jerky
+/// serialization epoch, pointer width, and byte order. A change that can alter
+/// canonical root bytes requires a new mapping identity.
+pub const RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE: Id =
+    id_hex!("57756614C20DA2C9B1D33679136176A7");
 
-/// Rank9 sidecar mapping algorithm for 32-bit big-endian targets.
-///
-/// Minted with `trible genid` on 2026-08-29; see
-/// [`RANK9_SIDECAR_MAPPING_V1_32_LE`] for the versioning contract.
-pub const RANK9_SIDECAR_MAPPING_V1_32_BE: Id = id_hex!("BE9B5E3778FB726BE8C2318E9810EC6E");
+/// Raw-to-accelerated mapping algorithm for 32-bit big-endian targets.
+pub const RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE: Id =
+    id_hex!("D225E3B88CAE65ECAA2DADA8E861D4B5");
 
-/// Rank9 sidecar mapping algorithm for 64-bit little-endian targets.
-///
-/// Minted with `trible genid` on 2026-08-29; see
-/// [`RANK9_SIDECAR_MAPPING_V1_32_LE`] for the versioning contract.
-pub const RANK9_SIDECAR_MAPPING_V1_64_LE: Id = id_hex!("61381B137469F022DA76C24A270C43A4");
+/// Raw-to-accelerated mapping algorithm for 64-bit little-endian targets.
+pub const RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE: Id =
+    id_hex!("30B1F8ABE7BA8348551D8A94209A841C");
 
-/// Rank9 sidecar mapping algorithm for 64-bit big-endian targets.
-///
-/// Minted with `trible genid` on 2026-08-29; see
-/// [`RANK9_SIDECAR_MAPPING_V1_32_LE`] for the versioning contract.
-pub const RANK9_SIDECAR_MAPPING_V1_64_BE: Id = id_hex!("80FCF163F890DECB6CA532B7CA79E2BD");
+/// Raw-to-accelerated mapping algorithm for 64-bit big-endian targets.
+pub const RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE: Id =
+    id_hex!("7B628024E742E031F4E58789D2847D70");
 
-/// The exact Rank9 sidecar mapping for this ABI.
-pub struct Rank9SidecarMappingV1_32Le;
+/// ABI-qualified raw-to-accelerated mapping description.
+pub struct RawToRank9AcceleratedMappingV1;
 
-impl MetaDescribe for Rank9SidecarMappingV1_32Le {
+impl MetaDescribe for RawToRank9AcceleratedMappingV1 {
     fn describe() -> Fragment {
-        let id: Id = RANK9_SIDECAR_MAPPING_V1_32_LE;
+        let id = current_rank9_accelerated_mapping_algorithm();
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-sidecar-mapping-v1-32-le",
-                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 32-bit pointer width and little-endian byte order.",
-                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
-        }
-    }
-}
-
-/// The exact Rank9 sidecar mapping for this ABI.
-pub struct Rank9SidecarMappingV1_32Be;
-
-impl MetaDescribe for Rank9SidecarMappingV1_32Be {
-    fn describe() -> Fragment {
-        let id: Id = RANK9_SIDECAR_MAPPING_V1_32_BE;
-        entity! {
-            ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-sidecar-mapping-v1-32-be",
-                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 32-bit pointer width and big-endian byte order.",
-                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
-        }
-    }
-}
-
-/// The exact Rank9 sidecar mapping for this ABI.
-pub struct Rank9SidecarMappingV1_64Le;
-
-impl MetaDescribe for Rank9SidecarMappingV1_64Le {
-    fn describe() -> Fragment {
-        let id: Id = RANK9_SIDECAR_MAPPING_V1_64_LE;
-        entity! {
-            ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-sidecar-mapping-v1-64-le",
-                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 64-bit pointer width and little-endian byte order.",
-                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
-        }
-    }
-}
-
-/// The exact Rank9 sidecar mapping for this ABI.
-pub struct Rank9SidecarMappingV1_64Be;
-
-impl MetaDescribe for Rank9SidecarMappingV1_64Be {
-    fn describe() -> Fragment {
-        let id: Id = RANK9_SIDECAR_MAPPING_V1_64_BE;
-        entity! {
-            ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-sidecar-mapping-v1-64-be",
-                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 64-bit pointer width and big-endian byte order.",
+                metadata::name: "raw-to-rank9-accelerated-succinctarchive-v1",
+                metadata::description: "Canonical mapping from a portable SuccinctArchive member to its ABI-qualified Rank9-accelerated Merkle artifact. The mapping preserves union: mapping raw members separately and joining their accelerated artifacts yields the same canonical root as mapping their raw union.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
 #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_32_LE;
+const CURRENT_RANK9_ACCELERATED_MAPPING: Id = RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE;
 #[cfg(all(target_pointer_width = "32", target_endian = "big"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_32_BE;
+const CURRENT_RANK9_ACCELERATED_MAPPING: Id = RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE;
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_64_LE;
+const CURRENT_RANK9_ACCELERATED_MAPPING: Id = RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE;
 #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_64_BE;
+const CURRENT_RANK9_ACCELERATED_MAPPING: Id = RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE;
 
-/// Mapping algorithm id for the exact Rank9 ABI supported by this build.
-pub const fn current_rank9_mapping_algorithm() -> Id {
-    CURRENT_RANK9_MAPPING
-}
-
-#[cfg(all(target_pointer_width = "32", target_endian = "little"))]
-fn current_rank9_mapping_description() -> Fragment {
-    Rank9SidecarMappingV1_32Le::describe()
-}
-#[cfg(all(target_pointer_width = "32", target_endian = "big"))]
-fn current_rank9_mapping_description() -> Fragment {
-    Rank9SidecarMappingV1_32Be::describe()
-}
-#[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-fn current_rank9_mapping_description() -> Fragment {
-    Rank9SidecarMappingV1_64Le::describe()
-}
-#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-fn current_rank9_mapping_description() -> Fragment {
-    Rank9SidecarMappingV1_64Be::describe()
+/// Mapping algorithm id for the exact accelerated ABI supported by this build.
+pub const fn current_rank9_accelerated_mapping_algorithm() -> Id {
+    CURRENT_RANK9_ACCELERATED_MAPPING
 }
 
-/// ABI-qualified mapping identity for raw SuccinctArchive members to detached
-/// Rank9 sidecars.
-///
-/// The fragment is ordinary queryable data. Its archived fact handle is used
-/// by [`MappingEvidence`](super::MappingEvidence); Rank9 itself is deliberately
-/// not exposed as another collection.
-pub fn rank9_mapping_fragment() -> Fragment {
+fn rank9_accelerated_mapping_fragment() -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_MAPPING,
-        mapping_algorithm*: current_rank9_mapping_description(),
+        mapping_algorithm*: <RawToRank9AcceleratedMappingV1 as MetaDescribe>::describe(),
+    }
+}
+
+/// Bound canonical raw-to-accelerated SuccinctArchive mapping.
+pub struct RawToRank9AcceleratedMapping;
+
+impl CollectionMapping<SuccinctArchiveBlob, Rank9AcceleratedSuccinctArchiveBlob>
+    for RawToRank9AcceleratedMapping
+{
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        let actual = descriptor_facts::mapping_algorithm(target.facts())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        let expected = Some(current_rank9_accelerated_mapping_algorithm());
+        if actual != expected {
+            return Err(CollectionOperationError::Fatal(format!(
+                "accelerated SuccinctArchive mapping algorithm {:?} does not match {}",
+                actual.map(|id| format!("{id:X}")),
+                format!("{:X}", expected.expect("mapping algorithm")),
+            )));
+        }
+        Ok(Self)
+    }
+
+    fn map(
+        &self,
+        source: &Blob<SuccinctArchiveBlob>,
+    ) -> Result<Rank9AcceleratedSuccinctArchiveArtifact, CollectionOperationError> {
+        Rank9AcceleratedSuccinctArchiveArtifact::from_raw(source.clone())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -472,6 +550,23 @@ pub fn descriptor(source: CollectionHandle, authority: VerifyingKey, reach: Frag
         collection_authority: authority,
         collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
         collection_mapping*: mapping_fragment(),
+        collection_reach*: reach,
+    }
+}
+
+/// Describe the Rank9-accelerated collection derived from one exact raw
+/// SuccinctArchive collection.
+pub fn accelerated_descriptor(
+    source: CollectionHandle,
+    authority: VerifyingKey,
+    reach: Fragment,
+) -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_source: source,
+        collection_authority: authority,
+        collection_representation*: <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::describe(),
+        collection_mapping*: rank9_accelerated_mapping_fragment(),
         collection_reach*: reach,
     }
 }

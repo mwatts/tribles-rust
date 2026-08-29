@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
-    SuccinctArchiveRank9IndexBlob,
+    merge_ordered_archives, OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive,
+    SuccinctArchiveBlob,
 };
 use triblespace_core::blob::{Blob, IntoBlob, TryFromBlob};
 
@@ -171,10 +171,10 @@ fn raw_merge_then_rank9(
     inputs: &[Blob<SuccinctArchiveBlob>],
 ) -> (
     Blob<SuccinctArchiveBlob>,
-    Blob<SuccinctArchiveRank9IndexBlob>,
+    Blob<Rank9AcceleratedSuccinctArchiveBlob>,
 ) {
     let raw = SuccinctArchiveBlob::merge(inputs).unwrap();
-    let rank9 = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
+    let rank9 = SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw.clone()).unwrap();
     (raw, rank9)
 }
 
@@ -182,13 +182,14 @@ fn rank9_pairs(
     inputs: &[Blob<SuccinctArchiveBlob>],
 ) -> Vec<(
     Blob<SuccinctArchiveBlob>,
-    Blob<SuccinctArchiveRank9IndexBlob>,
+    Blob<Rank9AcceleratedSuccinctArchiveBlob>,
 )> {
     inputs
         .iter()
         .cloned()
         .map(|raw| {
-            let rank9 = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
+            let rank9 =
+                SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw.clone()).unwrap();
             (raw, rank9)
         })
         .collect()
@@ -197,18 +198,20 @@ fn rank9_pairs(
 fn pair_merge(
     inputs: &[(
         Blob<SuccinctArchiveBlob>,
-        Blob<SuccinctArchiveRank9IndexBlob>,
+        Blob<Rank9AcceleratedSuccinctArchiveBlob>,
     )],
 ) -> (
     Blob<SuccinctArchiveBlob>,
-    Blob<SuccinctArchiveRank9IndexBlob>,
+    Blob<Rank9AcceleratedSuccinctArchiveBlob>,
 ) {
     let archives = inputs
         .iter()
         .cloned()
-        .map(|(raw, rank9)| SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, rank9).unwrap())
+        .map(|(raw, rank9)| {
+            SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, rank9).unwrap()
+        })
         .collect::<Vec<_>>();
-    merge_ordered_archives(&archives).to_blob_pair()
+    merge_ordered_archives(&archives).to_accelerated_parts()
 }
 
 fn print_measurement(label: &str, rows: usize, measurement: Measurement) {

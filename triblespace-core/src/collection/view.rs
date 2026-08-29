@@ -7,7 +7,6 @@
 
 use std::error::Error;
 
-use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 
@@ -20,7 +19,7 @@ use super::{Collection, CollectionEncoding, Cover};
 /// collection stages; attached blobs merely avoid rereading selected members.
 pub struct CoverAttachment<L: CollectionEncoding> {
     cover: Cover<L>,
-    members: Vec<(Inline<Handle<L>>, Blob<L>)>,
+    members: Vec<(Inline<Handle<L>>, L::Artifact)>,
 }
 
 impl<L: CollectionEncoding> CoverAttachment<L> {
@@ -31,7 +30,10 @@ impl<L: CollectionEncoding> CoverAttachment<L> {
         }
     }
 
-    pub(crate) fn from_parts(cover: Cover<L>, members: Vec<(Inline<Handle<L>>, Blob<L>)>) -> Self {
+    pub(crate) fn from_parts(
+        cover: Cover<L>,
+        members: Vec<(Inline<Handle<L>>, L::Artifact)>,
+    ) -> Self {
         Self { cover, members }
     }
 
@@ -51,18 +53,18 @@ impl<L: CollectionEncoding> CoverAttachment<L> {
     }
 
     /// Borrow the ordered physical members.
-    pub fn members(&self) -> &[(Inline<Handle<L>>, Blob<L>)] {
+    pub fn members(&self) -> &[(Inline<Handle<L>>, L::Artifact)] {
         &self.members
     }
 
     /// Consume the ordered physical members.
-    pub fn into_members(self) -> Vec<(Inline<Handle<L>>, Blob<L>)> {
+    pub fn into_members(self) -> Vec<(Inline<Handle<L>>, L::Artifact)> {
         self.members
     }
 
-    /// Consume just the ordered blobs.
-    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<L>> {
-        self.members.into_iter().map(|(_, blob)| blob)
+    /// Consume just the ordered attached artifacts.
+    pub fn into_artifacts(self) -> impl ExactSizeIterator<Item = L::Artifact> {
+        self.members.into_iter().map(|(_, artifact)| artifact)
     }
 }
 

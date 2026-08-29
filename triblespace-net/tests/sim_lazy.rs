@@ -46,8 +46,8 @@ use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, CapabilityProofStore, WantRequest,
-    WantStore,
+    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofStore,
+    WantRequest, WantStore,
 };
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
@@ -134,26 +134,31 @@ impl MetaDescribe for NetworkTestBlob {
 }
 
 impl CollectionEncoding for NetworkTestBlob {
-    fn validate_member(
+    type Artifact = Blob<Self>;
+
+    fn attach_member<R>(
         _descriptor: &Fragment,
-        target: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError> {
+        target: Blob<Self>,
+        _reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
         let Some(source) = target.bytes.as_ref().strip_suffix(&[0xA5]) else {
             return Err(CollectionOperationError::Fatal(
                 "network-test target lacks its canonical suffix".to_owned(),
             ));
         };
         simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
-            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        Ok(target)
     }
 
     fn join_members(
-        descriptor: &Fragment,
+        _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
     ) -> Result<Blob<Self>, CollectionOperationError> {
-        Self::validate_member(descriptor, low)?;
-        Self::validate_member(descriptor, high)?;
         let low =
             Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
         let high =

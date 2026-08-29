@@ -224,7 +224,12 @@ Then a resolver may derive a merged source once, derive leaves separately and
 merge their images, or reuse any validated mixture already present. `DERIVE`
 records expose those reusable edges across collection lattices.
 
-The raw SuccinctArchive facade applies this model directly:
+The SuccinctArchive facade applies this model as two ordinary derivations:
+
+```text
+SimpleArchive --DERIVE--> SuccinctArchiveBlob
+               --DERIVE--> Rank9AcceleratedSuccinctArchiveBlob
+```
 
 ```rust,ignore
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
@@ -245,28 +250,30 @@ let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 - `attach_exact` is read-only and requires a complete valid resident cover.
 - `ensure_exact` reuses valid equations, computes missing canonical images, and
   publishes dependencies before new records.
-- `compact_exact` performs explicit deterministic tiered merges for the same
-  source cover.
+- `compact_exact` deterministically compacts the raw target cover, then ensures
+  the matching accelerated cover and returns its query view.
 
 Every position uses the same `Cover<E>` shape, but its typed handles cannot be
 mixed across representations. `Cover<SimpleArchive>` contains only
 `Handle<SimpleArchive>`; `Cover<SuccinctArchiveBlob>` contains only
-`Handle<SuccinctArchiveBlob>`. The target descriptor and its bound
-`CollectionMapping<Source, Target>` determine route freedom: ordinary
+`Handle<SuccinctArchiveBlob>`; the second stage uses
+`Handle<Rank9AcceleratedSuccinctArchiveBlob>`. The target descriptor and its
+bound `CollectionMapping<Source, Target>` determine route freedom. Ordinary raw
 Succinct derivation may choose any cheapest validated route whose support
-equals the source cover, while Rank9 consumes the exact immediate raw Succinct
-cover selected upstream. Exactness is a property of the map, not a mode bit or
-an untyped hash convention.
+equals the source cover. The accelerated stage maps the exact raw cover selected
+upstream, while its attached artifact retains each root, raw child, and query
+runtime together. Exactness is a property of the mapping, not a mode bit or an
+untyped hash convention.
 
 None of them signs a replacement root, advances a head, flushes implicitly, or
-adds a special manifest. [Regular-path
-summaries](regular-path-indexes.md) use the collection algebra. Rank9 instead
-uses the smaller mapping-evidence substrate because its sidecar has no
-independent join: exact `(mapping, raw, sidecar)` equations are cache hints,
-not collection records. Construction may nevertheless join `(raw, sidecar)`
-pairs as a unit; the raw member supplies the information absent from the
-sidecar and the result remains one ordinary raw member plus its unary mapping
-evidence.
+adds a special manifest. [Regular-path summaries](regular-path-indexes.md) and
+Rank9 acceleration both use the same collection algebra. The accelerated
+encoding is a Merkle root whose first 32 bytes name its exact portable raw
+child. Its join operates on complete attached artifacts, so mapping and then
+joining produces the same root as joining the raw inputs and mapping once.
+Publication writes child before root before the ordinary `DERIVE` or `MERGE`;
+an incomplete closure is merely a nonresident route which `ensure_exact` can
+reconstruct.
 
 ## WANT missing content or computation
 

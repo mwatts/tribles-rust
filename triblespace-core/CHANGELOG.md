@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `MappingEvidence(mapping, input, output)` as a separate unsigned,
-  grow-only cache-evidence relation. Its mapping is the content address of a
-  canonical `SimpleArchive` fragment; exact 96-byte equations retain every
-  observed output, use domain-separated intrinsic ids, and persist through
-  `MemoryRepo`, `Pile`, `Yard`, and the standard store wrappers without
-  becoming collection membership or authority.
+- Add `CollectionArtifact<E>` as the transient attached form of one collection
+  member. Monolithic encodings use their root `Blob<E>` directly; Merkle
+  encodings can retain the root, resolved dependencies, and a validated runtime
+  together while keeping the root handle as the sole durable member identity.
+  Publication is dependency-ordered before the root and before the ordinary
+  `DERIVE` or `MERGE` record.
 
 - Add direct typed collection encodings, covers, snapshots, and logical cover
   views. `CollectionEncoding` attaches canonical validation and join directly
@@ -43,11 +43,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Replace the misleading public `Rank9MappingV1*` algorithms with freshly
-  minted `Rank9SidecarMappingV1*` identities. Rank9 is a canonical one-to-one
-  accelerator mapping for an exact SuccinctArchive member, not an independently
-  joinable collection encoding; existing cache evidence may be recomputed and
-  no compatibility aliases are retained.
+- Clean-cutover the unpublished Rank9 API and identities.
+  `Rank9AcceleratedSuccinctArchiveBlob` is now an ABI-qualified Merkle-root
+  `CollectionEncoding` whose first 32 bytes name its portable raw
+  `SuccinctArchiveBlob` child. `RawToRank9AcceleratedMappingV1` maps raw members
+  through ordinary `DERIVE` records, while accelerated artifact joins use
+  ordinary `MERGE` records. The former `Rank9MappingV1`/`RANK9_MAPPING_V1`,
+  intermediate `Rank9SidecarMappingV1*`, old blob names, and their obsolete id
+  family have no compatibility aliases. The separate mapping-evidence record
+  kind and store surface were removed after a scan found no live records in
+  known piles; derived artifacts may be recomputed.
 
 - Treat handles cached by typed `Blob` values returned from `BlobStoreGet` as
   trusted content identities. Collection operations retain structural and

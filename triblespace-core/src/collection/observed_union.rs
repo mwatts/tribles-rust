@@ -308,12 +308,19 @@ fn observed_attribute(descriptor: &Fragment) -> Result<Id, CollectionOperationEr
 }
 
 impl CollectionEncoding for ObservedSetBlob {
-    fn validate_member(
+    type Artifact = Blob<Self>;
+
+    fn attach_member<R>(
         _descriptor: &Fragment,
-        member: &Blob<Self>,
-    ) -> Result<(), CollectionOperationError> {
-        validate_element(member)
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+        member: Blob<Self>,
+        _reader: &R,
+    ) -> Result<Self::Artifact, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
+        validate_element(&member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        Ok(member)
     }
 
     fn join_members(
@@ -405,7 +412,7 @@ impl TryFromCover<ObservedSetBlob> for ObservedIndex {
 
     fn try_from_cover(attachment: CoverAttachment<ObservedSetBlob>) -> Result<Self, Self::Error> {
         let mut joined = empty();
-        for segment in attachment.into_blobs() {
+        for segment in attachment.into_artifacts() {
             joined = join(&joined, &segment)?;
         }
         Self::decode(&joined)

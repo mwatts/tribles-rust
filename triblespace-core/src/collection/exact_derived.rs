@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::{Blob, BlobEncoding};
+use crate::blob::BlobEncoding;
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
@@ -32,10 +32,11 @@ use crate::trible::Fragment;
 use super::discovery::discover_collection_records_for_derived_cover;
 use super::{
     collection_physical_cover, collection_physical_cover_for, descriptor,
-    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation, CollectionData,
-    CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
-    CollectionOperationError, CollectionRecord, CollectionSemantics, CollectionStore, Cover,
-    CoverAttachment, DiscoveredCollectionRecords,
+    resolve_collection_semantics_from_roots, Collection, CollectionArtifact,
+    CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
+    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError,
+    CollectionRecord, CollectionSemantics, CollectionStore, Cover, CoverAttachment,
+    DiscoveredCollectionRecords,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -54,9 +55,9 @@ impl TypedData {
     }
 }
 
-enum ScratchValue<Source: BlobEncoding, Target: BlobEncoding> {
-    Source(Blob<Source>),
-    Target(Blob<Target>),
+enum ScratchValue<Source: CollectionEncoding, Target: CollectionEncoding> {
+    Source(Source::Artifact),
+    Target(Target::Artifact),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -511,7 +512,7 @@ where
                             break;
                         }
                     };
-                    let output_data = data_identity(&output);
+                    let output_data = data_identity::<Target>(&output);
                     let claim = CollectionDerive::new(
                         self.target_collection.handle(),
                         input_data,
@@ -540,11 +541,9 @@ where
         drop(probe);
         self.publish_descriptors(store)?;
         for prepared in &prepared {
-            store
-                .put::<Target, _>(prepared.output.clone())
-                .map_err(|error| {
-                    ExactDerivedCollectionError::storage("store derived target", error)
-                })?;
+            prepared.output.publish(store).map_err(|error| {
+                ExactDerivedCollectionError::storage("store derived target", error)
+            })?;
         }
         for prepared in prepared {
             store
@@ -652,23 +651,16 @@ where
             let member = Handle::<Source>::to_hash(member_handle);
             let node = TypedData::Source(member);
             if !known.contains_key(&node) {
-                let Some(blob) =
-                    load_candidate::<_, Source>(&reader, member, "read source cover member")?
+                let Some(artifact) = load_candidate::<_, Source>(
+                    &reader,
+                    &self.source,
+                    member,
+                    "read source cover member",
+                )?
                 else {
                     return Err(ExactDerivedCollectionError::IncompleteMember(member));
                 };
-                Source::validate_member(&self.source, &blob).map_err(|error| {
-                    ExactDerivedCollectionError::RejectedMember {
-                        member,
-                        reason: match error {
-                            CollectionOperationError::Fatal(reason) => reason,
-                            CollectionOperationError::Capacity(reason) => format!(
-                                "persisted source exceeds representation capacity: {reason}"
-                            ),
-                        },
-                    }
-                })?;
-                known.insert(node, ScratchValue::Source(blob));
+                known.insert(node, ScratchValue::Source(artifact));
             }
             roots.insert(node);
         }
@@ -722,10 +714,10 @@ where
             let Ok(blob) = reader.get(Handle::<Source>::from_hash(member)) else {
                 continue;
             };
-            if Source::validate_member(&self.source, &blob).is_err() {
+            let Ok(artifact) = Source::attach_member(&self.source, blob, &reader) else {
                 continue;
-            }
-            known.insert(node, ScratchValue::Source(blob));
+            };
+            known.insert(node, ScratchValue::Source(artifact));
             local_results.insert(node);
             resident_results.insert(node);
         }
@@ -886,8 +878,9 @@ where
             .copied()
             .filter(|data| local_results.contains(&TypedData::Target(*data)))
             .collect();
-        let local_physical = validated_physical_cover(
+        let local_physical: ValidatedPhysicalCover<Target> = validated_physical_cover(
             &reader,
+            &self.target,
             resolution.semantics(),
             target,
             target_local,
@@ -911,6 +904,7 @@ where
                 .collect();
             validated_physical_cover(
                 &reader,
+                &self.target,
                 resolution.semantics(),
                 target,
                 target_resident,
@@ -958,6 +952,7 @@ where
         let source_plan =
             source_plan_parts.map(|(collection, resident, mandatory, required_members)| {
                 SourcePlan {
+                    descriptor: self.source.clone(),
                     semantics: resolution.into_semantics(),
                     collection,
                     resident,
@@ -1043,16 +1038,17 @@ where
     }
 }
 
-struct PreparedDerive<Target: BlobEncoding> {
-    output: Blob<Target>,
+struct PreparedDerive<Target: CollectionEncoding> {
+    output: Target::Artifact,
     claim: CollectionDerive,
 }
 
-struct SourcePlan<Source: BlobEncoding> {
+struct SourcePlan<Source: CollectionEncoding> {
+    descriptor: Fragment,
     semantics: CollectionSemantics,
     collection: CollectionHandle,
     resident: BTreeSet<CollectionData>,
-    mandatory: BTreeMap<CollectionData, Blob<Source>>,
+    mandatory: BTreeMap<CollectionData, Source::Artifact>,
     required_members: BTreeSet<CollectionData>,
 }
 
@@ -1095,14 +1091,15 @@ where
     fn source_residual_cover(
         &self,
         blocked: &BTreeMap<CollectionData, String>,
-    ) -> Result<Vec<(CollectionData, Blob<Source>)>, ExactDerivedCollectionError> {
+    ) -> Result<Vec<(CollectionData, Source::Artifact)>, ExactDerivedCollectionError> {
         let Some(plan) = &self.source_plan else {
             return Ok(Vec::new());
         };
         let blocked_set: BTreeSet<_> = blocked.keys().copied().collect();
         let resident = plan.resident.difference(&blocked_set).copied().collect();
-        let physical = validated_physical_cover(
+        let physical: ValidatedPhysicalCover<Source> = validated_physical_cover(
             &self.reader,
+            &plan.descriptor,
             &plan.semantics,
             plan.collection,
             resident,
@@ -1152,24 +1149,25 @@ where
     }
 }
 
-struct ValidatedPhysicalCover<E: BlobEncoding> {
+struct ValidatedPhysicalCover<E: CollectionEncoding> {
     cover: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,
-    blobs: BTreeMap<CollectionData, Blob<E>>,
+    blobs: BTreeMap<CollectionData, E::Artifact>,
     fetch: BTreeSet<CollectionData>,
 }
 
 fn validated_physical_cover<R, E>(
     reader: &R,
+    descriptor: &Fragment,
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
     mut resident: BTreeSet<CollectionData>,
-    mandatory: &BTreeMap<CollectionData, Blob<E>>,
+    mandatory: &BTreeMap<CollectionData, E::Artifact>,
     offered: &BTreeSet<CollectionData>,
 ) -> ValidatedPhysicalCover<E>
 where
     R: BlobStoreGet + BlobStoreMeta,
-    E: BlobEncoding + 'static,
+    E: CollectionEncoding,
     Handle<E>: InlineEncoding,
 {
     let mut selected = BTreeMap::new();
@@ -1198,9 +1196,12 @@ where
                 }
             }
             match reader.get(handle) {
-                Ok(actual) => {
-                    selected.insert(data, actual);
-                }
+                Ok(root) => match E::attach_member(descriptor, root, reader) {
+                    Ok(actual) => {
+                        selected.insert(data, actual);
+                    }
+                    Err(_) => rejected.push(data),
+                },
                 Err(_) => rejected.push(data),
             }
         }
@@ -1274,8 +1275,8 @@ where
         ) {
             Ok(value) => {
                 let actual = match &value {
-                    ScratchValue::Source(blob) => data_identity(blob),
-                    ScratchValue::Target(blob) => data_identity(blob),
+                    ScratchValue::Source(artifact) => data_identity::<Source>(artifact),
+                    ScratchValue::Target(artifact) => data_identity::<Target>(artifact),
                 };
                 if actual != result.data() {
                     rejected.insert(
@@ -1410,25 +1411,36 @@ where
 
 fn load_candidate<R, E>(
     reader: &R,
+    descriptor: &Fragment,
     data: CollectionData,
     operation: &'static str,
-) -> Result<Option<Blob<E>>, ExactDerivedCollectionError>
+) -> Result<Option<E::Artifact>, ExactDerivedCollectionError>
 where
     R: BlobStoreGet + BlobStoreMeta,
-    E: BlobEncoding + 'static,
+    E: CollectionEncoding,
     Handle<E>: InlineEncoding,
 {
     if !contains::<R, E>(reader, data, operation)? {
         return Ok(None);
     }
-    reader
+    let root = reader
         .get(Handle::<E>::from_hash(data))
+        .map_err(|error| ExactDerivedCollectionError::storage(operation, error))?;
+    E::attach_member(descriptor, root, reader)
         .map(Some)
-        .map_err(|error| ExactDerivedCollectionError::storage(operation, error))
+        .map_err(|error| ExactDerivedCollectionError::RejectedMember {
+            member: data,
+            reason: match error {
+                CollectionOperationError::Fatal(reason) => reason,
+                CollectionOperationError::Capacity(reason) => {
+                    format!("persisted member exceeds representation capacity: {reason}")
+                }
+            },
+        })
 }
 
-pub(super) fn data_identity<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData {
-    Handle::<E>::to_hash(blob.get_handle())
+pub(super) fn data_identity<E: CollectionEncoding>(artifact: &E::Artifact) -> CollectionData {
+    Handle::<E>::to_hash(artifact.root().get_handle())
 }
 
 #[cfg(test)]

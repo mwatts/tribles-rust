@@ -1184,12 +1184,15 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_algorithm_description_tests {
+    use crate::blob::encodings::utf8string::UTF8String;
+    use crate::blob::IntoBlob;
     use crate::collection::lww_register::RegisterCoordinatesMappingV1;
     use crate::collection::observed_union::ObserveStatesMappingV1;
     use crate::collection::succinctarchive_union::{
-        Rank9SidecarMappingV1_32Be, Rank9SidecarMappingV1_32Le, Rank9SidecarMappingV1_64Be,
-        Rank9SidecarMappingV1_64Le, SimpleToSuccinctMappingV1,
+        RawToRank9AcceleratedMappingV1, SimpleToSuccinctMappingV1,
     };
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::Inline;
     use crate::metadata::{self, MetaDescribe};
 
     /// Every mapping algorithm describes itself under its minted identity.
@@ -1211,6 +1214,13 @@ mod mapping_algorithm_description_tests {
                 metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
                 "{name} is not tagged as a collection mapping algorithm"
             );
+            let actual_name = super::one_inline(facts, &metadata::name, "name")
+                .expect("mapping algorithm has one name");
+            let expected_name: Inline<Handle<UTF8String>> = name.to_owned().to_blob().get_handle();
+            assert_eq!(
+                actual_name, expected_name,
+                "mapping algorithm description retained a stale name"
+            );
         }
         check::<SimpleToSuccinctMappingV1>(
             crate::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1,
@@ -1224,21 +1234,9 @@ mod mapping_algorithm_description_tests {
             crate::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1,
             "register-coordinates-v1",
         );
-        check::<Rank9SidecarMappingV1_32Le>(
-            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_32_LE,
-            "rank9-sidecar-v1-32-le",
-        );
-        check::<Rank9SidecarMappingV1_32Be>(
-            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_32_BE,
-            "rank9-sidecar-v1-32-be",
-        );
-        check::<Rank9SidecarMappingV1_64Le>(
-            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_64_LE,
-            "rank9-sidecar-v1-64-le",
-        );
-        check::<Rank9SidecarMappingV1_64Be>(
-            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_64_BE,
-            "rank9-sidecar-v1-64-be",
+        check::<RawToRank9AcceleratedMappingV1>(
+            crate::collection::succinctarchive_union::current_rank9_accelerated_mapping_algorithm(),
+            "raw-to-rank9-accelerated-succinctarchive-v1",
         );
     }
 }

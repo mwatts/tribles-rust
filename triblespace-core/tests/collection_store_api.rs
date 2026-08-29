@@ -4,6 +4,9 @@ use std::convert::Infallible;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+};
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
@@ -13,9 +16,12 @@ use triblespace_core::collection::records::{
     collection_authority, collection_name, collection_representation, KIND_COLLECTION_DESCRIPTOR,
 };
 use triblespace_core::collection::simplearchive_union;
+use triblespace_core::collection::succinctarchive_union::{
+    self, Rank9AcceleratedSuccinctArchiveArtifact, SuccinctArchiveCollection,
+};
 use triblespace_core::collection::{
-    reach, Collection, CollectionRecord, CollectionRecordSelector, CollectionStore,
-    CollectionStoreExt, ACTION_WRITE,
+    reach, Collection, CollectionArtifact, CollectionRecord, CollectionRecordSelector,
+    CollectionStore, CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -565,6 +571,53 @@ fn pile_reopen_discovers_resident_delegation_proof_and_claims() {
         reopened.snapshot(collection).unwrap().facts(),
         &fragment(3).into_facts()
     );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn pile_commit_reopens_complete_rank9_accelerated_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("accelerated-artifact-commit.pile");
+    std::fs::File::create(&path).unwrap();
+
+    let authority = SigningKey::from_bytes(&[19; 32]);
+    let facade = SuccinctArchiveCollection::new(
+        "direct-accelerated",
+        authority.verifying_key(),
+        reach::private(),
+        authority.verifying_key(),
+        reach::private(),
+    );
+    let raw = succinctarchive_union::derive_element(&fragment(4).into_facts().to_blob()).unwrap();
+    let artifact = Rank9AcceleratedSuccinctArchiveArtifact::from_raw(raw.clone()).unwrap();
+    let root = artifact.root().clone();
+
+    let mut pile = Pile::open(&path).unwrap();
+    let collection = pile
+        .collection::<Rank9AcceleratedSuccinctArchiveBlob>(facade.descriptor())
+        .unwrap();
+    let committed = pile.commit(collection, &authority, artifact).unwrap();
+    assert_eq!(
+        committed.data(),
+        Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(root.get_handle())
+    );
+    pile.close().unwrap();
+
+    let mut reopened = Pile::open(&path).unwrap();
+    let reader = reopened.reader().unwrap();
+    reader
+        .get::<Blob<SuccinctArchiveBlob>, _>(raw.get_handle())
+        .unwrap();
+    reader
+        .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, _>(root.get_handle())
+        .unwrap();
+    drop(reader);
+    let snapshot: triblespace_core::collection::Snapshot<
+        Rank9AcceleratedSuccinctArchiveBlob,
+        UnionArchive<OrderedUniverse>,
+        _,
+    > = reopened.snapshot(collection).unwrap();
+    assert_eq!(snapshot.value().iter().count(), 1);
     reopened.close().unwrap();
 }
 

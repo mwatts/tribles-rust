@@ -114,8 +114,8 @@ cannot conservatively mean “no effect”—requires a new frame magic instead.
 Concatenation is associative ordered composition, not universally commutative:
 WANT assertions/retractions and decoded legacy pins are right-biased logs.
 Opaque filtering is sound because it leaves the relative order of every known
-record unchanged; native collection, mapping-evidence, capability-proof,
-peer-evidence, and artifact-offer records additionally collapse to
+record unchanged; native collection, capability-proof, peer-evidence, and
+artifact-offer records additionally collapse to
 order-independent set union.
 
 ### Compatibility surface: v0.46.4, and a reframe for everything else
@@ -199,7 +199,7 @@ refreshing state.
    and `memmap2` mapping. It does not read any records yet (and it does not
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
-   `applied_length`, and rebuilds the blob, collection-record, mapping-evidence,
+   `applied_length`, and rebuilds the blob, collection-record,
    capability-proof, peer-evidence, artifact-offer, WANT, and legacy pin-snapshot indices
    in memory. It **fails loud** on a corrupt or torn record
    (`ReadError::CorruptPile { valid_length }`). It skips bounded unknown
@@ -467,16 +467,16 @@ these algebra records.
 | Merge | `0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379` (`9F5D028D4C423620D6957A5F726FA727`) | `64..96` descriptor handle, `96..128` lower input digest, `128..160` higher input digest, `160..192` result digest, `192..256` reserved zeros |
 | Derive | `7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36` (`ED6B46F7286D4556B076C17B79FD8315`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..256` reserved zeros |
 
-Mapping cache evidence is deliberately a separate grow-only relation, not a
-fourth `CollectionRecord` variant. A `MappingEvidence(mapping, input, output)`
-body is exactly 96 bytes: the mapping field is the BLAKE3 handle of its
-canonical `SimpleArchive` mapping fragment, followed by the input and output
-member digests. Its one-block pile kind is
-`1920A65638AF7ECA1FDB67D74F7769EB2AB95E98E9D191D325D43B1BB25FBD2F`
-(rooted at `8CDA7348DEC34BEBC11A32D550BAB7F6`), with the body in `64..160` and zeros
-through `256`. Every output observed for one `(mapping, input)` remains
-visible; evidence is unsigned cache metadata and grants no authority,
-collection membership, validity, uniqueness, or retention.
+These are the complete native collection-record family: there is no
+accelerator-specific fourth variant. A Rank9-accelerated member is an ordinary
+blob root plus its portable raw child, related to the raw collection by an
+ordinary `DERIVE`; accelerated unions use ordinary `MERGE` records. The
+accelerated root's first 32 bytes name the raw child, so generic blob traversal
+can follow the Merkle dependency without a special pile index. Writers publish
+the child, then the root, then the semantic record. Collection resolution treats
+an incomplete closure as nonresident and later construction may rebuild it.
+The unpublished mapping-evidence record kind was clean-cutover removed after a
+scan found no live records requiring migration.
 
 Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
 corrupt rather than silently assigning meaning to a format extension. Merge

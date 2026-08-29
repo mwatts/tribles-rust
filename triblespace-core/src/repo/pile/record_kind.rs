@@ -156,14 +156,6 @@ record_kinds! {
         "pile-collection-derive-v5",
         "An unsigned DERIVE equation asserting that an input state of a derived collection's source maps to an output state of that collection. Envelope bytes 64..96 hold the target collection's descriptor handle, 96..128 the input digest, 128..160 the output digest, and 160..256 are zeros. The source is not named here because the target's descriptor already names it, and naming it twice only creates a way for the two to disagree.";
 
-    /// Unsigned cache evidence for one mapping computation.
-    ///
-    /// Kind id minted with `trible genid` on 2026-08-29.
-    MappingEvidenceRecordV1 = KIND_ID_MAPPING_EVIDENCE "8CDA7348DEC34BEBC11A32D550BAB7F6",
-        KIND_MAPPING_EVIDENCE "1920A65638AF7ECA1FDB67D74F7769EB2AB95E98E9D191D325D43B1BB25FBD2F",
-        "pile-mapping-evidence-v1",
-        "Unsigned cache evidence MAPPING_EVIDENCE(mapping, input, output). Envelope bytes 64..96 hold the BLAKE3 handle of the canonical SimpleArchive mapping fragment, 96..128 the input collection-member digest, 128..160 the output collection-member digest, and 160..256 are zeros. Every distinct output remains visible for the same mapping and input; presence grants no authority, membership, validity, retention, or uniqueness semantics, and no inverse or retraction record exists.";
-
     /// A complete direct capability proof.
     ///
     /// Kind id minted with `trible genid` on 2026-08-25.
@@ -260,11 +252,6 @@ mod tests {
             KIND_ID_ARTIFACT_OFFER,
             crate::repo::offer::KIND_ARTIFACT_OFFER,
             "OFFER's dense semantic kind and pile description root must stay identical"
-        );
-        assert_eq!(
-            KIND_ID_MAPPING_EVIDENCE,
-            crate::collection::KIND_MAPPING_EVIDENCE,
-            "mapping evidence's dense semantic kind and pile description root must stay identical"
         );
     }
 }

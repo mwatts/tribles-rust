@@ -114,6 +114,14 @@ join, exposed by `CollectionEncoding`. The encoding is both the physical byte
 shape and its intra-collection join law, so the public type names that meaning
 directly.
 
+### Collection Artifact
+The transient, closure-attached form of one collection member. Monolithic
+encodings use their root blob directly; Merkle encodings retain the root,
+resolved dependencies, and any validated runtime rebuilt from them. Only the
+root handle is durable collection identity. Publishing an artifact stores its
+dependencies before that root and records the ordinary collection equation
+only after the complete closure is resident.
+
 ### Collection Mapping
 A parameterized source-to-target conversion exposed by
 `CollectionMapping<Source, Target>`. Its mapping entity is embedded in the
@@ -189,13 +197,6 @@ reproducible cache evidence, not authority.
 An unsigned exact equation `a ⊔ b = c` inside one collection. A validated merge
 result can replace its inputs in a physical cover without changing the logical
 value or creating new authority.
-
-### Mapping Evidence
-An unsigned cache equation `mapping(input) = output`, stored outside the
-collection-record algebra. `mapping` is the content handle of an ordinary
-queryable `SimpleArchive` mapping fragment. Every distinct output remains
-visible so the mapping implementation can validate or reject it; presence
-alone grants no authority, membership, uniqueness, or retention.
 
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.

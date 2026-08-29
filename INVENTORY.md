@@ -76,9 +76,9 @@ merge, and `succinctarchive_union::validate_derive` compares the target
 "byte-for-byte with a fresh direct construction from the source". Validating a
 balanced merge tree over N leaves rewrites every byte once per level, which is
 strictly more memory traffic than one k-way merge, and attaching a persisted
-`SuccinctArchive` pair over these facts measured **105 s** against a 4.16 s
-`TribleSet` rebuild, because `from_blob_pair` proves the bytes by re-deriving
-every prefix, mask, and rotation. Persisted derivation can only pay off behind
+accelerated SuccinctArchive closure over these facts measured **105 s** against
+a 4.16 s `TribleSet` rebuild, because attachment proves the raw/index structure
+before exposing the runtime. Persisted derivation can only pay off behind
 a *trusted* attach — bytes checked by content hash alone, admitted because a
 key the reader already treats as ground truth named them — which is a change
 to what "checkable" means, not a change to the code.
@@ -152,17 +152,11 @@ reader can recompute.
   currently open multiple partial operations whose per-stream tasks have no
   independent deadline or concurrency budget.
 - Choose the oversized native Succinct shard policy. Exact-cover Rank9
-  acceleration now has an ABI-qualified, source-bound persisted fiber with
-  transient fallback and cache-only retention semantics, but a single derived
-  raw shard still rejects more than `u32::MAX` rows or domain values. Decide
-  how to split or spool oversized source covers without changing collection
-  identity.
-- Extract a representation-neutral crash-ordered publisher for unsigned
-  collection equations: persist endpoint artifacts, flush dependencies, insert
-  the validated `DERIVE` or `MERGE`, then flush the record. The existing staged
-  publisher is intentionally concrete to `SimpleArchive` commits; a future
-  `ensure(cover, target_collection)` producer should reuse the generic seam
-  without giving unsigned construction evidence root authority.
+  acceleration now uses an ABI-qualified, source-bound Merkle artifact with a
+  transient attached runtime and ordinary collection equations, but a single
+  derived raw shard still rejects more than `u32::MAX` rows or domain values.
+  Decide how to split or spool oversized source covers without changing
+  collection identity.
 - For pathological single commits or Succinct LSM levels that cannot keep the
   domain, EAV rows, and equal rotation scratch in memory, add a file-backed EAV
   spool plus stable radix/counting passes into the final portable sink; choose
@@ -315,8 +309,8 @@ prioritized for efficient zero-copy access.
   until its clock/counter cost is measured, then compare an unsplit parent
   task with concrete child tasks using confidence and reconvergence loss
   rather than a global hardware cutoff.
-- Publish the checked Rank9 sidecar seam as a new Jerky crate version, then
-  replace the exact git-revision pins in `triblespace-core` and
+- Publish the checked Rank9 accelerated-root seam as a new Jerky crate version,
+  then replace the exact git-revision pins in `triblespace-core` and
   `triblespace-search` before the next crates.io release. The git pin is an
   intentional integration bridge, not the final publishable dependency.
 - Define archive-message semantics when one entity carries multiple content
