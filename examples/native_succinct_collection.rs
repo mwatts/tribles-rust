@@ -43,17 +43,17 @@ fn main() {
         .expect("publish person");
     }
 
-    // Freeze the exact admitted target frontier. ticket() reads collection
+    // Freeze the exact admitted target frontier. cover() reads collection
     // records, but not these commits' data or metadata blobs.
-    let ticket = pile.ticket(collection, &[]).expect("discover exact ticket");
-    assert_eq!(ticket.len(), 3);
+    let cover = pile.cover(collection, &[]).expect("discover exact cover");
+    assert_eq!(cover.len(), 3);
 
     // Build any missing canonical raw Succinct shards and their exact Rank9
     // fibers, then query the admitted physical cover directly.
     let succinct =
         SuccinctArchiveCollection::new(name, authority, source_reach, authority, reach::private());
     let archive = succinct
-        .ensure_exact(&mut pile, ticket.commits())
+        .ensure_exact(&mut pile, &cover)
         .expect("ensure exact Succinct projection");
     let mut names: Vec<String> = find!(
         name: Inline<_>,
@@ -63,7 +63,7 @@ fn main() {
     .collect();
     names.sort();
 
-    println!("queried exact Succinct ticket: {names:?}");
+    println!("queried exact Succinct cover: {names:?}");
     assert_eq!(names, ["Ada", "Barbara", "Grace"]);
 
     pile.close().expect("close pile");

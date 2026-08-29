@@ -258,7 +258,7 @@ pub(crate) fn named_for_tests(name: &str, representation: Id, recipe: Id) -> Fra
 
 /// Content identity of a descriptor, for tests that have no store.
 ///
-/// The record algebra -- which commits a ticket admits, which merges compose,
+/// The record algebra -- which payloads a cover admits, which merges compose,
 /// what a derive equates -- is a property of records alone, and its tests
 /// build them without a pile. There is no `put` to take a handle from, so
 /// there is nothing to forget to write and no phantom to create: the

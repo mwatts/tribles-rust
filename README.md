@@ -137,7 +137,7 @@ barrier.
 The [Getting Started](https://triblespace.github.io/triblespace-rs/getting-started.html)
 chapter breaks the example down, while [Collection
 Workflows](https://triblespace.github.io/triblespace-rs/repository-workflows.html)
-explains descriptors, exact tickets, `COMMIT`/`MERGE`/`DERIVE`, and lazy
+explains descriptors, exact covers, `COMMIT`/`MERGE`/`DERIVE`, and lazy
 derived representations.
 
 ## Learn More

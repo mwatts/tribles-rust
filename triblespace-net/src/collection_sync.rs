@@ -14,11 +14,11 @@ use std::fmt;
 use anybytes::Bytes;
 use triblespace_core::blob::{Blob, BlobEncoding};
 use triblespace_core::collection::exact_derived::{
-    ExactAttachPlan, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
+    CoverAttachment, ExactAttachPlan, ExactDerivedAlgebra, ExactDerivedCollection,
     ExactDerivedCollectionError,
 };
 use triblespace_core::collection::{
-    CollectionCommit, CollectionData, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CollectionData, CollectionRecord, CollectionRecordSelector, CollectionStore, Cover,
 };
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -39,7 +39,7 @@ fn remaining_fetch_budget(deadline: tokio::time::Instant) -> Option<std::time::D
 /// Failure while obtaining one exact derived cover from local or team state.
 #[derive(Debug)]
 pub enum ExactDerivedSyncError {
-    /// Exact-ticket authority, resolution, validation, or construction failed.
+    /// Exact-cover resolution, validation, or construction failed.
     Exact(ExactDerivedCollectionError),
     /// Reading or landing physical evidence failed.
     Storage {
@@ -97,11 +97,11 @@ impl From<ExactDerivedCollectionError> for ExactDerivedSyncError {
     }
 }
 
-/// Ensure one exact derived ticket, opportunistically reusing a team member's
+/// Ensure one exact derived cover, opportunistically reusing a team member's
 /// physical cover before reconstructing missing target artifacts locally.
 ///
-/// The source ticket and all source dependencies must already be resident; a
-/// remote artifact cannot substitute for signed source authority. Target
+/// The source cover and all source dependencies must already be resident; a
+/// remote artifact cannot substitute for an explicit source-cover member. Target
 /// offers are frozen from one local record view, are never treated as proof of
 /// residency, and shrink after every attempted fetch. The operation therefore
 /// terminates even when every offer is stale. Exact fetches neither create
@@ -109,9 +109,9 @@ impl From<ExactDerivedCollectionError> for ExactDerivedSyncError {
 pub async fn ensure_exact_derived<S, Source, Target, A>(
     peer: &mut Peer<S>,
     lifecycle: &ExactDerivedCollection<Source, Target>,
-    ticket: &[CollectionCommit],
+    source_cover: &Cover,
     algebra: &A,
-) -> Result<ExactCover<Target>, ExactDerivedSyncError>
+) -> Result<CoverAttachment<Target>, ExactDerivedSyncError>
 where
     S: BlobStore
         + CollectionStore
@@ -131,8 +131,10 @@ where
     Handle<Target>: InlineEncoding,
     A: ExactDerivedAlgebra<Source, Target> + ?Sized,
 {
-    if ticket.is_empty() {
-        return Ok(ExactCover::default());
+    if source_cover.is_empty() {
+        return lifecycle
+            .attach_exact(&mut *peer.store(), source_cover, algebra)
+            .map_err(Into::into);
     }
 
     // Admit any already-arrived record inventory exactly once, then freeze the
@@ -168,7 +170,7 @@ where
     'replan: loop {
         let plan = {
             let mut store = peer.store();
-            lifecycle.probe_exact(&mut *store, ticket, algebra, &offered)
+            lifecycle.probe_exact(&mut *store, source_cover, algebra, &offered)
         };
         match plan {
             Ok(ExactAttachPlan::Ready(cover)) => return Ok(cover),
@@ -213,7 +215,7 @@ where
             Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {
                 let mut store = peer.store();
                 return lifecycle
-                    .ensure_exact(&mut *store, ticket, algebra)
+                    .ensure_exact(&mut *store, source_cover, algebra)
                     .map_err(Into::into);
             }
             Err(error) => return Err(error.into()),

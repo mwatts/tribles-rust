@@ -151,7 +151,7 @@ reader can recompute.
   the same measurement to post-auth request streams: an authorized peer can
   currently open multiple partial operations whose per-stream tasks have no
   independent deadline or concurrency budget.
-- Choose the oversized native Succinct shard policy. Exact-ticket Rank9
+- Choose the oversized native Succinct shard policy. Exact-cover Rank9
   acceleration now has an ABI-qualified, source-bound persisted fiber with
   transient fallback and cache-only retention semantics, but a single derived
   raw shard still rejects more than `u32::MAX` rows or domain values. Decide
@@ -161,7 +161,7 @@ reader can recompute.
   collection equations: persist endpoint artifacts, flush dependencies, insert
   the validated `DERIVE` or `MERGE`, then flush the record. The existing staged
   publisher is intentionally concrete to `SimpleArchive` commits; a future
-  `ensure(ticket, target_collection)` producer should reuse the generic seam
+  `ensure(cover, target_collection)` producer should reuse the generic seam
   without giving unsigned construction evidence root authority.
 - For pathological single commits or Succinct LSM levels that cannot keep the
   domain, EAV rows, and equal rotation scratch in memory, add a file-backed EAV

@@ -1,10 +1,10 @@
-//! Private one-to-one Rank9 fibers over an already admitted raw exact cover.
+//! Private one-to-one Rank9 fibers over an already selected raw exact cover.
 //!
 //! For one fixed ABI recipe, the target lattice is the image `i(a)` of the raw
 //! SuccinctArchive lattice. Each target blob embeds the exact raw handle and
 //! its join is defined by `i(a) join i(b) = i(a join b)`, so an ordinary
 //! `DERIVE` is truthful. This helper intentionally consumes the raw
-//! [`ExactCover`] selected by the authoritative lifecycle instead of running a
+//! [`CoverAttachment`] selected by the authoritative lifecycle instead of running a
 //! second [`ExactDerivedCollection`](crate::collection::exact_derived::ExactDerivedCollection):
 //! raw collection members are derived cache artifacts and have no signed
 //! commits of their own.
@@ -19,7 +19,7 @@ use crate::blob::encodings::succinctarchive::{
     SuccinctArchiveRank9IndexBlob, UnionArchive,
 };
 use crate::blob::{Blob, BlobEncoding};
-use crate::collection::exact_derived::ExactCover;
+use crate::collection::exact_derived::CoverAttachment;
 use crate::collection::{
     CollectionData, CollectionDerive, CollectionHandle, CollectionRecord, CollectionRecordSelector,
     CollectionStore,
@@ -43,9 +43,16 @@ pub enum Rank9FiberError {
         /// Concrete backend failure.
         source: BoxError,
     },
-    /// The admitted raw member did not have the content identity carried by its cover.
+    /// The supplied raw cover belongs to another collection descriptor.
+    WrongRawCollection {
+        /// Raw collection this fiber indexes.
+        expected: CollectionHandle,
+        /// Collection carried by the supplied cover.
+        actual: CollectionHandle,
+    },
+    /// The selected raw member did not have the content identity carried by its cover.
     InvalidRawCover {
-        /// Identity selected by exact raw admission.
+        /// Identity selected by the exact raw cover.
         expected: CollectionData,
         /// Fresh identity of the supplied raw bytes.
         actual: CollectionData,
@@ -75,7 +82,7 @@ pub enum Rank9FiberError {
         /// Identity returned by the backend.
         actual: CollectionData,
     },
-    /// Fresh post-publication admission could not prove an expected exact pair.
+    /// Fresh post-publication verification could not prove an expected exact pair.
     IncompletePublication {
         /// Raw source member.
         raw: CollectionData,
@@ -99,6 +106,12 @@ impl fmt::Display for Rank9FiberError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage { operation, source } => write!(f, "{operation}: {source}"),
+            Self::WrongRawCollection { expected, actual } => write!(
+                f,
+                "raw cover belongs to collection {} instead of {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
+            ),
             Self::InvalidRawCover { expected, actual } => write!(
                 f,
                 "exact raw cover member {} hashes to {}",
@@ -133,7 +146,7 @@ impl fmt::Display for Rank9FiberError {
             ),
             Self::IncompletePublication { raw, rank9, reason } => write!(
                 f,
-                "fresh Rank9 admission for raw member {} and sidecar {} failed: {reason}",
+                "fresh Rank9 verification for raw member {} and sidecar {} failed: {reason}",
                 hex::encode_upper(raw.raw),
                 rank9
                     .map(|data| hex::encode_upper(data.raw))
@@ -220,7 +233,7 @@ impl Rank9Fiber {
     pub(super) fn attach<S>(
         &self,
         store: &mut S,
-        cover: ExactCover<SuccinctArchiveBlob>,
+        cover: CoverAttachment<SuccinctArchiveBlob>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
         S: BlobStore + CollectionStore,
@@ -243,11 +256,11 @@ impl Rank9Fiber {
     }
 
     /// Ensure one persisted exact Rank9 fiber for every member of this fixed
-    /// admitted raw cover, then strictly re-read those same expected pairs.
+    /// selected raw cover, then strictly re-read those same expected pairs.
     pub(super) fn ensure<S>(
         &self,
         store: &mut S,
-        cover: ExactCover<SuccinctArchiveBlob>,
+        cover: CoverAttachment<SuccinctArchiveBlob>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
@@ -316,13 +329,19 @@ impl Rank9Fiber {
     fn probe<S>(
         &self,
         store: &mut S,
-        cover: ExactCover<SuccinctArchiveBlob>,
+        cover: CoverAttachment<SuccinctArchiveBlob>,
         ensure: bool,
     ) -> Result<FiberProbe, Rank9FiberError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
+        if cover.cover().collection() != self.source_collection {
+            return Err(Rank9FiberError::WrongRawCollection {
+                expected: self.source_collection,
+                actual: cover.cover().collection(),
+            });
+        }
         let members = cover.into_members();
         let raw_by_input: BTreeMap<_, _> = members.iter().map(|(data, raw)| (*data, raw)).collect();
         let mut candidates = self.candidates(store, &raw_by_input, ensure)?;
@@ -501,10 +520,7 @@ impl Rank9Fiber {
         }
 
         let handle = Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(output);
-        let Some(_) = reader
-            .metadata(handle)
-            .map_err(|error| Rank9FiberError::storage("inspect Rank9 sidecar", error))?
-        else {
+        let Ok(Some(_)) = reader.metadata(handle) else {
             return Ok(None);
         };
         let Ok(rank9): Result<Blob<SuccinctArchiveRank9IndexBlob>, _> = reader.get(handle) else {

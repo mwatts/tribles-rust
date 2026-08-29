@@ -2,9 +2,10 @@
 //!
 //! Discovery establishes canonical record structure and strict commit
 //! self-signatures. This module deliberately starts one layer later: the
-//! caller chooses which commits are authorized and supplies the concrete
-//! representation/recipe validation for every eligible claim. Only positively
-//! accepted claims participate in the least fixed point.
+//! caller chooses whether membership roots come from authorized commits or an
+//! explicit payload cover, and supplies the concrete representation/recipe
+//! validation for every eligible claim. Only chosen roots and positively
+//! accepted equations participate in the least fixed point.
 //!
 //! Semantic membership is independent of local blob residency. The resolver
 //! retains a compact index of active construction lineage; callers may ask the
@@ -268,7 +269,7 @@ impl<D> CollectionResolution<D> {
     }
 }
 
-/// Least semantic closure of positively accepted collection claims.
+/// Least semantic closure of selected payload roots and accepted equations.
 ///
 /// The known order is not materialized transitively; reachability is computed
 /// from asserted and commuting-square-implied equations when needed. Metadata
@@ -278,6 +279,7 @@ impl<D> CollectionResolution<D> {
 pub struct CollectionSemantics {
     members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
     frontier: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
+    root_members: BTreeSet<MemberKey>,
     commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>>,
     merge_inputs_by_result: BTreeMap<MemberKey, BTreeSet<MergeProducer>>,
     order_results_by_input: BTreeMap<MemberKey, BTreeSet<CollectionData>>,
@@ -332,6 +334,49 @@ impl CollectionSemantics {
                     .flatten()
                     .copied(),
             );
+
+            if let Some(producers) = self.merge_inputs_by_result.get(&member) {
+                for (low, high, _) in producers {
+                    pending.push((member.0, *low));
+                    pending.push((member.0, *high));
+                }
+            }
+            if let Some(producers) = self.derive_inputs_by_output.get(&member) {
+                for (source, input, _) in producers {
+                    pending.push((*source, *input));
+                }
+            }
+        }
+        supporting
+    }
+
+    /// Canonical root payloads supporting one member through every known
+    /// active construction path.
+    ///
+    /// Unlike [`Self::supporting_commit_ids`], multiple authorized commits of
+    /// the same payload collapse to one leaf. A member is a root whenever it
+    /// was supplied directly, either by an accepted commit or as an explicit
+    /// payload root; traversal still follows active merge and derive producers
+    /// so that every known support path contributes its roots.
+    pub fn supporting_data(
+        &self,
+        collection: CollectionHandle,
+        data: CollectionData,
+    ) -> BTreeSet<CollectionData> {
+        if !self.contains(collection, data) {
+            return BTreeSet::new();
+        }
+
+        let mut supporting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![(collection, data)];
+        while let Some(member) = pending.pop() {
+            if !visited.insert(member) {
+                continue;
+            }
+            if self.root_members.contains(&member) {
+                supporting.insert(member.1);
+            }
 
             if let Some(producers) = self.merge_inputs_by_result.get(&member) {
                 for (low, high, _) in producers {
@@ -453,7 +498,7 @@ impl CollectionSemantics {
 
 /// A deterministic proof view over currently resident collection elements.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CollectionPhysicalCover {
+pub(crate) struct CollectionPhysicalCover {
     /// Resident semantic members selected by the first known proof.
     pub cover: BTreeSet<CollectionData>,
     /// Semantic-frontier obligations with no proof from `cover`.
@@ -471,13 +516,33 @@ pub struct CollectionPhysicalCover {
 ///
 /// The first proof in canonical order is returned. It is deterministic, but it
 /// is not promised to be globally minimum or hardware-optimal.
-pub fn collection_physical_cover(
+pub(crate) fn collection_physical_cover(
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
     resident: &BTreeSet<CollectionData>,
 ) -> CollectionPhysicalCover {
+    let obligations = semantics.frontier(collection).cloned().unwrap_or_default();
+    collection_physical_cover_for(semantics, collection, &obligations, resident)
+}
+
+/// Compute a resident proof for caller-selected semantic obligations.
+///
+/// Unlike [`collection_physical_cover`], this does not implicitly choose the
+/// collection frontier. It is used when two concrete Covers must be compared
+/// under the sparse join order: every obligation is discharged by an equal or
+/// greater resident member, or by recursively covering both inputs of an exact
+/// merge producer.
+pub(crate) fn collection_physical_cover_for(
+    semantics: &CollectionSemantics,
+    collection: CollectionHandle,
+    obligations: &BTreeSet<CollectionData>,
+    resident: &BTreeSet<CollectionData>,
+) -> CollectionPhysicalCover {
     let Some(members) = semantics.members(collection) else {
-        return CollectionPhysicalCover::default();
+        return CollectionPhysicalCover {
+            cover: BTreeSet::new(),
+            missing: obligations.clone(),
+        };
     };
     let resident_members: BTreeSet<_> = resident.intersection(members).copied().collect();
     let mut resident_frontier = BTreeSet::new();
@@ -491,12 +556,11 @@ pub fn collection_physical_cover(
     }
 
     let mut result = CollectionPhysicalCover::default();
-    for obligation in semantics
-        .frontier(collection)
-        .into_iter()
-        .flatten()
-        .copied()
-    {
+    for obligation in obligations.iter().copied() {
+        if !members.contains(&obligation) {
+            result.missing.insert(obligation);
+            continue;
+        }
         match semantics.cover_element(collection, obligation, &resident_frontier, BTreeSet::new()) {
             Some(proof) => result.cover.extend(proof),
             None => {
@@ -525,6 +589,50 @@ pub fn collection_physical_cover(
 pub fn resolve_collection_semantics<D, E, V>(
     records: &DiscoveredCollectionRecords,
     lineage: &BTreeMap<CollectionHandle, CollectionHandle>,
+    authorized_commit_ids: &BTreeSet<Id>,
+    validate: V,
+) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
+where
+    V: for<'a> FnMut(CollectionValidationRequest<'a>) -> Result<CollectionClaimValidation<D>, E>,
+{
+    resolve_collection_semantics_kernel(
+        records,
+        lineage,
+        &BTreeSet::new(),
+        authorized_commit_ids,
+        validate,
+    )
+}
+
+/// Resolve collection semantics from canonical payload roots.
+///
+/// The roots are membership facts supplied by the caller rather than signed
+/// `COMMIT` claims. They seed the same merge/derive closure as commits, but do
+/// not acquire synthetic claim ids, admitted-claim status, or commit
+/// provenance. Stored commit records are deliberately ineligible in this
+/// mode; callers that need signed admission use [`resolve_collection_semantics`].
+pub(crate) fn resolve_collection_semantics_from_roots<D, E, V>(
+    records: &DiscoveredCollectionRecords,
+    lineage: &BTreeMap<CollectionHandle, CollectionHandle>,
+    explicit_roots: &BTreeSet<(CollectionHandle, CollectionData)>,
+    validate: V,
+) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
+where
+    V: for<'a> FnMut(CollectionValidationRequest<'a>) -> Result<CollectionClaimValidation<D>, E>,
+{
+    resolve_collection_semantics_kernel(
+        records,
+        lineage,
+        explicit_roots,
+        &BTreeSet::new(),
+        validate,
+    )
+}
+
+fn resolve_collection_semantics_kernel<D, E, V>(
+    records: &DiscoveredCollectionRecords,
+    lineage: &BTreeMap<CollectionHandle, CollectionHandle>,
+    explicit_roots: &BTreeSet<(CollectionHandle, CollectionData)>,
     authorized_commit_ids: &BTreeSet<Id>,
     mut validate: V,
 ) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
@@ -587,12 +695,17 @@ where
         .collect();
 
     let mut members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>> = BTreeMap::new();
+    let mut root_members = explicit_roots.clone();
+    for (collection, data) in explicit_roots {
+        members.entry(*collection).or_default().insert(*data);
+    }
     let mut commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>> = BTreeMap::new();
     for commit in accepted_commits {
         members
             .entry(commit.collection())
             .or_default()
             .insert(commit.data());
+        root_members.insert((commit.collection(), commit.data()));
         commit_ids_by_member
             .entry((commit.collection(), commit.data()))
             .or_default()
@@ -676,6 +789,7 @@ where
     let mut semantics = CollectionSemantics {
         frontier: members.clone(),
         members,
+        root_members,
         commit_ids_by_member,
         ..CollectionSemantics::default()
     };
@@ -1375,6 +1489,128 @@ mod tests {
             .contains(identity_for_tests(&definition), unauthorized.data()));
     }
 
+    #[test]
+    fn explicit_payload_roots_drive_merge_and_derive_closure_without_provenance() {
+        let source = named_for_tests("source", id(2), id(3));
+        let target = named_for_tests("target", id(4), id(5));
+        let source_handle = identity_for_tests(&source);
+        let target_handle = identity_for_tests(&target);
+        let merge = CollectionMerge::new(source_handle, data(1), data(2), data(3));
+        let derive = CollectionDerive::new(target_handle, data(3), data(4));
+        let records = discover(
+            &[source, target],
+            &[],
+            &[merge.clone()],
+            &[derive.clone()],
+            false,
+        );
+        let roots = BTreeSet::from([(source_handle, data(1)), (source_handle, data(2))]);
+        let lineage = BTreeMap::from([(target_handle, source_handle)]);
+
+        let resolution =
+            resolve_collection_semantics_from_roots(&records, &lineage, &roots, accepted).unwrap();
+        let semantics = resolution.semantics();
+
+        assert_eq!(
+            semantics.members(source_handle),
+            Some(&BTreeSet::from([data(1), data(2), data(3)]))
+        );
+        assert_eq!(
+            semantics.members(target_handle),
+            Some(&BTreeSet::from([data(4)]))
+        );
+        assert_eq!(
+            semantics.frontier(source_handle),
+            Some(&BTreeSet::from([data(3)]))
+        );
+        assert_eq!(
+            semantics.supporting_data(target_handle, data(4)),
+            BTreeSet::from([data(1), data(2)])
+        );
+        assert!(semantics
+            .supporting_commit_ids(target_handle, data(4))
+            .is_empty());
+        assert_eq!(
+            resolution.admitted_claims(),
+            &BTreeSet::from([merge.id(), derive.id()])
+        );
+    }
+
+    #[test]
+    fn explicit_payload_roots_ignore_duplicate_commit_provenance() {
+        let definition = named_for_tests("c1", id(2), id(3));
+        let collection = identity_for_tests(&definition);
+        let first = commit(&definition, data(1), 1);
+        let duplicate = commit(&definition, data(1), 2);
+        let merge = CollectionMerge::new(collection, data(1), data(2), data(3));
+        let merge_id = merge.id();
+        let roots = BTreeSet::from([(collection, data(1)), (collection, data(2))]);
+        let with_duplicates = discover(
+            &[definition.clone()],
+            &[first, duplicate],
+            &[merge.clone()],
+            &[],
+            false,
+        );
+        let without_commits = discover(&[definition], &[], &[merge], &[], false);
+        let mut validated = Vec::new();
+
+        let actual = resolve_collection_semantics_from_roots(
+            &with_duplicates,
+            &BTreeMap::new(),
+            &roots,
+            |request| {
+                validated.push(request.claim_id());
+                Ok::<_, Infallible>(CollectionClaimValidation::<()>::Accepted)
+            },
+        )
+        .unwrap();
+        let expected = resolve_collection_semantics_from_roots(
+            &without_commits,
+            &BTreeMap::new(),
+            &roots,
+            accepted,
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(validated, vec![merge_id]);
+        assert!(actual
+            .semantics()
+            .supporting_commit_ids(collection, data(3))
+            .is_empty());
+    }
+
+    #[test]
+    fn authorized_commit_resolution_still_tracks_claim_provenance() {
+        let definition = named_for_tests("c1", id(2), id(3));
+        let collection = identity_for_tests(&definition);
+        let root = commit(&definition, data(1), 1);
+        let records = discover(&[definition], &[root.clone()], &[], &[], false);
+
+        let resolution = resolve_collection_semantics(
+            &records,
+            &BTreeMap::new(),
+            &BTreeSet::from([root.id()]),
+            accepted,
+        )
+        .unwrap();
+
+        assert_eq!(resolution.admitted_claims(), &BTreeSet::from([root.id()]));
+        assert_eq!(
+            resolution
+                .semantics()
+                .supporting_commit_ids(collection, root.data()),
+            BTreeSet::from([root.id()])
+        );
+        assert_eq!(
+            resolution
+                .semantics()
+                .supporting_data(collection, root.data()),
+            BTreeSet::from([root.data()])
+        );
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct InjectedFailure;
 
@@ -1980,6 +2216,73 @@ mod tests {
                 cover: BTreeSet::new(),
                 missing: BTreeSet::from([data(2)]),
             }
+        );
+    }
+
+    #[test]
+    fn payload_support_collapses_duplicate_commit_provenance() {
+        let definition = named_for_tests("c1", id(2), id(3));
+        let first = commit(&definition, data(1), 1);
+        let same_payload_other_commit = commit(&definition, data(1), 2);
+        let records = discover(
+            &[definition.clone()],
+            &[first.clone(), same_payload_other_commit.clone()],
+            &[],
+            &[],
+            false,
+        );
+        let resolution = resolve_with_derive_lineage(
+            &records,
+            &[],
+            &BTreeSet::from([first.id(), same_payload_other_commit.id()]),
+            accepted,
+        )
+        .unwrap();
+        let semantics = resolution.semantics();
+        let collection = identity_for_tests(&definition);
+
+        assert_eq!(
+            semantics.supporting_commit_ids(collection, data(1)),
+            BTreeSet::from([first.id(), same_payload_other_commit.id()])
+        );
+        assert_eq!(
+            semantics.supporting_data(collection, data(1)),
+            BTreeSet::from([data(1)])
+        );
+    }
+
+    #[test]
+    fn payload_support_follows_active_merge_and_derive_producers() {
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
+        let first = commit(&source, data(1), 1);
+        let second = commit(&source, data(2), 2);
+        let target_root = commit(&target, data(5), 3);
+        let source_merge =
+            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
+        let derive = CollectionDerive::new(identity_for_tests(&target), data(3), data(4));
+        let target_merge =
+            CollectionMerge::new(identity_for_tests(&target), data(4), data(5), data(6));
+        let records = discover(
+            &[source.clone(), target.clone()],
+            &[first.clone(), second.clone(), target_root.clone()],
+            &[source_merge, target_merge],
+            &[derive],
+            false,
+        );
+        let resolution = resolve_with_derive_lineage(
+            &records,
+            &[(identity_for_tests(&target), identity_for_tests(&source))],
+            &BTreeSet::from([first.id(), second.id(), target_root.id()]),
+            accepted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution
+                .semantics()
+                .supporting_data(identity_for_tests(&target), data(6)),
+            BTreeSet::from([data(1), data(2), data(5)])
         );
     }
 

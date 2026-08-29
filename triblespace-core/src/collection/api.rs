@@ -8,7 +8,7 @@
 //!
 //! Local publication is deliberately unconditional: a store may record any
 //! structurally valid, strictly signed commit. Authority is enforced when a
-//! ticket or snapshot is constructed. The descriptor authority's own commits
+//! cover or snapshot is constructed. The descriptor authority's own commits
 //! are admitted directly; delegated writers need an explicit proof for
 //! [`ACTION_WRITE`] on that exact descriptor handle.
 
@@ -19,7 +19,7 @@ use std::fmt;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
@@ -28,10 +28,10 @@ use crate::capability::{
     CapabilityRequest, CapabilityResource,
 };
 use crate::clock;
-use crate::id::Id;
 use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
+use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::{
     ArtifactHandle, ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut,
     OfferCapture, OfferCaptureInsertError,
@@ -40,16 +40,18 @@ use crate::repo::{
 // particular one.
 use crate::trible::{Fragment, TribleSet};
 
-use super::discovery::{discover_collection_records_for_collection_ticket, validate_exact_ticket};
+use super::discovery::{
+    discover_collection_claims_for_cover, discover_collection_equations_for_cover, ExactCoverError,
+};
 use super::simplearchive_union::{
     self, MaterializationError, PublicationError, SimpleArchiveUnionValidationError,
 };
 use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
-    resolve_collection_semantics, CollectionClaimValidation, CollectionCommit, CollectionData,
-    CollectionDiscoveryError, CollectionFunctionalConflict, CollectionHandle,
+    resolve_collection_semantics_from_roots, CollectionClaimValidation, CollectionCommit,
+    CollectionData, CollectionDiscoveryError, CollectionFunctionalConflict, CollectionHandle,
     CollectionResolutionError, CollectionStore, CollectionValidationRequest,
-    DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError, ACTION_WRITE,
+    DiscoveredCollectionRecords, RecordDecodeError, ACTION_WRITE,
 };
 
 /// One owned proof together with the exact leaf subject it is expected to
@@ -276,81 +278,153 @@ where
     }
 }
 
-/// One exact admitted collection frontier.
+/// One exact point in a collection lattice.
 ///
-/// The commits are duplicate-free and ordered by intrinsic record id. Keeping
-/// the collection identity beside them prevents an exact ticket for one
-/// descriptor from being accidentally attached to another.
+/// Members are content identities, not signatures. Several commits may attest
+/// the same member with different authors or metadata without changing this
+/// value. The private constructor makes a `Cover` an opaque result of
+/// admission or validated collection algebra rather than a caller-forged set
+/// of hashes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CollectionTicket {
+pub struct Cover {
     collection: CollectionHandle,
-    commits: Vec<CollectionCommit>,
+    members: PATCH<32, IdentitySchema, (), Blake3Merkle>,
 }
 
-impl CollectionTicket {
-    pub(crate) fn from_canonical(
+impl Cover {
+    pub(crate) fn from_members(
         collection: CollectionHandle,
-        commits: Vec<CollectionCommit>,
+        members: impl IntoIterator<Item = CollectionData>,
     ) -> Self {
-        debug_assert!(commits.windows(2).all(|pair| pair[0].id() < pair[1].id()));
-        debug_assert!(commits
-            .iter()
-            .all(|commit| commit.collection() == collection));
         Self {
             collection,
-            commits,
+            members: PATCH::from_keys(members.into_iter().map(|member| member.raw)),
         }
     }
 
-    /// Exact descriptor this ticket observes.
+    pub(crate) fn from_patch(
+        collection: CollectionHandle,
+        members: PATCH<32, IdentitySchema, (), Blake3Merkle>,
+    ) -> Self {
+        Self {
+            collection,
+            members,
+        }
+    }
+
+    /// Exact descriptor whose lattice contains these members.
     pub const fn collection(&self) -> CollectionHandle {
         self.collection
     }
 
-    /// Canonical admitted commit set.
-    pub fn commits(&self) -> &[CollectionCommit] {
-        &self.commits
+    /// Canonical member identities in ascending byte order.
+    pub fn members(&self) -> impl ExactSizeIterator<Item = CollectionData> + '_ {
+        self.members
+            .iter_ordered()
+            .map(|member| Inline::new(*member))
     }
 
-    /// Number of admitted commits.
+    /// Whether this cover contains one exact member identity.
+    pub fn contains(&self, member: CollectionData) -> bool {
+        self.members.get(&member.raw).is_some()
+    }
+
+    /// Number of distinct collection members.
     pub fn len(&self) -> usize {
-        self.commits.len()
+        self.members.len().min(usize::MAX as u64) as usize
     }
 
-    /// Whether no commit was admitted.
+    /// Whether this is the lattice bottom.
     pub fn is_empty(&self) -> bool {
-        self.commits.is_empty()
+        self.members.is_empty()
+    }
+
+    /// Return the members added since an earlier observation.
+    ///
+    /// This is PATCH set difference over payload identities. A new signature
+    /// or metadata archive for an existing member is provenance, not a data
+    /// delta. Shrinking observations fail because additions-only maintenance
+    /// would no longer be sound.
+    pub fn additions_since(&self, previous: &Self) -> Result<Self, CoverAdvanceError> {
+        if self.collection != previous.collection {
+            return Err(CoverAdvanceError::DifferentCollection {
+                previous: previous.collection,
+                current: self.collection,
+            });
+        }
+        let missing = previous.members.difference(&self.members);
+        if let Some(member) = missing.iter_ordered().next() {
+            return Err(CoverAdvanceError::ResetRequired {
+                missing: Inline::new(*member),
+            });
+        }
+        Ok(Self::from_patch(
+            self.collection,
+            self.members.difference(&previous.members),
+        ))
     }
 }
 
+/// Failure to treat two covers as one additions-only continuation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoverAdvanceError {
+    /// The two covers belong to different collection lattices.
+    DifferentCollection {
+        /// Earlier collection descriptor.
+        previous: CollectionHandle,
+        /// Current collection descriptor.
+        current: CollectionHandle,
+    },
+    /// A member of the earlier cover is absent from the current cover.
+    ResetRequired {
+        /// First missing member in canonical content order.
+        missing: CollectionData,
+    },
+}
+
+impl fmt::Display for CoverAdvanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DifferentCollection { previous, current } => write!(
+                formatter,
+                "cover collection {} differs from {}",
+                hex::encode_upper(current.raw),
+                hex::encode_upper(previous.raw),
+            ),
+            Self::ResetRequired { missing } => write!(
+                formatter,
+                "previous cover member {} is absent from the current observation; additions-only processing requires a reset",
+                hex::encode_upper(missing.raw),
+            ),
+        }
+    }
+}
+
+impl Error for CoverAdvanceError {}
+
 /// One coherent known-prefix view of a scoped collection.
 ///
-/// [`commits`](Self::commits) is the exact set of commits from the single
-/// collection-record discovery pass that admitted [`facts`](Self::facts).
+/// [`cover`](Self::cover) is the exact payload set materialized as
+/// [`facts`](Self::facts).
 /// [`reader`](Self::reader) is the blob-reader snapshot used to validate and
 /// materialize those facts. The reader may contain physically available blobs
 /// published after record discovery, but those blobs acquire no semantic role
-/// unless their commits are present in this snapshot.
+/// unless their payloads are present in this snapshot's cover.
 pub struct CollectionSnapshot<R> {
     facts: TribleSet,
-    ticket: CollectionTicket,
+    cover: Cover,
     reader: R,
 }
 
 impl<R> CollectionSnapshot<R> {
-    /// Materialized union admitted by this snapshot's exact commit set.
+    /// Materialized union named by this snapshot's exact payload cover.
     pub fn facts(&self) -> &TribleSet {
         &self.facts
     }
 
-    /// Exact admitted commits, ordered by intrinsic record id.
-    pub fn commits(&self) -> &[CollectionCommit] {
-        self.ticket.commits()
-    }
-
-    /// Exact collection frontier from which the facts were materialized.
-    pub fn ticket(&self) -> &CollectionTicket {
-        &self.ticket
+    /// Exact collection cover from which the facts were materialized.
+    pub fn cover(&self) -> &Cover {
+        &self.cover
     }
 
     /// Blob-reader snapshot used to validate and materialize the facts.
@@ -363,15 +437,15 @@ impl<R> CollectionSnapshot<R> {
         self.facts
     }
 
-    /// Consume the snapshot into materialized facts, exact commits, and reader.
-    pub fn into_parts(self) -> (TribleSet, CollectionTicket, R) {
-        (self.facts, self.ticket, self.reader)
+    /// Consume the snapshot into materialized facts, exact cover, and reader.
+    pub fn into_parts(self) -> (TribleSet, Cover, R) {
+        (self.facts, self.cover, self.reader)
     }
 }
 
-/// Failure to discover one exact admitted commit ticket.
+/// Failure to discover one exact admitted payload cover.
 #[derive(Debug)]
-pub enum CollectionTicketError<RecordsError, ReaderError, GetError> {
+pub enum CollectionCoverError<RecordsError, ReaderError, GetError> {
     /// The collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<ReaderError, GetError>),
     /// One explicitly supplied capability proof was invalid at this operation's
@@ -382,7 +456,7 @@ pub enum CollectionTicketError<RecordsError, ReaderError, GetError> {
 }
 
 impl<RecordsError, ReaderError, GetError> fmt::Display
-    for CollectionTicketError<RecordsError, ReaderError, GetError>
+    for CollectionCoverError<RecordsError, ReaderError, GetError>
 where
     RecordsError: fmt::Display,
     ReaderError: fmt::Display,
@@ -398,7 +472,7 @@ where
 }
 
 impl<RecordsError, ReaderError, GetError> Error
-    for CollectionTicketError<RecordsError, ReaderError, GetError>
+    for CollectionCoverError<RecordsError, ReaderError, GetError>
 where
     RecordsError: Error + 'static,
     ReaderError: Error + 'static,
@@ -413,7 +487,7 @@ where
     }
 }
 
-/// Failure to publish one collection element through explicit admission.
+/// Failure to publish one collection element into local storage.
 #[derive(Debug)]
 pub enum CollectionCommitError<ReaderError, GetError, PutError, InsertError> {
     /// The named collection descriptor was unavailable or malformed.
@@ -454,21 +528,22 @@ where
     }
 }
 
-/// Failure to materialize the complete admitted value of a collection.
+/// Failure to materialize the complete value named by an opaque cover.
 ///
-/// Every admitted strictly verified commit is ground truth, so its
-/// descriptor, data, and metadata fail loud. Unsigned equations are only
+/// Every cover member is explicit ground truth, so its descriptor and data
+/// fail loud. Signatures and metadata remain queryable provenance rather
+/// than becoming coordinates of the payload lattice. Unsigned equations are
 /// replaceable cache evidence: missing or invalid equations are omitted from
-/// the resolved semantics and cannot hide a valid committed leaf.
+/// the resolved semantics and cannot hide an explicit cover member.
 #[derive(Debug)]
 pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError> {
     /// One explicitly supplied capability proof was invalid.
     Admission(CollectionAdmissionError),
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
-    /// A supplied exact ticket was not an exact resident commit set.
-    ExactTicket(ExactTicketError),
-    /// An admitted commit's canonical descriptor blob could not be fetched.
+    /// A supplied exact cover names the wrong collection descriptor.
+    ExactCover(ExactCoverError),
+    /// The cover's canonical descriptor blob could not be fetched.
     DescriptorGet {
         /// Canonical collection-descriptor handle.
         collection: CollectionHandle,
@@ -484,9 +559,9 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         source: RecordDecodeError,
     },
     /// The fetched descriptor bytes did not hash to the handle named by the
-    /// commits.
+    /// cover.
     DescriptorIdentity {
-        /// Descriptor handle named by the commits.
+        /// Descriptor handle named by the cover.
         expected: CollectionHandle,
         /// Handle recomputed from the fetched bytes.
         actual: CollectionHandle,
@@ -494,56 +569,25 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
     /// The fetched canonical descriptor did not equal the descriptor expected
     /// by this facade.
     DescriptorMismatch {
-        /// Descriptor handle named by this facade and its commits.
+        /// Descriptor handle named by this facade and cover.
         collection: CollectionHandle,
     },
     /// The blob reader could not be created after record discovery.
     Reader(ReaderError),
-    /// An admitted commit's data blob could not be fetched.
-    CommitDataGet {
-        /// Intrinsic commit record id.
-        commit: Id,
-        /// Claimed data identity.
-        data: CollectionData,
+    /// A cover member's data blob could not be fetched.
+    MemberGet {
+        /// Exact payload identity.
+        member: CollectionData,
         /// Backend fetch failure.
         source: GetError,
     },
-    /// An admitted commit's data failed exact `SimpleArchive` collection
+    /// A cover member failed exact `SimpleArchive` collection
     /// validation.
-    InvalidCommitData {
-        /// Intrinsic commit record id.
-        commit: Id,
+    InvalidMember {
+        /// Exact payload identity.
+        member: CollectionData,
         /// Exact representation or identity diagnostic.
         source: SimpleArchiveUnionValidationError,
-    },
-    /// An admitted commit's mandatory metadata archive could not be fetched.
-    CommitMetadataGet {
-        /// Intrinsic commit record id.
-        commit: Id,
-        /// Mandatory metadata archive handle.
-        metadata: crate::inline::Inline<Handle<SimpleArchive>>,
-        /// Backend fetch failure.
-        source: GetError,
-    },
-    /// An admitted commit's mandatory metadata was not a canonical
-    /// `SimpleArchive`.
-    InvalidCommitMetadata {
-        /// Intrinsic commit record id.
-        commit: Id,
-        /// Mandatory metadata archive handle.
-        metadata: crate::inline::Inline<Handle<SimpleArchive>>,
-        /// Canonical archive failure.
-        source: UnarchiveError,
-    },
-    /// An admitted commit's canonical metadata bytes did not have the exact
-    /// identity signed by the commit.
-    InvalidCommitMetadataIdentity {
-        /// Intrinsic commit record id.
-        commit: Id,
-        /// Signed metadata archive handle.
-        expected: crate::inline::Inline<Handle<SimpleArchive>>,
-        /// Blake3 handle recomputed from the returned bytes.
-        actual: crate::inline::Inline<Handle<SimpleArchive>>,
     },
     /// Positively validated equations contradicted operation functionality.
     ResolutionConflict(Box<CollectionFunctionalConflict>),
@@ -552,28 +596,28 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
 }
 
 impl<RecordsError, ReaderError, MetaError, GetError>
-    From<CollectionTicketError<RecordsError, ReaderError, GetError>>
+    From<CollectionCoverError<RecordsError, ReaderError, GetError>>
     for CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError>
 {
-    fn from(source: CollectionTicketError<RecordsError, ReaderError, GetError>) -> Self {
+    fn from(source: CollectionCoverError<RecordsError, ReaderError, GetError>) -> Self {
         match source {
-            CollectionTicketError::Descriptor(CollectionDescriptorError::Reader(source)) => {
+            CollectionCoverError::Descriptor(CollectionDescriptorError::Reader(source)) => {
                 Self::Reader(source)
             }
-            CollectionTicketError::Descriptor(CollectionDescriptorError::Get {
+            CollectionCoverError::Descriptor(CollectionDescriptorError::Get {
                 collection,
                 source,
             }) => Self::DescriptorGet { collection, source },
-            CollectionTicketError::Descriptor(CollectionDescriptorError::Identity {
+            CollectionCoverError::Descriptor(CollectionDescriptorError::Identity {
                 expected,
                 actual,
             }) => Self::DescriptorIdentity { expected, actual },
-            CollectionTicketError::Descriptor(CollectionDescriptorError::Invalid {
+            CollectionCoverError::Descriptor(CollectionDescriptorError::Invalid {
                 collection,
                 source,
             }) => Self::InvalidDescriptor { collection, source },
-            CollectionTicketError::Admission(source) => Self::Admission(source),
-            CollectionTicketError::Discovery(source) => Self::Discovery(source),
+            CollectionCoverError::Admission(source) => Self::Admission(source),
+            CollectionCoverError::Discovery(source) => Self::Discovery(source),
         }
     }
 }
@@ -610,68 +654,38 @@ where
         match self {
             Self::Admission(source) => source.fmt(f),
             Self::Discovery(source) => source.fmt(f),
-            Self::ExactTicket(source) => write!(f, "invalid exact ticket: {source}"),
+            Self::ExactCover(source) => write!(f, "invalid exact cover: {source}"),
             Self::DescriptorGet { collection, source } => write!(
                 f,
-                "failed to fetch admitted collection descriptor {}: {source}",
+                "failed to fetch collection descriptor {}: {source}",
                 hex::encode_upper(collection.raw),
             ),
             Self::InvalidDescriptor { collection, source } => write!(
                 f,
-                "admitted collection descriptor {} is invalid: {source}",
+                "collection descriptor {} is invalid: {source}",
                 hex::encode_upper(collection.raw),
             ),
             Self::DescriptorIdentity { expected, actual } => write!(
                 f,
-                "admitted collection descriptor bytes hash to {} instead of {}",
+                "collection descriptor bytes hash to {} instead of {}",
                 hex::encode_upper(actual.raw),
                 hex::encode_upper(expected.raw),
             ),
             Self::DescriptorMismatch { collection } => write!(
                 f,
-                "admitted collection descriptor {} does not match the facade descriptor",
+                "collection descriptor {} does not match the facade descriptor",
                 hex::encode_upper(collection.raw),
             ),
             Self::Reader(source) => write!(f, "failed to open collection blob view: {source}"),
-            Self::CommitDataGet {
-                commit,
-                data,
-                source,
-            } => write!(
+            Self::MemberGet { member, source } => write!(
                 f,
-                "failed to fetch data {} for admitted commit {commit:X}: {source}",
-                hex::encode_upper(data.raw),
+                "failed to fetch cover member {}: {source}",
+                hex::encode_upper(member.raw),
             ),
-            Self::InvalidCommitData { commit, source } => {
-                write!(f, "admitted commit {commit:X} has invalid data: {source}")
-            }
-            Self::CommitMetadataGet {
-                commit,
-                metadata,
-                source,
-            } => write!(
+            Self::InvalidMember { member, source } => write!(
                 f,
-                "failed to fetch metadata {} for admitted commit {commit:X}: {source}",
-                hex::encode_upper(metadata.raw),
-            ),
-            Self::InvalidCommitMetadata {
-                commit,
-                metadata,
-                source,
-            } => write!(
-                f,
-                "admitted commit {commit:X} has invalid metadata {}: {source}",
-                hex::encode_upper(metadata.raw),
-            ),
-            Self::InvalidCommitMetadataIdentity {
-                commit,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "admitted commit {commit:X} metadata bytes hash to {} instead of signed {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
+                "cover member {} is invalid: {source}",
+                hex::encode_upper(member.raw),
             ),
             Self::ResolutionConflict(source) => source.fmt(f),
             Self::Materialize(source) => source.fmt(f),
@@ -691,153 +705,17 @@ where
         match self {
             Self::Admission(source) => Some(source),
             Self::Discovery(source) => Some(source),
-            Self::ExactTicket(source) => Some(source),
+            Self::ExactCover(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
             Self::InvalidDescriptor { source, .. } => Some(source),
             Self::DescriptorIdentity { .. } | Self::DescriptorMismatch { .. } => None,
             Self::Reader(source) => Some(source),
-            Self::CommitDataGet { source, .. } => Some(source),
-            Self::InvalidCommitData { source, .. } => Some(source),
-            Self::CommitMetadataGet { source, .. } => Some(source),
-            Self::InvalidCommitMetadata { source, .. } => Some(source),
-            Self::InvalidCommitMetadataIdentity { .. } => None,
+            Self::MemberGet { source, .. } => Some(source),
+            Self::InvalidMember { source, .. } => Some(source),
             Self::ResolutionConflict(source) => Some(source),
             Self::Materialize(source) => Some(source),
         }
     }
-}
-
-#[cfg(any(test, not(feature = "parallel")))]
-fn validate_unique_commit_dependencies<E, ValidateData, ValidateMetadata>(
-    commits: &[CollectionCommit],
-    mut validate_data: ValidateData,
-    mut validate_metadata: ValidateMetadata,
-) -> Result<BTreeMap<CollectionData, Blob<SimpleArchive>>, E>
-where
-    ValidateData: FnMut(&CollectionCommit) -> Result<Blob<SimpleArchive>, E>,
-    ValidateMetadata: FnMut(&CollectionCommit) -> Result<(), E>,
-{
-    let mut known = BTreeMap::new();
-    let mut validated_metadata = BTreeSet::new();
-    for commit in commits {
-        let data = commit.data();
-        if let std::collections::btree_map::Entry::Vacant(entry) = known.entry(data) {
-            entry.insert(validate_data(commit)?);
-        }
-        if validated_metadata.insert(commit.metadata()) {
-            validate_metadata(commit)?;
-        }
-    }
-    Ok(known)
-}
-
-#[cfg(feature = "parallel")]
-struct FetchedCommitData {
-    commit: CollectionCommit,
-    data: CollectionData,
-    blob: Blob<SimpleArchive>,
-}
-
-/// Fetch dependencies through the possibly non-`Sync` reader on the caller
-/// thread in serial data-then-metadata order, then parallelize concrete data
-/// checks. Error replay by intrinsic commit keeps data before metadata and
-/// prevents a later prefetched failure from outranking an earlier failure.
-#[cfg(feature = "parallel")]
-fn validate_unique_commit_dependencies_parallel<
-    E,
-    FetchData,
-    FetchMetadata,
-    ValidateMetadata,
-    MapDataError,
->(
-    commits: &[CollectionCommit],
-    descriptor: &Fragment,
-    mut fetch_data: FetchData,
-    mut fetch_metadata: FetchMetadata,
-    mut validate_metadata: ValidateMetadata,
-    mut map_data_error: MapDataError,
-) -> Result<BTreeMap<CollectionData, Blob<SimpleArchive>>, E>
-where
-    FetchData: FnMut(&CollectionCommit) -> Result<Blob<SimpleArchive>, E>,
-    FetchMetadata: FnMut(&CollectionCommit) -> Result<Blob<SimpleArchive>, E>,
-    ValidateMetadata: FnMut(&CollectionCommit, &Blob<SimpleArchive>) -> Result<(), E>,
-    MapDataError: FnMut(&CollectionCommit, SimpleArchiveUnionValidationError) -> E,
-{
-    use rayon::prelude::*;
-
-    if let [commit] = commits {
-        let data = commit.data();
-        let data_blob = fetch_data(commit)?;
-        simplearchive_union::validate_commit(descriptor, commit, &data_blob)
-            .map_err(|error| map_data_error(commit, error))?;
-        let metadata_blob = fetch_metadata(commit)?;
-        validate_metadata(commit, &metadata_blob)?;
-        return Ok(BTreeMap::from([(data, data_blob)]));
-    }
-
-    let mut seen_data = BTreeSet::new();
-    let mut seen_metadata = BTreeSet::new();
-    let mut fetched = Vec::with_capacity(commits.len());
-    let mut dependency_error = None;
-    for commit in commits {
-        if seen_data.insert(commit.data()) {
-            match fetch_data(commit) {
-                Ok(blob) => fetched.push(FetchedCommitData {
-                    commit: *commit,
-                    data: commit.data(),
-                    blob,
-                }),
-                Err(error) => {
-                    dependency_error = Some((commit.id(), error));
-                    break;
-                }
-            }
-        }
-        if seen_metadata.insert(commit.metadata()) {
-            match fetch_metadata(commit) {
-                Ok(blob) => {
-                    if let Err(error) = validate_metadata(commit, &blob) {
-                        dependency_error = Some((commit.id(), error));
-                        break;
-                    }
-                }
-                Err(error) => {
-                    dependency_error = Some((commit.id(), error));
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut fetched = fetched
-        .into_par_iter()
-        .map(|fetched| {
-            let validation =
-                simplearchive_union::validate_commit(descriptor, &fetched.commit, &fetched.blob);
-            (fetched, validation)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .peekable();
-
-    let mut known = BTreeMap::new();
-    for commit in commits {
-        if fetched
-            .peek()
-            .is_some_and(|(fetched, _)| fetched.commit.id() == commit.id())
-        {
-            let (fetched, validation) = fetched.next().expect("peeked commit data");
-            validation.map_err(|error| map_data_error(commit, error))?;
-            known.insert(fetched.data, fetched.blob);
-        }
-        if dependency_error
-            .as_ref()
-            .is_some_and(|(failed_commit, _)| *failed_commit == commit.id())
-        {
-            return Err(dependency_error.take().expect("matched dependency error").1);
-        }
-    }
-    Ok(known)
 }
 
 fn validate_generic_descriptor(facts: &TribleSet) -> Result<VerifyingKey, RecordDecodeError> {
@@ -990,14 +868,14 @@ fn admitted_subjects_at(
     Ok(admitted)
 }
 
-fn discover_admitted_commits_at<S>(
+fn discover_admitted_cover_at<S>(
     store: &mut S,
     collection: CollectionHandle,
     presentations: &[CapabilityPresentation],
     instant: hifitime::Epoch,
 ) -> Result<
-    (Fragment, DiscoveredCollectionRecords, CollectionTicket),
-    CollectionTicketError<
+    (Fragment, DiscoveredCollectionRecords, Cover),
+    CollectionCoverError<
         S::RecordsError,
         S::ReaderError,
         <S::Reader as BlobStoreGet>::GetError<Infallible>,
@@ -1007,15 +885,18 @@ where
     S: BlobStore + CollectionStore,
 {
     let loaded =
-        load_collection_descriptor(store, collection).map_err(CollectionTicketError::Descriptor)?;
+        load_collection_descriptor(store, collection).map_err(CollectionCoverError::Descriptor)?;
     let admitted = admitted_subjects_at(loaded.authority, collection, instant, presentations)
-        .map_err(CollectionTicketError::Admission)?;
+        .map_err(CollectionCoverError::Admission)?;
     let discovered = discover_collection_records_authorized(store, collection, |subject| {
         admitted.contains(subject)
     })
-    .map_err(CollectionTicketError::Discovery)?;
-    let ticket = CollectionTicket::from_canonical(collection, discovered.commits().to_vec());
-    Ok((loaded.fragment, discovered, ticket))
+    .map_err(CollectionCoverError::Discovery)?;
+    let cover = Cover::from_members(
+        collection,
+        discovered.commits().iter().map(CollectionCommit::data),
+    );
+    Ok((loaded.fragment, discovered, cover))
 }
 
 fn widen_preparation_error<PutError, InsertError>(
@@ -1056,7 +937,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     /// Publish one signed fragment into an already registered collection.
     ///
     /// This performs no capability check. Local storage is a grow-only claim
-    /// ledger; authority is applied only by [`ticket`](Self::ticket) and
+    /// ledger; authority is applied only by [`cover`](Self::cover) and
     /// [`snapshot`](Self::snapshot). The descriptor is fetched and
     /// exact-validated before dependencies are staged, and the signed record is
     /// inserted last without an implicit durability flush.
@@ -1090,30 +971,30 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
             .map_err(CollectionCommitError::Publication)
     }
 
-    /// Discover one canonical admitted commit frontier.
+    /// Discover one canonical admitted payload cover.
     ///
     /// The descriptor authority is always admitted directly. Every delegated
     /// writer must be named by an explicitly supplied proof for exact
     /// [`ACTION_WRITE`] on `collection`; an invalid supplied proof fails the
     /// whole operation rather than silently changing its meaning.
-    fn ticket(
+    fn cover(
         &mut self,
         collection: CollectionHandle,
         presentations: &[CapabilityPresentation],
     ) -> Result<
-        CollectionTicket,
-        CollectionTicketError<
+        Cover,
+        CollectionCoverError<
             <Self as CollectionStore>::RecordsError,
             <Self as BlobStore>::ReaderError,
             <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
-        let (_, _, ticket) =
-            discover_admitted_commits_at(self, collection, presentations, clock::epoch_now())?;
-        Ok(ticket)
+        let (_, _, cover) =
+            discover_admitted_cover_at(self, collection, presentations, clock::epoch_now())?;
+        Ok(cover)
     }
 
-    /// Capture one coherent known-prefix fact, ticket, and reader snapshot.
+    /// Capture one coherent known-prefix fact, cover, and reader snapshot.
     fn snapshot(
         &mut self,
         collection: CollectionHandle,
@@ -1130,22 +1011,21 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     where
         <Self as BlobStore>::Reader: BlobStoreMeta,
     {
-        let (descriptor, discovered, ticket) =
-            discover_admitted_commits_at(self, collection, presentations, clock::epoch_now())
+        let (descriptor, discovered, cover) =
+            discover_admitted_cover_at(self, collection, presentations, clock::epoch_now())
                 .map_err(CollectionMaterializationError::from)?;
-        snapshot_from_observation(self, &descriptor, discovered, ticket)
+        snapshot_from_observation(self, &descriptor, discovered, cover)
     }
 
-    /// Replay one already-admitted exact ticket against this store.
+    /// Replay one opaque exact cover against this store.
     ///
-    /// Unlike [`snapshot`](Self::snapshot), this performs no capability
-    /// discovery. Every complete commit in `ticket` must byte-match one
-    /// resident, strictly verified record for the ticket's descriptor. Other
-    /// commits are inert; same-descriptor merge records may still accelerate
-    /// the physical union.
+    /// Unlike [`snapshot`](Self::snapshot), this performs no capability or
+    /// provenance discovery. Only the descriptor and payload bytes named by
+    /// `cover` are mandatory; resident commits and metadata are unnecessary.
+    /// Same-descriptor merge records may still accelerate the physical union.
     fn materialize(
         &mut self,
-        ticket: &CollectionTicket,
+        cover: &Cover,
     ) -> Result<
         TribleSet,
         CollectionMaterializationError<
@@ -1158,42 +1038,49 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     where
         <Self as BlobStore>::Reader: BlobStoreMeta,
     {
-        let collection = ticket.collection();
+        let collection = cover.collection();
         let descriptor = load_collection_descriptor(self, collection)
             .map_err(CollectionMaterializationError::from)?
             .fragment;
-        let discovered = if ticket.is_empty() {
+        let discovered = if cover.is_empty() {
             DiscoveredCollectionRecords::default()
         } else {
-            let requested = ticket
-                .commits()
-                .iter()
-                .map(CollectionCommit::id)
-                .collect::<BTreeSet<_>>();
-            let discovered =
-                discover_collection_records_for_collection_ticket(self, &requested, collection)
-                    .map_err(CollectionMaterializationError::Discovery)?;
-            validate_exact_ticket(&discovered, ticket.commits())
-                .map_err(CollectionMaterializationError::ExactTicket)?;
-            discovered
+            discover_collection_equations_for_cover(self, cover)
+                .map_err(CollectionMaterializationError::Discovery)?
         };
-        snapshot_from_observation(self, &descriptor, discovered, ticket.clone())
+        snapshot_from_observation(self, &descriptor, discovered, cover.clone())
             .map(CollectionSnapshot::into_facts)
+    }
+
+    /// Return every strictly verified provenance claim currently known for the
+    /// members of an opaque cover.
+    ///
+    /// This query is intentionally broader than the admission event which
+    /// minted the cover: later authorship or metadata claims over the same
+    /// payloads are visible without changing the cover itself.
+    fn claims(
+        &mut self,
+        cover: &Cover,
+    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<Self::RecordsError>> {
+        let discovered = discover_collection_claims_for_cover(self, cover)?;
+        Ok(discovered.commits().to_vec())
     }
 }
 
 impl<S> CollectionStoreExt for S where S: BlobStore + CollectionStore + ArtifactOfferStore {}
 
-/// Materialize one already-discovered exact commit frontier.
+/// Materialize one already-discovered exact payload cover.
 ///
-/// Ordinary admitted snapshots and exact-ticket collection kinds use this
-/// single validator so descriptor, mandatory dependency, merge-cover, and
-/// reader-snapshot semantics cannot drift apart.
+/// Ordinary admitted snapshots, opaque replay, and exact-derived collection kinds use this
+/// single validator so descriptor, mandatory member, merge-cover, and
+/// reader-snapshot semantics cannot drift apart. Signed claims may have
+/// established a cover originally, but replay does not require them: metadata
+/// and authors remain optional provenance over the same payload member.
 pub(crate) fn snapshot_from_observation<S>(
     storage: &mut S,
     descriptor: &Fragment,
     discovered: DiscoveredCollectionRecords,
-    ticket: CollectionTicket,
+    cover: Cover,
 ) -> Result<
     CollectionSnapshot<S::Reader>,
     CollectionMaterializationError<
@@ -1207,25 +1094,21 @@ where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
 {
-    let collection = ticket.collection();
-    let commits = ticket.commits();
-    let admitted: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
-
+    let collection = cover.collection();
     let reader = storage
         .reader()
         .map_err(CollectionMaterializationError::Reader)?;
 
-    if commits.is_empty() {
+    if cover.is_empty() {
         return Ok(CollectionSnapshot {
             facts: TribleSet::new(),
-            ticket,
+            cover,
             reader,
         });
     }
 
-    // The descriptor handle is the collection identity. Once an admitted
-    // commit makes this collection nonempty, its descriptor is mandatory
-    // ground truth just like the signed data and metadata below. Fetch by
+    // The descriptor handle is the collection identity. A nonempty cover makes
+    // its descriptor and named payloads mandatory ground truth. Fetch by
     // the exact handle, recompute the identity rather than trusting a
     // cached handle, decode the canonical archive, and bind it back to the
     // facade's expected semantics before interpreting any element.
@@ -1250,92 +1133,29 @@ where
         return Err(CollectionMaterializationError::DescriptorMismatch { collection });
     }
 
-    // Authenticate and exact-validate every mandatory leaf first. Commit
-    // signatures were verified individually during discovery. Blob
-    // validation is instead keyed by content identity: several distinct
-    // signed commits may name the same data or metadata, and one reader
-    // snapshot cannot give that handle different bytes. Fetch and
-    // canonical-check each distinct handle once while retaining every
-    // commit as provenance and every data handle as a semantic root.
-    // Authenticated data remains available for fallback; derived scratch
-    // values below have a shorter, use-counted lifetime.
-    let fetch_data = |claim: &CollectionCommit| {
-        let data = claim.data();
-        reader
-            .get(Handle::<SimpleArchive>::from_hash(data))
-            .map_err(|source| CollectionMaterializationError::CommitDataGet {
-                commit: claim.id(),
-                data,
-                source,
-            })
-    };
-    let fetch_metadata = |claim: &CollectionCommit| {
-        let metadata = claim.metadata();
-        reader
-            .get(metadata)
-            .map_err(|source| CollectionMaterializationError::CommitMetadataGet {
-                commit: claim.id(),
-                metadata,
-                source,
-            })
-    };
-    let validate_metadata = |claim: &CollectionCommit, metadata_blob: &Blob<SimpleArchive>| {
-        let metadata = claim.metadata();
-        simplearchive_union::validate_element(metadata_blob).map_err(|source| {
-            CollectionMaterializationError::InvalidCommitMetadata {
-                commit: claim.id(),
-                metadata,
-                source,
-            }
-        })?;
-        let actual_metadata = Blob::<SimpleArchive>::new(metadata_blob.bytes.clone()).get_handle();
-        if actual_metadata != metadata {
-            return Err(
-                CollectionMaterializationError::InvalidCommitMetadataIdentity {
-                    commit: claim.id(),
-                    expected: metadata,
-                    actual: actual_metadata,
-                },
-            );
-        }
-        Ok(())
-    };
-    #[cfg(feature = "parallel")]
-    let mut known = validate_unique_commit_dependencies_parallel(
-        commits,
-        descriptor,
-        fetch_data,
-        fetch_metadata,
-        validate_metadata,
-        |claim, source| CollectionMaterializationError::InvalidCommitData {
-            commit: claim.id(),
-            source,
-        },
-    )?;
-    #[cfg(not(feature = "parallel"))]
-    let mut known = validate_unique_commit_dependencies(
-        commits,
-        |claim| {
-            let data_blob = fetch_data(claim)?;
-            simplearchive_union::validate_commit(descriptor, claim, &data_blob).map_err(
-                |source| CollectionMaterializationError::InvalidCommitData {
-                    commit: claim.id(),
-                    source,
-                },
-            )?;
-            Ok(data_blob)
-        },
-        |claim| {
-            let metadata_blob = fetch_metadata(claim)?;
-            validate_metadata(claim, &metadata_blob)
-        },
-    )?;
-    let roots: BTreeSet<_> = known.keys().copied().collect();
+    // Fetch and validate each cover payload exactly once. Claims, authorship,
+    // and metadata are intentionally absent: replay remains valid even when no
+    // provenance record or metadata blob is resident.
+    let mut known = BTreeMap::new();
+    for member in cover.members() {
+        let blob = reader
+            .get(Handle::<SimpleArchive>::from_hash(member))
+            .map_err(|source| CollectionMaterializationError::MemberGet { member, source })?;
+        simplearchive_union::validate_member(descriptor, collection, member, &blob)
+            .map_err(|source| CollectionMaterializationError::InvalidMember { member, source })?;
+        known.insert(member, blob);
+    }
+    let roots: BTreeSet<_> = cover.members().collect();
+    let explicit_roots: BTreeSet<_> = roots
+        .iter()
+        .copied()
+        .map(|data| (collection, data))
+        .collect();
 
     // Unsigned merges are useful only when they can contribute to a
     // resident physical cover. Walk backwards from resident result hashes
-    // first, then validate that finite subgraph forwards from authenticated
-    // leaves. This retains the resolver's nonresident-intermediate model:
+    // first, then validate that finite subgraph forwards from the explicit
+    // cover roots. This retains the resolver's nonresident-intermediate model:
     // an intermediate need not be stored when its computed bytes feed a
     // later resident result.
     let merges: Vec<_> = discovered
@@ -1382,7 +1202,7 @@ where
         }
     }
 
-    // Index each candidate by its missing inputs. Newly admitted results
+    // Index each candidate by its missing inputs. Newly validated results
     // wake only their direct dependants, avoiding repeated global scans as
     // a deep LSM cover becomes grounded.
     let mut missing = vec![u8::MAX; merges.len()];
@@ -1509,19 +1329,23 @@ where
 
     // A plain collection facade owns one root collection and derives
     // nothing, so it declares no lineage.
-    let resolution =
-        resolve_collection_semantics(&discovered, &BTreeMap::new(), &admitted, |request| {
+    let resolution = resolve_collection_semantics_from_roots(
+        &discovered,
+        &BTreeMap::new(),
+        &explicit_roots,
+        |request| {
             Ok::<CollectionClaimValidation<()>, Infallible>(match request {
-                CollectionValidationRequest::Commit { .. } => CollectionClaimValidation::Accepted,
                 CollectionValidationRequest::Merge { claim, .. }
                     if accepted_merges.contains(&claim.id()) =>
                 {
                     CollectionClaimValidation::Accepted
                 }
-                CollectionValidationRequest::Merge { .. }
+                CollectionValidationRequest::Commit { .. }
+                | CollectionValidationRequest::Merge { .. }
                 | CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
             })
-        });
+        },
+    );
 
     let resolution = match resolution {
         Ok(resolution) => resolution,
@@ -1547,19 +1371,19 @@ where
     }
 
     let mut selected = BTreeMap::<CollectionData, Blob<SimpleArchive>>::new();
-    let cover = loop {
-        let cover = collection_physical_cover(semantics, collection, &resident);
-        if !cover.missing.is_empty() {
+    let physical_cover = loop {
+        let candidate = collection_physical_cover(semantics, collection, &resident);
+        if !candidate.missing.is_empty() {
             return Err(CollectionMaterializationError::Materialize(
                 MaterializationError::Missing {
-                    obligations: cover.missing,
+                    obligations: candidate.missing,
                 },
             ));
         }
 
-        selected.retain(|data, _| cover.cover.contains(data));
+        selected.retain(|data, _| candidate.cover.contains(data));
         let mut rejected = Vec::new();
-        for data in cover.cover.iter().copied() {
+        for data in candidate.cover.iter().copied() {
             if roots.contains(&data) || selected.contains_key(&data) {
                 continue;
             }
@@ -1581,19 +1405,19 @@ where
         }
 
         if rejected.is_empty() {
-            break cover.cover;
+            break candidate.cover;
         }
         for data in rejected {
             resident.remove(&data);
         }
     };
 
-    let mut members = Vec::with_capacity(cover.len());
-    for data in cover {
+    let mut members = Vec::with_capacity(physical_cover.len());
+    for data in physical_cover {
         let blob = if roots.contains(&data) {
             known
                 .get(&data)
-                .expect("authenticated root bytes stay cached")
+                .expect("explicit cover-root bytes stay cached")
         } else {
             selected
                 .get(&data)
@@ -1628,7 +1452,7 @@ where
     };
     Ok(CollectionSnapshot {
         facts,
-        ticket,
+        cover,
         reader,
     })
 }

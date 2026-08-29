@@ -19,11 +19,11 @@ pub mod api;
 /// Reading one collection descriptor's facts.
 pub mod descriptor;
 pub mod discovery;
-/// Shared exact-ticket lifecycle for canonical derived collections.
+/// Shared exact-cover lifecycle for canonical derived collections.
 pub mod exact_derived;
 /// Explicit size-tiered maintenance for exact canonical target covers.
 pub mod exact_target_compaction;
-/// Maintained stated last-write-wins registers over exact source tickets.
+/// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.

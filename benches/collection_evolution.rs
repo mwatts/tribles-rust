@@ -1,7 +1,7 @@
-//! Evolving-ticket maintenance benchmark for canonical Succinct collections.
+//! Evolving-cover maintenance benchmark for canonical Succinct collections.
 //!
 //! This benchmark compares the three real public maintenance operations on
-//! geometrically growing exact tickets:
+//! geometrically growing exact covers:
 //!
 //! - `ensure_exact`: canonical raw Succinct derivation plus Rank9 fibers.
 //! - `exact_view().ensure`: retain already-admitted immutable shards and run
@@ -14,7 +14,7 @@
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
 //! state; a bench-local algebra wrapper performs one untimed, zero-write raw
-//! re-admission for stateless arms to expose replay work that store totals hide.
+//! fresh attachment for stateless arms to expose replay work that store totals hide.
 //! The maintained view reports the raw algebra calls made during its timed
 //! observation, so continuation reuse is measured rather than inferred from
 //! durable writes. It is intentionally not replayed after timing: that would
@@ -49,15 +49,15 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::exact_derived::{
-    ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
+    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
 };
 use triblespace_core::collection::reach;
 use triblespace_core::collection::succinctarchive_union::{
     SuccinctArchiveCollection, SuccinctArchiveView, SuccinctArchiveViewWork,
 };
 use triblespace_core::collection::{
-    simplearchive_union, CollectionCommit, CollectionHandle, CollectionRecord, CollectionStore,
-    CollectionStoreExt,
+    simplearchive_union, CollectionHandle, CollectionRecord, CollectionStore, CollectionStoreExt,
+    Cover,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
@@ -273,9 +273,7 @@ struct CoverIdentity {
     hash: [u8; 32],
 }
 
-fn cover_identity(
-    cover: &triblespace_core::collection::exact_derived::ExactCover<SuccinctArchiveBlob>,
-) -> CoverIdentity {
+fn cover_identity(cover: &CoverAttachment<SuccinctArchiveBlob>) -> CoverIdentity {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0u64;
     for (data, blob) in cover.members() {
@@ -300,14 +298,14 @@ impl Operation {
         self,
         succinct: &SuccinctArchiveCollection,
         store: &mut MemoryRepo,
-        ticket: &[CollectionCommit],
+        cover: &Cover,
     ) -> UnionArchive<OrderedUniverse> {
         match self {
             Self::Ensure => succinct
-                .ensure_exact(store, ticket)
+                .ensure_exact(store, cover)
                 .expect("ensure exact Succinct collection"),
             Self::Compact => succinct
-                .compact_exact(store, ticket)
+                .compact_exact(store, cover)
                 .expect("compact exact Succinct collection"),
         }
     }
@@ -368,7 +366,7 @@ struct TimedOperation {
 }
 
 struct RunContext<'a> {
-    ticket: &'a [CollectionCommit],
+    cover: &'a Cover,
     total_rows: u64,
     newly_supported_rows: u64,
     expected: RelationIdentity,
@@ -380,11 +378,11 @@ struct RunContext<'a> {
 fn time_operation(
     operation: Operation,
     store: &mut MemoryRepo,
-    ticket: &[CollectionCommit],
+    cover: &Cover,
     succinct: &SuccinctArchiveCollection,
 ) -> TimedOperation {
     let start = Instant::now();
-    let union = operation.execute(succinct, store, ticket);
+    let union = operation.execute(succinct, store, cover);
     let elapsed = start.elapsed();
     black_box(union.segment_count());
     TimedOperation { elapsed, union }
@@ -392,12 +390,12 @@ fn time_operation(
 
 fn diagnose_raw(
     store: &mut MemoryRepo,
-    ticket: &[CollectionCommit],
+    cover: &Cover,
     succinct: &SuccinctArchiveCollection,
     exact: &ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob>,
 ) -> (AlgebraCalls, CoverIdentity) {
     // This is outside the timer and must be a zero-write operation: it measures
-    // the scratch proof graph needed to re-admit the exact raw cover now held
+    // the scratch proof graph needed to revalidate the exact raw cover now held
     // by this arm. The public Rank9 phase remains represented only by timing
     // and its durable DERIVE/blob delta because its algebra is intentionally
     // private to the facade.
@@ -409,7 +407,7 @@ fn diagnose_raw(
         .expect("snapshot pre-diagnostic artifact offers");
     let algebra = CountingAlgebra::new(succinct);
     let raw_cover = exact
-        .ensure_exact(store, ticket, &algebra)
+        .ensure_exact(store, cover, &algebra)
         .expect("diagnose complete raw exact cover");
     let algebra_calls = algebra.calls.get();
     let cover = cover_identity(&raw_cover);
@@ -442,7 +440,7 @@ fn finish_sample(
     let relation = relation_identity(timed.union.iter());
     Sample {
         arm,
-        commits: context.ticket.len(),
+        commits: context.cover.len(),
         total_rows: context.total_rows,
         basis_rows,
         elapsed: timed.elapsed,
@@ -463,7 +461,7 @@ fn run_warm_pair(
         Operation::Ensure => (Arm::EnsureWarm, Arm::EnsureNoop),
         Operation::Compact => (Arm::CompactWarm, Arm::CompactNoop),
     };
-    let timed_warm = time_operation(operation, store, context.ticket, context.succinct);
+    let timed_warm = time_operation(operation, store, context.cover, context.succinct);
     let revision_after_warm = store
         .store_revision()
         .expect("snapshot revision between warm and no-op calls");
@@ -473,7 +471,7 @@ fn run_warm_pair(
 
     // Keep these public calls adjacent. In particular, do not materialize the
     // first result or replay the exact proof before timing the unchanged call.
-    let timed_noop = time_operation(operation, store, context.ticket, context.succinct);
+    let timed_noop = time_operation(operation, store, context.cover, context.succinct);
     let revision_after_noop = store
         .store_revision()
         .expect("snapshot revision after no-op call");
@@ -491,7 +489,7 @@ fn run_warm_pair(
 
     let after = store_shape(store, context.collections);
     let warm_work = after.difference(before);
-    let diagnostic = diagnose_raw(store, context.ticket, context.succinct, context.exact);
+    let diagnostic = diagnose_raw(store, context.cover, context.succinct, context.exact);
     let warm = finish_sample(
         warm_arm,
         context,
@@ -527,9 +525,9 @@ fn run_cold(
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> Sample {
-    let timed = time_operation(operation, store, context.ticket, context.succinct);
+    let timed = time_operation(operation, store, context.cover, context.succinct);
     let after = store_shape(store, context.collections);
-    let diagnostic = diagnose_raw(store, context.ticket, context.succinct, context.exact);
+    let diagnostic = diagnose_raw(store, context.cover, context.succinct, context.exact);
     let cold = finish_sample(
         arm,
         context,
@@ -573,11 +571,11 @@ fn run_operation_family(
 fn time_exact_view(
     view: &mut SuccinctArchiveView,
     store: &mut MemoryRepo,
-    ticket: &[CollectionCommit],
+    cover: &Cover,
 ) -> TimedOperation {
     let start = Instant::now();
     let union = view
-        .ensure(store, ticket)
+        .ensure(store, cover)
         .expect("advance maintained exact Succinct view");
     let elapsed = start.elapsed();
     black_box(union.segment_count());
@@ -590,15 +588,15 @@ fn run_exact_view_pair(
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
-    let timed_advance = time_exact_view(view, store, context.ticket);
+    let timed_advance = time_exact_view(view, store, context.cover);
     let advance_work = view
         .last_work()
         .expect("successful view advance records actual work");
-    assert_eq!(advance_work.ticket_commits, context.ticket.len());
+    assert_eq!(advance_work.cover_members, context.cover.len());
     assert_eq!(
-        advance_work.admitted_commits + advance_work.reused_commits,
-        context.ticket.len(),
-        "view support accounting must cover the exact ticket",
+        advance_work.processed_members + advance_work.reused_members,
+        context.cover.len(),
+        "view support accounting must cover the exact payload set",
     );
     let revision_after_advance = store
         .store_revision()
@@ -607,19 +605,19 @@ fn run_exact_view_pair(
         .offers_snapshot()
         .expect("snapshot offers between view advance and no-op");
 
-    let timed_noop = time_exact_view(view, store, context.ticket);
+    let timed_noop = time_exact_view(view, store, context.cover);
     let noop_work = view
         .last_work()
         .expect("successful view no-op records actual work");
     assert_eq!(
         noop_work,
         SuccinctArchiveViewWork {
-            ticket_commits: context.ticket.len(),
-            admitted_commits: 0,
-            reused_commits: context.ticket.len(),
+            cover_members: context.cover.len(),
+            processed_members: 0,
+            reused_members: context.cover.len(),
             ..SuccinctArchiveViewWork::default()
         },
-        "an identical exact-view ticket must not replay raw proof work",
+        "an identical exact-view cover must not replay raw proof work",
     );
     assert!(
         store
@@ -784,12 +782,10 @@ fn run_iteration(
         }
         published = checkpoint;
 
-        let ticket = source_accounting
-            .ticket(collections.source, &[])
-            .expect("freeze accounting source ticket")
-            .commits()
-            .to_vec();
-        assert_eq!(ticket.len(), checkpoint);
+        let cover = source_accounting
+            .cover(collections.source, &[])
+            .expect("freeze accounting source cover");
+        assert_eq!(cover.len(), checkpoint);
         let source_shape = store_shape(&mut source_accounting, &collections);
 
         let total_rows = expected.len() as u64;
@@ -797,7 +793,7 @@ fn run_iteration(
         previous_rows = total_rows;
         let expected_identity = relation_identity_set(&expected);
         let context = RunContext {
-            ticket: &ticket,
+            cover: &cover,
             total_rows,
             newly_supported_rows,
             expected: expected_identity,
@@ -1076,7 +1072,7 @@ fn main() {
                         format!("{:.2}", calls.input_bytes as f64 / (1024.0 * 1024.0)),
                     ),
                     Diagnostic::ViewActual(work) => (
-                        format!("{}/{}", work.admitted_commits, work.reused_commits),
+                        format!("{}/{}", work.processed_members, work.reused_members),
                         format!(
                             "{}/{}/{}/{}/{}",
                             work.validate_source,

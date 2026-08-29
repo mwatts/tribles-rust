@@ -5,7 +5,7 @@
 //! read repeats the joins from a state to its identity and order value. This
 //! module projects exactly those two columns into an exact derived collection
 //! and builds an [`LwwIndex`](crate::collection::lww_register::LwwIndex) when a
-//! reader attaches a ticket.
+//! reader attaches a cover.
 //!
 //! # Why the maintained element contains both fact halves
 //!
@@ -34,7 +34,7 @@
 //!
 //! # Data contract
 //!
-//! Within one exact source ticket, a state which asserts both halves may assert
+//! Within one exact source cover, a state which asserts both halves may assert
 //! at most one well-formed identity and at most one order value under the
 //! descriptor's two attributes. Repeating the same fact is harmless set
 //! idempotence. Distinct values are retained by the union law and rejected when
@@ -70,14 +70,14 @@ use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{
-    ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
+    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
     ExactDerivedCollectionError,
 };
 use super::records::{
     collection_authority, collection_reach, collection_recipe, collection_representation,
     collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
-use super::{simplearchive_union, CollectionCommit, CollectionStore};
+use super::{simplearchive_union, CollectionStore, Cover};
 
 const ID_LEN: usize = 16;
 const KEY_LEN: usize = 32;
@@ -394,7 +394,7 @@ impl MetaDescribe for LwwRegisterV1 {
     }
 }
 
-/// An attached last-write-wins index over one exact source ticket.
+/// An attached last-write-wins index over one exact source cover.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LwwIndex {
     coordinates: BTreeMap<RawId, (RawId, RawKey)>,
@@ -591,31 +591,31 @@ impl LwwRegisterCollection {
         )
     }
 
-    /// Attach an already resident exact projection for `ticket`.
+    /// Attach an already resident exact projection for `source_cover`.
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<LwwIndex, LwwRegisterCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, ticket, self)?;
+        let cover = self.kernel().attach_exact(store, source_cover, self)?;
         self.index_from_cover(cover)
     }
 
-    /// Ensure and attach the exact projection for `ticket`.
+    /// Ensure and attach the exact projection for `source_cover`.
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<LwwIndex, LwwRegisterCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(store, ticket, self)?;
+        let cover = self.kernel().ensure_exact(store, source_cover, self)?;
         self.index_from_cover(cover)
     }
 
@@ -625,7 +625,7 @@ impl LwwRegisterCollection {
 
     fn index_from_cover(
         &self,
-        cover: ExactCover<LwwRegisterBlob>,
+        cover: CoverAttachment<LwwRegisterBlob>,
     ) -> Result<LwwIndex, LwwRegisterCollectionError> {
         let mut combined = Projection::default();
         for segment in cover.into_blobs() {
@@ -636,10 +636,10 @@ impl LwwRegisterCollection {
     }
 }
 
-/// Failure to attach or construct one exact maintained LWW ticket.
+/// Failure to attach or construct one exact maintained LWW cover.
 #[derive(Debug)]
 pub enum LwwRegisterCollectionError {
-    /// Exact-ticket authority, resolution, construction, or storage failed.
+    /// Exact-cover resolution, construction, or storage failed.
     Collection(ExactDerivedCollectionError),
     /// Canonical projection construction or joining failed.
     Algebra(LwwRegisterError),
@@ -1091,13 +1091,16 @@ mod tests {
             &signing_key,
         )
         .unwrap();
-        let ticket = [identity_commit, order_commit];
+        let source_cover = Cover::from_members(
+            collection.source_collection(),
+            [identity_commit.data(), order_commit.data()],
+        );
 
-        let ensured = collection.ensure_exact(&mut store, &ticket).unwrap();
+        let ensured = collection.ensure_exact(&mut store, &source_cover).unwrap();
         assert_eq!(ensured.winner(*register), Some(*state));
         assert_eq!(
             collection
-                .attach_exact(&mut store, &ticket)
+                .attach_exact(&mut store, &source_cover)
                 .unwrap()
                 .winner(*register),
             Some(*state)

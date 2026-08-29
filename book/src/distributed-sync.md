@@ -334,14 +334,14 @@ does not blindly mirror every artifact named by them. An exact derived
 collection can instead ask `ensure_exact_derived` to reuse a physical cover
 already materialized elsewhere:
 
-1. the caller supplies one frozen, authenticated source ticket whose source
-   data and dependencies are resident locally;
+1. the caller supplies one frozen, opaque source cover whose payload
+   members and dependencies are resident locally;
 2. the peer freezes target `MERGE` and `DERIVE` result handles from its current
    converged record view as speculative availability offers;
 3. the core exact resolver first accepts any complete resident cover, then—if
    local bytes are insufficient—selects an exact antichain from those offers;
 4. the network fetches only the selected handles with authenticated exact
-   `GET_BLOB` requests and probes the same ticket again;
+   `GET_BLOB` requests and probes the same cover again;
 5. an absent, malformed, or stale offer is removed and the resolver replans;
    when no offered cover remains, ordinary local `ensure_exact` construction
    is the fallback.

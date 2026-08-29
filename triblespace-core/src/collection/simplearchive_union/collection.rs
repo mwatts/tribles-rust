@@ -1,11 +1,10 @@
-//! Read-only exact-ticket facade for one scoped `SimpleArchive` collection.
+//! Read-only exact-cover facade for one scoped `SimpleArchive` collection.
 //!
 //! [`SimpleArchiveCollection`] carries only the fixed canonical descriptor.
-//! Callers supply a mathematical set of complete signed commits on every read;
-//! no signing key, mutable head, signer-wide discovery rule, or write surface is
-//! present. Byte-identical ticket repeats collapse, while the stored records,
-//! signatures, descriptor, data, and mandatory metadata are all checked before
-//! facts are returned.
+//! Callers supply one opaque payload cover on every read; no signing key,
+//! mutable head, signer-wide discovery rule, or write surface is present.
+//! Signatures and metadata remain queryable provenance over those payloads and
+//! are not coordinates of the materialized value.
 
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
@@ -13,25 +12,20 @@
 use crate::collection::reach;
 use ed25519_dalek::VerifyingKey;
 
-use std::collections::BTreeSet;
 use std::convert::Infallible;
 
-use crate::collection::api::{snapshot_from_observation, CollectionSnapshot, CollectionTicket};
-use crate::collection::discovery::{
-    canonicalize_exact_ticket, discover_collection_records_for_collection_ticket,
-    validate_exact_ticket,
-};
+use crate::collection::api::{snapshot_from_observation, CollectionSnapshot, Cover};
+use crate::collection::discovery::discover_collection_equations_for_cover;
 use crate::collection::{
-    CollectionCommit, CollectionHandle, CollectionMaterializationError, CollectionStore,
-    DiscoveredCollectionRecords,
+    CollectionHandle, CollectionMaterializationError, CollectionStore, DiscoveredCollectionRecords,
 };
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, TribleSet};
 
-/// Read-only exact-ticket view of one canonical `SimpleArchive` union.
+/// Read-only exact-cover view of one canonical `SimpleArchive` union.
 ///
 /// The scope fixes the descriptor, while each call supplies the complete
-/// commit authority set. The facade borrows storage only for the duration of a
+/// explicit payload set. The facade borrows storage only for the duration of a
 /// read and has no API capable of inserting blobs or collection records.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleArchiveCollection {
@@ -41,11 +35,11 @@ pub struct SimpleArchiveCollection {
 }
 
 impl SimpleArchiveCollection {
-    /// Construct a read-only exact-ticket facade for one named root.
+    /// Construct a read-only exact-cover facade for one named root.
     ///
     /// `reach` is not decoration on a read facade: it is part of the
     /// descriptor this facade hashes, so a facade that names the wrong reach
-    /// names a different collection and matches no ticket.
+    /// names a different collection and matches no cover.
     pub fn new(name: impl Into<String>, authority: VerifyingKey, reach: Fragment) -> Self {
         Self {
             name: name.into(),
@@ -77,30 +71,25 @@ impl SimpleArchiveCollection {
     /// Content identity of this collection's descriptor.
     ///
     /// This is the read side: the facade is not storing anything, it is
-    /// naming the collection a ticket must match. A write path takes its
+    /// naming the collection a cover must match. A write path takes its
     /// handle from what `put` returns instead.
     pub fn collection(&self) -> CollectionHandle {
         use crate::blob::encodings::simplearchive::SimpleArchive;
         crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts()).get_handle()
     }
 
-    /// Attach the exact ticket as a materialized fact set without writing.
+    /// Attach the exact opaque cover as a materialized fact set without writing.
     ///
-    /// The ticket is a set of complete [`CollectionCommit`] records, not a
-    /// signer filter. Every member may therefore have a different author, but
-    /// it must name this exact descriptor, byte-match a strictly verified
-    /// stored record, and have resident valid descriptor, data, and metadata
-    /// dependencies. Commits present in storage but absent from `ticket` are
-    /// inert. Same-descriptor `MERGE` records may provide an exact physical
-    /// cover, but never add authority. Stores should bound unsigned merge
-    /// admission because every admitted same-descriptor equation is candidate
-    /// cache evidence for this read.
+    /// Every member must belong to this exact descriptor and have resident,
+    /// canonical data. Same-descriptor `MERGE` records may provide an exact
+    /// physical realization, but never add payload members. Other commits
+    /// and provenance claims in storage are inert.
     ///
-    /// An empty ticket returns the local empty set without touching storage.
+    /// An empty cover returns the local empty set without touching storage.
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        cover: &Cover,
     ) -> Result<
         TribleSet,
         CollectionMaterializationError<
@@ -114,27 +103,33 @@ impl SimpleArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let commits = canonicalize_exact_ticket(ticket, self.collection())
-            .map_err(CollectionMaterializationError::ExactTicket)?;
-        if commits.is_empty() {
+        if cover.collection() != self.collection() {
+            return Err(CollectionMaterializationError::ExactCover(
+                crate::collection::ExactCoverError::WrongCollection {
+                    expected: self.collection(),
+                    actual: cover.collection(),
+                },
+            ));
+        }
+        if cover.is_empty() {
             return Ok(TribleSet::new());
         }
-        self.snapshot_canonical(store, commits)
+        self.snapshot_canonical(store, cover.clone())
             .map(CollectionSnapshot::into_facts)
     }
 
-    /// Capture one coherent exact-ticket fact, commit, and reader snapshot.
+    /// Capture one coherent exact-cover fact, cover, and reader snapshot.
     ///
     /// Record selection happens once before one blob reader is opened. The
-    /// returned commits are canonical intrinsic-id ordered and duplicate-free,
-    /// and only those commits can authorize the returned facts even if the
-    /// reader physically contains later or otherwise unselected blobs.
-    /// An empty ticket still opens and returns a reader, matching
+    /// returned payload members are canonical and duplicate-free, and only
+    /// those members can contribute facts even if the reader physically
+    /// contains later or otherwise unselected blobs. An empty cover still
+    /// opens and returns a reader, matching
     /// [`crate::collection::CollectionStoreExt::snapshot`].
     pub fn snapshot_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        cover: &Cover,
     ) -> Result<
         CollectionSnapshot<S::Reader>,
         CollectionMaterializationError<
@@ -148,15 +143,21 @@ impl SimpleArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let commits = canonicalize_exact_ticket(ticket, self.collection())
-            .map_err(CollectionMaterializationError::ExactTicket)?;
-        self.snapshot_canonical(store, commits)
+        if cover.collection() != self.collection() {
+            return Err(CollectionMaterializationError::ExactCover(
+                crate::collection::ExactCoverError::WrongCollection {
+                    expected: self.collection(),
+                    actual: cover.collection(),
+                },
+            ));
+        }
+        self.snapshot_canonical(store, cover.clone())
     }
 
     fn snapshot_canonical<S>(
         &self,
         store: &mut S,
-        commits: Vec<CollectionCommit>,
+        cover: Cover,
     ) -> Result<
         CollectionSnapshot<S::Reader>,
         CollectionMaterializationError<
@@ -171,29 +172,24 @@ impl SimpleArchiveCollection {
         S::Reader: BlobStoreMeta,
     {
         let descriptor = self.descriptor();
-        let collection = self.collection();
-        let ticket = CollectionTicket::from_canonical(collection, commits);
-        if ticket.is_empty() {
+        if cover.is_empty() {
             return snapshot_from_observation(
                 store,
                 &descriptor,
                 DiscoveredCollectionRecords::default(),
-                ticket,
+                cover,
             );
         }
 
-        let requested: BTreeSet<_> = ticket.commits().iter().map(CollectionCommit::id).collect();
-        let discovered =
-            discover_collection_records_for_collection_ticket(store, &requested, collection)
-                .map_err(CollectionMaterializationError::Discovery)?;
-        validate_exact_ticket(&discovered, ticket.commits())
-            .map_err(CollectionMaterializationError::ExactTicket)?;
-        snapshot_from_observation(store, &descriptor, discovered, ticket)
+        let discovered = discover_collection_equations_for_cover(store, &cover)
+            .map_err(CollectionMaterializationError::Discovery)?;
+        snapshot_from_observation(store, &descriptor, discovered, cover)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::convert::Infallible;
 
     use ed25519_dalek::SigningKey;
@@ -202,7 +198,10 @@ mod tests {
     use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
     use crate::blob::{Blob, BlobEncoding, Bytes, IntoBlob};
     use crate::collection::descriptor::identity_for_tests;
-    use crate::collection::{CollectionRecord, CollectionRecordSelector, ExactTicketError};
+    use crate::collection::{
+        CollectionCommit, CollectionRecord, CollectionRecordSelector, CollectionStoreExt,
+        ExactCoverError,
+    };
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
     use crate::repo::memoryrepo::MemoryRepo;
@@ -246,6 +245,16 @@ mod tests {
         )
         .unwrap();
         (commit, data)
+    }
+
+    fn cover(
+        facade: &SimpleArchiveCollection,
+        commits: impl IntoIterator<Item = CollectionCommit>,
+    ) -> Cover {
+        Cover::from_members(
+            facade.collection(),
+            commits.into_iter().map(|commit| commit.data()),
+        )
     }
 
     fn invalid_signature(commit: CollectionCommit) -> CollectionCommit {
@@ -319,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_authors_form_one_exact_sorted_set_and_unselected_commits_are_inert() {
+    fn mixed_authors_form_one_exact_sorted_set_and_unselected_claims_are_inert() {
         let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut store = MemoryRepo::default();
@@ -327,16 +336,15 @@ mod tests {
         let (second, _) = publish(&mut store, &descriptor, 8, 2);
         let (_unselected, _) = publish(&mut store, &descriptor, 9, 3);
 
-        let snapshot = facade
-            .snapshot_exact(&mut store, &[second, first, first])
-            .unwrap();
+        let requested = cover(&facade, [second, first, first]);
+        let snapshot = facade.snapshot_exact(&mut store, &requested).unwrap();
         let mut expected = facts(1);
         expected += facts(2);
-        let mut expected_commits = vec![first, second];
-        expected_commits.sort_unstable_by_key(CollectionCommit::id);
+        let expected_cover = cover(&facade, [first, second]);
 
         assert_eq!(snapshot.facts(), &expected);
-        assert_eq!(snapshot.commits(), expected_commits);
+        assert_eq!(snapshot.cover(), &expected_cover);
+        assert_eq!(snapshot.cover().len(), 2);
         assert_ne!(first.public_key(), second.public_key());
     }
 
@@ -351,141 +359,143 @@ mod tests {
             ..ReadOnlyCountingStore::default()
         };
 
-        let snapshot = facade.snapshot_exact(&mut store, &[commit]).unwrap();
+        let requested = cover(&facade, [commit]);
+        let snapshot = facade.snapshot_exact(&mut store, &requested).unwrap();
 
         assert_eq!(snapshot.facts(), &facts(1));
-        assert_eq!(snapshot.commits(), &[commit]);
+        assert_eq!(snapshot.cover(), &requested);
         assert_eq!(store.selections, 1);
         assert_eq!(store.readers, 1);
         assert_eq!(
             store.last_selectors,
-            Some(BTreeSet::from([
-                CollectionRecordSelector::Id(commit.id()),
-                CollectionRecordSelector::MergeCollection(identity_for_tests(&descriptor)),
-            ])),
+            Some(BTreeSet::from([CollectionRecordSelector::MergeCollection(
+                identity_for_tests(&descriptor),
+            )])),
         );
     }
 
     #[test]
-    fn conflicting_ticket_bytes_and_a_mismatched_stored_record_fail_closed() {
+    fn duplicate_same_data_claims_and_their_metadata_do_not_change_the_cover() {
         let facade = test_facade("first");
         let descriptor = facade.descriptor();
-        let metadata = crate::collection::empty_metadata_handle();
-        let first = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&descriptor),
-            Inline::new([3; 32]),
-            metadata,
-        );
-        let conflicting = CollectionCommit::sign(
+        let mut store = MemoryRepo::default();
+        let (first, data) = publish(&mut store, &descriptor, 7, 1);
+        let missing_metadata = Inline::new([42; 32]);
+        let missing_metadata_claim = CollectionCommit::sign(
             &SigningKey::from_bytes(&[8; 32]),
-            identity_for_tests(&descriptor),
-            Inline::new([4; 32]),
-            metadata,
-        )
-        .with_test_id(first.id());
-        let mut untouched = ReadOnlyCountingStore::default();
-        assert!(matches!(
-            facade.attach_exact(&mut untouched, &[first, conflicting]),
-            Err(CollectionMaterializationError::ExactTicket(
-                ExactTicketError::ConflictingCommit { commit }
-            )) if commit == first.id()
-        ));
-        assert_eq!((untouched.selections, untouched.readers), (0, 0));
-
-        let mut inner = MemoryRepo::default();
-        let (stored, _) = publish(&mut inner, &descriptor, 8, 2);
-        let requested = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            stored.collection(),
-            stored.data(),
-            stored.metadata(),
+            first.collection(),
+            first.data(),
+            missing_metadata,
         );
-        inner
-            .insert(CollectionRecord::Commit(
-                stored.with_test_id(requested.id()),
-            ))
+        let corrupt_metadata = Inline::new([43; 32]);
+        let corrupt_metadata_claim = CollectionCommit::sign(
+            &SigningKey::from_bytes(&[9; 32]),
+            first.collection(),
+            first.data(),
+            corrupt_metadata,
+        );
+        store
+            .insert(CollectionRecord::Commit(missing_metadata_claim))
             .unwrap();
-        let mut mismatched = ReadOnlyCountingStore {
-            inner,
-            ..ReadOnlyCountingStore::default()
-        };
-        assert!(matches!(
-            facade.attach_exact(&mut mismatched, &[requested]),
-            Err(CollectionMaterializationError::ExactTicket(
-                ExactTicketError::StoredCommitMismatch { commit }
-            )) if commit == requested.id()
+        store
+            .insert(CollectionRecord::Commit(corrupt_metadata_claim))
+            .unwrap();
+
+        let descriptor_handle = identity_for_tests(&descriptor);
+        let data_handle = data.get_handle();
+        store.blobs.keep([
+            descriptor_handle.transmute::<Handle<UnknownBlob>>(),
+            data_handle.transmute::<Handle<UnknownBlob>>(),
+        ]);
+        store.blobs.insert(Blob::with_handle(
+            Bytes::from(vec![0; 63]),
+            corrupt_metadata,
         ));
-        assert_eq!((mismatched.selections, mismatched.readers), (1, 0));
+
+        let requested = cover(
+            &facade,
+            [first, missing_metadata_claim, corrupt_metadata_claim],
+        );
+        assert_eq!(requested.len(), 1);
+        assert_eq!(
+            facade.attach_exact(&mut store, &requested).unwrap(),
+            facts(1)
+        );
+
+        let claims = store.claims(&requested).unwrap();
+        assert_eq!(claims.len(), 3);
+        assert!(claims.contains(&first));
+        assert!(claims.contains(&missing_metadata_claim));
+        assert!(claims.contains(&corrupt_metadata_claim));
     }
 
     #[test]
-    fn absent_mismatched_and_invalid_records_do_not_satisfy_a_ticket() {
+    fn an_opaque_cover_replays_payload_without_rechecking_its_claim() {
         let facade = test_facade("first");
         let descriptor = facade.descriptor();
 
         let mut source = MemoryRepo::default();
         let (absent, _) = publish(&mut source, &descriptor, 7, 1);
-        let mut empty = MemoryRepo::default();
-        assert!(matches!(
-            facade.attach_exact(&mut empty, &[absent]),
-            Err(CollectionMaterializationError::ExactTicket(
-                ExactTicketError::MissingOrInvalidCommit { commit }
-            )) if commit == absent.id()
-        ));
-
-        // The same descriptor, data, and metadata under another author's
-        // signature is semantically similar but not the same full record.
-        let mut mismatched = MemoryRepo::default();
-        let (stored, _) = publish(&mut mismatched, &descriptor, 8, 2);
-        let requested = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            stored.collection(),
-            stored.data(),
-            stored.metadata(),
+        let requested = cover(&facade, [absent]);
+        let mut claimless = MemoryRepo::default();
+        claimless.blobs = source.blobs.clone();
+        assert_eq!(
+            facade.attach_exact(&mut claimless, &requested).unwrap(),
+            facts(1)
         );
-        assert_ne!(requested.to_bytes(), stored.to_bytes());
-        assert!(matches!(
-            facade.attach_exact(&mut mismatched, &[requested]),
-            Err(CollectionMaterializationError::ExactTicket(
-                ExactTicketError::MissingOrInvalidCommit { commit }
-            )) if commit == requested.id()
-        ));
 
-        let mut invalid_store = source;
+        // A different author's valid signature is inert provenance over the
+        // same payload. Replay neither requires nor rechecks it.
+        let alternate_author = CollectionCommit::sign(
+            &SigningKey::from_bytes(&[8; 32]),
+            absent.collection(),
+            absent.data(),
+            absent.metadata(),
+        );
+        let mut alternate_store = MemoryRepo::default();
+        alternate_store.blobs = source.blobs.clone();
+        alternate_store
+            .insert(CollectionRecord::Commit(alternate_author))
+            .unwrap();
+        assert_eq!(
+            facade
+                .attach_exact(&mut alternate_store, &requested)
+                .unwrap(),
+            facts(1)
+        );
+
         let invalid = invalid_signature(absent);
+        let mut invalid_store = MemoryRepo::default();
+        invalid_store.blobs = source.blobs;
         invalid_store
             .insert(CollectionRecord::Commit(invalid))
             .unwrap();
-        assert!(matches!(
-            facade.attach_exact(&mut invalid_store, &[invalid]),
-            Err(CollectionMaterializationError::ExactTicket(
-                ExactTicketError::MissingOrInvalidCommit { commit }
-            )) if commit == invalid.id()
-        ));
+        assert_eq!(
+            facade.attach_exact(&mut invalid_store, &requested).unwrap(),
+            facts(1)
+        );
     }
 
     #[test]
-    fn a_ticket_for_another_descriptor_is_rejected_before_storage_access() {
+    fn a_cover_for_another_descriptor_is_rejected_before_storage_access() {
         let facade = test_facade("first");
         let other = test_facade("second");
         let mut source = MemoryRepo::default();
         let (commit, _) = publish(&mut source, &other.descriptor(), 7, 1);
+        let requested = cover(&other, [commit]);
         let mut store = ReadOnlyCountingStore {
             inner: source,
             ..ReadOnlyCountingStore::default()
         };
 
         assert!(matches!(
-            facade.attach_exact(&mut store, &[commit]),
-            Err(CollectionMaterializationError::ExactTicket(
-                ExactTicketError::WrongCollection {
-                    commit: found,
+            facade.attach_exact(&mut store, &requested),
+            Err(CollectionMaterializationError::ExactCover(
+                ExactCoverError::WrongCollection {
                     expected,
                     actual,
                 }
-            )) if found == commit.id()
-                && expected == facade.collection()
+            )) if expected == facade.collection()
                 && actual == other.collection()
         ));
         assert_eq!(store.selections, 0);
@@ -493,31 +503,29 @@ mod tests {
     }
 
     #[test]
-    fn every_signed_descriptor_data_and_metadata_dependency_is_mandatory() {
+    fn descriptor_and_member_data_are_mandatory() {
         let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut base = MemoryRepo::default();
         let (commit, _) = publish(&mut base, &descriptor, 7, 1);
+        let requested = cover(&facade, [commit]);
         let descriptor_handle = identity_for_tests(&descriptor);
         let data_handle = Handle::<SimpleArchive>::from_hash(commit.data());
-        let metadata_handle = commit.metadata();
 
         let mut missing_descriptor = base.clone();
-        missing_descriptor.blobs.keep([
-            data_handle.transmute::<Handle<UnknownBlob>>(),
-            metadata_handle.transmute::<Handle<UnknownBlob>>(),
-        ]);
+        missing_descriptor
+            .blobs
+            .keep([data_handle.transmute::<Handle<UnknownBlob>>()]);
         assert!(matches!(
-            facade.attach_exact(&mut missing_descriptor, &[commit]),
+            facade.attach_exact(&mut missing_descriptor, &requested),
             Err(CollectionMaterializationError::DescriptorGet { collection, .. })
                 if collection == descriptor_handle
         ));
 
         let mut corrupt_descriptor = base.clone();
-        corrupt_descriptor.blobs.keep([
-            data_handle.transmute::<Handle<UnknownBlob>>(),
-            metadata_handle.transmute::<Handle<UnknownBlob>>(),
-        ]);
+        corrupt_descriptor
+            .blobs
+            .keep([data_handle.transmute::<Handle<UnknownBlob>>()]);
         let wrong_descriptor = crate::blob::IntoBlob::<SimpleArchive>::to_blob(
             test_facade("ninth").descriptor().into_facts(),
         );
@@ -525,20 +533,19 @@ mod tests {
             .blobs
             .insert(Blob::with_handle(wrong_descriptor.bytes, descriptor_handle));
         assert!(matches!(
-            facade.attach_exact(&mut corrupt_descriptor, &[commit]),
+            facade.attach_exact(&mut corrupt_descriptor, &requested),
             Err(CollectionMaterializationError::DescriptorIdentity { expected, .. })
                 if expected == descriptor_handle
         ));
 
         let mut missing_data = base.clone();
-        missing_data.blobs.keep([
-            descriptor_handle.transmute::<Handle<UnknownBlob>>(),
-            metadata_handle.transmute::<Handle<UnknownBlob>>(),
-        ]);
+        missing_data
+            .blobs
+            .keep([descriptor_handle.transmute::<Handle<UnknownBlob>>()]);
         assert!(matches!(
-            facade.attach_exact(&mut missing_data, &[commit]),
-            Err(CollectionMaterializationError::CommitDataGet { commit: found, .. })
-                if found == commit.id()
+            facade.attach_exact(&mut missing_data, &requested),
+            Err(CollectionMaterializationError::MemberGet { member, .. })
+                if member == commit.data()
         ));
 
         let mut corrupt_data = missing_data;
@@ -546,30 +553,9 @@ mod tests {
             .blobs
             .insert(Blob::with_handle(Bytes::from(vec![0; 63]), data_handle));
         assert!(matches!(
-            facade.attach_exact(&mut corrupt_data, &[commit]),
-            Err(CollectionMaterializationError::InvalidCommitData { commit: found, .. })
-                if found == commit.id()
-        ));
-
-        let mut missing_metadata = base.clone();
-        missing_metadata.blobs.keep([
-            descriptor_handle.transmute::<Handle<UnknownBlob>>(),
-            data_handle.transmute::<Handle<UnknownBlob>>(),
-        ]);
-        assert!(matches!(
-            facade.attach_exact(&mut missing_metadata, &[commit]),
-            Err(CollectionMaterializationError::CommitMetadataGet { commit: found, .. })
-                if found == commit.id()
-        ));
-
-        let mut corrupt_metadata = missing_metadata;
-        corrupt_metadata
-            .blobs
-            .insert(Blob::with_handle(Bytes::from(vec![0; 63]), metadata_handle));
-        assert!(matches!(
-            facade.attach_exact(&mut corrupt_metadata, &[commit]),
-            Err(CollectionMaterializationError::InvalidCommitMetadata { commit: found, .. })
-                if found == commit.id()
+            facade.attach_exact(&mut corrupt_data, &requested),
+            Err(CollectionMaterializationError::InvalidMember { member, .. })
+                if member == commit.data()
         ));
     }
 
@@ -596,7 +582,8 @@ mod tests {
         )
         .unwrap();
 
-        let attached = facade.attach_exact(&mut store, &[second, first]).unwrap();
+        let requested = cover(&facade, [second, first]);
+        let attached = facade.attach_exact(&mut store, &requested).unwrap();
         let mut expected = facts(1);
         expected += facts(2);
         assert_eq!(attached, expected);
@@ -606,16 +593,18 @@ mod tests {
     fn empty_attach_is_store_free_while_empty_snapshot_returns_one_reader() {
         let facade = test_facade("first");
         let mut store = ReadOnlyCountingStore::default();
+        let empty = Cover::from_members(facade.collection(), std::iter::empty());
 
         assert_eq!(
-            facade.attach_exact(&mut store, &[]).unwrap(),
+            facade.attach_exact(&mut store, &empty).unwrap(),
             TribleSet::new()
         );
         assert_eq!((store.selections, store.readers), (0, 0));
 
-        let snapshot = facade.snapshot_exact(&mut store, &[]).unwrap();
+        let snapshot = facade.snapshot_exact(&mut store, &empty).unwrap();
         assert_eq!(snapshot.facts(), &TribleSet::new());
-        assert!(snapshot.commits().is_empty());
+        assert!(snapshot.cover().is_empty());
+        assert_eq!(snapshot.cover(), &empty);
         assert_eq!((store.selections, store.readers), (0, 1));
     }
 }

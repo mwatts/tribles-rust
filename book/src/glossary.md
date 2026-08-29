@@ -78,8 +78,19 @@ validated merge records describe joins within the lattice; derivation records
 map elements into another collection through a canonical homomorphism. A
 collection has no distinguished head.
 
+### Cover
+One exact point in a collection lattice, represented by the collection
+descriptor identity and a PATCH set of distinct payload handles. Signatures,
+authors, and metadata are optional provenance fibers queryable from the store,
+not part of cover identity or required for replay, so several claims over
+identical data collapse to one member. Distinct covers may have the same
+support: a validated merge can prove that `{a, b}` and `{a⊔b}` denote the same
+join. Cover construction is opaque;
+admission and validated collection algebra produce them rather than accepting
+caller-forged hash sets.
+
 ### Collection Admission
-The read-time signer decision performed by `store.ticket` and
+The read-time signer decision performed by `store.cover` and
 `store.snapshot`. The descriptor authority is admitted directly; each
 additional expected leaf must carry an explicit proof bundle which verifies at
 one clock instant against that authority and the exact
@@ -100,8 +111,8 @@ idempotent by intrinsic record ID; combining two stores is set union.
 
 ### Collection Snapshot
 One coherent known-prefix observation containing materialized facts, the exact
-verified commit set which admitted them, and the blob reader which validated
-their dependencies.
+payload `Cover` which names them, and the blob reader which validated their
+dependencies.
 
 ### CONNECT
 The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
@@ -220,11 +231,6 @@ semantics, and reproducible derived representations.
 The third position in a trible. Values store a fixed 32-byte payload interpreted
 through the attribute’s schema. They often embed identifiers for related
 entities or handles referencing larger blobs.
-
-### Ticket
-The exact canonical set of signed commits selected as authority for one
-materialization or derivation. A ticket is explicit continuation state and can
-be diffed by intrinsic commit ID without walking a commit chain.
 
 ### WANT
 A durable local request for a blob or for an existing merge/derive result.

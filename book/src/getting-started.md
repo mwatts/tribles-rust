@@ -156,15 +156,18 @@ for (first, last, quote) in find!(
 
 `snapshot()` admits the descriptor authority plus explicitly supplied
 delegated presentations at one clock instant. It opens one target blob-reader
-view and materializes facts solely from the resulting exact commit set. The
-returned `CollectionSnapshot` keeps facts, commits, and reader together. A concurrent
+view and materializes facts solely from the resulting exact payload cover. The
+returned `CollectionSnapshot` keeps facts, its `Cover`, and reader together. A concurrent
 commit may appear on this call or a later call, but physically visible blobs
 from an unobserved commit cannot leak into the snapshot's admitted set.
 
-Use `storage.ticket(library, presentations)` when only the exact commit
+Use `storage.cover(library, presentations)` when only the exact payload
 frontier is needed. It verifies presentations and scans native collection
-records, but it does not fetch or materialize the selected commits' data or
-metadata blobs. This is useful for feeding derived representations such as
+records, but it does not fetch or materialize member blobs. Duplicate signed
+claims for one payload collapse to one cover member; authorship, signatures,
+and metadata currently known to the store are reported separately by
+`storage.claims(&cover)`, which may validly return no claims after construction.
+The cover is the continuation passed to derived representations such as
 SuccinctArchive or path-index collections.
 
 ## 7. Choose durability explicitly
@@ -196,5 +199,5 @@ the chosen backend rather than collection policy.
 - Derived indexes are reproducible collection images, not alternate authority.
 
 Continue with [Collection Workflows](repository-workflows.md) for the native
-record algebra, exact tickets, migration from legacy piles, and derived
+record algebra, exact covers, migration from legacy piles, and derived
 collection maintenance.

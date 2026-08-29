@@ -1,15 +1,15 @@
-//! End-to-end incremental-query maintenance over growing exact tickets.
+//! End-to-end incremental-query maintenance over growing exact covers.
 //!
 //! The two arms maintain the same application result set over source-identical
 //! stores. Both retain a `SuccinctArchiveView`; only their query strategy
 //! differs:
 //!
 //! - `full` re-runs the complete query and replaces the result set.
-//! - `incremental` obtains one exact commit-support delta, runs
+//! - `incremental` obtains one exact payload-support delta, runs
 //!   `pattern_changes!`, and extends the result set.
 //!
 //! Every timed observation includes exact-view admission and application-side
-//! `BTreeSet` maintenance. Source publication, ticket discovery, fixture
+//! `BTreeSet` maintenance. Source publication, cover discovery, fixture
 //! construction, and the seed view are outside timing. Each measured run uses
 //! fresh independent stores and advances through every fixed-size commit;
 //! geometric checkpoints only control which observations are reported.
@@ -39,8 +39,7 @@ use triblespace::core::collection::succinctarchive_union::{
     SuccinctArchiveCollection, SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    exact_ticket_additions, reach, simplearchive_union, CollectionCommit, CollectionStoreExt,
-    SimpleArchiveCollection,
+    reach, simplearchive_union, CollectionStoreExt, Cover, SimpleArchiveCollection,
 };
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
@@ -52,8 +51,8 @@ type Row = (Entity, Entity, Title);
 #[derive(Clone)]
 struct Fixture {
     store: MemoryRepo,
-    seed_ticket: Vec<CollectionCommit>,
-    tickets: Vec<Vec<CollectionCommit>>,
+    seed_cover: Cover,
+    covers: Vec<Cover>,
     expected_batches: Vec<Vec<Row>>,
     simple: SimpleArchiveCollection,
     succinct: SuccinctArchiveCollection,
@@ -88,14 +87,10 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     store
         .commit(collection, &signing_key, author)
         .expect("publish seed author");
-    let seed_ticket = store
-        .ticket(collection, &[])
-        .expect("freeze seed ticket")
-        .commits()
-        .to_vec();
-    assert_eq!(seed_ticket.len(), 1);
+    let seed_cover = store.cover(collection, &[]).expect("freeze seed cover");
+    assert_eq!(seed_cover.len(), 1);
 
-    let mut tickets = Vec::with_capacity(commits);
+    let mut covers = Vec::with_capacity(commits);
     let mut expected_batches = Vec::with_capacity(commits);
     for commit in 0..commits {
         let mut fragment = Fragment::empty();
@@ -121,13 +116,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         store
             .commit(collection, &signing_key, fragment)
             .expect("publish book commit");
-        tickets.push(
-            store
-                .ticket(collection, &[])
-                .expect("freeze exact ticket")
-                .commits()
-                .to_vec(),
-        );
+        covers.push(store.cover(collection, &[]).expect("freeze exact cover"));
         expected_batches.push(expected);
     }
 
@@ -142,8 +131,8 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
 
     Fixture {
         store,
-        seed_ticket,
-        tickets,
+        seed_cover,
+        covers,
         expected_batches,
         simple,
         succinct,
@@ -161,7 +150,7 @@ impl FullState {
         let mut store = fixture.store.clone();
         let mut view = fixture.succinct.exact_view();
         let seed = view
-            .ensure(&mut store, &fixture.seed_ticket)
+            .ensure(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
         assert_eq!(seed.iter().count(), 2, "seed contains the author facts");
         Self {
@@ -171,11 +160,11 @@ impl FullState {
         }
     }
 
-    fn observe(&mut self, ticket: &[CollectionCommit]) -> Step {
+    fn observe(&mut self, cover: &Cover) -> Step {
         let start = Instant::now();
         let full = self
             .view
-            .ensure(&mut self.store, ticket)
+            .ensure(&mut self.store, cover)
             .expect("advance full-query view");
         let mut raw_rows = 0usize;
         let mut next = BTreeSet::new();
@@ -203,7 +192,7 @@ impl FullState {
 struct IncrementalState {
     store: MemoryRepo,
     view: SuccinctArchiveView,
-    checkpoint: Vec<CollectionCommit>,
+    checkpoint: Cover,
     results: BTreeSet<Row>,
 }
 
@@ -212,25 +201,26 @@ impl IncrementalState {
         let mut store = fixture.store.clone();
         let mut view = fixture.succinct.exact_view();
         let seed = view
-            .ensure(&mut store, &fixture.seed_ticket)
+            .ensure(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
         assert_eq!(seed.iter().count(), 2, "seed contains the author facts");
         Self {
             store,
             view,
-            checkpoint: fixture.seed_ticket.clone(),
+            checkpoint: fixture.seed_cover.clone(),
             results: BTreeSet::new(),
         }
     }
 
-    fn observe(&mut self, fixture: &Fixture, ticket: &[CollectionCommit]) -> Step {
+    fn observe(&mut self, fixture: &Fixture, cover: &Cover) -> Step {
         let start = Instant::now();
-        let added = exact_ticket_additions(fixture.simple.collection(), &self.checkpoint, ticket)
-            .expect("ticket grows monotonically");
-        assert_eq!(added.len(), 1, "one commit is observed per step");
+        let added = cover
+            .additions_since(&self.checkpoint)
+            .expect("cover grows monotonically");
+        assert_eq!(added.len(), 1, "one payload is observed per step");
         let full = self
             .view
-            .ensure(&mut self.store, ticket)
+            .ensure(&mut self.store, cover)
             .expect("advance incremental full view");
         let changed = fixture
             .simple
@@ -251,7 +241,7 @@ impl IncrementalState {
         }
         let distinct_rows = batch.len();
         self.results.extend(batch);
-        self.checkpoint = ticket.to_vec();
+        self.checkpoint = cover.clone();
         black_box(self.results.len());
         Step {
             elapsed: start.elapsed(),
@@ -302,18 +292,18 @@ fn run_full(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
     let mut state = FullState::seeded(fixture);
     let mut expected = BTreeSet::new();
     let mut samples = Vec::with_capacity(checkpoints.len());
-    for (index, (ticket, batch)) in fixture
-        .tickets
+    for (index, (cover, batch)) in fixture
+        .covers
         .iter()
         .zip(&fixture.expected_batches)
         .enumerate()
     {
         expected.extend(batch.iter().cloned());
-        let step = state.observe(ticket);
+        let step = state.observe(cover);
         assert_eq!(step.raw_rows, expected.len());
         assert_eq!(step.distinct_rows, expected.len());
         assert_eq!(state.results, expected);
-        assert_eq!(state.view.ticket(), ticket);
+        assert_eq!(state.view.cover(), Some(cover));
         let commits = index + 1;
         if checkpoints.contains(&commits) {
             samples.push(Sample {
@@ -334,19 +324,19 @@ fn run_incremental(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
     let mut state = IncrementalState::seeded(fixture);
     let mut expected = BTreeSet::new();
     let mut samples = Vec::with_capacity(checkpoints.len());
-    for (index, (ticket, batch)) in fixture
-        .tickets
+    for (index, (cover, batch)) in fixture
+        .covers
         .iter()
         .zip(&fixture.expected_batches)
         .enumerate()
     {
         expected.extend(batch.iter().cloned());
-        let step = state.observe(fixture, ticket);
+        let step = state.observe(fixture, cover);
         assert_eq!(step.raw_rows, batch.len());
         assert_eq!(step.distinct_rows, batch.len());
         assert_eq!(state.results, expected);
-        assert_eq!(state.checkpoint, *ticket);
-        assert_eq!(state.view.ticket(), ticket);
+        assert_eq!(&state.checkpoint, cover);
+        assert_eq!(state.view.cover(), Some(cover));
         let commits = index + 1;
         if checkpoints.contains(&commits) {
             samples.push(Sample {

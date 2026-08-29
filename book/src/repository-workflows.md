@@ -15,8 +15,10 @@ merge or derivation equations provide reusable physical work.
 - **Collection descriptor** — a canonical `SimpleArchive` which describes a
   collection's anchor, element representation, join recipe, and reach law. Its
   content handle is the `CollectionHandle`.
-- **Ticket** — the exact byte-identical set of signed commits selected as
-  admitted ground truth for one read or derivation.
+- **`Cover`** — one collection identity plus the canonical set of distinct
+  payload handles selected for one read or derivation. Signatures, authors,
+  and metadata remain queryable provenance, but are not coordinates of the
+  value.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
 - **OFFER** — positive local willingness to serve an artifact; it is neither
@@ -68,7 +70,7 @@ let commit = storage.commit(
     entity! { metadata::name: "first-model" },
 )?;
 let snapshot = storage.snapshot(models, &[presentation.clone()])?;
-assert_eq!(snapshot.commits(), &[commit]);
+assert!(snapshot.cover().contains(commit.data()));
 storage.flush()?;
 ```
 
@@ -127,59 +129,63 @@ insertion rather than an update. Concatenating stores unions evidence.
 
 Unsigned equations are replaceable computation, not authority. A resolver
 admits them only when the declared recipe and content identities validate. An
-invalid or unavailable result is a cache miss and cannot suppress a signed
-leaf.
+invalid or unavailable result is a cache miss and cannot suppress an explicit
+cover member.
 
-## Known-prefix snapshots and exact tickets
+## Known-prefix snapshots and covers
 
 `store.snapshot(collection, presentations)` observes one clock instant,
 verifies every explicit capability presentation against the descriptor's
-authority, then discovers the exact strictly verified commits by the resulting
-subjects. It opens one target reader and materializes only that admitted set.
-It returns facts, a typed `CollectionTicket`, and reader together so downstream
-code cannot accidentally pair one logical frontier with a different physical
-view.
+authority, then discovers strictly verified commits by the resulting subjects.
+Their distinct data handles form a `Cover`. It opens one target reader and
+materializes only that payload set. The returned `CollectionSnapshot` keeps
+facts, the exact `Cover`, and reader together so downstream code cannot
+accidentally pair one logical frontier with a different physical view.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear on this call or a later
-call. Every selected commit is nevertheless present and valid in the returned
-snapshot, or the call fails instead of returning a partial set.
+call. Every cover member was nevertheless admitted and its payload validated
+for the returned snapshot, or the call fails instead of returning a partial
+set.
 
-`store.ticket(collection, presentations)` performs the same admission check and target-record discovery, but
-does not fetch or materialize the target collection's data and metadata blobs.
-Freeze a ticket when another component will select or build a representation:
+`store.cover(collection, presentations)` performs the same admission check and
+record discovery, but does not fetch or materialize member blobs. Freeze a
+cover when another component will select or build a representation:
 
 ```rust,ignore
-let ticket = storage.ticket(models, &[presentation])?;
-let facts = storage.materialize(&ticket)?;
+let cover = storage.cover(models, &[presentation])?;
+let facts = storage.materialize(&cover)?;
 ```
 
-Exact replay does not need a publishing key or re-run admission. Ticket members
-may have different authors, but each must byte-match one resident strictly
-verified record for the exact descriptor. Commits in storage but absent from
-the ticket remain inert. Call `snapshot` when admission and materialization
-should be one coherent operation; call `materialize(&ticket)` when replaying an
-already admitted exact frontier.
+Exact replay does not need a publishing key, re-run admission, or retain any
+signed commit or metadata. The opaque cover itself names the exact descriptor
+and payload members to validate. Use `store.claims(&cover)` when currently
+resident authorship and metadata provenance matters; zero claims is a valid
+answer and does not invalidate replay. Commits whose data handles are absent
+from the cover remain inert. Call `snapshot` when admission and
+materialization should be one coherent operation; call `materialize(&cover)`
+when replaying an opaque payload frontier.
 
 ## Reuse merge work without changing meaning
 
-A logical collection value is the join of the selected committed leaves. It
-does not need one monolithic blob. A resolver may choose an exact resident
-cover consisting of leaves and validated merge results:
+A logical collection value is the join of a cover's members. It does not need
+one monolithic blob. A resolver may choose members consisting of committed
+payloads and validated merge results:
 
 ```text
-    a       b       c           signed leaves
+    a       b       c           explicit payloads
      \     /        |
       a⊔b           |           reusable MERGE result
         \           /
          (a⊔b)⊔c                logical collection value
 ```
 
-Several physical covers can represent the same logical value. This is useful
-for LSM-like maintenance: small commits remain independently attributable,
-while deterministic merges amortize reads into larger canonical shards. The
-cover is an optimization chosen under an exact ticket, never a second history
-or a new authority root.
+Distinct covers can have the same support: `{a, b}` and `{a⊔b}` are different
+PATCH sets, but the validated `MERGE` equation proves that they denote the same
+join. This is useful for LSM-like maintenance: small commits remain
+independently attributable, while deterministic merges amortize reads into
+larger canonical shards. A selected target cover is replaceable computation,
+never a second history or a new authority root.
 
 ## Derive another representation
 
@@ -206,16 +212,22 @@ let succinct = SuccinctArchiveCollection::new(
     reach::private(), // target reach
 );
 
-let archive = succinct.ensure_exact(&mut storage, ticket.commits())?;
-let same_archive = succinct.attach_exact(&mut storage, ticket.commits())?;
-let compact_archive = succinct.compact_exact(&mut storage, ticket.commits())?;
+let archive = succinct.ensure_exact(&mut storage, &cover)?;
+let same_archive = succinct.attach_exact(&mut storage, &cover)?;
+let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 ```
 
 - `attach_exact` is read-only and requires a complete valid resident cover.
 - `ensure_exact` reuses valid equations, computes missing canonical images, and
   publishes dependencies before new records.
-- `compact_exact` performs explicit deterministic tiered merges under the same
-  ticket.
+- `compact_exact` performs explicit deterministic tiered merges for the same
+  source cover.
+
+All positions use the same `Cover` value type. What differs is the target
+descriptor's recipe: ordinary Succinct derivation may choose any cheapest
+validated route whose support equals the source cover, while Rank9 consumes
+the exact immediate raw Succinct cover selected upstream. Exactness is thus a
+property of the collection map, not a mode bit carried by `Cover`.
 
 None of them signs a replacement root, advances a head, flushes implicitly, or
 adds a special manifest. Rank9 fibers and [regular-path
@@ -270,7 +282,7 @@ and unrelated resident blobs are never scanned. Re-running is idempotent.
 
 This is intentionally a dedicated operator action rather than part of generic
 schema migration: it states willingness to serve historical artifacts. It does
-not add collection evidence, bind a team, require a ticket, or turn OFFER into
+not add collection evidence, bind a team, require a cover, or turn OFFER into
 a garbage-collection root.
 
 ## Migrate a legacy branch explicitly
@@ -295,7 +307,7 @@ not become members.
 
 With no further options the target descriptor's mandatory authority is the
 migration signing key. The resulting commits are therefore admitted directly
-by ordinary `ticket` and `snapshot` calls.
+by ordinary `cover` and `snapshot` calls.
 
 To register the migrated collection under a different authority, name that
 trust root explicitly:
@@ -330,11 +342,12 @@ branch. New code publishes directly to collections.
 ## Operational invariants
 
 - Persist dependencies before the record that makes them meaningful.
-- Treat signed selected commits as mandatory ground truth; fail loud when their
-  descriptor, data, or metadata is absent or invalid.
+- Treat an opaque cover's payload members as mandatory ground truth; fail loud
+  when its descriptor or data is absent or invalid. Signed commits and metadata
+  are unnecessary for replay and remain lazy provenance queried separately.
 - Treat unsigned equations as optional, freshly validated cache evidence.
 - Keep reach, trust, retention, and WANT policy orthogonal.
-- Carry exact tickets across derivation boundaries instead of asking for an
+- Carry exact covers across derivation boundaries instead of asking for an
   ambient “latest”.
 - Flush at explicit application durability boundaries.
 - Merge stores by union; never choose meaning from append order.

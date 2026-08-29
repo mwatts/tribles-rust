@@ -1,4 +1,4 @@
-//! Exact-ticket materialization of native path-summary collections.
+//! Exact-cover materialization of native path-summary collections.
 
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
@@ -11,13 +11,11 @@ use triblespace_core::collection::reach;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::exact_derived::{
-    ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
+    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
     ExactDerivedCollectionError,
 };
 use triblespace_core::collection::simplearchive_union;
-use triblespace_core::collection::{
-    CollectionCommit, CollectionHandle, CollectionStore, VerifyingKey,
-};
+use triblespace_core::collection::{CollectionHandle, CollectionStore, Cover, VerifyingKey};
 use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 use triblespace_core::trible::Fragment;
 
@@ -25,10 +23,10 @@ use crate::path_summary_union;
 use crate::{Automaton, PathError, PathIndex, PathSummaryBlob, PathSummaryBlobError};
 use path_summary_union::PathSummaryUnionError;
 
-/// Failure to validate, complete, or materialize one exact path ticket.
+/// Failure to validate, complete, or materialize one exact path cover.
 #[derive(Debug)]
 pub enum PathSummaryCollectionError {
-    /// Exact-ticket authority, resolution, construction, or storage failed.
+    /// Exact-cover resolution, construction, or storage failed.
     Collection(ExactDerivedCollectionError),
     /// Canonical path-summary construction failed.
     Algebra(PathSummaryUnionError),
@@ -162,35 +160,35 @@ impl PathSummaryCollection {
         IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts()).get_handle()
     }
 
-    /// Attach the exact endpoint relation already resident for `ticket`.
+    /// Attach the exact endpoint relation already resident for `source_cover`.
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, ticket, self)?;
+        let cover = self.kernel().attach_exact(store, source_cover, self)?;
         self.index_from_cover(cover).map(Arc::new)
     }
 
-    /// Ensure and attach the exact endpoint relation for `ticket`.
+    /// Ensure and attach the exact endpoint relation for `source_cover`.
     ///
     /// Existing source merges, target merges, and derivations are reused. New
     /// target blobs precede unsigned records, no flush is implied, and a fresh
-    /// pass proves the frozen ticket before path closure runs once.
+    /// pass proves the frozen cover before path closure runs once.
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(store, ticket, self)?;
+        let cover = self.kernel().ensure_exact(store, source_cover, self)?;
         self.index_from_cover(cover).map(Arc::new)
     }
 
@@ -200,7 +198,7 @@ impl PathSummaryCollection {
 
     fn index_from_cover(
         &self,
-        cover: ExactCover<PathSummaryBlob>,
+        cover: CoverAttachment<PathSummaryBlob>,
     ) -> Result<PathIndex, PathSummaryCollectionError> {
         let mut joined = path_summary_union::empty(&self.automaton);
         for segment in cover.into_blobs() {
@@ -283,7 +281,14 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
-    use triblespace_core::collection::{CollectionDerive, CollectionMerge, CollectionRecord};
+    use triblespace_core::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
+    use triblespace_core::collection::{
+        CapabilityPresentation, CollectionCommit, CollectionDerive, CollectionMerge,
+        CollectionRecord, CollectionStoreExt, ACTION_WRITE,
+    };
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::{InlineEncoding, RawInline};
@@ -436,6 +441,42 @@ mod tests {
         store.insert(CollectionRecord::Commit(commit)).unwrap();
     }
 
+    fn source_cover(
+        store: &mut CollectionOnly,
+        paths: &PathSummaryCollection,
+        commits: impl IntoIterator<Item = CollectionCommit>,
+    ) -> Cover {
+        let collection = store.collection(paths.source_descriptor()).unwrap();
+        assert_eq!(collection, paths.source_collection());
+        let authority = SigningKey::from_bytes(&[1; 32]);
+        let mut writers: Vec<_> = commits
+            .into_iter()
+            .map(|commit| VerifyingKey::from_bytes(&commit.public_key().raw).unwrap())
+            .filter(|writer| *writer != authority.verifying_key())
+            .collect();
+        writers.sort_unstable_by_key(VerifyingKey::to_bytes);
+        writers.dedup();
+        let atom = CapabilityAtom::new(
+            CapabilityAction::new(ACTION_WRITE),
+            CapabilityResource::from(collection),
+        );
+        let presentations: Vec<_> = writers
+            .into_iter()
+            .map(|writer| {
+                CapabilityPresentation::new(
+                    writer,
+                    CapabilityProofBundle::issue_root(
+                        &authority,
+                        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+                        writer,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        store.cover(collection, &presentations).unwrap()
+    }
+
     fn records(store: &mut CollectionOnly) -> Vec<CollectionRecord> {
         store.records().unwrap().map(Result::unwrap).collect()
     }
@@ -509,12 +550,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_ticket_is_local_bottom_and_writes_nothing() {
+    fn empty_cover_is_local_bottom_and_writes_nothing() {
         let mut store = CollectionOnly::default();
         let paths = test_paths(test_name("c9"), plus());
+        let collection = store.collection(paths.source_descriptor()).unwrap();
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
-        let index = paths.ensure_exact(&mut store, &[]).unwrap();
+        let cover = store.cover(collection, &[]).unwrap();
+        let index = paths.ensure_exact(&mut store, &cover).unwrap();
         assert_eq!(index.accepted_pair_count(), 0);
         assert_eq!(store.0.blobs.len(), blobs);
         assert_eq!(records(&mut store).len(), record_count);
@@ -531,19 +574,20 @@ mod tests {
         let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
+        let cover = source_cover(&mut store, &paths, [first, second]);
         assert!(matches!(
-            paths.attach_exact(&mut store, &[first, second]),
+            paths.attach_exact(&mut store, &cover),
             Err(PathSummaryCollectionError::Collection(
-                ExactDerivedCollectionError::IncompleteCover { unsupported_commits, .. }
+                ExactDerivedCollectionError::IncompleteCover { unsupported_members, .. }
             ))
-                if unsupported_commits.len() == 2
+                if unsupported_members.len() == 2
         ));
-        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &[first, second]).unwrap());
-        assert_cross_fragment_path(&paths.attach_exact(&mut store, &[first, second]).unwrap());
+        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &cover).unwrap());
+        assert_cross_fragment_path(&paths.attach_exact(&mut store, &cover).unwrap());
     }
 
     #[test]
-    fn old_ticket_ignores_later_commit_and_its_cache_equation() {
+    fn old_cover_ignores_later_commit_and_its_cache_equation() {
         let name = test_name("c9");
         let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
@@ -553,7 +597,8 @@ mod tests {
         let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
-        paths.ensure_exact(&mut store, &[first, second]).unwrap();
+        let old_cover = source_cover(&mut store, &paths, [first, second]);
+        paths.ensure_exact(&mut store, &old_cover).unwrap();
 
         let later = put_data(&mut store, &edge(3, 4));
         let third = signed_commit(&mut store, &name, 3, &later);
@@ -570,7 +615,7 @@ mod tests {
             )))
             .unwrap();
 
-        let old = paths.attach_exact(&mut store, &[first, second]).unwrap();
+        let old = paths.attach_exact(&mut store, &old_cover).unwrap();
         assert!(!old.contains(&RawInline::from(id(1)), &RawInline::from(id(4))));
     }
 
@@ -584,9 +629,8 @@ mod tests {
         let second = signed_commit(&mut store, &name, 2, &data);
         publish(&mut store, first);
         publish(&mut store, second);
-        paths
-            .ensure_exact(&mut store, &[first, first, second])
-            .unwrap();
+        let cover = source_cover(&mut store, &paths, [first, first, second]);
+        paths.ensure_exact(&mut store, &cover).unwrap();
         let derives = records(&mut store)
             .into_iter()
             .filter(|record| {
@@ -595,7 +639,7 @@ mod tests {
             })
             .count();
         assert_eq!(derives, 1);
-        paths.attach_exact(&mut store, &[first, second]).unwrap();
+        paths.attach_exact(&mut store, &cover).unwrap();
     }
 
     #[test]
@@ -614,14 +658,31 @@ mod tests {
                 Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
             )))
             .unwrap();
+        let empty_cover = source_cover(&mut store, &paths, [commit]);
+        assert!(empty_cover.is_empty());
+        assert_eq!(
+            paths
+                .attach_exact(&mut store, &empty_cover)
+                .unwrap()
+                .accepted_pair_count(),
+            0,
+        );
+
+        let other_name = test_name("c9-other");
+        let other_paths = test_paths(other_name.clone(), plus());
+        let other_commit = signed_commit(&mut store, &other_name, 7, &source);
+        publish(&mut store, other_commit);
+        let wrong_cover = source_cover(&mut store, &other_paths, [other_commit]);
         assert!(matches!(
-            paths.attach_exact(&mut store, &[commit]),
+            paths.attach_exact(&mut store, &wrong_cover),
             Err(PathSummaryCollectionError::Collection(
-                ExactDerivedCollectionError::InvalidTicket(_)
+                ExactDerivedCollectionError::InvalidCover(_)
             ))
         ));
+
         publish(&mut store, commit);
-        let attached = paths.attach_exact(&mut store, &[commit]).unwrap();
+        let cover = source_cover(&mut store, &paths, [commit]);
+        let attached = paths.attach_exact(&mut store, &cover).unwrap();
         assert!(attached.contains(&RawInline::from(id(1)), &RawInline::from(id(2))));
     }
 
@@ -647,7 +708,8 @@ mod tests {
                 joined_data,
             )))
             .unwrap();
-        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &[first, second]).unwrap());
+        let cover = source_cover(&mut store, &paths, [first, second]);
+        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &cover).unwrap());
         let inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
@@ -695,7 +757,8 @@ mod tests {
             )))
             .unwrap();
 
-        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &[first, second]).unwrap());
+        let cover = source_cover(&mut store, &paths, [first, second]);
+        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &cover).unwrap());
         let mut inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
@@ -748,17 +811,18 @@ mod tests {
                 joined_data,
             )))
             .unwrap();
+        let source_cover = source_cover(&mut store, &paths, [first, second]);
         let cover = paths
             .kernel()
-            .attach_exact(&mut store, &[first, second], &paths)
+            .attach_exact(&mut store, &source_cover, &paths)
             .unwrap();
         assert_eq!(cover.len(), 1);
         assert_eq!(cover.members()[0].0, joined_data);
-        assert_cross_fragment_path(&paths.attach_exact(&mut store, &[first, second]).unwrap());
+        assert_cross_fragment_path(&paths.attach_exact(&mut store, &source_cover).unwrap());
     }
 
     #[test]
-    fn absent_source_bytes_report_the_commit() {
+    fn absent_source_bytes_report_the_member() {
         let name = test_name("c9");
         let paths = test_paths(name.clone(), plus());
         let mut store = CollectionOnly::default();
@@ -773,11 +837,12 @@ mod tests {
             metadata,
         );
         publish(&mut store, commit);
+        let cover = source_cover(&mut store, &paths, [commit]);
         assert!(matches!(
-            paths.attach_exact(&mut store, &[commit]),
+            paths.attach_exact(&mut store, &cover),
             Err(PathSummaryCollectionError::Collection(
-                ExactDerivedCollectionError::IncompleteCommit(found)
-            )) if found == commit.id()
+                ExactDerivedCollectionError::IncompleteMember(found)
+            )) if found == commit.data()
         ));
     }
 }

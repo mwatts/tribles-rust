@@ -58,7 +58,7 @@ itself.
 │ entity! · Fragment · find! · pattern!            │
 ├──────────────────────────────────────────────────┤
 │ Collection facades                               │
-│ publish, select exact tickets, materialize views │
+│ publish, select exact covers, materialize views  │
 ├──────────────────────────────────────────────────┤
 │ Collection algebra                              │
 │ signed COMMIT · checked MERGE · checked DERIVE   │
@@ -165,19 +165,24 @@ not what a process may append to its own store.
 
 Reads are exact about what they observed, not magical about global time:
 
-- `store.ticket(collection, presentations)` loads the descriptor authority,
+- `store.cover(collection, presentations)` loads the descriptor authority,
   admits its own strictly signed commits directly, verifies every explicit
-  delegated presentation, and returns one canonical `CollectionTicket` without
+  delegated presentation, and returns one canonical payload `Cover` without
   fetching member data;
 - `store.snapshot(collection, presentations)` performs that same admission and
-  carries materialized facts, the exact ticket, and the blob reader which
+  carries materialized facts, the exact cover, and the blob reader which
   validated them; and
-- `store.materialize(&ticket)` exact-replays an already admitted multi-author
+- `store.materialize(&cover)` exact-replays an already admitted multi-author
   frontier without holding a publishing key or repeating capability policy.
+
+Cover identity is the collection descriptor plus distinct payload handles.
+Signer, signature, and metadata claims currently known to the store remain
+queryable, but no claim is required for replay, and another claim over the same
+payload does not change the cover or repeat data work.
 
 Each call observes one known prefix of an append-only store. A concurrent
 commit may appear now or on the next call, but a snapshot never
-combines facts from one admission frontier with commits from another. The
+combines facts from one admission frontier with payloads from another. The
 descriptor authority and every explicitly presented valid delegate participate;
 unpresented commits remain inert.
 
@@ -194,9 +199,16 @@ f(a ⊔ b) = f(a) ⊔ f(b)
 
 That law permits either route through the evidence graph: merge source shards
 and derive once, derive individual shards and merge their images, or reuse any
-validated mixture already present. Exact tickets keep the logical authority
-fixed while a resolver chooses a resident physical cover. Missing derived
-artifacts are cache misses, not missing facts.
+validated mixture already present. An opaque source cover fixes the logical
+value while a resolver chooses a target cover with equal support.
+Different target covers may denote the same join, and the same `Cover` type is
+used at every lattice position. Missing derived artifacts are cache misses, not
+missing facts.
+
+Route freedom belongs to the collection recipe rather than to a flag on
+`Cover`: ordinary Succinct construction may reuse any validated equal-support
+route, while Rank9 consumes the exact immediate raw Succinct cover selected
+upstream.
 
 ## WANT is operational, not semantic
 

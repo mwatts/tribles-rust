@@ -48,9 +48,11 @@ fn legacy_mutation_commands_are_absent() {
     assert!(has_command(&migrate, "reframe"));
     assert!(has_command(&migrate, "seed-artifact-offers"));
     let branch_to_collection = help(&["pile", "migrate", "unused.pile", "branch-to-collection"]);
-    assert!(branch_to_collection.contains("--namespace"));
+    assert!(branch_to_collection.contains("--collection-name"));
     assert!(branch_to_collection.contains("--authority"));
-    assert!(branch_to_collection.contains("--proof"));
+    assert!(branch_to_collection.contains("--signing-key"));
+    assert!(!branch_to_collection.contains("--namespace"));
+    assert!(!branch_to_collection.contains("--proof"));
     assert!(!branch_to_collection.contains("--team-root"));
     let run = help(&["pile", "migrate", "unused.pile", "run"]);
     assert!(!run.contains("branch-metadata-name"));

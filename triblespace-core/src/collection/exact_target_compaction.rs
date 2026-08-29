@@ -1,10 +1,10 @@
 //! Explicit size-tiered maintenance for exact derived target collections.
 //!
-//! Compaction remains separate from exact-ticket admission. It starts from an
-//! admitted exact cover, publishes only canonical target blobs and unsigned
+//! Compaction remains separate from cover construction. It starts from an
+//! opaque exact cover, publishes only canonical target blobs and unsigned
 //! `MERGE` equations, then proves the result again through a fresh attachment.
-//! Signed source commits remain the sole authority, and published equations add
-//! neither retention roots nor durable validation receipts.
+//! The source cover remains the value boundary, and published equations add
+//! neither provenance, retention roots, nor durable validation receipts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -18,12 +18,11 @@ use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, BlobStorePut, Of
 use crate::trible::Fragment;
 
 use super::exact_derived::{
-    fresh_data_identity, ExactAlgebraError, ExactCover, ExactDerivedAlgebra,
+    fresh_data_identity, CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra,
     ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use super::{
-    CollectionCommit, CollectionData, CollectionHandle, CollectionMerge, CollectionRecord,
-    CollectionStore,
+    CollectionData, CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore, Cover,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -31,7 +30,7 @@ type BoxError = Box<dyn Error + Send + Sync + 'static>;
 /// Failure while explicitly compacting one exact target cover.
 #[derive(Debug)]
 pub enum ExactTargetCompactionError {
-    /// Exact-ticket completion or fresh admission failed.
+    /// Exact-cover completion or fresh attachment failed.
     Exact(ExactDerivedCollectionError),
     /// The target algebra could not join one deterministic pair.
     Merge {
@@ -74,7 +73,7 @@ pub enum ExactTargetCompactionError {
         /// Identity returned by the blob store.
         actual: CollectionData,
     },
-    /// Fresh admission repeated an unstable physical cover.
+    /// Fresh attachment repeated an unstable physical cover.
     Stalled {
         /// Repeated cover in canonical content-handle order.
         cover: Vec<CollectionData>,
@@ -164,19 +163,19 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// implicit flush are involved.
 ///
 /// Each maintenance round first stages its complete deterministic carry in
-/// memory. Fatal construction errors and rounds with no successful claim write
-/// nothing. Otherwise, after the admission reader has been dropped, the target
+/// memory. Fatal construction errors and rounds with no successful join write
+/// nothing. Otherwise, after the attachment reader has been dropped, the target
 /// descriptor and every staged result are stored before the topologically
-/// ordered `MERGE` records. A fresh read pass then admits the result. Freshly
+/// ordered `MERGE` records. A fresh read pass then validates the result. Freshly
 /// selected covers are compacted again when concurrent or older evidence
 /// exposes another collision. Repetition of any non-capacity-stable canonical
 /// cover returns [`ExactTargetCompactionError::Stalled`].
 pub fn compact_exact_target<S, Source, Target, A>(
     exact: &ExactDerivedCollection<Source, Target>,
     store: &mut S,
-    ticket: &[CollectionCommit],
+    source_cover: &Cover,
     algebra: &A,
-) -> Result<ExactCover<Target>, ExactTargetCompactionError>
+) -> Result<CoverAttachment<Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore + ArtifactOfferStore,
     S::Reader: BlobStoreMeta,
@@ -187,15 +186,15 @@ where
     A: ExactDerivedAlgebra<Source, Target> + ?Sized,
 {
     let mut capture = OfferCapture::new(store);
-    compact_exact_target_unoffered(exact, &mut capture, ticket, algebra)
+    compact_exact_target_unoffered(exact, &mut capture, source_cover, algebra)
 }
 
 pub(crate) fn compact_exact_target_unoffered<S, Source, Target, A>(
     exact: &ExactDerivedCollection<Source, Target>,
     store: &mut S,
-    ticket: &[CollectionCommit],
+    source_cover: &Cover,
     algebra: &A,
-) -> Result<ExactCover<Target>, ExactTargetCompactionError>
+) -> Result<CoverAttachment<Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
@@ -205,7 +204,7 @@ where
     Handle<Target>: InlineEncoding,
     A: ExactDerivedAlgebra<Source, Target> + ?Sized,
 {
-    let mut cover = exact.ensure_exact_unoffered(store, ticket, algebra)?;
+    let mut cover = exact.ensure_exact_unoffered(store, source_cover, algebra)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 
@@ -224,7 +223,7 @@ where
             RoundOutcome::Published => {}
             RoundOutcome::CapacityStable(cover) => return Ok(cover),
         }
-        cover = exact.attach_exact(store, ticket, algebra)?;
+        cover = exact.attach_exact(store, source_cover, algebra)?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
             return Err(ExactTargetCompactionError::Stalled { cover: identity });
@@ -236,11 +235,11 @@ fn target_tier<Target: BlobEncoding>(blob: &Blob<Target>) -> u32 {
     blob.bytes.len().max(1).ilog2()
 }
 
-fn cover_identity<Target: BlobEncoding>(cover: &ExactCover<Target>) -> Vec<CollectionData> {
+fn cover_identity<Target: BlobEncoding>(cover: &CoverAttachment<Target>) -> Vec<CollectionData> {
     cover.members().iter().map(|(data, _)| *data).collect()
 }
 
-fn has_tier_collision<Target: BlobEncoding>(cover: &ExactCover<Target>) -> bool {
+fn has_tier_collision<Target: BlobEncoding>(cover: &CoverAttachment<Target>) -> bool {
     let mut tiers = BTreeSet::new();
     cover
         .members()
@@ -250,14 +249,14 @@ fn has_tier_collision<Target: BlobEncoding>(cover: &ExactCover<Target>) -> bool 
 
 enum RoundOutcome<Target: BlobEncoding> {
     Published,
-    CapacityStable(ExactCover<Target>),
+    CapacityStable(CoverAttachment<Target>),
 }
 
 fn publish_round<S, Source, Target, A>(
     descriptor: Fragment,
     collection: CollectionHandle,
     store: &mut S,
-    cover: ExactCover<Target>,
+    cover: CoverAttachment<Target>,
     algebra: &A,
 ) -> Result<RoundOutcome<Target>, ExactTargetCompactionError>
 where

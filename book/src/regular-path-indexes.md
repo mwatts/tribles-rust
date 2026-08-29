@@ -7,7 +7,7 @@ materializes the accepted endpoint relation, then exposes it as an ordinary
 two-variable [`Constraint`](triblespace::core::query::Constraint).
 
 This separation keeps query-time constraints stateless. The expensive fixpoint
-is built once for one exact collection ticket; `find!`, `and!`, constants,
+is built once for one exact collection cover; `find!`, `and!`, constants,
 and normal dynamic variable ordering then treat the result like any other
 relation.
 
@@ -175,51 +175,52 @@ let path_collection = PathSummaryCollection::new(
     reach::private(),
 );
 
-// `ticket` is the exact byte-identical set of signed source
-// CollectionCommit records selected by the caller.
-let paths = path_collection.ensure_exact(&mut store, ticket.commits())?;
+// `cover` is the admitted PATCH set of distinct source payload handles.
+let paths = path_collection.ensure_exact(&mut store, &cover)?;
 
 // Read-only consumers can require an already resident exact cover.
-let same_paths = path_collection.attach_exact(&mut store, ticket.commits())?;
+let same_paths = path_collection.attach_exact(&mut store, &cover)?;
 ```
 
 Both methods require only `BlobStore + CollectionStore`. The exact source
-ticket replaces ambient heads, commit-chain traversal, manifests, registered
+cover replaces ambient heads, commit-chain traversal, manifests, registered
 hooks, and range planning.
 
-The ticket is the authority boundary. Every commit must:
+The derivation selects a target `Cover` whose support equals the source cover;
+the same value type represents both lattice positions. The path recipe permits
+any validated combination of source merges, target merges, and derivations
+with that support, so route choice is not encoded as a cover mode.
 
-- name the canonical authority-bearing `SimpleArchive` source descriptor;
-- byte-match one strictly self-signed record discovered in the store; and
-- name resident canonical source data.
+The opaque cover is the value boundary. It must name the canonical
+authority-bearing `SimpleArchive` source descriptor, and every member must name
+resident canonical source data.
 
-Duplicate copies of the same commit id collapse as set input. Distinct commits
-that name identical data remain distinct provenance roots and share one
-canonical derivation. Commit metadata is intentionally outside this
-path-semantic check: callers that require metadata closure validate it while
-constructing the ticket.
+Distinct signed claims that name identical data collapse to one cover member
+and one unit of derivation work. Their authorship, signatures, and metadata are
+queryable, possibly absent provenance through `store.claims(&cover)` and are
+intentionally unnecessary for replay or path semantics.
 
 `attach_exact` never writes. It admits existing canonical source `MERGE`,
 path-summary `MERGE`, and source-to-target `DERIVE` equations, then requires
 both:
 
 1. the union of support on the logical target frontier is exactly the supplied
-   commit-id set; and
-2. the target frontier has a complete resident physical cover.
+   payload set; and
+2. the target frontier has a complete resident target `Cover`.
 
 Only then are selected summaries joined and closed once into `PathIndex`.
 
-`ensure_exact` performs the same probe, selects a deterministic resident
-physical cover of the source lattice, and lowers only cover members supporting
-at least one still-unsupported signed root. A resident source merge can
-therefore replace several leaf derivations, even when it overlaps a root that
+`ensure_exact` performs the same probe, selects a deterministic resident source
+`Cover`, and lowers only cover members supporting
+at least one still-unsupported payload member. A resident source merge can
+therefore replace several leaf derivations, even when it overlaps a member that
 already has a target image. It publishes descriptor and output blobs before the
 unsigned `DERIVE` records and performs no implicit durability flush. It drops
 the old reader before those writes and calls `attach_exact` afterwards, so
 local construction never substitutes for fresh admission. Concurrent and
 repeated ensures are content-addressed and record-idempotent.
 
-An empty ticket returns the automaton-indexed bottom relation locally and
+An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.
 
 ## What a persisted summary means

@@ -333,29 +333,50 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
         .unwrap();
 
     let delegated = store.commit(collection, &delegate, fragment(2)).unwrap();
-    assert!(store.ticket(collection, &[]).unwrap().is_empty());
+    assert!(store.cover(collection, &[]).unwrap().is_empty());
 
     let root = store.commit(collection, &authority, fragment(1)).unwrap();
-    assert_eq!(store.ticket(collection, &[]).unwrap().commits(), &[root]);
+    let authority_cover = store.cover(collection, &[]).unwrap();
+    assert_eq!(authority_cover.collection(), collection);
+    assert_eq!(
+        authority_cover.members().collect::<Vec<_>>(),
+        vec![root.data()]
+    );
 
     let proof = write_presentation(&authority, delegate.verifying_key(), collection);
-    let ticket = store.ticket(collection, &[proof.clone()]).unwrap();
-    assert_eq!(ticket.collection(), collection);
+    let cover_before_duplicate = store.cover(collection, &[proof.clone()]).unwrap();
+    assert_eq!(cover_before_duplicate.len(), 2);
+
+    // A second authorized signer may attest the same payload with a distinct
+    // signed record. Provenance grows, but the payload lattice point does not.
+    let duplicate = store.commit(collection, &delegate, fragment(1)).unwrap();
+    assert_ne!(duplicate.id(), root.id());
+    assert_eq!(duplicate.data(), root.data());
+
+    let cover = store.cover(collection, &[proof.clone()]).unwrap();
+    assert_eq!(cover, cover_before_duplicate);
+    assert_eq!(cover.collection(), collection);
+    assert_eq!(cover.len(), 2);
     assert_eq!(
-        ticket
-            .commits()
-            .iter()
-            .map(|commit| commit.id())
+        cover.members().collect::<BTreeSet<_>>(),
+        BTreeSet::from([root.data(), delegated.data()]),
+    );
+    assert_eq!(
+        store
+            .claims(&cover)
+            .unwrap()
+            .into_iter()
+            .map(|claim| claim.id())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([root.id(), delegated.id()]),
+        BTreeSet::from([root.id(), delegated.id(), duplicate.id()]),
     );
 
     let snapshot = store.snapshot(collection, &[proof]).unwrap();
     let mut expected = fragment(1).into_facts();
     expected += fragment(2).into_facts();
     assert_eq!(snapshot.facts(), &expected);
-    assert_eq!(snapshot.ticket(), &ticket);
-    assert_eq!(store.materialize(&ticket).unwrap(), expected);
+    assert_eq!(snapshot.cover(), &cover);
+    assert_eq!(store.materialize(&cover).unwrap(), expected);
 }
 
 #[test]
@@ -382,8 +403,8 @@ fn invalid_explicit_presentation_fails_loud() {
     let valid = write_presentation(&authority, other_delegate.verifying_key(), collection);
 
     assert!(matches!(
-        store.ticket(collection, &[valid, wrong]),
-        Err(triblespace_core::collection::CollectionTicketError::Admission(error))
+        store.cover(collection, &[valid, wrong]),
+        Err(triblespace_core::collection::CollectionCoverError::Admission(error))
             if error.presentation() == 1
     ));
 }

@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use crate::id::Id;
 use crate::repo::WantRequest;
 
-use super::{CollectionHandle, CollectionRecord};
+use super::{CollectionData, CollectionHandle, CollectionRecord};
 
 /// One semantic route into the grow-only collection-record set.
 ///
@@ -24,6 +24,11 @@ use super::{CollectionHandle, CollectionRecord};
 pub enum CollectionRecordSelector {
     /// Select one record by its intrinsic content-derived id.
     Id(Id),
+    /// Select every signed membership claim for one exact collection element.
+    ///
+    /// Several authors or metadata archives may attest the same data member;
+    /// all of those claims remain provenance over one payload identity.
+    CommitMember(CollectionHandle, CollectionData),
     /// Select every `MERGE` asserted for one collection descriptor.
     MergeCollection(CollectionHandle),
     /// Select every `DERIVE` into one exact target descriptor.
@@ -60,7 +65,9 @@ pub(crate) fn selectors_match_record(
         return true;
     }
     match record {
-        CollectionRecord::Commit(_) => false,
+        CollectionRecord::Commit(commit) => selectors.contains(
+            &CollectionRecordSelector::CommitMember(commit.collection(), commit.data()),
+        ),
         CollectionRecord::Merge(merge) => {
             selectors.contains(&CollectionRecordSelector::MergeCollection(
                 merge.collection(),

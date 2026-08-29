@@ -75,14 +75,14 @@ use crate::query::register::RegisterOrder;
 use crate::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{
-    ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
+    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
     ExactDerivedCollectionError,
 };
 use super::records::{
     collection_authority, collection_reach, collection_recipe, collection_representation,
     collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
-use super::{simplearchive_union, CollectionCommit, CollectionStore};
+use super::{simplearchive_union, CollectionStore, Cover};
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
 /// Width of one stored id.
@@ -423,31 +423,31 @@ impl ObservedSetCollection {
         )
     }
 
-    /// Attach the observed set already resident for `ticket`.
+    /// Attach the observed set already resident for `source_cover`.
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, ticket, self)?;
+        let cover = self.kernel().attach_exact(store, source_cover, self)?;
         self.index_from_cover(cover)
     }
 
-    /// Ensure and attach the observed set for `ticket`.
+    /// Ensure and attach the observed set for `source_cover`.
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(store, ticket, self)?;
+        let cover = self.kernel().ensure_exact(store, source_cover, self)?;
         self.index_from_cover(cover)
     }
 
@@ -457,7 +457,7 @@ impl ObservedSetCollection {
 
     fn index_from_cover(
         &self,
-        cover: ExactCover<ObservedSetBlob>,
+        cover: CoverAttachment<ObservedSetBlob>,
     ) -> Result<ObservedIndex, ObservedSetCollectionError> {
         let mut joined = empty();
         for segment in cover.into_blobs() {
@@ -467,10 +467,10 @@ impl ObservedSetCollection {
     }
 }
 
-/// Failure to validate, complete, or materialize one observed-set ticket.
+/// Failure to validate, complete, or materialize one observed-set cover.
 #[derive(Debug)]
 pub enum ObservedSetCollectionError {
-    /// Exact-ticket authority, resolution, construction, or storage failed.
+    /// Exact-cover resolution, construction, or storage failed.
     Collection(ExactDerivedCollectionError),
     /// Canonical observed-set construction failed.
     Algebra(ObservedSetError),

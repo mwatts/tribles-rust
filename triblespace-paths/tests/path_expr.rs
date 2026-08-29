@@ -5,7 +5,7 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::{
-    simplearchive_union, CollectionCommit, CollectionRecord, CollectionStore,
+    simplearchive_union, CollectionCommit, CollectionRecord, CollectionStore, CollectionStoreExt,
 };
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::hash::Handle;
@@ -123,7 +123,8 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     );
     store.insert(CollectionRecord::Commit(commit)).unwrap();
 
-    let index = paths.ensure_exact(&mut store, &[commit]).unwrap();
+    let cover = store.cover(source, &[]).unwrap();
+    let index = paths.ensure_exact(&mut store, &cover).unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));
     let reachable = Query::new(index.constraint(start, end), |binding: &Binding| {

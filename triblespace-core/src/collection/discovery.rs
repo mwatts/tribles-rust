@@ -6,8 +6,7 @@
 //! recovery path: a structural storage failure is fatal. It verifies signed
 //! commits, classifies records, and canonicalizes the resulting semantic view.
 
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -19,8 +18,35 @@ use crate::inline::Inline;
 
 use super::{
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
-    CollectionRecordSelector, CollectionStore, CommitVerificationError,
+    CollectionRecordSelector, CollectionStore, CommitVerificationError, Cover,
 };
+
+/// Failure to use one opaque payload cover with an exact collection recipe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactCoverError {
+    /// The cover belongs to another collection descriptor.
+    WrongCollection {
+        /// Descriptor required by the operation.
+        expected: CollectionHandle,
+        /// Descriptor carried by the cover.
+        actual: CollectionHandle,
+    },
+}
+
+impl fmt::Display for ExactCoverError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongCollection { expected, actual } => write!(
+                formatter,
+                "cover names collection {} instead of {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
+            ),
+        }
+    }
+}
+
+impl Error for ExactCoverError {}
 
 /// One collection record with a discovery-time validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,322 +62,6 @@ pub struct CollectionRecordDiagnostic {
 pub enum CollectionRecordDiagnosticError {
     /// A structurally canonical commit failed strict Ed25519 verification.
     InvalidCommit(CommitVerificationError),
-}
-
-/// Failure to canonicalize or admit an exact commit ticket.
-///
-/// Exact tickets are mathematical sets of complete [`CollectionCommit`]
-/// records. Byte-identical repeats collapse, while every distinct member must
-/// name the expected collection and byte-match one strictly verified record
-/// selected from storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExactTicketError {
-    /// A supplied commit names another collection descriptor.
-    WrongCollection {
-        /// Intrinsic commit record id.
-        commit: Id,
-        /// Descriptor required by the fixed facade.
-        expected: CollectionHandle,
-        /// Descriptor named by the supplied commit.
-        actual: CollectionHandle,
-    },
-    /// Two supplied records have the same intrinsic id but different bytes.
-    ConflictingCommit {
-        /// Colliding intrinsic commit record id.
-        commit: Id,
-    },
-    /// Storage returned the requested intrinsic id with different commit bytes.
-    StoredCommitMismatch {
-        /// Intrinsic commit record id.
-        commit: Id,
-    },
-    /// The exact record is absent or did not pass strict signature verification.
-    MissingOrInvalidCommit {
-        /// Intrinsic commit record id.
-        commit: Id,
-    },
-}
-
-impl fmt::Display for ExactTicketError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongCollection {
-                commit,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "ticket commit {commit:X} names collection {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-            Self::ConflictingCommit { commit } => write!(
-                f,
-                "ticket contains byte-distinct commits with intrinsic id {commit:X}",
-            ),
-            Self::StoredCommitMismatch { commit } => write!(
-                f,
-                "ticket commit {commit:X} does not byte-match the stored record",
-            ),
-            Self::MissingOrInvalidCommit { commit } => write!(
-                f,
-                "ticket commit {commit:X} is absent or fails strict signature verification",
-            ),
-        }
-    }
-}
-
-impl Error for ExactTicketError {}
-
-/// Failure to compare two exact ticket observations as one monotone advance.
-///
-/// [`exact_ticket_additions`] performs no storage access or signature
-/// verification. These errors concern only the supplied complete records and
-/// the additions-only relationship between the two observations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExactTicketAdvanceError {
-    /// A supplied commit names another collection descriptor.
-    WrongCollection {
-        /// Intrinsic commit record id.
-        commit: Id,
-        /// Descriptor shared by both observations.
-        expected: CollectionHandle,
-        /// Descriptor named by the supplied commit.
-        actual: CollectionHandle,
-    },
-    /// Two supplied records have the same intrinsic id but different bytes.
-    ConflictingCommit {
-        /// Colliding intrinsic commit record id.
-        commit: Id,
-    },
-    /// A member of the previous observation is absent from the current one.
-    ///
-    /// Additions-only incremental evaluation is unsound across this boundary;
-    /// rebuild application state from `current` instead.
-    ResetRequired {
-        /// First missing previous member in canonical intrinsic-id order.
-        missing: Id,
-    },
-}
-
-impl fmt::Display for ExactTicketAdvanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongCollection {
-                commit,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "ticket commit {commit:X} names collection {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-            Self::ConflictingCommit { commit } => write!(
-                f,
-                "ticket contains byte-distinct commits with intrinsic id {commit:X}",
-            ),
-            Self::ResetRequired { missing } => write!(
-                f,
-                "previous ticket commit {missing:X} is absent from the current observation; \
-                 additions-only processing requires a reset",
-            ),
-        }
-    }
-}
-
-impl Error for ExactTicketAdvanceError {}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TicketShapeError {
-    WrongCollection {
-        commit: Id,
-        expected: CollectionHandle,
-        actual: CollectionHandle,
-    },
-    ConflictingCommit {
-        commit: Id,
-    },
-}
-
-impl From<TicketShapeError> for ExactTicketError {
-    fn from(error: TicketShapeError) -> Self {
-        match error {
-            TicketShapeError::WrongCollection {
-                commit,
-                expected,
-                actual,
-            } => Self::WrongCollection {
-                commit,
-                expected,
-                actual,
-            },
-            TicketShapeError::ConflictingCommit { commit } => Self::ConflictingCommit { commit },
-        }
-    }
-}
-
-impl From<TicketShapeError> for ExactTicketAdvanceError {
-    fn from(error: TicketShapeError) -> Self {
-        match error {
-            TicketShapeError::WrongCollection {
-                commit,
-                expected,
-                actual,
-            } => Self::WrongCollection {
-                commit,
-                expected,
-                actual,
-            },
-            TicketShapeError::ConflictingCommit { commit } => Self::ConflictingCommit { commit },
-        }
-    }
-}
-
-fn canonicalize_ticket_records<'a>(
-    ticket: &'a [CollectionCommit],
-    expected: CollectionHandle,
-) -> Result<Cow<'a, [CollectionCommit]>, TicketShapeError> {
-    // `Collection::ticket` already returns this order. Preserve that common
-    // O(n) path while accepting the more permissive slice shape used by exact
-    // attachment APIs.
-    if ticket.windows(2).all(|pair| pair[0].id() < pair[1].id()) {
-        for commit in ticket {
-            if commit.collection() != expected {
-                return Err(TicketShapeError::WrongCollection {
-                    commit: commit.id(),
-                    expected,
-                    actual: commit.collection(),
-                });
-            }
-        }
-        return Ok(Cow::Borrowed(ticket));
-    }
-
-    let mut ticket = ticket.to_vec();
-    ticket.sort_unstable_by(|left, right| {
-        left.id()
-            .cmp(&right.id())
-            .then_with(|| left.to_bytes().cmp(&right.to_bytes()))
-    });
-    let mut commits = BTreeMap::<Id, CollectionCommit>::new();
-    for commit in &ticket {
-        if commit.collection() != expected {
-            return Err(TicketShapeError::WrongCollection {
-                commit: commit.id(),
-                expected,
-                actual: commit.collection(),
-            });
-        }
-        match commits.entry(commit.id()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(*commit);
-            }
-            std::collections::btree_map::Entry::Occupied(entry)
-                if entry.get().to_bytes() == commit.to_bytes() => {}
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(TicketShapeError::ConflictingCommit {
-                    commit: commit.id(),
-                });
-            }
-        }
-    }
-    Ok(Cow::Owned(commits.into_values().collect()))
-}
-
-/// Canonical intrinsic-id order for one exact ticket.
-pub(crate) fn canonicalize_exact_ticket(
-    ticket: &[CollectionCommit],
-    expected: CollectionHandle,
-) -> Result<Vec<CollectionCommit>, ExactTicketError> {
-    canonicalize_ticket_records(ticket, expected)
-        .map(Cow::into_owned)
-        .map_err(Into::into)
-}
-
-/// Return the signed commit support newly present in an exact ticket.
-///
-/// Both inputs are mathematical sets of complete [`CollectionCommit`] records
-/// for `collection`. Byte-identical duplicates collapse and output is ordered
-/// by intrinsic record id. When every previous member remains present, the
-/// result is exactly `current - previous`. If a previous member disappeared,
-/// [`ExactTicketAdvanceError::ResetRequired`] reports that additions-only
-/// incremental evaluation is no longer sound.
-///
-/// This compares semantic support, not materialized facts or physical lattice
-/// covers. A newly admitted commit may repeat facts already present and can
-/// legitimately provide a new witness to an incremental query. The helper
-/// performs no storage access and no signature verification; obtain both
-/// observations from the same admitted [`crate::collection::Collection`]
-/// facade before calling it.
-pub fn exact_ticket_additions(
-    collection: CollectionHandle,
-    previous: &[CollectionCommit],
-    current: &[CollectionCommit],
-) -> Result<Vec<CollectionCommit>, ExactTicketAdvanceError> {
-    let previous = canonicalize_ticket_records(previous, collection)?;
-    let current = canonicalize_ticket_records(current, collection)?;
-    let mut additions = Vec::with_capacity(current.len().saturating_sub(previous.len()));
-    let (mut old, mut new) = (0, 0);
-
-    while old < previous.len() && new < current.len() {
-        match previous[old].id().cmp(&current[new].id()) {
-            std::cmp::Ordering::Less => {
-                return Err(ExactTicketAdvanceError::ResetRequired {
-                    missing: previous[old].id(),
-                });
-            }
-            std::cmp::Ordering::Equal => {
-                if previous[old].to_bytes() != current[new].to_bytes() {
-                    return Err(ExactTicketAdvanceError::ConflictingCommit {
-                        commit: previous[old].id(),
-                    });
-                }
-                old += 1;
-                new += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                additions.push(current[new]);
-                new += 1;
-            }
-        }
-    }
-
-    if old < previous.len() {
-        return Err(ExactTicketAdvanceError::ResetRequired {
-            missing: previous[old].id(),
-        });
-    }
-    additions.extend_from_slice(&current[new..]);
-    Ok(additions)
-}
-
-/// Require every canonical ticket member to byte-match strict discovered data.
-pub(crate) fn validate_exact_ticket(
-    discovered: &DiscoveredCollectionRecords,
-    ticket: &[CollectionCommit],
-) -> Result<BTreeSet<Id>, ExactTicketError> {
-    let mut ids = BTreeSet::new();
-    for commit in ticket {
-        match discovered
-            .commits()
-            .binary_search_by_key(&commit.id(), CollectionCommit::id)
-        {
-            Ok(index) if discovered.commits()[index].to_bytes() == commit.to_bytes() => {}
-            Ok(_) => {
-                return Err(ExactTicketError::StoredCommitMismatch {
-                    commit: commit.id(),
-                });
-            }
-            Err(_) => {
-                return Err(ExactTicketError::MissingOrInvalidCommit {
-                    commit: commit.id(),
-                });
-            }
-        }
-        ids.insert(commit.id());
-    }
-    Ok(ids)
 }
 
 impl fmt::Display for CollectionRecordDiagnosticError {
@@ -486,63 +196,64 @@ where
     Ok(discovered)
 }
 
-/// Discover the exact proof domain and verify only commits named by a ticket.
+/// Discover the source/target equations that may realize one exact source
+/// cover.
 ///
-/// Exact-ticket consumers authorize concrete commit records rather than every
-/// signer or every commit in the store. Their ticket IDs are structurally
-/// available before Ed25519 verification, so unrelated commits can be skipped
-/// without paying their signature cost. Their fixed derived kernel can only
-/// activate source/target merges and source-to-target derives, so unrelated
-/// unsigned equations are omitted at the same boundary. Matching commits
-/// retain the ordinary strict-verification and diagnostic behavior. The caller
-/// must still byte-match each supplied ticket record against the returned
-/// commit with the same intrinsic ID.
-pub(crate) fn discover_collection_records_for_ticket<S>(
+/// The cover already crossed admission or validated collection algebra when
+/// it was constructed. Replaying it therefore needs equations, not another
+/// signature scan over provenance claims for the same payloads.
+pub(crate) fn discover_collection_records_for_derived_cover<S>(
     store: &mut S,
-    ticket_ids: &BTreeSet<Id>,
-    source: CollectionHandle,
+    cover: &Cover,
     target: CollectionHandle,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
 {
-    let mut selectors: BTreeSet<_> = ticket_ids
-        .iter()
-        .copied()
-        .map(CollectionRecordSelector::Id)
-        .collect();
+    let source = cover.collection();
+    let mut selectors = BTreeSet::new();
     selectors.insert(CollectionRecordSelector::MergeCollection(source));
     selectors.insert(CollectionRecordSelector::MergeCollection(target));
     selectors.insert(CollectionRecordSelector::DeriveTarget(target));
-    discover_collection_records_for_selectors(store, ticket_ids, &selectors)
+    discover_collection_records_for_cover_selectors(store, cover, &selectors)
 }
 
-/// Discover one direct collection's exact ticket and same-descriptor merges.
+/// Discover same-lattice equations that may physically realize one cover.
 ///
-/// Commits outside `ticket_ids`, derives, and merges for other descriptors are
-/// excluded at the storage selector boundary. Matching ticket commits retain
-/// strict signature verification; callers must still byte-match the supplied
-/// full records with [`validate_exact_ticket`].
-pub(crate) fn discover_collection_records_for_collection_ticket<S>(
+/// The cover is already an opaque constructed value, so this
+/// path deliberately does not select or verify provenance commits.
+pub(crate) fn discover_collection_equations_for_cover<S>(
     store: &mut S,
-    ticket_ids: &BTreeSet<Id>,
-    collection: CollectionHandle,
+    cover: &Cover,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
 {
-    let mut selectors: BTreeSet<_> = ticket_ids
-        .iter()
-        .copied()
-        .map(CollectionRecordSelector::Id)
-        .collect();
-    selectors.insert(CollectionRecordSelector::MergeCollection(collection));
-    discover_collection_records_for_selectors(store, ticket_ids, &selectors)
+    let selectors = BTreeSet::from([CollectionRecordSelector::MergeCollection(
+        cover.collection(),
+    )]);
+    discover_collection_records_for_cover_selectors(store, cover, &selectors)
 }
 
-fn discover_collection_records_for_selectors<S>(
+/// Discover every strictly signed provenance claim currently known for one
+/// exact payload cover.
+pub(crate) fn discover_collection_claims_for_cover<S>(
     store: &mut S,
-    ticket_ids: &BTreeSet<Id>,
+    cover: &Cover,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+{
+    let selectors: BTreeSet<_> = cover
+        .members()
+        .map(|member| CollectionRecordSelector::CommitMember(cover.collection(), member))
+        .collect();
+    discover_collection_records_for_cover_selectors(store, cover, &selectors)
+}
+
+fn discover_collection_records_for_cover_selectors<S>(
+    store: &mut S,
+    cover: &Cover,
     selectors: &BTreeSet<CollectionRecordSelector>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
@@ -556,8 +267,10 @@ where
 
     for record in records {
         match record {
-            CollectionRecord::Commit(record) if ticket_ids.contains(&record.id()) => {
-                matching_commits.push(record)
+            CollectionRecord::Commit(record)
+                if record.collection() == cover.collection() && cover.contains(record.data()) =>
+            {
+                matching_commits.push(record);
             }
             CollectionRecord::Commit(_) => {}
             CollectionRecord::Merge(record) => discovered.merges.push(record),
@@ -570,7 +283,7 @@ where
     matching_commits.retain(|record| {
         match verifications
             .next()
-            .expect("one verification result per ticket commit")
+            .expect("one verification result per cover claim")
         {
             Ok(()) => true,
             Err(error) => {
@@ -584,7 +297,6 @@ where
     });
     debug_assert!(verifications.next().is_none());
     discovered.commits = matching_commits;
-
     discovered.canonicalize();
     Ok(discovered)
 }
@@ -678,10 +390,10 @@ where
 /// binds that key to the signed bytes, so a forged claim fails there. The
 /// predicate supplies the admission scope, while strict verification
 /// establishes that the claimed signer actually authored the commit. Ordinary
-/// [`Collection`](super::Collection) reads pass either their explicitly
-/// verified capability subjects or an open predicate here. This lower-level
-/// primitive accepts a callback so protocols can supply any already-decided
-/// signer set without coupling discovery to how that decision was made.
+/// Higher-level collection reads pass either their explicitly verified
+/// capability subjects or an open predicate here. This lower-level primitive
+/// accepts a callback so protocols can supply any already-decided signer set
+/// without coupling discovery to how that decision was made.
 ///
 /// `MERGE` and `DERIVE` records are retained in full, for the same reason
 /// [`discover_collection_records_scoped`] retains them: they are unsigned
@@ -845,74 +557,31 @@ mod tests {
     }
 
     #[test]
-    fn exact_ticket_additions_canonicalizes_support_sets() {
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
+    fn cover_additions_are_payload_set_difference() {
         let target = collection(1);
-        let first = CollectionCommit::sign(&signing_key, target, hash(1), empty_metadata_handle());
-        let second = CollectionCommit::sign(&signing_key, target, hash(2), empty_metadata_handle());
-        let third = CollectionCommit::sign(&signing_key, target, hash(3), empty_metadata_handle());
+        let previous = Cover::from_members(target, [hash(2), hash(1), hash(1)]);
+        let current = Cover::from_members(target, [hash(3), hash(1), hash(2), hash(3)]);
 
-        let additions = exact_ticket_additions(
-            target,
-            &[second, first, first],
-            &[third, first, second, third],
-        )
-        .unwrap();
-        assert_eq!(additions, vec![third]);
-
-        let all = exact_ticket_additions(target, &[], &[third, first, second, first]).unwrap();
-        let mut expected = vec![first, second, third];
-        expected.sort_unstable_by_key(CollectionCommit::id);
-        assert_eq!(all, expected);
-        assert!(exact_ticket_additions(target, &expected, &expected)
-            .unwrap()
-            .is_empty());
+        let additions = current.additions_since(&previous).unwrap();
+        assert_eq!(additions.members().collect::<Vec<_>>(), vec![hash(3)]);
+        assert!(current.additions_since(&current).unwrap().is_empty());
     }
 
     #[test]
-    fn exact_ticket_additions_requires_a_reset_after_support_shrinks() {
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let target = collection(1);
-        let missing =
-            CollectionCommit::sign(&signing_key, target, hash(1), empty_metadata_handle());
-
+    fn cover_additions_reject_shrink_and_cross_collection() {
+        let first = Cover::from_members(collection(1), [hash(1)]);
+        let empty = Cover::from_members(collection(1), []);
         assert_eq!(
-            exact_ticket_additions(target, &[missing], &[]),
-            Err(ExactTicketAdvanceError::ResetRequired {
-                missing: missing.id(),
-            })
+            empty.additions_since(&first),
+            Err(crate::collection::CoverAdvanceError::ResetRequired { missing: hash(1) })
         );
-    }
 
-    #[test]
-    fn exact_ticket_additions_rejects_cross_observation_id_conflicts() {
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let target = collection(1);
-        let first = CollectionCommit::sign(&signing_key, target, hash(1), empty_metadata_handle());
-        let conflicting =
-            CollectionCommit::sign(&signing_key, target, hash(2), empty_metadata_handle())
-                .with_test_id(first.id());
-
+        let foreign = Cover::from_members(collection(2), [hash(1)]);
         assert_eq!(
-            exact_ticket_additions(target, &[first], &[conflicting]),
-            Err(ExactTicketAdvanceError::ConflictingCommit { commit: first.id() })
-        );
-    }
-
-    #[test]
-    fn exact_ticket_additions_rejects_another_collection() {
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let expected = collection(1);
-        let actual = collection(2);
-        let foreign =
-            CollectionCommit::sign(&signing_key, actual, hash(1), empty_metadata_handle());
-
-        assert_eq!(
-            exact_ticket_additions(expected, &[], &[foreign]),
-            Err(ExactTicketAdvanceError::WrongCollection {
-                commit: foreign.id(),
-                expected,
-                actual,
+            foreign.additions_since(&first),
+            Err(crate::collection::CoverAdvanceError::DifferentCollection {
+                previous: collection(1),
+                current: collection(2),
             })
         );
     }
@@ -941,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_ticket_discovery_selects_only_the_fixed_source_target_proof_domain() {
+    fn exact_cover_discovery_selects_only_the_fixed_source_target_equation_domain() {
         let source = collection(1);
         let target = collection(2);
         let other = collection(3);
@@ -977,17 +646,13 @@ mod tests {
             ..ProbeStore::default()
         };
 
-        let discovered = discover_collection_records_for_ticket(
-            &mut store,
-            &[commit.id()].into_iter().collect(),
-            source,
-            target,
-        )
-        .unwrap();
+        let cover = Cover::from_members(source, [commit.data()]);
+        let discovered =
+            discover_collection_records_for_derived_cover(&mut store, &cover, target).unwrap();
 
         let mut expected_merges = vec![source_merge, target_merge];
         expected_merges.sort_unstable_by_key(CollectionMerge::id);
-        assert_eq!(discovered.commits(), &[commit]);
+        assert!(discovered.commits().is_empty());
         assert_eq!(discovered.merges(), expected_merges);
         assert_eq!(discovered.derives(), &[derive]);
         assert!(discovered.diagnostics().is_empty());

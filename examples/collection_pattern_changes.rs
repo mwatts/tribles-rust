@@ -12,8 +12,8 @@ use triblespace::core::collection::succinctarchive_union::{
     SuccinctArchiveCollection, SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    exact_ticket_additions, reach, simplearchive_union, CollectionCommit, CollectionHandle,
-    CollectionStoreExt, SimpleArchiveCollection,
+    reach, simplearchive_union, CollectionHandle, CollectionStoreExt, Cover,
+    SimpleArchiveCollection,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -25,16 +25,19 @@ fn observe(
     collection: CollectionHandle,
     simple: &SimpleArchiveCollection,
     full_view: &mut SuccinctArchiveView,
-    checkpoint: &mut Vec<CollectionCommit>,
+    checkpoint: &mut Option<Cover>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    let current = store.ticket(collection, &[])?;
-    let added = exact_ticket_additions(collection, checkpoint, current.commits())?;
+    let current = store.cover(collection, &[])?;
+    let added = match checkpoint.as_ref() {
+        Some(previous) => current.additions_since(previous)?,
+        None => current.clone(),
+    };
 
     // The full view retains its already-admitted immutable Succinct shards and
     // admits only new support. The small SimpleArchive delta stays independent
     // because it drives the change query and advances only after consumption.
-    let full = full_view.ensure(store, current.commits())?;
+    let full = full_view.ensure(store, &current)?;
     let changed = simple.attach_exact(store, &added)?;
 
     let mut titles = Vec::new();
@@ -55,7 +58,7 @@ fn observe(
     // Advance only after the complete fold succeeds. A failed consumer retries
     // the same support delta, so external effects must be transactional or
     // idempotent when exactly-once delivery matters.
-    *checkpoint = current.commits().to_vec();
+    *checkpoint = Some(current);
     Ok(titles)
 }
 // ANCHOR_END: collection_pattern_changes_observe
@@ -91,7 +94,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let succinct =
         SuccinctArchiveCollection::new(name, authority, source_reach, authority, reach::private());
     let mut full_view = succinct.exact_view();
-    let mut checkpoint = Vec::new();
+    let mut checkpoint = None;
 
     let first = observe(
         &mut store,

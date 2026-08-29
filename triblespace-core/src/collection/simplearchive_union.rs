@@ -699,12 +699,26 @@ pub fn validate_commit(
     commit: &CollectionCommit,
     data_blob: &Blob<SimpleArchive>,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
+    validate_member(descriptor, commit.collection(), commit.data(), data_blob)
+}
+
+/// Validate one payload member against an exact collection descriptor.
+///
+/// A [`crate::collection::Cover`] deliberately erases which signed commit
+/// admitted a payload. This is the corresponding data-lattice boundary: bind
+/// the descriptor identity and payload hash directly, without inventing or
+/// selecting a provenance claim merely to validate the bytes.
+pub(crate) fn validate_member(
+    descriptor: &Fragment,
+    collection: CollectionHandle,
+    member: CollectionData,
+    data_blob: &Blob<SimpleArchive>,
+) -> Result<(), SimpleArchiveUnionValidationError> {
     validate_descriptor(descriptor)?;
-    let collection: CollectionHandle =
+    let expected: CollectionHandle =
         crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
-    validate_collection(collection, commit.collection())?;
-    validate_endpoint(ElementRole::CommitData, commit.data(), data_blob)?;
-    Ok(())
+    validate_collection(expected, collection)?;
+    validate_endpoint(ElementRole::CommitData, member, data_blob)
 }
 
 /// Validate a claimed exact union without materializing another result blob.

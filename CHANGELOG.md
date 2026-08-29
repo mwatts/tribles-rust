@@ -20,29 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Make `SuccinctArchiveView` continuation reuse directly observable through a
   last-successful-work report. It distinguishes newly admitted from retained
-  commits and counts the actual raw validation, derivation, and join calls made
-  by that observation. The evolving-collection benchmark now labels its
-  stateless post-timing proof replay separately from maintained-view work,
-  proving that an identical ticket performs zero algebra/storage work and a
-  monotone extension admits only its signed delta.
+  payload members and counts the actual raw validation, derivation, and join
+  calls made by that observation. The evolving-collection benchmark now labels
+  its stateless post-timing proof replay separately from maintained-view work,
+  proving that an identical cover performs zero algebra/storage work and a
+  monotone extension admits only its payload delta.
 
 - Add an end-to-end incremental collection-query benchmark comparing full
   re-query with `pattern_changes!` maintenance over source-identical exact
   Succinct views. It measures one fixed-size commit observation, including
   view admission and application result-set maintenance, while checking raw
-  rows, accumulated results, tickets, and checkpoints at every step.
+  rows, accumulated results, covers, and checkpoints at every step.
 
 - Add `SuccinctArchiveCollection::exact_view()` for maintaining one admitted
-  in-process query view across exact ticket observations. Unchanged support
+  in-process query view across exact cover observations. Unchanged support
   performs no storage I/O, monotone additions run ordinary exact admission only
-  over the signed delta and union immutable shards, and shrinking observations
+  over the payload delta and union immutable shards, and shrinking observations
   rebuild. The continuation is ephemeral and advances only after complete
   success; it creates no receipts, revision tokens, or alternate trust path.
 
-- Add `exact_ticket_additions` as the pure continuation boundary between two
-  exact collection observations. It canonicalizes complete commit sets,
-  returns newly observed signed support only when the previous ticket remains
-  a subset, and reports `ResetRequired` before additions-only incremental
+- Add `Cover::additions_since` as the pure continuation boundary between two
+  exact collection observations. It compares PATCH sets of payload identities,
+  returns newly observed members only when the previous cover remains a
+  subset, and reports `ResetRequired` before additions-only incremental
   processing can cross a shrinking admission view. A runnable example combines
   a maintained Succinct full view, a cheap SimpleArchive support delta,
   `pattern_changes!`, and checkpoint advancement after successful consumption.
@@ -125,8 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offers. `triblespace-net::collection_sync::ensure_exact_derived` fetches only
   those selected handles through authenticated `GET_BLOB`, creates no durable
   WANT, and falls back to canonical local construction. Remote equations remain
-  unsigned cache evidence and are recomputed from the authenticated source
-  ticket, so this first slice saves transfer and residency rather than claiming
+  unsigned cache evidence and are recomputed from the opaque source
+  cover, so this first slice saves transfer and residency rather than claiming
   a compute attestation.
 
 - Add a monotone native store-scope assertion binding one physical repository
@@ -209,6 +209,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the unpublished commit-bearing `CollectionTicket`, `store.ticket`,
+  and `exact_ticket_additions` surfaces with one opaque PATCH-backed `Cover`
+  value. A cover is identified by its collection descriptor and distinct payload
+  handles; duplicate signatures or metadata claims over the same payload are
+  optional provenance reported by `store.claims(&cover)`, not new members or
+  data work. Replay and derivation require no resident commit or metadata.
+  `store.cover`, snapshots, exact derivations, maintained Succinct views,
+  paths, and network reuse now share this continuation type. Distinct covers
+  may have equal support through validated merges; route freedom or exact
+  immediate-input requirements belong to the collection recipe, including
+  Rank9's exact raw-Succinct input. Exact derivation can reverse-ground a
+  compacted source member through freshly validated MERGE inputs, so `{c}` may
+  reuse resident `{f(a), f(b)}` when `a join b = c`, while forged equations
+  remain inert and fall back to direct construction. The same equivalence lets
+  capacity replanning replace a blocked compacted member with its resident
+  lower shards. Resolution tries the explicit Cover path first and widens into
+  reverse decompositions only when needed; unreadable optional inputs and
+  Rank9 fibers cannot poison an otherwise valid replay or turn speculative
+  misses into durable demand.
+
 - Port the remaining benchmark, path/network test, macro-instrumentation, and
   benchmark-ledger callers to the store-centric collection API with mandatory
   descriptor authority. The tribleset benchmark results ledger now uses one
@@ -220,10 +240,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store-centric collection operations. `store.collection(fragment)` validates,
   stores, and durably offers a descriptor's complete attachment closure;
   `store.commit(handle, key, fragment)` publishes locally without conflating
-  storage with authorization; and `ticket`/`snapshot` admit the descriptor
-  authority plus explicitly presented delegated writers. `CollectionTicket`
-  now carries one canonical exact commit set for replay through
-  `store.materialize(&ticket)`. Descriptor handles are the collection values,
+  storage with authorization; and `cover`/`snapshot` admit the descriptor
+  authority plus explicitly presented delegated writers. `Cover` carries one
+  canonical exact payload set for replay through `store.materialize(&cover)`.
+  Descriptor handles are the collection values,
   publication never flushes implicitly, and repeated commits remain
   idempotent native records.
 
@@ -303,7 +323,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace the current-facing Repository, Workspace, mutable branch, pin, and
   compare-and-swap documentation with the native collection model. The book now
   presents self-describing descriptors, signed `COMMIT` members, validated
-  `MERGE`/`DERIVE` equations, exact tickets, and orthogonal WANTs as one coherent
+  `MERGE`/`DERIVE` equations, exact covers, and orthogonal WANTs as one coherent
   workflow; obsolete speculative chapters and their retired proof harnesses are
   removed, while immutable legacy pin snapshots remain documented only for
   diagnosis, retention, and explicit migration.
@@ -630,13 +650,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore`, `CollectionStore`, and `StorageFlush` forwarding surfaces and
   allowing a temporary `Repository` view without transferring backend
   ownership or reimplementing the pin trait in downstream crates.
-- **Direct `SimpleArchive` collections now have a keyless exact-ticket read
-  facade.** `SimpleArchiveCollection::{attach_exact,snapshot_exact}` accepts a
-  set of complete `CollectionCommit` records, admits mixed authors only after
-  exact stored-byte and strict-signature checks, and keeps unselected commits
-  inert. It shares `Collection`'s descriptor, mandatory data/metadata, merge
-  cover, and coherent-reader validation path, exposes no write operation, and
-  canonicalizes byte-identical ticket repeats into one sorted commit set.
+- **Direct `SimpleArchive` collections now have a keyless exact-cover read
+  facade.** `SimpleArchiveCollection::{attach_exact,snapshot_exact}` accepts an
+  opaque `Cover` and requires only its descriptor and payload bytes; no signed
+  commit or metadata needs to remain resident. It shares ordinary descriptor,
+  member, merge-cover, and coherent-reader validation, exposes no write
+  operation, and keeps provenance independently queryable.
 - **The unpublished branch-index persistence stack is gone.** Core no longer
   exposes commit-range manifests, `IndexKind`, repository on-commit hooks, or
   their branch-head maintenance path. Search no longer exposes the
@@ -654,17 +673,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot type are also gone.
 - **The SuccinctArchive example now follows the native collection lifecycle.**
   `native_succinct_collection` publishes intrinsic fragments as independent
-  signed commits, freezes authority with a record-only ticket, and queries an
+  signed commits, freezes the admitted value as a payload cover, and queries an
   exact `SuccinctArchiveCollection` projection without branch hooks, manifests,
   or a checkout. The pile re-id/rename integration test now exercises its real
   generic contract by carrying unrelated canonical branch annotations instead
   of depending on a Succinct-specific manifest fixture.
 - **The portable Succinct LSM benchmark now measures the native exact
-  collection lifecycle.** Source chunks are published and ticketed outside the
-  timer; `build_exact` measures canonical raw construction, deterministic
-  target compaction, Rank9 fiber persistence, and query-ready attachment as one
-  fixed operation. The report replaces legacy fanout/range/manifest counters
-  with exact-ticket, raw-cover, serialized-byte, and physical-shard metrics
+  collection lifecycle.** Source chunks are published and their cover is
+  discovered outside the timer; `build_exact` measures canonical raw
+  construction, deterministic target compaction, Rank9 fiber persistence, and
+  query-ready attachment as one fixed operation. The report replaces legacy
+  fanout/range/manifest counters with exact-cover, raw-cover, serialized-byte,
+  and physical-shard metrics
   while retaining the union-versus-`TribleSet` query identity gates.
 - **The speculative adaptive Succinct rollup wrapper is gone.** Core retains
   the stateless `WaveletMatrixFreezeBackend` and
@@ -674,11 +694,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-to-end measurement showed no useful win from that legacy adapter. Native
   GPU execution for the exact raw-Succinct collection would require a separate
   direct-raw adapter rather than restoring a branch-bound lifecycle.
-- **Derived collections now share one qualified exact-ticket lifecycle.**
-  `collection::exact_derived::ExactDerivedCollection` supplies strict ticket
-  discovery, signed-root admission, deterministic resident covers, residual
+- **Derived collections now share one qualified exact-cover lifecycle.**
+  `collection::exact_derived::ExactDerivedCollection` supplies strict cover
+  discovery, payload validation, deterministic resident covers, residual
   lowering, descriptors-before-outputs-before-`DERIVE` publication, and fresh
-  read-side re-admission without `PinStore` or an implicit flush. Regular paths
+  read-side revalidation without `PinStore` or an implicit flush. Regular paths
   use this kernel, and the new `SuccinctArchiveCollection` facade returns the
   exact raw target cover as an owned sharded `UnionArchive`, preserving that
   cover's physical shape while attaching an exact Rank9 accelerator fiber to
@@ -687,7 +707,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `i(a) join i(b) = i(a join b)`, so ordinary raw-to-Rank9 `DERIVE` records are
   truthful without introducing Rank9 `MERGE` records. Four explicitly minted
   recipe ids distinguish 32/64-bit and little/big-endian profiles; the current
-  target selects exactly one. An empty ticket performs no storage I/O and
+  target selects exactly one. An empty cover performs no storage I/O and
   receives one authority-free local empty query shard, whereas a signed commit
   over empty source data still publishes ordinary provenance-bearing raw and
   Rank9 `DERIVE` evidence.
@@ -708,7 +728,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   garbage collection. A five-operation representation algebra validates the
   fixed descriptors and terminal artifacts while a descriptor-typed evaluator
   walks backwards from resident source and target results, then reconstructs
-  every candidate path forwards from authenticated source leaves. Computed
+  every candidate path forwards from explicit source-cover leaves. Computed
   intermediates have use-counted scratch lifetimes and are never persisted.
   Selected optional artifacts are freshly hashed and representation-validated;
   invalid cache bytes are removed and the deterministic physical cover is
@@ -724,7 +744,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   I/O, or malformed persisted bytes. When a selected source upper exceeds that
   geometry, completion excludes it and globally replans the physical cover
   under the same read/resolution snapshot, caching successful images but
-  publishing only the final feasible plan. An indispensable signed source leaf
+  publishing only the final feasible plan. An indispensable source-cover member
   reports an explicit unrepresentable cover with zero writes. Succinct raw
   construction and merge preserve typed input-versus-union-growth phases.
   Paths remains fatal on all algebra failures, including fixed summary limits:
@@ -738,7 +758,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeatedly joins the two lowest content handles in the lowest colliding
   dyadic serialized-byte tier, puts and verifies the target descriptor and all
   canonical result blobs before topologically ordered unsigned `MERGE` records,
-  and freshly re-admits every published round under the same exact ticket. A
+  and freshly revalidates every published round under the same exact cover. A
   capacity failure retires only the lower input for that planning round, so the
   higher input remains eligible for another deterministic pair and every
   attempt shrinks the active set. A no-claim round returns a capacity-stable
@@ -749,12 +769,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never for compacted-away leaves; each raw shard retains the explicit
   `u32::MAX` row/domain boundary.
 - **Regular paths now use one exact native collection path.**
-  `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
-  of signed `SimpleArchive` commits, reuses canonical source merges, target
+  `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen
+  source `Cover`, reuses canonical source merges, target
   merges, and derives, and closes the exact resident summary cover once into a
   `PathIndex`. Ensuring lowers only unsupported distinct source elements,
   publishes blobs before unsigned records without an implicit flush, and
-  re-admits through a fresh reader. The empty ticket is a no-write local
+  reattaches through a fresh reader. The empty cover is a no-write local
   bottom. `PathRollup`, its range attribute, range-manifest attachment,
   repository hooks, commit ranges, and manifest-specific path tests are
   removed; the new API requires only `BlobStore + CollectionStore` and works
@@ -921,14 +941,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needed, and it compiles to one short-circuited reverse-index probe per
   candidate.
 
-- **Ordinary collections expose authority-resolved exact tickets.**
-  `Collection::ticket()` resolves the team's positive authority DAG and returns
-  every exact strictly verified commit whose signer may invoke `ACTION_WRITE`
-  on the canonical descriptor, ordered by intrinsic record id. It opens and
-  reads authority grant blobs but does not fetch or materialize the selected
-  target commits' data or metadata blobs. Ticket, snapshot, and materialization
-  therefore share one multi-author known-prefix authority frontier rather than
-  treating the facade's signing key as ambient authority.
+- **Ordinary collections expose authority-resolved exact covers.**
+  `store.cover(collection, presentations)` verifies the descriptor authority
+  and every explicit delegated presentation, then returns the distinct payload
+  handles named by admitted strict claims. It reads no member data or metadata
+  blobs. Cover, snapshot, and materialization therefore share one multi-author
+  known-prefix payload frontier rather than treating a publishing key as
+  ambient authority.
 
 - **Path summaries now form a native typed collection algebra.** A source
   `SimpleArchive` collection can be lowered through an automaton-specific
@@ -1032,13 +1051,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also reports the count and boundary offsets of inert legacy V3 collection
   evidence and opaque records.
 - **Ordinary collections now expose coherent authority-aware known-prefix
-  snapshots.** `Collection::snapshot()` resolves the team's positive authority
-  DAG, discovers every exact commit whose signer may invoke `ACTION_WRITE` on
-  the descriptor, and returns the materialized facts, admitted commits, and
-  target blob reader as one value. Later physically visible blobs cannot alter
-  that authority frontier, preventing derived indexes from mixing an old fact
-  view with a newer source ticket. `Collection::materialize()` shares the same
-  authority resolution and materialization path.
+  snapshots.** `store.snapshot(collection, presentations)` verifies the
+  descriptor authority and explicit delegations, discovers admitted payloads,
+  and returns the materialized facts, exact cover, and target blob reader as
+  one value. Later physically visible blobs cannot alter that authority
+  frontier, preventing derived indexes from mixing an old fact view with a
+  newer source cover. `store.materialize(&cover)` shares the same validation
+  and materialization path without repeating admission.
 - **New pile writes use a generic, length-delimited record envelope.** The
   envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` was minted with
   `trible genid` on 2026-08-11; the next 16 bytes reuse each current V3/V4

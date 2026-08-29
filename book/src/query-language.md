@@ -692,7 +692,7 @@ It implements `RegisterOrder`, and therefore substitutes for
 `StatedOrder::tiebreak_by_id()` at read time.
 
 The maintained LWW form makes one validity contract explicit: within an exact
-ticket, a state which has both halves has at most one well-formed identity and
+cover, a state which has both halves has at most one well-formed identity and
 at most one order value under the descriptor's attributes. Incomplete states
 remain incomparable even if the present half is multivalued. The row sets
 retain those values so a later counterpart exposes rather than hides a

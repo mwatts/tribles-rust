@@ -588,8 +588,8 @@ mod tests {
 
         assert!(!mappings.is_empty(), "migration still publishes locally");
         assert!(pile
-            .ticket(collection, &[])
-            .map_err(|error| anyhow!("read unpresented ticket: {error}"))?
+            .cover(collection, &[])
+            .map_err(|error| anyhow!("read unpresented cover: {error}"))?
             .is_empty());
         assert!(pile
             .records()?

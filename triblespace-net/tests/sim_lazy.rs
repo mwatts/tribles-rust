@@ -22,13 +22,18 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding};
+use triblespace_core::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+    CapabilityResource,
+};
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::exact_derived::{
     ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
 };
 use triblespace_core::collection::{
-    CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionRecord,
-    CollectionStore, simplearchive_union,
+    ACTION_WRITE, CapabilityPresentation, CollectionCommit, CollectionData, CollectionDerive,
+    CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore, CollectionStoreExt,
+    simplearchive_union,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -70,6 +75,26 @@ where
     Handle<E>: InlineEncoding,
 {
     Handle::<E>::to_hash(blob.get_handle())
+}
+
+fn write_presentation(
+    authority: &ed25519_dalek::SigningKey,
+    writer: ed25519_dalek::VerifyingKey,
+    collection: CollectionHandle,
+) -> CapabilityPresentation {
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(collection),
+    );
+    CapabilityPresentation::new(
+        writer,
+        CapabilityProofBundle::issue_root(
+            authority,
+            CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+            writer,
+        )
+        .unwrap(),
+    )
 }
 
 fn derive_test_target(source: &Blob<SimpleArchive>) -> Blob<UnknownBlob> {
@@ -342,7 +367,7 @@ fn fetch_blob_pulls_from_the_holder() {
 /// particular, asking for it must not opportunistically admit inventory that
 /// is already waiting at the peer boundary.
 #[test]
-fn empty_exact_ticket_does_not_admit_pending_inventory() {
+fn empty_exact_cover_does_not_admit_pending_inventory() {
     let _g = sim_guard();
     run_paused(0xC0AE_0000, async {
         let net = SimNet::new(0xC0AE_0000, SimConfig::default());
@@ -369,6 +394,11 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
             source: source_descriptor,
             target: target_descriptor,
         };
+        let mut client_store = empty_store();
+        let source_collection = client_store
+            .collection(lifecycle.source_descriptor().clone())
+            .unwrap();
+        let source_cover = client_store.cover(source_collection, &[]).unwrap();
 
         let lower_a = Blob::<UnknownBlob>::new(vec![0x31].into());
         let lower_b = Blob::<UnknownBlob>::new(vec![0x32].into());
@@ -394,7 +424,7 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
         let mut client = bring_up_with_peers(
             &net,
             &client_key,
-            empty_store(),
+            client_store,
             team_root,
             team_proofs(&root, &client_key),
             vec![pk(&server_key)],
@@ -411,7 +441,7 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
             "precondition: the client has not admitted the pending marker",
         );
 
-        let cover = ensure_exact_derived(&mut client, &lifecycle, &[], &algebra)
+        let cover = ensure_exact_derived(&mut client, &lifecycle, &source_cover, &algebra)
             .await
             .expect("the exact empty bottom is infallible");
         assert!(cover.is_empty());
@@ -432,7 +462,7 @@ fn empty_exact_ticket_does_not_admit_pending_inventory() {
 
 /// A nonempty exact attachment is an operation on one physically team-scoped
 /// store. If an external append introduces a conflicting scope, the checked
-/// refresh boundary must report it before ticket discovery, fetch, landing,
+/// refresh boundary must report it before cover discovery, fetch, landing,
 /// or local construction can continue.
 #[test]
 fn nonempty_exact_attachment_reports_external_scope_conflict() {
@@ -476,6 +506,10 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
 
         let mut serving = Pile::open(&serving_path).unwrap();
         serving.bind_store_scope(serving_team).unwrap();
+        let source_collection = serving
+            .collection(lifecycle.source_descriptor().clone())
+            .unwrap();
+        assert_eq!(source_collection, lifecycle.source_collection());
         let source = content_blob(0xA1).0;
         serving.put::<SimpleArchive, _>(source.clone()).unwrap();
         let metadata = serving
@@ -488,6 +522,9 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
             metadata,
         );
         serving.insert(CollectionRecord::Commit(commit)).unwrap();
+        let presentation =
+            write_presentation(&key(0xE3), key(0xE4).verifying_key(), source_collection);
+        let source_cover = serving.cover(source_collection, &[presentation]).unwrap();
 
         let mut conflicting = Pile::open(&conflicting_path).unwrap();
         conflicting.bind_store_scope(conflicting_team).unwrap();
@@ -512,7 +549,7 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
             .write_all(&std::fs::read(&conflicting_path).unwrap())
             .unwrap();
 
-        let result = ensure_exact_derived(&mut peer, &lifecycle, &[commit], &algebra).await;
+        let result = ensure_exact_derived(&mut peer, &lifecycle, &source_cover, &algebra).await;
         assert!(matches!(
             result,
             Err(ExactDerivedSyncError::Storage {
@@ -565,10 +602,14 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
         let upper = algebra.join_target(&targets[0], &targets[1]).unwrap();
 
         let mut client_store = empty_store();
+        let source_collection = client_store
+            .collection(lifecycle.source_descriptor().clone())
+            .unwrap();
+        assert_eq!(source_collection, lifecycle.source_collection());
         let metadata = client_store
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
-        let ticket: Vec<_> = sources
+        let commits: Vec<_> = sources
             .iter()
             .enumerate()
             .map(|(index, source)| {
@@ -587,6 +628,15 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
                 commit
             })
             .collect();
+        let authority = key(0xD4);
+        let presentations: Vec<_> = [key(0x91), key(0x92)]
+            .into_iter()
+            .map(|writer| write_presentation(&authority, writer.verifying_key(), source_collection))
+            .collect();
+        let source_cover = client_store
+            .cover(source_collection, &presentations)
+            .unwrap();
+        assert_eq!(source_cover.len(), commits.len());
 
         let mut server_store = empty_store();
         for target in &targets {
@@ -658,7 +708,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
         ));
 
         let cover = drive_future(
-            ensure_exact_derived(&mut client, &lifecycle, &ticket, &algebra),
+            ensure_exact_derived(&mut client, &lifecycle, &source_cover, &algebra),
             || server.refresh(),
             240,
         )

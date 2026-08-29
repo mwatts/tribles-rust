@@ -10,7 +10,7 @@
 //!   build_exact — one end-to-end query-ready exact-Succinct build. Every
 //!                 iteration first publishes the input chunks as independent
 //!                 native `SimpleArchive` collection commits and freezes that
-//!                 collection's exact ticket OUTSIDE the timer. The timer then
+//!                 collection's exact payload cover OUTSIDE the timer. The timer then
 //!                 covers `SuccinctArchiveCollection::compact_exact`: exact
 //!                 source validation/derivation, canonical raw blob puts,
 //!                 deterministic dyadic target compaction, persisted Rank9
@@ -663,7 +663,7 @@ fn parse_size(s: &str) -> Option<usize> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BuildShape {
-    ticket_commits: usize,
+    source_cover_members: usize,
     raw_cover_members: usize,
     query_shards: usize,
     raw_bytes: usize,
@@ -738,7 +738,7 @@ fn main() {
     };
 
     // -- BUILD-EXACT -------------------------------------------------------
-    // Per iteration: publish the source chunks and freeze their exact ticket
+    // Per iteration: publish the source chunks and freeze their exact cover
     // in a fresh scratch store (untimed), then time one fixed end-to-end call
     // that returns a query-ready exact cover. Source signing/publication is an
     // admission setup cost, not part of Succinct construction.
@@ -772,15 +772,11 @@ fn main() {
                     .commit(source, &signing_key, Fragment::from(chunk.content.clone()))
                     .expect("publish source chunk");
             }
-            let ticket = store
-                .ticket(source, &[])
-                .expect("freeze exact source ticket")
-                .commits()
-                .to_vec();
+            let cover = store.cover(source, &[]).expect("freeze exact source cover");
 
             let t = Instant::now();
             let union = succinct
-                .compact_exact(&mut store, &ticket)
+                .compact_exact(&mut store, &cover)
                 .expect("build compact exact Succinct cover");
             if recording {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -794,10 +790,10 @@ fn main() {
                 succinct.descriptor(),
             );
             let raw_cover = exact
-                .attach_exact(&mut store, &ticket, &succinct)
+                .attach_exact(&mut store, &cover, &succinct)
                 .expect("reattach exact raw cover for metrics");
             let shape = BuildShape {
-                ticket_commits: ticket.len(),
+                source_cover_members: cover.len(),
                 raw_cover_members: raw_cover.len(),
                 query_shards: union.segment_count(),
                 raw_bytes: raw_cover
@@ -833,7 +829,7 @@ fn main() {
     let mut union_counts = [PANIC_COUNT; 4];
     let mut full_len = PANIC_COUNT;
     let mut build_shape = BuildShape {
-        ticket_commits: PANIC_COUNT,
+        source_cover_members: PANIC_COUNT,
         raw_cover_members: PANIC_COUNT,
         query_shards: PANIC_COUNT,
         raw_bytes: PANIC_COUNT,
@@ -844,8 +840,11 @@ fn main() {
             all.push(("build_exact".to_owned(), Outcome::Samples(samples)));
             build_shape = shape;
             println!(
-                "exact    : {} source commits, {} raw physical members ({} bytes), {} query shards",
-                shape.ticket_commits, shape.raw_cover_members, shape.raw_bytes, shape.query_shards
+                "exact    : {} source-cover members, {} raw physical members ({} bytes), {} query shards",
+                shape.source_cover_members,
+                shape.raw_cover_members,
+                shape.raw_bytes,
+                shape.query_shards
             );
 
             let (union_outcomes, counts) =
@@ -877,10 +876,10 @@ fn main() {
     }
 
     println!(
-        "identity : tribles={} q[1,3,4,5]={:?} ticket={} raw-cover={} query-shards={} raw-bytes={}  (runs comparable ONLY if ALL match; {} = PANIC sentinel)",
+        "identity : tribles={} q[1,3,4,5]={:?} source-cover={} raw-cover={} query-shards={} raw-bytes={}  (runs comparable ONLY if ALL match; {} = PANIC sentinel)",
         full_len,
         union_counts,
-        build_shape.ticket_commits,
+        build_shape.source_cover_members,
         build_shape.raw_cover_members,
         build_shape.query_shards,
         build_shape.raw_bytes,

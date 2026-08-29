@@ -1,8 +1,8 @@
-//! Exact-ticket facade for canonical raw SuccinctArchive collections.
+//! Exact-cover facade for canonical raw SuccinctArchive collections.
 //!
 //! Unsigned equations are reproducible cache evidence rather than authority or
 //! durable receipts: attachment reconstructs collected intermediates in
-//! use-counted scratch from authenticated source leaves, then freshly validates
+//! use-counted scratch from explicit source-cover leaves, then freshly validates
 //! only the resident artifacts selected by the physical cover. Target
 //! compaction is an explicit maintenance call rather than background policy.
 //! The raw exact cover remains authoritative and fixes the returned shard shape;
@@ -21,9 +21,6 @@ use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
     SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError, UnionArchive,
 };
-use crate::collection::discovery::{
-    canonicalize_exact_ticket, exact_ticket_additions, ExactTicketAdvanceError,
-};
 use crate::collection::exact_derived::{
     ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
 };
@@ -32,6 +29,7 @@ use crate::collection::exact_target_compaction::{
 };
 use crate::collection::records::collection_authority;
 use crate::collection::simplearchive_union;
+use crate::collection::CoverAdvanceError;
 use crate::trible::Fragment;
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
@@ -40,16 +38,16 @@ use crate::collection::reach;
 use crate::collection::records::{
     collection_recipe, collection_representation, collection_source, KIND_COLLECTION_DESCRIPTOR,
 };
-use crate::collection::{CollectionCommit, CollectionHandle, CollectionStore};
+use crate::collection::{CollectionHandle, CollectionStore, Cover};
 use crate::metadata::MetaDescribe;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
 use super::rank9_fiber::Rank9Fiber;
 
-/// Failure to complete or attach one exact Succinct ticket.
+/// Failure to complete or attach one exact Succinct cover.
 #[derive(Debug)]
 pub enum SuccinctArchiveCollectionError {
-    /// Exact-ticket authority, resolution, construction, or storage failed.
+    /// Exact-cover resolution, construction, or storage failed.
     Exact(ExactDerivedCollectionError),
     /// Explicit target compaction failed.
     Compaction(ExactTargetCompactionError),
@@ -97,8 +95,8 @@ impl From<super::Rank9FiberError> for SuccinctArchiveCollectionError {
 
 /// Canonical raw SuccinctArchive projection of one scoped SimpleArchive union.
 ///
-/// Signed source commits remain the only authority. Returned query sources
-/// preserve the deterministic resident physical cover as Succinct shards.
+/// The opaque source cover is the operation's value boundary. Returned query
+/// sources preserve the deterministic resident physical cover as Succinct shards.
 /// Persisted Rank9 `DERIVE` records are optional one-to-one fibers over that
 /// cover: they add no authority, retention, target merges, or shard selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,19 +110,19 @@ pub struct SuccinctArchiveCollection {
 
 /// Exact work performed by one successful [`SuccinctArchiveView::ensure`].
 ///
-/// The ticket fields make continuation reuse explicit. Raw algebra counters
-/// report actual calls made while admitting this observation; they are not
+/// The cover fields make continuation reuse explicit. Raw algebra counters
+/// report actual calls made while materializing this observation; they are not
 /// inferred from newly persisted artifacts, which may already exist. Input
 /// bytes count every argument presented to those calls, including both inputs
 /// of a join.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SuccinctArchiveViewWork {
-    /// Canonical commits represented after the call.
-    pub ticket_commits: usize,
-    /// Commits whose exact evidence was admitted by this call.
-    pub admitted_commits: usize,
-    /// Previously admitted commits reused without replaying their proof work.
-    pub reused_commits: usize,
+    /// Distinct payload members represented after the call.
+    pub cover_members: usize,
+    /// Payload members newly processed by this call.
+    pub processed_members: usize,
+    /// Previously materialized payload members reused without replaying data work.
+    pub reused_members: usize,
     /// Canonical source-element validations.
     pub validate_source: u64,
     /// Canonical target-element validations.
@@ -140,11 +138,11 @@ pub struct SuccinctArchiveViewWork {
 }
 
 impl SuccinctArchiveViewWork {
-    fn with_support(ticket_commits: usize, admitted_commits: usize, reused_commits: usize) -> Self {
+    fn with_support(cover_members: usize, processed_members: usize, reused_members: usize) -> Self {
         Self {
-            ticket_commits,
-            admitted_commits,
-            reused_commits,
+            cover_members,
+            processed_members,
+            reused_members,
             ..Self::default()
         }
     }
@@ -231,13 +229,13 @@ impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for MeasuredSuccinc
     }
 }
 
-/// One in-process Succinct view maintained across exact ticket observations.
+/// One in-process Succinct view maintained across exact cover observations.
 ///
-/// Every retained shard was admitted by an earlier ordinary
-/// [`SuccinctArchiveCollection::ensure_exact`] call. When the next ticket is a
-/// monotone extension, only its newly signed support is admitted and the two
-/// immutable covers are unioned. An unchanged ticket performs no storage I/O;
-/// a shrinking ticket rebuilds from the new exact observation.
+/// Every retained shard was materialized by an earlier ordinary
+/// [`SuccinctArchiveCollection::ensure_exact`] call. When the next cover is a
+/// monotone extension, only its new payload support is processed and the two
+/// immutable archives are unioned. An unchanged cover performs no storage I/O;
+/// a shrinking cover rebuilds from the new exact observation.
 ///
 /// This is continuation state, not durable authority or a cache receipt. It
 /// deliberately retains the physical shards already returned to the caller,
@@ -245,7 +243,7 @@ impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for MeasuredSuccinc
 #[derive(Clone)]
 pub struct SuccinctArchiveView {
     collection: SuccinctArchiveCollection,
-    ticket: Vec<CollectionCommit>,
+    cover: Option<Cover>,
     archive: Option<UnionArchive<OrderedUniverse>>,
     last_work: Option<SuccinctArchiveViewWork>,
 }
@@ -254,15 +252,15 @@ impl SuccinctArchiveView {
     fn new(collection: SuccinctArchiveCollection) -> Self {
         Self {
             collection,
-            ticket: Vec::new(),
+            cover: None,
             archive: None,
             last_work: None,
         }
     }
 
-    /// Exact support represented by the current archive.
-    pub fn ticket(&self) -> &[CollectionCommit] {
-        &self.ticket
+    /// Exact payload support represented by the current archive.
+    pub fn cover(&self) -> Option<&Cover> {
+        self.cover.as_ref()
     }
 
     /// Current queryable archive, if the first observation has succeeded.
@@ -277,7 +275,7 @@ impl SuccinctArchiveView {
         self.last_work
     }
 
-    /// Ensure and retain the exact view for the current ticket.
+    /// Ensure and retain the exact view for the current cover.
     ///
     /// State advances only after every derivation, Rank9 attachment, and
     /// logical union succeeds. Retrying after an error therefore observes the
@@ -285,66 +283,60 @@ impl SuccinctArchiveView {
     pub fn ensure<S>(
         &mut self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        current: &Cover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        if ticket == self.ticket.as_slice() {
+        if self.cover.as_ref() == Some(current) {
             if let Some(previous) = &self.archive {
                 let previous = previous.clone();
                 self.last_work = Some(SuccinctArchiveViewWork::with_support(
-                    self.ticket.len(),
+                    current.len(),
                     0,
-                    self.ticket.len(),
+                    current.len(),
                 ));
                 return Ok(previous);
             }
         }
-        let current = canonicalize_exact_ticket(ticket, self.collection.source_collection())
-            .map_err(|error| {
-                SuccinctArchiveCollectionError::Exact(ExactDerivedCollectionError::InvalidTicket(
-                    error.to_string(),
-                ))
-            })?;
         let (next, work) = match self.archive.as_ref() {
             None => {
                 let work = SuccinctArchiveViewWork::with_support(current.len(), current.len(), 0);
-                self.ensure_measured(store, &current, work)?
+                self.ensure_measured(store, current, work)?
             }
-            Some(previous) => match exact_ticket_additions(
-                self.collection.source_collection(),
-                &self.ticket,
-                &current,
+            Some(previous) => match current.additions_since(
+                self.cover
+                    .as_ref()
+                    .expect("an existing archive has a cover checkpoint"),
             ) {
                 Ok(additions) if additions.is_empty() => (
                     previous.clone(),
-                    SuccinctArchiveViewWork::with_support(current.len(), 0, self.ticket.len()),
+                    SuccinctArchiveViewWork::with_support(current.len(), 0, current.len()),
                 ),
                 Ok(additions) => {
                     let work = SuccinctArchiveViewWork::with_support(
                         current.len(),
                         additions.len(),
-                        self.ticket.len(),
+                        self.cover.as_ref().map_or(0, Cover::len),
                     );
                     let (delta, work) = self.ensure_measured(store, &additions, work)?;
                     (previous.union(&delta), work)
                 }
-                Err(ExactTicketAdvanceError::ResetRequired { .. }) => {
+                Err(CoverAdvanceError::ResetRequired { .. }) => {
                     let work =
                         SuccinctArchiveViewWork::with_support(current.len(), current.len(), 0);
-                    self.ensure_measured(store, &current, work)?
+                    self.ensure_measured(store, current, work)?
                 }
                 Err(error) => {
                     return Err(SuccinctArchiveCollectionError::Exact(
-                        ExactDerivedCollectionError::InvalidTicket(error.to_string()),
+                        ExactDerivedCollectionError::InvalidCover(error.to_string()),
                     ));
                 }
             },
         };
 
-        self.ticket = current;
+        self.cover = Some(current.clone());
         self.archive = Some(next.clone());
         self.last_work = Some(work);
         Ok(next)
@@ -353,7 +345,7 @@ impl SuccinctArchiveView {
     fn ensure_measured<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        cover: &Cover,
         work: SuccinctArchiveViewWork,
     ) -> Result<
         (UnionArchive<OrderedUniverse>, SuccinctArchiveViewWork),
@@ -366,7 +358,7 @@ impl SuccinctArchiveView {
         let algebra = MeasuredSuccinctAlgebra::new(&self.collection, work);
         let archive = self
             .collection
-            .ensure_exact_with_algebra(store, ticket, &algebra)?;
+            .ensure_exact_with_algebra(store, cover, &algebra)?;
         Ok((archive, algebra.work.get()))
     }
 }
@@ -387,7 +379,7 @@ impl SuccinctArchiveCollection {
     /// to want, and an index can expose what its source did not, so the two
     /// are stated separately rather than derived from one another.
     /// `source_authority` and `authority` are independent mandatory descriptor
-    /// facts: the former must exactly match the root ticket, while the latter
+    /// facts: the former must exactly match the root cover, while the latter
     /// governs the raw Succinct and Rank9 derived family.
     pub fn new(
         name: impl Into<String>,
@@ -481,20 +473,20 @@ impl SuccinctArchiveCollection {
         }
     }
 
-    /// Attach the exact resident Succinct cover for `ticket` without writing.
+    /// Attach the exact resident Succinct cover for `source_cover` without writing.
     ///
-    /// An empty ticket returns one authority-free process-local empty shard;
+    /// An empty cover returns one authority-free process-local empty shard;
     /// it is not a persisted target member or a provenance assertion.
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, ticket, self)?;
+        let cover = self.kernel().attach_exact(store, source_cover, self)?;
         if cover.is_empty() {
             return self.empty_archive();
         }
@@ -504,27 +496,27 @@ impl SuccinctArchiveCollection {
     /// Ensure missing raw derivations and attach the exact sharded cover.
     ///
     /// Completion writes raw outputs first, then ensures one persisted Rank9
-    /// sidecar and ordinary `DERIVE` for each member of that fixed admitted raw
+    /// sidecar and ordinary `DERIVE` for each member of that fixed selected raw
     /// cover. Every newly claimed endpoint precedes the first new Rank9
     /// equation, no flush occurs, and the exact expected pairs are strictly
     /// re-read through a fresh reader.
-    /// An empty ticket has the same local-only behavior as [`Self::attach_exact`].
+    /// An empty cover has the same local-only behavior as [`Self::attach_exact`].
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        self.ensure_exact_with_algebra(store, ticket, self)
+        self.ensure_exact_with_algebra(store, source_cover, self)
     }
 
     fn ensure_exact_with_algebra<S, A>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
         algebra: &A,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
@@ -532,29 +524,29 @@ impl SuccinctArchiveCollection {
         S::Reader: BlobStoreMeta,
         A: ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> + ?Sized,
     {
-        let cover = self.kernel().ensure_exact(store, ticket, algebra)?;
+        let cover = self.kernel().ensure_exact(store, source_cover, algebra)?;
         if cover.is_empty() {
             return self.empty_archive();
         }
         Ok(self.rank9_fiber().ensure(store, cover)?)
     }
 
-    /// Explicitly compact and attach the exact raw target cover for `ticket`.
+    /// Explicitly compact and attach the exact raw target cover for `source_cover`.
     ///
     /// This first performs ordinary exact completion, then applies the fixed
     /// dyadic byte-size policy to canonical target members. All compacted blobs
     /// precede unsigned `MERGE` records, no flush or signed record is implied,
-    /// and the returned cover is freshly re-admitted under the same ticket.
+    /// and the returned cover is freshly revalidated under the same source cover.
     pub fn compact_exact<S>(
         &self,
         store: &mut S,
-        ticket: &[CollectionCommit],
+        source_cover: &Cover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = compact_exact_target(&self.kernel(), store, ticket, self)?;
+        let cover = compact_exact_target(&self.kernel(), store, source_cover, self)?;
         if cover.is_empty() {
             return self.empty_archive();
         }
@@ -685,8 +677,8 @@ mod tests {
     use crate::collection::descriptor::{self, identity_for_tests};
     use crate::collection::{
         collection_physical_cover, discover_collection_records, resolve_collection_semantics,
-        CollectionClaimValidation, CollectionData, CollectionDerive, CollectionMerge,
-        CollectionRecord,
+        CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
+        CollectionMerge, CollectionRecord,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
@@ -863,9 +855,71 @@ mod tests {
 
     impl std::error::Error for InjectedFailure {}
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FaultReader {
+        inner: <MemoryRepo as BlobStore>::Reader,
+        metadata_failure: Option<CollectionData>,
+    }
+
+    impl BlobStoreMeta for FaultReader {
+        type MetaError = InjectedFailure;
+
+        fn metadata<E>(
+            &self,
+            handle: Inline<Handle<E>>,
+        ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
+        where
+            E: BlobEncoding + 'static,
+            Handle<E>: InlineEncoding,
+        {
+            if self.metadata_failure.map(|data| data.raw) == Some(handle.raw) {
+                return Err(InjectedFailure("injected metadata failure"));
+            }
+            self.inner.metadata(handle).map_err(|never| match never {})
+        }
+    }
+
+    impl BlobStoreGet for FaultReader {
+        type GetError<E: std::error::Error + Send + Sync + 'static> =
+            <<MemoryRepo as BlobStore>::Reader as BlobStoreGet>::GetError<E>;
+
+        fn get<T, E>(
+            &self,
+            handle: Inline<Handle<E>>,
+        ) -> Result<T, Self::GetError<<T as TryFromBlob<E>>::Error>>
+        where
+            E: BlobEncoding + 'static,
+            T: TryFromBlob<E>,
+            Handle<E>: InlineEncoding,
+        {
+            self.inner.get(handle)
+        }
+    }
+
+    impl BlobStoreList for FaultReader {
+        type Iter<'a>
+            = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Iter<'a>
+        where
+            Self: 'a;
+        type Err = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Err;
+
+        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+            self.inner.blobs()
+        }
+
+        fn contains_blob<E>(&self, handle: Inline<Handle<E>>) -> Result<bool, Self::Err>
+        where
+            E: BlobEncoding + 'static,
+            Handle<E>: InlineEncoding,
+        {
+            self.inner.contains_blob(handle)
+        }
+    }
+
     struct FaultStore {
         repo: MemoryRepo,
         rank9_target: crate::collection::CollectionHandle,
+        rank9_metadata_failure: Option<CollectionData>,
         fail_rank9_put: bool,
         drop_rank9_put: bool,
         replace_rank9_on_put: Option<CollectionData>,
@@ -881,6 +935,7 @@ mod tests {
             Self {
                 repo,
                 rank9_target,
+                rank9_metadata_failure: None,
                 fail_rank9_put: false,
                 drop_rank9_put: false,
                 replace_rank9_on_put: None,
@@ -945,11 +1000,14 @@ mod tests {
     }
 
     impl BlobStore for FaultStore {
-        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type Reader = FaultReader;
         type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
 
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.repo.reader()
+            Ok(FaultReader {
+                inner: self.repo.reader()?,
+                metadata_failure: self.rank9_metadata_failure,
+            })
         }
     }
 
@@ -1184,7 +1242,7 @@ mod tests {
             T: crate::blob::IntoBlob<E>,
             Handle<E>: InlineEncoding,
         {
-            panic!("empty Succinct ticket attempted a blob write")
+            panic!("empty Succinct cover attempted a blob write")
         }
     }
 
@@ -1193,7 +1251,7 @@ mod tests {
         type ReaderError = Infallible;
 
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            panic!("empty Succinct ticket opened a reader")
+            panic!("empty Succinct cover opened a reader")
         }
     }
 
@@ -1203,11 +1261,11 @@ mod tests {
         type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
 
         fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            panic!("empty Succinct ticket scanned records")
+            panic!("empty Succinct cover scanned records")
         }
 
         fn insert(&mut self, _: CollectionRecord) -> Result<(), Self::InsertError> {
-            panic!("empty Succinct ticket inserted a record")
+            panic!("empty Succinct cover inserted a record")
         }
     }
 
@@ -1218,7 +1276,7 @@ mod tests {
         where
             I: IntoIterator<Item = crate::repo::ArtifactHandle>,
         {
-            panic!("empty Succinct ticket attempted an OFFER write")
+            panic!("empty Succinct cover attempted an OFFER write")
         }
 
         fn offers_snapshot(
@@ -1283,6 +1341,17 @@ mod tests {
         Handle<E>: InlineEncoding,
     {
         Handle::<E>::to_hash(blob.get_handle())
+    }
+
+    fn source_cover(collection: &SuccinctArchiveCollection, commits: &[CollectionCommit]) -> Cover {
+        Cover::from_members(
+            collection.source_collection(),
+            commits.iter().map(CollectionCommit::data),
+        )
+    }
+
+    fn empty_source_cover(collection: &SuccinctArchiveCollection) -> Cover {
+        Cover::from_members(collection.source_collection(), [])
     }
 
     fn raw_derives<S: CollectionStore>(
@@ -1363,7 +1432,11 @@ mod tests {
         publish(&mut store, commit);
         let cover = collection
             .kernel()
-            .ensure_exact(&mut store, &[commit], &collection)
+            .ensure_exact(
+                &mut store,
+                &source_cover(&collection, &[commit]),
+                &collection,
+            )
             .unwrap();
         assert_eq!(cover.len(), 1);
         let raw = super::super::derive_element(&source).unwrap();
@@ -1463,7 +1536,9 @@ mod tests {
             .unwrap();
         store.reset_writes();
 
-        let attached = collection.attach_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         assert_eq!(store.writes(), (0, 0));
         assert!(rank9_derives(&mut store, &collection).is_empty());
@@ -1603,7 +1678,7 @@ mod tests {
         publish(&mut store, second);
 
         let ensured = collection
-            .ensure_exact(&mut store, &[second, first])
+            .ensure_exact(&mut store, &source_cover(&collection, &[second, first]))
             .unwrap();
         assert_eq!(ensured.segment_count(), 2);
         assert_eq!(attached_facts(&ensured), left_facts + right_facts);
@@ -1635,13 +1710,13 @@ mod tests {
 
         store.reset_writes();
         let attached = collection
-            .attach_exact(&mut store, &[first, second])
+            .attach_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(attached.segment_count(), 2);
         assert_eq!(store.writes(), (0, 0));
         store.reset_writes();
         let repeated = collection
-            .ensure_exact(&mut store, &[first, second])
+            .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(repeated.segment_count(), 2);
         assert_eq!(store.writes(), (0, 0));
@@ -1651,7 +1726,9 @@ mod tests {
     #[test]
     fn absent_corrupt_and_source_mismatched_rank9_evidence_falls_back_without_writes() {
         let (collection, mut store, commit, expected, raw) = one_raw_fixture(11);
-        let attached = collection.attach_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         assert_eq!(store.writes(), (0, 0));
 
@@ -1667,7 +1744,9 @@ mod tests {
             )))
             .unwrap();
         store.reset_writes();
-        let attached = collection.attach_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         assert_eq!(store.writes(), (0, 0));
 
@@ -1689,10 +1768,36 @@ mod tests {
             .unwrap();
         other_store.reset_writes();
         let attached = other_collection
-            .attach_exact(&mut other_store, &[other_commit])
+            .attach_exact(
+                &mut other_store,
+                &source_cover(&other_collection, &[other_commit]),
+            )
             .unwrap();
         assert_eq!(attached_facts(&attached), other_expected);
         assert_eq!(other_store.writes(), (0, 0));
+    }
+
+    #[test]
+    fn optional_rank9_metadata_failure_falls_back_to_transient_attachment() {
+        let (collection, mut base, commit, expected, raw) = one_raw_fixture(31);
+        let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
+        base.put::<SuccinctArchiveRank9IndexBlob, _>(canonical.clone())
+            .unwrap();
+        base.insert(CollectionRecord::Derive(CollectionDerive::new(
+            collection.rank9_collection(),
+            data(&raw),
+            data(&canonical),
+        )))
+        .unwrap();
+        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
+        store.rank9_metadata_failure = Some(data(&canonical));
+
+        let attached = collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
+
+        assert_eq!(attached_facts(&attached), expected);
+        assert_eq!(store.writes(), (0, 0));
     }
 
     #[test]
@@ -1714,11 +1819,15 @@ mod tests {
         }
         store.reset_writes();
 
-        let attached = collection.attach_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         assert_eq!(store.writes(), (0, 0));
         store.reset_writes();
-        let ensured = collection.ensure_exact(&mut store, &[commit]).unwrap();
+        let ensured = collection
+            .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&ensured), expected);
         assert_eq!(store.writes(), (0, 0));
         assert_eq!(rank9_derives(&mut store, &collection).len(), 2);
@@ -1741,10 +1850,14 @@ mod tests {
         remove_blob(&mut store, canonical.get_handle());
         store.reset_writes();
 
-        let attached = collection.attach_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         assert_eq!(store.writes(), (0, 0));
-        let repaired = collection.ensure_exact(&mut store, &[commit]).unwrap();
+        let repaired = collection
+            .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&repaired), expected);
         assert_eq!(store.writes(), (3, 1));
         assert_eq!(rank9_derives(&mut store, &collection).len(), 1);
@@ -1772,10 +1885,14 @@ mod tests {
         let mut store = FaultStore::new(base.repo, collection.rank9_collection());
         store.replace_rank9_on_put = Some(data(&canonical));
 
-        let attached = collection.attach_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         assert_eq!(store.writes(), (0, 0));
-        let repaired = collection.ensure_exact(&mut store, &[commit]).unwrap();
+        let repaired = collection
+            .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&repaired), expected);
         assert_eq!(store.writes(), (3, 1));
         assert_eq!(rank9_derives(&mut store, &collection).len(), 1);
@@ -1792,7 +1909,7 @@ mod tests {
         let mut store = FaultStore::new(base.repo, collection.rank9_collection());
         store.fail_rank9_put = true;
         assert!(matches!(
-            collection.ensure_exact(&mut store, &[commit]),
+            collection.ensure_exact(&mut store, &source_cover(&collection, &[commit])),
             Err(SuccinctArchiveCollectionError::Rank9(
                 super::super::Rank9FiberError::Storage { .. }
             ))
@@ -1806,7 +1923,7 @@ mod tests {
         let mut dropped_sidecar = FaultStore::new(base.repo, collection.rank9_collection());
         dropped_sidecar.drop_rank9_put = true;
         assert!(matches!(
-            collection.ensure_exact(&mut dropped_sidecar, &[commit]),
+            collection.ensure_exact(&mut dropped_sidecar, &source_cover(&collection, &[commit]),),
             Err(SuccinctArchiveCollectionError::Rank9(
                 super::super::Rank9FiberError::IncompletePublication { .. }
             ))
@@ -1818,7 +1935,7 @@ mod tests {
         let mut dropped_claim = FaultStore::new(base.repo, collection.rank9_collection());
         dropped_claim.drop_rank9_claim = true;
         assert!(matches!(
-            collection.ensure_exact(&mut dropped_claim, &[commit]),
+            collection.ensure_exact(&mut dropped_claim, &source_cover(&collection, &[commit]),),
             Err(SuccinctArchiveCollectionError::Rank9(
                 super::super::Rank9FiberError::IncompletePublication { .. }
             ))
@@ -1847,7 +1964,11 @@ mod tests {
         publish(&mut base, second);
         let cover = collection
             .kernel()
-            .ensure_exact(&mut base, &[first, second], &collection)
+            .ensure_exact(
+                &mut base,
+                &source_cover(&collection, &[first, second]),
+                &collection,
+            )
             .unwrap();
         assert_eq!(cover.len(), 2);
         drop(cover);
@@ -1855,7 +1976,7 @@ mod tests {
         store.fail_rank9_claim_at = Some(2);
 
         assert!(matches!(
-            collection.ensure_exact(&mut store, &[first, second]),
+            collection.ensure_exact(&mut store, &source_cover(&collection, &[first, second]),),
             Err(SuccinctArchiveCollectionError::Rank9(
                 super::super::Rank9FiberError::Storage { .. }
             ))
@@ -1864,14 +1985,14 @@ mod tests {
         store.fail_rank9_claim_at = None;
         store.reset_writes();
         let retried = collection
-            .ensure_exact(&mut store, &[first, second])
+            .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(retried.segment_count(), 2);
         assert_eq!(rank9_derives(&mut store, &collection).len(), 2);
         assert_eq!(store.inserts, 1);
         store.reset_writes();
         collection
-            .ensure_exact(&mut store, &[second, first])
+            .ensure_exact(&mut store, &source_cover(&collection, &[second, first]))
             .unwrap();
         assert_eq!(store.writes(), (0, 0));
     }
@@ -1895,7 +2016,11 @@ mod tests {
         publish(&mut base, second);
         let cover = collection
             .kernel()
-            .ensure_exact(&mut base, &[first, second], &collection)
+            .ensure_exact(
+                &mut base,
+                &source_cover(&collection, &[first, second]),
+                &collection,
+            )
             .unwrap();
         assert_eq!(cover.len(), 2);
         drop(cover);
@@ -1907,7 +2032,7 @@ mod tests {
         };
 
         let attached = collection
-            .ensure_exact(&mut store, &[second, first])
+            .ensure_exact(&mut store, &source_cover(&collection, &[second, first]))
             .unwrap();
         assert_eq!(attached.segment_count(), 2);
         assert_eq!(live.load(Ordering::SeqCst), 0);
@@ -1978,14 +2103,18 @@ mod tests {
         publish(&mut store, second);
         let cover = collection
             .kernel()
-            .ensure_exact(&mut store, &[first, second], &collection)
+            .ensure_exact(
+                &mut store,
+                &source_cover(&collection, &[first, second]),
+                &collection,
+            )
             .unwrap();
         assert_eq!(cover.len(), 2);
         drop(cover);
         assert!(rank9_derives(&mut store, &collection).is_empty());
 
         let compacted = collection
-            .compact_exact(&mut store, &[second, first])
+            .compact_exact(&mut store, &source_cover(&collection, &[second, first]))
             .unwrap();
         assert_eq!(compacted.segment_count(), 1);
         let rank9_claims = rank9_derives(&mut store, &collection);
@@ -2007,13 +2136,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_ticket_is_one_authority_free_local_shard_and_performs_no_io() {
+    fn empty_cover_is_one_authority_free_local_shard_and_performs_no_io() {
         let collection = test_collection("c7");
         let mut store = PanicStore;
+        let empty = empty_source_cover(&collection);
         for attached in [
-            collection.attach_exact(&mut store, &[]).unwrap(),
-            collection.ensure_exact(&mut store, &[]).unwrap(),
-            collection.compact_exact(&mut store, &[]).unwrap(),
+            collection.attach_exact(&mut store, &empty).unwrap(),
+            collection.ensure_exact(&mut store, &empty).unwrap(),
+            collection.compact_exact(&mut store, &empty).unwrap(),
         ] {
             assert_eq!(attached.segment_count(), 1);
             assert_eq!(attached.iter().count(), 0);
@@ -2037,23 +2167,24 @@ mod tests {
         publish(&mut store, commit);
 
         let mut maintained = collection.exact_view();
-        let first = maintained.ensure(&mut store, &[commit]).unwrap();
+        let cover = source_cover(&collection, &[commit]);
+        let first = maintained.ensure(&mut store, &cover).unwrap();
         assert_eq!(attached_facts(&first), expected);
-        assert_eq!(maintained.ticket(), &[commit]);
+        assert_eq!(maintained.cover(), Some(&cover));
         let first_work = maintained.last_work().expect("first observation work");
-        assert_eq!(first_work.ticket_commits, 1);
-        assert_eq!(first_work.admitted_commits, 1);
-        assert_eq!(first_work.reused_commits, 0);
+        assert_eq!(first_work.cover_members, 1);
+        assert_eq!(first_work.processed_members, 1);
+        assert_eq!(first_work.reused_members, 0);
         assert!(first_work.validate_source > 0);
         assert!(first_work.derive > 0);
 
-        let repeated = maintained.ensure(&mut PanicStore, &[commit]).unwrap();
+        let repeated = maintained.ensure(&mut PanicStore, &cover).unwrap();
         assert_eq!(attached_facts(&repeated), expected);
-        assert_eq!(maintained.ticket(), &[commit]);
+        assert_eq!(maintained.cover(), Some(&cover));
         assert_eq!(
             maintained.last_work(),
             Some(SuccinctArchiveViewWork::with_support(1, 0, 1)),
-            "an identical ticket performs no raw proof or derivation work",
+            "an identical cover performs no raw proof or derivation work",
         );
     }
 
@@ -2076,11 +2207,22 @@ mod tests {
         publish(&mut store, second);
 
         let mut maintained = collection.exact_view();
-        maintained.ensure(&mut store, &[first]).unwrap();
-        let grown = maintained.ensure(&mut store, &[first, second]).unwrap();
+        let first_cover = source_cover(&collection, &[first]);
+        let duplicate_provenance_cover = source_cover(&collection, &[first, second]);
+        assert_eq!(duplicate_provenance_cover, first_cover);
+        maintained.ensure(&mut store, &first_cover).unwrap();
+        let grown = maintained
+            .ensure(&mut PanicStore, &duplicate_provenance_cover)
+            .unwrap();
 
         assert_eq!(attached_facts(&grown), expected);
-        assert_eq!(maintained.ticket().len(), 2);
+        assert_eq!(maintained.cover(), Some(&first_cover));
+        assert_eq!(maintained.cover().unwrap().len(), 1);
+        assert_eq!(
+            maintained.last_work(),
+            Some(SuccinctArchiveViewWork::with_support(1, 0, 1)),
+            "another signature over the same payload is provenance-only",
+        );
     }
 
     #[test]
@@ -2104,34 +2246,35 @@ mod tests {
         publish(&mut store, second);
 
         let mut maintained = collection.exact_view();
-        maintained.ensure(&mut store, &[first]).unwrap();
+        let first_cover = source_cover(&collection, &[first]);
+        let full_cover = source_cover(&collection, &[second, first]);
+        let second_cover = source_cover(&collection, &[second]);
+        maintained.ensure(&mut store, &first_cover).unwrap();
         let first_work = maintained.last_work().expect("first observation work");
         remove_blob(&mut store, left.get_handle());
         drop(left);
-        let grown = maintained.ensure(&mut store, &[second, first]).unwrap();
+        let grown = maintained.ensure(&mut store, &full_cover).unwrap();
         assert_eq!(
             attached_facts(&grown),
             left_facts.clone() + right_facts.clone()
         );
         let grown_work = maintained.last_work().expect("extension work");
-        assert_eq!(grown_work.ticket_commits, 2);
-        assert_eq!(grown_work.admitted_commits, 1);
-        assert_eq!(grown_work.reused_commits, 1);
+        assert_eq!(grown_work.cover_members, 2);
+        assert_eq!(grown_work.processed_members, 1);
+        assert_eq!(grown_work.reused_members, 1);
         assert_eq!(
             grown_work.derive, first_work.derive,
             "one-commit extension admits only its delta",
         );
-        let mut full_ticket = vec![first, second];
-        full_ticket.sort_unstable_by_key(CollectionCommit::id);
-        assert_eq!(maintained.ticket(), full_ticket);
+        assert_eq!(maintained.cover(), Some(&full_cover));
 
-        let shrunk = maintained.ensure(&mut store, &[second]).unwrap();
+        let shrunk = maintained.ensure(&mut store, &second_cover).unwrap();
         assert_eq!(attached_facts(&shrunk), right_facts);
-        assert_eq!(maintained.ticket(), &[second]);
+        assert_eq!(maintained.cover(), Some(&second_cover));
     }
 
     #[test]
-    fn exact_view_does_not_advance_on_invalid_ticket_shape() {
+    fn exact_view_does_not_advance_on_invalid_cover_shape() {
         let name = "maintained-errors".to_owned();
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
@@ -2147,18 +2290,21 @@ mod tests {
         publish(&mut store, commit);
 
         let mut maintained = collection.exact_view();
-        maintained.ensure(&mut store, &[commit]).unwrap();
+        let cover = source_cover(&collection, &[commit]);
+        maintained.ensure(&mut store, &cover).unwrap();
         let successful_work = maintained.last_work();
         let foreign_name = "foreign".to_owned();
         let foreign = signed_commit(&mut store, &foreign_name, 2, &source);
+        let foreign_collection = test_collection(&foreign_name);
+        let foreign_cover = source_cover(&foreign_collection, &[foreign]);
 
         assert!(matches!(
-            maintained.ensure(&mut store, &[commit, foreign]),
+            maintained.ensure(&mut store, &foreign_cover),
             Err(SuccinctArchiveCollectionError::Exact(
-                ExactDerivedCollectionError::InvalidTicket(_)
+                ExactDerivedCollectionError::InvalidCover(_)
             ))
         ));
-        assert_eq!(maintained.ticket(), &[commit]);
+        assert_eq!(maintained.cover(), Some(&cover));
         assert_eq!(maintained.last_work(), successful_work);
         assert_eq!(
             attached_facts(maintained.archive().expect("previous archive remains")),
@@ -2167,8 +2313,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_view_does_not_advance_when_delta_admission_fails() {
-        let name = "maintained-admission-failure".to_owned();
+    fn exact_view_does_not_advance_when_delta_attachment_fails() {
+        let name = "maintained-attachment-failure".to_owned();
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
             test_team(),
@@ -2188,17 +2334,19 @@ mod tests {
 
         let mut store = FaultStore::new(base.repo, collection.rank9_collection());
         let mut maintained = collection.exact_view();
-        maintained.ensure(&mut store, &[first]).unwrap();
+        let first_cover = source_cover(&collection, &[first]);
+        let full_cover = source_cover(&collection, &[first, second]);
+        maintained.ensure(&mut store, &first_cover).unwrap();
         let successful_work = maintained.last_work();
 
         store.fail_rank9_put = true;
         assert!(matches!(
-            maintained.ensure(&mut store, &[first, second]),
+            maintained.ensure(&mut store, &full_cover),
             Err(SuccinctArchiveCollectionError::Rank9(
                 super::super::Rank9FiberError::Storage { .. }
             ))
         ));
-        assert_eq!(maintained.ticket(), &[first]);
+        assert_eq!(maintained.cover(), Some(&first_cover));
         assert_eq!(maintained.last_work(), successful_work);
         assert_eq!(
             attached_facts(maintained.archive().expect("previous archive remains")),
@@ -2206,12 +2354,12 @@ mod tests {
         );
 
         store.fail_rank9_put = false;
-        let retried = maintained.ensure(&mut store, &[first, second]).unwrap();
+        let retried = maintained.ensure(&mut store, &full_cover).unwrap();
         assert_eq!(attached_facts(&retried), left_facts + right_facts);
     }
 
     #[test]
-    fn signed_empty_source_still_publishes_nonempty_ticket_provenance() {
+    fn signed_empty_source_still_publishes_nonempty_cover_provenance() {
         let name = "c7".to_owned();
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
@@ -2225,7 +2373,9 @@ mod tests {
         let commit = signed_commit(&mut store, &name, 1, &source);
         publish(&mut store, commit);
 
-        let attached = collection.ensure_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached.segment_count(), 1);
         assert_eq!(attached.iter().count(), 0);
         let mappings: Vec<_> = records(&mut store)
@@ -2239,7 +2389,9 @@ mod tests {
             .collect();
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].0, commit.data());
-        collection.attach_exact(&mut store, &[commit]).unwrap();
+        collection
+            .attach_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
     }
 
     #[test]
@@ -2262,13 +2414,13 @@ mod tests {
         publish(&mut store, first);
         publish(&mut store, second);
         assert!(matches!(
-            collection.attach_exact(&mut store, &[first, second]),
+            collection.attach_exact(&mut store, &source_cover(&collection, &[first, second]),),
             Err(SuccinctArchiveCollectionError::Exact(
                 ExactDerivedCollectionError::IncompleteCover { .. }
             ))
         ));
         let attached = collection
-            .ensure_exact(&mut store, &[first, second])
+            .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
         assert_eq!(attached.segment_count(), 2);
@@ -2312,7 +2464,7 @@ mod tests {
         publish(&mut store, second);
 
         let attached = collection
-            .compact_exact(&mut store, &[second, first])
+            .compact_exact(&mut store, &source_cover(&collection, &[second, first]))
             .unwrap();
         assert_eq!(attached.segment_count(), 1);
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
@@ -2346,7 +2498,10 @@ mod tests {
         publish(&mut store, first);
         publish(&mut store, second);
         let attached = collection
-            .ensure_exact(&mut store, &[first, first, second])
+            .ensure_exact(
+                &mut store,
+                &source_cover(&collection, &[first, first, second]),
+            )
             .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         let derives = records(&mut store)
@@ -2358,7 +2513,7 @@ mod tests {
             .count();
         assert_eq!(derives, 1);
         collection
-            .attach_exact(&mut store, &[first, second])
+            .attach_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
     }
 
@@ -2393,7 +2548,7 @@ mod tests {
             )))
             .unwrap();
         let attached = collection
-            .ensure_exact(&mut store, &[first, second])
+            .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(attached.segment_count(), 1);
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
@@ -2451,7 +2606,7 @@ mod tests {
             )))
             .unwrap();
         let attached = collection
-            .attach_exact(&mut store, &[first, second])
+            .attach_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(attached.segment_count(), 1);
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
@@ -2503,14 +2658,14 @@ mod tests {
             .unwrap();
 
         let attached = collection
-            .attach_exact(&mut store, &[first, second])
+            .attach_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(attached.segment_count(), 2);
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
     }
 
     #[test]
-    fn old_ticket_stays_stable_after_later_commit_and_cache() {
+    fn old_cover_stays_stable_after_later_commit_and_cache() {
         let name = "c7".to_owned();
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
@@ -2524,7 +2679,8 @@ mod tests {
         let old = put_data(&mut store, &old_facts);
         let first = signed_commit(&mut store, &name, 1, &old);
         publish(&mut store, first);
-        collection.ensure_exact(&mut store, &[first]).unwrap();
+        let old_cover = source_cover(&collection, &[first]);
+        collection.ensure_exact(&mut store, &old_cover).unwrap();
 
         let later_facts = facts([(2, 4)]);
         let later = put_data(&mut store, &later_facts);
@@ -2542,7 +2698,7 @@ mod tests {
             )))
             .unwrap();
         assert_eq!(
-            attached_facts(&collection.attach_exact(&mut store, &[first]).unwrap()),
+            attached_facts(&collection.attach_exact(&mut store, &old_cover).unwrap()),
             old_facts,
         );
     }
@@ -2571,19 +2727,23 @@ mod tests {
             )))
             .unwrap();
         assert!(matches!(
-            collection.attach_exact(&mut store, &[commit]),
+            collection.attach_exact(&mut store, &source_cover(&collection, &[commit])),
             Err(SuccinctArchiveCollectionError::Exact(
                 ExactDerivedCollectionError::IncompleteCover { .. }
             ))
         ));
         assert_eq!(
-            attached_facts(&collection.ensure_exact(&mut store, &[commit]).unwrap()),
+            attached_facts(
+                &collection
+                    .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
+                    .unwrap()
+            ),
             expected,
         );
     }
 
     #[test]
-    fn ungrounded_source_superset_never_enters_smaller_ticket() {
+    fn ungrounded_source_superset_never_enters_smaller_cover() {
         let name = "c7".to_owned();
         let collection = SuccinctArchiveCollection::new(
             name.clone(),
@@ -2608,7 +2768,9 @@ mod tests {
                 data(&superset),
             )))
             .unwrap();
-        let attached = collection.ensure_exact(&mut store, &[commit]).unwrap();
+        let attached = collection
+            .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
+            .unwrap();
         assert_eq!(attached_facts(&attached), expected);
         let derive_inputs: Vec<_> = records(&mut store)
             .into_iter()
@@ -2699,7 +2861,7 @@ mod tests {
             source_store.insert(record).unwrap();
         }
         let ensured = collection
-            .ensure_exact(&mut source_store, &commits)
+            .ensure_exact(&mut source_store, &source_cover(&collection, &commits))
             .unwrap();
         assert_eq!(ensured.segment_count(), 1);
         let rank9_claims = rank9_derives(&mut source_store, &collection);
@@ -2745,13 +2907,13 @@ mod tests {
 
         let before = std::fs::metadata(&retained_path).unwrap().len();
         let attached = collection
-            .attach_exact(&mut retained_store, &commits)
+            .attach_exact(&mut retained_store, &source_cover(&collection, &commits))
             .unwrap();
         assert_eq!(attached.segment_count(), 1);
         assert_eq!(attached_facts(&attached), a_facts + b_facts + c_facts);
         assert_eq!(std::fs::metadata(&retained_path).unwrap().len(), before);
         let ensured = collection
-            .ensure_exact(&mut retained_store, &commits)
+            .ensure_exact(&mut retained_store, &source_cover(&collection, &commits))
             .unwrap();
         assert_eq!(ensured.segment_count(), 1);
         let repaired = std::fs::metadata(&retained_path).unwrap().len();
@@ -2761,7 +2923,7 @@ mod tests {
             rank9_claims
         );
         let repeated = collection
-            .ensure_exact(&mut retained_store, &commits)
+            .ensure_exact(&mut retained_store, &source_cover(&collection, &commits))
             .unwrap();
         assert_eq!(repeated.segment_count(), 1);
         assert_eq!(std::fs::metadata(&retained_path).unwrap().len(), repaired);
@@ -2845,7 +3007,7 @@ mod tests {
         assert!(reader.contains_blob(abc.get_handle()).unwrap());
         drop(reader);
         let attached = collection
-            .ensure_exact(&mut retained_store, &commits)
+            .ensure_exact(&mut retained_store, &source_cover(&collection, &commits))
             .unwrap();
         assert_eq!(attached.segment_count(), 1);
         let derive_inputs: Vec<_> = retained_store

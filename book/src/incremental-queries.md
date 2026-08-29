@@ -43,7 +43,7 @@ The complete runnable version is deliberately storage-independent:
 ```
 
 Applications may obtain `changed` directly from an importer, an event batch, a
-collection-ticket difference, or any other source. The query algorithm only
+collection-cover difference, or any other source. The query algorithm only
 needs the two fact sets.
 
 ## How semi-naive evaluation works
@@ -71,46 +71,47 @@ seen earlier when a new fact supplies another proof. Applications that require
 global once-only delivery retain the projected tuples they have consumed;
 applications interested in witness events should project the witness identity.
 
-## Use collection tickets as continuation tokens
+## Use collection covers as continuation tokens
 
-A native collection ticket is the exact commit set observed by one discovery
-pass. Its complete signed records make a natural storage-level continuation
-token. [`exact_ticket_additions`](triblespace::core::collection::exact_ticket_additions)
-compares two observations, verifies that the earlier support remains a subset
-of the later support, and returns only the newly observed commits:
+A `Cover` is the exact set of distinct payload handles observed by one
+collection discovery pass. Its PATCH-backed membership makes a natural
+storage-level continuation token. `Cover::additions_since` verifies that the
+earlier payload set remains a subset of the later set and returns a cover
+containing only newly observed members:
 
 ```rust,ignore
 {{#include ../../examples/collection_pattern_changes.rs:collection_pattern_changes_observe}}
 ```
 
-This computes a support-set difference over immutable records; it does not walk
-a parent chain, inspect a physical merge cover, or ask an ambient head what
-changed. If a previous member is absent, the helper returns
-`ExactTicketAdvanceError::ResetRequired`: additions-only maintenance is no
-longer sound, so rebuild the accumulated application state from `current`.
-Advance the saved ticket only after the complete fallible fold succeeds, as the
-example does, to make a failed fold retry the same support.
+This computes set difference over immutable payload identities; it does not
+walk a parent chain or ask an ambient head what changed. A second signer or
+metadata claim over an existing payload is provenance and produces no data
+delta. If a previous member is absent, the helper returns
+`CoverAdvanceError::ResetRequired`: additions-only maintenance is no longer
+sound, so rebuild the accumulated application state from `current`. Advance the
+saved cover only after the complete fallible fold succeeds, as the example
+does, to make a failed fold retry the same support.
 
 The two pattern inputs need not share a representation. The runnable example
 (`cargo run --example collection_pattern_changes`) keeps a
-`SuccinctArchiveCollection::exact_view()`. An unchanged ticket reuses its
+`SuccinctArchiveCollection::exact_view()`. An unchanged cover reuses its
 owned, already-admitted immutable archive without storage access. For a strict
-extension, the view runs ordinary exact admission only over the added commits
+extension, the view runs ordinary exact admission only over the added members
 and unions those shards with its previous archive; a shrinking observation
 rebuilds. The independent consumption checkpoint still controls the cheap
 `SimpleArchive`-backed change set, so a failed consumer retries the same delta
-even though constructing the full view already succeeded. Exact tickets ensure
-that commits first observed after `current` cannot leak into either input merely
-because their blobs are already resident.
+even though constructing the full view already succeeded. Exact covers ensure
+that payloads first observed after `current` cannot leak into either input
+merely because their blobs are already resident.
 
-Commit support is deliberately not an exact fact difference. A new commit may
-repeat a fact already present, and that new witness may legitimately make a
+Payload support is deliberately not an exact fact difference. A new payload
+may repeat a fact already present, and that new witness may legitimately make a
 projected result recur. Consumers requiring global once-only delivery retain
 their consumed result identities independently.
 
 When an ingestion API already returns its newly produced fragment, using that
-fragment's facts directly is cheaper than rematerializing a ticket subset. The
-ticket pattern is useful across process boundaries or after reopening storage.
+fragment's facts directly is cheaper than rematerializing a cover subset. The
+cover pattern is useful across process boundaries or after reopening storage.
 
 The `incremental_collection_queries` benchmark measures this complete
 maintenance loop against a full re-query over the same evolving source data:
@@ -121,9 +122,9 @@ cargo bench --bench incremental_collection_queries -- \
 ```
 
 Each observation includes advancing the exact Succinct view and maintaining
-the application's result set. Publication, ticket discovery, and fixture
+the application's result set. Publication, cover discovery, and fixture
 construction remain outside the timer. The benchmark checks raw row counts,
-projection-level set equality, consumer checkpoints, and exact view tickets at
+projection-level set equality, consumer checkpoints, and exact view covers at
 every commit; geometric checkpoints affect reporting only, not observation.
 Its fixture projects every query variable and gives every book a unique
 binding, so those equality checks do not imply projected-set semantics for

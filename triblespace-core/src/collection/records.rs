@@ -422,12 +422,6 @@ impl CollectionCommit {
         self.id
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_test_id(mut self, id: Id) -> Self {
-        self.id = id;
-        self
-    }
-
     /// Collection receiving the asserted member.
     pub fn collection(&self) -> CollectionHandle {
         self.collection
