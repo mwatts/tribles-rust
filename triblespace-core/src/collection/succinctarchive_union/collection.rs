@@ -19,11 +19,9 @@ use std::fmt;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
-    SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError, UnionArchive,
+    UnionArchive,
 };
-use crate::collection::exact_derived::{
-    ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
-};
+use crate::collection::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
@@ -38,11 +36,51 @@ use crate::collection::reach;
 use crate::collection::records::{
     collection_recipe, collection_representation, collection_source, KIND_COLLECTION_DESCRIPTOR,
 };
-use crate::collection::{CollectionHandle, CollectionStore, Cover};
+#[cfg(test)]
+use crate::collection::CollectionLattice;
+use crate::collection::{
+    CollectionHandle, CollectionHomomorphism, CollectionLatticeError, CollectionStore,
+    CoverAttachment, FactCover, TryFromCover,
+};
 use crate::metadata::MetaDescribe;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
 use super::rank9_fiber::Rank9Fiber;
+
+impl TryFromCover<super::SuccinctArchiveUnion> for UnionArchive<OrderedUniverse> {
+    type Error = super::Rank9FiberError;
+
+    fn try_from_cover(
+        attachment: CoverAttachment<super::SuccinctArchiveUnion>,
+    ) -> Result<Self, Self::Error> {
+        let mut segments = Vec::with_capacity(attachment.len().max(1));
+        for (handle, raw) in attachment.into_members() {
+            let raw_data =
+                crate::inline::encodings::hash::Handle::<SuccinctArchiveBlob>::to_hash(handle);
+            segments.push(
+                raw.try_from_blob()
+                    .map_err(|source| super::Rank9FiberError::Build {
+                        raw: raw_data,
+                        source,
+                    })?,
+            );
+        }
+        if segments.is_empty() {
+            let raw = super::empty();
+            let raw_data = crate::inline::encodings::hash::Handle::<SuccinctArchiveBlob>::to_hash(
+                raw.get_handle(),
+            );
+            segments.push(
+                raw.try_from_blob()
+                    .map_err(|source| super::Rank9FiberError::Build {
+                        raw: raw_data,
+                        source,
+                    })?,
+            );
+        }
+        Ok(UnionArchive::new(segments))
+    }
+}
 
 /// Failure to complete or attach one exact Succinct cover.
 #[derive(Debug)]
@@ -110,11 +148,9 @@ pub struct SuccinctArchiveCollection {
 
 /// Exact work performed by one successful [`SuccinctArchiveView::ensure`].
 ///
-/// The cover fields make continuation reuse explicit. Raw algebra counters
-/// report actual calls made while materializing this observation; they are not
-/// inferred from newly persisted artifacts, which may already exist. Input
-/// bytes count every argument presented to those calls, including both inputs
-/// of a join.
+/// The cover fields make continuation reuse explicit. The derivation counters
+/// report actual source-to-target maps made while materializing this
+/// observation; validation and join belong to the typed lattices themselves.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SuccinctArchiveViewWork {
     /// Distinct payload members represented after the call.
@@ -123,17 +159,9 @@ pub struct SuccinctArchiveViewWork {
     pub processed_members: usize,
     /// Previously materialized payload members reused without replaying data work.
     pub reused_members: usize,
-    /// Canonical source-element validations.
-    pub validate_source: u64,
-    /// Canonical target-element validations.
-    pub validate_target: u64,
-    /// Canonical source joins.
-    pub join_source: u64,
     /// Canonical source-to-target derivations.
     pub derive: u64,
-    /// Canonical target joins.
-    pub join_target: u64,
-    /// Cumulative bytes supplied to raw algebra calls.
+    /// Cumulative bytes supplied to source-to-target derivations.
     pub input_bytes: u64,
 }
 
@@ -148,13 +176,13 @@ impl SuccinctArchiveViewWork {
     }
 }
 
-struct MeasuredSuccinctAlgebra<'a> {
-    inner: &'a SuccinctArchiveCollection,
+struct MeasuredSuccinctHomomorphism {
+    inner: super::SimpleArchiveToSuccinctArchive,
     work: Cell<SuccinctArchiveViewWork>,
 }
 
-impl<'a> MeasuredSuccinctAlgebra<'a> {
-    fn new(inner: &'a SuccinctArchiveCollection, work: SuccinctArchiveViewWork) -> Self {
+impl MeasuredSuccinctHomomorphism {
+    fn new(inner: super::SimpleArchiveToSuccinctArchive, work: SuccinctArchiveViewWork) -> Self {
         Self {
             inner,
             work: Cell::new(work),
@@ -168,64 +196,25 @@ impl<'a> MeasuredSuccinctAlgebra<'a> {
     }
 }
 
-impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for MeasuredSuccinctAlgebra<'_> {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        self.bump(|work| {
-            work.validate_source += 1;
-            work.input_bytes += source.bytes.len() as u64;
-        });
-        self.inner.validate_source(descriptor, source)
+impl CollectionHomomorphism<simplearchive_union::SimpleArchiveUnion, super::SuccinctArchiveUnion>
+    for MeasuredSuccinctHomomorphism
+{
+    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self::new(
+            super::SimpleArchiveToSuccinctArchive::bind(source, target)?,
+            SuccinctArchiveViewWork::default(),
+        ))
     }
 
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &crate::blob::Blob<SuccinctArchiveBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        self.bump(|work| {
-            work.validate_target += 1;
-            work.input_bytes += target.bytes.len() as u64;
-        });
-        self.inner.validate_target(descriptor, target)
-    }
-
-    fn join_source(
-        &self,
-        low: &crate::blob::Blob<SimpleArchive>,
-        high: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SimpleArchive>, ExactAlgebraError> {
-        self.bump(|work| {
-            work.join_source += 1;
-            work.input_bytes += low.bytes.len() as u64 + high.bytes.len() as u64;
-        });
-        self.inner.join_source(low, high)
-    }
-
-    fn derive(
+    fn map(
         &self,
         source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, CollectionLatticeError> {
         self.bump(|work| {
             work.derive += 1;
             work.input_bytes += source.bytes.len() as u64;
         });
-        self.inner.derive(source)
-    }
-
-    fn join_target(
-        &self,
-        low: &crate::blob::Blob<SuccinctArchiveBlob>,
-        high: &crate::blob::Blob<SuccinctArchiveBlob>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
-        self.bump(|work| {
-            work.join_target += 1;
-            work.input_bytes += low.bytes.len() as u64 + high.bytes.len() as u64;
-        });
-        self.inner.join_target(low, high)
+        self.inner.map(source)
     }
 }
 
@@ -243,7 +232,7 @@ impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for MeasuredSuccinc
 #[derive(Clone)]
 pub struct SuccinctArchiveView {
     collection: SuccinctArchiveCollection,
-    cover: Option<Cover>,
+    cover: Option<FactCover>,
     archive: Option<UnionArchive<OrderedUniverse>>,
     last_work: Option<SuccinctArchiveViewWork>,
 }
@@ -259,7 +248,7 @@ impl SuccinctArchiveView {
     }
 
     /// Exact payload support represented by the current archive.
-    pub fn cover(&self) -> Option<&Cover> {
+    pub fn cover(&self) -> Option<&FactCover> {
         self.cover.as_ref()
     }
 
@@ -283,7 +272,7 @@ impl SuccinctArchiveView {
     pub fn ensure<S>(
         &mut self,
         store: &mut S,
-        current: &Cover,
+        current: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
@@ -318,7 +307,7 @@ impl SuccinctArchiveView {
                     let work = SuccinctArchiveViewWork::with_support(
                         current.len(),
                         additions.len(),
-                        self.cover.as_ref().map_or(0, Cover::len),
+                        self.cover.as_ref().map_or(0, FactCover::len),
                     );
                     let (delta, work) = self.ensure_measured(store, &additions, work)?;
                     (previous.union(&delta), work)
@@ -345,7 +334,7 @@ impl SuccinctArchiveView {
     fn ensure_measured<S>(
         &self,
         store: &mut S,
-        cover: &Cover,
+        cover: &FactCover,
         work: SuccinctArchiveViewWork,
     ) -> Result<
         (UnionArchive<OrderedUniverse>, SuccinctArchiveViewWork),
@@ -355,11 +344,20 @@ impl SuccinctArchiveView {
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let algebra = MeasuredSuccinctAlgebra::new(&self.collection, work);
-        let archive = self
-            .collection
-            .ensure_exact_with_algebra(store, cover, &algebra)?;
-        Ok((archive, algebra.work.get()))
+        let source = self.collection.source_descriptor();
+        let target = self.collection.descriptor();
+        let inner = super::SimpleArchiveToSuccinctArchive::bind(&source, &target)
+            .map_err(|error| ExactDerivedCollectionError::Resolution(error.to_string()))?;
+        let measured = MeasuredSuccinctHomomorphism::new(inner, work);
+        let kernel = ExactDerivedCollection::with_homomorphism(source, target, measured)?;
+        let target_cover = kernel.ensure_exact(store, cover)?;
+        let work = kernel.homomorphism().work.get();
+        let archive = if target_cover.is_empty() {
+            self.collection.empty_archive()?
+        } else {
+            self.collection.rank9_fiber().ensure(store, target_cover)?
+        };
+        Ok((archive, work))
     }
 }
 
@@ -480,13 +478,13 @@ impl SuccinctArchiveCollection {
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, source_cover, self)?;
+        let cover = self.kernel()?.attach_exact(store, source_cover)?;
         if cover.is_empty() {
             return self.empty_archive();
         }
@@ -504,27 +502,13 @@ impl SuccinctArchiveCollection {
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        self.ensure_exact_with_algebra(store, source_cover, self)
-    }
-
-    fn ensure_exact_with_algebra<S, A>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
-    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
-    where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> + ?Sized,
-    {
-        let cover = self.kernel().ensure_exact(store, source_cover, algebra)?;
+        let cover = self.kernel()?.ensure_exact(store, source_cover)?;
         if cover.is_empty() {
             return self.empty_archive();
         }
@@ -540,20 +524,30 @@ impl SuccinctArchiveCollection {
     pub fn compact_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = compact_exact_target(&self.kernel(), store, source_cover, self)?;
+        let kernel = self.kernel()?;
+        let cover = compact_exact_target(&kernel, store, source_cover)?;
         if cover.is_empty() {
             return self.empty_archive();
         }
         Ok(self.rank9_fiber().ensure(store, cover)?)
     }
 
-    fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob> {
+    fn kernel(
+        &self,
+    ) -> Result<
+        ExactDerivedCollection<
+            simplearchive_union::SimpleArchiveUnion,
+            super::SuccinctArchiveUnion,
+            super::SimpleArchiveToSuccinctArchive,
+        >,
+        ExactDerivedCollectionError,
+    > {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
     }
 
@@ -578,88 +572,6 @@ impl SuccinctArchiveCollection {
     }
 }
 
-fn fatal_algebra_error(error: impl fmt::Display) -> ExactAlgebraError {
-    ExactAlgebraError::Fatal(error.to_string())
-}
-
-fn classify_raw_build_error(error: SuccinctArchiveRawBuildError) -> ExactAlgebraError {
-    match error {
-        SuccinctArchiveRawBuildError::TooManyRows(_)
-        | SuccinctArchiveRawBuildError::DomainTooWide(_) => {
-            ExactAlgebraError::Capacity(error.to_string())
-        }
-        SuccinctArchiveRawBuildError::Source(_) | SuccinctArchiveRawBuildError::Construction(_) => {
-            fatal_algebra_error(error)
-        }
-    }
-}
-
-fn classify_raw_merge_error(error: SuccinctArchiveRawMergeError) -> ExactAlgebraError {
-    match error {
-        SuccinctArchiveRawMergeError::DomainTooWide | SuccinctArchiveRawMergeError::TooManyRows => {
-            ExactAlgebraError::Capacity(error.to_string())
-        }
-        SuccinctArchiveRawMergeError::InvalidInput { .. }
-        | SuccinctArchiveRawMergeError::Construction(_) => fatal_algebra_error(error),
-    }
-}
-
-impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for SuccinctArchiveCollection {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.source_descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "source descriptor does not match this Succinct collection".to_owned(),
-            ));
-        }
-        simplearchive_union::validate_element(source).map_err(fatal_algebra_error)
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &crate::blob::Blob<SuccinctArchiveBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "target descriptor does not match this Succinct collection".to_owned(),
-            ));
-        }
-        // This is proof of one already-persisted artifact, not construction of
-        // a larger union. Any failure is malformed/noncanonical input and must
-        // remain fatal even if its decoder reports capacity-shaped metadata.
-        SuccinctArchiveBlob::merge(std::slice::from_ref(target))
-            .map(|_| ())
-            .map_err(fatal_algebra_error)
-    }
-
-    fn join_source(
-        &self,
-        low: &crate::blob::Blob<SimpleArchive>,
-        high: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SimpleArchive>, ExactAlgebraError> {
-        simplearchive_union::join(low, high).map_err(fatal_algebra_error)
-    }
-
-    fn derive(
-        &self,
-        source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
-        super::derive_element(source).map_err(classify_raw_build_error)
-    }
-
-    fn join_target(
-        &self,
-        low: &crate::blob::Blob<SuccinctArchiveBlob>,
-        high: &crate::blob::Blob<SuccinctArchiveBlob>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
-        super::join(low, high).map_err(classify_raw_merge_error)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,7 +589,7 @@ mod tests {
     use crate::collection::descriptor::{self, identity_for_tests};
     use crate::collection::{
         collection_physical_cover, discover_collection_records, resolve_collection_semantics,
-        CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
+        Collection, CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
         CollectionMerge, CollectionRecord,
     };
     use crate::inline::encodings::hash::Handle;
@@ -734,29 +646,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_succinct_capacity_classification_is_typed_and_contextual() {
-        assert!(matches!(
-            classify_raw_build_error(SuccinctArchiveRawBuildError::TooManyRows(usize::MAX)),
-            ExactAlgebraError::Capacity(_)
-        ));
-        assert!(matches!(
-            classify_raw_build_error(SuccinctArchiveRawBuildError::DomainTooWide(usize::MAX)),
-            ExactAlgebraError::Capacity(_)
-        ));
-        assert!(matches!(
-            classify_raw_merge_error(SuccinctArchiveRawMergeError::DomainTooWide),
-            ExactAlgebraError::Capacity(_)
-        ));
-        assert!(matches!(
-            classify_raw_merge_error(SuccinctArchiveRawMergeError::TooManyRows),
-            ExactAlgebraError::Capacity(_)
-        ));
-
+    fn exact_succinct_member_validation_is_typed_and_contextual() {
         let collection = test_collection("first");
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0u8; 1]));
         assert!(matches!(
-            collection.validate_target(&collection.descriptor(), &malformed),
-            Err(ExactAlgebraError::Fatal(_))
+            super::super::SuccinctArchiveUnion::validate_member(
+                &collection.descriptor(),
+                &malformed,
+            ),
+            Err(CollectionLatticeError::Fatal(_))
         ));
     }
 
@@ -1343,15 +1241,27 @@ mod tests {
         Handle::<E>::to_hash(blob.get_handle())
     }
 
-    fn source_cover(collection: &SuccinctArchiveCollection, commits: &[CollectionCommit]) -> Cover {
-        Cover::from_members(
-            collection.source_collection(),
-            commits.iter().map(CollectionCommit::data),
+    fn source_cover(
+        collection: &SuccinctArchiveCollection,
+        commits: &[CollectionCommit],
+    ) -> FactCover {
+        FactCover::from_members(
+            Collection::<simplearchive_union::SimpleArchiveUnion>::from_handle(
+                collection.source_collection(),
+            ),
+            commits
+                .iter()
+                .map(|commit| Handle::<SimpleArchive>::from_hash(commit.data())),
         )
     }
 
-    fn empty_source_cover(collection: &SuccinctArchiveCollection) -> Cover {
-        Cover::from_members(collection.source_collection(), [])
+    fn empty_source_cover(collection: &SuccinctArchiveCollection) -> FactCover {
+        FactCover::from_members(
+            Collection::<simplearchive_union::SimpleArchiveUnion>::from_handle(
+                collection.source_collection(),
+            ),
+            [],
+        )
     }
 
     fn raw_derives<S: CollectionStore>(
@@ -1432,15 +1342,12 @@ mod tests {
         publish(&mut store, commit);
         let cover = collection
             .kernel()
-            .ensure_exact(
-                &mut store,
-                &source_cover(&collection, &[commit]),
-                &collection,
-            )
+            .unwrap()
+            .ensure_exact(&mut store, &source_cover(&collection, &[commit]))
             .unwrap();
         assert_eq!(cover.len(), 1);
         let raw = super::super::derive_element(&source).unwrap();
-        assert_eq!(cover.members()[0].0, data(&raw));
+        assert_eq!(cover.members()[0].0, raw.get_handle());
         drop(cover);
         store.reset_writes();
         (collection, store, commit, expected, raw)
@@ -1964,11 +1871,8 @@ mod tests {
         publish(&mut base, second);
         let cover = collection
             .kernel()
-            .ensure_exact(
-                &mut base,
-                &source_cover(&collection, &[first, second]),
-                &collection,
-            )
+            .unwrap()
+            .ensure_exact(&mut base, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(cover.len(), 2);
         drop(cover);
@@ -2016,11 +1920,8 @@ mod tests {
         publish(&mut base, second);
         let cover = collection
             .kernel()
-            .ensure_exact(
-                &mut base,
-                &source_cover(&collection, &[first, second]),
-                &collection,
-            )
+            .unwrap()
+            .ensure_exact(&mut base, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(cover.len(), 2);
         drop(cover);
@@ -2103,11 +2004,8 @@ mod tests {
         publish(&mut store, second);
         let cover = collection
             .kernel()
-            .ensure_exact(
-                &mut store,
-                &source_cover(&collection, &[first, second]),
-                &collection,
-            )
+            .unwrap()
+            .ensure_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(cover.len(), 2);
         drop(cover);
@@ -2175,7 +2073,6 @@ mod tests {
         assert_eq!(first_work.cover_members, 1);
         assert_eq!(first_work.processed_members, 1);
         assert_eq!(first_work.reused_members, 0);
-        assert!(first_work.validate_source > 0);
         assert!(first_work.derive > 0);
 
         let repeated = maintained.ensure(&mut PanicStore, &cover).unwrap();

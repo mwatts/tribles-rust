@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add typed collection lattices, covers, snapshots, and logical cover views.
+  Member handles retain their encoding through the public API; generic commit
+  and materialization work for non-`SimpleArchive` collections; and exact
+  derived lifecycles bind one source-to-target homomorphism instead of taking
+  a mutable five-operation callback bundle on every call.
+
 - Add top-level `capability`, a direct authorization kernel. Keyless canonical
   `SimpleArchive` claims carry one exact action/resource atom, invoke/delegate
   mode, optional inclusive validity interval, and optional parent claim handle.

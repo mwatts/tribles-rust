@@ -62,6 +62,8 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -69,15 +71,16 @@ use crate::query::register::{register_identity, register_orders, RegisterOrder};
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
 
-use super::exact_derived::{
-    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
-    ExactDerivedCollectionError,
-};
+use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use super::records::{
     collection_authority, collection_reach, collection_recipe, collection_representation,
     collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
-use super::{simplearchive_union, CollectionStore, Cover};
+use super::{
+    simplearchive_union::{self, SimpleArchiveUnion},
+    CollectionHomomorphism, CollectionLattice, CollectionLatticeError, CollectionStore,
+    CoverAttachment, FactCover, TryFromCover,
+};
 
 const ID_LEN: usize = 16;
 const KEY_LEN: usize = 32;
@@ -394,6 +397,84 @@ impl MetaDescribe for LwwRegisterV1 {
     }
 }
 
+/// The canonical LWW projection representation under its union law.
+pub struct LwwRegisterUnion;
+
+fn register_attributes(descriptor: &Fragment) -> Result<(Id, Id), CollectionLatticeError> {
+    let parse = |attribute, name| {
+        let raw = crate::collection::descriptor::argument(descriptor.facts(), attribute)
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?
+            .ok_or_else(|| {
+                CollectionLatticeError::Fatal(format!("LWW register descriptor is missing {name}"))
+            })?;
+        Inline::<GenId>::new(raw)
+            .try_from_inline::<Id>()
+            .map_err(|source| {
+                CollectionLatticeError::Fatal(format!(
+                    "LWW register descriptor has an invalid {name}: {source:?}"
+                ))
+            })
+    };
+    Ok((
+        parse(register_identity.id(), "register_identity")?,
+        parse(register_orders.id(), "register_orders")?,
+    ))
+}
+
+impl CollectionLattice for LwwRegisterUnion {
+    type Encoding = LwwRegisterBlob;
+    type Recipe = LwwRegisterV1;
+
+    fn validate_arguments(descriptor: &Fragment) -> Result<(), CollectionLatticeError> {
+        let source = crate::collection::descriptor::source(descriptor.facts())
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?;
+        if source.is_none() {
+            return Err(CollectionLatticeError::Fatal(
+                "LWW register descriptor is missing its source collection".to_owned(),
+            ));
+        }
+
+        register_attributes(descriptor).map(|_| ())
+    }
+
+    fn validate_member(
+        _descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        validate_element(member).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+
+    fn merge_members(
+        _descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        join(low, high).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+}
+
+/// Bound projection from facts to the two canonical LWW coordinate halves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectLwwRegister {
+    identity: Id,
+    orders: Id,
+}
+
+impl CollectionHomomorphism<SimpleArchiveUnion, LwwRegisterUnion> for ProjectLwwRegister {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        let (identity, orders) = register_attributes(target)?;
+        Ok(Self { identity, orders })
+    }
+
+    fn map(
+        &self,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<LwwRegisterBlob>, CollectionLatticeError> {
+        derive_element(source, self.identity, self.orders)
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+}
+
 /// An attached last-write-wins index over one exact source cover.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LwwIndex {
@@ -490,6 +571,18 @@ impl RegisterOrder for LwwIndex {
         self.winners
             .get(register)
             .is_some_and(|(_, winner)| *winner != raw)
+    }
+}
+
+impl TryFromCover<LwwRegisterUnion> for LwwIndex {
+    type Error = LwwRegisterError;
+
+    fn try_from_cover(attachment: CoverAttachment<LwwRegisterUnion>) -> Result<Self, Self::Error> {
+        let mut combined = Projection::default();
+        for segment in attachment.into_blobs() {
+            combined = combined.union(decode_projection(&segment)?);
+        }
+        Self::from_projection(combined)
     }
 }
 
@@ -595,44 +688,37 @@ impl LwwRegisterCollection {
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &FactCover,
     ) -> Result<LwwIndex, LwwRegisterCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, source_cover, self)?;
-        self.index_from_cover(cover)
+        let cover = self.kernel()?.attach_exact(store, source_cover)?;
+        LwwIndex::try_from_cover(cover).map_err(LwwRegisterCollectionError::Algebra)
     }
 
     /// Ensure and attach the exact projection for `source_cover`.
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &FactCover,
     ) -> Result<LwwIndex, LwwRegisterCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(store, source_cover, self)?;
-        self.index_from_cover(cover)
+        let cover = self.kernel()?.ensure_exact(store, source_cover)?;
+        LwwIndex::try_from_cover(cover).map_err(LwwRegisterCollectionError::Algebra)
     }
 
-    fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, LwwRegisterBlob> {
-        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
-    }
-
-    fn index_from_cover(
+    fn kernel(
         &self,
-        cover: CoverAttachment<LwwRegisterBlob>,
-    ) -> Result<LwwIndex, LwwRegisterCollectionError> {
-        let mut combined = Projection::default();
-        for segment in cover.into_blobs() {
-            combined = combined
-                .union(decode_projection(&segment).map_err(LwwRegisterCollectionError::Algebra)?);
-        }
-        LwwIndex::from_projection(combined).map_err(LwwRegisterCollectionError::Algebra)
+    ) -> Result<
+        ExactDerivedCollection<SimpleArchiveUnion, LwwRegisterUnion, ProjectLwwRegister>,
+        ExactDerivedCollectionError,
+    > {
+        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
     }
 }
 
@@ -666,60 +752,6 @@ impl Error for LwwRegisterCollectionError {
 impl From<ExactDerivedCollectionError> for LwwRegisterCollectionError {
     fn from(source: ExactDerivedCollectionError) -> Self {
         Self::Collection(source)
-    }
-}
-
-impl ExactDerivedAlgebra<SimpleArchive, LwwRegisterBlob> for LwwRegisterCollection {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.source_descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "source descriptor does not match this LWW register collection".to_owned(),
-            ));
-        }
-        simplearchive_union::validate_element(source)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<LwwRegisterBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "target descriptor does not match this LWW register collection".to_owned(),
-            ));
-        }
-        validate_element(target).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn join_source(
-        &self,
-        low: &Blob<SimpleArchive>,
-        high: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
-        simplearchive_union::join(low, high)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn derive(
-        &self,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<LwwRegisterBlob>, ExactAlgebraError> {
-        derive_element(source, self.identity, self.orders)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn join_target(
-        &self,
-        low: &Blob<LwwRegisterBlob>,
-        high: &Blob<LwwRegisterBlob>,
-    ) -> Result<Blob<LwwRegisterBlob>, ExactAlgebraError> {
-        join(low, high).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
     }
 }
 
@@ -1091,8 +1123,8 @@ mod tests {
             &signing_key,
         )
         .unwrap();
-        let source_cover = Cover::from_members(
-            collection.source_collection(),
+        let source_cover = FactCover::from_data(
+            collection.kernel().unwrap().source_collection(),
             [identity_commit.data(), order_commit.data()],
         );
 

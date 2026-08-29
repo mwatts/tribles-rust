@@ -11,18 +11,19 @@ use std::error::Error;
 use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::{Blob, BlobEncoding};
+use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, BlobStorePut, OfferCapture};
 use crate::trible::Fragment;
 
 use super::exact_derived::{
-    fresh_data_identity, CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra,
-    ExactDerivedCollection, ExactDerivedCollectionError,
+    fresh_data_identity, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use super::{
-    CollectionData, CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore, Cover,
+    CollectionData, CollectionHandle, CollectionHomomorphism, CollectionLattice,
+    CollectionLatticeError, CollectionMerge, CollectionRecord, CollectionStore, Cover,
+    CoverAttachment,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -170,41 +171,39 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// selected covers are compacted again when concurrent or older evidence
 /// exposes another collision. Repetition of any non-capacity-stable canonical
 /// cover returns [`ExactTargetCompactionError::Stalled`].
-pub fn compact_exact_target<S, Source, Target, A>(
-    exact: &ExactDerivedCollection<Source, Target>,
+pub fn compact_exact_target<S, Source, Target, H>(
+    exact: &ExactDerivedCollection<Source, Target, H>,
     store: &mut S,
-    source_cover: &Cover,
-    algebra: &A,
+    source_cover: &Cover<Source>,
 ) -> Result<CoverAttachment<Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore + ArtifactOfferStore,
     S::Reader: BlobStoreMeta,
-    Source: BlobEncoding + 'static,
-    Target: BlobEncoding + 'static,
-    Handle<Source>: InlineEncoding,
-    Handle<Target>: InlineEncoding,
-    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    Source: CollectionLattice,
+    Target: CollectionLattice,
+    Handle<Source::Encoding>: InlineEncoding,
+    Handle<Target::Encoding>: InlineEncoding,
+    H: CollectionHomomorphism<Source, Target>,
 {
     let mut capture = OfferCapture::new(store);
-    compact_exact_target_unoffered(exact, &mut capture, source_cover, algebra)
+    compact_exact_target_unoffered(exact, &mut capture, source_cover)
 }
 
-pub(crate) fn compact_exact_target_unoffered<S, Source, Target, A>(
-    exact: &ExactDerivedCollection<Source, Target>,
+pub(crate) fn compact_exact_target_unoffered<S, Source, Target, H>(
+    exact: &ExactDerivedCollection<Source, Target, H>,
     store: &mut S,
-    source_cover: &Cover,
-    algebra: &A,
+    source_cover: &Cover<Source>,
 ) -> Result<CoverAttachment<Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
-    Source: BlobEncoding + 'static,
-    Target: BlobEncoding + 'static,
-    Handle<Source>: InlineEncoding,
-    Handle<Target>: InlineEncoding,
-    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    Source: CollectionLattice,
+    Target: CollectionLattice,
+    Handle<Source::Encoding>: InlineEncoding,
+    Handle<Target::Encoding>: InlineEncoding,
+    H: CollectionHomomorphism<Source, Target>,
 {
-    let mut cover = exact.ensure_exact_unoffered(store, source_cover, algebra)?;
+    let mut cover = exact.ensure_exact_unoffered(store, source_cover)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 
@@ -213,17 +212,16 @@ where
             return Ok(cover);
         }
 
-        match publish_round(
+        match publish_round::<S, Target>(
             exact.target_descriptor().clone(),
-            exact.target_collection(),
+            exact.target_collection().handle(),
             store,
             cover,
-            algebra,
         )? {
             RoundOutcome::Published => {}
             RoundOutcome::CapacityStable(cover) => return Ok(cover),
         }
-        cover = exact.attach_exact(store, source_cover, algebra)?;
+        cover = exact.attach_exact(store, source_cover)?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
             return Err(ExactTargetCompactionError::Stalled { cover: identity });
@@ -231,50 +229,54 @@ where
     }
 }
 
-fn target_tier<Target: BlobEncoding>(blob: &Blob<Target>) -> u32 {
+fn target_tier<Target: CollectionLattice>(blob: &Blob<Target::Encoding>) -> u32 {
     blob.bytes.len().max(1).ilog2()
 }
 
-fn cover_identity<Target: BlobEncoding>(cover: &CoverAttachment<Target>) -> Vec<CollectionData> {
-    cover.members().iter().map(|(data, _)| *data).collect()
+fn cover_identity<Target: CollectionLattice>(
+    cover: &CoverAttachment<Target>,
+) -> Vec<CollectionData> {
+    cover
+        .members()
+        .iter()
+        .map(|(data, _)| Handle::<Target::Encoding>::to_hash(*data))
+        .collect()
 }
 
-fn has_tier_collision<Target: BlobEncoding>(cover: &CoverAttachment<Target>) -> bool {
+fn has_tier_collision<Target: CollectionLattice>(cover: &CoverAttachment<Target>) -> bool {
     let mut tiers = BTreeSet::new();
     cover
         .members()
         .iter()
-        .any(|(_, blob)| !tiers.insert(target_tier(blob)))
+        .any(|(_, blob)| !tiers.insert(target_tier::<Target>(blob)))
 }
 
-enum RoundOutcome<Target: BlobEncoding> {
+enum RoundOutcome<Target: CollectionLattice> {
     Published,
     CapacityStable(CoverAttachment<Target>),
 }
 
-fn publish_round<S, Source, Target, A>(
+fn publish_round<S, Target>(
     descriptor: Fragment,
     collection: CollectionHandle,
     store: &mut S,
     cover: CoverAttachment<Target>,
-    algebra: &A,
 ) -> Result<RoundOutcome<Target>, ExactTargetCompactionError>
 where
     S: BlobStorePut + CollectionStore,
-    Source: BlobEncoding,
-    Target: BlobEncoding + 'static,
-    Handle<Target>: InlineEncoding,
-    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    Target: CollectionLattice,
+    Handle<Target::Encoding>: InlineEncoding,
 {
-    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
+    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target::Encoding>>>::new();
     let mut locations = BTreeMap::<CollectionData, u32>::new();
     for (data, blob) in cover.members().iter().cloned() {
-        let tier = target_tier(&blob);
+        let data = Handle::<Target::Encoding>::to_hash(data);
+        let tier = target_tier::<Target>(&blob);
         locations.insert(data, tier);
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
-    let mut outputs = BTreeMap::<CollectionData, Blob<Target>>::new();
+    let mut outputs = BTreeMap::<CollectionData, Blob<Target::Encoding>>::new();
     let mut claims = Vec::<CollectionMerge>::new();
     loop {
         let Some(tier) = tiers
@@ -292,26 +294,29 @@ where
         locations.remove(&low_data);
         locations.remove(&high_data);
 
-        let constructed = match algebra.join_target(&low, &high) {
+        let constructed = match Target::merge_members(&descriptor, &low, &high) {
             Ok(constructed) => constructed,
-            Err(ExactAlgebraError::Fatal(reason)) => {
+            Err(CollectionLatticeError::Fatal(reason)) => {
                 return Err(ExactTargetCompactionError::Merge {
                     low: low_data,
                     high: high_data,
                     reason,
                 });
             }
-            Err(ExactAlgebraError::Capacity(_)) => {
+            Err(CollectionLatticeError::Capacity(_)) => {
                 locations.insert(high_data, tier);
                 tiers.entry(tier).or_default().insert(high_data, high);
                 continue;
             }
         };
         let result_data = fresh_data_identity(&constructed);
-        let result = Blob::with_handle(constructed.bytes, Handle::<Target>::from_hash(result_data));
-        match algebra.validate_target(&descriptor, &result) {
+        let result = Blob::with_handle(
+            constructed.bytes,
+            Handle::<Target::Encoding>::from_hash(result_data),
+        );
+        match Target::validate_member(&descriptor, &result) {
             Ok(()) => {}
-            Err(ExactAlgebraError::Fatal(reason)) => {
+            Err(CollectionLatticeError::Fatal(reason)) => {
                 return Err(ExactTargetCompactionError::InvalidResult {
                     low: low_data,
                     high: high_data,
@@ -319,7 +324,7 @@ where
                     reason,
                 });
             }
-            Err(ExactAlgebraError::Capacity(_)) => {
+            Err(CollectionLatticeError::Capacity(_)) => {
                 locations.insert(high_data, tier);
                 tiers.entry(tier).or_default().insert(high_data, high);
                 continue;
@@ -336,7 +341,7 @@ where
                 tiers.remove(&existing_tier);
             }
         }
-        let result_tier = target_tier(&result);
+        let result_tier = target_tier::<Target>(&result);
         locations.insert(result_data, result_tier);
         tiers
             .entry(result_tier)
@@ -362,10 +367,10 @@ where
         });
     }
     for (expected, result) in outputs {
-        let actual = store.put::<Target, _>(result).map_err(|error| {
+        let actual = store.put::<Target::Encoding, _>(result).map_err(|error| {
             ExactTargetCompactionError::storage("store compacted target", error)
         })?;
-        let actual = Handle::<Target>::to_hash(actual);
+        let actual = Handle::<Target::Encoding>::to_hash(actual);
         if actual != expected {
             return Err(ExactTargetCompactionError::NonCanonicalTargetPut { expected, actual });
         }

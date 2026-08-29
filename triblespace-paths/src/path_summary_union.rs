@@ -16,29 +16,42 @@
 
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 #[cfg(test)]
 use triblespace_core::collection::reach;
 use triblespace_core::prelude::entity;
 
+use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::collection::descriptor;
-use triblespace_core::collection::simplearchive_union::{self, TRIBLE_SET_UNION_RECIPE_V1};
+use triblespace_core::collection::simplearchive_union::{
+    self, SimpleArchiveUnion, TRIBLE_SET_UNION_RECIPE_V1,
+};
 use triblespace_core::collection::{
-    CollectionData, CollectionDerive, CollectionHandle, CollectionMerge, VerifyingKey,
+    CollectionData, CollectionDerive, CollectionHandle, CollectionHomomorphism, CollectionLattice,
+    CollectionLatticeError, CollectionMerge, Cover, CoverAttachment, TryFromCover, VerifyingKey,
 };
 use triblespace_core::id::Id;
-use triblespace_core::inline::encodings::hash::{Blake3, Hash};
-use triblespace_core::inline::Inline;
+use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
+use triblespace_core::inline::encodings::iu256::U256BE;
+use triblespace_core::inline::{Inline, TryFromInline};
 use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 use crate::persistence::{
-    automaton_fingerprint, path_automaton_fingerprint, PathSummaryV1, PATH_SUMMARY_RECIPE_V1,
+    automaton_fingerprint, path_automaton_accepting_state, path_automaton_fingerprint,
+    path_automaton_initial_state, path_automaton_state_count, path_automaton_transition,
+    path_transition_from, path_transition_kind, path_transition_label, path_transition_to,
+    PathSummaryV1, PATH_SUMMARY_RECIPE_V1,
 };
-use crate::{Automaton, GraphEdge, PathError, PathSummary, PathSummaryBlob, PathSummaryBlobError};
+use crate::{
+    Automaton, GraphEdge, PathError, PathSummary, PathSummaryBlob, PathSummaryBlobError, Step,
+    Transition,
+};
 
 /// A collection descriptor participating in a validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,7 +253,10 @@ impl Error for PathSummaryUnionValidationError {
 ///
 /// The automaton's canonical fingerprint participates in the recipe identity,
 /// so two path expressions over the same source scope form distinct target
-/// collections.
+/// collections. Since 2026-08-29 the complete automaton is also carried as
+/// canonical descriptor facts. This intentionally replaced the unshipped
+/// fingerprint-only descriptor identity so typed readers need no out-of-band
+/// automaton value.
 pub fn descriptor(
     source: triblespace_core::collection::records::CollectionHandle,
     automaton: &Automaton,
@@ -248,6 +264,24 @@ pub fn descriptor(
     reach: Fragment,
 ) -> triblespace_core::trible::Fragment {
     let fingerprint = automaton_fingerprint(automaton);
+    descriptor_with_fingerprint(source, automaton, authority, reach, fingerprint)
+}
+
+fn descriptor_with_fingerprint(
+    source: triblespace_core::collection::records::CollectionHandle,
+    automaton: &Automaton,
+    authority: VerifyingKey,
+    reach: Fragment,
+    fingerprint: Inline<Hash<Blake3>>,
+) -> Fragment {
+    let transitions = automaton
+        .transitions()
+        .iter()
+        .map(transition_fragment)
+        .fold(Fragment::empty(), |mut transitions, transition| {
+            transitions += transition;
+            transitions
+        });
     entity! { _ @
         triblespace_core::metadata::tag: triblespace_core::collection::records::KIND_COLLECTION_DESCRIPTOR,
         triblespace_core::collection::records::collection_source: source,
@@ -257,8 +291,298 @@ pub fn descriptor(
         triblespace_core::collection::records::collection_recipe*:
             <PathSummaryV1 as MetaDescribe>::describe(),
         path_automaton_fingerprint: fingerprint,
+        path_automaton_state_count: automaton.state_count(),
+        path_automaton_initial_state*: automaton.initial_states(),
+        path_automaton_accepting_state*: automaton.accepting_states(),
+        path_automaton_transition*: transitions,
         triblespace_core::collection::records::collection_reach*: reach,
     }
+}
+
+fn transition_fragment(transition: &Transition) -> Fragment {
+    let (kind, labels): (u32, &[triblespace_core::id::RawId]) = match &transition.step {
+        Step::Forward(label) => (0, std::slice::from_ref(label)),
+        Step::Reverse(label) => (1, std::slice::from_ref(label)),
+        Step::ForwardExcept(labels) => (2, labels),
+        Step::ReverseExcept(labels) => (3, labels),
+    };
+    let labels = labels
+        .iter()
+        .copied()
+        .map(u128::from_be_bytes)
+        .collect::<Vec<_>>();
+    entity! { _ @
+        path_transition_from: transition.from,
+        path_transition_to: transition.to,
+        path_transition_kind: kind,
+        path_transition_label*: labels,
+    }
+}
+
+/// The canonical path-summary representation under union for one automaton.
+///
+/// The Rust marker fixes the representation and law. The complete canonical
+/// automaton lives in each concrete descriptor, so generic collection code can
+/// validate and merge members without an out-of-band facade value.
+pub struct PathSummaryUnion;
+
+impl CollectionLattice for PathSummaryUnion {
+    type Encoding = PathSummaryBlob;
+    type Recipe = PathSummaryV1;
+
+    fn validate_arguments(descriptor: &Fragment) -> Result<(), CollectionLatticeError> {
+        let source = descriptor::source(descriptor.facts())
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?;
+        if source.is_none() {
+            return Err(CollectionLatticeError::Fatal(
+                "path-summary descriptor is missing its source collection".to_owned(),
+            ));
+        }
+        automaton_from_descriptor(descriptor).map(|_| ())
+    }
+
+    fn validate_member(
+        descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        let automaton = automaton_from_descriptor(descriptor)?;
+        PathSummaryBlob::decode(member.clone(), &automaton)
+            .map(|_| ())
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+
+    fn merge_members(
+        descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        let automaton = automaton_from_descriptor(descriptor)?;
+        join(low, high, &automaton)
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+}
+
+/// Canonical lowering from fact-union members to path-summary members.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimpleArchiveToPathSummary {
+    automaton: Automaton,
+}
+
+impl CollectionHomomorphism<SimpleArchiveUnion, PathSummaryUnion> for SimpleArchiveToPathSummary {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self {
+            automaton: automaton_from_descriptor(target)?,
+        })
+    }
+
+    fn map(
+        &self,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<PathSummaryBlob>, CollectionLatticeError> {
+        derive_element(source, &self.automaton)
+            // Paths currently rejoins every selected shard before closure, so
+            // a finer cover cannot evade fixed summary capacity.
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+}
+
+/// A lazy logical path-summary value retaining its exact physical members.
+///
+/// Closure is intentionally not part of the collection law. Callers may keep
+/// this cheap view until they actually need to construct a [`PathIndex`].
+pub struct PathSummaryView {
+    attachment: CoverAttachment<PathSummaryUnion>,
+}
+
+impl PathSummaryView {
+    /// Exact typed physical cover represented by this view.
+    pub fn cover(&self) -> &Cover<PathSummaryUnion> {
+        self.attachment.cover()
+    }
+
+    /// Number of physical path-summary members retained by this view.
+    pub fn len(&self) -> usize {
+        self.attachment.len()
+    }
+
+    /// Whether this view is the empty-cover bottom.
+    pub fn is_empty(&self) -> bool {
+        self.attachment.is_empty()
+    }
+
+    /// Borrow the ordered, already validated physical summary members.
+    pub fn segments(&self) -> &[(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)] {
+        self.attachment.members()
+    }
+
+    /// Consume the view into its ordered, already validated physical members.
+    pub fn into_segments(self) -> Vec<(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)> {
+        self.attachment.into_members()
+    }
+
+    /// Consume just the physical summary blobs without forcing their union.
+    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<PathSummaryBlob>> {
+        self.attachment.into_blobs()
+    }
+}
+
+impl TryFromCover<PathSummaryUnion> for PathSummaryView {
+    type Error = Infallible;
+
+    fn try_from_cover(attachment: CoverAttachment<PathSummaryUnion>) -> Result<Self, Self::Error> {
+        Ok(Self { attachment })
+    }
+}
+
+fn automaton_from_descriptor(
+    descriptor_fragment: &Fragment,
+) -> Result<Automaton, CollectionLatticeError> {
+    let facts = descriptor_fragment.facts();
+    let root = descriptor::entity(facts)
+        .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?;
+    let state_count = exactly_one_u32(
+        facts,
+        root,
+        &path_automaton_state_count,
+        "path_automaton_state_count",
+    )?;
+    let initial = u32_values(facts, root, &path_automaton_initial_state)?;
+    let accepting = u32_values(facts, root, &path_automaton_accepting_state)?;
+    let transition_ids = id_values(facts, root, &path_automaton_transition)?;
+    let mut transitions = Vec::with_capacity(transition_ids.len());
+    for transition in transition_ids {
+        let from = exactly_one_u32(
+            facts,
+            transition,
+            &path_transition_from,
+            "path_transition_from",
+        )?;
+        let to = exactly_one_u32(facts, transition, &path_transition_to, "path_transition_to")?;
+        let kind = exactly_one_u32(
+            facts,
+            transition,
+            &path_transition_kind,
+            "path_transition_kind",
+        )?;
+        let labels = u128_values(facts, transition, &path_transition_label)?
+            .into_iter()
+            .map(u128::to_be_bytes)
+            .collect::<Vec<_>>();
+        let step = match (kind, labels.as_slice()) {
+            (0, [label]) => Step::Forward(*label),
+            (1, [label]) => Step::Reverse(*label),
+            (2, labels) => Step::ForwardExcept(labels.to_vec()),
+            (3, labels) => Step::ReverseExcept(labels.to_vec()),
+            (0 | 1, _) => {
+                return Err(CollectionLatticeError::Fatal(
+                    "exact path transition requires exactly one label".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(CollectionLatticeError::Fatal(format!(
+                    "unknown path transition kind {kind}"
+                )));
+            }
+        };
+        let decoded = Transition::new(from, to, step);
+        let canonical = transition_fragment(&decoded)
+            .root()
+            .expect("a transition fragment is always rooted");
+        if canonical != transition {
+            return Err(CollectionLatticeError::Fatal(
+                "path descriptor transition id is not intrinsic to its canonical fields".to_owned(),
+            ));
+        }
+        transitions.push(decoded);
+    }
+    let automaton = Automaton::new(state_count, initial, accepting, transitions)
+        .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?;
+    let expected = automaton_fingerprint(&automaton);
+    let actual = descriptor::argument(descriptor_fragment.facts(), path_automaton_fingerprint.id())
+        .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?
+        .ok_or_else(|| {
+            CollectionLatticeError::Fatal(
+                "path-summary descriptor is missing path_automaton_fingerprint".to_owned(),
+            )
+        })?;
+    if actual != expected.raw {
+        return Err(CollectionLatticeError::Fatal(
+            "path-summary descriptor automaton facts do not match its fingerprint".to_owned(),
+        ));
+    }
+    Ok(automaton)
+}
+
+fn exactly_one_u32(
+    facts: &TribleSet,
+    entity: Id,
+    attribute: &Attribute<U256BE>,
+    field: &'static str,
+) -> Result<u32, CollectionLatticeError> {
+    let mut values = u32_values(facts, entity, attribute)?.into_iter();
+    let value = values.next().ok_or_else(|| {
+        CollectionLatticeError::Fatal(format!("path descriptor is missing {field}"))
+    })?;
+    if values.next().is_some() {
+        return Err(CollectionLatticeError::Fatal(format!(
+            "path descriptor repeats {field}"
+        )));
+    }
+    Ok(value)
+}
+
+fn u32_values(
+    facts: &TribleSet,
+    entity: Id,
+    attribute: &Attribute<U256BE>,
+) -> Result<Vec<u32>, CollectionLatticeError> {
+    facts
+        .iter()
+        .filter(|fact| fact.e() == &entity && fact.a() == &attribute.id())
+        .map(|fact| {
+            u32::try_from_inline(fact.v::<U256BE>()).map_err(|source| {
+                CollectionLatticeError::Fatal(format!(
+                    "path descriptor integer does not fit u32: {source:?}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn u128_values(
+    facts: &TribleSet,
+    entity: Id,
+    attribute: &Attribute<U256BE>,
+) -> Result<Vec<u128>, CollectionLatticeError> {
+    facts
+        .iter()
+        .filter(|fact| fact.e() == &entity && fact.a() == &attribute.id())
+        .map(|fact| {
+            u128::try_from_inline(fact.v::<U256BE>()).map_err(|source| {
+                CollectionLatticeError::Fatal(format!(
+                    "path descriptor label does not fit u128: {source:?}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn id_values(
+    facts: &TribleSet,
+    entity: Id,
+    attribute: &Attribute<GenId>,
+) -> Result<Vec<Id>, CollectionLatticeError> {
+    facts
+        .iter()
+        .filter(|fact| fact.e() == &entity && fact.a() == &attribute.id())
+        .map(|fact| {
+            Id::try_from_inline(fact.v::<GenId>()).map_err(|source| {
+                CollectionLatticeError::Fatal(format!(
+                    "path descriptor transition has an invalid id: {source:?}"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Return the canonical empty path summary for one fixed automaton.
@@ -387,10 +711,12 @@ fn validate_target_descriptor(
         <PathSummaryBlob as MetaDescribe>::id(),
         PATH_SUMMARY_RECIPE_V1,
     )?;
-    let expected = automaton_fingerprint(automaton);
-    match descriptor::argument(collection_descriptor, path_automaton_fingerprint.id())? {
-        Some(actual) if actual == expected.raw => Ok(()),
-        _ => Err(PathSummaryUnionValidationError::WrongAutomaton),
+    let decoded = automaton_from_descriptor(&Fragment::from(collection_descriptor.clone()))
+        .map_err(|_| PathSummaryUnionValidationError::WrongAutomaton)?;
+    if decoded == *automaton {
+        Ok(())
+    } else {
+        Err(PathSummaryUnionValidationError::WrongAutomaton)
     }
 }
 
@@ -604,6 +930,38 @@ mod tests {
             descriptor::argument(second.facts(), path_automaton_fingerprint.id())
         );
         assert_ne!(collection_of(&first), collection_of(&second));
+    }
+
+    #[test]
+    fn descriptor_round_trips_automaton_and_rejects_fingerprint_mismatch() {
+        let automaton = Automaton::new(
+            3,
+            [0, 1],
+            [1, 2],
+            [
+                Transition::new(0, 1, Step::Forward(label(7))),
+                Transition::new(1, 2, Step::ReverseExcept(vec![label(8), label(9)])),
+            ],
+        )
+        .unwrap();
+        let source = collection_of(&source_collection());
+        let descriptor = descriptor(source, &automaton, authority(), reach::private());
+
+        assert_eq!(automaton_from_descriptor(&descriptor).unwrap(), automaton);
+        <PathSummaryUnion as CollectionLattice>::validate_arguments(&descriptor).unwrap();
+
+        let mismatched = descriptor_with_fingerprint(
+            source,
+            &automaton,
+            authority(),
+            reach::private(),
+            Inline::new([0xA5; 32]),
+        );
+        assert!(matches!(
+            <PathSummaryUnion as CollectionLattice>::validate_arguments(&mismatched),
+            Err(CollectionLatticeError::Fatal(reason))
+                if reason.contains("do not match its fingerprint")
+        ));
     }
 
     #[test]

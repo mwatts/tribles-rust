@@ -5,6 +5,7 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
+use crate::metadata::Describe;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 
@@ -243,6 +244,18 @@ impl Fragment {
     }
 }
 
+impl Describe for Fragment {
+    /// Returns this fragment's description as an ordinary fragment.
+    ///
+    /// Metafacts become the description's content facts. The shared blob store
+    /// is retained conservatively because it owns attachments referenced by
+    /// both the content and its description; this lets a generic publication
+    /// path stage the complete closure before consuming the original value.
+    fn describe(&self) -> Fragment {
+        Fragment::from_facts_and_blobs(self.metafacts.clone(), self.blobs.clone())
+    }
+}
+
 impl Deref for Fragment {
     type Target = TribleSet;
 
@@ -324,5 +337,28 @@ impl From<TribleSet> for Fragment {
 impl From<Fragment> for TribleSet {
     fn from(value: Fragment) -> Self {
         value.facts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macros::entity;
+    use crate::metadata;
+
+    #[test]
+    fn describe_promotes_metafacts_and_keeps_the_attachment_closure() {
+        let fragment = entity! { _ @
+            metadata::description: "fragment content",
+        };
+        assert!(!fragment.metafacts().is_empty());
+        assert!(!fragment.blobs().is_empty());
+
+        let description = Describe::describe(&fragment);
+
+        assert_eq!(description.facts(), fragment.metafacts());
+        assert!(description.metafacts().is_empty());
+        assert_eq!(description.exports().count(), 0);
+        assert_eq!(description.blobs(), fragment.blobs());
     }
 }

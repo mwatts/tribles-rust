@@ -5,6 +5,7 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::collection::simplearchive_union::SimpleArchiveUnion;
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace::core::collection::{reach, simplearchive_union, CollectionStoreExt};
 use triblespace::core::examples::literature;
@@ -25,7 +26,7 @@ fn main() {
     let authority = signing_key.verifying_key();
     let source_reach = reach::private();
     let collection = pile
-        .collection(simplearchive_union::descriptor(
+        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
             name,
             authority,
             source_reach.clone(),

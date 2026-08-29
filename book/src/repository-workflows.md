@@ -15,10 +15,16 @@ merge or derivation equations provide reusable physical work.
 - **Collection descriptor** — a canonical `SimpleArchive` which describes a
   collection's anchor, element representation, join recipe, and reach law. Its
   content handle is the `CollectionHandle`.
-- **`Cover`** — one collection identity plus the canonical set of distinct
-  payload handles selected for one read or derivation. Signatures, authors,
-  and metadata remain queryable provenance, but are not coordinates of the
-  value.
+- **`Collection<L>`** — a cheap descriptor handle whose Rust lattice type `L`
+  fixes both the member encoding and join recipe. Constructing it validates
+  that the runtime descriptor names exactly that pair.
+- **`Cover<L>`** — one typed collection identity plus a PATCH of distinct
+  `Handle<L::Encoding>` members selected for one read or derivation.
+  Signatures, authors, and metadata remain queryable provenance, but are not
+  coordinates of the value.
+- **`TryFromCover<L>`** — reconstruction of one logical value from validated
+  physical members. A view may join eagerly or retain mmap-backed shards and
+  query their union lazily.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
 - **OFFER** — positive local willingness to serve an artifact; it is neither
@@ -40,7 +46,9 @@ use triblespace::core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode,
     CapabilityProofBundle, CapabilityResource,
 };
-use triblespace::core::collection::{reach, simplearchive_union, ACTION_WRITE};
+use triblespace::core::collection::{
+    reach, simplearchive_union::{self, SimpleArchiveUnion}, ACTION_WRITE,
+};
 use triblespace::prelude::*;
 
 let team_key = SigningKey::generate(&mut OsRng);
@@ -48,7 +56,7 @@ let writer = SigningKey::generate(&mut OsRng);
 let team = team_key.verifying_key();
 let writer_subject = writer.verifying_key();
 let mut storage = MemoryRepo::default();
-let models = storage.collection(simplearchive_union::descriptor(
+let models = storage.collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
     "models",
     team,
     reach::private(),
@@ -69,8 +77,10 @@ let commit = storage.commit(
     &writer,
     entity! { metadata::name: "first-model" },
 )?;
-let snapshot = storage.snapshot(models, &[presentation.clone()])?;
-assert!(snapshot.cover().contains(commit.data()));
+let snapshot = storage.snapshot::<TribleSet, _>(models, &[presentation.clone()])?;
+assert!(snapshot
+    .cover()
+    .contains(Handle::<SimpleArchive>::from_hash(commit.data())));
 storage.flush()?;
 ```
 
@@ -96,7 +106,7 @@ One `store.commit(collection, signer, fragment)` performs these semantic steps:
 
 1. fetch and exact-validate the already registered descriptor;
 2. store the fragment's attachments;
-3. encode facts as the canonical data `SimpleArchive`;
+3. encode the value using the lattice's canonical member encoding;
 4. encode metafacts as the mandatory canonical metadata `SimpleArchive`;
 5. durably offer those dependencies; and
 6. insert a signed `COMMIT` naming the descriptor, data, and metadata handles.
@@ -137,10 +147,12 @@ cover member.
 `store.snapshot(collection, presentations)` observes one clock instant,
 verifies every explicit capability presentation against the descriptor's
 authority, then discovers strictly verified commits by the resulting subjects.
-Their distinct data handles form a `Cover`. It opens one target reader and
-materializes only that payload set. The returned `CollectionSnapshot` keeps
-facts, the exact `Cover`, and reader together so downstream code cannot
-accidentally pair one logical frontier with a different physical view.
+Their distinct data handles form a `Cover<L>`. It opens one target reader and
+materializes only that payload set. The returned `Snapshot<L, V, R>` keeps the
+logical value `V`, exact cover, and reader together so downstream code cannot
+accidentally pair one logical frontier with a different physical view. For a
+`SimpleArchiveUnion`, `V = TribleSet`; for a `SuccinctArchiveUnion`, `V` may be
+an mmap-backed `UnionArchive` retaining all selected shards.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear on this call or a later
@@ -223,11 +235,15 @@ let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 - `compact_exact` performs explicit deterministic tiered merges for the same
   source cover.
 
-All positions use the same `Cover` value type. What differs is the target
-descriptor's recipe: ordinary Succinct derivation may choose any cheapest
-validated route whose support equals the source cover, while Rank9 consumes
-the exact immediate raw Succinct cover selected upstream. Exactness is thus a
-property of the collection map, not a mode bit carried by `Cover`.
+Every position uses the same `Cover<L>` shape, but its typed handles cannot be
+mixed across representations. `Cover<SimpleArchiveUnion>` contains only
+`Handle<SimpleArchive>`; `Cover<SuccinctArchiveUnion>` contains only
+`Handle<SuccinctArchiveBlob>`. The target descriptor and its bound
+`CollectionHomomorphism<Source, Target>` determine route freedom: ordinary
+Succinct derivation may choose any cheapest validated route whose support
+equals the source cover, while Rank9 consumes the exact immediate raw Succinct
+cover selected upstream. Exactness is a property of the map, not a mode bit or
+an untyped hash convention.
 
 None of them signs a replacement root, advances a head, flushes implicitly, or
 adds a special manifest. Rank9 fibers and [regular-path

@@ -1,6 +1,7 @@
 use super::*;
 use crate::collection::reach;
 
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,12 +10,13 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{IntoBlob, TryFromBlob};
-use crate::collection::descriptor::{self, identity_for_tests};
+use crate::collection::descriptor;
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
 use crate::collection::simplearchive_union;
 use crate::collection::CollectionCommit;
+use crate::id::ExclusiveId;
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::MemoryRepo;
@@ -64,183 +66,62 @@ fn source_root() -> Fragment {
     simplearchive_union::descriptor("source", test_team(), reach::private())
 }
 
-fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
-    ExactDerivedCollection::new(
-        source_root(),
-        descriptor::naming(
-            "target",
-            test_team(),
-            <UnknownBlob as MetaDescribe>::id(),
-            simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
-            reach::private(),
-        ),
-    )
-}
+/// Test-only recipe for the `SimpleArchive || 0xA5` target representation.
+struct TestTargetUnionV1;
 
-fn second_kernel() -> ExactDerivedCollection<UnknownBlob, UnknownBlob> {
-    ExactDerivedCollection::new(
-        kernel().target_descriptor().clone(),
-        descriptor::naming(
-            "second target",
-            test_team(),
-            <UnknownBlob as MetaDescribe>::id(),
-            simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
-            reach::private(),
-        ),
-    )
-}
-
-fn row(entity: u8, value: u8) -> Trible {
-    let mut raw = [value; TRIBLE_LEN];
-    raw[..16].fill(entity);
-    raw[16..32].fill(9);
-    Trible::force_raw(raw).unwrap()
-}
-
-fn archive(rows: impl IntoIterator<Item = (u8, u8)>) -> Blob<SimpleArchive> {
-    let mut set = TribleSet::new();
-    for (entity, value) in rows {
-        set.insert(&row(entity, value));
-    }
-    set.to_blob()
-}
-
-fn data<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData
-where
-    Handle<E>: InlineEncoding,
-{
-    Handle::<E>::to_hash(blob.get_handle())
-}
-
-struct TestAlgebra;
-
-impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for TestAlgebra {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        if descriptor != kernel().source_descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "wrong test source descriptor".to_owned(),
-            ));
+impl MetaDescribe for TestTargetUnionV1 {
+    fn describe() -> Fragment {
+        let recipe = id(0xE1);
+        crate::macros::entity! { ExclusiveId::force_ref(&recipe) @
+            crate::metadata::name: "exact-derived-test-target-union-v1",
+            crate::metadata::tag: crate::metadata::KIND_COLLECTION_RECIPE,
         }
-        simplearchive_union::validate_element(source)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<UnknownBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        if descriptor != kernel().target_descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "wrong test target descriptor".to_owned(),
-            ));
-        }
-        let Some(source) = target.bytes.as_ref().strip_suffix(&[0xA5]) else {
-            return Err(ExactAlgebraError::Fatal(
-                "test target lacks its canonical suffix".to_owned(),
-            ));
-        };
-        simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn join_source(
-        &self,
-        low: &Blob<SimpleArchive>,
-        high: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
-        simplearchive_union::join(low, high)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn derive(&self, source: &Blob<SimpleArchive>) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        Ok(derive(source).unwrap())
-    }
-
-    fn join_target(
-        &self,
-        low: &Blob<UnknownBlob>,
-        high: &Blob<UnknownBlob>,
-    ) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        let descriptor = kernel().target_descriptor().clone();
-        self.validate_target(&descriptor, low)?;
-        self.validate_target(&descriptor, high)?;
-        let low =
-            Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
-        let high =
-            Blob::<SimpleArchive>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
-        let joined = simplearchive_union::join(&low, &high)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))?;
-        Ok(derive(&joined).unwrap())
     }
 }
 
-struct SecondAlgebra;
+/// Test-only recipe for the `(SimpleArchive || 0xA5) || 0xB6` target.
+struct SecondTestTargetUnionV1;
 
-impl ExactDerivedAlgebra<UnknownBlob, UnknownBlob> for SecondAlgebra {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<UnknownBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        TestAlgebra.validate_target(descriptor, source)
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<UnknownBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        if descriptor != second_kernel().target_descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "wrong second test target descriptor".to_owned(),
-            ));
+impl MetaDescribe for SecondTestTargetUnionV1 {
+    fn describe() -> Fragment {
+        let recipe = id(0xE2);
+        crate::macros::entity! { ExclusiveId::force_ref(&recipe) @
+            crate::metadata::name: "exact-derived-second-test-target-union-v1",
+            crate::metadata::tag: crate::metadata::KIND_COLLECTION_RECIPE,
         }
-        let Some(source) = target.bytes.as_ref().strip_suffix(&[0xB6]) else {
-            return Err(ExactAlgebraError::Fatal(
-                "second test target lacks its canonical suffix".to_owned(),
-            ));
-        };
-        TestAlgebra.validate_target(
-            kernel().target_descriptor(),
-            &Blob::new(source.to_vec().into()),
-        )
+    }
+}
+
+/// The source lattice is deliberately distinct from the production marker so
+/// planning tests can observe source joins without changing production code.
+struct TestSourceUnion;
+
+impl CollectionLattice for TestSourceUnion {
+    type Encoding = SimpleArchive;
+    type Recipe = simplearchive_union::TribleSetUnionV1;
+
+    fn validate_member(
+        descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        simplearchive_union::SimpleArchiveUnion::validate_member(descriptor, member)
     }
 
-    fn join_source(
-        &self,
-        low: &Blob<UnknownBlob>,
-        high: &Blob<UnknownBlob>,
-    ) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        TestAlgebra.join_target(low, high)
-    }
-
-    fn derive(&self, source: &Blob<UnknownBlob>) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        let mut bytes = source.bytes.as_ref().to_vec();
-        bytes.push(0xB6);
-        Ok(Blob::new(bytes.into()))
-    }
-
-    fn join_target(
-        &self,
-        low: &Blob<UnknownBlob>,
-        high: &Blob<UnknownBlob>,
-    ) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        let descriptor = second_kernel().target_descriptor().clone();
-        self.validate_target(&descriptor, low)?;
-        self.validate_target(&descriptor, high)?;
-        let low =
-            Blob::<UnknownBlob>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
-        let high =
-            Blob::<UnknownBlob>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
-        let joined = self.join_source(&low, &high)?;
-        let mut bytes = joined.bytes.as_ref().to_vec();
-        bytes.push(0xB6);
-        Ok(Blob::new(bytes.into()))
+    fn merge_members(
+        descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        SELECTIVE_POLICY.with(|policy| {
+            if let Some(policy) = policy.borrow().as_ref() {
+                policy
+                    .source_attempts
+                    .lock()
+                    .unwrap()
+                    .push(SelectiveAlgebra::pair(low, high));
+            }
+        });
+        simplearchive_union::SimpleArchiveUnion::merge_members(descriptor, low, high)
     }
 }
 
@@ -266,67 +147,281 @@ impl SelectiveAlgebra {
     }
 }
 
-impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for SelectiveAlgebra {
-    fn validate_source(
+thread_local! {
+    /// Per-test instrumentation for lattice-owned joins. Test worker threads
+    /// may run these cases concurrently, so a process-global switch would be
+    /// both racy and capable of changing another test's semantics.
+    static SELECTIVE_POLICY: RefCell<Option<SelectiveAlgebra>> = const { RefCell::new(None) };
+}
+
+struct TestTargetUnion;
+
+impl CollectionLattice for TestTargetUnion {
+    type Encoding = UnknownBlob;
+    type Recipe = TestTargetUnionV1;
+
+    fn validate_member(
+        _descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        validate_test_target(member)
+    }
+
+    fn merge_members(
+        _descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        let injected = SELECTIVE_POLICY.with(|policy| {
+            let policy = policy.borrow();
+            let Some(policy) = policy.as_ref() else {
+                return None;
+            };
+            let pair = SelectiveAlgebra::pair(low, high);
+            policy.target_attempts.lock().unwrap().push(pair);
+            if policy.fatal_target_pairs.contains(&pair) {
+                Some(CollectionLatticeError::Fatal(
+                    "injected fatal target join".to_owned(),
+                ))
+            } else if policy.capacity_target_pairs.contains(&pair) {
+                Some(CollectionLatticeError::Capacity(
+                    "injected target capacity".to_owned(),
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some(error) = injected {
+            return Err(error);
+        }
+        join_test_targets(low, high)
+    }
+}
+
+struct SecondTestTargetUnion;
+
+impl CollectionLattice for SecondTestTargetUnion {
+    type Encoding = UnknownBlob;
+    type Recipe = SecondTestTargetUnionV1;
+
+    fn validate_member(
+        _descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        validate_second_test_target(member)
+    }
+
+    fn merge_members(
+        _descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        validate_second_test_target(low)?;
+        validate_second_test_target(high)?;
+        let low =
+            Blob::<UnknownBlob>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
+        let high =
+            Blob::<UnknownBlob>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
+        let joined = join_test_targets(&low, &high)?;
+        let mut bytes = joined.bytes.as_ref().to_vec();
+        bytes.push(0xB6);
+        Ok(Blob::new(bytes.into()))
+    }
+}
+
+fn validate_test_target(target: &Blob<UnknownBlob>) -> Result<(), CollectionLatticeError> {
+    let Some(source) = target.bytes.as_ref().strip_suffix(&[0xA5]) else {
+        return Err(CollectionLatticeError::Fatal(
+            "test target lacks its canonical suffix".to_owned(),
+        ));
+    };
+    simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
+        .map_err(|error| CollectionLatticeError::Fatal(error.to_string()))
+}
+
+fn join_test_targets(
+    low: &Blob<UnknownBlob>,
+    high: &Blob<UnknownBlob>,
+) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+    validate_test_target(low)?;
+    validate_test_target(high)?;
+    let low = Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
+    let high =
+        Blob::<SimpleArchive>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
+    let joined = simplearchive_union::join(&low, &high)
+        .map_err(|error| CollectionLatticeError::Fatal(error.to_string()))?;
+    Ok(derive(&joined).unwrap())
+}
+
+fn validate_second_test_target(target: &Blob<UnknownBlob>) -> Result<(), CollectionLatticeError> {
+    let Some(source) = target.bytes.as_ref().strip_suffix(&[0xB6]) else {
+        return Err(CollectionLatticeError::Fatal(
+            "second test target lacks its canonical suffix".to_owned(),
+        ));
+    };
+    validate_test_target(&Blob::new(source.to_vec().into()))
+}
+
+fn target_root(source: CollectionHandle) -> Fragment {
+    crate::macros::entity! { _ @
+        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
+        crate::collection::collection_source: source,
+        crate::collection::collection_authority: test_team(),
+        crate::collection::collection_representation: <UnknownBlob as MetaDescribe>::id(),
+        crate::collection::collection_recipe: <TestTargetUnionV1 as MetaDescribe>::id(),
+        crate::collection::collection_reach*: reach::private(),
+    }
+}
+
+fn second_target_root(source: CollectionHandle) -> Fragment {
+    crate::macros::entity! { _ @
+        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
+        crate::collection::collection_source: source,
+        crate::collection::collection_authority: test_team(),
+        crate::collection::collection_representation: <UnknownBlob as MetaDescribe>::id(),
+        crate::collection::collection_recipe: <SecondTestTargetUnionV1 as MetaDescribe>::id(),
+        crate::collection::collection_reach*: reach::private(),
+    }
+}
+
+fn kernel() -> ExactDerivedCollection<TestSourceUnion, TestTargetUnion, TestAlgebra> {
+    let source = source_root();
+    let source_collection = Collection::<TestSourceUnion>::from_descriptor(&source).unwrap();
+    ExactDerivedCollection::new(source, target_root(source_collection.handle())).unwrap()
+}
+
+fn selective_kernel(
+    algebra: SelectiveAlgebra,
+) -> ExactDerivedCollection<TestSourceUnion, TestTargetUnion, SelectiveAlgebra> {
+    let source = source_root();
+    let source_collection = Collection::<TestSourceUnion>::from_descriptor(&source).unwrap();
+    ExactDerivedCollection::with_homomorphism(
+        source,
+        target_root(source_collection.handle()),
+        algebra,
+    )
+    .unwrap()
+}
+
+fn second_kernel() -> ExactDerivedCollection<TestTargetUnion, SecondTestTargetUnion, SecondAlgebra>
+{
+    let source = kernel().target_descriptor().clone();
+    let source_collection = Collection::<TestTargetUnion>::from_descriptor(&source).unwrap();
+    ExactDerivedCollection::new(source, second_target_root(source_collection.handle())).unwrap()
+}
+
+struct SelectivePolicyGuard(Option<SelectiveAlgebra>);
+
+impl Drop for SelectivePolicyGuard {
+    fn drop(&mut self) {
+        SELECTIVE_POLICY.with(|policy| {
+            policy.replace(self.0.take());
+        });
+    }
+}
+
+fn with_selective<R>(
+    algebra: &SelectiveAlgebra,
+    operation: impl FnOnce(
+        &ExactDerivedCollection<TestSourceUnion, TestTargetUnion, SelectiveAlgebra>,
+    ) -> R,
+) -> R {
+    let previous = SELECTIVE_POLICY.with(|policy| policy.replace(Some(algebra.clone())));
+    let _guard = SelectivePolicyGuard(previous);
+    let kernel = selective_kernel(algebra.clone());
+    operation(&kernel)
+}
+
+fn row(entity: u8, value: u8) -> Trible {
+    let mut raw = [value; TRIBLE_LEN];
+    raw[..16].fill(entity);
+    raw[16..32].fill(9);
+    Trible::force_raw(raw).unwrap()
+}
+
+fn archive(rows: impl IntoIterator<Item = (u8, u8)>) -> Blob<SimpleArchive> {
+    let mut set = TribleSet::new();
+    for (entity, value) in rows {
+        set.insert(&row(entity, value));
+    }
+    set.to_blob()
+}
+
+fn data<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData
+where
+    Handle<E>: InlineEncoding,
+{
+    Handle::<E>::to_hash(blob.get_handle())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TestAlgebra;
+
+impl CollectionHomomorphism<TestSourceUnion, TestTargetUnion> for TestAlgebra {
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self)
+    }
+
+    fn map(
         &self,
-        descriptor: &Fragment,
         source: &Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        TestAlgebra.validate_source(descriptor, source)
+    ) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+        Ok(derive(source).unwrap())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecondAlgebra;
+
+impl CollectionHomomorphism<TestTargetUnion, SecondTestTargetUnion> for SecondAlgebra {
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self)
     }
 
-    fn validate_target(
+    fn map(&self, source: &Blob<UnknownBlob>) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
+        let mut bytes = source.bytes.as_ref().to_vec();
+        bytes.push(0xB6);
+        Ok(Blob::new(bytes.into()))
+    }
+}
+
+struct IdentityAlgebra;
+
+impl CollectionHomomorphism<TestSourceUnion, TestSourceUnion> for IdentityAlgebra {
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self)
+    }
+
+    fn map(
         &self,
-        descriptor: &Fragment,
-        target: &Blob<UnknownBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        TestAlgebra.validate_target(descriptor, target)
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<SimpleArchive>, CollectionLatticeError> {
+        Ok(source.clone())
+    }
+}
+
+impl CollectionHomomorphism<TestSourceUnion, TestTargetUnion> for SelectiveAlgebra {
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self::default())
     }
 
-    fn join_source(
+    fn map(
         &self,
-        low: &Blob<SimpleArchive>,
-        high: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
-        self.source_attempts
-            .lock()
-            .unwrap()
-            .push(Self::pair(low, high));
-        TestAlgebra.join_source(low, high)
-    }
-
-    fn derive(&self, source: &Blob<SimpleArchive>) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<UnknownBlob>, CollectionLatticeError> {
         let input = data(source);
         self.derive_attempts.lock().unwrap().push(input);
         if self.fatal_derives.contains(&input) {
-            return Err(ExactAlgebraError::Fatal("injected fatal derive".to_owned()));
+            return Err(CollectionLatticeError::Fatal(
+                "injected fatal derive".to_owned(),
+            ));
         }
         if self.capacity_derives.contains(&input) {
-            return Err(ExactAlgebraError::Capacity(
+            return Err(CollectionLatticeError::Capacity(
                 "injected derive capacity".to_owned(),
             ));
         }
-        TestAlgebra.derive(source)
-    }
-
-    fn join_target(
-        &self,
-        low: &Blob<UnknownBlob>,
-        high: &Blob<UnknownBlob>,
-    ) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        let pair = Self::pair(low, high);
-        self.target_attempts.lock().unwrap().push(pair);
-        if self.fatal_target_pairs.contains(&pair) {
-            return Err(ExactAlgebraError::Fatal(
-                "injected fatal target join".to_owned(),
-            ));
-        }
-        if self.capacity_target_pairs.contains(&pair) {
-            return Err(ExactAlgebraError::Capacity(
-                "injected target capacity".to_owned(),
-            ));
-        }
-        TestAlgebra.join_target(low, high)
+        Ok(derive(source).unwrap())
     }
 }
 
@@ -343,7 +438,7 @@ fn source_commit(store: &mut MemoryRepo, key: u8, blob: &Blob<SimpleArchive>) ->
         .unwrap();
     let commit = CollectionCommit::sign(
         &SigningKey::from_bytes(&[key; 32]),
-        kernel().source_collection(),
+        kernel().source_collection().handle(),
         data(blob),
         metadata,
     );
@@ -351,10 +446,13 @@ fn source_commit(store: &mut MemoryRepo, key: u8, blob: &Blob<SimpleArchive>) ->
     commit
 }
 
-fn source_cover(commits: &[CollectionCommit]) -> Cover {
+fn source_cover(commits: &[CollectionCommit]) -> Cover<TestSourceUnion> {
     Cover::from_members(
         kernel().source_collection(),
-        commits.iter().map(CollectionCommit::data),
+        commits
+            .iter()
+            .map(CollectionCommit::data)
+            .map(Handle::<SimpleArchive>::from_hash),
     )
 }
 
@@ -363,7 +461,7 @@ fn publish_derive(store: &mut MemoryRepo, input: &Blob<SimpleArchive>) -> Blob<U
     store.put::<UnknownBlob, _>(output.clone()).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(input),
             data(&output),
         )))
@@ -380,7 +478,7 @@ fn publish_source_merge(
     store.put::<SimpleArchive, _>(result.clone()).unwrap();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_collection(),
+            kernel().source_collection().handle(),
             data(low),
             data(high),
             data(&result),
@@ -395,7 +493,9 @@ fn derived_inputs(store: &mut MemoryRepo) -> Vec<CollectionData> {
         .unwrap()
         .map(Result::unwrap)
         .filter_map(|record| match record {
-            CollectionRecord::Derive(claim) if claim.target() == kernel().target_collection() => {
+            CollectionRecord::Derive(claim)
+                if claim.target() == kernel().target_collection().handle() =>
+            {
                 Some(claim.mapping().0)
             }
             _ => None,
@@ -446,27 +546,29 @@ fn empty_cover_performs_no_store_operation() {
     let mut store = PanicStore;
     let cover = source_cover(&[]);
     assert!(kernel()
-        .attach_exact(&mut store, &cover, &TestAlgebra)
+        .attach_exact(&mut store, &cover)
         .unwrap()
         .is_empty());
     assert!(kernel()
-        .ensure_exact(&mut store, &cover, &TestAlgebra)
+        .ensure_exact(&mut store, &cover)
         .unwrap()
         .is_empty());
-    assert!(
-        compact_exact_target(&kernel(), &mut store, &cover, &TestAlgebra)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(compact_exact_target(&kernel(), &mut store, &cover)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
 fn empty_cover_still_belongs_to_one_exact_collection() {
     let mut store = PanicStore;
-    let foreign = Cover::from_members(kernel().target_collection(), []);
+    let foreign_descriptor =
+        simplearchive_union::descriptor("foreign", test_team(), reach::private());
+    let foreign_collection =
+        Collection::<TestSourceUnion>::from_descriptor(&foreign_descriptor).unwrap();
+    let foreign = Cover::from_members(foreign_collection, []);
     for result in [
-        kernel().attach_exact(&mut store, &foreign, &TestAlgebra),
-        kernel().ensure_exact(&mut store, &foreign, &TestAlgebra),
+        kernel().attach_exact(&mut store, &foreign),
+        kernel().ensure_exact(&mut store, &foreign),
     ] {
         assert!(matches!(
             result,
@@ -474,7 +576,7 @@ fn empty_cover_still_belongs_to_one_exact_collection() {
         ));
     }
     assert!(matches!(
-        kernel().probe_exact(&mut store, &foreign, &TestAlgebra, &BTreeSet::new()),
+        kernel().probe_exact(&mut store, &foreign, &BTreeSet::new()),
         Err(ExactDerivedCollectionError::InvalidCover(_))
     ));
 }
@@ -633,9 +735,7 @@ fn complete_probe_ensure_performs_zero_writes() {
     };
     let source_cover = source_cover(&[commit]);
 
-    let cover = kernel()
-        .ensure_exact(&mut store, &source_cover, &TestAlgebra)
-        .unwrap();
+    let cover = kernel().ensure_exact(&mut store, &source_cover).unwrap();
     assert_eq!(cover.len(), 1);
     assert_eq!(store.puts, 0);
     assert_eq!(store.inserts, 0);
@@ -656,15 +756,16 @@ fn compacted_source_cover_reuses_resident_decomposition_images() {
         inner,
         ..CountingStore::default()
     };
-    let source_cover = Cover::from_members(kernel().source_collection(), [data(&c)]);
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = kernel()
-        .ensure_exact(&mut store, &source_cover, &algebra)
-        .unwrap();
+    let target = with_selective(&algebra, |kernel| {
+        kernel.ensure_exact(&mut store, &source_cover)
+    })
+    .unwrap();
 
     let mut actual: Vec<_> = target.cover().members().collect();
     actual.sort_unstable();
-    let mut expected = vec![data(&fa), data(&fb)];
+    let mut expected = vec![fa.get_handle(), fb.get_handle()];
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert_eq!((store.puts, store.inserts), (0, 0));
@@ -687,15 +788,19 @@ fn compacted_source_capacity_falls_back_to_resident_decomposition_inputs() {
         inner,
         ..CountingStore::default()
     };
-    let source_cover = Cover::from_members(kernel().source_collection(), [data(&c)]);
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = kernel()
-        .ensure_exact(&mut store, &source_cover, &algebra)
-        .unwrap();
+    let target = with_selective(&algebra, |kernel| {
+        kernel.ensure_exact(&mut store, &source_cover)
+    })
+    .unwrap();
 
     let mut actual: Vec<_> = target.cover().members().collect();
     actual.sort_unstable();
-    let mut expected = vec![data(&derive(&a).unwrap()), data(&derive(&b).unwrap())];
+    let mut expected = vec![
+        derive(&a).unwrap().get_handle(),
+        derive(&b).unwrap().get_handle(),
+    ];
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert!(store.puts > 0 && store.inserts > 0);
@@ -720,15 +825,16 @@ fn complete_direct_image_does_not_expand_source_decompositions() {
         inner,
         ..CountingStore::default()
     };
-    let source_cover = Cover::from_members(kernel().source_collection(), [data(&c)]);
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = kernel()
-        .ensure_exact(&mut store, &source_cover, &algebra)
-        .unwrap();
+    let target = with_selective(&algebra, |kernel| {
+        kernel.ensure_exact(&mut store, &source_cover)
+    })
+    .unwrap();
 
     assert_eq!(
         target.cover().members().collect::<Vec<_>>(),
-        vec![data(&fc)]
+        vec![fc.get_handle()]
     );
     assert_eq!((store.puts, store.inserts), (0, 0));
     assert!(algebra.source_attempts.lock().unwrap().is_empty());
@@ -743,7 +849,7 @@ fn unrelated_optional_result_metadata_failure_is_inert() {
     let unrelated = Inline::<Hash<Blake3>>::new([0x73; 32]);
     inner
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_collection(),
+            kernel().source_collection().handle(),
             Inline::new([0x51; 32]),
             Inline::new([0x62; 32]),
             unrelated,
@@ -758,15 +864,13 @@ fn unrelated_optional_result_metadata_failure_is_inert() {
         .lock()
         .unwrap()
         .insert(unrelated.raw);
-    let source_cover = Cover::from_members(kernel().source_collection(), [data(&source)]);
+    let source_cover = Cover::from_members(kernel().source_collection(), [source.get_handle()]);
 
-    let attached = kernel()
-        .attach_exact(&mut store, &source_cover, &TestAlgebra)
-        .unwrap();
+    let attached = kernel().attach_exact(&mut store, &source_cover).unwrap();
 
     assert_eq!(
         attached.cover().members().collect::<Vec<_>>(),
-        vec![data(&target)]
+        vec![target.get_handle()]
     );
     assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
 }
@@ -780,7 +884,7 @@ fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
     let missing_b = Inline::<Hash<Blake3>>::new([0x42; 32]);
     inner
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_collection(),
+            kernel().source_collection().handle(),
             missing_a,
             missing_b,
             data(&c),
@@ -791,11 +895,12 @@ fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
         inner,
         ..CountingStore::default()
     };
-    let source_cover = Cover::from_members(kernel().source_collection(), [data(&c)]);
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = kernel()
-        .ensure_exact(&mut store, &source_cover, &algebra)
-        .unwrap();
+    let target = with_selective(&algebra, |kernel| {
+        kernel.ensure_exact(&mut store, &source_cover)
+    })
+    .unwrap();
 
     assert_eq!(target.len(), 1);
     assert_eq!(target.members()[0].1.bytes, derive(&c).unwrap().bytes);
@@ -814,7 +919,7 @@ fn forged_reverse_decomposition_cannot_supply_a_cover() {
     }
     inner
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_collection(),
+            kernel().source_collection().handle(),
             data(&a),
             data(&b),
             data(&c),
@@ -827,17 +932,19 @@ fn forged_reverse_decomposition_cannot_supply_a_cover() {
         inner,
         ..CountingStore::default()
     };
-    let source_cover = Cover::from_members(kernel().source_collection(), [data(&c)]);
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
     assert!(matches!(
-        kernel().attach_exact(&mut store, &source_cover, &algebra),
+        with_selective(&algebra, |kernel| kernel
+            .attach_exact(&mut store, &source_cover)),
         Err(ExactDerivedCollectionError::IncompleteCover { .. })
     ));
     assert_eq!((store.puts, store.inserts), (0, 0));
 
-    let target = kernel()
-        .ensure_exact(&mut store, &source_cover, &algebra)
-        .unwrap();
+    let target = with_selective(&algebra, |kernel| {
+        kernel.ensure_exact(&mut store, &source_cover)
+    })
+    .unwrap();
     assert_eq!(target.len(), 1);
     assert_eq!(target.members()[0].1.bytes, derive(&c).unwrap().bytes);
     assert!(algebra.derive_attempts.lock().unwrap().contains(&data(&c)));
@@ -851,9 +958,7 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
     let commit = source_commit(&mut store, 1, &source);
     let source_cover = source_cover(&[commit]);
 
-    let first = kernel()
-        .ensure_exact(&mut store, &source_cover, &TestAlgebra)
-        .unwrap();
+    let first = kernel().ensure_exact(&mut store, &source_cover).unwrap();
     let first_member = first.cover().members().next().unwrap();
     assert!(
         !store
@@ -863,14 +968,14 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
             .any(|record| matches!(
                 record,
                 CollectionRecord::Commit(commit)
-                    if commit.collection() == kernel().target_collection()
-                        && commit.data() == first_member
+                    if commit.collection() == kernel().target_collection().handle()
+                        && commit.data() == Handle::<UnknownBlob>::to_hash(first_member)
             )),
         "the first algebra result must remain unsigned equation evidence",
     );
 
     let second = second_kernel()
-        .ensure_exact(&mut store, first.cover(), &SecondAlgebra)
+        .ensure_exact(&mut store, first.cover())
         .unwrap();
     assert_eq!(second.len(), 1);
     let mut expected = derive(&source).unwrap().bytes.as_ref().to_vec();
@@ -890,7 +995,7 @@ fn stable_exact_cover_compaction_performs_zero_additional_writes() {
     };
     let source_cover = source_cover(&[commit]);
 
-    let cover = compact_exact_target(&kernel(), &mut store, &source_cover, &TestAlgebra).unwrap();
+    let cover = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     assert_eq!(cover.len(), 1);
     assert_eq!(store.puts, 0);
     assert_eq!(store.inserts, 0);
@@ -916,9 +1021,10 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
     };
     let source_cover = source_cover(&commits);
 
-    let cover = kernel()
-        .ensure_exact(&mut store, &source_cover, &algebra)
-        .unwrap();
+    let cover = with_selective(&algebra, |kernel| {
+        kernel.ensure_exact(&mut store, &source_cover)
+    })
+    .unwrap();
     assert_eq!(cover.len(), 2);
     let mut actual = derived_inputs(&mut store.inner);
     actual.sort_unstable();
@@ -960,9 +1066,10 @@ fn capacity_source_replan_is_global_across_overlapping_uppers() {
     };
     let source_cover = source_cover(&commits);
 
-    kernel()
-        .ensure_exact(&mut store, &source_cover, &algebra)
-        .unwrap();
+    with_selective(&algebra, |kernel| {
+        kernel.ensure_exact(&mut store, &source_cover)
+    })
+    .unwrap();
     let mut actual = derived_inputs(&mut store.inner);
     actual.sort_unstable();
     let mut expected = vec![data(successful_upper), data(final_leaf)];
@@ -998,7 +1105,7 @@ fn terminal_source_capacity_is_repeatable_and_zero_write() {
 
     for _ in 0..2 {
         assert!(matches!(
-            kernel().ensure_exact(&mut store, &source_cover, &algebra),
+            with_selective(&algebra, |kernel| kernel.ensure_exact(&mut store, &source_cover)),
             Err(ExactDerivedCollectionError::UnrepresentableCover { ref blocked, ref missing })
                 if blocked.len() == 1 && missing.len() == 1
         ));
@@ -1031,7 +1138,8 @@ fn mixed_terminal_capacity_publishes_no_prepared_sibling() {
     let source_cover = source_cover(&commits);
 
     assert!(matches!(
-        kernel().ensure_exact(&mut store, &source_cover, &algebra),
+        with_selective(&algebra, |kernel| kernel
+            .ensure_exact(&mut store, &source_cover)),
         Err(ExactDerivedCollectionError::UnrepresentableCover { .. })
     ));
     assert_eq!((store.puts, store.inserts), (0, 0));
@@ -1059,7 +1167,7 @@ fn fatal_source_construction_is_not_capacity_fallback() {
     let source_cover = source_cover(&[commit]);
 
     assert!(matches!(
-        kernel().ensure_exact(&mut store, &source_cover, &algebra),
+        with_selective(&algebra, |kernel| kernel.ensure_exact(&mut store, &source_cover)),
         Err(ExactDerivedCollectionError::Derive { input, .. }) if input == data(&source)
     ));
     assert_eq!((store.puts, store.inserts), (0, 0));
@@ -1231,9 +1339,7 @@ fn reader_is_dropped_before_first_write() {
         events: Vec::new(),
     };
     let source_cover = source_cover(&[commit]);
-    kernel()
-        .ensure_exact(&mut store, &source_cover, &TestAlgebra)
-        .unwrap();
+    kernel().ensure_exact(&mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
 }
 
@@ -1244,7 +1350,7 @@ fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
         .map(Result::unwrap)
         .filter_map(|record| match record {
             CollectionRecord::Merge(claim)
-                if claim.collection() == kernel().target_collection() =>
+                if claim.collection() == kernel().target_collection().handle() =>
             {
                 Some(claim)
             }
@@ -1253,7 +1359,7 @@ fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
         .collect()
 }
 
-fn joined_cover(cover: &CoverAttachment<UnknownBlob>) -> Blob<UnknownBlob> {
+fn joined_cover(cover: &CoverAttachment<TestTargetUnion>) -> Blob<UnknownBlob> {
     let mut members = cover.members().iter();
     let mut joined = members
         .next()
@@ -1261,13 +1367,34 @@ fn joined_cover(cover: &CoverAttachment<UnknownBlob>) -> Blob<UnknownBlob> {
         .1
         .clone();
     for (_, member) in members {
-        joined = TestAlgebra.join_target(&joined, member).unwrap();
+        joined = join_test_targets(&joined, member).unwrap();
     }
     joined
 }
 
-fn cover_ids(cover: &CoverAttachment<UnknownBlob>) -> Vec<CollectionData> {
-    cover.members().iter().map(|(data, _)| *data).collect()
+fn cover_ids(cover: &CoverAttachment<TestTargetUnion>) -> Vec<CollectionData> {
+    cover
+        .members()
+        .iter()
+        .map(|(handle, _)| Handle::<UnknownBlob>::to_hash(*handle))
+        .collect()
+}
+
+fn target_handles(
+    data: impl IntoIterator<Item = CollectionData>,
+) -> BTreeSet<Inline<Handle<UnknownBlob>>> {
+    data.into_iter()
+        .map(Handle::<UnknownBlob>::from_hash)
+        .collect()
+}
+
+fn target_ids(
+    handles: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
+) -> Vec<CollectionData> {
+    handles
+        .into_iter()
+        .map(Handle::<UnknownBlob>::to_hash)
+        .collect()
 }
 
 #[test]
@@ -1285,7 +1412,7 @@ fn compaction_collapses_same_tier_and_returns_an_exact_tier_stable_cover() {
         .collect();
     let source_cover = source_cover(&commits);
 
-    let cover = compact_exact_target(&kernel(), &mut store, &source_cover, &TestAlgebra).unwrap();
+    let cover = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     let mut tiers = BTreeSet::new();
     for (_, blob) in cover.members() {
         assert!(tiers.insert(blob.bytes.len().max(1).ilog2()));
@@ -1336,7 +1463,10 @@ fn target_capacity_retires_only_low() {
         ..CountingStore::default()
     };
 
-    let cover = compact_exact_target(&kernel(), &mut store, &source_cover, &algebra).unwrap();
+    let cover = with_selective(&algebra, |kernel| {
+        compact_exact_target(kernel, &mut store, &source_cover)
+    })
+    .unwrap();
     assert_eq!(cover.len(), 2);
     assert_eq!(
         algebra.target_attempts.lock().unwrap().as_slice(),
@@ -1384,7 +1514,9 @@ fn fatal_late_target_join_publishes_no_staged_prefix() {
     };
 
     assert!(matches!(
-        compact_exact_target(&kernel(), &mut store, &source_cover, &algebra),
+        with_selective(&algebra, |kernel| {
+            compact_exact_target(kernel, &mut store, &source_cover)
+        }),
         Err(ExactTargetCompactionError::Merge { low, high, .. })
             if (low, high) == fatal_pair
     ));
@@ -1424,10 +1556,16 @@ fn capacity_stable_target_collision_is_repeatable_and_zero_write() {
         ..CountingStore::default()
     };
 
-    let first = compact_exact_target(&kernel(), &mut store, &source_cover, &algebra).unwrap();
+    let first = with_selective(&algebra, |kernel| {
+        compact_exact_target(kernel, &mut store, &source_cover)
+    })
+    .unwrap();
     assert_eq!(first.len(), 2);
     assert_eq!((store.puts, store.inserts), (0, 0));
-    let second = compact_exact_target(&kernel(), &mut store, &source_cover, &algebra).unwrap();
+    let second = with_selective(&algebra, |kernel| {
+        compact_exact_target(kernel, &mut store, &source_cover)
+    })
+    .unwrap();
     assert_eq!(cover_ids(&first), cover_ids(&second));
     assert_eq!((store.puts, store.inserts), (0, 0));
     assert!(target_merge_records(&mut store.inner).is_empty());
@@ -1455,21 +1593,17 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof()
         })
         .collect();
     targets.sort_unstable_by_key(|(data, _)| *data);
-    let old_intermediate = TestAlgebra
-        .join_target(&targets[1].1, &targets[2].1)
-        .unwrap();
-    let old_upper = TestAlgebra
-        .join_target(&targets[0].1, &old_intermediate)
-        .unwrap();
+    let old_intermediate = join_test_targets(&targets[1].1, &targets[2].1).unwrap();
+    let old_upper = join_test_targets(&targets[0].1, &old_intermediate).unwrap();
     for claim in [
         CollectionMerge::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             targets[1].0,
             targets[2].0,
             data(&old_intermediate),
         ),
         CollectionMerge::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             targets[0].0,
             data(&old_intermediate),
             data(&old_upper),
@@ -1485,11 +1619,9 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof()
         ))
         .unwrap();
 
-    let before = kernel()
-        .attach_exact(&mut store, &source_cover, &TestAlgebra)
-        .unwrap();
+    let before = kernel().attach_exact(&mut store, &source_cover).unwrap();
     assert_eq!(before.len(), 3);
-    let after = compact_exact_target(&kernel(), &mut store, &source_cover, &TestAlgebra).unwrap();
+    let after = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     let mut tiers = BTreeSet::new();
     assert!(after
         .members()
@@ -1526,10 +1658,8 @@ fn compaction_is_cover_order_deterministic_and_repeatedly_idempotent() {
     let first_cover = source_cover(&first_commits);
     let second_cover = source_cover(&second_commits);
 
-    let first =
-        compact_exact_target(&kernel(), &mut first_store, &first_cover, &TestAlgebra).unwrap();
-    let second =
-        compact_exact_target(&kernel(), &mut second_store, &second_cover, &TestAlgebra).unwrap();
+    let first = compact_exact_target(&kernel(), &mut first_store, &first_cover).unwrap();
+    let second = compact_exact_target(&kernel(), &mut second_store, &second_cover).unwrap();
     assert_eq!(cover_ids(&first), cover_ids(&second));
     assert_eq!(
         target_merge_records(&mut first_store),
@@ -1537,8 +1667,7 @@ fn compaction_is_cover_order_deterministic_and_repeatedly_idempotent() {
     );
 
     let records_before: Vec<_> = first_store.records().unwrap().map(Result::unwrap).collect();
-    let repeated =
-        compact_exact_target(&kernel(), &mut first_store, &first_cover, &TestAlgebra).unwrap();
+    let repeated = compact_exact_target(&kernel(), &mut first_store, &first_cover).unwrap();
     let records_after: Vec<_> = first_store.records().unwrap().map(Result::unwrap).collect();
     assert_eq!(cover_ids(&first), cover_ids(&repeated));
     assert_eq!(records_before, records_after);
@@ -1570,14 +1699,14 @@ fn compaction_drops_readers_and_puts_all_results_before_the_first_merge() {
         events: Vec::new(),
     };
 
-    compact_exact_target(&kernel(), &mut store, &source_cover, &TestAlgebra).unwrap();
+    compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
     let first_merge = store
         .events
         .iter()
         .position(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
         .expect("colliding cover publishes a MERGE");
-    let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection());
+    let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection().handle());
     assert!(store.events[..first_merge]
         .iter()
         .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
@@ -1594,48 +1723,6 @@ fn compaction_drops_readers_and_puts_all_results_before_the_first_merge() {
         assert!(store.events[..first_merge]
             .iter()
             .any(|event| matches!(event, WriteEvent::Put(data) if *data == result)));
-    }
-}
-
-struct FailingJoinAlgebra;
-
-impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for FailingJoinAlgebra {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        TestAlgebra.validate_source(descriptor, source)
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<UnknownBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        TestAlgebra.validate_target(descriptor, target)
-    }
-
-    fn join_source(
-        &self,
-        low: &Blob<SimpleArchive>,
-        high: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
-        TestAlgebra.join_source(low, high)
-    }
-
-    fn derive(&self, source: &Blob<SimpleArchive>) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        TestAlgebra.derive(source)
-    }
-
-    fn join_target(
-        &self,
-        _: &Blob<UnknownBlob>,
-        _: &Blob<UnknownBlob>,
-    ) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        Err(ExactAlgebraError::Fatal(
-            "injected target join failure".to_owned(),
-        ))
     }
 }
 
@@ -1760,8 +1847,15 @@ fn join_and_put_failures_publish_no_target_merge() {
         .map(|(index, source)| source_commit(&mut join_store, index as u8 + 1, source))
         .collect();
     let join_cover = source_cover(&join_commits);
+    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
+    let algebra = SelectiveAlgebra {
+        fatal_target_pairs: BTreeSet::from([SelectiveAlgebra::pair(&targets[0], &targets[1])]),
+        ..SelectiveAlgebra::default()
+    };
     assert!(matches!(
-        compact_exact_target(&kernel(), &mut join_store, &join_cover, &FailingJoinAlgebra,),
+        with_selective(&algebra, |kernel| {
+            compact_exact_target(kernel, &mut join_store, &join_cover)
+        }),
         Err(ExactTargetCompactionError::Merge { .. })
     ));
     assert!(target_merge_records(&mut join_store).is_empty());
@@ -1779,7 +1873,7 @@ fn join_and_put_failures_publish_no_target_merge() {
     let put_cover = source_cover(&put_commits);
     let mut put_store = RejectPutStore { inner, puts: 0 };
     assert!(matches!(
-        compact_exact_target(&kernel(), &mut put_store, &put_cover, &TestAlgebra),
+        compact_exact_target(&kernel(), &mut put_store, &put_cover),
         Err(ExactTargetCompactionError::Storage { .. })
     ));
     assert!(target_merge_records(&mut put_store.inner).is_empty());
@@ -1802,7 +1896,7 @@ fn discarded_merge_insert_stalls_instead_of_looping() {
     let mut store = DropMergeStore { inner };
 
     assert!(matches!(
-        compact_exact_target(&kernel(), &mut store, &source_cover, &TestAlgebra),
+        compact_exact_target(&kernel(), &mut store, &source_cover),
         Err(ExactTargetCompactionError::Stalled { cover }) if cover.len() == 2
     ));
     assert!(target_merge_records(&mut store.inner).is_empty());
@@ -1871,7 +1965,7 @@ fn fresh_reprobe_rejects_a_lossy_output_put() {
         discard_put: 3,
     };
     let source_cover = source_cover(&[commit]);
-    match kernel().ensure_exact(&mut store, &source_cover, &TestAlgebra) {
+    match kernel().ensure_exact(&mut store, &source_cover) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected fresh-reprobe error: {error:?}"),
         Ok(_) => panic!("lossy output was incorrectly admitted"),
@@ -1886,20 +1980,20 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
     let missing = derive(&source).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(&source),
             data(&missing),
         )))
         .unwrap();
     let source_cover = source_cover(&[commit]);
-    match kernel().attach_exact(&mut store, &source_cover, &TestAlgebra) {
+    match kernel().attach_exact(&mut store, &source_cover) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected missing-output error: {error:?}"),
         Ok(_) => panic!("missing output was incorrectly admitted"),
     }
     assert_eq!(
         kernel()
-            .ensure_exact(&mut store, &source_cover, &TestAlgebra)
+            .ensure_exact(&mut store, &source_cover)
             .unwrap()
             .len(),
         1,
@@ -1910,7 +2004,7 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
 fn offered_upper_is_selected_as_one_remote_cover_member() {
     let sources = [archive([(1, 3)]), archive([(2, 4)])];
     let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
     let mut store = MemoryRepo::default();
     let commits: Vec<_> = sources
         .iter()
@@ -1921,7 +2015,7 @@ fn offered_upper_is_selected_as_one_remote_cover_member() {
     for (source, target) in sources.iter().zip(&targets) {
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection(),
+                kernel().target_collection().handle(),
                 data(source),
                 data(target),
             )))
@@ -1929,25 +2023,25 @@ fn offered_upper_is_selected_as_one_remote_cover_member() {
     }
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(&targets[0]),
             data(&targets[1]),
             data(&upper),
         )))
         .unwrap();
 
-    let offered = BTreeSet::from([data(&targets[0]), data(&targets[1]), data(&upper)]);
+    let offered = target_handles([data(&targets[0]), data(&targets[1]), data(&upper)]);
     match kernel()
-        .probe_exact(&mut store, &source_cover, &TestAlgebra, &offered)
+        .probe_exact(&mut store, &source_cover, &offered)
         .unwrap()
     {
-        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![data(&upper)]),
+        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![upper.get_handle()]),
         ExactAttachPlan::Ready(_) => panic!("nonresident offered upper was already ready"),
     }
 
     store.put::<UnknownBlob, _>(upper.clone()).unwrap();
     match kernel()
-        .probe_exact(&mut store, &source_cover, &TestAlgebra, &offered)
+        .probe_exact(&mut store, &source_cover, &offered)
         .unwrap()
     {
         ExactAttachPlan::Ready(cover) => {
@@ -1961,7 +2055,7 @@ fn offered_upper_is_selected_as_one_remote_cover_member() {
 fn unavailable_offered_upper_replans_to_offered_lower_cover() {
     let sources = [archive([(1, 3)]), archive([(2, 4)])];
     let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
     let mut store = MemoryRepo::default();
     let commits: Vec<_> = sources
         .iter()
@@ -1972,7 +2066,7 @@ fn unavailable_offered_upper_replans_to_offered_lower_cover() {
     for (source, target) in sources.iter().zip(&targets) {
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection(),
+                kernel().target_collection().handle(),
                 data(source),
                 data(target),
             )))
@@ -1980,36 +2074,40 @@ fn unavailable_offered_upper_replans_to_offered_lower_cover() {
     }
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(&targets[0]),
             data(&targets[1]),
             data(&upper),
         )))
         .unwrap();
 
-    let mut offered = BTreeSet::from([data(&targets[0]), data(&targets[1]), data(&upper)]);
+    let mut offered = target_handles([data(&targets[0]), data(&targets[1]), data(&upper)]);
     match kernel()
-        .probe_exact(&mut store, &source_cover, &TestAlgebra, &offered)
+        .probe_exact(&mut store, &source_cover, &offered)
         .unwrap()
     {
-        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![data(&upper)]),
+        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![upper.get_handle()]),
         ExactAttachPlan::Ready(_) => panic!("nonresident offered upper was already ready"),
     }
 
-    offered.remove(&data(&upper));
-    let expected: Vec<_> = offered.iter().copied().collect();
+    offered.remove(&upper.get_handle());
+    let expected: Vec<_> = offered
+        .iter()
+        .copied()
+        .map(Handle::<UnknownBlob>::to_hash)
+        .collect();
     match kernel()
-        .probe_exact(&mut store, &source_cover, &TestAlgebra, &offered)
+        .probe_exact(&mut store, &source_cover, &offered)
         .unwrap()
     {
-        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, expected),
+        ExactAttachPlan::Fetch(fetch) => assert_eq!(target_ids(fetch), expected),
         ExactAttachPlan::Ready(_) => panic!("nonresident offered lowers were already ready"),
     }
     for target in targets {
         store.put::<UnknownBlob, _>(target).unwrap();
     }
     match kernel()
-        .probe_exact(&mut store, &source_cover, &TestAlgebra, &offered)
+        .probe_exact(&mut store, &source_cover, &offered)
         .unwrap()
     {
         ExactAttachPlan::Ready(cover) => assert_eq!(cover_ids(&cover), expected),
@@ -2021,7 +2119,7 @@ fn unavailable_offered_upper_replans_to_offered_lower_cover() {
 fn offered_upper_does_not_displace_a_complete_resident_lower_cover() {
     let sources = [archive([(1, 3)]), archive([(2, 4)])];
     let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
     let mut store = MemoryRepo::default();
     let commits: Vec<_> = sources
         .iter()
@@ -2033,7 +2131,7 @@ fn offered_upper_does_not_displace_a_complete_resident_lower_cover() {
         store.put::<UnknownBlob, _>(target.clone()).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection(),
+                kernel().target_collection().handle(),
                 data(source),
                 data(target),
             )))
@@ -2041,7 +2139,7 @@ fn offered_upper_does_not_displace_a_complete_resident_lower_cover() {
     }
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(&targets[0]),
             data(&targets[1]),
             data(&upper),
@@ -2052,8 +2150,7 @@ fn offered_upper_does_not_displace_a_complete_resident_lower_cover() {
         .probe_exact(
             &mut store,
             &source_cover,
-            &TestAlgebra,
-            &BTreeSet::from([data(&upper)]),
+            &BTreeSet::from([upper.get_handle()]),
         )
         .unwrap()
     {
@@ -2081,7 +2178,7 @@ fn unrelated_and_rejected_offers_never_become_fetch_work() {
     let lying_output = data(&derive(&archive([(9, 9)])).unwrap());
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(&source),
             lying_output,
         )))
@@ -2091,8 +2188,7 @@ fn unrelated_and_rejected_offers_never_become_fetch_work() {
     match kernel().probe_exact(
         &mut store,
         &source_cover,
-        &TestAlgebra,
-        &BTreeSet::from([lying_output, unrelated]),
+        &target_handles([lying_output, unrelated]),
     ) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected rejected-offer error: {error:?}"),
@@ -2107,7 +2203,7 @@ fn unrelated_and_rejected_offers_never_become_fetch_work() {
 fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
     let sources = [archive([(1, 3)]), archive([(2, 4)])];
     let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = TestAlgebra.join_target(&targets[0], &targets[1]).unwrap();
+    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
     let mut store = MemoryRepo::default();
     let commits: Vec<_> = sources
         .iter()
@@ -2119,7 +2215,7 @@ fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
         store.put::<UnknownBlob, _>(target.clone()).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection(),
+                kernel().target_collection().handle(),
                 data(source),
                 data(target),
             )))
@@ -2127,7 +2223,7 @@ fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
     }
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(&targets[0]),
             data(&targets[1]),
             data(&upper),
@@ -2141,9 +2237,9 @@ fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
         ))
         .unwrap();
 
-    let offered = BTreeSet::from([data(&upper)]);
+    let offered = BTreeSet::from([upper.get_handle()]);
     match kernel()
-        .probe_exact(&mut store, &source_cover, &TestAlgebra, &offered)
+        .probe_exact(&mut store, &source_cover, &offered)
         .unwrap()
     {
         ExactAttachPlan::Ready(cover) => {
@@ -2173,7 +2269,7 @@ fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
     store.put::<UnknownBlob, _>(forged).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_collection(),
+            kernel().target_collection().handle(),
             data(&source),
             data(&expected),
         )))
@@ -2184,7 +2280,7 @@ fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
     // forged resident artifact, removes it from the optional candidate set,
     // and reports the target incomplete rather than granting cache corruption
     // authority or failing unrelated evidence globally.
-    match kernel().attach_exact(&mut store, &source_cover, &TestAlgebra) {
+    match kernel().attach_exact(&mut store, &source_cover) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected corrupt-cache error: {error:?}"),
         Ok(_) => panic!("corrupt unsigned output was incorrectly admitted"),
@@ -2203,16 +2299,14 @@ fn ungrounded_source_superset_cannot_escape_the_cover() {
     store.put::<SimpleArchive, _>(ac.clone()).unwrap();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_collection(),
+            kernel().source_collection().handle(),
             data(&a),
             data(&c),
             data(&ac),
         )))
         .unwrap();
 
-    let cover = kernel()
-        .ensure_exact(&mut store, &source_cover, &TestAlgebra)
-        .unwrap();
+    let cover = kernel().ensure_exact(&mut store, &source_cover).unwrap();
     assert_eq!(cover.members()[0].1.bytes, derive(&a).unwrap().bytes);
     let derives: Vec<_> = store
         .records()
@@ -2227,8 +2321,7 @@ fn ungrounded_source_superset_cannot_escape_the_cover() {
 }
 
 #[test]
-fn algebra_rejects_a_lying_source_descriptor() {
-    let source = archive([(1, 3)]);
+fn typed_lifecycle_rejects_a_lying_source_descriptor() {
     let lying_source = descriptor::naming(
         "source",
         test_team(),
@@ -2236,35 +2329,26 @@ fn algebra_rejects_a_lying_source_descriptor() {
         id(99),
         reach::private(),
     );
-    let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
-        lying_source.clone(),
+    let result = ExactDerivedCollection::<TestSourceUnion, TestTargetUnion, TestAlgebra>::new(
+        lying_source,
         kernel().target_descriptor().clone(),
     );
-    let mut store = MemoryRepo::default();
-    store.put::<SimpleArchive, _>(source.clone()).unwrap();
-    let metadata = store
-        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-        .unwrap();
-    let commit = CollectionCommit::sign(
-        &SigningKey::from_bytes(&[7; 32]),
-        identity_for_tests(&lying_source),
-        data(&source),
-        metadata,
-    );
-    store.insert(CollectionRecord::Commit(commit)).unwrap();
-    let source_cover = Cover::from_members(lifecycle.source_collection(), [commit.data()]);
-
     assert!(matches!(
-        lifecycle.attach_exact(&mut store, &source_cover, &TestAlgebra),
-        Err(ExactDerivedCollectionError::RejectedMember { member: found, .. })
-            if found == commit.data()
+        result,
+        Err(ExactDerivedCollectionError::Resolution(_))
     ));
 }
 
 #[test]
-#[should_panic(expected = "distinct source and target descriptors")]
 fn identity_descriptor_pair_is_rejected() {
     let descriptor = source_root();
-    let _ =
-        ExactDerivedCollection::<SimpleArchive, SimpleArchive>::new(descriptor.clone(), descriptor);
+    let result = ExactDerivedCollection::<TestSourceUnion, TestSourceUnion, IdentityAlgebra>::new(
+        descriptor.clone(),
+        descriptor,
+    );
+    assert!(matches!(
+        result,
+        Err(ExactDerivedCollectionError::Resolution(reason))
+            if reason.contains("distinct source and target descriptors")
+    ));
 }

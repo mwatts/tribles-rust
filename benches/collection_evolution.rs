@@ -13,12 +13,13 @@
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
-//! state; a bench-local algebra wrapper performs one untimed, zero-write raw
-//! fresh attachment for stateless arms to expose replay work that store totals hide.
-//! The maintained view reports the raw algebra calls made during its timed
-//! observation, so continuation reuse is measured rather than inferred from
-//! durable writes. It is intentionally not replayed after timing: that would
-//! measure the stateless operation it exists to avoid, not its actual work.
+//! state; a bench-local homomorphism wrapper performs one untimed, zero-write
+//! raw fresh attachment for stateless arms to expose replay work that store
+//! totals hide. The maintained view reports the canonical projection calls
+//! made during its timed observation, so continuation reuse is measured rather
+//! than inferred from durable writes. It is intentionally not replayed after
+//! timing: that would measure the stateless operation it exists to avoid, not
+//! its actual work.
 //! No scan or diagnostic touches a measured store before its first timed call
 //! at a checkpoint, and the immediate no-op remains adjacent to that call.
 //!
@@ -48,109 +49,64 @@ use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::Blob;
-use triblespace_core::collection::exact_derived::{
-    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
-};
+use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::reach;
 use triblespace_core::collection::succinctarchive_union::{
-    SuccinctArchiveCollection, SuccinctArchiveView, SuccinctArchiveViewWork,
+    SimpleArchiveToSuccinctArchive, SuccinctArchiveCollection, SuccinctArchiveUnion,
+    SuccinctArchiveView, SuccinctArchiveViewWork,
 };
 use triblespace_core::collection::{
-    simplearchive_union, CollectionHandle, CollectionRecord, CollectionStore, CollectionStoreExt,
-    Cover,
+    simplearchive_union, Collection, CollectionHandle, CollectionHomomorphism,
+    CollectionLatticeError, CollectionRecord, CollectionStore, CollectionStoreExt, CoverAttachment,
+    FactCover,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreList, StoreRevision};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct AlgebraCalls {
-    validate_source: u64,
-    validate_target: u64,
-    join_source: u64,
+struct HomomorphismCalls {
     derive: u64,
-    join_target: u64,
     input_bytes: u64,
 }
 
-struct CountingAlgebra<'a> {
-    inner: &'a SuccinctArchiveCollection,
-    calls: Cell<AlgebraCalls>,
+thread_local! {
+    static HOMOMORPHISM_CALLS: Cell<HomomorphismCalls> =
+        const { Cell::new(HomomorphismCalls { derive: 0, input_bytes: 0 }) };
 }
 
-impl<'a> CountingAlgebra<'a> {
-    fn new(inner: &'a SuccinctArchiveCollection) -> Self {
-        Self {
-            inner,
-            calls: Cell::new(AlgebraCalls::default()),
-        }
-    }
-
-    fn bump(&self, update: impl FnOnce(&mut AlgebraCalls)) {
-        let mut calls = self.calls.get();
-        update(&mut calls);
-        self.calls.set(calls);
-    }
+fn reset_homomorphism_calls() {
+    HOMOMORPHISM_CALLS.set(HomomorphismCalls::default());
 }
 
-impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for CountingAlgebra<'_> {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        self.bump(|calls| {
-            calls.validate_source += 1;
-            calls.input_bytes += source.bytes.len() as u64;
-        });
-        self.inner.validate_source(descriptor, source)
+fn homomorphism_calls() -> HomomorphismCalls {
+    HOMOMORPHISM_CALLS.get()
+}
+
+struct CountingSuccinctHomomorphism {
+    inner: SimpleArchiveToSuccinctArchive,
+}
+
+impl CollectionHomomorphism<simplearchive_union::SimpleArchiveUnion, SuccinctArchiveUnion>
+    for CountingSuccinctHomomorphism
+{
+    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self {
+            inner: SimpleArchiveToSuccinctArchive::bind(source, target)?,
+        })
     }
 
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<SuccinctArchiveBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        self.bump(|calls| {
-            calls.validate_target += 1;
-            calls.input_bytes += target.bytes.len() as u64;
-        });
-        self.inner.validate_target(descriptor, target)
-    }
-
-    fn join_source(
-        &self,
-        low: &Blob<SimpleArchive>,
-        high: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
-        self.bump(|calls| {
-            calls.join_source += 1;
-            calls.input_bytes += (low.bytes.len() + high.bytes.len()) as u64;
-        });
-        self.inner.join_source(low, high)
-    }
-
-    fn derive(
+    fn map(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
-        self.bump(|calls| {
+    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionLatticeError> {
+        HOMOMORPHISM_CALLS.with(|slot| {
+            let mut calls = slot.get();
             calls.derive += 1;
             calls.input_bytes += source.bytes.len() as u64;
+            slot.set(calls);
         });
-        self.inner.derive(source)
-    }
-
-    fn join_target(
-        &self,
-        low: &Blob<SuccinctArchiveBlob>,
-        high: &Blob<SuccinctArchiveBlob>,
-    ) -> Result<Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
-        self.bump(|calls| {
-            calls.join_target += 1;
-            calls.input_bytes += (low.bytes.len() + high.bytes.len()) as u64;
-        });
-        self.inner.join_target(low, high)
+        self.inner.map(source)
     }
 }
 
@@ -273,7 +229,7 @@ struct CoverIdentity {
     hash: [u8; 32],
 }
 
-fn cover_identity(cover: &CoverAttachment<SuccinctArchiveBlob>) -> CoverIdentity {
+fn cover_identity(cover: &CoverAttachment<SuccinctArchiveUnion>) -> CoverIdentity {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0u64;
     for (data, blob) in cover.members() {
@@ -298,7 +254,7 @@ impl Operation {
         self,
         succinct: &SuccinctArchiveCollection,
         store: &mut MemoryRepo,
-        cover: &Cover,
+        cover: &FactCover,
     ) -> UnionArchive<OrderedUniverse> {
         match self {
             Self::Ensure => succinct
@@ -354,7 +310,7 @@ struct Sample {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Diagnostic {
     StatelessReplay {
-        calls: AlgebraCalls,
+        calls: HomomorphismCalls,
         cover: CoverIdentity,
     },
     ViewActual(SuccinctArchiveViewWork),
@@ -366,19 +322,23 @@ struct TimedOperation {
 }
 
 struct RunContext<'a> {
-    cover: &'a Cover,
+    cover: &'a FactCover,
     total_rows: u64,
     newly_supported_rows: u64,
     expected: RelationIdentity,
     succinct: &'a SuccinctArchiveCollection,
-    exact: &'a ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob>,
+    exact: &'a ExactDerivedCollection<
+        simplearchive_union::SimpleArchiveUnion,
+        SuccinctArchiveUnion,
+        CountingSuccinctHomomorphism,
+    >,
     collections: &'a Collections,
 }
 
 fn time_operation(
     operation: Operation,
     store: &mut MemoryRepo,
-    cover: &Cover,
+    cover: &FactCover,
     succinct: &SuccinctArchiveCollection,
 ) -> TimedOperation {
     let start = Instant::now();
@@ -390,42 +350,45 @@ fn time_operation(
 
 fn diagnose_raw(
     store: &mut MemoryRepo,
-    cover: &Cover,
-    succinct: &SuccinctArchiveCollection,
-    exact: &ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob>,
-) -> (AlgebraCalls, CoverIdentity) {
+    cover: &FactCover,
+    exact: &ExactDerivedCollection<
+        simplearchive_union::SimpleArchiveUnion,
+        SuccinctArchiveUnion,
+        CountingSuccinctHomomorphism,
+    >,
+) -> (HomomorphismCalls, CoverIdentity) {
     // This is outside the timer and must be a zero-write operation: it measures
     // the scratch proof graph needed to revalidate the exact raw cover now held
     // by this arm. The public Rank9 phase remains represented only by timing
-    // and its durable DERIVE/blob delta because its algebra is intentionally
-    // private to the facade.
+    // and its durable DERIVE/blob delta because fiber construction is
+    // intentionally private to the facade.
     let diagnostic_before = store
         .store_revision()
         .expect("snapshot pre-diagnostic store revision");
     let offers_before = store
         .offers_snapshot()
         .expect("snapshot pre-diagnostic artifact offers");
-    let algebra = CountingAlgebra::new(succinct);
+    reset_homomorphism_calls();
     let raw_cover = exact
-        .ensure_exact(store, cover, &algebra)
+        .ensure_exact(store, cover)
         .expect("diagnose complete raw exact cover");
-    let algebra_calls = algebra.calls.get();
+    let projection_calls = homomorphism_calls();
     let cover = cover_identity(&raw_cover);
     let diagnostic_after = store
         .store_revision()
         .expect("snapshot post-diagnostic store revision");
     assert!(
         diagnostic_after == diagnostic_before,
-        "post-operation raw algebra diagnostic wrote sync-visible storage"
+        "post-operation raw homomorphism diagnostic wrote sync-visible storage"
     );
     assert_eq!(
         store
             .offers_snapshot()
             .expect("snapshot post-diagnostic artifact offers"),
         offers_before,
-        "post-operation raw algebra diagnostic published an artifact offer"
+        "post-operation raw homomorphism diagnostic published an artifact offer"
     );
-    (algebra_calls, cover)
+    (projection_calls, cover)
 }
 
 fn finish_sample(
@@ -489,7 +452,7 @@ fn run_warm_pair(
 
     let after = store_shape(store, context.collections);
     let warm_work = after.difference(before);
-    let diagnostic = diagnose_raw(store, context.cover, context.succinct, context.exact);
+    let diagnostic = diagnose_raw(store, context.cover, context.exact);
     let warm = finish_sample(
         warm_arm,
         context,
@@ -527,7 +490,7 @@ fn run_cold(
 ) -> Sample {
     let timed = time_operation(operation, store, context.cover, context.succinct);
     let after = store_shape(store, context.collections);
-    let diagnostic = diagnose_raw(store, context.cover, context.succinct, context.exact);
+    let diagnostic = diagnose_raw(store, context.cover, context.exact);
     let cold = finish_sample(
         arm,
         context,
@@ -571,7 +534,7 @@ fn run_operation_family(
 fn time_exact_view(
     view: &mut SuccinctArchiveView,
     store: &mut MemoryRepo,
-    cover: &Cover,
+    cover: &FactCover,
 ) -> TimedOperation {
     let start = Instant::now();
     let union = view
@@ -696,7 +659,7 @@ fn benchmark_authority() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[0x71; 32]).verifying_key()
 }
 
-fn new_source_store(source: CollectionHandle) -> MemoryRepo {
+fn new_source_store(source: Collection<simplearchive_union::SimpleArchiveUnion>) -> MemoryRepo {
     let mut store = MemoryRepo::default();
     let registered = store
         .collection(simplearchive_union::descriptor(
@@ -711,7 +674,7 @@ fn new_source_store(source: CollectionHandle) -> MemoryRepo {
 
 fn publish_same_chunk(
     chunk: &TribleSet,
-    source: CollectionHandle,
+    source: Collection<simplearchive_union::SimpleArchiveUnion>,
     signing_key: &SigningKey,
     stores: &mut [&mut MemoryRepo],
 ) {
@@ -739,22 +702,25 @@ fn run_iteration(
     succinct: &SuccinctArchiveCollection,
 ) -> Vec<Sample> {
     let mut exact_view = succinct.exact_view();
-    let exact = ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob>::new(
-        succinct.source_descriptor(),
-        succinct.descriptor(),
-    );
+    let exact = ExactDerivedCollection::<
+        simplearchive_union::SimpleArchiveUnion,
+        SuccinctArchiveUnion,
+        CountingSuccinctHomomorphism,
+    >::new(succinct.source_descriptor(), succinct.descriptor())
+    .expect("bind measured raw Succinct projection");
+    let source = exact.source_collection();
     let collections = Collections {
-        source: succinct.source_collection(),
+        source: source.handle(),
         raw: succinct.collection(),
         rank9: succinct.rank9_collection(),
     };
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
-    let mut source_accounting = new_source_store(collections.source);
-    let mut cold_ensure_source = new_source_store(collections.source);
-    let mut cold_compact_source = new_source_store(collections.source);
-    let mut warm_ensure = new_source_store(collections.source);
-    let mut exact_view_source = new_source_store(collections.source);
-    let mut warm_compact = new_source_store(collections.source);
+    let mut source_accounting = new_source_store(source);
+    let mut cold_ensure_source = new_source_store(source);
+    let mut cold_compact_source = new_source_store(source);
+    let mut warm_ensure = new_source_store(source);
+    let mut exact_view_source = new_source_store(source);
+    let mut warm_compact = new_source_store(source);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;
@@ -768,7 +734,7 @@ fn run_iteration(
             expected.union(chunk.clone());
             publish_same_chunk(
                 chunk,
-                collections.source,
+                source,
                 &signing_key,
                 &mut [
                     &mut source_accounting,
@@ -783,7 +749,7 @@ fn run_iteration(
         published = checkpoint;
 
         let cover = source_accounting
-            .cover(collections.source, &[])
+            .cover(source, &[])
             .expect("freeze accounting source cover");
         assert_eq!(cover.len(), checkpoint);
         let source_shape = store_shape(&mut source_accounting, &collections);
@@ -1037,7 +1003,7 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 derives; algebra=vs/vt/d/js/jt calls and cumulative argument MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +R=Rank9 derives; maps=canonical source-to-target homomorphism calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
     );
     println!(
         "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
@@ -1050,7 +1016,7 @@ fn main() {
         "+M",
         "+R",
         "support",
-        "algebra vs/vt/d/js/jt",
+        "projection maps",
         "arg-MiB",
     );
     for &checkpoint in &checkpoints {
@@ -1061,26 +1027,12 @@ fn main() {
                 match aggregate.diagnostic.expect("diagnostic observation") {
                     Diagnostic::StatelessReplay { calls, .. } => (
                         "replay/full".to_owned(),
-                        format!(
-                            "{}/{}/{}/{}/{}",
-                            calls.validate_source,
-                            calls.validate_target,
-                            calls.derive,
-                            calls.join_source,
-                            calls.join_target,
-                        ),
+                        calls.derive.to_string(),
                         format!("{:.2}", calls.input_bytes as f64 / (1024.0 * 1024.0)),
                     ),
                     Diagnostic::ViewActual(work) => (
                         format!("{}/{}", work.processed_members, work.reused_members),
-                        format!(
-                            "{}/{}/{}/{}/{}",
-                            work.validate_source,
-                            work.validate_target,
-                            work.derive,
-                            work.join_source,
-                            work.join_target,
-                        ),
+                        work.derive.to_string(),
                         format!("{:.2}", work.input_bytes as f64 / (1024.0 * 1024.0)),
                     ),
                 };

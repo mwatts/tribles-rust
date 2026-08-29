@@ -14,11 +14,11 @@ use ed25519_dalek::VerifyingKey;
 
 use std::convert::Infallible;
 
-use crate::collection::api::{snapshot_from_observation, CollectionSnapshot, Cover};
-use crate::collection::discovery::discover_collection_equations_for_cover;
-use crate::collection::{
-    CollectionHandle, CollectionMaterializationError, CollectionStore, DiscoveredCollectionRecords,
+use crate::collection::api::{
+    snapshot_from_observation, FactCover, FactMaterializationError, FactSnapshot,
 };
+use crate::collection::discovery::discover_collection_equations_for_cover;
+use crate::collection::{Collection, CollectionStore, DiscoveredCollectionRecords};
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, TribleSet};
 
@@ -73,9 +73,9 @@ impl SimpleArchiveCollection {
     /// This is the read side: the facade is not storing anything, it is
     /// naming the collection a cover must match. A write path takes its
     /// handle from what `put` returns instead.
-    pub fn collection(&self) -> CollectionHandle {
-        use crate::blob::encodings::simplearchive::SimpleArchive;
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts()).get_handle()
+    pub fn collection(&self) -> Collection<super::SimpleArchiveUnion> {
+        Collection::from_descriptor(&self.descriptor())
+            .expect("SimpleArchiveCollection constructs its own typed descriptor")
     }
 
     /// Attach the exact opaque cover as a materialized fact set without writing.
@@ -89,13 +89,12 @@ impl SimpleArchiveCollection {
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        cover: &Cover,
+        cover: &FactCover,
     ) -> Result<
         TribleSet,
-        CollectionMaterializationError<
+        FactMaterializationError<
             S::RecordsError,
             S::ReaderError,
-            <S::Reader as BlobStoreMeta>::MetaError,
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     >
@@ -104,10 +103,10 @@ impl SimpleArchiveCollection {
         S::Reader: BlobStoreMeta,
     {
         if cover.collection() != self.collection() {
-            return Err(CollectionMaterializationError::ExactCover(
+            return Err(FactMaterializationError::ExactCover(
                 crate::collection::ExactCoverError::WrongCollection {
-                    expected: self.collection(),
-                    actual: cover.collection(),
+                    expected: self.collection().handle(),
+                    actual: cover.collection().handle(),
                 },
             ));
         }
@@ -115,7 +114,7 @@ impl SimpleArchiveCollection {
             return Ok(TribleSet::new());
         }
         self.snapshot_canonical(store, cover.clone())
-            .map(CollectionSnapshot::into_facts)
+            .map(FactSnapshot::into_facts)
     }
 
     /// Capture one coherent exact-cover fact, cover, and reader snapshot.
@@ -129,13 +128,12 @@ impl SimpleArchiveCollection {
     pub fn snapshot_exact<S>(
         &self,
         store: &mut S,
-        cover: &Cover,
+        cover: &FactCover,
     ) -> Result<
-        CollectionSnapshot<S::Reader>,
-        CollectionMaterializationError<
+        FactSnapshot<S::Reader>,
+        FactMaterializationError<
             S::RecordsError,
             S::ReaderError,
-            <S::Reader as BlobStoreMeta>::MetaError,
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     >
@@ -144,10 +142,10 @@ impl SimpleArchiveCollection {
         S::Reader: BlobStoreMeta,
     {
         if cover.collection() != self.collection() {
-            return Err(CollectionMaterializationError::ExactCover(
+            return Err(FactMaterializationError::ExactCover(
                 crate::collection::ExactCoverError::WrongCollection {
-                    expected: self.collection(),
-                    actual: cover.collection(),
+                    expected: self.collection().handle(),
+                    actual: cover.collection().handle(),
                 },
             ));
         }
@@ -157,13 +155,12 @@ impl SimpleArchiveCollection {
     fn snapshot_canonical<S>(
         &self,
         store: &mut S,
-        cover: Cover,
+        cover: FactCover,
     ) -> Result<
-        CollectionSnapshot<S::Reader>,
-        CollectionMaterializationError<
+        FactSnapshot<S::Reader>,
+        FactMaterializationError<
             S::RecordsError,
             S::ReaderError,
-            <S::Reader as BlobStoreMeta>::MetaError,
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     >
@@ -182,7 +179,7 @@ impl SimpleArchiveCollection {
         }
 
         let discovered = discover_collection_equations_for_cover(store, &cover)
-            .map_err(CollectionMaterializationError::Discovery)?;
+            .map_err(FactMaterializationError::Discovery)?;
         snapshot_from_observation(store, &descriptor, discovered, cover)
     }
 }
@@ -250,8 +247,8 @@ mod tests {
     fn cover(
         facade: &SimpleArchiveCollection,
         commits: impl IntoIterator<Item = CollectionCommit>,
-    ) -> Cover {
-        Cover::from_members(
+    ) -> FactCover {
+        FactCover::from_data(
             facade.collection(),
             commits.into_iter().map(|commit| commit.data()),
         )
@@ -490,13 +487,13 @@ mod tests {
 
         assert!(matches!(
             facade.attach_exact(&mut store, &requested),
-            Err(CollectionMaterializationError::ExactCover(
+            Err(FactMaterializationError::ExactCover(
                 ExactCoverError::WrongCollection {
                     expected,
                     actual,
                 }
-            )) if expected == facade.collection()
-                && actual == other.collection()
+            )) if expected == facade.collection().handle()
+                && actual == other.collection().handle()
         ));
         assert_eq!(store.selections, 0);
         assert_eq!(store.readers, 0);
@@ -518,7 +515,7 @@ mod tests {
             .keep([data_handle.transmute::<Handle<UnknownBlob>>()]);
         assert!(matches!(
             facade.attach_exact(&mut missing_descriptor, &requested),
-            Err(CollectionMaterializationError::DescriptorGet { collection, .. })
+            Err(FactMaterializationError::DescriptorGet { collection, .. })
                 if collection == descriptor_handle
         ));
 
@@ -534,7 +531,7 @@ mod tests {
             .insert(Blob::with_handle(wrong_descriptor.bytes, descriptor_handle));
         assert!(matches!(
             facade.attach_exact(&mut corrupt_descriptor, &requested),
-            Err(CollectionMaterializationError::DescriptorIdentity { expected, .. })
+            Err(FactMaterializationError::DescriptorIdentity { expected, .. })
                 if expected == descriptor_handle
         ));
 
@@ -544,7 +541,7 @@ mod tests {
             .keep([descriptor_handle.transmute::<Handle<UnknownBlob>>()]);
         assert!(matches!(
             facade.attach_exact(&mut missing_data, &requested),
-            Err(CollectionMaterializationError::MemberGet { member, .. })
+            Err(FactMaterializationError::MemberGet { member, .. })
                 if member == commit.data()
         ));
 
@@ -554,7 +551,7 @@ mod tests {
             .insert(Blob::with_handle(Bytes::from(vec![0; 63]), data_handle));
         assert!(matches!(
             facade.attach_exact(&mut corrupt_data, &requested),
-            Err(CollectionMaterializationError::InvalidMember { member, .. })
+            Err(FactMaterializationError::InvalidMember { member, .. })
                 if member == commit.data()
         ));
     }
@@ -593,7 +590,7 @@ mod tests {
     fn empty_attach_is_store_free_while_empty_snapshot_returns_one_reader() {
         let facade = test_facade("first");
         let mut store = ReadOnlyCountingStore::default();
-        let empty = Cover::from_members(facade.collection(), std::iter::empty());
+        let empty = FactCover::from_data(facade.collection(), std::iter::empty());
 
         assert_eq!(
             facade.attach_exact(&mut store, &empty).unwrap(),

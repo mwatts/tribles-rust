@@ -22,7 +22,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
-use crate::blob::Blob;
+use crate::blob::{Blob, IntoBlob};
 use crate::capability::{
     CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProofBundle, CapabilityProofError,
     CapabilityRequest, CapabilityResource,
@@ -31,6 +31,7 @@ use crate::clock;
 use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
+use crate::metadata::Describe;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::{
     ArtifactHandle, ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut,
@@ -43,15 +44,15 @@ use crate::trible::{Fragment, TribleSet};
 use super::discovery::{
     discover_collection_claims_for_cover, discover_collection_equations_for_cover, ExactCoverError,
 };
-use super::simplearchive_union::{
-    self, MaterializationError, PublicationError, SimpleArchiveUnionValidationError,
-};
+use super::simplearchive_union::FactViewError;
+use super::simplearchive_union::SimpleArchiveUnion;
 use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
-    resolve_collection_semantics_from_roots, CollectionClaimValidation, CollectionCommit,
-    CollectionData, CollectionDiscoveryError, CollectionFunctionalConflict, CollectionHandle,
-    CollectionResolutionError, CollectionStore, CollectionValidationRequest,
-    DiscoveredCollectionRecords, RecordDecodeError, ACTION_WRITE,
+    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
+    CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionFunctionalConflict,
+    CollectionHandle, CollectionLattice, CollectionLatticeError, CollectionResolutionError,
+    CollectionStore, CollectionTypeError, CollectionValidationRequest, CoverAttachment,
+    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, ACTION_WRITE,
 };
 
 /// One owned proof together with the exact leaf subject it is expected to
@@ -212,6 +213,9 @@ where
 /// Failure to register and advertise a self-contained collection descriptor.
 #[derive(Debug)]
 pub enum CollectionRegistrationError<PutError, OfferError> {
+    /// The descriptor names a representation or recipe other than the
+    /// requested typed collection lattice.
+    WrongType(CollectionTypeError),
     /// Descriptor facts did not have the mandatory generic shape.
     InvalidDescriptor(RecordDecodeError),
     /// A mandatory descriptor attachment was absent or did not match the
@@ -240,6 +244,7 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongType(source) => write!(formatter, "wrong collection type: {source}"),
             Self::InvalidDescriptor(source) => {
                 write!(formatter, "invalid collection descriptor: {source}")
             }
@@ -270,6 +275,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::WrongType(source) => Some(source),
             Self::InvalidDescriptor(source) => Some(source),
             Self::InvalidAttachment { .. } => None,
             Self::DependencyPut(source) => Some(source),
@@ -285,15 +291,24 @@ where
 /// value. The private constructor makes a `Cover` an opaque result of
 /// admission or validated collection algebra rather than a caller-forged set
 /// of hashes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Cover {
-    collection: CollectionHandle,
+pub struct Cover<L: CollectionLattice> {
+    collection: Collection<L>,
     members: PATCH<32, IdentitySchema, (), Blake3Merkle>,
 }
 
-impl Cover {
+impl<L: CollectionLattice> Cover<L> {
     pub(crate) fn from_members(
-        collection: CollectionHandle,
+        collection: Collection<L>,
+        members: impl IntoIterator<Item = Inline<Handle<L::Encoding>>>,
+    ) -> Self {
+        Self {
+            collection,
+            members: PATCH::from_keys(members.into_iter().map(|member| member.raw)),
+        }
+    }
+
+    pub(crate) fn from_data(
+        collection: Collection<L>,
         members: impl IntoIterator<Item = CollectionData>,
     ) -> Self {
         Self {
@@ -303,7 +318,7 @@ impl Cover {
     }
 
     pub(crate) fn from_patch(
-        collection: CollectionHandle,
+        collection: Collection<L>,
         members: PATCH<32, IdentitySchema, (), Blake3Merkle>,
     ) -> Self {
         Self {
@@ -313,19 +328,29 @@ impl Cover {
     }
 
     /// Exact descriptor whose lattice contains these members.
-    pub const fn collection(&self) -> CollectionHandle {
+    pub const fn collection(&self) -> Collection<L> {
         self.collection
     }
 
     /// Canonical member identities in ascending byte order.
-    pub fn members(&self) -> impl ExactSizeIterator<Item = CollectionData> + '_ {
+    pub fn members(&self) -> impl ExactSizeIterator<Item = Inline<Handle<L::Encoding>>> + '_ {
         self.members
             .iter_ordered()
             .map(|member| Inline::new(*member))
     }
 
     /// Whether this cover contains one exact member identity.
-    pub fn contains(&self, member: CollectionData) -> bool {
+    pub fn contains(&self, member: Inline<Handle<L::Encoding>>) -> bool {
+        self.members.get(&member.raw).is_some()
+    }
+
+    pub(crate) fn data_members(&self) -> impl ExactSizeIterator<Item = CollectionData> + '_ {
+        self.members
+            .iter_ordered()
+            .map(|member| Inline::new(*member))
+    }
+
+    pub(crate) fn contains_data(&self, member: CollectionData) -> bool {
         self.members.get(&member.raw).is_some()
     }
 
@@ -348,8 +373,8 @@ impl Cover {
     pub fn additions_since(&self, previous: &Self) -> Result<Self, CoverAdvanceError> {
         if self.collection != previous.collection {
             return Err(CoverAdvanceError::DifferentCollection {
-                previous: previous.collection,
-                current: self.collection,
+                previous: previous.collection.handle(),
+                current: self.collection.handle(),
             });
         }
         let missing = previous.members.difference(&self.members);
@@ -364,6 +389,36 @@ impl Cover {
         ))
     }
 }
+
+impl<L: CollectionLattice> Clone for Cover<L> {
+    fn clone(&self) -> Self {
+        Self {
+            collection: self.collection,
+            members: self.members.clone(),
+        }
+    }
+}
+
+impl<L: CollectionLattice> fmt::Debug for Cover<L> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Cover")
+            .field("collection", &self.collection)
+            .field("members", &self.data_members().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl<L: CollectionLattice> PartialEq for Cover<L> {
+    fn eq(&self, other: &Self) -> bool {
+        self.collection == other.collection && self.members == other.members
+    }
+}
+
+impl<L: CollectionLattice> Eq for Cover<L> {}
+
+/// Typed exact cover of the canonical fact collection.
+pub type FactCover = Cover<SimpleArchiveUnion>;
 
 /// Failure to treat two covers as one additions-only continuation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -404,50 +459,67 @@ impl Error for CoverAdvanceError {}
 
 /// One coherent known-prefix view of a scoped collection.
 ///
-/// [`cover`](Self::cover) is the exact payload set materialized as
-/// [`facts`](Self::facts).
+/// [`cover`](Self::cover) is the exact payload set reconstructed as
+/// [`value`](Self::value).
 /// [`reader`](Self::reader) is the blob-reader snapshot used to validate and
 /// materialize those facts. The reader may contain physically available blobs
 /// published after record discovery, but those blobs acquire no semantic role
 /// unless their payloads are present in this snapshot's cover.
-pub struct CollectionSnapshot<R> {
-    facts: TribleSet,
-    cover: Cover,
+pub struct Snapshot<L: CollectionLattice, V, R> {
+    value: V,
+    cover: Cover<L>,
     reader: R,
 }
 
-impl<R> CollectionSnapshot<R> {
-    /// Materialized union named by this snapshot's exact payload cover.
-    pub fn facts(&self) -> &TribleSet {
-        &self.facts
+impl<L: CollectionLattice, V, R> Snapshot<L, V, R> {
+    /// Materialized logical value named by this snapshot's exact cover.
+    pub fn value(&self) -> &V {
+        &self.value
     }
 
-    /// Exact collection cover from which the facts were materialized.
-    pub fn cover(&self) -> &Cover {
+    /// Exact collection cover from which the value was materialized.
+    pub fn cover(&self) -> &Cover<L> {
         &self.cover
     }
 
-    /// Blob-reader snapshot used to validate and materialize the facts.
+    /// Blob-reader snapshot used to validate and reconstruct the logical value.
     pub fn reader(&self) -> &R {
         &self.reader
     }
 
-    /// Consume the snapshot and return its materialized facts.
-    pub fn into_facts(self) -> TribleSet {
-        self.facts
+    /// Consume the snapshot and return its materialized value.
+    pub fn into_value(self) -> V {
+        self.value
     }
 
-    /// Consume the snapshot into materialized facts, exact cover, and reader.
-    pub fn into_parts(self) -> (TribleSet, Cover, R) {
-        (self.facts, self.cover, self.reader)
+    /// Consume the snapshot into materialized value, exact cover, and reader.
+    pub fn into_parts(self) -> (V, Cover<L>, R) {
+        (self.value, self.cover, self.reader)
     }
 }
+
+impl<R> Snapshot<SimpleArchiveUnion, TribleSet, R> {
+    /// Materialized fact union named by this snapshot's exact payload cover.
+    pub fn facts(&self) -> &TribleSet {
+        self.value()
+    }
+
+    /// Consume the snapshot and return its materialized fact union.
+    pub fn into_facts(self) -> TribleSet {
+        self.into_value()
+    }
+}
+
+/// Snapshot of the canonical SimpleArchive fact-union lattice.
+pub type FactSnapshot<R> = Snapshot<SimpleArchiveUnion, TribleSet, R>;
 
 /// Failure to discover one exact admitted payload cover.
 #[derive(Debug)]
 pub enum CollectionCoverError<RecordsError, ReaderError, GetError> {
     /// The collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<ReaderError, GetError>),
+    /// The descriptor names another representation or lattice recipe.
+    WrongType(CollectionTypeError),
     /// One explicitly supplied capability proof was invalid at this operation's
     /// single clock observation.
     Admission(CollectionAdmissionError),
@@ -465,6 +537,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
+            Self::WrongType(source) => write!(formatter, "wrong collection type: {source}"),
             Self::Admission(source) => source.fmt(formatter),
             Self::Discovery(source) => source.fmt(formatter),
         }
@@ -481,6 +554,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Descriptor(source) => Some(source),
+            Self::WrongType(source) => Some(source),
             Self::Admission(source) => Some(source),
             Self::Discovery(source) => Some(source),
         }
@@ -492,8 +566,14 @@ where
 pub enum CollectionCommitError<ReaderError, GetError, PutError, InsertError> {
     /// The named collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<ReaderError, GetError>),
-    /// Canonical fragment publication failed.
-    Publication(PublicationError<PutError, InsertError>),
+    /// The descriptor names another representation or lattice recipe.
+    WrongType(CollectionTypeError),
+    /// The encoded member is not a canonical element of the collection lattice.
+    InvalidMember(CollectionLatticeError),
+    /// A described attachment, member, or metadata archive could not be stored.
+    DependencyPut(PutError),
+    /// The signed visibility record could not be inserted after its dependencies.
+    RecordInsert(InsertError),
 }
 
 impl<ReaderError, GetError, PutError, InsertError> fmt::Display
@@ -507,7 +587,14 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
-            Self::Publication(source) => source.fmt(formatter),
+            Self::WrongType(source) => write!(formatter, "wrong collection type: {source}"),
+            Self::InvalidMember(source) => write!(formatter, "invalid collection member: {source}"),
+            Self::DependencyPut(source) => {
+                write!(formatter, "failed to store collection dependency: {source}")
+            }
+            Self::RecordInsert(source) => {
+                write!(formatter, "failed to insert collection commit: {source}")
+            }
         }
     }
 }
@@ -523,7 +610,10 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Descriptor(source) => Some(source),
-            Self::Publication(source) => Some(source),
+            Self::WrongType(source) => Some(source),
+            Self::InvalidMember(source) => Some(source),
+            Self::DependencyPut(source) => Some(source),
+            Self::RecordInsert(source) => Some(source),
         }
     }
 }
@@ -536,9 +626,11 @@ where
 /// replaceable cache evidence: missing or invalid equations are omitted from
 /// the resolved semantics and cannot hide an explicit cover member.
 #[derive(Debug)]
-pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError> {
+pub enum CollectionMaterializationError<RecordsError, ReaderError, GetError, ViewError> {
     /// One explicitly supplied capability proof was invalid.
     Admission(CollectionAdmissionError),
+    /// The descriptor names another representation or lattice recipe.
+    WrongType(CollectionTypeError),
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
     /// A supplied exact cover names the wrong collection descriptor.
@@ -581,23 +673,31 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Backend fetch failure.
         source: GetError,
     },
-    /// A cover member failed exact `SimpleArchive` collection
-    /// validation.
+    /// A cover member failed exact lattice validation.
     InvalidMember {
         /// Exact payload identity.
         member: CollectionData,
         /// Exact representation or identity diagnostic.
-        source: SimpleArchiveUnionValidationError,
+        source: CollectionLatticeError,
     },
     /// Positively validated equations contradicted operation functionality.
     ResolutionConflict(Box<CollectionFunctionalConflict>),
-    /// The resolved semantic frontier could not be physically materialized.
-    Materialize(MaterializationError<MetaError, GetError>),
+    /// No resident physical cover spans every semantic obligation.
+    Missing {
+        /// Uncovered members of the collection's semantic frontier.
+        obligations: BTreeSet<CollectionData>,
+    },
+    /// The selected exact attachment could not form the requested logical view.
+    View(ViewError),
 }
 
-impl<RecordsError, ReaderError, MetaError, GetError>
+/// Materialization failure for the canonical SimpleArchive fact view.
+pub type FactMaterializationError<RecordsError, ReaderError, GetError> =
+    CollectionMaterializationError<RecordsError, ReaderError, GetError, FactViewError>;
+
+impl<RecordsError, ReaderError, GetError, ViewError>
     From<CollectionCoverError<RecordsError, ReaderError, GetError>>
-    for CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError>
+    for CollectionMaterializationError<RecordsError, ReaderError, GetError, ViewError>
 {
     fn from(source: CollectionCoverError<RecordsError, ReaderError, GetError>) -> Self {
         match source {
@@ -616,15 +716,16 @@ impl<RecordsError, ReaderError, MetaError, GetError>
                 collection,
                 source,
             }) => Self::InvalidDescriptor { collection, source },
+            CollectionCoverError::WrongType(source) => Self::WrongType(source),
             CollectionCoverError::Admission(source) => Self::Admission(source),
             CollectionCoverError::Discovery(source) => Self::Discovery(source),
         }
     }
 }
 
-impl<RecordsError, ReaderError, MetaError, GetError>
+impl<RecordsError, ReaderError, GetError, ViewError>
     From<CollectionDescriptorError<ReaderError, GetError>>
-    for CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError>
+    for CollectionMaterializationError<RecordsError, ReaderError, GetError, ViewError>
 {
     fn from(source: CollectionDescriptorError<ReaderError, GetError>) -> Self {
         match source {
@@ -642,17 +743,18 @@ impl<RecordsError, ReaderError, MetaError, GetError>
     }
 }
 
-impl<RecordsError, ReaderError, MetaError, GetError> fmt::Display
-    for CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError>
+impl<RecordsError, ReaderError, GetError, ViewError> fmt::Display
+    for CollectionMaterializationError<RecordsError, ReaderError, GetError, ViewError>
 where
     RecordsError: fmt::Display,
     ReaderError: fmt::Display,
-    MetaError: fmt::Display,
     GetError: fmt::Display,
+    ViewError: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Admission(source) => source.fmt(f),
+            Self::WrongType(source) => write!(f, "wrong collection type: {source}"),
             Self::Discovery(source) => source.fmt(f),
             Self::ExactCover(source) => write!(f, "invalid exact cover: {source}"),
             Self::DescriptorGet { collection, source } => write!(
@@ -688,22 +790,28 @@ where
                 hex::encode_upper(member.raw),
             ),
             Self::ResolutionConflict(source) => source.fmt(f),
-            Self::Materialize(source) => source.fmt(f),
+            Self::Missing { obligations } => write!(
+                f,
+                "{} semantic frontier obligation(s) have no resident physical cover",
+                obligations.len(),
+            ),
+            Self::View(source) => source.fmt(f),
         }
     }
 }
 
-impl<RecordsError, ReaderError, MetaError, GetError> Error
-    for CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError>
+impl<RecordsError, ReaderError, GetError, ViewError> Error
+    for CollectionMaterializationError<RecordsError, ReaderError, GetError, ViewError>
 where
     RecordsError: Error + 'static,
     ReaderError: Error + 'static,
-    MetaError: Error + 'static,
     GetError: Error + 'static,
+    ViewError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Admission(source) => Some(source),
+            Self::WrongType(source) => Some(source),
             Self::Discovery(source) => Some(source),
             Self::ExactCover(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
@@ -713,7 +821,8 @@ where
             Self::MemberGet { source, .. } => Some(source),
             Self::InvalidMember { source, .. } => Some(source),
             Self::ResolutionConflict(source) => Some(source),
-            Self::Materialize(source) => Some(source),
+            Self::Missing { .. } => None,
+            Self::View(source) => Some(source),
         }
     }
 }
@@ -868,13 +977,13 @@ fn admitted_subjects_at(
     Ok(admitted)
 }
 
-fn discover_admitted_cover_at<S>(
+fn discover_admitted_cover_at<S, L>(
     store: &mut S,
-    collection: CollectionHandle,
+    collection: Collection<L>,
     presentations: &[CapabilityPresentation],
     instant: hifitime::Epoch,
 ) -> Result<
-    (Fragment, DiscoveredCollectionRecords, Cover),
+    (Fragment, DiscoveredCollectionRecords, Cover<L>),
     CollectionCoverError<
         S::RecordsError,
         S::ReaderError,
@@ -883,34 +992,29 @@ fn discover_admitted_cover_at<S>(
 >
 where
     S: BlobStore + CollectionStore,
+    L: CollectionLattice,
 {
-    let loaded =
-        load_collection_descriptor(store, collection).map_err(CollectionCoverError::Descriptor)?;
-    let admitted = admitted_subjects_at(loaded.authority, collection, instant, presentations)
-        .map_err(CollectionCoverError::Admission)?;
-    let discovered = discover_collection_records_authorized(store, collection, |subject| {
-        admitted.contains(subject)
-    })
-    .map_err(CollectionCoverError::Discovery)?;
-    let cover = Cover::from_members(
+    let loaded = load_collection_descriptor(store, collection.handle())
+        .map_err(CollectionCoverError::Descriptor)?;
+    super::lattice::validate_descriptor_type::<L>(&loaded.fragment)
+        .map_err(CollectionCoverError::WrongType)?;
+    let admitted = admitted_subjects_at(
+        loaded.authority,
+        collection.handle(),
+        instant,
+        presentations,
+    )
+    .map_err(CollectionCoverError::Admission)?;
+    let discovered =
+        discover_collection_records_authorized(store, collection.handle(), |subject| {
+            admitted.contains(subject)
+        })
+        .map_err(CollectionCoverError::Discovery)?;
+    let cover = Cover::from_data(
         collection,
         discovered.commits().iter().map(CollectionCommit::data),
     );
     Ok((loaded.fragment, discovered, cover))
-}
-
-fn widen_preparation_error<PutError, InsertError>(
-    error: simplearchive_union::PreparationError,
-) -> PublicationError<PutError, InsertError> {
-    match error {
-        PublicationError::Validation(source) => PublicationError::Validation(source),
-        PublicationError::InvalidMetadata(source) => PublicationError::InvalidMetadata(source),
-        PublicationError::DependencyPut(never) => match never {},
-        PublicationError::RecordInsert(never) => match never {},
-        PublicationError::MergeInputAbsent { role, data } => {
-            PublicationError::MergeInputAbsent { role, data }
-        }
-    }
 }
 
 /// Ergonomic collection operations implemented directly by the backing store.
@@ -921,17 +1025,24 @@ fn widen_preparation_error<PutError, InsertError>(
 pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore + Sized {
     /// Register and advertise one self-contained descriptor, returning the
     /// handle produced by the store for its canonical facts.
-    fn collection(
+    fn collection<L>(
         &mut self,
         descriptor: Fragment,
     ) -> Result<
-        CollectionHandle,
+        Collection<L>,
         CollectionRegistrationError<
             <Self as BlobStorePut>::PutError,
             <Self as ArtifactOfferStore>::OfferError,
         >,
-    > {
-        register_collection(self, descriptor)
+    >
+    where
+        L: CollectionLattice,
+    {
+        let collection = Collection::<L>::from_descriptor(&descriptor)
+            .map_err(CollectionRegistrationError::WrongType)?;
+        let stored = register_collection(self, descriptor)?;
+        debug_assert_eq!(stored, collection.handle());
+        Ok(collection)
     }
 
     /// Publish one signed fragment into an already registered collection.
@@ -941,11 +1052,11 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     /// [`snapshot`](Self::snapshot). The descriptor is fetched and
     /// exact-validated before dependencies are staged, and the signed record is
     /// inserted last without an implicit durability flush.
-    fn commit(
+    fn commit<L, T>(
         &mut self,
-        collection: CollectionHandle,
+        collection: Collection<L>,
         signing_key: &SigningKey,
-        fragment: Fragment,
+        value: T,
     ) -> Result<
         CollectionCommit,
         CollectionCommitError<
@@ -957,18 +1068,57 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
                 <Self as CollectionStore>::InsertError,
             >,
         >,
-    > {
-        let loaded = load_collection_descriptor(self, collection)
+    >
+    where
+        L: CollectionLattice,
+        T: Describe + IntoBlob<L::Encoding>,
+    {
+        let loaded = load_collection_descriptor(self, collection.handle())
             .map_err(CollectionCommitError::Descriptor)?;
-        let prepared = simplearchive_union::prepare_fragment_commit(&loaded.fragment, fragment)
-            .map_err(|source| {
-                CollectionCommitError::Publication(widen_preparation_error(source))
-            })?;
-        prepared
-            .stage_for(self, collection, signing_key)
-            .map_err(CollectionCommitError::Publication)?
-            .finalize()
-            .map_err(CollectionCommitError::Publication)
+        super::lattice::validate_descriptor_type::<L>(&loaded.fragment)
+            .map_err(CollectionCommitError::WrongType)?;
+
+        // Description happens before the value is consumed by its encoding.
+        // A Fragment description deliberately retains its shared blob store,
+        // so data and metadata attachments travel through this one generic
+        // path without a representation-specific side channel.
+        let description = value.describe();
+        let data = value.to_blob();
+        L::validate_member(&loaded.fragment, &data)
+            .map_err(CollectionCommitError::InvalidMember)?;
+
+        let (_, metadata_facts, _, mut described_blobs) = description.into_parts();
+        let metadata: Blob<SimpleArchive> = metadata_facts.to_blob();
+        let mut attachments: Vec<Blob<UnknownBlob>> = described_blobs
+            .reader()
+            .expect("MemoryBlobStore::reader is infallible")
+            .into_iter()
+            .map(|(_, blob)| blob)
+            .collect();
+        attachments.sort_unstable_by_key(|blob| blob.get_handle().raw);
+
+        let mut store = OfferCapture::new(self);
+        for blob in attachments {
+            store
+                .put::<UnknownBlob, _>(blob)
+                .map_err(CollectionCommitError::DependencyPut)?;
+        }
+        let data = store
+            .put::<L::Encoding, _>(data)
+            .map_err(CollectionCommitError::DependencyPut)?;
+        let metadata = store
+            .put::<SimpleArchive, _>(metadata)
+            .map_err(CollectionCommitError::DependencyPut)?;
+        let commit = CollectionCommit::sign(
+            signing_key,
+            collection.handle(),
+            Handle::<L::Encoding>::to_hash(data),
+            metadata,
+        );
+        store
+            .insert(super::CollectionRecord::Commit(commit))
+            .map_err(CollectionCommitError::RecordInsert)?;
+        Ok(commit)
     }
 
     /// Discover one canonical admitted payload cover.
@@ -977,39 +1127,44 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     /// writer must be named by an explicitly supplied proof for exact
     /// [`ACTION_WRITE`] on `collection`; an invalid supplied proof fails the
     /// whole operation rather than silently changing its meaning.
-    fn cover(
+    fn cover<L>(
         &mut self,
-        collection: CollectionHandle,
+        collection: Collection<L>,
         presentations: &[CapabilityPresentation],
     ) -> Result<
-        Cover,
+        Cover<L>,
         CollectionCoverError<
             <Self as CollectionStore>::RecordsError,
             <Self as BlobStore>::ReaderError,
             <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
-    > {
+    >
+    where
+        L: CollectionLattice,
+    {
         let (_, _, cover) =
             discover_admitted_cover_at(self, collection, presentations, clock::epoch_now())?;
         Ok(cover)
     }
 
-    /// Capture one coherent known-prefix fact, cover, and reader snapshot.
-    fn snapshot(
+    /// Capture one coherent known-prefix logical value, cover, and reader snapshot.
+    fn snapshot<V, L>(
         &mut self,
-        collection: CollectionHandle,
+        collection: Collection<L>,
         presentations: &[CapabilityPresentation],
     ) -> Result<
-        CollectionSnapshot<<Self as BlobStore>::Reader>,
+        Snapshot<L, V, <Self as BlobStore>::Reader>,
         CollectionMaterializationError<
             <Self as CollectionStore>::RecordsError,
             <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreMeta>::MetaError,
             <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
+            V::Error,
         >,
     >
     where
         <Self as BlobStore>::Reader: BlobStoreMeta,
+        L: CollectionLattice,
+        V: TryFromCover<L>,
     {
         let (descriptor, discovered, cover) =
             discover_admitted_cover_at(self, collection, presentations, clock::epoch_now())
@@ -1023,23 +1178,25 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     /// provenance discovery. Only the descriptor and payload bytes named by
     /// `cover` are mandatory; resident commits and metadata are unnecessary.
     /// Same-descriptor merge records may still accelerate the physical union.
-    fn materialize(
+    fn materialize<V, L>(
         &mut self,
-        cover: &Cover,
+        cover: &Cover<L>,
     ) -> Result<
-        TribleSet,
+        V,
         CollectionMaterializationError<
             <Self as CollectionStore>::RecordsError,
             <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreMeta>::MetaError,
             <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
+            V::Error,
         >,
     >
     where
         <Self as BlobStore>::Reader: BlobStoreMeta,
+        L: CollectionLattice,
+        V: TryFromCover<L>,
     {
         let collection = cover.collection();
-        let descriptor = load_collection_descriptor(self, collection)
+        let descriptor = load_collection_descriptor(self, collection.handle())
             .map_err(CollectionMaterializationError::from)?
             .fragment;
         let discovered = if cover.is_empty() {
@@ -1049,7 +1206,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
                 .map_err(CollectionMaterializationError::Discovery)?
         };
         snapshot_from_observation(self, &descriptor, discovered, cover.clone())
-            .map(CollectionSnapshot::into_facts)
+            .map(Snapshot::into_value)
     }
 
     /// Return every strictly verified provenance claim currently known for the
@@ -1058,10 +1215,13 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     /// This query is intentionally broader than the admission event which
     /// minted the cover: later authorship or metadata claims over the same
     /// payloads are visible without changing the cover itself.
-    fn claims(
+    fn claims<L>(
         &mut self,
-        cover: &Cover,
-    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<Self::RecordsError>> {
+        cover: &Cover<L>,
+    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<Self::RecordsError>>
+    where
+        L: CollectionLattice,
+    {
         let discovered = discover_collection_claims_for_cover(self, cover)?;
         Ok(discovered.commits().to_vec())
     }
@@ -1076,33 +1236,38 @@ impl<S> CollectionStoreExt for S where S: BlobStore + CollectionStore + Artifact
 /// reader-snapshot semantics cannot drift apart. Signed claims may have
 /// established a cover originally, but replay does not require them: metadata
 /// and authors remain optional provenance over the same payload member.
-pub(crate) fn snapshot_from_observation<S>(
+pub(crate) fn snapshot_from_observation<S, L, V>(
     storage: &mut S,
     descriptor: &Fragment,
     discovered: DiscoveredCollectionRecords,
-    cover: Cover,
+    cover: Cover<L>,
 ) -> Result<
-    CollectionSnapshot<S::Reader>,
+    Snapshot<L, V, S::Reader>,
     CollectionMaterializationError<
         S::RecordsError,
         S::ReaderError,
-        <S::Reader as BlobStoreMeta>::MetaError,
         <S::Reader as BlobStoreGet>::GetError<Infallible>,
+        V::Error,
     >,
 >
 where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
+    L: CollectionLattice,
+    V: TryFromCover<L>,
 {
-    let collection = cover.collection();
+    let collection = cover.collection().handle();
     let reader = storage
         .reader()
         .map_err(CollectionMaterializationError::Reader)?;
 
     if cover.is_empty() {
-        return Ok(CollectionSnapshot {
-            facts: TribleSet::new(),
-            cover,
+        let snapshot_cover = cover.clone();
+        let value = V::try_from_cover(CoverAttachment::from_parts(cover, Vec::new()))
+            .map_err(CollectionMaterializationError::View)?;
+        return Ok(Snapshot {
+            value,
+            cover: snapshot_cover,
             reader,
         });
     }
@@ -1132,20 +1297,23 @@ where
     if decoded_descriptor != *descriptor.facts() {
         return Err(CollectionMaterializationError::DescriptorMismatch { collection });
     }
+    super::lattice::validate_descriptor_type::<L>(descriptor)
+        .map_err(CollectionMaterializationError::WrongType)?;
 
     // Fetch and validate each cover payload exactly once. Claims, authorship,
     // and metadata are intentionally absent: replay remains valid even when no
     // provenance record or metadata blob is resident.
     let mut known = BTreeMap::new();
-    for member in cover.members() {
+    for member_handle in cover.members() {
+        let member = Handle::<L::Encoding>::to_hash(member_handle);
         let blob = reader
-            .get(Handle::<SimpleArchive>::from_hash(member))
+            .get(member_handle)
             .map_err(|source| CollectionMaterializationError::MemberGet { member, source })?;
-        simplearchive_union::validate_member(descriptor, collection, member, &blob)
+        L::validate_member(descriptor, &blob)
             .map_err(|source| CollectionMaterializationError::InvalidMember { member, source })?;
         known.insert(member, blob);
     }
-    let roots: BTreeSet<_> = cover.members().collect();
+    let roots: BTreeSet<_> = cover.data_members().collect();
     let explicit_roots: BTreeSet<_> = roots
         .iter()
         .copied()
@@ -1175,7 +1343,7 @@ where
     for result in producers.keys().copied() {
         let resident = known.contains_key(&result)
             || matches!(
-                reader.metadata(Handle::<SimpleArchive>::from_hash(result)),
+                reader.metadata(Handle::<L::Encoding>::from_hash(result)),
                 Ok(Some(_))
             );
         if resident {
@@ -1244,9 +1412,9 @@ where
         } else {
             match (known.get(&low), known.get(&high)) {
                 (Some(low_blob), Some(high_blob)) => {
-                    match simplearchive_union::join(low_blob, high_blob) {
+                    match L::merge_members(descriptor, low_blob, high_blob) {
                         Ok(value) => {
-                            let expected = Handle::<SimpleArchive>::to_hash(value.get_handle());
+                            let expected = Handle::<L::Encoding>::to_hash(value.get_handle());
                             expected_hashes.insert(pair, expected);
                             joined = Some(value);
                             Some(expected)
@@ -1272,14 +1440,14 @@ where
                 if joined.is_none() {
                     joined = match (known.get(&low), known.get(&high)) {
                         (Some(low_blob), Some(high_blob)) => {
-                            simplearchive_union::join(low_blob, high_blob).ok()
+                            L::merge_members(descriptor, low_blob, high_blob).ok()
                         }
                         _ => None,
                     };
                 }
                 if let Some(value) = joined {
                     debug_assert_eq!(
-                        Handle::<SimpleArchive>::to_hash(value.get_handle()),
+                        Handle::<L::Encoding>::to_hash(value.get_handle()),
                         expected_data
                     );
                     known.insert(expected_data, value);
@@ -1370,15 +1538,13 @@ where
         }
     }
 
-    let mut selected = BTreeMap::<CollectionData, Blob<SimpleArchive>>::new();
+    let mut selected = BTreeMap::<CollectionData, Blob<L::Encoding>>::new();
     let physical_cover = loop {
         let candidate = collection_physical_cover(semantics, collection, &resident);
         if !candidate.missing.is_empty() {
-            return Err(CollectionMaterializationError::Materialize(
-                MaterializationError::Missing {
-                    obligations: candidate.missing,
-                },
-            ));
+            return Err(CollectionMaterializationError::Missing {
+                obligations: candidate.missing,
+            });
         }
 
         selected.retain(|data, _| candidate.cover.contains(data));
@@ -1387,14 +1553,13 @@ where
             if roots.contains(&data) || selected.contains_key(&data) {
                 continue;
             }
-            let handle = Handle::<SimpleArchive>::from_hash(data);
-            let actual: Result<Blob<SimpleArchive>, _> = reader.get(handle);
+            let handle = Handle::<L::Encoding>::from_hash(data);
+            let actual: Result<Blob<L::Encoding>, _> = reader.get(handle);
             match actual {
                 Ok(actual) => {
-                    let actual = Blob::<SimpleArchive>::new(actual.bytes.clone());
-                    let actual_data = Handle::<SimpleArchive>::to_hash(actual.get_handle());
-                    if actual_data == data && simplearchive_union::validate_element(&actual).is_ok()
-                    {
+                    let actual = Blob::<L::Encoding>::new(actual.bytes.clone());
+                    let actual_data = Handle::<L::Encoding>::to_hash(actual.get_handle());
+                    if actual_data == data && L::validate_member(descriptor, &actual).is_ok() {
                         selected.insert(data, actual);
                     } else {
                         rejected.push(data);
@@ -1423,36 +1588,14 @@ where
                 .get(&data)
                 .expect("optional cover members were exact-validated")
         };
-        members.push((data, blob));
+        members.push((Handle::<L::Encoding>::from_hash(data), (*blob).clone()));
     }
-    let facts = match members.as_slice() {
-        [(data, blob)] => (*blob).clone().try_from_blob().map_err(|source| {
-            CollectionMaterializationError::Materialize(MaterializationError::InvalidElement {
-                data: *data,
-                source,
-            })
-        })?,
-        _ => {
-            // The union's handle is never asked for here — it is decoded
-            // and dropped — so it is computed without one. Hashing 1.7 GB
-            // to name a value this expression consumes is a fifth of the
-            // merge that produced it.
-            let union = simplearchive_union::join_many_bytes(members.iter().map(|(_, blob)| *blob))
-                .map_err(|(index, source)| {
-                    CollectionMaterializationError::Materialize(
-                        MaterializationError::InvalidElement {
-                            data: members[index].0,
-                            source,
-                        },
-                    )
-                })?;
-            crate::blob::encodings::simplearchive::try_from_archive_bytes(union)
-                .expect("join_many emits one canonical SimpleArchive")
-        }
-    };
-    Ok(CollectionSnapshot {
-        facts,
-        cover,
+    let snapshot_cover = cover.clone();
+    let value = V::try_from_cover(CoverAttachment::from_parts(cover, members))
+        .map_err(CollectionMaterializationError::View)?;
+    Ok(Snapshot {
+        value,
+        cover: snapshot_cover,
         reader,
     })
 }

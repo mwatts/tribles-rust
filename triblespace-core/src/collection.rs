@@ -23,6 +23,8 @@ pub mod discovery;
 pub mod exact_derived;
 /// Explicit size-tiered maintenance for exact canonical target covers.
 pub mod exact_target_compaction;
+/// Typed lattice identities above representation-neutral collection records.
+pub mod lattice;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
 /// Maintained observed-set projection — the monotone half of register
@@ -41,6 +43,8 @@ pub mod simplearchive_union;
 pub mod store;
 /// Canonical raw `SuccinctArchiveBlob` set-union collection kind.
 pub mod succinctarchive_union;
+/// Logical values reconstructed from typed physical covers.
+pub mod view;
 
 /// Ed25519 public key, re-exported.
 ///
@@ -52,11 +56,13 @@ pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
 pub use discovery::*;
+pub use lattice::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;
 pub use simplearchive_union::SimpleArchiveCollection;
 pub use store::*;
+pub use view::*;
 
 #[cfg(test)]
 mod oracle;

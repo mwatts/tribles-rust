@@ -735,8 +735,11 @@ mod tests {
         let key = SigningKey::from_bytes(&[23; 32]);
         let team = key.verifying_key();
         let descriptor = simplearchive_union::descriptor(name, team, reach::private());
-        let collection = identity_for_tests(&descriptor);
-        assert_eq!(repo.collection(descriptor).unwrap(), collection);
+        let expected_collection = identity_for_tests(&descriptor);
+        let collection: crate::collection::Collection<
+            crate::collection::simplearchive_union::SimpleArchiveUnion,
+        > = repo.collection(descriptor).unwrap();
+        assert_eq!(collection.handle(), expected_collection);
         let commit = repo.commit(collection, &key, fragment).unwrap();
         let orphan = repo.put::<UTF8String, _>("orphan".to_owned()).unwrap();
 
@@ -744,7 +747,7 @@ mod tests {
 
         let reader = repo.reader().unwrap();
         for retained in [
-            collection.transmute(),
+            collection.handle().transmute(),
             Inline::<Handle<UnknownBlob>>::new(commit.data().raw),
             commit.metadata().transmute(),
             child.transmute(),

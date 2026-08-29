@@ -46,12 +46,76 @@ use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 
 use super::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
-use super::{CollectionData, CollectionDerive, CollectionHandle, CollectionMerge};
+use super::{
+    CollectionData, CollectionDerive, CollectionHandle, CollectionHomomorphism, CollectionLattice,
+    CollectionLatticeError, CollectionMerge,
+};
 
 mod collection;
 mod rank9_fiber;
 pub use collection::*;
 pub use rank9_fiber::Rank9FiberError;
+
+/// The canonical raw-SuccinctArchive representation of trible-set union.
+pub struct SuccinctArchiveUnion;
+
+impl CollectionLattice for SuccinctArchiveUnion {
+    type Encoding = SuccinctArchiveBlob;
+    type Recipe = TribleSetUnionV1;
+
+    fn validate_member(
+        _descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        SuccinctArchiveBlob::merge(std::slice::from_ref(member))
+            .map(|_| ())
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+
+    fn merge_members(
+        _descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        join(low, high).map_err(|source| match source {
+            SuccinctArchiveRawMergeError::DomainTooWide
+            | SuccinctArchiveRawMergeError::TooManyRows => {
+                CollectionLatticeError::Capacity(source.to_string())
+            }
+            SuccinctArchiveRawMergeError::InvalidInput { .. }
+            | SuccinctArchiveRawMergeError::Construction(_) => {
+                CollectionLatticeError::Fatal(source.to_string())
+            }
+        })
+    }
+}
+
+/// Canonical SimpleArchive-to-SuccinctArchive set-union homomorphism.
+pub struct SimpleArchiveToSuccinctArchive;
+
+impl CollectionHomomorphism<super::simplearchive_union::SimpleArchiveUnion, SuccinctArchiveUnion>
+    for SimpleArchiveToSuccinctArchive
+{
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self)
+    }
+
+    fn map(
+        &self,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionLatticeError> {
+        derive_element(source).map_err(|source| match source {
+            SuccinctArchiveRawBuildError::TooManyRows(_)
+            | SuccinctArchiveRawBuildError::DomainTooWide(_) => {
+                CollectionLatticeError::Capacity(source.to_string())
+            }
+            SuccinctArchiveRawBuildError::Source(_)
+            | SuccinctArchiveRawBuildError::Construction(_) => {
+                CollectionLatticeError::Fatal(source.to_string())
+            }
+        })
+    }
+}
 
 /// Lifted Rank9-union recipe for 32-bit little-endian targets.
 ///

@@ -11,15 +11,18 @@ use triblespace_core::collection::reach;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::exact_derived::{
-    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
-    ExactDerivedCollectionError,
+    ExactDerivedCollection, ExactDerivedCollectionError,
 };
-use triblespace_core::collection::simplearchive_union;
-use triblespace_core::collection::{CollectionHandle, CollectionStore, Cover, VerifyingKey};
+use triblespace_core::collection::simplearchive_union::{self, SimpleArchiveUnion};
+use triblespace_core::collection::{
+    CollectionHandle, CollectionStore, Cover, CoverAttachment, TryFromCover, VerifyingKey,
+};
 use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 use triblespace_core::trible::Fragment;
 
-use crate::path_summary_union;
+use crate::path_summary_union::{
+    self, PathSummaryUnion, PathSummaryView, SimpleArchiveToPathSummary,
+};
 use crate::{Automaton, PathError, PathIndex, PathSummaryBlob, PathSummaryBlobError};
 use path_summary_union::PathSummaryUnionError;
 
@@ -164,13 +167,13 @@ impl PathSummaryCollection {
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &Cover<SimpleArchiveUnion>,
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, source_cover, self)?;
+        let cover = self.kernel()?.attach_exact(store, source_cover)?;
         self.index_from_cover(cover).map(Arc::new)
     }
 
@@ -182,24 +185,31 @@ impl PathSummaryCollection {
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &Cover<SimpleArchiveUnion>,
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(store, source_cover, self)?;
+        let cover = self.kernel()?.ensure_exact(store, source_cover)?;
         self.index_from_cover(cover).map(Arc::new)
     }
 
-    fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, PathSummaryBlob> {
+    fn kernel(
+        &self,
+    ) -> Result<
+        ExactDerivedCollection<SimpleArchiveUnion, PathSummaryUnion, SimpleArchiveToPathSummary>,
+        ExactDerivedCollectionError,
+    > {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
     }
 
     fn index_from_cover(
         &self,
-        cover: CoverAttachment<PathSummaryBlob>,
+        cover: CoverAttachment<PathSummaryUnion>,
     ) -> Result<PathIndex, PathSummaryCollectionError> {
+        let cover = PathSummaryView::try_from_cover(cover)
+            .expect("constructing a lazy path-summary view is infallible");
         let mut joined = path_summary_union::empty(&self.automaton);
         for segment in cover.into_blobs() {
             joined = path_summary_union::join(&joined, &segment, &self.automaton)
@@ -209,70 +219,6 @@ impl PathSummaryCollection {
             .map_err(PathSummaryCollectionError::Summary)?;
         PathIndex::from_summary(summary).map_err(PathSummaryCollectionError::Index)
     }
-}
-
-impl ExactDerivedAlgebra<SimpleArchive, PathSummaryBlob> for PathSummaryCollection {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &triblespace_core::blob::Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.source_descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "source descriptor does not match this path collection".to_owned(),
-            ));
-        }
-        simplearchive_union::validate_element(source)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &triblespace_core::blob::Blob<PathSummaryBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "target descriptor does not match this path collection".to_owned(),
-            ));
-        }
-        PathSummaryBlob::decode(target.clone(), &self.automaton)
-            .map(|_| ())
-            // These bytes are persisted evidence. Even a capacity-looking
-            // header is malformed input, not a reason to refine the cover.
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn join_source(
-        &self,
-        low: &triblespace_core::blob::Blob<SimpleArchive>,
-        high: &triblespace_core::blob::Blob<SimpleArchive>,
-    ) -> Result<triblespace_core::blob::Blob<SimpleArchive>, ExactAlgebraError> {
-        simplearchive_union::join(low, high)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn derive(
-        &self,
-        source: &triblespace_core::blob::Blob<SimpleArchive>,
-    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, ExactAlgebraError> {
-        path_summary_union::derive_element(source, &self.automaton).map_err(fatal_algebra_error)
-    }
-
-    fn join_target(
-        &self,
-        low: &triblespace_core::blob::Blob<PathSummaryBlob>,
-        high: &triblespace_core::blob::Blob<PathSummaryBlob>,
-    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, ExactAlgebraError> {
-        path_summary_union::join(low, high, &self.automaton).map_err(fatal_algebra_error)
-    }
-}
-
-fn fatal_algebra_error(error: PathSummaryUnionError) -> ExactAlgebraError {
-    // Paths currently rejoins every selected shard before closure, so a finer
-    // cover cannot evade fixed summary capacity. Reserve `Capacity` until the
-    // public operation supports fragmented closure/materialization.
-    ExactAlgebraError::Fatal(error.to_string())
 }
 
 #[cfg(test)]
@@ -445,9 +391,11 @@ mod tests {
         store: &mut CollectionOnly,
         paths: &PathSummaryCollection,
         commits: impl IntoIterator<Item = CollectionCommit>,
-    ) -> Cover {
-        let collection = store.collection(paths.source_descriptor()).unwrap();
-        assert_eq!(collection, paths.source_collection());
+    ) -> Cover<SimpleArchiveUnion> {
+        let collection = store
+            .collection::<SimpleArchiveUnion>(paths.source_descriptor())
+            .unwrap();
+        assert_eq!(collection.handle(), paths.source_collection());
         let authority = SigningKey::from_bytes(&[1; 32]);
         let mut writers: Vec<_> = commits
             .into_iter()
@@ -458,7 +406,7 @@ mod tests {
         writers.dedup();
         let atom = CapabilityAtom::new(
             CapabilityAction::new(ACTION_WRITE),
-            CapabilityResource::from(collection),
+            CapabilityResource::from(collection.handle()),
         );
         let presentations: Vec<_> = writers
             .into_iter()
@@ -518,21 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_algebra_treats_fixed_representation_capacity_as_fatal() {
-        for error in [
-            PathSummaryUnionError::Merge(PathError::TooManyVertices { count: usize::MAX }),
-            PathSummaryUnionError::Merge(PathError::ProductCarrierTooLarge {
-                vertices: usize::MAX,
-                states: u32::MAX,
-            }),
-            PathSummaryUnionError::Summary(PathSummaryBlobError::CapacityOverflow),
-        ] {
-            assert!(matches!(
-                fatal_algebra_error(error),
-                ExactAlgebraError::Fatal(_)
-            ));
-        }
-
+    fn malformed_fixed_representation_capacity_is_fatal() {
         let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
         let paths = test_paths(test_name("c9"), automaton.clone());
         let mut bytes = Vec::new();
@@ -544,8 +478,13 @@ mod tests {
         bytes.extend_from_slice(&[2; 32]);
         let persisted = Blob::<PathSummaryBlob>::new(bytes.into());
         assert!(matches!(
-            paths.validate_target(&paths.descriptor(), &persisted),
-            Err(ExactAlgebraError::Fatal(_))
+            <PathSummaryUnion as triblespace_core::collection::CollectionLattice>::validate_member(
+                &paths.descriptor(),
+                &persisted,
+            ),
+            Err(triblespace_core::collection::CollectionLatticeError::Fatal(
+                _
+            ))
         ));
     }
 
@@ -553,7 +492,9 @@ mod tests {
     fn empty_cover_is_local_bottom_and_writes_nothing() {
         let mut store = CollectionOnly::default();
         let paths = test_paths(test_name("c9"), plus());
-        let collection = store.collection(paths.source_descriptor()).unwrap();
+        let collection = store
+            .collection::<SimpleArchiveUnion>(paths.source_descriptor())
+            .unwrap();
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
         let cover = store.cover(collection, &[]).unwrap();
@@ -814,10 +755,11 @@ mod tests {
         let source_cover = source_cover(&mut store, &paths, [first, second]);
         let cover = paths
             .kernel()
-            .attach_exact(&mut store, &source_cover, &paths)
+            .unwrap()
+            .attach_exact(&mut store, &source_cover)
             .unwrap();
         assert_eq!(cover.len(), 1);
-        assert_eq!(cover.members()[0].0, joined_data);
+        assert_eq!(cover.members()[0].0, joined.get_handle());
         assert_cross_fragment_path(&paths.attach_exact(&mut store, &source_cover).unwrap());
     }
 

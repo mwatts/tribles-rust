@@ -74,15 +74,16 @@ use crate::metadata::MetaDescribe;
 use crate::query::register::RegisterOrder;
 use crate::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 
-use super::exact_derived::{
-    CoverAttachment, ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection,
-    ExactDerivedCollectionError,
-};
+use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use super::records::{
     collection_authority, collection_reach, collection_recipe, collection_representation,
     collection_source, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
-use super::{simplearchive_union, CollectionStore, Cover};
+use super::{
+    simplearchive_union::{self, SimpleArchiveUnion},
+    CollectionHomomorphism, CollectionLattice, CollectionLatticeError, CollectionStore,
+    CoverAttachment, FactCover, TryFromCover,
+};
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 
 /// Width of one stored id.
@@ -284,6 +285,80 @@ impl MetaDescribe for ObservedUnionV1 {
     }
 }
 
+/// The canonical observed-set representation under the observed-union law.
+pub struct ObservedSetUnion;
+
+fn observed_attribute(descriptor: &Fragment) -> Result<Id, CollectionLatticeError> {
+    let raw = crate::collection::descriptor::argument(descriptor.facts(), register_observes.id())
+        .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?
+        .ok_or_else(|| {
+            CollectionLatticeError::Fatal(
+                "observed-set descriptor is missing register_observes".to_owned(),
+            )
+        })?;
+    Inline::<GenId>::new(raw)
+        .try_from_inline::<Id>()
+        .map_err(|source| {
+            CollectionLatticeError::Fatal(format!(
+                "observed-set descriptor has an invalid register_observes: {source:?}"
+            ))
+        })
+}
+
+impl CollectionLattice for ObservedSetUnion {
+    type Encoding = ObservedSetBlob;
+    type Recipe = ObservedUnionV1;
+
+    fn validate_arguments(descriptor: &Fragment) -> Result<(), CollectionLatticeError> {
+        let source = crate::collection::descriptor::source(descriptor.facts())
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))?;
+        if source.is_none() {
+            return Err(CollectionLatticeError::Fatal(
+                "observed-set descriptor is missing its source collection".to_owned(),
+            ));
+        }
+
+        observed_attribute(descriptor).map(|_| ())
+    }
+
+    fn validate_member(
+        _descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        validate_element(member).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+
+    fn merge_members(
+        _descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        join(low, high).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+}
+
+/// Bound projection from one fact-set member to its observed-state set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObserveStates {
+    observes: Id,
+}
+
+impl CollectionHomomorphism<SimpleArchiveUnion, ObservedSetUnion> for ObserveStates {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionLatticeError> {
+        Ok(Self {
+            observes: observed_attribute(target)?,
+        })
+    }
+
+    fn map(
+        &self,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<ObservedSetBlob>, CollectionLatticeError> {
+        derive_element(source, self.observes)
+            .map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+}
+
 /// A resolved observed set, ready to answer domination.
 ///
 /// Implements [`RegisterOrder`], so it substitutes for a live
@@ -327,6 +402,18 @@ impl RegisterOrder for ObservedIndex {
     fn dominated(&self, state: Id) -> bool {
         let raw: [u8; ID_LEN] = state[..].try_into().expect("id is 16 bytes");
         self.observed.binary_search(&raw).is_ok()
+    }
+}
+
+impl TryFromCover<ObservedSetUnion> for ObservedIndex {
+    type Error = ObservedSetError;
+
+    fn try_from_cover(attachment: CoverAttachment<ObservedSetUnion>) -> Result<Self, Self::Error> {
+        let mut joined = empty();
+        for segment in attachment.into_blobs() {
+            joined = join(&joined, &segment)?;
+        }
+        Self::decode(&joined)
     }
 }
 
@@ -427,43 +514,37 @@ impl ObservedSetCollection {
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &FactCover,
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().attach_exact(store, source_cover, self)?;
-        self.index_from_cover(cover)
+        let cover = self.kernel()?.attach_exact(store, source_cover)?;
+        ObservedIndex::try_from_cover(cover).map_err(ObservedSetCollectionError::Algebra)
     }
 
     /// Ensure and attach the observed set for `source_cover`.
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
+        source_cover: &FactCover,
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(store, source_cover, self)?;
-        self.index_from_cover(cover)
+        let cover = self.kernel()?.ensure_exact(store, source_cover)?;
+        ObservedIndex::try_from_cover(cover).map_err(ObservedSetCollectionError::Algebra)
     }
 
-    fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, ObservedSetBlob> {
-        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
-    }
-
-    fn index_from_cover(
+    fn kernel(
         &self,
-        cover: CoverAttachment<ObservedSetBlob>,
-    ) -> Result<ObservedIndex, ObservedSetCollectionError> {
-        let mut joined = empty();
-        for segment in cover.into_blobs() {
-            joined = join(&joined, &segment).map_err(ObservedSetCollectionError::Algebra)?;
-        }
-        ObservedIndex::decode(&joined).map_err(ObservedSetCollectionError::Algebra)
+    ) -> Result<
+        ExactDerivedCollection<SimpleArchiveUnion, ObservedSetUnion, ObserveStates>,
+        ExactDerivedCollectionError,
+    > {
+        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
     }
 }
 
@@ -497,62 +578,6 @@ impl Error for ObservedSetCollectionError {
 impl From<ExactDerivedCollectionError> for ObservedSetCollectionError {
     fn from(source: ExactDerivedCollectionError) -> Self {
         Self::Collection(source)
-    }
-}
-
-impl ExactDerivedAlgebra<SimpleArchive, ObservedSetBlob> for ObservedSetCollection {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.source_descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "source descriptor does not match this observed-set collection".to_owned(),
-            ));
-        }
-        simplearchive_union::validate_element(source)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<ObservedSetBlob>,
-    ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != self.descriptor() {
-            return Err(ExactAlgebraError::Fatal(
-                "target descriptor does not match this observed-set collection".to_owned(),
-            ));
-        }
-        // Persisted bytes: malformed is malformed, never a reason to refine
-        // the physical cover.
-        validate_element(target).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn join_source(
-        &self,
-        low: &Blob<SimpleArchive>,
-        high: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
-        simplearchive_union::join(low, high)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn derive(
-        &self,
-        source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<ObservedSetBlob>, ExactAlgebraError> {
-        derive_element(source, self.observes)
-            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
-    }
-
-    fn join_target(
-        &self,
-        low: &Blob<ObservedSetBlob>,
-        high: &Blob<ObservedSetBlob>,
-    ) -> Result<Blob<ObservedSetBlob>, ExactAlgebraError> {
-        join(low, high).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
     }
 }
 

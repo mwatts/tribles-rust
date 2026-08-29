@@ -104,7 +104,8 @@ fn publish_metadata(
         signing_key.verifying_key(),
         reach::private(),
     );
-    let Ok(collection) = pile.collection(descriptor) else {
+    let Ok(collection) = pile.collection::<simplearchive_union::SimpleArchiveUnion>(descriptor)
+    else {
         let _ = pile.close();
         return;
     };

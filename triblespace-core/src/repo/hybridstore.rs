@@ -276,7 +276,7 @@ mod tests {
             .commit(target, &signing_key, Fragment::empty())
             .unwrap();
         assert_eq!(hybrid.snapshot(target, &[]).unwrap().facts().len(), 0);
-        assert_eq!(commit.collection(), target);
+        assert_eq!(commit.collection(), target.handle());
         assert!(hybrid.blobs.blobs.len() >= 2);
         assert_eq!(
             hybrid
@@ -285,7 +285,7 @@ mod tests {
                 .unwrap()
                 .filter_map(Result::ok)
                 .filter(|record| {
-                    matches!(record, CollectionRecord::Commit(commit) if commit.collection() == target)
+                    matches!(record, CollectionRecord::Commit(commit) if commit.collection() == target.handle())
                 })
                 .count(),
             1

@@ -13,10 +13,12 @@ use triblespace_core::collection::records::{
     collection_authority, collection_name, collection_recipe, collection_representation,
     KIND_COLLECTION_DESCRIPTOR,
 };
-use triblespace_core::collection::simplearchive_union::{self, TRIBLE_SET_UNION_RECIPE_V1};
+use triblespace_core::collection::simplearchive_union::{
+    self, SimpleArchiveUnion, TRIBLE_SET_UNION_RECIPE_V1,
+};
 use triblespace_core::collection::{
-    reach, CapabilityPresentation, CollectionRecord, CollectionRecordSelector, CollectionStore,
-    CollectionStoreExt, ACTION_WRITE,
+    reach, CapabilityPresentation, Collection, CollectionRecord, CollectionRecordSelector,
+    CollectionStore, CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -137,11 +139,11 @@ fn fragment(entity: u8) -> Fragment {
 fn write_presentation(
     authority: &SigningKey,
     writer: VerifyingKey,
-    collection: triblespace_core::collection::CollectionHandle,
+    collection: Collection<SimpleArchiveUnion>,
 ) -> CapabilityPresentation {
     let atom = CapabilityAtom::new(
         CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(collection),
+        CapabilityResource::from(collection.handle()),
     );
     CapabilityPresentation::new(
         writer,
@@ -169,14 +171,14 @@ fn registration_offers_the_complete_descriptor_closure_once() {
     assert!(!attachment_handles.is_empty());
 
     let mut store = CountingRepo::default();
-    let collection = store.collection(descriptor).unwrap();
+    let collection = store.collection::<SimpleArchiveUnion>(descriptor).unwrap();
     let offers = store.offers_snapshot().unwrap();
 
-    assert!(offers.contains(collection.transmute()));
+    assert!(offers.contains(collection.handle().transmute()));
     for attachment in attachment_handles {
         assert!(offers.contains(attachment));
     }
-    assert_eq!(store.puts_for(collection), 1);
+    assert_eq!(store.puts_for(collection.handle()), 1);
 }
 
 #[test]
@@ -244,17 +246,17 @@ fn commit_does_not_rewrite_the_registered_descriptor() {
     let authority = SigningKey::from_bytes(&[2; 32]);
     let mut store = CountingRepo::default();
     let collection = store
-        .collection(simplearchive_union::descriptor(
+        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
             "no-reput",
             authority.verifying_key(),
             reach::private(),
         ))
         .unwrap();
-    let descriptor_puts = store.puts_for(collection);
+    let descriptor_puts = store.puts_for(collection.handle());
 
     store.commit(collection, &authority, fragment(1)).unwrap();
 
-    assert_eq!(store.puts_for(collection), descriptor_puts);
+    assert_eq!(store.puts_for(collection.handle()), descriptor_puts);
 }
 
 #[test]
@@ -262,7 +264,7 @@ fn commit_offers_every_dependency_before_one_idempotent_record() {
     let authority = SigningKey::from_bytes(&[9; 32]);
     let mut store = CountingRepo::default();
     let collection = store
-        .collection(simplearchive_union::descriptor(
+        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
             "publication-order",
             authority.verifying_key(),
             reach::private(),
@@ -303,7 +305,7 @@ fn commit_offers_every_dependency_before_one_idempotent_record() {
     }
     assert!(!store.events[..insert]
         .iter()
-        .any(|event| matches!(event, StoreEvent::Put(raw) if *raw == collection.raw)));
+        .any(|event| matches!(event, StoreEvent::Put(raw) if *raw == collection.handle().raw)));
 
     let repeated = store.commit(collection, &authority, committed).unwrap();
     assert_eq!(repeated, first);
@@ -325,7 +327,7 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     let delegate = SigningKey::from_bytes(&[4; 32]);
     let mut store = CountingRepo::default();
     let collection = store
-        .collection(simplearchive_union::descriptor(
+        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
             "authority",
             authority.verifying_key(),
             reach::private(),
@@ -340,7 +342,7 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     assert_eq!(authority_cover.collection(), collection);
     assert_eq!(
         authority_cover.members().collect::<Vec<_>>(),
-        vec![root.data()]
+        vec![Handle::<SimpleArchive>::from_hash(root.data())]
     );
 
     let proof = write_presentation(&authority, delegate.verifying_key(), collection);
@@ -359,7 +361,10 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     assert_eq!(cover.len(), 2);
     assert_eq!(
         cover.members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([root.data(), delegated.data()]),
+        BTreeSet::from([
+            Handle::<SimpleArchive>::from_hash(root.data()),
+            Handle::<SimpleArchive>::from_hash(delegated.data()),
+        ]),
     );
     assert_eq!(
         store
@@ -376,7 +381,8 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     expected += fragment(2).into_facts();
     assert_eq!(snapshot.facts(), &expected);
     assert_eq!(snapshot.cover(), &cover);
-    assert_eq!(store.materialize(&cover).unwrap(), expected);
+    let materialized: TribleSet = store.materialize(&cover).unwrap();
+    assert_eq!(materialized, expected);
 }
 
 #[test]
@@ -386,14 +392,14 @@ fn invalid_explicit_presentation_fails_loud() {
     let other_delegate = SigningKey::from_bytes(&[16; 32]);
     let mut store = CountingRepo::default();
     let collection = store
-        .collection(simplearchive_union::descriptor(
+        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
             "target",
             authority.verifying_key(),
             reach::private(),
         ))
         .unwrap();
     let other = store
-        .collection(simplearchive_union::descriptor(
+        .collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
             "other",
             authority.verifying_key(),
             reach::private(),
@@ -421,7 +427,7 @@ fn anchorless_descriptor_is_rejected_before_storage() {
     let mut store = CountingRepo::default();
 
     assert!(matches!(
-        store.collection(anchorless),
+        store.collection::<SimpleArchiveUnion>(anchorless),
         Err(
             triblespace_core::collection::CollectionRegistrationError::InvalidDescriptor(
                 triblespace_core::collection::RecordDecodeError::MissingField(_)
@@ -444,7 +450,7 @@ fn root_descriptor_without_its_name_blob_is_rejected_before_storage() {
     let mut store = CountingRepo::default();
 
     assert!(matches!(
-        store.collection(stripped),
+        store.collection::<SimpleArchiveUnion>(stripped),
         Err(
             triblespace_core::collection::CollectionRegistrationError::InvalidAttachment {
                 role: "name",
@@ -466,7 +472,7 @@ fn descriptor_without_authority_is_rejected_before_storage() {
     let mut store = CountingRepo::default();
 
     assert!(matches!(
-        store.collection(missing_authority),
+        store.collection::<SimpleArchiveUnion>(missing_authority),
         Err(
             triblespace_core::collection::CollectionRegistrationError::InvalidDescriptor(
                 triblespace_core::collection::RecordDecodeError::MissingField(

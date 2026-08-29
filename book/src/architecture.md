@@ -167,11 +167,11 @@ Reads are exact about what they observed, not magical about global time:
 
 - `store.cover(collection, presentations)` loads the descriptor authority,
   admits its own strictly signed commits directly, verifies every explicit
-  delegated presentation, and returns one canonical payload `Cover` without
-  fetching member data;
+  delegated presentation, and returns one canonical typed payload `Cover<L>`
+  without fetching member data;
 - `store.snapshot(collection, presentations)` performs that same admission and
-  carries materialized facts, the exact cover, and the blob reader which
-  validated them; and
+  carries a `TryFromCover<L>` logical value, the exact cover, and the blob
+  reader which validated them; and
 - `store.materialize(&cover)` exact-replays an already admitted multi-author
   frontier without holding a publishing key or repeating capability policy.
 
@@ -201,9 +201,9 @@ That law permits either route through the evidence graph: merge source shards
 and derive once, derive individual shards and merge their images, or reuse any
 validated mixture already present. An opaque source cover fixes the logical
 value while a resolver chooses a target cover with equal support.
-Different target covers may denote the same join, and the same `Cover` type is
-used at every lattice position. Missing derived artifacts are cache misses, not
-missing facts.
+Different target covers may denote the same join, and every lattice position
+uses the same `Cover<L>` shape while retaining its own typed member handles.
+Missing derived artifacts are cache misses, not missing facts.
 
 Route freedom belongs to the collection recipe rather than to a flag on
 `Cover`: ordinary Succinct construction may reuse any validated equal-support

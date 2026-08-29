@@ -19,10 +19,9 @@ use crate::blob::encodings::succinctarchive::{
     SuccinctArchiveRank9IndexBlob, UnionArchive,
 };
 use crate::blob::{Blob, BlobEncoding};
-use crate::collection::exact_derived::CoverAttachment;
 use crate::collection::{
     CollectionData, CollectionDerive, CollectionHandle, CollectionRecord, CollectionRecordSelector,
-    CollectionStore,
+    CollectionStore, CoverAttachment,
 };
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
@@ -30,6 +29,8 @@ use crate::repo::{
     ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, OfferCapture,
 };
 use crate::trible::{Fragment, TribleSet};
+
+use super::SuccinctArchiveUnion;
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -233,7 +234,7 @@ impl Rank9Fiber {
     pub(super) fn attach<S>(
         &self,
         store: &mut S,
-        cover: CoverAttachment<SuccinctArchiveBlob>,
+        cover: CoverAttachment<SuccinctArchiveUnion>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
         S: BlobStore + CollectionStore,
@@ -260,7 +261,7 @@ impl Rank9Fiber {
     pub(super) fn ensure<S>(
         &self,
         store: &mut S,
-        cover: CoverAttachment<SuccinctArchiveBlob>,
+        cover: CoverAttachment<SuccinctArchiveUnion>,
     ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
@@ -329,20 +330,24 @@ impl Rank9Fiber {
     fn probe<S>(
         &self,
         store: &mut S,
-        cover: CoverAttachment<SuccinctArchiveBlob>,
+        cover: CoverAttachment<SuccinctArchiveUnion>,
         ensure: bool,
     ) -> Result<FiberProbe, Rank9FiberError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        if cover.cover().collection() != self.source_collection {
+        if cover.cover().collection().handle() != self.source_collection {
             return Err(Rank9FiberError::WrongRawCollection {
                 expected: self.source_collection,
-                actual: cover.cover().collection(),
+                actual: cover.cover().collection().handle(),
             });
         }
-        let members = cover.into_members();
+        let members: Vec<_> = cover
+            .into_members()
+            .into_iter()
+            .map(|(data, raw)| (Handle::<SuccinctArchiveBlob>::to_hash(data), raw))
+            .collect();
         let raw_by_input: BTreeMap<_, _> = members.iter().map(|(data, raw)| (*data, raw)).collect();
         let mut candidates = self.candidates(store, &raw_by_input, ensure)?;
         let reader = store

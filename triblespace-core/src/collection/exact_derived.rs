@@ -1,8 +1,10 @@
 //! Exact-cover attachment shared by canonical derived collections.
 //!
-//! Concrete facades supply descriptors, one canonical five-operation algebra,
-//! and final query materialization. This kernel owns the common I/O lifecycle
-//! around opaque source-cover roots and reproducible unsigned evidence.
+//! Concrete facades bind one [`CollectionHomomorphism`] to typed source and
+//! target descriptors, then choose a final logical view. Validation and join
+//! belong to the two [`CollectionLattice`] types; the homomorphism contributes
+//! only the map between them. This kernel owns the common I/O lifecycle around
+//! opaque source-cover roots and reproducible unsigned evidence.
 //!
 //! Unsigned equations are cache evidence, not durable validation receipts.
 //! Resolution walks backwards from resident source and target results, then
@@ -17,7 +19,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::marker::PhantomData;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, BlobEncoding};
@@ -32,80 +33,13 @@ use crate::trible::Fragment;
 use super::discovery::discover_collection_records_for_derived_cover;
 use super::{
     collection_physical_cover, collection_physical_cover_for,
-    resolve_collection_semantics_from_roots, CollectionClaimValidation, CollectionData,
-    CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord, CollectionSemantics,
-    CollectionStore, Cover, DiscoveredCollectionRecords,
+    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation, CollectionData,
+    CollectionDerive, CollectionHandle, CollectionHomomorphism, CollectionLattice,
+    CollectionLatticeError, CollectionMerge, CollectionRecord, CollectionSemantics,
+    CollectionStore, Cover, CoverAttachment, DiscoveredCollectionRecords,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
-
-/// Failure of one fixed canonical collection operation.
-///
-/// `Capacity` is reserved for deterministic geometry limits of the chosen
-/// representation (for example, a `u32` ordinal space). It must never stand
-/// for transient allocation, I/O, or accelerator failure. Persisted malformed
-/// or noncanonical bytes are always `Fatal`, even when their decoder happens
-/// to encounter a capacity-looking field.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExactAlgebraError {
-    /// The operation or supplied bytes are invalid for reasons that cannot be
-    /// repaired by selecting a finer physical cover.
-    Fatal(String),
-    /// The canonical result does not fit this fixed representation, but the
-    /// operation may still proceed through finer physical cover members.
-    Capacity(String),
-}
-
-impl fmt::Display for ExactAlgebraError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Fatal(reason) | Self::Capacity(reason) => f.write_str(reason),
-        }
-    }
-}
-
-impl Error for ExactAlgebraError {}
-
-/// Canonical operations needed to reconstruct one exact derived collection.
-///
-/// The kernel binds descriptors, records, and freshly computed content
-/// identities. This trait is the representation boundary: validators prove
-/// that resident terminal bytes belong to their lattice, while constructors
-/// compute the unique canonical result of each algebraic operation. Errors on
-/// unsigned equations reject only that optional cache evidence; errors on an
-/// explicit source-cover member reject the cover.
-pub trait ExactDerivedAlgebra<Source: BlobEncoding, Target: BlobEncoding> {
-    /// Validate the exact source descriptor and one canonical source element.
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<Source>,
-    ) -> Result<(), ExactAlgebraError>;
-
-    /// Validate the exact target descriptor and one canonical target element.
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<Target>,
-    ) -> Result<(), ExactAlgebraError>;
-
-    /// Compute the canonical source join.
-    fn join_source(
-        &self,
-        low: &Blob<Source>,
-        high: &Blob<Source>,
-    ) -> Result<Blob<Source>, ExactAlgebraError>;
-
-    /// Compute the canonical source-to-target homomorphism.
-    fn derive(&self, source: &Blob<Source>) -> Result<Blob<Target>, ExactAlgebraError>;
-
-    /// Compute the canonical target join.
-    fn join_target(
-        &self,
-        low: &Blob<Target>,
-        high: &Blob<Target>,
-    ) -> Result<Blob<Target>, ExactAlgebraError>;
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum TypedData {
@@ -178,55 +112,6 @@ impl Candidate {
     }
 }
 
-/// Freshly validated bytes attached to one exact semantic [`Cover`].
-///
-/// This is transient materialization state, not a second kind of cover. The
-/// contained `Cover` remains the identity passed between collection stages;
-/// the blobs merely avoid rereading members while one operation consumes them.
-pub struct CoverAttachment<Target: BlobEncoding> {
-    cover: Cover,
-    members: Vec<(CollectionData, Blob<Target>)>,
-}
-
-impl<Target: BlobEncoding> CoverAttachment<Target> {
-    fn empty(collection: CollectionHandle) -> Self {
-        Self {
-            cover: Cover::from_members(collection, []),
-            members: Vec::new(),
-        }
-    }
-
-    /// Exact semantic cover whose bytes are attached.
-    pub fn cover(&self) -> &Cover {
-        &self.cover
-    }
-
-    /// Number of selected physical members.
-    pub fn len(&self) -> usize {
-        self.members.len()
-    }
-
-    /// Whether the attachment is the store-free empty-cover bottom.
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-
-    /// Borrow the ordered physical members.
-    pub fn members(&self) -> &[(CollectionData, Blob<Target>)] {
-        &self.members
-    }
-
-    /// Consume the ordered physical members.
-    pub fn into_members(self) -> Vec<(CollectionData, Blob<Target>)> {
-        self.members
-    }
-
-    /// Consume just the ordered blobs.
-    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<Target>> {
-        self.members.into_iter().map(|(_, blob)| blob)
-    }
-}
-
 /// Read-only outcome of probing an exact derived collection with speculative
 /// target-artifact availability.
 ///
@@ -236,14 +121,14 @@ impl<Target: BlobEncoding> CoverAttachment<Target> {
 /// [`Self::Fetch`]. A caller that cannot obtain one of those exact handles
 /// removes it from the offered set and probes again; ordinary physical-cover
 /// selection then chooses another valid cover or reports incompleteness.
-pub enum ExactAttachPlan<Target: BlobEncoding> {
+pub enum ExactAttachPlan<Target: CollectionLattice> {
     /// Every selected physical member is resident and freshly validated.
     Ready(CoverAttachment<Target>),
     /// Exact target members selected from the offered set but not resident.
     ///
     /// Handles are returned in ascending content-identity order. Fetching them
     /// is deliberately outside this synchronous storage kernel.
-    Fetch(Vec<CollectionData>),
+    Fetch(Vec<Inline<Handle<Target::Encoding>>>),
 }
 
 /// Failure to attach or complete one exact derived cover.
@@ -356,44 +241,95 @@ impl Error for ExactDerivedCollectionError {
 
 /// Exact-cover lifecycle for one fixed source-to-target homomorphism.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExactDerivedCollection<Source: BlobEncoding, Target: BlobEncoding> {
+pub struct ExactDerivedCollection<Source, Target, Homomorphism>
+where
+    Source: CollectionLattice,
+    Target: CollectionLattice,
+    Homomorphism: CollectionHomomorphism<Source, Target>,
+{
     source: Fragment,
-    source_collection: CollectionHandle,
+    source_collection: Collection<Source>,
     target: Fragment,
-    target_collection: CollectionHandle,
-    encodings: PhantomData<fn() -> (Source, Target)>,
+    target_collection: Collection<Target>,
+    homomorphism: Homomorphism,
 }
 
-impl<Source, Target> ExactDerivedCollection<Source, Target>
+impl<Source, Target, Homomorphism> ExactDerivedCollection<Source, Target, Homomorphism>
 where
-    Source: BlobEncoding + 'static,
-    Target: BlobEncoding + 'static,
-    Handle<Source>: InlineEncoding,
-    Handle<Target>: InlineEncoding,
+    Source: CollectionLattice,
+    Target: CollectionLattice,
+    Homomorphism: CollectionHomomorphism<Source, Target>,
 {
-    /// Bind the lifecycle to two distinct canonical descriptors.
-    ///
-    /// # Panics
-    ///
-    /// Panics when source and target are the same collection. An identity
-    /// mapping is not a derived-collection lifecycle and would make claim
-    /// dispatch ambiguous.
-    pub fn new(source: Fragment, target: Fragment) -> Self {
-        let source_collection: CollectionHandle =
-            crate::blob::IntoBlob::<SimpleArchive>::to_blob(source.facts().clone()).get_handle();
-        let target_collection: CollectionHandle =
-            crate::blob::IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()).get_handle();
-        assert_ne!(
-            source_collection, target_collection,
-            "exact derived collection requires distinct source and target descriptors",
-        );
-        Self {
+    /// Bind one homomorphism to two exact typed descriptors.
+    pub fn new(source: Fragment, target: Fragment) -> Result<Self, ExactDerivedCollectionError> {
+        let (source_collection, target_collection) = Self::validate_descriptors(&source, &target)?;
+        let homomorphism = Homomorphism::bind(&source, &target).map_err(|error| {
+            ExactDerivedCollectionError::Resolution(format!(
+                "invalid exact collection homomorphism: {error}"
+            ))
+        })?;
+        Ok(Self {
             source,
             source_collection,
             target,
             target_collection,
-            encodings: PhantomData,
+            homomorphism,
+        })
+    }
+
+    /// Bind an already constructed observational wrapper around the canonical
+    /// homomorphism. Kept crate-private so public callers cannot swap semantic
+    /// behavior between operations on one typed lifecycle.
+    pub(crate) fn with_homomorphism(
+        source: Fragment,
+        target: Fragment,
+        homomorphism: Homomorphism,
+    ) -> Result<Self, ExactDerivedCollectionError> {
+        let (source_collection, target_collection) = Self::validate_descriptors(&source, &target)?;
+        Ok(Self {
+            source,
+            source_collection,
+            target,
+            target_collection,
+            homomorphism,
+        })
+    }
+
+    fn validate_descriptors(
+        source: &Fragment,
+        target: &Fragment,
+    ) -> Result<(Collection<Source>, Collection<Target>), ExactDerivedCollectionError> {
+        let source_collection =
+            Collection::<Source>::from_descriptor(&source).map_err(|error| {
+                ExactDerivedCollectionError::Resolution(format!(
+                    "invalid exact source descriptor: {error}"
+                ))
+            })?;
+        let target_collection =
+            Collection::<Target>::from_descriptor(&target).map_err(|error| {
+                ExactDerivedCollectionError::Resolution(format!(
+                    "invalid exact target descriptor: {error}"
+                ))
+            })?;
+        if source_collection.handle() == target_collection.handle() {
+            return Err(ExactDerivedCollectionError::Resolution(
+                "exact derived collection requires distinct source and target descriptors"
+                    .to_owned(),
+            ));
         }
+        let declared_source = super::descriptor::source(target.facts()).map_err(|error| {
+            ExactDerivedCollectionError::Resolution(format!(
+                "invalid target collection_source: {error}"
+            ))
+        })?;
+        if declared_source != Some(source_collection.handle()) {
+            return Err(ExactDerivedCollectionError::Resolution(format!(
+                "target collection_source {:?} does not match source descriptor {}",
+                declared_source.map(|handle| hex::encode_upper(handle.raw)),
+                hex::encode_upper(source_collection.handle().raw),
+            )));
+        }
+        Ok((source_collection, target_collection))
     }
 
     /// Source descriptor.
@@ -407,26 +343,30 @@ where
     }
 
     /// Identity of the source collection.
-    pub fn source_collection(&self) -> CollectionHandle {
+    pub fn source_collection(&self) -> Collection<Source> {
         self.source_collection
     }
 
     /// Identity of the target collection.
-    pub fn target_collection(&self) -> CollectionHandle {
+    pub fn target_collection(&self) -> Collection<Target> {
         self.target_collection
+    }
+
+    pub(crate) fn homomorphism(&self) -> &Homomorphism {
+        &self.homomorphism
     }
 
     fn require_source_cover(
         &self,
-        source_cover: &Cover,
+        source_cover: &Cover<Source>,
     ) -> Result<(), ExactDerivedCollectionError> {
         if source_cover.collection() == self.source_collection {
             return Ok(());
         }
         Err(ExactDerivedCollectionError::InvalidCover(format!(
             "source descriptor {} differs from {}",
-            hex::encode_upper(source_cover.collection().raw),
-            hex::encode_upper(self.source_collection.raw),
+            hex::encode_upper(source_cover.collection().handle().raw),
+            hex::encode_upper(self.source_collection.handle().raw),
         )))
     }
 
@@ -435,18 +375,16 @@ where
     /// Missing unsigned intermediates are reconstructed in use-counted scratch
     /// from explicit source-cover roots. Scratch validation never publishes a
     /// blob or equation.
-    pub fn attach_exact<S, A>(
+    pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
+        source_cover: &Cover<Source>,
     ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
-        self.attach_with(store, source_cover, algebra)
+        self.attach_with(store, source_cover)
     }
 
     /// Probe an exact cover while treating target handles as speculative
@@ -462,17 +400,15 @@ where
     ///
     /// Every source Cover member remains mandatory resident evidence. Remote
     /// offers cannot replace those bytes or establish a source decomposition.
-    pub fn probe_exact<S, A>(
+    pub fn probe_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
-        offered_target: &BTreeSet<CollectionData>,
+        source_cover: &Cover<Source>,
+        offered_target: &BTreeSet<Inline<Handle<Target::Encoding>>>,
     ) -> Result<ExactAttachPlan<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
@@ -480,7 +416,12 @@ where
                 self.target_collection,
             )));
         }
-        let probe = self.probe(store, source_cover, algebra, false, offered_target)?;
+        let offered_target = offered_target
+            .iter()
+            .copied()
+            .map(Handle::<Target::Encoding>::to_hash)
+            .collect();
+        let probe = self.probe(store, source_cover, false, &offered_target)?;
         if probe.is_complete() {
             return Ok(ExactAttachPlan::Ready(probe.into_target_cover()));
         }
@@ -489,7 +430,12 @@ where
             && !probe.target_fetch.is_empty()
         {
             return Ok(ExactAttachPlan::Fetch(
-                probe.target_fetch.iter().copied().collect(),
+                probe
+                    .target_fetch
+                    .iter()
+                    .copied()
+                    .map(Handle::<Target::Encoding>::from_hash)
+                    .collect(),
             ));
         }
         Err(probe.incomplete_error())
@@ -503,38 +449,34 @@ where
     /// returns before any write. For a final feasible plan, the reader is
     /// dropped before descriptors and all output blobs are written ahead of
     /// unsigned `DERIVE` records. No flush or signed record is emitted.
-    pub fn ensure_exact<S, A>(
+    pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
+        source_cover: &Cover<Source>,
     ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         let mut capture = OfferCapture::new(store);
-        self.ensure_exact_unoffered(&mut capture, source_cover, algebra)
+        self.ensure_exact_unoffered(&mut capture, source_cover)
     }
 
-    pub(crate) fn ensure_exact_unoffered<S, A>(
+    pub(crate) fn ensure_exact_unoffered<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
+        source_cover: &Cover<Source>,
     ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
             return Ok(CoverAttachment::empty(self.target_collection));
         }
 
-        let probe = self.probe(store, source_cover, algebra, true, &BTreeSet::new())?;
+        let probe = self.probe(store, source_cover, true, &BTreeSet::new())?;
         if probe.is_complete() {
             return Ok(probe.into_target_cover());
         }
@@ -545,9 +487,9 @@ where
         // Successful images are cached by source identity, but only members of
         // the final feasible plan are ever published.
         let mut blocked = BTreeMap::<CollectionData, String>::new();
-        let mut cached = BTreeMap::<CollectionData, PreparedDerive<Target>>::new();
+        let mut cached = BTreeMap::<CollectionData, PreparedDerive<Target::Encoding>>::new();
         let prepared = loop {
-            let source_cover = probe.source_residual_cover(algebra, &blocked)?;
+            let source_cover = probe.source_residual_cover(&blocked)?;
             if source_cover.is_empty() {
                 return Err(probe.incomplete_error());
             }
@@ -556,35 +498,38 @@ where
             let mut replan = None;
             for (input_data, input) in source_cover {
                 if !cached.contains_key(&input_data) {
-                    let output = match algebra.derive(&input) {
+                    let output = match self.homomorphism.map(&input) {
                         Ok(output) => output,
-                        Err(ExactAlgebraError::Fatal(reason)) => {
+                        Err(CollectionLatticeError::Fatal(reason)) => {
                             return Err(ExactDerivedCollectionError::Derive {
                                 input: input_data,
                                 reason,
                             });
                         }
-                        Err(ExactAlgebraError::Capacity(reason)) => {
+                        Err(CollectionLatticeError::Capacity(reason)) => {
                             replan = Some((input_data, reason));
                             break;
                         }
                     };
-                    match algebra.validate_target(&self.target, &output) {
+                    match Target::validate_member(&self.target, &output) {
                         Ok(()) => {}
-                        Err(ExactAlgebraError::Fatal(reason)) => {
+                        Err(CollectionLatticeError::Fatal(reason)) => {
                             return Err(ExactDerivedCollectionError::Resolution(format!(
                                 "fresh DERIVE for {} constructed an invalid target: {reason}",
                                 hex::encode_upper(input_data.raw),
                             )));
                         }
-                        Err(ExactAlgebraError::Capacity(reason)) => {
+                        Err(CollectionLatticeError::Capacity(reason)) => {
                             replan = Some((input_data, reason));
                             break;
                         }
                     }
                     let output_data = fresh_data_identity(&output);
-                    let claim =
-                        CollectionDerive::new(self.target_collection, input_data, output_data);
+                    let claim = CollectionDerive::new(
+                        self.target_collection.handle(),
+                        input_data,
+                        output_data,
+                    );
                     cached.insert(
                         input_data,
                         PreparedDerive {
@@ -616,11 +561,11 @@ where
         self.publish_descriptors(store)?;
         for prepared in &prepared {
             let actual = store
-                .put::<Target, _>(prepared.output.clone())
+                .put::<Target::Encoding, _>(prepared.output.clone())
                 .map_err(|error| {
                     ExactDerivedCollectionError::storage("store derived target", error)
                 })?;
-            if Handle::<Target>::to_hash(actual) != prepared.output_data {
+            if Handle::<Target::Encoding>::to_hash(actual) != prepared.output_data {
                 return Err(ExactDerivedCollectionError::Resolution(
                     "blob store returned a noncanonical target handle".to_owned(),
                 ));
@@ -634,25 +579,23 @@ where
 
         // Construction does not change the opaque source cover; a fresh
         // attachment validates the outputs just published.
-        self.attach_with(store, source_cover, algebra)
+        self.attach_with(store, source_cover)
     }
 
-    fn attach_with<S, A>(
+    fn attach_with<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
+        source_cover: &Cover<Source>,
     ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
             return Ok(CoverAttachment::empty(self.target_collection));
         }
-        let probe = self.probe(store, source_cover, algebra, false, &BTreeSet::new())?;
+        let probe = self.probe(store, source_cover, false, &BTreeSet::new())?;
         if !probe.is_complete() {
             return Err(probe.incomplete_error());
         }
@@ -664,8 +607,8 @@ where
         store: &mut S,
     ) -> Result<(), ExactDerivedCollectionError> {
         for (descriptor, expected) in [
-            (&self.source, self.source_collection),
-            (&self.target, self.target_collection),
+            (&self.source, self.source_collection.handle()),
+            (&self.target, self.target_collection.handle()),
         ] {
             let blob = crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone());
             let actual = store
@@ -680,18 +623,16 @@ where
         Ok(())
     }
 
-    fn probe<S, A>(
+    fn probe<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
+        source_cover: &Cover<Source>,
         plan_source_residual: bool,
         offered_target: &BTreeSet<CollectionData>,
     ) -> Result<ExactProbe<S::Reader, Source, Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         // Preserve the low-latency direct path. Reverse decomposition may fan
         // out over many unsigned MERGE observations, so consult it only when
@@ -700,7 +641,6 @@ where
         let direct = self.probe_once(
             store,
             source_cover,
-            algebra,
             plan_source_residual,
             offered_target,
             false,
@@ -712,18 +652,16 @@ where
         self.probe_once(
             store,
             source_cover,
-            algebra,
             plan_source_residual,
             offered_target,
             true,
         )
     }
 
-    fn probe_once<S, A>(
+    fn probe_once<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover,
-        algebra: &A,
+        source_cover: &Cover<Source>,
         plan_source_residual: bool,
         offered_target: &BTreeSet<CollectionData>,
         allow_source_decomposition: bool,
@@ -731,26 +669,30 @@ where
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         self.require_source_cover(source_cover)?;
         let discovered = discover_collection_records_for_derived_cover(
             store,
             source_cover,
-            self.target_collection,
+            self.target_collection.handle(),
         )
         .map_err(|error| ExactDerivedCollectionError::storage("discover exact cover", error))?;
         let reader = store.reader().map_err(|error| {
             ExactDerivedCollectionError::storage("open exact-cover reader", error)
         })?;
 
-        let mut known = BTreeMap::<TypedData, ScratchValue<Source, Target>>::new();
+        let mut known =
+            BTreeMap::<TypedData, ScratchValue<Source::Encoding, Target::Encoding>>::new();
         let mut roots = BTreeSet::new();
-        for member in source_cover.members() {
+        for member_handle in source_cover.members() {
+            let member = Handle::<Source::Encoding>::to_hash(member_handle);
             let node = TypedData::Source(member);
             if !known.contains_key(&node) {
-                let Some(blob) =
-                    load_candidate::<_, Source>(&reader, member, "read source cover member")?
+                let Some(blob) = load_candidate::<_, Source::Encoding>(
+                    &reader,
+                    member,
+                    "read source cover member",
+                )?
                 else {
                     return Err(ExactDerivedCollectionError::IncompleteMember(member));
                 };
@@ -765,17 +707,17 @@ where
                         ),
                     });
                 }
-                algebra
-                    .validate_source(&self.source, &blob)
-                    .map_err(|error| ExactDerivedCollectionError::RejectedMember {
+                Source::validate_member(&self.source, &blob).map_err(|error| {
+                    ExactDerivedCollectionError::RejectedMember {
                         member,
                         reason: match error {
-                            ExactAlgebraError::Fatal(reason) => reason,
-                            ExactAlgebraError::Capacity(reason) => format!(
+                            CollectionLatticeError::Fatal(reason) => reason,
+                            CollectionLatticeError::Capacity(reason) => format!(
                                 "persisted source exceeds representation capacity: {reason}"
                             ),
                         },
-                    })?;
+                    }
+                })?;
                 known.insert(node, ScratchValue::Source(blob));
             }
             roots.insert(node);
@@ -824,14 +766,14 @@ where
             // Decomposition inputs are optional local cache evidence. Never
             // route an absent input through a reader whose miss semantics may
             // record a durable WANT (for example `LazyReader`).
-            let Ok(Some(_)) = reader.metadata(Handle::<Source>::from_hash(member)) else {
+            let Ok(Some(_)) = reader.metadata(Handle::<Source::Encoding>::from_hash(member)) else {
                 continue;
             };
-            let Ok(blob) = reader.get(Handle::<Source>::from_hash(member)) else {
+            let Ok(blob) = reader.get(Handle::<Source::Encoding>::from_hash(member)) else {
                 continue;
             };
             if fresh_data_identity(&blob) != member
-                || algebra.validate_source(&self.source, &blob).is_err()
+                || Source::validate_member(&self.source, &blob).is_err()
             {
                 continue;
             }
@@ -887,7 +829,7 @@ where
             &mut known,
             &self.source,
             &self.target,
-            algebra,
+            &self.homomorphism,
         );
 
         // Only successfully recomputed decompositions become semantic seeds.
@@ -914,11 +856,14 @@ where
 
         // This kernel holds both descriptors, so it can state the lineage the
         // derive records observe.
-        let lineage = BTreeMap::from([(self.target_collection, self.source_collection)]);
+        let lineage = BTreeMap::from([(
+            self.target_collection.handle(),
+            self.source_collection.handle(),
+        )]);
         let explicit_roots: BTreeSet<_> = semantic_roots
             .iter()
             .filter_map(|node| match node {
-                TypedData::Source(member) => Some((self.source_collection, *member)),
+                TypedData::Source(member) => Some((self.source_collection.handle(), *member)),
                 TypedData::Target(_) => None,
             })
             .collect();
@@ -949,7 +894,7 @@ where
             }
         };
 
-        let target = self.target_collection;
+        let target = self.target_collection.handle();
         let logically_supported: BTreeSet<_> = resolution
             .semantics()
             .frontier(target)
@@ -957,8 +902,8 @@ where
             .flatten()
             .flat_map(|data| resolution.semantics().supporting_data(target, *data))
             .collect();
-        let source_members: BTreeSet<_> = source_cover.members().collect();
-        let source = self.source_collection;
+        let source_members: BTreeSet<_> = source_cover.data_members().collect();
+        let source = self.source_collection.handle();
 
         // Compare supports in the source lattice, not as raw handle sets. A
         // validated `a join b = c` makes Covers `{a, b}` and `{c}` distinct
@@ -1000,7 +945,7 @@ where
             target_local,
             &BTreeMap::new(),
             &BTreeSet::new(),
-            |blob| algebra.validate_target(&self.target, blob),
+            |blob| Target::validate_member(&self.target, blob),
         );
         // A speculative offer must never displace a complete resident cover.
         // Only widen physical selection to offered members when local bytes do
@@ -1024,7 +969,7 @@ where
                 target_resident,
                 &BTreeMap::new(),
                 offered_target,
-                |blob| algebra.validate_target(&self.target, blob),
+                |blob| Target::validate_member(&self.target, blob),
             )
         };
 
@@ -1034,7 +979,7 @@ where
         let source_plan_parts = if !plan_source_residual || complete {
             None
         } else {
-            let source = self.source_collection;
+            let source = self.source_collection.handle();
             let source_roots: BTreeMap<_, _> = roots
                 .iter()
                 .filter_map(|node| match (node, known.get(node)) {
@@ -1078,25 +1023,27 @@ where
 
         Ok(ExactProbe {
             reader,
-            target_cover: target_physical.fetch.is_empty().then(|| CoverAttachment {
-                cover: Cover::from_members(
-                    self.target_collection,
-                    target_physical.cover.iter().copied(),
-                ),
-                members: target_physical
-                    .cover
-                    .iter()
-                    .map(|data| {
-                        (
-                            *data,
-                            target_physical
-                                .blobs
-                                .get(data)
-                                .expect("resident target cover retains selected bytes")
-                                .clone(),
-                        )
-                    })
-                    .collect(),
+            target_cover: target_physical.fetch.is_empty().then(|| {
+                CoverAttachment::from_parts(
+                    Cover::from_data(
+                        self.target_collection,
+                        target_physical.cover.iter().copied(),
+                    ),
+                    target_physical
+                        .cover
+                        .iter()
+                        .map(|data| {
+                            (
+                                Handle::<Target::Encoding>::from_hash(*data),
+                                target_physical
+                                    .blobs
+                                    .get(data)
+                                    .expect("resident target cover retains selected bytes")
+                                    .clone(),
+                            )
+                        })
+                        .collect(),
+                )
             }),
             target_fetch: target_physical.fetch,
             missing: target_physical.missing,
@@ -1111,7 +1058,7 @@ where
             discovered
                 .merges()
                 .iter()
-                .filter(|claim| claim.collection() == self.source_collection)
+                .filter(|claim| claim.collection() == self.source_collection.handle())
                 .copied()
                 .map(Candidate::SourceMerge),
         );
@@ -1119,7 +1066,7 @@ where
             discovered
                 .derives()
                 .iter()
-                .filter(|claim| claim.target() == self.target_collection)
+                .filter(|claim| claim.target() == self.target_collection.handle())
                 .copied()
                 .map(Candidate::Derive),
         );
@@ -1127,7 +1074,7 @@ where
             discovered
                 .merges()
                 .iter()
-                .filter(|claim| claim.collection() == self.target_collection)
+                .filter(|claim| claim.collection() == self.target_collection.handle())
                 .copied()
                 .map(Candidate::TargetMerge),
         );
@@ -1138,12 +1085,12 @@ where
     fn contains_typed<R: BlobStoreMeta>(&self, reader: &R, data: TypedData) -> bool {
         match data {
             TypedData::Source(data) => reader
-                .metadata(Handle::<Source>::from_hash(data))
+                .metadata(Handle::<Source::Encoding>::from_hash(data))
                 .ok()
                 .flatten()
                 .is_some(),
             TypedData::Target(data) => reader
-                .metadata(Handle::<Target>::from_hash(data))
+                .metadata(Handle::<Target::Encoding>::from_hash(data))
                 .ok()
                 .flatten()
                 .is_some(),
@@ -1166,16 +1113,16 @@ struct SourcePlan<Source: BlobEncoding> {
     required_members: BTreeSet<CollectionData>,
 }
 
-struct ExactProbe<R, Source: BlobEncoding, Target: BlobEncoding> {
+struct ExactProbe<R, Source: CollectionLattice, Target: CollectionLattice> {
     reader: R,
     target_cover: Option<CoverAttachment<Target>>,
     target_fetch: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,
     unsupported_members: BTreeSet<CollectionData>,
-    source_plan: Option<SourcePlan<Source>>,
+    source_plan: Option<SourcePlan<Source::Encoding>>,
 }
 
-impl<R, Source: BlobEncoding, Target: BlobEncoding> ExactProbe<R, Source, Target> {
+impl<R, Source: CollectionLattice, Target: CollectionLattice> ExactProbe<R, Source, Target> {
     fn is_complete(&self) -> bool {
         self.target_cover.is_some()
             && self.target_fetch.is_empty()
@@ -1199,18 +1146,13 @@ impl<R, Source: BlobEncoding, Target: BlobEncoding> ExactProbe<R, Source, Target
 impl<R, Source, Target> ExactProbe<R, Source, Target>
 where
     R: BlobStoreGet + BlobStoreMeta,
-    Source: BlobEncoding + 'static,
-    Target: BlobEncoding,
-    Handle<Source>: InlineEncoding,
+    Source: CollectionLattice,
+    Target: CollectionLattice,
 {
-    fn source_residual_cover<A>(
+    fn source_residual_cover(
         &self,
-        algebra: &A,
         blocked: &BTreeMap<CollectionData, String>,
-    ) -> Result<Vec<(CollectionData, Blob<Source>)>, ExactDerivedCollectionError>
-    where
-        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
-    {
+    ) -> Result<Vec<(CollectionData, Blob<Source::Encoding>)>, ExactDerivedCollectionError> {
         let Some(plan) = &self.source_plan else {
             return Ok(Vec::new());
         };
@@ -1223,7 +1165,7 @@ where
             resident,
             &plan.mandatory,
             &BTreeSet::new(),
-            |blob| algebra.validate_source(&plan.descriptor, blob),
+            |blob| Source::validate_member(&plan.descriptor, blob),
         );
         if !physical.missing.is_empty() {
             if blocked.is_empty() {
@@ -1288,7 +1230,7 @@ where
     R: BlobStoreGet + BlobStoreMeta,
     E: BlobEncoding + 'static,
     Handle<E>: InlineEncoding,
-    V: Fn(&Blob<E>) -> Result<(), ExactAlgebraError>,
+    V: Fn(&Blob<E>) -> Result<(), CollectionLatticeError>,
 {
     let mut selected = BTreeMap::new();
     loop {
@@ -1344,19 +1286,19 @@ where
     }
 }
 
-fn evaluate_candidates<Source, Target, A>(
+fn evaluate_candidates<Source, Target, Homomorphism>(
     candidates: &[Candidate],
     candidate_indices: &BTreeSet<usize>,
     roots: &BTreeSet<TypedData>,
-    known: &mut BTreeMap<TypedData, ScratchValue<Source, Target>>,
+    known: &mut BTreeMap<TypedData, ScratchValue<Source::Encoding, Target::Encoding>>,
     source_descriptor: &Fragment,
     target_descriptor: &Fragment,
-    algebra: &A,
+    homomorphism: &Homomorphism,
 ) -> (BTreeSet<Id>, BTreeMap<Id, String>)
 where
-    Source: BlobEncoding,
-    Target: BlobEncoding,
-    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    Source: CollectionLattice,
+    Target: CollectionLattice,
+    Homomorphism: CollectionHomomorphism<Source, Target>,
 {
     let mut missing = vec![u8::MAX; candidates.len()];
     let mut waiters = BTreeMap::<TypedData, Vec<usize>>::new();
@@ -1385,15 +1327,21 @@ where
     while let Some((_, _, index)) = ready.pop_first() {
         let candidate = candidates[index];
         let result = candidate.result();
-        match evaluate_candidate(candidate, known, algebra) {
+        match evaluate_candidate::<Source, Target, Homomorphism>(
+            candidate,
+            known,
+            source_descriptor,
+            target_descriptor,
+            homomorphism,
+        ) {
             Ok(value) => {
                 let actual = match &value {
                     ScratchValue::Source(blob) => fresh_data_identity(blob),
                     ScratchValue::Target(blob) => fresh_data_identity(blob),
                 };
                 let representation = match &value {
-                    ScratchValue::Source(blob) => algebra.validate_source(source_descriptor, blob),
-                    ScratchValue::Target(blob) => algebra.validate_target(target_descriptor, blob),
+                    ScratchValue::Source(blob) => Source::validate_member(source_descriptor, blob),
+                    ScratchValue::Target(blob) => Target::validate_member(target_descriptor, blob),
                 };
                 if actual != result.data() {
                     rejected.insert(
@@ -1406,10 +1354,10 @@ where
                     );
                 } else {
                     match representation {
-                        Err(ExactAlgebraError::Fatal(reason)) => {
+                        Err(CollectionLatticeError::Fatal(reason)) => {
                             rejected.insert(candidate.id(), reason);
                         }
-                        Err(ExactAlgebraError::Capacity(reason)) => {
+                        Err(CollectionLatticeError::Capacity(reason)) => {
                             rejected.insert(
                                 candidate.id(),
                                 format!("canonical operation exceeded representation capacity: {reason}"),
@@ -1444,10 +1392,10 @@ where
                     }
                 }
             }
-            Err(ExactAlgebraError::Fatal(reason)) => {
+            Err(CollectionLatticeError::Fatal(reason)) => {
                 rejected.insert(candidate.id(), reason);
             }
-            Err(ExactAlgebraError::Capacity(reason)) => {
+            Err(CollectionLatticeError::Capacity(reason)) => {
                 rejected.insert(
                     candidate.id(),
                     format!("canonical operation exceeded representation capacity: {reason}"),
@@ -1471,53 +1419,55 @@ where
     (accepted, rejected)
 }
 
-fn evaluate_candidate<Source, Target, A>(
+fn evaluate_candidate<Source, Target, Homomorphism>(
     candidate: Candidate,
-    known: &BTreeMap<TypedData, ScratchValue<Source, Target>>,
-    algebra: &A,
-) -> Result<ScratchValue<Source, Target>, ExactAlgebraError>
+    known: &BTreeMap<TypedData, ScratchValue<Source::Encoding, Target::Encoding>>,
+    source_descriptor: &Fragment,
+    target_descriptor: &Fragment,
+    homomorphism: &Homomorphism,
+) -> Result<ScratchValue<Source::Encoding, Target::Encoding>, CollectionLatticeError>
 where
-    Source: BlobEncoding,
-    Target: BlobEncoding,
-    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    Source: CollectionLattice,
+    Target: CollectionLattice,
+    Homomorphism: CollectionHomomorphism<Source, Target>,
 {
     match candidate {
         Candidate::SourceMerge(claim) => {
             let (low, high) = claim.inputs();
             let Some(ScratchValue::Source(low)) = known.get(&TypedData::Source(low)) else {
-                return Err(ExactAlgebraError::Fatal(
+                return Err(CollectionLatticeError::Fatal(
                     "source merge became ready without its low input".to_owned(),
                 ));
             };
             let Some(ScratchValue::Source(high)) = known.get(&TypedData::Source(high)) else {
-                return Err(ExactAlgebraError::Fatal(
+                return Err(CollectionLatticeError::Fatal(
                     "source merge became ready without its high input".to_owned(),
                 ));
             };
-            algebra.join_source(low, high).map(ScratchValue::Source)
+            Source::merge_members(source_descriptor, low, high).map(ScratchValue::Source)
         }
         Candidate::Derive(claim) => {
             let input = claim.mapping().0;
             let Some(ScratchValue::Source(input)) = known.get(&TypedData::Source(input)) else {
-                return Err(ExactAlgebraError::Fatal(
+                return Err(CollectionLatticeError::Fatal(
                     "derive became ready without its source input".to_owned(),
                 ));
             };
-            algebra.derive(input).map(ScratchValue::Target)
+            homomorphism.map(input).map(ScratchValue::Target)
         }
         Candidate::TargetMerge(claim) => {
             let (low, high) = claim.inputs();
             let Some(ScratchValue::Target(low)) = known.get(&TypedData::Target(low)) else {
-                return Err(ExactAlgebraError::Fatal(
+                return Err(CollectionLatticeError::Fatal(
                     "target merge became ready without its low input".to_owned(),
                 ));
             };
             let Some(ScratchValue::Target(high)) = known.get(&TypedData::Target(high)) else {
-                return Err(ExactAlgebraError::Fatal(
+                return Err(CollectionLatticeError::Fatal(
                     "target merge became ready without its high input".to_owned(),
                 ));
             };
-            algebra.join_target(low, high).map(ScratchValue::Target)
+            Target::merge_members(target_descriptor, low, high).map(ScratchValue::Target)
         }
     }
 }

@@ -69,10 +69,11 @@ use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
-use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
+use triblespace_core::collection::succinctarchive_union::{
+    SimpleArchiveToSuccinctArchive, SuccinctArchiveCollection, SuccinctArchiveUnion,
+};
 use triblespace_core::collection::{simplearchive_union, CollectionStoreExt};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
@@ -785,12 +786,14 @@ fn main() {
             // Inspect the raw physical cover outside the timer. This reports
             // construction shape without charging validation a second time to
             // the build metric.
-            let exact = ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob>::new(
-                succinct.source_descriptor(),
-                succinct.descriptor(),
-            );
+            let exact = ExactDerivedCollection::<
+                simplearchive_union::SimpleArchiveUnion,
+                SuccinctArchiveUnion,
+                SimpleArchiveToSuccinctArchive,
+            >::new(succinct.source_descriptor(), succinct.descriptor())
+            .expect("bind exact raw Succinct projection");
             let raw_cover = exact
-                .attach_exact(&mut store, &cover, &succinct)
+                .attach_exact(&mut store, &cover)
                 .expect("reattach exact raw cover for metrics");
             let shape = BuildShape {
                 source_cover_members: cover.len(),

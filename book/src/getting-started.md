@@ -157,9 +157,10 @@ for (first, last, quote) in find!(
 `snapshot()` admits the descriptor authority plus explicitly supplied
 delegated presentations at one clock instant. It opens one target blob-reader
 view and materializes facts solely from the resulting exact payload cover. The
-returned `CollectionSnapshot` keeps facts, its `Cover`, and reader together. A concurrent
-commit may appear on this call or a later call, but physically visible blobs
-from an unobserved commit cannot leak into the snapshot's admitted set.
+returned `Snapshot<SimpleArchiveUnion, TribleSet, R>` keeps facts, its typed
+`Cover<SimpleArchiveUnion>`, and reader together. A concurrent commit may
+appear on this call or a later call, but physically visible blobs from an
+unobserved commit cannot leak into the snapshot's admitted set.
 
 Use `storage.cover(library, presentations)` when only the exact payload
 frontier is needed. It verifies presentations and scans native collection
@@ -190,7 +191,8 @@ the chosen backend rather than collection policy.
 
 - `entity!` builds intrinsic entities and carries required blobs.
 - `Fragment` is the self-contained publication value.
-- A collection value is its descriptor handle; the store owns all I/O.
+- `Collection<L>` is a descriptor handle statically bound to its member
+  encoding and join law; the store owns all I/O.
 - `store.commit` publishes one signed, independent member without conflating
   local storage with network authorization.
 - `store.snapshot` returns one coherent known-prefix view admitted by the

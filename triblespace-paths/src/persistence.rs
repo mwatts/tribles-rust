@@ -5,7 +5,9 @@ use std::fmt;
 use triblespace_core::blob::{Blob, BlobEncoding};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
+use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
+use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::{attributes, entity};
@@ -27,6 +29,32 @@ attributes! {
     /// Canonical BLAKE3 fingerprint of the fixed path automaton. Minted with
     /// `trible genid` on 2026-07-28.
     "77DF5A905CCE3B0643BB02999F73BE4C" unsafe as pub path_automaton_fingerprint: Hash<Blake3>;
+    /// Number of states in the canonical path automaton. Minted with
+    /// `trible genid` on 2026-08-29.
+    "562D157447DBE25FE8E6DCB95C5A5AB4" as pub path_automaton_state_count: U256BE;
+    /// Initial state of the canonical path automaton. Repeated on the
+    /// collection descriptor. Minted with `trible genid` on 2026-08-29.
+    "EE0D84553EB07FD3E75CD2709ED50E79" as pub path_automaton_initial_state: U256BE;
+    /// Accepting state of the canonical path automaton. Repeated on the
+    /// collection descriptor. Minted with `trible genid` on 2026-08-29.
+    "4D10E8C83A816E1D888AD243B1DBD5C7" as pub path_automaton_accepting_state: U256BE;
+    /// Intrinsic transition entity belonging to the canonical path automaton.
+    /// Repeated on the collection descriptor. Minted with `trible genid` on
+    /// 2026-08-29.
+    "4828A5918A259F89038041053EA720CC" as pub path_automaton_transition: GenId;
+    /// Source state of one path-automaton transition. Minted with
+    /// `trible genid` on 2026-08-29.
+    "15FBA850D9AC99B7CF8D7842FC5F77B3" as pub path_transition_from: U256BE;
+    /// Target state of one path-automaton transition. Minted with
+    /// `trible genid` on 2026-08-29.
+    "A8F46B12D94B7400F052C45ED579873E" as pub path_transition_to: U256BE;
+    /// Canonical transition opcode: forward, reverse, forward-except, or
+    /// reverse-except. Minted with `trible genid` on 2026-08-29.
+    "08B0B01EFE6E68AB85DF4F0967D914B8" as pub path_transition_kind: U256BE;
+    /// Attribute label carried by one transition. Exact forward/reverse
+    /// transitions have one; exclusion transitions have zero or more. Minted
+    /// with `trible genid` on 2026-08-29.
+    "FD88EA3256CD24545BEB7759E7DBA6FA" as pub path_transition_label: U256BE;
 }
 
 /// Canonical direct-product summary bytes for one fixed automaton.
@@ -337,9 +365,9 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
 /// The path-summary law.
 ///
 /// This names the law only. *Which* automaton a summary is over is an argument
-/// carried on the collection descriptor as `path_automaton_fingerprint`, not
-/// folded into this id: a digest of an automaton that is stored nowhere would
-/// leave the collection's meaning unrecoverable from the pile.
+/// carried canonically on the collection descriptor, not folded into this id.
+/// The fingerprint remains a compact integrity check, while the state and
+/// transition facts make the law recoverable from the descriptor itself.
 pub const PATH_SUMMARY_RECIPE_V1: Id =
     triblespace_core::id_hex!("341216BFE738E2D82BFFF96F52E7FE06");
 
@@ -352,7 +380,7 @@ impl MetaDescribe for PathSummaryV1 {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "path-summary-v1",
-                metadata::description: "Summary of the vertex pairs connected by a fixed regular path automaton, unioned across a collection's elements. Union is associative, commutative and idempotent, so summaries merge without regard to order. Takes one argument, carried as a trible on the collection descriptor: `path_automaton_fingerprint`, the digest of the epsilon-free automaton the summary is over. A different automaton is a different collection, because it answers a different question.",
+                metadata::description: "Summary of the vertex pairs connected by a fixed regular path automaton, unioned across a collection's elements. Union is associative, commutative and idempotent, so summaries merge without regard to order. The complete canonical epsilon-free automaton is carried as descriptor facts, with `path_automaton_fingerprint` as a compact integrity check. A different automaton is a different collection because it answers a different question.",
                 metadata::tag: metadata::KIND_COLLECTION_RECIPE,
         }
     }

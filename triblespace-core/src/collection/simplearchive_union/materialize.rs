@@ -12,7 +12,69 @@ use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, TribleSet};
 
 use super::{join_many, validate_descriptor, SimpleArchiveUnionValidationError};
-use crate::collection::{collection_physical_cover, CollectionData, CollectionSemantics};
+use crate::collection::{
+    collection_physical_cover, CollectionData, CollectionSemantics, CoverAttachment, TryFromCover,
+};
+
+use super::SimpleArchiveUnion;
+
+/// Failure to form a logical fact union from an already validated exact cover.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactViewError {
+    /// Member whose canonical bytes failed to decode.
+    pub member: CollectionData,
+    /// Exact SimpleArchive decoding failure.
+    pub source: UnarchiveError,
+}
+
+impl fmt::Display for FactViewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "collection member {} could not form the fact view: {}",
+            hex::encode_upper(self.member.raw),
+            self.source,
+        )
+    }
+}
+
+impl Error for FactViewError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl TryFromCover<SimpleArchiveUnion> for TribleSet {
+    type Error = FactViewError;
+
+    fn try_from_cover(
+        attachment: CoverAttachment<SimpleArchiveUnion>,
+    ) -> Result<Self, Self::Error> {
+        let members = attachment.into_members();
+        match members.as_slice() {
+            [] => Ok(TribleSet::new()),
+            [(handle, blob)] => blob
+                .clone()
+                .try_from_blob()
+                .map_err(|source| FactViewError {
+                    member: Handle::<SimpleArchive>::to_hash(*handle),
+                    source,
+                }),
+            _ => {
+                let union = join_many(members.iter().map(|(_, blob)| blob)).map_err(
+                    |(index, source)| FactViewError {
+                        member: Handle::<SimpleArchive>::to_hash(members[index].0),
+                        source,
+                    },
+                )?;
+                union.try_from_blob().map_err(|source| FactViewError {
+                    member: Handle::<SimpleArchive>::to_hash(members[0].0),
+                    source,
+                })
+            }
+        }
+    }
+}
 
 /// Failure to materialize one resolved `SimpleArchive` union collection.
 #[derive(Debug)]

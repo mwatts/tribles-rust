@@ -8,12 +8,12 @@ use std::io;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::collection::simplearchive_union::SimpleArchiveUnion;
 use triblespace::core::collection::succinctarchive_union::{
     SuccinctArchiveCollection, SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    reach, simplearchive_union, CollectionHandle, CollectionStoreExt, Cover,
-    SimpleArchiveCollection,
+    reach, simplearchive_union, Collection, CollectionStoreExt, FactCover, SimpleArchiveCollection,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -22,10 +22,10 @@ use triblespace::prelude::*;
 // ANCHOR: collection_pattern_changes_observe
 fn observe(
     store: &mut MemoryRepo,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchiveUnion>,
     simple: &SimpleArchiveCollection,
     full_view: &mut SuccinctArchiveView,
-    checkpoint: &mut Option<Cover>,
+    checkpoint: &mut Option<FactCover>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let current = store.cover(collection, &[])?;
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let source_reach = reach::private();
     let simple = SimpleArchiveCollection::new(name, authority, source_reach.clone());
     let mut store = MemoryRepo::default();
-    let collection = store.collection(simplearchive_union::descriptor(
+    let collection = store.collection::<SimpleArchiveUnion>(simplearchive_union::descriptor(
         name,
         authority,
         source_reach.clone(),

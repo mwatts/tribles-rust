@@ -69,6 +69,28 @@ where
     }
 }
 
+impl Encodes<Fragment> for SimpleArchive
+where
+    crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
+{
+    type Output = Blob<SimpleArchive>;
+
+    fn encode(source: Fragment) -> Blob<SimpleArchive> {
+        <SimpleArchive as Encodes<TribleSet>>::encode(source.into_facts())
+    }
+}
+
+impl Encodes<&Fragment> for SimpleArchive
+where
+    crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
+{
+    type Output = Blob<SimpleArchive>;
+
+    fn encode(source: &Fragment) -> Blob<SimpleArchive> {
+        <SimpleArchive as Encodes<&TribleSet>>::encode(source.facts())
+    }
+}
+
 /// Error returned when deserializing a [`SimpleArchive`] blob into a [`TribleSet`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnarchiveError {
@@ -327,6 +349,9 @@ fn check_archive_run_boundaries(runs: &[&[[u8; 64]]]) -> Result<(), UnarchiveErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::IntoBlob;
+    use crate::macros::entity;
+    use crate::metadata;
     use crate::patch::{KeySchema, PATCH};
     use crate::trible::{AEVOrder, AVEOrder, EAVOrder, EVAOrder, VAEOrder, VEAOrder};
     use std::hint::black_box;
@@ -356,6 +381,21 @@ mod tests {
         assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
         let bytes: Bytes = rows.into();
         Blob::new(bytes)
+    }
+
+    #[test]
+    fn fragment_encoding_archives_only_content_facts() {
+        let fragment = entity! { _ @
+            metadata::description: "content",
+        };
+        assert!(!fragment.metafacts().is_empty());
+
+        let expected = fragment.facts().to_blob();
+        let owned: Blob<SimpleArchive> = fragment.clone().to_blob();
+        let borrowed: Blob<SimpleArchive> = (&fragment).to_blob();
+
+        assert_eq!(owned, expected);
+        assert_eq!(borrowed, expected);
     }
 
     fn blob_from_rows(rows: Vec<[u8; 64]>) -> Blob<SimpleArchive> {

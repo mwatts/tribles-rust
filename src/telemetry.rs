@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::core::collection::{reach, simplearchive_union, CollectionHandle, CollectionStoreExt};
+use crate::core::collection::{reach, simplearchive_union, Collection, CollectionStoreExt};
 use crate::core::metadata;
 use crate::core::repo::pile::{Pile, ReadError};
 use crate::prelude::blobencodings::UTF8String;
@@ -175,7 +175,7 @@ struct TelemetryInner {
 
 struct TelemetryDestination {
     pile: Pile,
-    collection: CollectionHandle,
+    collection: Collection<simplearchive_union::SimpleArchiveUnion>,
     signing_key: SigningKey,
 }
 

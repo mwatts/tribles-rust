@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a typed collection-lattice API above the representation-neutral wire
+  records. `Collection<L>` validates a descriptor's encoding and recipe,
+  `Cover<L>` carries only `Handle<L::Encoding>` members, and
+  `TryFromCover<L>` reconstructs either eager values or lazy mmap-backed
+  unions. Generic `store.commit`, `cover`, `snapshot`, and `materialize`
+  operations now work across encodings. Exact derivations bind one
+  `CollectionHomomorphism<Source, Target>` at construction; source/target
+  validation and joins live on their lattice types, so callers cannot swap a
+  runtime algebra between operations.
+
 - Add an exact maintained last-write-wins register collection. Its canonical
   projection keeps state identity and raw order facts as two independently
   unionable row sets, so the derivation remains a join homomorphism when those
@@ -20,11 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Make `SuccinctArchiveView` continuation reuse directly observable through a
   last-successful-work report. It distinguishes newly admitted from retained
-  payload members and counts the actual raw validation, derivation, and join
-  calls made by that observation. The evolving-collection benchmark now labels
-  its stateless post-timing proof replay separately from maintained-view work,
-  proving that an identical cover performs zero algebra/storage work and a
-  monotone extension admits only its payload delta.
+  payload members and counts the actual source-to-target derivations made by
+  that observation. The evolving-collection benchmark now labels its stateless
+  post-timing proof replay separately from maintained-view work, proving that
+  an identical cover performs zero algebra/storage work and a monotone
+  extension admits only its payload delta.
 
 - Add an end-to-end incremental collection-query benchmark comparing full
   re-query with `pattern_changes!` maintenance over source-identical exact
@@ -725,10 +735,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DERIVE`.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
-  garbage collection. A five-operation representation algebra validates the
-  fixed descriptors and terminal artifacts while a descriptor-typed evaluator
-  walks backwards from resident source and target results, then reconstructs
-  every candidate path forwards from explicit source-cover leaves. Computed
+  garbage collection. Descriptor-typed lattice methods validate fixed
+  descriptors and terminal artifacts while the evaluator walks backwards from
+  resident source and target results, then reconstructs every candidate path
+  forwards from explicit source-cover leaves. Computed
   intermediates have use-counted scratch lifetimes and are never persisted.
   Selected optional artifacts are freshly hashed and representation-validated;
   invalid cache bytes are removed and the deterministic physical cover is
@@ -738,8 +748,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the missing canonical cache endpoints and is write-free again once the
   exact fibers are resident.
 
-  The five-operation algebra now returns one typed
-  `ExactAlgebraError::{Fatal, Capacity}`. `Capacity` is reserved for
+  Lattice operations return
+  `CollectionLatticeError::{Fatal, Capacity}`. `Capacity` is reserved for
   deterministic fixed-representation geometry, never transient allocation,
   I/O, or malformed persisted bytes. When a selected source upper exceeds that
   geometry, completion excludes it and globally replans the physical cover

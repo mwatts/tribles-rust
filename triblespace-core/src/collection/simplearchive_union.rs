@@ -55,8 +55,8 @@ use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::descriptor as descriptor_facts;
 use super::{
-    CollectionCommit, CollectionData, CollectionHandle, CollectionMerge, CollectionRecord,
-    CollectionStore,
+    CollectionCommit, CollectionData, CollectionHandle, CollectionLattice, CollectionLatticeError,
+    CollectionMerge, CollectionRecord, CollectionStore,
 };
 
 mod collection;
@@ -87,6 +87,32 @@ impl MetaDescribe for TribleSetUnionV1 {
                 metadata::description: "Set union of the tribles carried by a collection's elements. Associative, commutative and idempotent, so any two states have a least upper bound and merging is order-independent: a collection's value is the union over every element committed to it, and two replicas that have seen the same elements agree regardless of the order they arrived in. Takes no arguments.",
                 metadata::tag: metadata::KIND_COLLECTION_RECIPE,
         }
+    }
+}
+
+/// The canonical SimpleArchive representation of the trible-set union law.
+///
+/// The recipe is intentionally shared with the Succinct representation; this
+/// marker names their representation-and-law pair at the Rust API boundary.
+pub struct SimpleArchiveUnion;
+
+impl CollectionLattice for SimpleArchiveUnion {
+    type Encoding = SimpleArchive;
+    type Recipe = TribleSetUnionV1;
+
+    fn validate_member(
+        _descriptor: &Fragment,
+        member: &Blob<Self::Encoding>,
+    ) -> Result<(), CollectionLatticeError> {
+        validate_element(member).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
+    }
+
+    fn merge_members(
+        _descriptor: &Fragment,
+        low: &Blob<Self::Encoding>,
+        high: &Blob<Self::Encoding>,
+    ) -> Result<Blob<Self::Encoding>, CollectionLatticeError> {
+        join(low, high).map_err(|source| CollectionLatticeError::Fatal(source.to_string()))
     }
 }
 

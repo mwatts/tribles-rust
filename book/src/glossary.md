@@ -76,11 +76,14 @@ another principal from silently becoming an admission decision.
 A self-describing grow-only join semilattice. Signed commits introduce members;
 validated merge records describe joins within the lattice; derivation records
 map elements into another collection through a canonical homomorphism. A
-collection has no distinguished head.
+collection has no distinguished head. In Rust, `Collection<L>` is the cheap
+descriptor handle after the runtime representation and recipe have been
+validated against the lattice type `L`.
 
 ### Cover
-One exact point in a collection lattice, represented by the collection
-descriptor identity and a PATCH set of distinct payload handles. Signatures,
+One exact point in a collection lattice, represented by a typed collection
+descriptor and a PATCH set of distinct `Handle<L::Encoding>` payload handles.
+Signatures,
 authors, and metadata are optional provenance fibers queryable from the store,
 not part of cover identity or required for replay, so several claims over
 identical data collapse to one member. Distinct covers may have the same
@@ -110,9 +113,10 @@ A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
 idempotent by intrinsic record ID; combining two stores is set union.
 
 ### Collection Snapshot
-One coherent known-prefix observation containing materialized facts, the exact
-payload `Cover` which names them, and the blob reader which validated their
-dependencies.
+One coherent known-prefix observation `Snapshot<L, V, R>` containing a logical
+value `V`, the exact typed payload `Cover<L>` which names it, and the blob
+reader which validated its dependencies. `TryFromCover<L>` controls whether
+`V` eagerly joins member bytes or retains them as a lazy sharded view.
 
 ### CONNECT
 The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a

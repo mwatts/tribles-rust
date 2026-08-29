@@ -17,8 +17,8 @@ use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::Inline;
 
 use super::{
-    CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
-    CollectionRecordSelector, CollectionStore, CommitVerificationError, Cover,
+    CollectionCommit, CollectionDerive, CollectionHandle, CollectionLattice, CollectionMerge,
+    CollectionRecord, CollectionRecordSelector, CollectionStore, CommitVerificationError, Cover,
 };
 
 /// Failure to use one opaque payload cover with an exact collection recipe.
@@ -202,15 +202,16 @@ where
 /// The cover already crossed admission or validated collection algebra when
 /// it was constructed. Replaying it therefore needs equations, not another
 /// signature scan over provenance claims for the same payloads.
-pub(crate) fn discover_collection_records_for_derived_cover<S>(
+pub(crate) fn discover_collection_records_for_derived_cover<S, L>(
     store: &mut S,
-    cover: &Cover,
+    cover: &Cover<L>,
     target: CollectionHandle,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
+    L: CollectionLattice,
 {
-    let source = cover.collection();
+    let source = cover.collection().handle();
     let mut selectors = BTreeSet::new();
     selectors.insert(CollectionRecordSelector::MergeCollection(source));
     selectors.insert(CollectionRecordSelector::MergeCollection(target));
@@ -222,42 +223,45 @@ where
 ///
 /// The cover is already an opaque constructed value, so this
 /// path deliberately does not select or verify provenance commits.
-pub(crate) fn discover_collection_equations_for_cover<S>(
+pub(crate) fn discover_collection_equations_for_cover<S, L>(
     store: &mut S,
-    cover: &Cover,
+    cover: &Cover<L>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
+    L: CollectionLattice,
 {
     let selectors = BTreeSet::from([CollectionRecordSelector::MergeCollection(
-        cover.collection(),
+        cover.collection().handle(),
     )]);
     discover_collection_records_for_cover_selectors(store, cover, &selectors)
 }
 
 /// Discover every strictly signed provenance claim currently known for one
 /// exact payload cover.
-pub(crate) fn discover_collection_claims_for_cover<S>(
+pub(crate) fn discover_collection_claims_for_cover<S, L>(
     store: &mut S,
-    cover: &Cover,
+    cover: &Cover<L>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
+    L: CollectionLattice,
 {
     let selectors: BTreeSet<_> = cover
-        .members()
-        .map(|member| CollectionRecordSelector::CommitMember(cover.collection(), member))
+        .data_members()
+        .map(|member| CollectionRecordSelector::CommitMember(cover.collection().handle(), member))
         .collect();
     discover_collection_records_for_cover_selectors(store, cover, &selectors)
 }
 
-fn discover_collection_records_for_cover_selectors<S>(
+fn discover_collection_records_for_cover_selectors<S, L>(
     store: &mut S,
-    cover: &Cover,
+    cover: &Cover<L>,
     selectors: &BTreeSet<CollectionRecordSelector>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
+    L: CollectionLattice,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
@@ -268,7 +272,8 @@ where
     for record in records {
         match record {
             CollectionRecord::Commit(record)
-                if record.collection() == cover.collection() && cover.contains(record.data()) =>
+                if record.collection() == cover.collection().handle()
+                    && cover.contains_data(record.data()) =>
             {
                 matching_commits.push(record);
             }
@@ -493,7 +498,10 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
 
-    use crate::collection::{empty_metadata_handle, CollectionData, CollectionHandle};
+    use crate::blob::encodings::simplearchive::SimpleArchive;
+    use crate::collection::simplearchive_union::SimpleArchiveUnion;
+    use crate::collection::{empty_metadata_handle, Collection, CollectionData, FactCover};
+    use crate::inline::encodings::hash::Handle;
     use crate::inline::Inline;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -531,12 +539,16 @@ mod tests {
         }
     }
 
-    fn hash(byte: u8) -> CollectionData {
+    fn data(byte: u8) -> CollectionData {
         Inline::new([byte; 32])
     }
 
-    fn collection(byte: u8) -> CollectionHandle {
+    fn member(byte: u8) -> Inline<Handle<SimpleArchive>> {
         Inline::new([byte; 32])
+    }
+
+    fn collection(byte: u8) -> Collection<SimpleArchiveUnion> {
+        Collection::from_handle(Inline::new([byte; 32]))
     }
 
     fn signer(key: &SigningKey) -> Inline<ED25519PublicKey> {
@@ -559,29 +571,29 @@ mod tests {
     #[test]
     fn cover_additions_are_payload_set_difference() {
         let target = collection(1);
-        let previous = Cover::from_members(target, [hash(2), hash(1), hash(1)]);
-        let current = Cover::from_members(target, [hash(3), hash(1), hash(2), hash(3)]);
+        let previous = FactCover::from_members(target, [member(2), member(1), member(1)]);
+        let current = FactCover::from_members(target, [member(3), member(1), member(2), member(3)]);
 
         let additions = current.additions_since(&previous).unwrap();
-        assert_eq!(additions.members().collect::<Vec<_>>(), vec![hash(3)]);
+        assert_eq!(additions.members().collect::<Vec<_>>(), vec![member(3)]);
         assert!(current.additions_since(&current).unwrap().is_empty());
     }
 
     #[test]
     fn cover_additions_reject_shrink_and_cross_collection() {
-        let first = Cover::from_members(collection(1), [hash(1)]);
-        let empty = Cover::from_members(collection(1), []);
+        let first = FactCover::from_members(collection(1), [member(1)]);
+        let empty = FactCover::from_members(collection(1), []);
         assert_eq!(
             empty.additions_since(&first),
-            Err(crate::collection::CoverAdvanceError::ResetRequired { missing: hash(1) })
+            Err(crate::collection::CoverAdvanceError::ResetRequired { missing: data(1) })
         );
 
-        let foreign = Cover::from_members(collection(2), [hash(1)]);
+        let foreign = FactCover::from_members(collection(2), [member(1)]);
         assert_eq!(
             foreign.additions_since(&first),
             Err(crate::collection::CoverAdvanceError::DifferentCollection {
-                previous: collection(1),
-                current: collection(2),
+                previous: collection(1).handle(),
+                current: collection(2).handle(),
             })
         );
     }
@@ -589,12 +601,12 @@ mod tests {
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
-            collection(1),
-            hash(4),
+            collection(1).handle(),
+            data(4),
             empty_metadata_handle(),
         );
-        let merge = CollectionMerge::new(collection(1), hash(4), hash(5), hash(6));
-        let derive = CollectionDerive::new(collection(7), hash(4), hash(8));
+        let merge = CollectionMerge::new(collection(1).handle(), data(4), data(5), data(6));
+        let derive = CollectionDerive::new(collection(7).handle(), data(4), data(8));
 
         let invalid_commit = invalid_signature(commit);
 
@@ -616,19 +628,19 @@ mod tests {
         let other = collection(3);
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
-            source,
-            hash(4),
+            source.handle(),
+            data(4),
             empty_metadata_handle(),
         );
-        let source_merge = CollectionMerge::new(source, hash(4), hash(5), hash(6));
-        let target_merge = CollectionMerge::new(target, hash(7), hash(8), hash(9));
-        let derive = CollectionDerive::new(target, hash(6), hash(7));
-        let unrelated_merge = CollectionMerge::new(other, hash(10), hash(11), hash(12));
-        let unrelated_derive = CollectionDerive::new(other, hash(6), hash(13));
+        let source_merge = CollectionMerge::new(source.handle(), data(4), data(5), data(6));
+        let target_merge = CollectionMerge::new(target.handle(), data(7), data(8), data(9));
+        let derive = CollectionDerive::new(target.handle(), data(6), data(7));
+        let unrelated_merge = CollectionMerge::new(other.handle(), data(10), data(11), data(12));
+        let unrelated_derive = CollectionDerive::new(other.handle(), data(6), data(13));
         let unrelated_commit = invalid_signature(CollectionCommit::sign(
             &SigningKey::from_bytes(&[8; 32]),
-            other,
-            hash(14),
+            other.handle(),
+            data(14),
             empty_metadata_handle(),
         ));
         let mut physical = vec![
@@ -646,9 +658,11 @@ mod tests {
             ..ProbeStore::default()
         };
 
-        let cover = Cover::from_members(source, [commit.data()]);
+        let cover =
+            FactCover::from_members(source, [Handle::<SimpleArchive>::from_hash(commit.data())]);
         let discovered =
-            discover_collection_records_for_derived_cover(&mut store, &cover, target).unwrap();
+            discover_collection_records_for_derived_cover(&mut store, &cover, target.handle())
+                .unwrap();
 
         let mut expected_merges = vec![source_merge, target_merge];
         expected_merges.sort_unstable_by_key(CollectionMerge::id);
@@ -694,29 +708,33 @@ mod tests {
         let other = collection(2);
         let authorized_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
-        let valid =
-            CollectionCommit::sign(&authorized_key, target, hash(1), empty_metadata_handle());
+        let valid = CollectionCommit::sign(
+            &authorized_key,
+            target.handle(),
+            data(1),
+            empty_metadata_handle(),
+        );
         let relevant_invalid = invalid_signature(CollectionCommit::sign(
             &authorized_key,
-            target,
-            hash(2),
+            target.handle(),
+            data(2),
             empty_metadata_handle(),
         ));
         let wrong_collection = invalid_signature(CollectionCommit::sign(
             &authorized_key,
-            other,
-            hash(3),
+            other.handle(),
+            data(3),
             empty_metadata_handle(),
         ));
         let wrong_signer = invalid_signature(CollectionCommit::sign(
             &foreign_key,
-            target,
-            hash(4),
+            target.handle(),
+            data(4),
             empty_metadata_handle(),
         ));
-        let target_merge = CollectionMerge::new(target, hash(1), hash(2), hash(5));
-        let other_merge = CollectionMerge::new(other, hash(3), hash(4), hash(6));
-        let crossing_derive = CollectionDerive::new(other, hash(5), hash(6));
+        let target_merge = CollectionMerge::new(target.handle(), data(1), data(2), data(5));
+        let other_merge = CollectionMerge::new(other.handle(), data(3), data(4), data(6));
+        let crossing_derive = CollectionDerive::new(other.handle(), data(5), data(6));
 
         let mut store = ProbeStore {
             records: [
@@ -734,9 +752,12 @@ mod tests {
             ..ProbeStore::default()
         };
 
-        let discovered =
-            discover_collection_records_scoped(&mut store, target, signer(&authorized_key))
-                .unwrap();
+        let discovered = discover_collection_records_scoped(
+            &mut store,
+            target.handle(),
+            signer(&authorized_key),
+        )
+        .unwrap();
 
         assert_eq!(discovered.commits(), &[valid]);
         assert_eq!(
@@ -764,13 +785,13 @@ mod tests {
 
         let template = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
-            target,
-            hash(1),
+            target.handle(),
+            data(1),
             empty_metadata_handle(),
         );
         let (r, s) = template.signature();
         let invalid_key_commit = CollectionCommit::from_parts(
-            target,
+            target.handle(),
             template.data(),
             template.metadata(),
             invalid_signer,
@@ -783,7 +804,8 @@ mod tests {
         };
 
         let discovered =
-            discover_collection_records_scoped(&mut store, target, invalid_signer).unwrap();
+            discover_collection_records_scoped(&mut store, target.handle(), invalid_signer)
+                .unwrap();
         assert!(discovered.commits().is_empty());
         assert_eq!(
             discovered.diagnostics(),
@@ -803,27 +825,47 @@ mod tests {
         let authorized_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
         let matching = [
-            CollectionCommit::sign(&authorized_key, target, hash(1), empty_metadata_handle()),
-            CollectionCommit::sign(&authorized_key, target, hash(2), empty_metadata_handle()),
+            CollectionCommit::sign(
+                &authorized_key,
+                target.handle(),
+                data(1),
+                empty_metadata_handle(),
+            ),
+            CollectionCommit::sign(
+                &authorized_key,
+                target.handle(),
+                data(2),
+                empty_metadata_handle(),
+            ),
         ];
         let records = vec![
             CollectionRecord::Commit(CollectionCommit::sign(
                 &foreign_key,
-                target,
-                hash(3),
+                target.handle(),
+                data(3),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(other, hash(3), hash(4), hash(5))),
+            CollectionRecord::Merge(CollectionMerge::new(
+                other.handle(),
+                data(3),
+                data(4),
+                data(5),
+            )),
             CollectionRecord::Commit(matching[1]),
-            CollectionRecord::Derive(CollectionDerive::new(target, hash(5), hash(2))),
+            CollectionRecord::Derive(CollectionDerive::new(target.handle(), data(5), data(2))),
             CollectionRecord::Commit(CollectionCommit::sign(
                 &authorized_key,
-                other,
-                hash(4),
+                other.handle(),
+                data(4),
                 empty_metadata_handle(),
             )),
             CollectionRecord::Commit(matching[0]),
-            CollectionRecord::Merge(CollectionMerge::new(target, hash(1), hash(2), hash(6))),
+            CollectionRecord::Merge(CollectionMerge::new(
+                target.handle(),
+                data(1),
+                data(2),
+                data(6),
+            )),
         ];
         let mut full_store = ProbeStore {
             records: records.iter().copied().map(Ok).collect(),
@@ -835,15 +877,19 @@ mod tests {
         };
 
         let full = discover_collection_records(&mut full_store).unwrap();
-        let scoped =
-            discover_collection_records_scoped(&mut scoped_store, target, signer(&authorized_key))
-                .unwrap();
+        let scoped = discover_collection_records_scoped(
+            &mut scoped_store,
+            target.handle(),
+            signer(&authorized_key),
+        )
+        .unwrap();
         let expected_commits: Vec<_> = full
             .commits()
             .iter()
             .copied()
             .filter(|commit| {
-                commit.collection() == target && commit.public_key() == signer(&authorized_key)
+                commit.collection() == target.handle()
+                    && commit.public_key() == signer(&authorized_key)
             })
             .collect();
 
@@ -863,8 +909,8 @@ mod tests {
             .map(|byte| {
                 let commit = CollectionCommit::sign(
                     &authorized_key,
-                    target,
-                    hash(byte),
+                    target.handle(),
+                    data(byte),
                     empty_metadata_handle(),
                 );
                 CollectionRecord::Commit(if byte % 3 == 0 {
@@ -889,8 +935,12 @@ mod tests {
                     records: records.iter().copied().map(Ok).collect(),
                     ..ProbeStore::default()
                 };
-                discover_collection_records_scoped(&mut store, target, signer(&authorized_key))
-                    .unwrap()
+                discover_collection_records_scoped(
+                    &mut store,
+                    target.handle(),
+                    signer(&authorized_key),
+                )
+                .unwrap()
             })
         };
 
@@ -947,7 +997,7 @@ mod tests {
         assert!(matches!(
             discover_collection_records_scoped(
                 &mut scoped_failure,
-                collection(99),
+                collection(99).handle(),
                 signer(&SigningKey::from_bytes(&[9; 32])),
             ),
             Err(CollectionDiscoveryError::Records(ProbeRecordsError(

@@ -959,7 +959,7 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
         let signing_key = SigningKey::generate(&mut OsRng);
         let authority = signing_key.verifying_key();
         let collection = storage
-            .collection(simplearchive_union::descriptor(
+            .collection::<simplearchive_union::SimpleArchiveUnion>(simplearchive_union::descriptor(
                 "materialize-bench",
                 authority,
                 reach::private(),
@@ -985,7 +985,7 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
             }
             total_tribles += commit_data.len() as u64;
             storage
-                .commit(collection, &signing_key, commit_data.into())
+                .commit(collection, &signing_key, Fragment::from(commit_data))
                 .expect("publish collection commit");
         }
 
@@ -993,7 +993,7 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("materialize", n_commits), |b| {
             b.iter(|| {
                 storage
-                    .snapshot(collection, &[])
+                    .snapshot::<TribleSet, _>(collection, &[])
                     .expect("materialize collection")
             });
         });

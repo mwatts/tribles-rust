@@ -17,9 +17,10 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::reach;
-use triblespace_core::collection::records::CollectionHandle;
-use triblespace_core::collection::simplearchive_union::{self, PreparedCollectionCommit};
-use triblespace_core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace_core::collection::simplearchive_union::{
+    self, PreparedCollectionCommit, SimpleArchiveUnion,
+};
+use triblespace_core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::shortstring::ShortString;
@@ -84,7 +85,7 @@ fn migrate(
 ) -> Result<(
     MigrationReport,
     Vec<(CommitHandle, CollectionCommit)>,
-    CollectionHandle,
+    Collection<SimpleArchiveUnion>,
 )> {
     // Freeze the mutable names first, then take one append-only blob view.
     // A concurrent append may enter the later reader, but cannot change the
@@ -117,7 +118,7 @@ fn migrate(
     let mut mappings = Vec::with_capacity(authored);
     for (source, prepared) in prepared {
         let staged = prepared
-            .stage_for(pile, collection, signer)
+            .stage_for(pile, collection.handle(), signer)
             .map_err(|error| anyhow!("stage native collection commit: {error}"))?;
         let commit = staged
             .finalize()
@@ -381,7 +382,7 @@ fn handle_hex(handle: ArchiveHandle) -> String {
 fn print_report(
     pile_path: &PathBuf,
     name: &str,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchiveUnion>,
     authority: VerifyingKey,
     signer: VerifyingKey,
     report: MigrationReport,
@@ -398,7 +399,10 @@ fn print_report(
     );
     println!("collection name: {name}");
     println!("authority: {}", hex::encode_upper(authority.to_bytes()));
-    println!("collection: blake3:{}", hex::encode(collection.raw));
+    println!(
+        "collection: blake3:{}",
+        hex::encode(collection.handle().raw)
+    );
     println!("target signer: {}", hex::encode_upper(signer.to_bytes()));
     println!("SOURCE COMMIT                                                     TARGET COMMIT");
     for (source, target) in mappings {
@@ -596,7 +600,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .any(|record| {
-                matches!(record, CollectionRecord::Commit(commit) if commit.collection() == collection)
+                matches!(record, CollectionRecord::Commit(commit) if commit.collection() == collection.handle())
             }));
         pile.close()?;
         Ok(())
@@ -639,7 +643,7 @@ mod tests {
         let mut mappings = Vec::new();
         for (source, prepared) in prepared {
             let target = prepared
-                .stage_for(&mut pile, collection, &signer)
+                .stage_for(&mut pile, collection.handle(), &signer)
                 .map_err(|error| anyhow!("stage test migration: {error}"))?
                 .finalize()
                 .map_err(|error| anyhow!("finalize test migration: {error}"))?;

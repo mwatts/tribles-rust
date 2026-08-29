@@ -23,8 +23,12 @@ pub use constraint::PathConstraint;
 pub use expr::PathExpr;
 pub use index::PathIndex;
 pub use path_collection::{PathSummaryCollection, PathSummaryCollectionError};
+pub use path_summary_union::{PathSummaryUnion, PathSummaryView, SimpleArchiveToPathSummary};
 pub use persistence::{
-    automaton_fingerprint, path_automaton_fingerprint, PathSummaryBlob, PathSummaryBlobError,
+    automaton_fingerprint, path_automaton_accepting_state, path_automaton_fingerprint,
+    path_automaton_initial_state, path_automaton_state_count, path_automaton_transition,
+    path_transition_from, path_transition_kind, path_transition_label, path_transition_to,
+    PathSummaryBlob, PathSummaryBlobError,
 };
 pub use summary::{GraphEdge, PathError, PathSummary};
 

@@ -12,13 +12,13 @@ use std::error::Error;
 use std::fmt;
 
 use anybytes::Bytes;
-use triblespace_core::blob::{Blob, BlobEncoding};
+use triblespace_core::blob::Blob;
 use triblespace_core::collection::exact_derived::{
-    CoverAttachment, ExactAttachPlan, ExactDerivedAlgebra, ExactDerivedCollection,
-    ExactDerivedCollectionError,
+    ExactAttachPlan, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use triblespace_core::collection::{
-    CollectionData, CollectionRecord, CollectionRecordSelector, CollectionStore, Cover,
+    CollectionData, CollectionHomomorphism, CollectionLattice, CollectionRecord,
+    CollectionRecordSelector, CollectionStore, Cover, CoverAttachment,
 };
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -106,11 +106,10 @@ impl From<ExactDerivedCollectionError> for ExactDerivedSyncError {
 /// residency, and shrink after every attempted fetch. The operation therefore
 /// terminates even when every offer is stale. Exact fetches neither create
 /// durable [`WantStore`] entries nor change collection authority.
-pub async fn ensure_exact_derived<S, Source, Target, A>(
+pub async fn ensure_exact_derived<S, Source, Target, Homomorphism>(
     peer: &mut Peer<S>,
-    lifecycle: &ExactDerivedCollection<Source, Target>,
-    source_cover: &Cover,
-    algebra: &A,
+    lifecycle: &ExactDerivedCollection<Source, Target, Homomorphism>,
+    source_cover: &Cover<Source>,
 ) -> Result<CoverAttachment<Target>, ExactDerivedSyncError>
 where
     S: BlobStore
@@ -125,15 +124,15 @@ where
         + Send
         + 'static,
     S::Reader: BlobStoreMeta,
-    Source: BlobEncoding + 'static,
-    Target: BlobEncoding + 'static,
-    Handle<Source>: InlineEncoding,
-    Handle<Target>: InlineEncoding,
-    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+    Source: CollectionLattice,
+    Target: CollectionLattice,
+    Homomorphism: CollectionHomomorphism<Source, Target>,
+    Handle<Source::Encoding>: InlineEncoding,
+    Handle<Target::Encoding>: InlineEncoding,
 {
     if source_cover.is_empty() {
         return lifecycle
-            .attach_exact(&mut *peer.store(), source_cover, algebra)
+            .attach_exact(&mut *peer.store(), source_cover)
             .map_err(Into::into);
     }
 
@@ -145,8 +144,8 @@ where
     let mut offered = {
         let mut store = peer.store();
         let selectors = BTreeSet::from([
-            CollectionRecordSelector::MergeCollection(lifecycle.target_collection()),
-            CollectionRecordSelector::DeriveTarget(lifecycle.target_collection()),
+            CollectionRecordSelector::MergeCollection(lifecycle.target_collection().handle()),
+            CollectionRecordSelector::DeriveTarget(lifecycle.target_collection().handle()),
         ]);
         store
             .select_records(&selectors)
@@ -159,6 +158,7 @@ where
                 CollectionRecord::Merge(merge) => Some(merge.result()),
                 CollectionRecord::Derive(derive) => Some(derive.mapping().1),
             })
+            .map(Handle::<Target::Encoding>::from_hash)
             .collect::<BTreeSet<_>>()
     };
 
@@ -170,7 +170,7 @@ where
     'replan: loop {
         let plan = {
             let mut store = peer.store();
-            lifecycle.probe_exact(&mut *store, source_cover, algebra, &offered)
+            lifecycle.probe_exact(&mut *store, source_cover, &offered)
         };
         match plan {
             Ok(ExactAttachPlan::Ready(cover)) => return Ok(cover),
@@ -188,22 +188,27 @@ where
                         offered.remove(&expected);
                         continue 'replan;
                     };
-                    let blob = Blob::<Target>::new(Bytes::from(raw));
-                    let actual = Handle::<Target>::to_hash(blob.get_handle());
+                    let blob = Blob::<Target::Encoding>::new(Bytes::from(raw));
+                    let actual = blob.get_handle();
                     if actual != expected {
                         // `fetch_blob` already checks this. Keep the boundary
                         // explicit so a future transport cannot weaken it.
                         offered.remove(&expected);
                         continue 'replan;
                     }
-                    let landed = peer.store().put::<Target, _>(blob).map_err(|error| {
-                        ExactDerivedSyncError::storage("land fetched target artifact", error)
-                    })?;
-                    let landed = Handle::<Target>::to_hash(landed);
+                    let landed =
+                        peer.store()
+                            .put::<Target::Encoding, _>(blob)
+                            .map_err(|error| {
+                                ExactDerivedSyncError::storage(
+                                    "land fetched target artifact",
+                                    error,
+                                )
+                            })?;
                     if landed != expected {
                         return Err(ExactDerivedSyncError::LandingIdentity {
-                            expected,
-                            actual: landed,
+                            expected: Handle::<Target::Encoding>::to_hash(expected),
+                            actual: Handle::<Target::Encoding>::to_hash(landed),
                         });
                     }
                     // Local residency, freshly re-read by the next probe, now
@@ -215,7 +220,7 @@ where
             Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {
                 let mut store = peer.store();
                 return lifecycle
-                    .ensure_exact(&mut *store, source_cover, algebra)
+                    .ensure_exact(&mut *store, source_cover)
                     .map_err(Into::into);
             }
             Err(error) => return Err(error.into()),
