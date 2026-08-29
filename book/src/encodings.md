@@ -168,11 +168,12 @@ The crate also ships with these blob encodings:
   `MappingEvidence(mapping, raw, sidecar)`. Rank9 is not a
   `CollectionEncoding`: a sidecar cannot join without the raw archive it
   indexes, so presenting it as an independent target collection would expose a
-  law its bytes cannot implement. Pair admission freshly checks both
-  content hashes, the embedded source handle, native format fields, and the
-  exact raw/index relationship. The Rank9-index validation pass is linear and
-  does not allocate a replacement index; rebuilding the query runtime still
-  allocates its runtime arena and views.
+  law its bytes cannot implement. Pair admission trusts the content identities
+  cached by `Blob`/`BlobStore`, then checks the embedded source handle, native
+  format fields, and exact raw/index structure without hashing either artifact
+  again. The Rank9-index validation pass is linear and does not allocate a
+  replacement index; rebuilding the query runtime still allocates its runtime
+  arena and views.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 

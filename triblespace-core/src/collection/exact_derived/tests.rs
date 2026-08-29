@@ -19,7 +19,7 @@ use crate::collection::simplearchive_union;
 use crate::collection::CollectionCommit;
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
-use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::MemoryRepo;
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut};
@@ -1809,14 +1809,6 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof()
     ] {
         store.insert(CollectionRecord::Merge(claim)).unwrap();
     }
-    let wrong = derive(&archive([(9, 9)])).unwrap();
-    store
-        .put::<TestTargetBlob, _>(Blob::<TestTargetBlob>::with_handle(
-            wrong.bytes,
-            old_upper.get_handle(),
-        ))
-        .unwrap();
-
     let before = kernel().attach_exact(&mut store, &source_cover).unwrap();
     assert_eq!(before.len(), 3);
     let after = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
@@ -2391,94 +2383,6 @@ fn unrelated_and_rejected_offers_never_become_fetch_work() {
             panic!("unrelated or rejected offers became fetch work: {fetch:?}")
         }
         Ok(ExactAttachPlan::Ready(_)) => panic!("rejected equation completed the cover"),
-    }
-}
-
-#[test]
-fn corrupt_offered_upper_replans_to_valid_resident_lowers() {
-    let sources = [archive([(1, 3)]), archive([(2, 4)])];
-    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
-    let mut store = MemoryRepo::default();
-    let commits: Vec<_> = sources
-        .iter()
-        .enumerate()
-        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
-        .collect();
-    let source_cover = source_cover(&commits);
-    for (source, target) in sources.iter().zip(&targets) {
-        store.put::<TestTargetBlob, _>(target.clone()).unwrap();
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection().handle(),
-                data(source),
-                data(target),
-            )))
-            .unwrap();
-    }
-    store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection().handle(),
-            data(&targets[0]),
-            data(&targets[1]),
-            data(&upper),
-        )))
-        .unwrap();
-    let wrong = derive(&archive([(9, 9)])).unwrap();
-    store
-        .put::<TestTargetBlob, _>(Blob::<TestTargetBlob>::with_handle(
-            wrong.bytes,
-            upper.get_handle(),
-        ))
-        .unwrap();
-
-    let offered = BTreeSet::from([upper.get_handle()]);
-    match kernel()
-        .probe_exact(&mut store, &source_cover, &offered)
-        .unwrap()
-    {
-        ExactAttachPlan::Ready(cover) => {
-            let expected: Vec<_> = targets
-                .iter()
-                .map(data)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            assert_eq!(cover_ids(&cover), expected);
-        }
-        ExactAttachPlan::Fetch(fetch) => {
-            panic!("corrupt local upper became a remote fetch request: {fetch:?}")
-        }
-    }
-}
-
-#[test]
-fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
-    let source = archive([(1, 3)]);
-    let expected = derive(&source).unwrap();
-    let wrong = archive([(9, 9)]);
-    let forged = Blob::<TestTargetBlob>::with_handle(wrong.bytes.clone(), expected.get_handle());
-    let mut store = MemoryRepo::default();
-    let commit = source_commit(&mut store, 1, &source);
-    let source_cover = source_cover(&[commit]);
-    store.put::<TestTargetBlob, _>(forged).unwrap();
-    store
-        .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_collection().handle(),
-            data(&source),
-            data(&expected),
-        )))
-        .unwrap();
-
-    // Scratch reconstruction proves the canonical DERIVE equation without
-    // trusting these bytes. Physical-cover admission then freshly hashes the
-    // forged resident artifact, removes it from the optional candidate set,
-    // and reports the target incomplete rather than granting cache corruption
-    // authority or failing unrelated evidence globally.
-    match kernel().attach_exact(&mut store, &source_cover) {
-        Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
-        Err(error) => panic!("unexpected corrupt-cache error: {error:?}"),
-        Ok(_) => panic!("corrupt unsigned output was incorrectly admitted"),
     }
 }
 

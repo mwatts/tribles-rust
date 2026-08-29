@@ -135,8 +135,8 @@ impl Error for CollectionAdmissionError {
     }
 }
 
-/// Failure while reading and exact-validating a collection descriptor by its
-/// content identity.
+/// Failure while reading and structurally validating a collection descriptor
+/// by its content identity.
 #[derive(Debug)]
 pub enum CollectionDescriptorError<ReaderError, GetError> {
     /// The blob-reader snapshot could not be created.
@@ -147,13 +147,6 @@ pub enum CollectionDescriptorError<ReaderError, GetError> {
         collection: CollectionHandle,
         /// Backend fetch failure.
         source: GetError,
-    },
-    /// Returned bytes did not hash to the requested collection identity.
-    Identity {
-        /// Requested collection identity.
-        expected: CollectionHandle,
-        /// Identity recomputed from the returned bytes.
-        actual: CollectionHandle,
     },
     /// The bytes were not a canonical, generically well-formed descriptor.
     Invalid {
@@ -179,12 +172,6 @@ where
                 "failed to fetch collection descriptor {}: {source}",
                 hex::encode_upper(collection.raw),
             ),
-            Self::Identity { expected, actual } => write!(
-                formatter,
-                "collection descriptor bytes hash to {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
             Self::Invalid { collection, source } => write!(
                 formatter,
                 "collection descriptor {} is invalid: {source}",
@@ -203,7 +190,6 @@ where
         match self {
             Self::Reader(source) => Some(source),
             Self::Get { source, .. } => Some(source),
-            Self::Identity { .. } => None,
             Self::Invalid { source, .. } => Some(source),
         }
     }
@@ -516,8 +502,6 @@ pub type FactSnapshot<R> = Snapshot<SimpleArchive, TribleSet, R>;
 pub enum CollectionCoverError<RecordsError, ReaderError, GetError> {
     /// The collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<ReaderError, GetError>),
-    /// The descriptor names another encoding or invalid encoding context.
-    WrongType(CollectionTypeError),
     /// One explicitly supplied capability proof was invalid at this operation's
     /// single clock observation.
     Admission(CollectionAdmissionError),
@@ -535,7 +519,6 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
-            Self::WrongType(source) => write!(formatter, "wrong collection type: {source}"),
             Self::Admission(source) => source.fmt(formatter),
             Self::Discovery(source) => source.fmt(formatter),
         }
@@ -552,7 +535,6 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Descriptor(source) => Some(source),
-            Self::WrongType(source) => Some(source),
             Self::Admission(source) => Some(source),
             Self::Discovery(source) => Some(source),
         }
@@ -564,8 +546,6 @@ where
 pub enum CollectionCommitError<ReaderError, GetError, PutError, InsertError> {
     /// The named collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<ReaderError, GetError>),
-    /// The descriptor names another encoding or invalid encoding context.
-    WrongType(CollectionTypeError),
     /// The encoded member is not a canonical element of the collection lattice.
     InvalidMember(CollectionOperationError),
     /// A described attachment, member, or metadata archive could not be stored.
@@ -585,7 +565,6 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
-            Self::WrongType(source) => write!(formatter, "wrong collection type: {source}"),
             Self::InvalidMember(source) => write!(formatter, "invalid collection member: {source}"),
             Self::DependencyPut(source) => {
                 write!(formatter, "failed to store collection dependency: {source}")
@@ -608,7 +587,6 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Descriptor(source) => Some(source),
-            Self::WrongType(source) => Some(source),
             Self::InvalidMember(source) => Some(source),
             Self::DependencyPut(source) => Some(source),
             Self::RecordInsert(source) => Some(source),
@@ -627,8 +605,6 @@ where
 pub enum CollectionMaterializationError<RecordsError, ReaderError, GetError, ViewError> {
     /// One explicitly supplied capability proof was invalid.
     Admission(CollectionAdmissionError),
-    /// The descriptor names another encoding or invalid encoding context.
-    WrongType(CollectionTypeError),
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
     /// A supplied exact cover names the wrong collection descriptor.
@@ -647,20 +623,6 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, GetError, Vie
         collection: CollectionHandle,
         /// Structural descriptor decoding failure.
         source: RecordDecodeError,
-    },
-    /// The fetched descriptor bytes did not hash to the handle named by the
-    /// cover.
-    DescriptorIdentity {
-        /// Descriptor handle named by the cover.
-        expected: CollectionHandle,
-        /// Handle recomputed from the fetched bytes.
-        actual: CollectionHandle,
-    },
-    /// The fetched canonical descriptor did not equal the descriptor expected
-    /// by this facade.
-    DescriptorMismatch {
-        /// Descriptor handle named by this facade and cover.
-        collection: CollectionHandle,
     },
     /// The blob reader could not be created after record discovery.
     Reader(ReaderError),
@@ -706,15 +668,10 @@ impl<RecordsError, ReaderError, GetError, ViewError>
                 collection,
                 source,
             }) => Self::DescriptorGet { collection, source },
-            CollectionCoverError::Descriptor(CollectionDescriptorError::Identity {
-                expected,
-                actual,
-            }) => Self::DescriptorIdentity { expected, actual },
             CollectionCoverError::Descriptor(CollectionDescriptorError::Invalid {
                 collection,
                 source,
             }) => Self::InvalidDescriptor { collection, source },
-            CollectionCoverError::WrongType(source) => Self::WrongType(source),
             CollectionCoverError::Admission(source) => Self::Admission(source),
             CollectionCoverError::Discovery(source) => Self::Discovery(source),
         }
@@ -730,9 +687,6 @@ impl<RecordsError, ReaderError, GetError, ViewError>
             CollectionDescriptorError::Reader(source) => Self::Reader(source),
             CollectionDescriptorError::Get { collection, source } => {
                 Self::DescriptorGet { collection, source }
-            }
-            CollectionDescriptorError::Identity { expected, actual } => {
-                Self::DescriptorIdentity { expected, actual }
             }
             CollectionDescriptorError::Invalid { collection, source } => {
                 Self::InvalidDescriptor { collection, source }
@@ -752,7 +706,6 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Admission(source) => source.fmt(f),
-            Self::WrongType(source) => write!(f, "wrong collection type: {source}"),
             Self::Discovery(source) => source.fmt(f),
             Self::ExactCover(source) => write!(f, "invalid exact cover: {source}"),
             Self::DescriptorGet { collection, source } => write!(
@@ -763,17 +716,6 @@ where
             Self::InvalidDescriptor { collection, source } => write!(
                 f,
                 "collection descriptor {} is invalid: {source}",
-                hex::encode_upper(collection.raw),
-            ),
-            Self::DescriptorIdentity { expected, actual } => write!(
-                f,
-                "collection descriptor bytes hash to {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-            Self::DescriptorMismatch { collection } => write!(
-                f,
-                "collection descriptor {} does not match the facade descriptor",
                 hex::encode_upper(collection.raw),
             ),
             Self::Reader(source) => write!(f, "failed to open collection blob view: {source}"),
@@ -809,12 +751,10 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Admission(source) => Some(source),
-            Self::WrongType(source) => Some(source),
             Self::Discovery(source) => Some(source),
             Self::ExactCover(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
             Self::InvalidDescriptor { source, .. } => Some(source),
-            Self::DescriptorIdentity { .. } | Self::DescriptorMismatch { .. } => None,
             Self::Reader(source) => Some(source),
             Self::MemberGet { source, .. } => Some(source),
             Self::InvalidMember { source, .. } => Some(source),
@@ -904,14 +844,6 @@ where
     let descriptor_blob: Blob<SimpleArchive> = reader
         .get(collection)
         .map_err(|source| CollectionDescriptorError::Get { collection, source })?;
-    let descriptor_blob = Blob::<SimpleArchive>::new(descriptor_blob.bytes.clone());
-    let actual = descriptor_blob.get_handle();
-    if actual != collection {
-        return Err(CollectionDescriptorError::Identity {
-            expected: collection,
-            actual,
-        });
-    }
     let facts =
         <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(descriptor_blob)
             .map_err(|source| CollectionDescriptorError::Invalid {
@@ -975,8 +907,6 @@ where
 {
     let loaded = load_collection_descriptor(store, collection.handle())
         .map_err(CollectionCoverError::Descriptor)?;
-    super::encoding::validate_descriptor_type::<L>(&loaded.fragment)
-        .map_err(CollectionCoverError::WrongType)?;
     let admitted = admitted_subjects_at(
         loaded.authority,
         collection.handle(),
@@ -1032,8 +962,8 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     ///
     /// This performs no capability check. Local storage is a grow-only claim
     /// ledger; authority is applied only by [`cover`](Self::cover) and
-    /// [`snapshot`](Self::snapshot). The descriptor is fetched and
-    /// exact-validated before dependencies are staged, and the signed record is
+    /// [`snapshot`](Self::snapshot). The descriptor is fetched and structurally
+    /// decoded before dependencies are staged, and the signed record is
     /// inserted last without an implicit durability flush.
     fn commit<L, T>(
         &mut self,
@@ -1058,8 +988,6 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     {
         let loaded = load_collection_descriptor(self, collection.handle())
             .map_err(CollectionCommitError::Descriptor)?;
-        super::encoding::validate_descriptor_type::<L>(&loaded.fragment)
-            .map_err(CollectionCommitError::WrongType)?;
 
         // Description happens before the value is consumed by its encoding.
         // A Fragment description deliberately retains its shared blob store,
@@ -1255,33 +1183,9 @@ where
         });
     }
 
-    // The descriptor handle is the collection identity. A nonempty cover makes
-    // its descriptor and named payloads mandatory ground truth. Fetch by
-    // the exact handle, recompute the identity rather than trusting a
-    // cached handle, decode the canonical archive, and bind it back to the
-    // facade's expected semantics before interpreting any element.
-    let descriptor_blob: Blob<SimpleArchive> = reader
-        .get(collection)
-        .map_err(|source| CollectionMaterializationError::DescriptorGet { collection, source })?;
-    let descriptor_blob = Blob::<SimpleArchive>::new(descriptor_blob.bytes.clone());
-    let actual_descriptor = descriptor_blob.get_handle();
-    if actual_descriptor != collection {
-        return Err(CollectionMaterializationError::DescriptorIdentity {
-            expected: collection,
-            actual: actual_descriptor,
-        });
-    }
-    let decoded_descriptor =
-        <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(descriptor_blob)
-            .map_err(|source| CollectionMaterializationError::InvalidDescriptor {
-                collection,
-                source: RecordDecodeError::from(source),
-            })?;
-    if decoded_descriptor != *descriptor.facts() {
-        return Err(CollectionMaterializationError::DescriptorMismatch { collection });
-    }
-    super::encoding::validate_descriptor_type::<L>(descriptor)
-        .map_err(CollectionMaterializationError::WrongType)?;
+    // The descriptor was bound to this typed collection before this coherent
+    // reader was opened. Its immutable content address already binds these
+    // facts; another fetch cannot strengthen that proof.
 
     // Fetch and validate each cover payload exactly once. Claims, authorship,
     // and metadata are intentionally absent: replay remains valid even when no
@@ -1399,8 +1303,9 @@ where
                             joined = Some(value);
                             Some(expected)
                         }
-                        // `known` contains only exact-validated canonical
-                        // elements, so this is a defensive invariant guard.
+                        // `known` contains only structurally validated members,
+                        // so this is a defensive invariant guard around the
+                        // encoding's join implementation.
                         Err(_) => None,
                     }
                 }
@@ -1534,13 +1439,7 @@ where
             let actual: Result<Blob<L>, _> = reader.get(handle);
             match actual {
                 Ok(actual) => {
-                    let actual = Blob::<L>::new(actual.bytes.clone());
-                    let actual_data = Handle::<L>::to_hash(actual.get_handle());
-                    if actual_data == data && L::validate_member(descriptor, &actual).is_ok() {
-                        selected.insert(data, actual);
-                    } else {
-                        rejected.push(data);
-                    }
+                    selected.insert(data, actual);
                 }
                 Err(_) => rejected.push(data),
             }
@@ -1563,7 +1462,7 @@ where
         } else {
             selected
                 .get(&data)
-                .expect("optional cover members were exact-validated")
+                .expect("selected optional cover members stay cached")
         };
         members.push((Handle::<L>::from_hash(data), (*blob).clone()));
     }

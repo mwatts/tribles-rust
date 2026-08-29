@@ -39,8 +39,7 @@ use crate::blob::encodings::succinctarchive::{
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
 use crate::id_hex;
-use crate::inline::encodings::hash::{Blake3, Hash};
-use crate::inline::Inline;
+use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
 
 use super::{
@@ -143,105 +142,101 @@ impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for SimpleToSuccinctM
     }
 }
 
-/// Rank9 mapping algorithm for 32-bit little-endian targets.
+/// Rank9 sidecar mapping algorithm for 32-bit little-endian targets.
 ///
-/// Minted with `trible genid` on 2026-08-14. The profile pins the current portable
+/// Minted with `trible genid` on 2026-08-29. The profile pins the current portable
 /// SuccinctArchive source schema, detached Rank9 format
 /// marker/version/flags, the canonical Rank9 builder and Jerky serialization
 /// epoch, pointer width, and byte order. Any change that can alter canonical
 /// sidecar bytes requires a newly minted mapping id.
-pub const RANK9_MAPPING_V1_32_LE: Id = id_hex!("0685616E15F332468977EB59BDA4EB9D");
+pub const RANK9_SIDECAR_MAPPING_V1_32_LE: Id = id_hex!("6359769178CE0E7FBAFCC4CF5E96BF65");
 
-/// Rank9 mapping algorithm for 32-bit big-endian targets.
+/// Rank9 sidecar mapping algorithm for 32-bit big-endian targets.
 ///
-/// Minted with `trible genid` on 2026-08-14; see
-/// [`RANK9_MAPPING_V1_32_LE`] for the versioning contract.
-pub const RANK9_MAPPING_V1_32_BE: Id = id_hex!("154A792188583355B1CDAA9910E60748");
+/// Minted with `trible genid` on 2026-08-29; see
+/// [`RANK9_SIDECAR_MAPPING_V1_32_LE`] for the versioning contract.
+pub const RANK9_SIDECAR_MAPPING_V1_32_BE: Id = id_hex!("BE9B5E3778FB726BE8C2318E9810EC6E");
 
-/// Rank9 mapping algorithm for 64-bit little-endian targets.
+/// Rank9 sidecar mapping algorithm for 64-bit little-endian targets.
 ///
-/// Minted with `trible genid` on 2026-08-14; see
-/// [`RANK9_MAPPING_V1_32_LE`] for the versioning contract.
-pub const RANK9_MAPPING_V1_64_LE: Id = id_hex!("E4A77808BBF9E373244789F007E81261");
+/// Minted with `trible genid` on 2026-08-29; see
+/// [`RANK9_SIDECAR_MAPPING_V1_32_LE`] for the versioning contract.
+pub const RANK9_SIDECAR_MAPPING_V1_64_LE: Id = id_hex!("61381B137469F022DA76C24A270C43A4");
 
-/// Rank9 mapping algorithm for 64-bit big-endian targets.
+/// Rank9 sidecar mapping algorithm for 64-bit big-endian targets.
 ///
-/// Minted with `trible genid` on 2026-08-14; see
-/// [`RANK9_MAPPING_V1_32_LE`] for the versioning contract.
-pub const RANK9_MAPPING_V1_64_BE: Id = id_hex!("A470EAEB76777091CE795D9B108C79D0");
+/// Minted with `trible genid` on 2026-08-29; see
+/// [`RANK9_SIDECAR_MAPPING_V1_32_LE`] for the versioning contract.
+pub const RANK9_SIDECAR_MAPPING_V1_64_BE: Id = id_hex!("80FCF163F890DECB6CA532B7CA79E2BD");
 
-/// The exact Rank9 mapping for this ABI, as a describable algorithm.
-// The historical name and description below participate in the content address
-// of `rank9_mapping_fragment()`. Their lifted-collection vocabulary is frozen
-// format identity, not the current model: Rank9 now publishes one-to-one
-// MappingEvidence and has no independent collection join.
-pub struct Rank9MappingV1_32Le;
+/// The exact Rank9 sidecar mapping for this ABI.
+pub struct Rank9SidecarMappingV1_32Le;
 
-impl MetaDescribe for Rank9MappingV1_32Le {
+impl MetaDescribe for Rank9SidecarMappingV1_32Le {
     fn describe() -> Fragment {
-        let id: Id = RANK9_MAPPING_V1_32_LE;
+        let id: Id = RANK9_SIDECAR_MAPPING_V1_32_LE;
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-lifted-union-v1-32-le",
-                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 32-bit pointer width and little-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::name: "rank9-sidecar-mapping-v1-32-le",
+                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 32-bit pointer width and little-endian byte order.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The exact Rank9 mapping for this ABI, as a describable algorithm.
-pub struct Rank9MappingV1_32Be;
+/// The exact Rank9 sidecar mapping for this ABI.
+pub struct Rank9SidecarMappingV1_32Be;
 
-impl MetaDescribe for Rank9MappingV1_32Be {
+impl MetaDescribe for Rank9SidecarMappingV1_32Be {
     fn describe() -> Fragment {
-        let id: Id = RANK9_MAPPING_V1_32_BE;
+        let id: Id = RANK9_SIDECAR_MAPPING_V1_32_BE;
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-lifted-union-v1-32-be",
-                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 32-bit pointer width and big-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::name: "rank9-sidecar-mapping-v1-32-be",
+                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 32-bit pointer width and big-endian byte order.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The exact Rank9 mapping for this ABI, as a describable algorithm.
-pub struct Rank9MappingV1_64Le;
+/// The exact Rank9 sidecar mapping for this ABI.
+pub struct Rank9SidecarMappingV1_64Le;
 
-impl MetaDescribe for Rank9MappingV1_64Le {
+impl MetaDescribe for Rank9SidecarMappingV1_64Le {
     fn describe() -> Fragment {
-        let id: Id = RANK9_MAPPING_V1_64_LE;
+        let id: Id = RANK9_SIDECAR_MAPPING_V1_64_LE;
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-lifted-union-v1-64-le",
-                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 64-bit pointer width and little-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::name: "rank9-sidecar-mapping-v1-64-le",
+                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 64-bit pointer width and little-endian byte order.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// The exact Rank9 mapping for this ABI, as a describable algorithm.
-pub struct Rank9MappingV1_64Be;
+/// The exact Rank9 sidecar mapping for this ABI.
+pub struct Rank9SidecarMappingV1_64Be;
 
-impl MetaDescribe for Rank9MappingV1_64Be {
+impl MetaDescribe for Rank9SidecarMappingV1_64Be {
     fn describe() -> Fragment {
-        let id: Id = RANK9_MAPPING_V1_64_BE;
+        let id: Id = RANK9_SIDECAR_MAPPING_V1_64_BE;
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "rank9-lifted-union-v1-64-be",
-                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 64-bit pointer width and big-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::name: "rank9-sidecar-mapping-v1-64-be",
+                metadata::description: "Canonical one-to-one mapping from one portable SuccinctArchive member to its detached, source-bound Rank9/select accelerator. The mapping identity pins everything that can change canonical sidecar bytes: the source schema, Rank9 format marker, version and flags, canonical builder and Jerky serialization epoch, and the target's 64-bit pointer width and big-endian byte order.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
 #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_32_LE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_32_LE;
 #[cfg(all(target_pointer_width = "32", target_endian = "big"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_32_BE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_32_BE;
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_64_LE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_64_LE;
 #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-const CURRENT_RANK9_MAPPING: Id = RANK9_MAPPING_V1_64_BE;
+const CURRENT_RANK9_MAPPING: Id = RANK9_SIDECAR_MAPPING_V1_64_BE;
 
 /// Mapping algorithm id for the exact Rank9 ABI supported by this build.
 pub const fn current_rank9_mapping_algorithm() -> Id {
@@ -250,19 +245,19 @@ pub const fn current_rank9_mapping_algorithm() -> Id {
 
 #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
 fn current_rank9_mapping_description() -> Fragment {
-    Rank9MappingV1_32Le::describe()
+    Rank9SidecarMappingV1_32Le::describe()
 }
 #[cfg(all(target_pointer_width = "32", target_endian = "big"))]
 fn current_rank9_mapping_description() -> Fragment {
-    Rank9MappingV1_32Be::describe()
+    Rank9SidecarMappingV1_32Be::describe()
 }
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
 fn current_rank9_mapping_description() -> Fragment {
-    Rank9MappingV1_64Le::describe()
+    Rank9SidecarMappingV1_64Le::describe()
 }
 #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
 fn current_rank9_mapping_description() -> Fragment {
-    Rank9MappingV1_64Be::describe()
+    Rank9SidecarMappingV1_64Be::describe()
 }
 
 /// ABI-qualified mapping identity for raw SuccinctArchive members to detached
@@ -362,13 +357,13 @@ pub enum SuccinctArchiveUnionValidationError {
         /// Descriptor named by the record.
         actual: CollectionHandle,
     },
-    /// Supplied bytes do not have the content identity named by the record.
+    /// The supplied blob's trusted cached identity differs from the record.
     EndpointMismatch {
         /// Endpoint being checked.
         role: ElementRole,
         /// Identity named by the record.
         expected: CollectionData,
-        /// Fresh identity computed from the supplied bytes.
+        /// Cached identity carried by the supplied blob.
         actual: CollectionData,
     },
     /// The SimpleArchive source could not be canonically converted.
@@ -554,8 +549,9 @@ pub fn validate_derive(
 
 /// Validate an exact canonical raw SuccinctArchive union equation.
 ///
-/// All three endpoint identities are recomputed from bytes. The raw merge
-/// exact-validates both inputs while constructing their canonical union;
+/// All three endpoint identities are checked through their trusted cached
+/// handles. The raw merge structurally validates both inputs while constructing
+/// their canonical union;
 /// byte-for-byte equality with that union proves the claimed result canonical.
 pub fn validate_merge(
     descriptor: &Fragment,
@@ -647,7 +643,7 @@ fn validate_endpoint<S: BlobEncoding>(
     expected: CollectionData,
     blob: &Blob<S>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    let actual = data_identity(blob);
+    let actual = Handle::<S>::to_hash(blob.get_handle());
     if actual != expected {
         return Err(SuccinctArchiveUnionValidationError::EndpointMismatch {
             role,
@@ -656,10 +652,6 @@ fn validate_endpoint<S: BlobEncoding>(
         });
     }
     Ok(())
-}
-
-fn data_identity<S: BlobEncoding>(blob: &Blob<S>) -> CollectionData {
-    Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes))
 }
 
 #[cfg(test)]
@@ -697,6 +689,10 @@ mod tests {
             facts.insert(&Trible::force_raw(row).unwrap());
         }
         facts.to_blob()
+    }
+
+    fn data_identity<S: BlobEncoding>(blob: &Blob<S>) -> CollectionData {
+        Handle::<S>::to_hash(blob.get_handle())
     }
 
     fn ordered<'a, S: BlobEncoding>(

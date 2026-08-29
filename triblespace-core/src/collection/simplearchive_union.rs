@@ -42,7 +42,10 @@ use crate::blob::Blob;
 use crate::id::Id;
 #[cfg(test)]
 use crate::id_hex;
-use crate::inline::encodings::hash::{Blake3, Handle, Hash};
+use crate::inline::encodings::hash::Handle;
+#[cfg(test)]
+use crate::inline::encodings::hash::{Blake3, Hash};
+#[cfg(test)]
 use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 use crate::repo::{
@@ -116,7 +119,7 @@ pub enum SimpleArchiveUnionValidationError {
         expected: CollectionHandle,
         actual: CollectionHandle,
     },
-    /// Supplied bytes do not have the content identity named by the record.
+    /// The supplied blob's trusted cached identity differs from the record.
     EndpointMismatch {
         role: ElementRole,
         expected: CollectionData,
@@ -214,9 +217,9 @@ pub type PreparationError = PublicationError<Infallible, Infallible>;
 
 /// A canonical collection commit whose bytes have not been published.
 ///
-/// Preparation validates and normalizes the descriptor, data, metadata, and
-/// embedded fragment blobs entirely in memory, without touching any store and
-/// without needing a signing key. Call [`Self::stage`] to write every
+/// Preparation structurally validates the descriptor, data, and metadata while
+/// retaining their trusted cached identities and embedded fragment blobs. It
+/// touches no store and needs no signing key. Call [`Self::stage`] to write every
 /// dependency and sign the resulting commit over the handles the store itself
 /// returned. Dropping a prepared value has no storage effect.
 #[derive(Clone, Debug)]
@@ -754,9 +757,10 @@ pub fn validate_merge(
 
 /// Prepare a canonical membership root entirely in memory.
 ///
-/// Supplied data and metadata are normalized from their bytes before either is
-/// validated, so a forged [`Blob::with_handle`] cache cannot enter storage or
-/// determine the commit identity. No store is touched and no key is needed:
+/// Supplied data and metadata retain their cached content identities and are
+/// validated structurally. A [`Blob`] is a trusted typed value produced by this
+/// process or by a [`crate::repo::BlobStore`] that upholds its handle contract;
+/// this layer does not defensively rehash it. No store is touched and no key is needed:
 /// the commit is signed by [`PreparedCollectionCommit::stage`] over the
 /// handles the store returns. The returned value can be staged, abandoned
 /// inertly, or finalized later.
@@ -805,22 +809,20 @@ fn prepare_commit_with_embedded(
 ) -> Result<PreparedCollectionCommit, PreparationError> {
     validate_descriptor(descriptor).map_err(PublicationError::Validation)?;
 
-    let data = normalize_blob(data);
-    validate_element(&data).map_err(|source| {
+    validate_element(data).map_err(|source| {
         PublicationError::Validation(SimpleArchiveUnionValidationError::InvalidElement {
             role: ElementRole::CommitData,
             source,
         })
     })?;
 
-    let metadata = normalize_blob(metadata);
-    validate_element(&metadata).map_err(PublicationError::InvalidMetadata)?;
+    validate_element(metadata).map_err(PublicationError::InvalidMetadata)?;
 
     Ok(PreparedCollectionCommit {
         embedded,
         descriptor: descriptor.clone(),
-        data,
-        metadata,
+        data: data.clone(),
+        metadata: metadata.clone(),
     })
 }
 
@@ -842,9 +844,8 @@ fn widen_preparation_error<PutError, InsertError>(
 
 /// Publish a signed membership root after writing its dependencies.
 ///
-/// Supplied data and metadata are normalized from their bytes before either is
-/// validated or stored, so a forged [`Blob::with_handle`] cache cannot enter
-/// storage or the signed transcript. The exact write order is:
+/// Supplied data and metadata retain their trusted cached identities and are
+/// structurally validated before storage. The exact write order is:
 ///
 /// 1. descriptor attachments, collection-descriptor blob, data blob,
 ///    metadata blob;
@@ -1070,10 +1071,7 @@ fn validate_handle(
     expected: CollectionData,
     blob: &Blob<SimpleArchive>,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
-    // `Blob::with_handle` is an explicitly trusted read-path constructor, so
-    // an admission boundary must not rely on its cached handle. Recompute the
-    // content identity from the supplied bytes before accepting the endpoint.
-    let actual = Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes));
+    let actual = Handle::<SimpleArchive>::to_hash(blob.get_handle());
     if actual != expected {
         return Err(SimpleArchiveUnionValidationError::EndpointMismatch {
             role,
@@ -1082,10 +1080,6 @@ fn validate_handle(
         });
     }
     Ok(())
-}
-
-fn normalize_blob(blob: &Blob<SimpleArchive>) -> Blob<SimpleArchive> {
-    Blob::new(blob.bytes.clone())
 }
 
 fn join_canonical_rows(
@@ -1780,11 +1774,8 @@ mod tests {
     }
 
     #[test]
-    fn commit_publication_normalizes_orders_and_replays_idempotently() {
+    fn commit_publication_orders_and_replays_idempotently() {
         let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
-        let bogus = archive([row(14, 1, 14)]);
-        let forged_data = Blob::with_handle(data_blob.bytes.clone(), bogus.get_handle());
-        let forged_metadata = Blob::with_handle(metadata.bytes.clone(), bogus.get_handle());
         let descriptor_embedded = embedded_put_events(&descriptor);
         let mut sequence = [
             descriptor_embedded.clone(),
@@ -1801,22 +1792,10 @@ mod tests {
         sequence.push(insert_event(CollectionRecord::Commit(expected)));
 
         let mut store = ProbeStore::default();
-        let first = publish_commit(
-            &mut store,
-            &descriptor,
-            &forged_data,
-            &forged_metadata,
-            &signing_key,
-        )
-        .unwrap();
-        let second = publish_commit(
-            &mut store,
-            &descriptor,
-            &forged_data,
-            &forged_metadata,
-            &signing_key,
-        )
-        .unwrap();
+        let first =
+            publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key).unwrap();
+        let second =
+            publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key).unwrap();
 
         assert_eq!(first, expected);
         assert_eq!(second, expected);
@@ -2362,12 +2341,6 @@ mod tests {
         assert_eq!(join(&a, &a).unwrap(), a);
         assert_eq!(join(&a, &b).unwrap(), join(&b, &a).unwrap());
 
-        let forged = Blob::with_handle(a.bytes.clone(), empty.get_handle());
-        assert_ne!(forged.get_handle().raw, data(&forged).raw);
-        let normalized = join(&forged, &empty).unwrap();
-        assert_eq!(normalized.bytes, a.bytes);
-        assert_eq!(normalized.get_handle().raw, data(&normalized).raw);
-
         let left_associated = join(&join(&a, &b).unwrap(), &c).unwrap();
         let right_associated = join(&a, &join(&b, &c).unwrap()).unwrap();
         assert_eq!(left_associated, right_associated);
@@ -2478,7 +2451,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_validation_binds_descriptor_collection_handle_and_bytes() {
+    fn commit_validation_binds_descriptor_collection_handle_and_structure() {
         let descriptor = root("first");
         let blob = archive([row(1, 1, 1)]);
         let commit = CollectionCommit::sign(
@@ -2512,16 +2485,6 @@ mod tests {
                 ..
             })
         ));
-
-        let forged = Blob::with_handle(other_blob.bytes.clone(), blob.get_handle());
-        assert_eq!(
-            validate_commit(&descriptor, &commit, &forged),
-            Err(SimpleArchiveUnionValidationError::EndpointMismatch {
-                role: ElementRole::CommitData,
-                expected: data(&blob),
-                actual: data(&other_blob),
-            })
-        );
 
         let invalid = raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]);
         let invalid_commit = CollectionCommit::sign(
@@ -2572,16 +2535,6 @@ mod tests {
                 ..
             })
         ));
-
-        let forged_high = Blob::with_handle(low.bytes.clone(), high.get_handle());
-        assert_eq!(
-            validate_merge(&descriptor, &claim, low, &forged_high, &result),
-            Err(SimpleArchiveUnionValidationError::EndpointMismatch {
-                role: ElementRole::MergeHigh,
-                expected: data(high),
-                actual: data(low),
-            })
-        );
 
         let other_result = archive([row(4, 1, 4)]);
         assert!(matches!(

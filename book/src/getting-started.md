@@ -122,7 +122,7 @@ let second = storage.commit(library, &key, entity! {
 assert_ne!(first.id(), second.id());
 ```
 
-Publication exact-validates the registered descriptor, then writes fragment
+Publication loads and structurally validates the registered descriptor, then writes fragment
 attachments, data, and metadata before inserting the signed `COMMIT` record.
 It performs no permission check and no implicit flush. The commit is the atomic
 assertion. There is no mutable head to advance: both records remain members and

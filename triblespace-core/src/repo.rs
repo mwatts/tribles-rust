@@ -399,6 +399,13 @@ pub trait BlobStoreForget {
 }
 
 /// The `GetBlob` trait is used to retrieve blobs from a repository.
+///
+/// Implementations are a trust boundary: on success, the returned typed value
+/// must carry `handle` as its content identity and its bytes must be the bytes
+/// validated for that identity. Callers may trust the cached handle and must
+/// not need to hash the same bytes again. Stores ingesting untrusted pile,
+/// object-store, or network data therefore perform content-address validation
+/// before constructing the returned [`Blob`].
 pub trait BlobStoreGet {
     /// Error type for get operations, parameterised by the deserialization error.
     type GetError<E: std::error::Error + Send + Sync + 'static>: Error + Send + Sync + 'static;

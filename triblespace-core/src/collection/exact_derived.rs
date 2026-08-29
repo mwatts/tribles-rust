@@ -12,9 +12,9 @@
 //! members and any validated source decompositions rooted beneath them.
 //! Canonical intermediates live only in use-counted scratch, so garbage
 //! collection may discard them without invalidating a resident upper result.
-//! Selected optional artifacts are still freshly hashed and representation-
-//! validated; bad cache bytes are removed from consideration and the physical
-//! cover falls back without acquiring authority.
+//! Selected optional artifacts are representation-validated at the point
+//! where stored bytes acquire collection meaning. Content identity itself is
+//! supplied by the `BlobStore` contract and is never recomputed in this layer.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -22,7 +22,7 @@ use std::fmt;
 
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
-use crate::inline::encodings::hash::{Blake3, Handle, Hash};
+use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
     ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, OfferCapture,
@@ -511,33 +511,13 @@ where
                             break;
                         }
                     };
-                    match Target::validate_member(&self.target, &output) {
-                        Ok(()) => {}
-                        Err(CollectionOperationError::Fatal(reason)) => {
-                            return Err(ExactDerivedCollectionError::Resolution(format!(
-                                "fresh DERIVE for {} constructed an invalid target: {reason}",
-                                hex::encode_upper(input_data.raw),
-                            )));
-                        }
-                        Err(CollectionOperationError::Capacity(reason)) => {
-                            replan = Some((input_data, reason));
-                            break;
-                        }
-                    }
-                    let output_data = fresh_data_identity(&output);
+                    let output_data = data_identity(&output);
                     let claim = CollectionDerive::new(
                         self.target_collection.handle(),
                         input_data,
                         output_data,
                     );
-                    cached.insert(
-                        input_data,
-                        PreparedDerive {
-                            output_data,
-                            output,
-                            claim,
-                        },
-                    );
+                    cached.insert(input_data, PreparedDerive { output, claim });
                 }
                 selected.push(input_data);
             }
@@ -560,16 +540,11 @@ where
         drop(probe);
         self.publish_descriptors(store)?;
         for prepared in &prepared {
-            let actual = store
+            store
                 .put::<Target, _>(prepared.output.clone())
                 .map_err(|error| {
                     ExactDerivedCollectionError::storage("store derived target", error)
                 })?;
-            if Handle::<Target>::to_hash(actual) != prepared.output_data {
-                return Err(ExactDerivedCollectionError::Resolution(
-                    "blob store returned a noncanonical target handle".to_owned(),
-                ));
-            }
         }
         for prepared in prepared {
             store
@@ -606,17 +581,9 @@ where
         &self,
         store: &mut S,
     ) -> Result<(), ExactDerivedCollectionError> {
-        for (descriptor, expected) in [
-            (&self.source, self.source_collection.handle()),
-            (&self.target, self.target_collection.handle()),
-        ] {
-            let actual = descriptor::put_closure(store, descriptor)
+        for descriptor in [&self.source, &self.target] {
+            descriptor::put_closure(store, descriptor)
                 .map_err(|error| ExactDerivedCollectionError::storage("store descriptor", error))?;
-            if actual != expected {
-                return Err(ExactDerivedCollectionError::Resolution(
-                    "blob store returned a noncanonical descriptor handle".to_owned(),
-                ));
-            }
         }
         Ok(())
     }
@@ -690,17 +657,6 @@ where
                 else {
                     return Err(ExactDerivedCollectionError::IncompleteMember(member));
                 };
-                let actual = fresh_data_identity(&blob);
-                if actual != member {
-                    return Err(ExactDerivedCollectionError::RejectedMember {
-                        member,
-                        reason: format!(
-                            "source bytes hash to {} instead of {}",
-                            hex::encode_upper(actual.raw),
-                            hex::encode_upper(member.raw),
-                        ),
-                    });
-                }
                 Source::validate_member(&self.source, &blob).map_err(|error| {
                     ExactDerivedCollectionError::RejectedMember {
                         member,
@@ -766,9 +722,7 @@ where
             let Ok(blob) = reader.get(Handle::<Source>::from_hash(member)) else {
                 continue;
             };
-            if fresh_data_identity(&blob) != member
-                || Source::validate_member(&self.source, &blob).is_err()
-            {
+            if Source::validate_member(&self.source, &blob).is_err() {
                 continue;
             }
             known.insert(node, ScratchValue::Source(blob));
@@ -939,7 +893,6 @@ where
             target_local,
             &BTreeMap::new(),
             &BTreeSet::new(),
-            |blob| Target::validate_member(&self.target, blob),
         );
         // A speculative offer must never displace a complete resident cover.
         // Only widen physical selection to offered members when local bytes do
@@ -963,7 +916,6 @@ where
                 target_resident,
                 &BTreeMap::new(),
                 offered_target,
-                |blob| Target::validate_member(&self.target, blob),
             )
         };
 
@@ -1006,7 +958,6 @@ where
         let source_plan =
             source_plan_parts.map(|(collection, resident, mandatory, required_members)| {
                 SourcePlan {
-                    descriptor: self.source.clone(),
                     semantics: resolution.into_semantics(),
                     collection,
                     resident,
@@ -1093,13 +1044,11 @@ where
 }
 
 struct PreparedDerive<Target: BlobEncoding> {
-    output_data: CollectionData,
     output: Blob<Target>,
     claim: CollectionDerive,
 }
 
 struct SourcePlan<Source: BlobEncoding> {
-    descriptor: Fragment,
     semantics: CollectionSemantics,
     collection: CollectionHandle,
     resident: BTreeSet<CollectionData>,
@@ -1159,7 +1108,6 @@ where
             resident,
             &plan.mandatory,
             &BTreeSet::new(),
-            |blob| Source::validate_member(&plan.descriptor, blob),
         );
         if !physical.missing.is_empty() {
             if blocked.is_empty() {
@@ -1211,20 +1159,18 @@ struct ValidatedPhysicalCover<E: BlobEncoding> {
     fetch: BTreeSet<CollectionData>,
 }
 
-fn validated_physical_cover<R, E, V>(
+fn validated_physical_cover<R, E>(
     reader: &R,
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
     mut resident: BTreeSet<CollectionData>,
     mandatory: &BTreeMap<CollectionData, Blob<E>>,
     offered: &BTreeSet<CollectionData>,
-    validate: V,
 ) -> ValidatedPhysicalCover<E>
 where
     R: BlobStoreGet + BlobStoreMeta,
     E: BlobEncoding + 'static,
     Handle<E>: InlineEncoding,
-    V: Fn(&Blob<E>) -> Result<(), CollectionOperationError>,
 {
     let mut selected = BTreeMap::new();
     loop {
@@ -1251,12 +1197,10 @@ where
                     continue;
                 }
             }
-            let actual: Result<Blob<E>, _> = reader.get(handle);
-            match actual {
-                Ok(actual) if fresh_data_identity(&actual) == data && validate(&actual).is_ok() => {
+            match reader.get(handle) {
+                Ok(actual) => {
                     selected.insert(data, actual);
                 }
-                Ok(_) => rejected.push(data),
                 Err(_) => rejected.push(data),
             }
         }
@@ -1330,12 +1274,8 @@ where
         ) {
             Ok(value) => {
                 let actual = match &value {
-                    ScratchValue::Source(blob) => fresh_data_identity(blob),
-                    ScratchValue::Target(blob) => fresh_data_identity(blob),
-                };
-                let representation = match &value {
-                    ScratchValue::Source(blob) => Source::validate_member(source_descriptor, blob),
-                    ScratchValue::Target(blob) => Target::validate_member(target_descriptor, blob),
+                    ScratchValue::Source(blob) => data_identity(blob),
+                    ScratchValue::Target(blob) => data_identity(blob),
                 };
                 if actual != result.data() {
                     rejected.insert(
@@ -1347,40 +1287,26 @@ where
                         ),
                     );
                 } else {
-                    match representation {
-                        Err(CollectionOperationError::Fatal(reason)) => {
-                            rejected.insert(candidate.id(), reason);
-                        }
-                        Err(CollectionOperationError::Capacity(reason)) => {
-                            rejected.insert(
-                                candidate.id(),
-                                format!("canonical operation exceeded representation capacity: {reason}"),
+                    let retain_result =
+                        remaining_uses.get(&result).copied().unwrap_or_default() > 0;
+                    let inserted = !known.contains_key(&result) && retain_result;
+                    if inserted {
+                        known.insert(result, value);
+                    }
+                    accepted.insert(candidate.id());
+                    if inserted {
+                        for dependent_index in waiters.remove(&result).unwrap_or_default() {
+                            debug_assert!(
+                                missing[dependent_index] > 0 && missing[dependent_index] <= 2
                             );
-                        }
-                        Ok(()) => {
-                            let retain_result =
-                                remaining_uses.get(&result).copied().unwrap_or_default() > 0;
-                            let inserted = !known.contains_key(&result) && retain_result;
-                            if inserted {
-                                known.insert(result, value);
-                            }
-                            accepted.insert(candidate.id());
-                            if inserted {
-                                for dependent_index in waiters.remove(&result).unwrap_or_default() {
-                                    debug_assert!(
-                                        missing[dependent_index] > 0
-                                            && missing[dependent_index] <= 2
-                                    );
-                                    missing[dependent_index] -= 1;
-                                    if missing[dependent_index] == 0 {
-                                        let dependent = candidates[dependent_index];
-                                        ready.insert((
-                                            dependent.id(),
-                                            dependent.kind_order(),
-                                            dependent_index,
-                                        ));
-                                    }
-                                }
+                            missing[dependent_index] -= 1;
+                            if missing[dependent_index] == 0 {
+                                let dependent = candidates[dependent_index];
+                                ready.insert((
+                                    dependent.id(),
+                                    dependent.kind_order(),
+                                    dependent_index,
+                                ));
                             }
                         }
                     }
@@ -1501,8 +1427,8 @@ where
         .map_err(|error| ExactDerivedCollectionError::storage(operation, error))
 }
 
-pub(super) fn fresh_data_identity<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData {
-    Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes))
+pub(super) fn data_identity<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData {
+    Handle::<E>::to_hash(blob.get_handle())
 }
 
 #[cfg(test)]

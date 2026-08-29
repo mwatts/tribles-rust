@@ -16,9 +16,7 @@ use crate::inline::InlineEncoding;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, BlobStorePut, OfferCapture};
 use crate::trible::Fragment;
 
-use super::exact_derived::{
-    fresh_data_identity, ExactDerivedCollection, ExactDerivedCollectionError,
-};
+use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
 use super::{
     CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
     CollectionOperationError, CollectionRecord, CollectionStore, Cover, CoverAttachment,
@@ -40,37 +38,12 @@ pub enum ExactTargetCompactionError {
         /// Concrete construction failure.
         reason: String,
     },
-    /// A freshly constructed target did not validate under the fixed descriptor.
-    InvalidResult {
-        /// Canonically lower input content identity.
-        low: CollectionData,
-        /// Canonically higher input content identity.
-        high: CollectionData,
-        /// Fresh result content identity.
-        result: CollectionData,
-        /// Concrete validation failure.
-        reason: String,
-    },
     /// A storage operation failed.
     Storage {
         /// Operation that failed.
         operation: &'static str,
         /// Backend failure.
         source: BoxError,
-    },
-    /// The blob store returned another handle for the canonical target descriptor.
-    NonCanonicalDescriptorPut {
-        /// Descriptor handle computed from canonical bytes.
-        expected: CollectionHandle,
-        /// Handle returned by the blob store.
-        actual: CollectionHandle,
-    },
-    /// The blob store returned another handle for a freshly hashed target result.
-    NonCanonicalTargetPut {
-        /// Target identity computed from canonical bytes.
-        expected: CollectionData,
-        /// Identity returned by the blob store.
-        actual: CollectionData,
     },
     /// Fresh attachment repeated an unstable physical cover.
     Stalled {
@@ -98,31 +71,7 @@ impl fmt::Display for ExactTargetCompactionError {
                 hex::encode_upper(low.raw),
                 hex::encode_upper(high.raw),
             ),
-            Self::InvalidResult {
-                low,
-                high,
-                result,
-                reason,
-            } => write!(
-                f,
-                "merge exact target elements {} and {} produced invalid result {}: {reason}",
-                hex::encode_upper(low.raw),
-                hex::encode_upper(high.raw),
-                hex::encode_upper(result.raw),
-            ),
             Self::Storage { operation, source } => write!(f, "{operation}: {source}"),
-            Self::NonCanonicalDescriptorPut { expected, actual } => write!(
-                f,
-                "blob store returned descriptor handle {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-            Self::NonCanonicalTargetPut { expected, actual } => write!(
-                f,
-                "blob store returned target handle {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
             Self::Stalled { cover } => write!(
                 f,
                 "exact target compaction repeated an unstable {}-member cover",
@@ -307,24 +256,8 @@ where
                 continue;
             }
         };
-        let result_data = fresh_data_identity(&constructed);
-        let result = Blob::with_handle(constructed.bytes, Handle::<Target>::from_hash(result_data));
-        match Target::validate_member(&descriptor, &result) {
-            Ok(()) => {}
-            Err(CollectionOperationError::Fatal(reason)) => {
-                return Err(ExactTargetCompactionError::InvalidResult {
-                    low: low_data,
-                    high: high_data,
-                    result: result_data,
-                    reason,
-                });
-            }
-            Err(CollectionOperationError::Capacity(_)) => {
-                locations.insert(high_data, tier);
-                tiers.entry(tier).or_default().insert(high_data, high);
-                continue;
-            }
-        }
+        let result_data = data_identity(&constructed);
+        let result = constructed;
         let claim = CollectionMerge::new(collection, low_data, high_data, result_data);
 
         if let Some(existing_tier) = locations.remove(&result_data) {
@@ -350,22 +283,12 @@ where
         return Ok(RoundOutcome::CapacityStable(cover));
     }
 
-    let actual_descriptor = super::descriptor::put_closure(store, &descriptor)
+    super::descriptor::put_closure(store, &descriptor)
         .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
-    if actual_descriptor != collection {
-        return Err(ExactTargetCompactionError::NonCanonicalDescriptorPut {
-            expected: collection,
-            actual: actual_descriptor,
-        });
-    }
-    for (expected, result) in outputs {
-        let actual = store.put::<Target, _>(result).map_err(|error| {
+    for result in outputs.into_values() {
+        store.put::<Target, _>(result).map_err(|error| {
             ExactTargetCompactionError::storage("store compacted target", error)
         })?;
-        let actual = Handle::<Target>::to_hash(actual);
-        if actual != expected {
-            return Err(ExactTargetCompactionError::NonCanonicalTargetPut { expected, actual });
-        }
     }
     for claim in claims {
         store

@@ -107,7 +107,7 @@ descriptors.
 
 One `store.commit(collection, signer, fragment)` performs these semantic steps:
 
-1. fetch and exact-validate the already registered descriptor;
+1. fetch and structurally validate the already registered descriptor;
 2. store the fragment's attachments;
 3. encode the value using `E`'s canonical member encoding;
 4. encode metafacts as the mandatory canonical metadata `SimpleArchive`;
@@ -256,7 +256,10 @@ adds a special manifest. [Regular-path
 summaries](regular-path-indexes.md) use the collection algebra. Rank9 instead
 uses the smaller mapping-evidence substrate because its sidecar has no
 independent join: exact `(mapping, raw, sidecar)` equations are cache hints,
-not collection records.
+not collection records. Construction may nevertheless join `(raw, sidecar)`
+pairs as a unit; the raw member supplies the information absent from the
+sidecar and the result remains one ordinary raw member plus its unary mapping
+evidence.
 
 ## WANT missing content or computation
 

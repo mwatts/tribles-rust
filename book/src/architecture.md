@@ -161,7 +161,7 @@ The collection value is its canonical descriptor handle. The descriptor
 carries one mandatory local authority, and the storage backend owns I/O and
 durability. `store.collection(descriptor_fragment)` registers and offers the
 descriptor's complete attachment closure. `store.commit(collection, signer,
-fragment)` then exact-validates that descriptor and publishes attachments,
+fragment)` then loads and structurally validates that descriptor and publishes attachments,
 canonical data, canonical metadata, and the signed native record in dependency
 order. Local publication performs no authorization check and no implicit
 flush: authorization governs which resident claims another operation admits,
@@ -215,7 +215,10 @@ Rank9 sidecar cannot join without its raw archive, so it is an accelerator
 mapping over each exact immediate raw member, not another collection. Its
 separate `MappingEvidence(mapping, input, output)` relation records reusable
 cache work without manufacturing a descriptor, collection frontier, or
-authority surface.
+authority surface. The *pairs* do retain a useful construction algebra:
+`(a, R(a)) ⊔ (b, R(b)) = (a ⊔ b, R(a ⊔ b))`. This permits an implementation to
+reuse attached input accelerators while constructing the output pair, but does
+not imply a join on `R(a)` and `R(b)` in isolation.
 
 ## WANT is operational, not semantic
 

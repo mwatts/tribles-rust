@@ -1187,8 +1187,8 @@ mod mapping_algorithm_description_tests {
     use crate::collection::lww_register::RegisterCoordinatesMappingV1;
     use crate::collection::observed_union::ObserveStatesMappingV1;
     use crate::collection::succinctarchive_union::{
-        Rank9MappingV1_32Be, Rank9MappingV1_32Le, Rank9MappingV1_64Be, Rank9MappingV1_64Le,
-        SimpleToSuccinctMappingV1,
+        Rank9SidecarMappingV1_32Be, Rank9SidecarMappingV1_32Le, Rank9SidecarMappingV1_64Be,
+        Rank9SidecarMappingV1_64Le, SimpleToSuccinctMappingV1,
     };
     use crate::metadata::{self, MetaDescribe};
 
@@ -1224,21 +1224,21 @@ mod mapping_algorithm_description_tests {
             crate::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1,
             "register-coordinates-v1",
         );
-        check::<Rank9MappingV1_32Le>(
-            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_32_LE,
-            "rank9-32-le",
+        check::<Rank9SidecarMappingV1_32Le>(
+            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_32_LE,
+            "rank9-sidecar-v1-32-le",
         );
-        check::<Rank9MappingV1_32Be>(
-            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_32_BE,
-            "rank9-32-be",
+        check::<Rank9SidecarMappingV1_32Be>(
+            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_32_BE,
+            "rank9-sidecar-v1-32-be",
         );
-        check::<Rank9MappingV1_64Le>(
-            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_64_LE,
-            "rank9-64-le",
+        check::<Rank9SidecarMappingV1_64Le>(
+            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_64_LE,
+            "rank9-sidecar-v1-64-le",
         );
-        check::<Rank9MappingV1_64Be>(
-            crate::collection::succinctarchive_union::RANK9_MAPPING_V1_64_BE,
-            "rank9-64-be",
+        check::<Rank9SidecarMappingV1_64Be>(
+            crate::collection::succinctarchive_union::RANK9_SIDECAR_MAPPING_V1_64_BE,
+            "rank9-sidecar-v1-64-be",
         );
     }
 }

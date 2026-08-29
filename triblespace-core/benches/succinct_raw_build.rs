@@ -17,6 +17,7 @@ use anybytes::Bytes;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
     merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+    SuccinctArchiveRank9IndexBlob,
 };
 use triblespace_core::blob::{Blob, IntoBlob, TryFromBlob};
 
@@ -166,6 +167,50 @@ fn old_runtime_merge_path(inputs: &[Blob<SuccinctArchiveBlob>]) -> Blob<Succinct
     merge_ordered_archives(&archives).to_blob()
 }
 
+fn raw_merge_then_rank9(
+    inputs: &[Blob<SuccinctArchiveBlob>],
+) -> (
+    Blob<SuccinctArchiveBlob>,
+    Blob<SuccinctArchiveRank9IndexBlob>,
+) {
+    let raw = SuccinctArchiveBlob::merge(inputs).unwrap();
+    let rank9 = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
+    (raw, rank9)
+}
+
+fn rank9_pairs(
+    inputs: &[Blob<SuccinctArchiveBlob>],
+) -> Vec<(
+    Blob<SuccinctArchiveBlob>,
+    Blob<SuccinctArchiveRank9IndexBlob>,
+)> {
+    inputs
+        .iter()
+        .cloned()
+        .map(|raw| {
+            let rank9 = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone()).unwrap();
+            (raw, rank9)
+        })
+        .collect()
+}
+
+fn pair_merge(
+    inputs: &[(
+        Blob<SuccinctArchiveBlob>,
+        Blob<SuccinctArchiveRank9IndexBlob>,
+    )],
+) -> (
+    Blob<SuccinctArchiveBlob>,
+    Blob<SuccinctArchiveRank9IndexBlob>,
+) {
+    let archives = inputs
+        .iter()
+        .cloned()
+        .map(|(raw, rank9)| SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, rank9).unwrap())
+        .collect::<Vec<_>>();
+    merge_ordered_archives(&archives).to_blob_pair()
+}
+
 fn print_measurement(label: &str, rows: usize, measurement: Measurement) {
     println!(
         "{label:>12}  N={rows:>8}  {:>8.1} ms  {:>8.1} Mrow/s  allocs={:>8}  requested={:>9.1} MiB  peak-live={:>9.1} MiB",
@@ -228,5 +273,35 @@ fn main() {
             legacy_measurement.peak_live_bytes as f64 / raw_measurement.peak_live_bytes as f64,
         );
         drop((raw, legacy, inputs));
+    }
+
+    println!("\n=== exact Rank9 output: rebuild result vs reuse input pairs ===");
+    let warm = merge_inputs(4_096);
+    let warm_pairs = rank9_pairs(&warm);
+    drop(raw_merge_then_rank9(&warm));
+    drop(pair_merge(&warm_pairs));
+
+    for input_rows in [10_000usize, 100_000, 500_000] {
+        let inputs = merge_inputs(input_rows);
+        let pairs = rank9_pairs(&inputs);
+        let (rebuilt, rebuild_measurement) = measure(|| raw_merge_then_rank9(&inputs));
+        let (reused, reuse_measurement) = measure(|| pair_merge(&pairs));
+        assert_eq!(rebuilt.0.bytes, reused.0.bytes);
+        assert_eq!(rebuilt.1.bytes, reused.1.bytes);
+        println!(
+            "\nportable bytes: {} raw + {} Rank9 ({:.1} B/input-row)",
+            rebuilt.0.bytes.len(),
+            rebuilt.1.bytes.len(),
+            (rebuilt.0.bytes.len() + rebuilt.1.bytes.len()) as f64 / input_rows as f64,
+        );
+        print_measurement("rebuild-out", input_rows, rebuild_measurement);
+        print_measurement("reuse-pairs", input_rows, reuse_measurement);
+        println!(
+            "       delta  reuse/rebuild time={:.2}x  requested={:.2}x  peak-live={:.2}x",
+            reuse_measurement.elapsed.as_secs_f64() / rebuild_measurement.elapsed.as_secs_f64(),
+            reuse_measurement.allocated_bytes as f64 / rebuild_measurement.allocated_bytes as f64,
+            reuse_measurement.peak_live_bytes as f64 / rebuild_measurement.peak_live_bytes as f64,
+        );
+        drop((rebuilt, reused, pairs, inputs));
     }
 }

@@ -56,7 +56,8 @@ fragment nor the source-bound sidecar becomes owned by it. A later
 `attach_exact` treats missing bytes as a cache miss and rebuilds the query
 accelerator transiently without writes. A later `ensure_exact` republishes the
 mapping closure and sidecar before idempotently reinserting the evidence, then
-freshly verifies the exact raw/sidecar pair. No Rank9 collection, descriptor,
+returns the retained validated runtime without a redundant read or hash pass.
+No Rank9 collection, descriptor,
 retention record, or hidden root is needed.
 
 The resulting roots compose with both storage paths. Yard's `collect` and

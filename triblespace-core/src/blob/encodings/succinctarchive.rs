@@ -662,8 +662,12 @@ where
 pub struct SuccinctArchive<U> {
     /// The canonical, architecture-independent raw archive blob bytes.
     pub bytes: Bytes,
+    /// Cached identity of the canonical raw archive bytes.
+    raw_handle: Inline<Handle<SuccinctArchiveBlob>>,
     /// Detached persisted Rank9/select accelerator bytes.
     rank9_index_bytes: Bytes,
+    /// Cached identity of the detached Rank9/select accelerator bytes.
+    rank9_handle: Inline<Handle<SuccinctArchiveRank9IndexBlob>>,
     /// The universe — maps integer codes to raw 32-byte values (the
     /// domain of all distinct values appearing in E, A, or V positions).
     pub domain: U,
@@ -2906,8 +2910,8 @@ where
     Ok(SuccinctArchive::from_runtime_bytes_with_rank9_indexes(
         meta,
         runtime_bytes,
-        bytes,
-        rank9_bytes,
+        raw_blob,
+        Blob::new(rank9_bytes),
     )
     .unwrap())
 }
@@ -3204,8 +3208,8 @@ where
     Ok(SuccinctArchive::from_runtime_bytes_with_rank9_indexes(
         meta,
         runtime_bytes,
-        bytes,
-        rank9_bytes,
+        raw_blob,
+        Blob::new(rank9_bytes),
     )
     .unwrap())
 }
@@ -3286,10 +3290,13 @@ where
     fn from_runtime_bytes_with_rank9_indexes(
         meta: SuccinctArchiveMeta<U::Meta>,
         runtime_bytes: Bytes,
-        bytes: Bytes,
-        rank9_index_bytes: Bytes,
+        raw: Blob<SuccinctArchiveBlob>,
+        rank9: Blob<SuccinctArchiveRank9IndexBlob>,
     ) -> Result<Self, jerky::error::Error> {
-        let source = Blob::<SuccinctArchiveBlob>::new(bytes.clone()).get_handle();
+        let source = raw.get_handle();
+        let rank9_handle = rank9.get_handle();
+        let bytes = raw.bytes;
+        let rank9_index_bytes = rank9.bytes;
         let raw_end = validate_raw_rank9_sources(&meta, &runtime_bytes, runtime_bytes.len())?;
         if raw_end != runtime_bytes.len() {
             return Err(invalid_rank9_metadata(format!(
@@ -3342,7 +3349,9 @@ where
 
         Ok(SuccinctArchive {
             bytes,
+            raw_handle: source,
             rank9_index_bytes,
+            rank9_handle,
             domain,
             entity_count: meta.entity_count,
             attribute_count: meta.attribute_count,
@@ -3373,7 +3382,7 @@ where
 {
     type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: &SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
-        Blob::new(source.bytes.clone())
+        Blob::with_handle(source.bytes.clone(), source.raw_handle)
     }
 }
 
@@ -3384,7 +3393,7 @@ where
 {
     type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
-        Blob::new(source.bytes)
+        Blob::with_handle(source.bytes, source.raw_handle)
     }
 }
 
@@ -3436,13 +3445,18 @@ where
     /// Proves the portable bytes by independently deriving all prefixes,
     /// changed masks, and rotations from the decoded EAV source ring before
     /// constructing a runtime. No merely structural parse reaches query APIs.
-    fn from_portable_bytes(bytes: Bytes) -> Result<Self, SuccinctArchiveError> {
-        let (meta, runtime_bytes) = Self::validated_runtime(&bytes)?;
-        let source = Blob::<SuccinctArchiveBlob>::new(bytes.clone()).get_handle();
+    fn from_portable_blob(raw: Blob<SuccinctArchiveBlob>) -> Result<Self, SuccinctArchiveError> {
+        let source = raw.get_handle();
+        let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
         let rank9_index_bytes = build_runtime_rank9_index(&meta, &runtime_bytes, source)
             .map_err(SuccinctArchiveError)?;
-        Self::from_runtime_bytes_with_rank9_indexes(meta, runtime_bytes, bytes, rank9_index_bytes)
-            .map_err(SuccinctArchiveError)
+        Self::from_runtime_bytes_with_rank9_indexes(
+            meta,
+            runtime_bytes,
+            raw,
+            Blob::new(rank9_index_bytes),
+        )
+        .map_err(SuccinctArchiveError)
     }
 
     /// Builds a queryable archive and returns its raw and Rank9 artifacts.
@@ -3468,9 +3482,17 @@ where
         Blob<SuccinctArchiveRank9IndexBlob>,
     ) {
         (
-            Blob::new(self.bytes.clone()),
-            Blob::new(self.rank9_index_bytes.clone()),
+            Blob::with_handle(self.bytes.clone(), self.raw_handle),
+            self.rank9_blob(),
         )
+    }
+
+    /// Returns only this runtime's detached, source-bound Rank9 accelerator.
+    ///
+    /// This is useful when the caller already owns the canonical raw blob and
+    /// must persist the accelerator without hashing the raw bytes again.
+    pub fn rank9_blob(&self) -> Blob<SuccinctArchiveRank9IndexBlob> {
+        Blob::with_handle(self.rank9_index_bytes.clone(), self.rank9_handle)
     }
 
     /// Rebuilds only the detached Rank9 artifact for a canonical raw archive.
@@ -3478,9 +3500,8 @@ where
     pub fn build_rank9_index(
         raw: Blob<SuccinctArchiveBlob>,
     ) -> Result<Blob<SuccinctArchiveRank9IndexBlob>, SuccinctArchiveError> {
-        let bytes = raw.bytes;
-        let (meta, runtime_bytes) = Self::validated_runtime(&bytes)?;
-        let source = Blob::<SuccinctArchiveBlob>::new(bytes).get_handle();
+        let source = raw.get_handle();
+        let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
         let index = build_runtime_rank9_index(&meta, &runtime_bytes, source)
             .map_err(SuccinctArchiveError)?;
         Ok(Blob::new(index))
@@ -3491,9 +3512,8 @@ where
         raw: Blob<SuccinctArchiveBlob>,
         rank9: Blob<SuccinctArchiveRank9IndexBlob>,
     ) -> Result<Self, SuccinctArchiveError> {
-        let bytes = raw.bytes;
-        let (meta, runtime_bytes) = Self::validated_runtime(&bytes)?;
-        Self::from_runtime_bytes_with_rank9_indexes(meta, runtime_bytes, bytes, rank9.bytes)
+        let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
+        Self::from_runtime_bytes_with_rank9_indexes(meta, runtime_bytes, raw, rank9)
             .map_err(SuccinctArchiveError)
     }
 
@@ -3519,7 +3539,7 @@ where
     type Error = SuccinctArchiveError;
 
     fn try_from_blob(blob: Blob<SuccinctArchiveBlob>) -> Result<Self, Self::Error> {
-        Self::from_portable_bytes(blob.bytes)
+        Self::from_portable_blob(blob)
     }
 }
 

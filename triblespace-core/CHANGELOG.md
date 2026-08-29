@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the misleading public `Rank9MappingV1*` algorithms with freshly
+  minted `Rank9SidecarMappingV1*` identities. Rank9 is a canonical one-to-one
+  accelerator mapping for an exact SuccinctArchive member, not an independently
+  joinable collection encoding; existing cache evidence may be recomputed and
+  no compatibility aliases are retained.
+
+- Treat handles cached by typed `Blob` values returned from `BlobStoreGet` as
+  trusted content identities. Collection operations retain structural and
+  semantic validation at real ingress boundaries while deleting duplicate
+  rehashes and post-write rereads of values produced or loaded in-process.
+
 - Add conservative `StoreRevisionChanges` classification to `StoreRevision`.
   The default treats every unequal opaque token as a full change, while
   `MemoryRepo`, `Pile`, and `Yard` compare their persistent component indexes

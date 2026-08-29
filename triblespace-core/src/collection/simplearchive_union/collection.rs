@@ -384,7 +384,8 @@ mod tests {
             first.data(),
             missing_metadata,
         );
-        let corrupt_metadata = Inline::new([43; 32]);
+        let corrupt_metadata_blob = Blob::new(Bytes::from(vec![0; 63]));
+        let corrupt_metadata = corrupt_metadata_blob.get_handle();
         let corrupt_metadata_claim = CollectionCommit::sign(
             &SigningKey::from_bytes(&[9; 32]),
             first.collection(),
@@ -404,10 +405,7 @@ mod tests {
             descriptor_handle.transmute::<Handle<UnknownBlob>>(),
             data_handle.transmute::<Handle<UnknownBlob>>(),
         ]);
-        store.blobs.insert(Blob::with_handle(
-            Bytes::from(vec![0; 63]),
-            corrupt_metadata,
-        ));
+        store.blobs.insert(corrupt_metadata_blob);
 
         let requested = cover(
             &facade,
@@ -500,58 +498,30 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_and_member_data_are_mandatory() {
+    fn locally_bound_descriptor_need_not_be_resident_but_member_data_must() {
         let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut base = MemoryRepo::default();
         let (commit, _) = publish(&mut base, &descriptor, 7, 1);
         let requested = cover(&facade, [commit]);
-        let descriptor_handle = identity_for_tests(&descriptor);
         let data_handle = Handle::<SimpleArchive>::from_hash(commit.data());
 
         let mut missing_descriptor = base.clone();
         missing_descriptor
             .blobs
             .keep([data_handle.transmute::<Handle<UnknownBlob>>()]);
-        assert!(matches!(
-            facade.attach_exact(&mut missing_descriptor, &requested),
-            Err(FactMaterializationError::DescriptorGet { collection, .. })
-                if collection == descriptor_handle
-        ));
-
-        let mut corrupt_descriptor = base.clone();
-        corrupt_descriptor
-            .blobs
-            .keep([data_handle.transmute::<Handle<UnknownBlob>>()]);
-        let wrong_descriptor = crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-            test_facade("ninth").descriptor().into_facts(),
+        assert_eq!(
+            facade
+                .attach_exact(&mut missing_descriptor, &requested)
+                .unwrap(),
+            facts(1),
         );
-        corrupt_descriptor
-            .blobs
-            .insert(Blob::with_handle(wrong_descriptor.bytes, descriptor_handle));
-        assert!(matches!(
-            facade.attach_exact(&mut corrupt_descriptor, &requested),
-            Err(FactMaterializationError::DescriptorIdentity { expected, .. })
-                if expected == descriptor_handle
-        ));
 
         let mut missing_data = base.clone();
-        missing_data
-            .blobs
-            .keep([descriptor_handle.transmute::<Handle<UnknownBlob>>()]);
+        missing_data.blobs.keep([]);
         assert!(matches!(
             facade.attach_exact(&mut missing_data, &requested),
             Err(FactMaterializationError::MemberGet { member, .. })
-                if member == commit.data()
-        ));
-
-        let mut corrupt_data = missing_data;
-        corrupt_data
-            .blobs
-            .insert(Blob::with_handle(Bytes::from(vec![0; 63]), data_handle));
-        assert!(matches!(
-            facade.attach_exact(&mut corrupt_data, &requested),
-            Err(FactMaterializationError::InvalidMember { member, .. })
                 if member == commit.data()
         ));
     }

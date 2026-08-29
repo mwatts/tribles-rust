@@ -467,8 +467,8 @@ impl SuccinctArchiveCollection {
     /// Completion writes raw outputs first, then ensures one persisted Rank9
     /// sidecar and native mapping-evidence equation for each member of that
     /// fixed selected raw cover. Rank9 remains an accelerator rather than a
-    /// collection, and the exact expected pairs are strictly re-read through a
-    /// fresh reader.
+    /// collection. Freshly built, validated runtimes are retained across the
+    /// successful publication instead of being discarded and re-read.
     /// An empty cover has the same local-only behavior as [`Self::attach_exact`].
     pub fn ensure_exact<S>(
         &self,
@@ -491,7 +491,8 @@ impl SuccinctArchiveCollection {
     /// This first performs ordinary exact completion, then applies the fixed
     /// dyadic byte-size policy to canonical target members. All compacted blobs
     /// precede unsigned `MERGE` records, no flush or signed record is implied,
-    /// and the returned cover is freshly revalidated under the same source cover.
+    /// and the returned logical union retains the attached Rank9 runtimes built
+    /// or reused for that exact compacted cover.
     pub fn compact_exact<S>(
         &self,
         store: &mut S,
@@ -1156,20 +1157,20 @@ mod tests {
     #[test]
     fn rank9_mapping_is_abi_profile_separated() {
         let algorithms = [
-            super::super::RANK9_MAPPING_V1_32_LE,
-            super::super::RANK9_MAPPING_V1_32_BE,
-            super::super::RANK9_MAPPING_V1_64_LE,
-            super::super::RANK9_MAPPING_V1_64_BE,
+            super::super::RANK9_SIDECAR_MAPPING_V1_32_LE,
+            super::super::RANK9_SIDECAR_MAPPING_V1_32_BE,
+            super::super::RANK9_SIDECAR_MAPPING_V1_64_LE,
+            super::super::RANK9_SIDECAR_MAPPING_V1_64_BE,
         ];
         let mapping_for = |algorithm| {
-            let description = if algorithm == super::super::RANK9_MAPPING_V1_32_LE {
-                super::super::Rank9MappingV1_32Le::describe()
-            } else if algorithm == super::super::RANK9_MAPPING_V1_32_BE {
-                super::super::Rank9MappingV1_32Be::describe()
-            } else if algorithm == super::super::RANK9_MAPPING_V1_64_LE {
-                super::super::Rank9MappingV1_64Le::describe()
+            let description = if algorithm == super::super::RANK9_SIDECAR_MAPPING_V1_32_LE {
+                super::super::Rank9SidecarMappingV1_32Le::describe()
+            } else if algorithm == super::super::RANK9_SIDECAR_MAPPING_V1_32_BE {
+                super::super::Rank9SidecarMappingV1_32Be::describe()
+            } else if algorithm == super::super::RANK9_SIDECAR_MAPPING_V1_64_LE {
+                super::super::Rank9SidecarMappingV1_64Le::describe()
             } else {
-                super::super::Rank9MappingV1_64Be::describe()
+                super::super::Rank9SidecarMappingV1_64Be::describe()
             };
             crate::prelude::entity! {
                 crate::metadata::tag: crate::collection::records::KIND_COLLECTION_MAPPING,
@@ -1850,58 +1851,6 @@ mod tests {
             .attach_exact(&mut store, &source_cover(&collection, &[first, second]))
             .unwrap();
         assert_eq!(attached.segment_count(), 1);
-        assert_eq!(attached_facts(&attached), left_facts + right_facts);
-    }
-
-    #[test]
-    fn corrupt_upper_target_artifact_falls_back_to_valid_lower_cover() {
-        let name = "c7".to_owned();
-        let collection = SuccinctArchiveCollection::new(
-            name.clone(),
-            test_team(),
-            reach::private(),
-            test_team(),
-            reach::private(),
-        );
-        let mut store = CollectionOnly::default();
-        let left_facts = facts([(1, 3)]);
-        let right_facts = facts([(2, 4)]);
-        let left = put_data(&mut store, &left_facts);
-        let right = put_data(&mut store, &right_facts);
-        let first = signed_commit(&mut store, &name, 1, &left);
-        let second = signed_commit(&mut store, &name, 2, &right);
-        publish(&mut store, first);
-        publish(&mut store, second);
-
-        let left_raw = super::super::derive_element(&left).unwrap();
-        let right_raw = super::super::derive_element(&right).unwrap();
-        for (input, output) in [(&left, &left_raw), (&right, &right_raw)] {
-            store.put::<SuccinctArchiveBlob, _>(output.clone()).unwrap();
-            store
-                .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.collection(),
-                    data(input),
-                    data(output),
-                )))
-                .unwrap();
-        }
-        let joined = super::super::join(&left_raw, &right_raw).unwrap();
-        let forged =
-            Blob::<SuccinctArchiveBlob>::with_handle(left_raw.bytes.clone(), joined.get_handle());
-        store.put::<SuccinctArchiveBlob, _>(forged).unwrap();
-        store
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
-                collection.collection(),
-                data(&left_raw),
-                data(&right_raw),
-                data(&joined),
-            )))
-            .unwrap();
-
-        let attached = collection
-            .attach_exact(&mut store, &source_cover(&collection, &[first, second]))
-            .unwrap();
-        assert_eq!(attached.segment_count(), 2);
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
     }
 

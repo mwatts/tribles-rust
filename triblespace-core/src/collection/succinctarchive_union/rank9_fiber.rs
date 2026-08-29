@@ -16,15 +16,14 @@ use crate::blob::encodings::succinctarchive::{
     SuccinctArchiveRank9IndexBlob, UnionArchive,
 };
 use crate::blob::encodings::UnknownBlob;
-use crate::blob::{Blob, BlobEncoding, IntoBlob};
+use crate::blob::{Blob, IntoBlob};
 use crate::collection::{
     CollectionData, CollectionHandle, CoverAttachment, MappingEvidence, MappingEvidenceSelector,
     MappingEvidenceStore, MappingHandle,
 };
-use crate::inline::encodings::hash::{Blake3, Handle, Hash};
-use crate::inline::{Inline, InlineEncoding};
+use crate::inline::encodings::hash::Handle;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStorePut, OfferCapture};
-use crate::trible::{Fragment, TribleSet};
+use crate::trible::Fragment;
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -45,44 +44,12 @@ pub enum Rank9FiberError {
         /// Collection carried by the supplied cover.
         actual: CollectionHandle,
     },
-    /// The selected raw member did not have the content identity carried by its cover.
-    InvalidRawCover {
-        /// Identity selected by the exact raw cover.
-        expected: CollectionData,
-        /// Fresh identity of the supplied raw bytes.
-        actual: CollectionData,
-    },
     /// A transient or persisted Rank9 runtime could not be constructed.
     Build {
         /// Raw member whose Rank9 runtime failed.
         raw: CollectionData,
         /// Exact raw/Rank9 validation failure.
         source: SuccinctArchiveError,
-    },
-    /// A mapping-fragment put acknowledged a different content identity.
-    NonCanonicalMappingPut {
-        /// Canonical mapping-fragment identity.
-        expected: MappingHandle,
-        /// Identity returned by the backend.
-        actual: MappingHandle,
-    },
-    /// A Rank9 put acknowledged a different content identity.
-    NonCanonicalRank9Put {
-        /// Raw source member.
-        raw: CollectionData,
-        /// Canonical Rank9 content identity.
-        expected: CollectionData,
-        /// Identity returned by the backend.
-        actual: CollectionData,
-    },
-    /// Fresh post-publication verification could not prove an expected exact pair.
-    IncompletePublication {
-        /// Raw source member.
-        raw: CollectionData,
-        /// Expected Rank9 member, when construction reached that point.
-        rank9: Option<CollectionData>,
-        /// Concrete missing, corrupt, or mismatched dependency.
-        reason: String,
     },
 }
 
@@ -105,41 +72,10 @@ impl fmt::Display for Rank9FiberError {
                 hex::encode_upper(actual.raw),
                 hex::encode_upper(expected.raw),
             ),
-            Self::InvalidRawCover { expected, actual } => write!(
-                f,
-                "exact raw cover member {} hashes to {}",
-                hex::encode_upper(expected.raw),
-                hex::encode_upper(actual.raw),
-            ),
             Self::Build { raw, source } => write!(
                 f,
                 "build Rank9 accelerator for raw member {}: {source}",
                 hex::encode_upper(raw.raw),
-            ),
-            Self::NonCanonicalMappingPut { expected, actual } => write!(
-                f,
-                "blob store returned Rank9 mapping {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-            Self::NonCanonicalRank9Put {
-                raw,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "blob store returned Rank9 handle {} instead of {} for raw member {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-                hex::encode_upper(raw.raw),
-            ),
-            Self::IncompletePublication { raw, rank9, reason } => write!(
-                f,
-                "fresh Rank9 verification for raw member {} and sidecar {} failed: {reason}",
-                hex::encode_upper(raw.raw),
-                rank9
-                    .map(|data| hex::encode_upper(data.raw))
-                    .unwrap_or_else(|| "<unbuilt>".to_owned()),
             ),
         }
     }
@@ -175,7 +111,11 @@ struct FiberProbe {
 
 impl FiberProbe {
     fn is_complete(&self) -> bool {
-        self.mapping_complete && self.members.iter().all(|member| member.runtime.is_some())
+        self.mapping_complete
+            && self
+                .members
+                .iter()
+                .all(|member| member.runtime.is_some() && member.prepared.is_none())
     }
 
     fn into_archive(self) -> UnionArchive<OrderedUniverse> {
@@ -234,7 +174,7 @@ impl Rank9Fiber {
     }
 
     /// Ensure one persisted exact Rank9 accelerator for every member of this
-    /// fixed raw cover, then strictly re-read those same expected pairs.
+    /// fixed raw cover, retaining freshly built runtimes across publication.
     pub(super) fn ensure<S>(
         &self,
         store: &mut S,
@@ -249,11 +189,6 @@ impl Rank9Fiber {
         }
 
         let mut members = probe.members;
-        // Verification below deliberately reopens every endpoint, including
-        // members whose accelerator was already valid before this repair.
-        for member in &mut members {
-            member.runtime = None;
-        }
 
         let mut capture = OfferCapture::new(store);
         let store = &mut capture;
@@ -263,19 +198,9 @@ impl Rank9Fiber {
             let Some(rank9) = member.prepared.take() else {
                 continue;
             };
-            let output = fresh_data_identity(&rank9);
-            let actual = store
+            store
                 .put::<SuccinctArchiveRank9IndexBlob, _>(rank9)
                 .map_err(|error| Rank9FiberError::storage("store Rank9 sidecar", error))?;
-            let actual = Handle::<SuccinctArchiveRank9IndexBlob>::to_hash(actual);
-            if actual != output {
-                return Err(Rank9FiberError::NonCanonicalRank9Put {
-                    raw: member.raw_data,
-                    expected: output,
-                    actual,
-                });
-            }
-            member.output = Some(output);
         }
 
         // OfferCapture advertises the complete mapping closure and every new
@@ -297,7 +222,16 @@ impl Rank9Fiber {
                 })?;
         }
 
-        self.verify_published(store, members)
+        Ok(UnionArchive::new(
+            members
+                .into_iter()
+                .map(|member| {
+                    member
+                        .runtime
+                        .expect("every ensured Rank9 member retains its runtime")
+                })
+                .collect::<Vec<_>>(),
+        ))
     }
 
     fn probe<S>(
@@ -332,13 +266,6 @@ impl Rank9Fiber {
 
         let mut probed = Vec::with_capacity(members.len());
         for (raw_data, raw) in members {
-            let actual = fresh_data_identity(&raw);
-            if actual != raw_data {
-                return Err(Rank9FiberError::InvalidRawCover {
-                    expected: raw_data,
-                    actual,
-                });
-            }
             let unique = candidates
                 .remove(&raw_data)
                 .and_then(|outputs| (!outputs.ambiguous).then_some(outputs.first));
@@ -346,12 +273,10 @@ impl Rank9Fiber {
             let mut prepared = None;
             let mut runtime = None;
 
-            if mapping_complete {
-                if let Some(candidate) = unique {
-                    if let Some(attached) = self.try_attach(&reader, raw_data, &raw, candidate) {
-                        output = Some(candidate);
-                        runtime = Some(attached);
-                    }
+            if let Some(candidate) = unique {
+                if let Some(attached) = self.try_attach(&reader, raw_data, &raw, candidate) {
+                    output = Some(candidate);
+                    runtime = Some(attached);
                 }
             }
 
@@ -359,13 +284,19 @@ impl Rank9Fiber {
                 // Missing, corrupt, source-mismatched, or ambiguous evidence
                 // is a cache miss. Rebuild the one canonical sidecar instead
                 // of choosing among claims supplied by the store.
-                let rank9 = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw.clone())
-                    .map_err(|source| Rank9FiberError::Build {
-                        raw: raw_data,
-                        source,
-                    })?;
-                output = Some(fresh_data_identity(&rank9));
+                let built: SuccinctArchive<OrderedUniverse> =
+                    raw.clone()
+                        .try_from_blob()
+                        .map_err(|source| Rank9FiberError::Build {
+                            raw: raw_data,
+                            source,
+                        })?;
+                let rank9 = built.rank9_blob();
+                output = Some(Handle::<SuccinctArchiveRank9IndexBlob>::to_hash(
+                    rank9.get_handle(),
+                ));
                 prepared = Some(rank9);
+                runtime = Some(built);
             }
             probed.push(ProbedMember {
                 raw_data,
@@ -425,9 +356,6 @@ impl Rank9Fiber {
     ) -> Option<SuccinctArchive<OrderedUniverse>> {
         let handle = Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(output);
         let rank9: Blob<SuccinctArchiveRank9IndexBlob> = reader.get(handle).ok()?;
-        if fresh_data_identity(&rank9) != output {
-            return None;
-        }
         let source = SuccinctArchiveRank9IndexBlob::source_handle(&rank9).ok()?;
         if Handle::<SuccinctArchiveBlob>::to_hash(source) != raw_data {
             return None;
@@ -439,173 +367,24 @@ impl Rank9Fiber {
         &self,
         store: &mut S,
     ) -> Result<(), Rank9FiberError> {
-        let actual = crate::collection::descriptor::put_closure(store, &self.mapping)
+        crate::collection::descriptor::put_closure(store, &self.mapping)
             .map_err(|error| Rank9FiberError::storage("store Rank9 mapping closure", error))?;
-        if actual != self.mapping_handle {
-            return Err(Rank9FiberError::NonCanonicalMappingPut {
-                expected: self.mapping_handle,
-                actual,
-            });
-        }
         Ok(())
     }
 
     fn mapping_closure_is_complete<R: BlobStoreGet>(&self, reader: &R) -> bool {
-        let Ok(blob): Result<Blob<SimpleArchive>, _> = reader.get(self.mapping_handle) else {
+        let Ok(_): Result<Blob<SimpleArchive>, _> = reader.get(self.mapping_handle) else {
             return false;
         };
-        if blob.get_handle() != self.mapping_handle {
-            return false;
-        }
-        let Ok(facts) = <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(blob)
-        else {
-            return false;
-        };
-        if &facts != self.mapping.facts() {
-            return false;
-        }
         let mut blobs = self.mapping.blobs().clone();
-        for (handle, expected) in blobs
+        for (handle, _) in blobs
             .reader()
             .expect("MemoryBlobStore::reader is infallible")
         {
-            let Ok(actual): Result<Blob<UnknownBlob>, _> = reader.get(handle) else {
+            let Ok(_): Result<Blob<UnknownBlob>, _> = reader.get(handle) else {
                 return false;
             };
-            if actual.get_handle() != handle || actual.bytes != expected.bytes {
-                return false;
-            }
         }
         true
     }
-
-    fn verify_published<S>(
-        &self,
-        store: &mut S,
-        members: Vec<ProbedMember>,
-    ) -> Result<UnionArchive<OrderedUniverse>, Rank9FiberError>
-    where
-        S: BlobStore + MappingEvidenceStore,
-    {
-        let expected: Vec<_> = members
-            .iter()
-            .map(|member| {
-                MappingEvidence::new(
-                    self.mapping_handle,
-                    member.raw_data,
-                    member
-                        .output
-                        .expect("published Rank9 member has an exact output"),
-                )
-            })
-            .collect();
-        let selectors = expected
-            .iter()
-            .map(|evidence| MappingEvidenceSelector::Id(evidence.id()))
-            .collect();
-        let found: BTreeSet<_> = store
-            .select_evidence(&selectors)
-            .map_err(|error| {
-                Rank9FiberError::storage("re-select published Rank9 mapping evidence", error)
-            })?
-            .into_iter()
-            .collect();
-        for evidence in &expected {
-            if !found.contains(evidence) {
-                return Err(Rank9FiberError::IncompletePublication {
-                    raw: evidence.input(),
-                    rank9: Some(evidence.output()),
-                    reason: format!(
-                        "expected mapping evidence {} is not resident",
-                        evidence.id()
-                    ),
-                });
-            }
-        }
-
-        let reader = store.reader().map_err(|error| {
-            Rank9FiberError::storage("open fresh Rank9 verification reader", error)
-        })?;
-        let raw_context = members
-            .first()
-            .expect("nonempty fixed cover reaches publication")
-            .raw_data;
-        if !self.mapping_closure_is_complete(&reader) {
-            return Err(Rank9FiberError::IncompletePublication {
-                raw: raw_context,
-                rank9: None,
-                reason: "Rank9 mapping fragment or one of its attachments is not resident"
-                    .to_owned(),
-            });
-        }
-
-        let mut segments = Vec::with_capacity(members.len());
-        for member in members {
-            let output = member.output.expect("published member has an output");
-            let raw_handle = Handle::<SuccinctArchiveBlob>::from_hash(member.raw_data);
-            let raw: Blob<SuccinctArchiveBlob> =
-                reader
-                    .get(raw_handle)
-                    .map_err(|error| Rank9FiberError::IncompletePublication {
-                        raw: member.raw_data,
-                        rank9: Some(output),
-                        reason: format!("expected raw endpoint is not readable: {error}"),
-                    })?;
-            if fresh_data_identity(&raw) != member.raw_data {
-                return Err(Rank9FiberError::IncompletePublication {
-                    raw: member.raw_data,
-                    rank9: Some(output),
-                    reason: "fresh raw endpoint hash does not match its cover".to_owned(),
-                });
-            }
-
-            let rank9_handle = Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(output);
-            let rank9: Blob<SuccinctArchiveRank9IndexBlob> =
-                reader.get(rank9_handle).map_err(|error| {
-                    Rank9FiberError::IncompletePublication {
-                        raw: member.raw_data,
-                        rank9: Some(output),
-                        reason: format!("expected Rank9 endpoint is not readable: {error}"),
-                    }
-                })?;
-            if fresh_data_identity(&rank9) != output {
-                return Err(Rank9FiberError::IncompletePublication {
-                    raw: member.raw_data,
-                    rank9: Some(output),
-                    reason: "fresh Rank9 endpoint hash does not match its evidence".to_owned(),
-                });
-            }
-            let source = SuccinctArchiveRank9IndexBlob::source_handle(&rank9).map_err(|error| {
-                Rank9FiberError::IncompletePublication {
-                    raw: member.raw_data,
-                    rank9: Some(output),
-                    reason: format!("Rank9 source header is invalid: {error}"),
-                }
-            })?;
-            if Handle::<SuccinctArchiveBlob>::to_hash(source) != member.raw_data {
-                return Err(Rank9FiberError::IncompletePublication {
-                    raw: member.raw_data,
-                    rank9: Some(output),
-                    reason: "Rank9 source header names another raw member".to_owned(),
-                });
-            }
-            segments.push(
-                SuccinctArchive::from_blob_pair(raw, rank9).map_err(|error| {
-                    Rank9FiberError::IncompletePublication {
-                        raw: member.raw_data,
-                        rank9: Some(output),
-                        reason: format!("exact raw/Rank9 validation failed: {error}"),
-                    }
-                })?,
-            );
-        }
-        Ok(UnionArchive::new(segments))
-    }
-}
-
-fn fresh_data_identity<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData
-where
-    Handle<E>: InlineEncoding,
-{
-    Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes))
 }

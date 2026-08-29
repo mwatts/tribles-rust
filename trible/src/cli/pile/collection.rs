@@ -179,20 +179,21 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
     use triblespace_core::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1;
     use triblespace_core::collection::observed_union::OBSERVE_STATES_MAPPING_V1;
     use triblespace_core::collection::succinctarchive_union::{
-        RANK9_MAPPING_V1_32_BE, RANK9_MAPPING_V1_32_LE, RANK9_MAPPING_V1_64_BE,
-        RANK9_MAPPING_V1_64_LE, SIMPLE_TO_SUCCINCT_MAPPING_V1,
+        RANK9_SIDECAR_MAPPING_V1_32_BE, RANK9_SIDECAR_MAPPING_V1_32_LE,
+        RANK9_SIDECAR_MAPPING_V1_64_BE, RANK9_SIDECAR_MAPPING_V1_64_LE,
+        SIMPLE_TO_SUCCINCT_MAPPING_V1,
     };
 
     if id == SIMPLE_TO_SUCCINCT_MAPPING_V1 {
         Some("SIMPLE_TO_SUCCINCT_MAPPING_V1")
-    } else if id == RANK9_MAPPING_V1_32_LE {
-        Some("RANK9_MAPPING_V1_32_LE")
-    } else if id == RANK9_MAPPING_V1_32_BE {
-        Some("RANK9_MAPPING_V1_32_BE")
-    } else if id == RANK9_MAPPING_V1_64_LE {
-        Some("RANK9_MAPPING_V1_64_LE")
-    } else if id == RANK9_MAPPING_V1_64_BE {
-        Some("RANK9_MAPPING_V1_64_BE")
+    } else if id == RANK9_SIDECAR_MAPPING_V1_32_LE {
+        Some("RANK9_SIDECAR_MAPPING_V1_32_LE")
+    } else if id == RANK9_SIDECAR_MAPPING_V1_32_BE {
+        Some("RANK9_SIDECAR_MAPPING_V1_32_BE")
+    } else if id == RANK9_SIDECAR_MAPPING_V1_64_LE {
+        Some("RANK9_SIDECAR_MAPPING_V1_64_LE")
+    } else if id == RANK9_SIDECAR_MAPPING_V1_64_BE {
+        Some("RANK9_SIDECAR_MAPPING_V1_64_BE")
     } else if id == OBSERVE_STATES_MAPPING_V1 {
         Some("OBSERVE_STATES_MAPPING_V1")
     } else if id == REGISTER_COORDINATES_MAPPING_V1 {
