@@ -11,12 +11,13 @@ use std::fmt::{self, Debug};
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob};
+use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
 use crate::id::{id_hex, Id};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
-use crate::repo::{BlobStore, BlobStorePut};
+use crate::repo::{BlobStore, BlobStorePut, CapabilityProofStore};
 
 /// Stable semantic kind of a positive local artifact offer.
 ///
@@ -316,13 +317,53 @@ where
     }
 }
 
+impl<S> CapabilityProofStore for OfferCapture<S>
+where
+    S: CapabilityProofStore + ArtifactOfferStore,
+{
+    type ProofsError = S::ProofsError;
+    type InsertError = OfferCaptureInsertError<S::OfferError, S::InsertError>;
+    type ProofIter<'a>
+        = S::ProofIter<'a>
+    where
+        Self: 'a;
+
+    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        self.inner.proofs()
+    }
+
+    fn proof(
+        &mut self,
+        id: CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        self.inner.proof(id)
+    }
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        if let Err(source) = self.offer_pending() {
+            return Err(OfferCaptureInsertError::Offer {
+                source,
+                artifacts: self.pending.iter().copied().collect(),
+            });
+        }
+        self.inner
+            .insert_proof(proof)
+            .map_err(OfferCaptureInsertError::Insert)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blob::{Blob, Bytes};
+    use crate::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
     use crate::collection::{CollectionData, CollectionHandle, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::StoreRevision;
+    use ed25519_dalek::SigningKey;
     use std::convert::Infallible;
 
     fn handle(byte: u8) -> ArtifactHandle {
@@ -365,6 +406,7 @@ mod tests {
         Put(ArtifactHandle),
         Offer(Vec<ArtifactHandle>),
         Insert(Id),
+        InsertProof(CapabilityProofId),
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +425,7 @@ mod tests {
         events: Vec<ProbeEvent>,
         offers: ArtifactOfferSnapshot,
         records: Vec<CollectionRecord>,
+        proofs: Vec<CapabilityProof>,
         fail_offer: bool,
         fail_insert: bool,
     }
@@ -454,6 +497,34 @@ mod tests {
                 return Err(ProbeError("insert"));
             }
             self.records.push(record);
+            Ok(())
+        }
+    }
+
+    impl CapabilityProofStore for ProbeStore {
+        type ProofsError = ProbeError;
+        type InsertError = ProbeError;
+        type ProofIter<'a>
+            = std::vec::IntoIter<Result<CapabilityProof, ProbeError>>
+        where
+            Self: 'a;
+
+        fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+            Ok(self
+                .proofs
+                .clone()
+                .into_iter()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+
+        fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+            self.events.push(ProbeEvent::InsertProof(proof.id()));
+            if self.fail_insert {
+                return Err(ProbeError("insert"));
+            }
+            self.proofs.push(proof);
             Ok(())
         }
     }
@@ -540,6 +611,43 @@ mod tests {
         capture.insert(record).unwrap();
         assert_eq!(capture.inner().records, vec![record]);
         assert_eq!(capture.inner().offers.len(), 1);
+    }
+
+    #[test]
+    fn proof_insert_offers_pending_claims_before_publishing_the_proof() {
+        let root = SigningKey::from_bytes(&[41; 32]);
+        let delegate = SigningKey::from_bytes(&[42; 32]);
+        let claim = CapabilityClaim::root(
+            CapabilityAtom::new(
+                CapabilityAction::new(Id::new([43; 16]).unwrap()),
+                CapabilityResource::new([44; 32]),
+            ),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let bundle =
+            CapabilityProofBundle::issue_root(&root, claim, delegate.verifying_key()).unwrap();
+        let proof = bundle.proof().clone();
+        let mut capture = OfferCapture::new(ProbeStore::default());
+        let claim_handle = capture
+            .put::<crate::blob::encodings::simplearchive::SimpleArchive, _>(
+                bundle.claims()[0].clone(),
+            )
+            .unwrap()
+            .transmute();
+
+        capture.insert_proof(proof.clone()).unwrap();
+
+        assert_eq!(
+            capture.inner().events,
+            vec![
+                ProbeEvent::Put(claim_handle),
+                ProbeEvent::Offer(vec![claim_handle]),
+                ProbeEvent::InsertProof(proof.id()),
+            ]
+        );
+        assert_eq!(capture.inner().proofs, vec![proof]);
+        assert!(capture.pending().next().is_none());
     }
 
     #[test]

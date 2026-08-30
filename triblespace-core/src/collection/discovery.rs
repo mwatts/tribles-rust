@@ -479,11 +479,34 @@ where
     L: CollectionEncoding,
     F: Fn(&Inline<ED25519PublicKey>) -> bool,
 {
+    discover_collection_cover_authorized_with_admission(store, collection, is_member)
+        .map(|(cover, _)| cover)
+}
+
+/// Discover one typed payload cover and the exact COMMIT roots admitted by
+/// the same caller-supplied signer policy and strict-verification scan.
+///
+/// This is the provenance-retaining form of
+/// [`discover_collection_cover_authorized`]. The roots are deliberately
+/// returned from the same frozen discovery rather than from a later claims
+/// query: unauthorized or newly arrived duplicate claims cannot become roots
+/// of an earlier cover observation.
+pub fn discover_collection_cover_authorized_with_admission<S, L, F>(
+    store: &mut S,
+    collection: super::Collection<L>,
+    is_member: F,
+) -> Result<(Cover<L>, Vec<CollectionCommit>), CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+    L: CollectionEncoding,
+    F: Fn(&Inline<ED25519PublicKey>) -> bool,
+{
     let discovered = discover_collection_records_authorized(store, collection.handle(), is_member)?;
-    Ok(Cover::from_data(
+    let cover = Cover::from_data(
         collection,
         discovered.commits().iter().map(CollectionCommit::data),
-    ))
+    );
+    Ok((cover, discovered.commits().to_vec()))
 }
 
 #[cfg(feature = "parallel")]
@@ -846,15 +869,27 @@ mod tests {
             ..ProbeStore::default()
         };
 
-        let cover = discover_collection_cover_authorized(&mut store, target, |subject| {
-            *subject == signer(&authorized_key)
-        })
-        .unwrap();
+        let (cover, roots) =
+            discover_collection_cover_authorized_with_admission(&mut store, target, |subject| {
+                *subject == signer(&authorized_key)
+            })
+            .unwrap();
         assert_eq!(cover.collection(), target);
         assert_eq!(
             cover.members().collect::<Vec<_>>(),
             vec![Handle::<SimpleArchive>::from_hash(admitted.data())],
         );
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&admitted));
+        assert!(roots.contains(&duplicate));
+        assert!(!roots.contains(&unauthorized));
+        assert!(!roots.contains(&invalid));
+
+        let projected = discover_collection_cover_authorized(&mut store, target, |subject| {
+            *subject == signer(&authorized_key)
+        })
+        .unwrap();
+        assert_eq!(projected, cover);
     }
 
     #[test]
