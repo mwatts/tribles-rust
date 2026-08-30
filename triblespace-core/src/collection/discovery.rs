@@ -463,58 +463,6 @@ where
     Ok(discovered)
 }
 
-/// Discover one typed payload cover under an already-established signer policy.
-///
-/// The callback decides which claimed signing keys the caller admits. Every
-/// matching COMMIT still undergoes strict Ed25519 verification before its
-/// payload enters the returned cover; invalid signatures and commits outside
-/// the exact collection remain inert. Duplicate claims over one payload
-/// collapse through the cover's set semantics.
-///
-/// This is internal machinery for the descriptor-policy admission path. It is
-/// not a public alternate authority surface: only code which has already
-/// established the descriptor policy may supply the predicate.
-pub(crate) fn discover_collection_cover_authorized<S, L, F>(
-    snapshot: &S,
-    collection: super::Collection<L>,
-    is_member: F,
-) -> Result<Cover<L>, CollectionDiscoveryError<S::RecordsError>>
-where
-    S: CollectionRead,
-    L: CollectionEncoding,
-    F: Fn(&Inline<ED25519PublicKey>) -> bool,
-{
-    discover_collection_cover_authorized_with_admission(snapshot, collection, is_member)
-        .map(|(cover, _)| cover)
-}
-
-/// Discover one typed payload cover and the exact COMMIT roots admitted by
-/// the same caller-supplied signer policy and strict-verification scan.
-///
-/// This is the provenance-retaining form of
-/// [`discover_collection_cover_authorized`]. The roots are deliberately
-/// returned from the same frozen discovery rather than from a later claims
-/// query: unauthorized or newly arrived duplicate claims cannot become roots
-/// of an earlier cover observation.
-pub(crate) fn discover_collection_cover_authorized_with_admission<S, L, F>(
-    snapshot: &S,
-    collection: super::Collection<L>,
-    is_member: F,
-) -> Result<(Cover<L>, Vec<CollectionCommit>), CollectionDiscoveryError<S::RecordsError>>
-where
-    S: CollectionRead,
-    L: CollectionEncoding,
-    F: Fn(&Inline<ED25519PublicKey>) -> bool,
-{
-    let discovered =
-        discover_collection_records_authorized(snapshot, collection.handle(), is_member)?;
-    let cover = Cover::from_data(
-        collection,
-        discovered.commits().iter().map(CollectionCommit::data),
-    );
-    Ok((cover, discovered.commits().to_vec()))
-}
-
 #[cfg(feature = "parallel")]
 fn verify_matching_commits<V>(
     commits: &[CollectionCommit],
@@ -819,71 +767,6 @@ mod tests {
         assert!(discovered.merges().contains(&target_merge));
         assert!(discovered.merges().contains(&other_merge));
         assert_eq!(discovered.derives(), &[crossing_derive]);
-    }
-
-    #[test]
-    fn authorized_cover_applies_caller_policy_and_strict_signature_checks() {
-        let target = collection(1);
-        let authorized_key = SigningKey::from_bytes(&[17; 32]);
-        let foreign_key = SigningKey::from_bytes(&[18; 32]);
-        let admitted = CollectionCommit::sign(
-            &authorized_key,
-            target.handle(),
-            data(1),
-            empty_metadata_handle(),
-        );
-        let duplicate = CollectionCommit::sign(
-            &authorized_key,
-            target.handle(),
-            data(1),
-            Inline::new([9; 32]),
-        );
-        let unauthorized = CollectionCommit::sign(
-            &foreign_key,
-            target.handle(),
-            data(2),
-            empty_metadata_handle(),
-        );
-        let invalid = invalid_signature(CollectionCommit::sign(
-            &authorized_key,
-            target.handle(),
-            data(3),
-            empty_metadata_handle(),
-        ));
-        let store = ProbeStore {
-            records: [
-                CollectionRecord::Commit(unauthorized),
-                CollectionRecord::Commit(invalid),
-                CollectionRecord::Commit(duplicate),
-                CollectionRecord::Commit(admitted),
-            ]
-            .into_iter()
-            .map(Ok)
-            .collect(),
-            ..ProbeStore::default()
-        };
-
-        let (cover, roots) =
-            discover_collection_cover_authorized_with_admission(&store, target, |subject| {
-                *subject == signer(&authorized_key)
-            })
-            .unwrap();
-        assert_eq!(cover.collection(), target);
-        assert_eq!(
-            cover.members().collect::<Vec<_>>(),
-            vec![Handle::<SimpleArchive>::from_hash(admitted.data())],
-        );
-        assert_eq!(roots.len(), 2);
-        assert!(roots.contains(&admitted));
-        assert!(roots.contains(&duplicate));
-        assert!(!roots.contains(&unauthorized));
-        assert!(!roots.contains(&invalid));
-
-        let projected = discover_collection_cover_authorized(&store, target, |subject| {
-            *subject == signer(&authorized_key)
-        })
-        .unwrap();
-        assert_eq!(projected, cover);
     }
 
     #[test]
