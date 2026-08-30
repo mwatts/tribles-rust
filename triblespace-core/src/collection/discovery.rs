@@ -408,7 +408,7 @@ where
 /// `MERGE` and `DERIVE` records are retained in full, for the same reason
 /// [`discover_collection_records_scoped`] retains them: they are unsigned
 /// equations whose relevance can span collection boundaries.
-pub fn discover_collection_records_authorized<S, F>(
+pub(crate) fn discover_collection_records_authorized<S, F>(
     snapshot: &S,
     collection: CollectionHandle,
     mut is_member: F,
@@ -463,7 +463,7 @@ where
     Ok(discovered)
 }
 
-/// Discover one typed payload cover under a caller-supplied signer policy.
+/// Discover one typed payload cover under an already-established signer policy.
 ///
 /// The callback decides which claimed signing keys the caller admits. Every
 /// matching COMMIT still undergoes strict Ed25519 verification before its
@@ -471,12 +471,10 @@ where
 /// the exact collection remain inert. Duplicate claims over one payload
 /// collapse through the cover's set semantics.
 ///
-/// This is a deliberately low-level admission seam. Unlike
-/// [`crate::collection::Collection::admitted`], it does not discover or
-/// verify capability proofs and does not load the descriptor policy. A
-/// caller using this helper is responsible for supplying an authorization
-/// predicate appropriate to its own already-verified boundary.
-pub fn discover_collection_cover_authorized<S, L, F>(
+/// This is internal machinery for the descriptor-policy admission path. It is
+/// not a public alternate authority surface: only code which has already
+/// established the descriptor policy may supply the predicate.
+pub(crate) fn discover_collection_cover_authorized<S, L, F>(
     snapshot: &S,
     collection: super::Collection<L>,
     is_member: F,
@@ -498,7 +496,7 @@ where
 /// returned from the same frozen discovery rather than from a later claims
 /// query: unauthorized or newly arrived duplicate claims cannot become roots
 /// of an earlier cover observation.
-pub fn discover_collection_cover_authorized_with_admission<S, L, F>(
+pub(crate) fn discover_collection_cover_authorized_with_admission<S, L, F>(
     snapshot: &S,
     collection: super::Collection<L>,
     is_member: F,

@@ -33,11 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned roots stay narrower than later provenance queries over the same
   cover and immutable store snapshot.
 
-- Add `discover_collection_cover_authorized` as a narrow low-level bridge from
-  a caller-supplied signer policy to a typed, strictly verified payload cover,
-  without exposing `Cover` constructors or implicitly discovering capability
-  proofs.
-
 - Give collection validation, canonical joins, mappings, and cover views one
   frozen store-snapshot boundary. Encodings and mappings may resolve immutable
   content-addressed dependencies named by their source members without making
