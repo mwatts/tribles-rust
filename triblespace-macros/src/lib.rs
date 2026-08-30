@@ -8,7 +8,6 @@
 
 use proc_macro::Span;
 use proc_macro::TokenStream;
-use triblespace_core::collection::reach;
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, ToTokens};
@@ -18,8 +17,7 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use hex::FromHex;
 
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::collection::{simplearchive_union, CollectionStoreExt};
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
@@ -90,6 +88,11 @@ fn metadata_signing_key() -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&bytes))
 }
 
+fn metadata_collection_policy(signing_key: &SigningKey) -> CollectionPolicy {
+    let root = signing_key.verifying_key();
+    CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
+}
+
 fn publish_metadata(
     pile_path: &Path,
     collection_name: &str,
@@ -100,12 +103,8 @@ fn publish_metadata(
         Ok(pile) => pile,
         Err(_) => return,
     };
-    let descriptor = simplearchive_union::descriptor(
-        collection_name,
-        signing_key.verifying_key(),
-        reach::private(),
-    );
-    let Ok(collection) = pile.collection::<SimpleArchive>(descriptor) else {
+    let policy = metadata_collection_policy(&signing_key);
+    let Ok(collection) = pile.collection(collection_name, policy) else {
         let _ = pile.close();
         return;
     };
@@ -511,9 +510,11 @@ mod instrumentation_tests {
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::blob::Blob;
-    use triblespace_core::collection::{self, CollectionRead, CollectionRecord};
+    use triblespace_core::collection::{
+        descriptor, CollectionRead, CollectionRecord, CollectionStoreExt,
+    };
     use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::repo::{BlobStoreGet, SnapshotSource, StorageClose};
+    use triblespace_core::repo::{BlobStoreGet, MemoryRepo, SnapshotSource, StorageClose};
     use triblespace_core::trible::TribleSet;
 
     #[test]
@@ -585,6 +586,7 @@ mod instrumentation_tests {
         let name = "macro-metadata";
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let authority = signing_key.verifying_key();
+        let policy = metadata_collection_policy(&signing_key);
         publish_metadata(&path, name, signing_key.clone(), fragment.clone());
         publish_metadata(&path, name, signing_key, fragment);
 
@@ -600,12 +602,11 @@ mod instrumentation_tests {
             1,
             "one target commit is the only native record"
         );
-        let expected_descriptor =
-            collection::simplearchive_union::descriptor(name, authority, reach::private())
-                .into_facts();
-        let target =
-            triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(expected_descriptor.clone())
-                .get_handle();
+        let mut expected_store = MemoryRepo::default();
+        let expected_collection = expected_store
+            .collection(name, policy.clone())
+            .expect("register expected collection");
+        let target = expected_collection.handle();
         let commit = records
             .into_iter()
             .find_map(|record| match record {
@@ -621,10 +622,15 @@ mod instrumentation_tests {
                 descriptor_blob,
             )
             .unwrap();
+        assert_eq!(descriptor::policy(&descriptor).unwrap(), policy);
         assert_eq!(
-            descriptor, expected_descriptor,
-            "the commit names the descriptor the facade published"
+            descriptor::representation(&descriptor).unwrap(),
+            <SimpleArchive as triblespace_core::metadata::MetaDescribe>::id()
         );
+        let name_handle = descriptor::name(&descriptor).unwrap().unwrap();
+        let name_blob: Blob<UTF8String> = snapshot.get(name_handle).unwrap();
+        assert_eq!(name_blob.bytes.as_ref(), name.as_bytes());
+        assert_eq!(authority.to_bytes(), commit.public_key().raw);
 
         let _: Blob<UTF8String> = snapshot.get(attachment).unwrap();
         drop(snapshot);
