@@ -178,6 +178,9 @@ one directly materializable join. Returning no direct join means that physical
 compaction belongs in another lattice; multi-member covers and logical views
 remain valid. `SimpleArchive` and `SuccinctArchiveBlob` are directly joinable,
 while `Rank9AcceleratedSuccinctArchiveBlob` is derived after raw compaction.
+Validation and joining share the snapshot's blob reader, so Merkle-shaped
+encodings can resolve children named by their members without consulting
+ambient mutable state.
 The maintained collection encodings implement the same contract directly;
 there is no separate public artifact or lattice wrapper to pair with them.
 

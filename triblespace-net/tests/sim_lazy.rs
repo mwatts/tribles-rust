@@ -152,11 +152,15 @@ impl CollectionEncoding for NetworkTestBlob {
         Ok(())
     }
 
-    fn join_members(
+    fn join_members<R>(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
         let low =
             Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
         let high =
@@ -208,10 +212,14 @@ impl CollectionMapping<SimpleArchive, NetworkTestBlob> for NetworkTestMapping {
         Ok(Self)
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<NetworkTestBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<NetworkTestBlob>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
         Ok(derive_test_target(source))
     }
 }
@@ -646,11 +654,13 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             derive_test_target(&sources[0]),
             derive_test_target(&sources[1]),
         ];
-        let upper = NetworkTestBlob::join_members(&target_descriptor, &targets[0], &targets[1])
-            .unwrap()
-            .expect("network test encoding has a direct join");
-
         let mut client_store = empty_store();
+        let reader = client_store.reader().unwrap();
+        let upper =
+            NetworkTestBlob::join_members(&target_descriptor, &targets[0], &targets[1], &reader)
+                .unwrap()
+                .expect("network test encoding has a direct join");
+        drop(reader);
         let source_collection = client_store
             .collection(lifecycle.source_descriptor().clone())
             .unwrap();

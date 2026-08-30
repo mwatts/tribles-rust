@@ -1341,7 +1341,7 @@ where
         } else {
             match (known.get(&low), known.get(&high)) {
                 (Some(low_blob), Some(high_blob)) => {
-                    match L::join_members(descriptor, low_blob, high_blob) {
+                    match L::join_members(descriptor, low_blob, high_blob, &reader) {
                         Ok(Some(value)) => {
                             let expected = Handle::<L>::to_hash(value.get_handle());
                             expected_hashes.insert(pair, expected);
@@ -1370,7 +1370,7 @@ where
                 if joined.is_none() {
                     joined = match (known.get(&low), known.get(&high)) {
                         (Some(low_blob), Some(high_blob)) => {
-                            L::join_members(descriptor, low_blob, high_blob)
+                            L::join_members(descriptor, low_blob, high_blob, &reader)
                                 .ok()
                                 .flatten()
                         }

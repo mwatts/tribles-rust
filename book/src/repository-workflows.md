@@ -223,6 +223,10 @@ f(a ⊔ b) = f(a) ⊔ f(b)
 Then a resolver may derive a merged source once, derive leaves separately and
 merge their images, or reuse any validated mixture already present. `DERIVE`
 records expose those reusable edges across collection lattices.
+Validation, canonical joins, mappings, and logical cover views all receive one
+frozen blob reader. They may resolve immutable dependencies named by their
+input members (for example a text attachment or Merkle child); unrelated
+resident blobs are never ambient semantic input.
 
 The SuccinctArchive facade applies this model as two ordinary derivations:
 

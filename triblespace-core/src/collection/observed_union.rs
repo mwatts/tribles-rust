@@ -320,11 +320,15 @@ impl CollectionEncoding for ObservedSetBlob {
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn join_members(
+    fn join_members<R>(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         join(low, high)
             .map(Some)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
@@ -351,10 +355,14 @@ impl CollectionMapping<SimpleArchive, ObservedSetBlob> for ObserveStatesMapping 
         Ok(Self { observes })
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<ObservedSetBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<ObservedSetBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         derive_element(source, self.observes)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }

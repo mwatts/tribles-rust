@@ -13,7 +13,7 @@ use std::fmt;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, BlobStorePut, OfferCapture};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, OfferCapture};
 use crate::trible::Fragment;
 
 use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
@@ -211,10 +211,14 @@ fn publish_round<S, Target>(
     cover: CoverAttachment<Target>,
 ) -> Result<RoundOutcome<Target>, ExactTargetCompactionError>
 where
-    S: BlobStorePut + CollectionStore,
+    S: BlobStore + CollectionStore,
+    S::Reader: BlobStoreMeta,
     Target: CollectionEncoding,
     Handle<Target>: InlineEncoding,
 {
+    let reader = store.reader().map_err(|source| {
+        ExactTargetCompactionError::storage("open target-compaction reader", source)
+    })?;
     let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
     let mut locations = BTreeMap::<CollectionData, u32>::new();
     for (data, blob) in cover.members().iter().cloned() {
@@ -242,7 +246,7 @@ where
         locations.remove(&low_data);
         locations.remove(&high_data);
 
-        let constructed = match Target::join_members(&descriptor, &low, &high) {
+        let constructed = match Target::join_members(&descriptor, &low, &high, &reader) {
             Ok(Some(constructed)) => constructed,
             Ok(None) => return Ok(RoundOutcome::Stable(cover)),
             Err(CollectionOperationError::Fatal(reason)) => {
@@ -285,6 +289,10 @@ where
         return Ok(RoundOutcome::Stable(cover));
     }
 
+    // Closure-dependent joins observe one immutable reader boundary. Do not
+    // retain it across publication.
+    drop(reader);
+
     super::descriptor::put_closure(store, &descriptor)
         .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
     for result in outputs.into_values() {
@@ -313,6 +321,7 @@ mod tests {
     use crate::id_hex;
     use crate::inline::Inline;
     use crate::metadata::MetaDescribe;
+    use crate::repo::memoryrepo::MemoryRepo;
 
     /// Test-only encoding with no directly materialized join.
     /// Minted with `trible genid` on 2026-08-30.
@@ -346,9 +355,12 @@ mod tests {
         }
     }
 
-    struct NoWriteStore;
+    #[derive(Default)]
+    struct NoWriteStore {
+        blobs: MemoryRepo,
+    }
 
-    impl BlobStorePut for NoWriteStore {
+    impl crate::repo::BlobStorePut for NoWriteStore {
         type PutError = Infallible;
 
         fn put<S, T>(&mut self, _: T) -> Result<Inline<Handle<S>>, Self::PutError>
@@ -358,6 +370,15 @@ mod tests {
             Handle<S>: InlineEncoding,
         {
             panic!("stable no-join compaction attempted a blob write")
+        }
+    }
+
+    impl BlobStore for NoWriteStore {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = Infallible;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.blobs.reader()
         }
     }
 
@@ -415,7 +436,7 @@ mod tests {
         let result = publish_round(
             descriptor,
             collection.handle(),
-            &mut NoWriteStore,
+            &mut NoWriteStore::default(),
             attachment,
         )
         .unwrap();

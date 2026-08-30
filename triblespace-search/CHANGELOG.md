@@ -23,6 +23,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Portable BM25 has one canonical join surface
 
+- Implement the native `CollectionEncoding` law for `PortableBM25Blob` in its
+  owning crate, using the existing canonical grammar validation and document
+  union / pointwise-maximum frequency merge directly.
 - Removed the unpublished `Bm25Rollup`, `seg_bm25`, and `query_across`
   repository-range facade. `PortableBM25Index::merge` is the single canonical
   document-union / pointwise-max join for direct callers and collection-owned

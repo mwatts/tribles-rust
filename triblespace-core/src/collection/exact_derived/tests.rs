@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::descriptor;
@@ -16,7 +17,7 @@ use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
 use crate::collection::simplearchive_union;
-use crate::collection::CollectionCommit;
+use crate::collection::{CollectionCommit, CollectionStoreExt};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -95,11 +96,15 @@ impl CollectionEncoding for TestSourceBlob {
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 
-    fn join_members(
+    fn join_members<R>(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         SELECTIVE_POLICY.with(|policy| {
             if let Some(policy) = policy.borrow().as_ref() {
                 policy
@@ -181,6 +186,117 @@ impl MetaDescribe for TestTargetBlob {
     }
 }
 
+/// Test-only UTF-8 target whose bytes come from a source attachment.
+/// Minted with `trible genid` on 2026-08-30.
+const ATTACHED_TEXT_ENCODING_V1: Id = id_hex!("9E0CC64DE6D66EC9231B781D7215C2EC");
+
+struct AttachedTextBlob;
+
+impl BlobEncoding for AttachedTextBlob {}
+
+impl MetaDescribe for AttachedTextBlob {
+    fn describe() -> Fragment {
+        let id = ATTACHED_TEXT_ENCODING_V1;
+        crate::macros::entity! { ExclusiveId::force_ref(&id) @
+            crate::metadata::name: "exact-derived-attached-text-v1",
+            crate::metadata::description: "Test-only UTF-8 target resolved from a handle carried by one SimpleArchive source member.",
+            crate::metadata::tag: crate::metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
+impl CollectionEncoding for AttachedTextBlob {
+    fn validate_member<R>(
+        _descriptor: &Fragment,
+        member: &Blob<Self>,
+        _reader: &R,
+    ) -> Result<(), CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
+        std::str::from_utf8(member.bytes.as_ref())
+            .map(|_| ())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    }
+}
+
+/// Test-only source-attachment dereference mapping.
+/// Minted with `trible genid` on 2026-08-30.
+const ATTACHED_TEXT_MAPPING_V1: Id = id_hex!("B0DF19D3C1B35052C31E722F1294D9CB");
+
+struct AttachedTextMappingV1;
+
+impl MetaDescribe for AttachedTextMappingV1 {
+    fn describe() -> Fragment {
+        let id = ATTACHED_TEXT_MAPPING_V1;
+        crate::macros::entity! { ExclusiveId::force_ref(&id) @
+            crate::metadata::name: "exact-derived-attached-text-mapping-v1",
+            crate::metadata::description: "Test-only mapping that resolves the UTF8String named by metadata::description in a SimpleArchive member.",
+            crate::metadata::tag: crate::metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+fn attached_text_mapping_fragment() -> Fragment {
+    crate::macros::entity! {
+        crate::metadata::tag: crate::collection::KIND_COLLECTION_MAPPING,
+        crate::collection::mapping_algorithm*: <AttachedTextMappingV1 as MetaDescribe>::describe(),
+    }
+}
+
+fn attached_text_target(source: CollectionHandle) -> Fragment {
+    crate::macros::entity! { _ @
+        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
+        crate::collection::collection_source: source,
+        crate::collection::collection_authority: test_team(),
+        crate::collection::collection_representation*: <AttachedTextBlob as MetaDescribe>::describe(),
+        crate::collection::collection_mapping*: attached_text_mapping_fragment(),
+        crate::collection::collection_reach*: reach::private(),
+    }
+}
+
+struct AttachedTextMapping;
+
+impl CollectionMapping<SimpleArchive, AttachedTextBlob> for AttachedTextMapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        require_mapping(target, ATTACHED_TEXT_MAPPING_V1, "attached text")?;
+        Ok(Self)
+    }
+
+    fn map<R>(
+        &self,
+        source: &Blob<SimpleArchive>,
+        reader: &R,
+    ) -> Result<Blob<AttachedTextBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
+        let description = source
+            .bytes
+            .as_ref()
+            .chunks_exact(TRIBLE_LEN)
+            .find(|row| row[16..32] == crate::metadata::description.id()[..])
+            .map(|row| {
+                Inline::<Handle<UTF8String>>::new(
+                    row[32..64]
+                        .try_into()
+                        .expect("SimpleArchive rows have a 32-byte value"),
+                )
+            })
+            .ok_or_else(|| {
+                CollectionOperationError::Fatal(
+                    "source member has no metadata::description attachment".to_owned(),
+                )
+            })?;
+        let text: Blob<UTF8String> = reader.get(description).map_err(|source| {
+            CollectionOperationError::Fatal(format!(
+                "resolve source metadata::description attachment: {source}"
+            ))
+        })?;
+        Ok(Blob::new(text.bytes))
+    }
+}
+
 impl CollectionEncoding for TestTargetBlob {
     fn validate_member<R>(
         _descriptor: &Fragment,
@@ -193,11 +309,15 @@ impl CollectionEncoding for TestTargetBlob {
         validate_test_target(member)
     }
 
-    fn join_members(
+    fn join_members<R>(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         let injected = SELECTIVE_POLICY.with(|policy| {
             let policy = policy.borrow();
             let Some(policy) = policy.as_ref() else {
@@ -255,11 +375,15 @@ impl CollectionEncoding for SecondTestTargetBlob {
         validate_second_test_target(member)
     }
 
-    fn join_members(
+    fn join_members<R>(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         validate_second_test_target(low)?;
         validate_second_test_target(high)?;
         let low =
@@ -439,6 +563,49 @@ fn mapping_entity_id_substitution_preserves_binding_semantics() {
     .expect("binding depends on mapping facts, not intrinsic-id minting history");
 }
 
+#[test]
+fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() {
+    let authority = SigningKey::from_bytes(&[1; 32]);
+    let source_descriptor = simplearchive_union::descriptor(
+        "reader-aware-source",
+        authority.verifying_key(),
+        reach::private(),
+    );
+    let source_collection =
+        Collection::<SimpleArchive>::from_descriptor(&source_descriptor).unwrap();
+    let target_descriptor = attached_text_target(source_collection.handle());
+    let exact =
+        ExactDerivedCollection::<SimpleArchive, AttachedTextBlob, AttachedTextMapping>::new(
+            source_descriptor.clone(),
+            target_descriptor,
+        )
+        .unwrap();
+    let expected = "the attachment is part of the source closure";
+    let source = crate::macros::entity! {
+        crate::metadata::description: expected.to_owned(),
+    };
+
+    let mut store = MemoryRepo::default();
+    let registered = store
+        .collection::<SimpleArchive>(source_descriptor)
+        .unwrap();
+    assert_eq!(registered, source_collection);
+    let commit = store.commit(registered, &authority, source).unwrap();
+    let cover = Cover::from_data(source_collection, [commit.data()]);
+
+    let attached = exact.ensure_exact(&mut store, &cover).unwrap();
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached.members()[0].1.bytes.as_ref(), expected.as_bytes());
+
+    // A second read-only pass forward-validates the resident DERIVE through
+    // the same attachment lookup rather than trusting its output handle.
+    let reattached = exact.attach_exact(&mut store, &cover).unwrap();
+    assert_eq!(
+        reattached.members()[0].1.bytes.as_ref(),
+        expected.as_bytes()
+    );
+}
+
 fn selective_kernel(
     mapping: SelectiveMapping,
 ) -> ExactDerivedCollection<TestSourceBlob, TestTargetBlob, SelectiveMapping> {
@@ -508,10 +675,14 @@ impl CollectionMapping<TestSourceBlob, TestTargetBlob> for TestSuffixMapping {
         Ok(Self)
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<TestSourceBlob>,
-    ) -> Result<Blob<TestTargetBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<TestTargetBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         Ok(derive(source).unwrap())
     }
 }
@@ -525,10 +696,14 @@ impl CollectionMapping<TestTargetBlob, SecondTestTargetBlob> for SecondTestSuffi
         Ok(Self)
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<TestTargetBlob>,
-    ) -> Result<Blob<SecondTestTargetBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<SecondTestTargetBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         let mut bytes = source.bytes.as_ref().to_vec();
         bytes.push(0xB6);
         Ok(Blob::new(bytes.into()))
@@ -542,10 +717,14 @@ impl CollectionMapping<TestSourceBlob, TestSourceBlob> for IdentityMapping {
         Ok(Self)
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<TestSourceBlob>,
-    ) -> Result<Blob<TestSourceBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<TestSourceBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         Ok(source.clone())
     }
 }
@@ -556,10 +735,14 @@ impl CollectionMapping<TestSourceBlob, TestTargetBlob> for SelectiveMapping {
         Ok(Self::default())
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<TestSourceBlob>,
-    ) -> Result<Blob<TestTargetBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<TestTargetBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         let input = data(source);
         self.derive_attempts.lock().unwrap().push(input);
         if self.fatal_derives.contains(&input) {

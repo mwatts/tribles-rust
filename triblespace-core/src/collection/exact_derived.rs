@@ -566,7 +566,7 @@ where
             let mut replan = None;
             for (input_data, input) in source_cover {
                 if !cached.contains_key(&input_data) {
-                    let output = match self.mapping.map(&input) {
+                    let output = match self.mapping.map(&input, &probe.reader) {
                         Ok(output) => output,
                         Err(CollectionOperationError::Fatal(reason)) => {
                             return Err(ExactDerivedCollectionError::Derive {
@@ -877,6 +877,7 @@ where
             &self.source,
             &self.target,
             &self.mapping,
+            &reader,
         );
 
         // Only successfully recomputed decompositions become semantic seeds.
@@ -1341,6 +1342,7 @@ fn evaluate_candidates<Source, Target, Mapping>(
     source_descriptor: &Fragment,
     target_descriptor: &Fragment,
     mapping: &Mapping,
+    reader: &(impl BlobStoreGet + BlobStoreMeta),
 ) -> (BTreeSet<Id>, BTreeMap<Id, String>)
 where
     Source: CollectionEncoding,
@@ -1380,6 +1382,7 @@ where
             source_descriptor,
             target_descriptor,
             mapping,
+            reader,
         ) {
             Ok(value) => {
                 let actual = match &value {
@@ -1454,6 +1457,7 @@ fn evaluate_candidate<Source, Target, Mapping>(
     source_descriptor: &Fragment,
     target_descriptor: &Fragment,
     mapping: &Mapping,
+    reader: &(impl BlobStoreGet + BlobStoreMeta),
 ) -> Result<ScratchValue<Source, Target>, CollectionOperationError>
 where
     Source: CollectionEncoding,
@@ -1473,7 +1477,7 @@ where
                     "source merge became ready without its high input".to_owned(),
                 ));
             };
-            Source::join_members(source_descriptor, low, high)?
+            Source::join_members(source_descriptor, low, high, reader)?
                 .map(ScratchValue::Source)
                 .ok_or_else(|| {
                     CollectionOperationError::Fatal(
@@ -1488,7 +1492,7 @@ where
                     "derive became ready without its source input".to_owned(),
                 ));
             };
-            mapping.map(input).map(ScratchValue::Target)
+            mapping.map(input, reader).map(ScratchValue::Target)
         }
         Candidate::TargetMerge(claim) => {
             let (low, high) = claim.inputs();
@@ -1502,7 +1506,7 @@ where
                     "target merge became ready without its high input".to_owned(),
                 ));
             };
-            Target::join_members(target_descriptor, low, high)?
+            Target::join_members(target_descriptor, low, high, reader)?
                 .map(ScratchValue::Target)
                 .ok_or_else(|| {
                     CollectionOperationError::Fatal(

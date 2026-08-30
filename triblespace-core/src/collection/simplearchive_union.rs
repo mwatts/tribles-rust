@@ -78,11 +78,15 @@ impl CollectionEncoding for SimpleArchive {
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn join_members(
+    fn join_members<R>(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         join(low, high)
             .map(Some)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))

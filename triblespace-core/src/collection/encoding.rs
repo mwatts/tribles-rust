@@ -89,15 +89,22 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
     /// Compute the exact canonical join of two members when this encoding owns
     /// one directly materializable join law.
     ///
+    /// `reader` resolves immutable content-addressed dependencies named by the
+    /// two members. Other resident content is not an input to the join.
+    ///
     /// `Ok(None)` is structural, not a capacity failure: callers should keep a
     /// multi-member cover or perform maintenance in an upstream joinable
     /// encoding and derive this representation afterwards.
-    fn join_members(
+    fn join_members<R>(
         descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
-        let _ = (descriptor, low, high);
+        reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        let _ = (descriptor, low, high, reader);
         Ok(None)
     }
 }
@@ -125,7 +132,18 @@ where
         Self: Sized;
 
     /// Compute the canonical target image of one source member.
-    fn map(&self, source: &Blob<Source>) -> Result<Blob<Target>, CollectionOperationError>;
+    ///
+    /// `reader` is the same frozen content-addressed boundary used to validate
+    /// the source cover. A mapping may use it only to resolve immutable
+    /// dependencies named by `source`; ambient store contents are not semantic
+    /// inputs to the mapping.
+    fn map<R>(
+        &self,
+        source: &Blob<Source>,
+        reader: &R,
+    ) -> Result<Blob<Target>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta;
 }
 
 /// A descriptor does not denote the encoding requested by its Rust type.

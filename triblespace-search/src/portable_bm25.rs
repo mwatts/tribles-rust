@@ -42,6 +42,7 @@ use std::ops::Range;
 
 use anybytes::Bytes;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
+use triblespace_core::collection::{CollectionEncoding, CollectionOperationError};
 use triblespace_core::id::{id_hex, ExclusiveId};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -78,6 +79,47 @@ impl MetaDescribe for PortableBM25Blob {
             metadata::description: "Portable canonical BM25 sufficient statistic: sorted document and term domains plus exact positive u32 term-frequency postings. Merge is document union and pointwise maximum; lengths and scores are derived after attachment.",
             metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
+    }
+}
+
+impl CollectionEncoding for PortableBM25Blob {
+    fn validate_member<R>(
+        _descriptor: &Fragment,
+        member: &Blob<Self>,
+        _reader: &R,
+    ) -> Result<(), CollectionOperationError>
+    where
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+    {
+        PortableBM25Index::<
+            triblespace_core::inline::encodings::UnknownInline,
+            triblespace_core::inline::encodings::UnknownInline,
+        >::try_from_blob(member.clone())
+        .map(|_| ())
+        .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    }
+
+    fn join_members<R>(
+        _descriptor: &Fragment,
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+    {
+        type RawIndex = PortableBM25Index<
+            triblespace_core::inline::encodings::UnknownInline,
+            triblespace_core::inline::encodings::UnknownInline,
+        >;
+
+        let low = RawIndex::try_from_blob(low.clone())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        let high = RawIndex::try_from_blob(high.clone())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        let joined = RawIndex::merge([&low, &high])
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        Ok(Some(Blob::new(joined.bytes)))
     }
 }
 
@@ -769,6 +811,8 @@ mod tests {
     use triblespace_core::blob::{IntoBlob, TryFromBlob};
     use triblespace_core::inline::encodings::UnknownInline;
     use triblespace_core::query::{Constraint, Frontier, ProposalBuffer, VariableContext};
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::BlobStore;
 
     type TestIndex = PortableBM25Index<UnknownInline, UnknownInline>;
 
@@ -995,6 +1039,34 @@ mod tests {
         assert_eq!(joined.term_frequency(&value(2), &value(0xa1)), 3);
         assert_eq!(joined.doc_len(2), Some(0));
         assert_eq!(TestIndex::merge([&joined, &joined]).unwrap(), joined);
+    }
+
+    #[test]
+    fn collection_encoding_uses_the_canonical_portable_join() {
+        let left = TestIndex::from_exact_counts(
+            [value(1), value(3)],
+            [(value(1), value(0xa1), 2), (value(1), value(0xa2), 1)],
+        )
+        .unwrap();
+        let right = TestIndex::from_exact_counts(
+            [value(2)],
+            [(value(1), value(0xa1), 7), (value(2), value(0xa1), 3)],
+        )
+        .unwrap();
+        let expected = TestIndex::merge([&left, &right]).unwrap();
+        let low: Blob<PortableBM25Blob> = (&left).to_blob();
+        let high: Blob<PortableBM25Blob> = (&right).to_blob();
+        let mut store = MemoryRepo::default();
+        let reader = store.reader().unwrap();
+
+        PortableBM25Blob::validate_member(&Fragment::empty(), &low, &reader).unwrap();
+        PortableBM25Blob::validate_member(&Fragment::empty(), &high, &reader).unwrap();
+        let joined = PortableBM25Blob::join_members(&Fragment::empty(), &low, &high, &reader)
+            .unwrap()
+            .expect("portable BM25 has a direct canonical join");
+
+        assert_eq!(joined.bytes.as_ref(), expected.bytes().as_ref());
+        PortableBM25Blob::validate_member(&Fragment::empty(), &joined, &reader).unwrap();
     }
 
     #[cfg(feature = "succinct")]

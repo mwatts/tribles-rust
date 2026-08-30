@@ -260,15 +260,19 @@ impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for MeasuredSuccinctH
         ))
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, CollectionOperationError> {
+        reader: &R,
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         let mut work = self.work.get();
         work.derive += 1;
         work.input_bytes += source.bytes.len() as u64;
         self.work.set(work);
-        self.inner.map(source)
+        self.inner.map(source, reader)
     }
 }
 
@@ -607,6 +611,12 @@ mod tests {
         super::super::derive_element(&simple).unwrap()
     }
 
+    fn accelerated(raw: &Blob<SuccinctArchiveBlob>) -> Blob<Rank9AcceleratedSuccinctArchiveBlob> {
+        let mut store = MemoryRepo::default();
+        let reader = store.reader().unwrap();
+        RawToRank9AcceleratedMapping.map(raw, &reader).unwrap()
+    }
+
     #[test]
     fn facade_descriptor_is_a_two_stage_ordinary_derivation() {
         let facade = SuccinctArchiveCollection::new(
@@ -771,7 +781,7 @@ mod tests {
         let a_data = Handle::<SuccinctArchiveBlob>::to_hash(a.get_handle());
         let b_data = Handle::<SuccinctArchiveBlob>::to_hash(b.get_handle());
         let c_data = Handle::<SuccinctArchiveBlob>::to_hash(c.get_handle());
-        let fc = RawToRank9AcceleratedMapping.map(&c).unwrap();
+        let fc = accelerated(&c);
         let fc_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fc.get_handle());
 
         let mut store = MemoryRepo::default();
@@ -810,7 +820,7 @@ mod tests {
         let mut expected = [a, b]
             .iter()
             .map(|raw| {
-                let root = RawToRank9AcceleratedMapping.map(raw).unwrap();
+                let root = accelerated(raw);
                 Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(root.get_handle())
             })
             .collect::<Vec<_>>();
@@ -836,7 +846,7 @@ mod tests {
     #[test]
     fn accelerated_root_without_raw_child_is_not_resident() {
         let raw = raw([row(1, 2, 3)]);
-        let root = RawToRank9AcceleratedMapping.map(&raw).unwrap();
+        let root = accelerated(&raw);
         let mut store = MemoryRepo::default();
         store
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(root.clone())
@@ -855,7 +865,7 @@ mod tests {
     #[test]
     fn accelerated_member_validation_rejects_a_corrupt_index() {
         let raw = raw([row(1, 2, 3)]);
-        let root = RawToRank9AcceleratedMapping.map(&raw).unwrap();
+        let root = accelerated(&raw);
         let mut bytes = root.bytes.as_ref().to_vec();
         let last = bytes.last_mut().expect("Rank9 root is not empty");
         *last ^= 1;

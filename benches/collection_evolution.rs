@@ -93,17 +93,21 @@ impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for CountingSuccinctM
         })
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError> {
+        reader: &R,
+    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError>
+    where
+        R: triblespace::core::repo::BlobStoreGet + triblespace::core::repo::BlobStoreMeta,
+    {
         MAPPING_CALLS.with(|slot| {
             let mut calls = slot.get();
             calls.derive += 1;
             calls.input_bytes += source.bytes.len() as u64;
             slot.set(calls);
         });
-        self.inner.map(source)
+        self.inner.map(source, reader)
     }
 }
 

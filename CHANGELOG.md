@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Give collection validation, canonical joins, mappings, and cover views one
+  frozen blob-reader boundary. Encodings and mappings may resolve immutable
+  content-addressed dependencies named by their source members without making
+  ambient resident content a semantic input.
+
 - Make every collection member an ordinary typed `Blob<E>`.
   `CollectionEncoding` validates that blob and may expose one directly
   materializable canonical join; encodings whose physical compaction belongs

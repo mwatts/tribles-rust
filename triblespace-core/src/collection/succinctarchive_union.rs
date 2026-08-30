@@ -66,11 +66,15 @@ impl CollectionEncoding for SuccinctArchiveBlob {
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn join_members(
+    fn join_members<R>(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         join(low, high).map(Some).map_err(|source| match source {
             SuccinctArchiveRawMergeError::DomainTooWide
             | SuccinctArchiveRawMergeError::TooManyRows => {
@@ -153,10 +157,14 @@ impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for SimpleToSuccinctM
         Ok(Self)
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         derive_element(source).map_err(|source| match source {
             SuccinctArchiveRawBuildError::TooManyRows(_)
             | SuccinctArchiveRawBuildError::DomainTooWide(_) => {
@@ -247,10 +255,14 @@ impl CollectionMapping<SuccinctArchiveBlob, Rank9AcceleratedSuccinctArchiveBlob>
         Ok(Self)
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<SuccinctArchiveBlob>,
-    ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
         SuccinctArchive::<OrderedUniverse>::build_accelerated_root(source.clone())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }

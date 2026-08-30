@@ -214,11 +214,15 @@ impl CollectionEncoding for PathSummaryBlob {
         Ok(())
     }
 
-    fn join_members(
+    fn join_members<R>(
         descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+    {
         let automaton = automaton_from_descriptor(descriptor)?;
         PathSummaryBlob::join(low, high, &automaton)
             .map(Some)
@@ -240,10 +244,14 @@ impl CollectionMapping<SimpleArchive, PathSummaryBlob> for RegularPathMapping {
         })
     }
 
-    fn map(
+    fn map<R>(
         &self,
         source: &Blob<SimpleArchive>,
-    ) -> Result<Blob<PathSummaryBlob>, CollectionOperationError> {
+        _reader: &R,
+    ) -> Result<Blob<PathSummaryBlob>, CollectionOperationError>
+    where
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+    {
         derive_element(source, &self.automaton).map_err(|source| match source {
             RegularPathMappingError::Summary(PathSummaryBlobError::CapacityOverflow) => {
                 CollectionOperationError::Capacity(source.to_string())
