@@ -152,9 +152,11 @@ reader can recompute.
   currently open multiple partial operations whose per-stream tasks have no
   independent deadline or concurrency budget.
 - Choose the oversized native Succinct shard policy. Exact-cover Rank9
-  acceleration now uses an ABI-qualified, source-bound Merkle artifact with a
-  transient attached runtime and ordinary collection equations, but a single
-  derived raw shard still rejects more than `u32::MAX` rows or domain values.
+  acceleration now uses an ABI-qualified, source-bound blob whose embedded
+  handle names its exact raw Succinct source. Raw members are joinable and
+  Rank9 members are derived after raw compaction, with no direct Rank9 merge;
+  a single derived raw shard still rejects more than `u32::MAX` rows or domain
+  values.
   Decide how to split or spool oversized source covers without changing
   collection identity.
 - For pathological single commits or Succinct LSM levels that cannot keep the

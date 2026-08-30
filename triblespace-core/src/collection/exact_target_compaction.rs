@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, BlobStorePut, OfferCapture};
@@ -17,9 +18,8 @@ use crate::trible::Fragment;
 
 use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
 use super::{
-    CollectionArtifact, CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping,
-    CollectionMerge, CollectionOperationError, CollectionRecord, CollectionStore, Cover,
-    CoverAttachment,
+    CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
+    CollectionOperationError, CollectionRecord, CollectionStore, Cover, CoverAttachment,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -103,12 +103,13 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// `floor(log2(max(1, serialized_len)))`, then repeatedly joins the two lowest
 /// content handles in the lowest colliding tier. A stable cover therefore has
 /// at most one physical member per dyadic byte-size tier, except when a fixed
-/// representation cannot encode the join. Such a capacity-stable cover may
-/// retain colliding members: the lower member is retired for that planning
-/// round while the higher member remains eligible for the next pair. Every
-/// attempt shrinks the active set, so a round attempts at most `n - 1` pairs.
-/// No policy knobs, manifest, receipt, signed record, retention record, or
-/// implicit flush are involved.
+/// representation cannot encode the join or deliberately has no directly
+/// materialized join. A capacity-stable cover may retain colliding members:
+/// the lower member is retired for that planning round while the higher member
+/// remains eligible for the next pair. `Ok(None)` leaves the original cover
+/// unchanged. Every capacity-limited attempt shrinks the active set, so a
+/// round attempts at most `n - 1` pairs. No policy knobs, manifest, receipt,
+/// signed record, retention record, or implicit flush are involved.
 ///
 /// Each maintenance round first stages its complete deterministic carry in
 /// memory. Fatal construction errors and rounds with no successful join write
@@ -116,8 +117,8 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// descriptor and every staged result are stored before the topologically
 /// ordered `MERGE` records. A fresh read pass then validates the result. Freshly
 /// selected covers are compacted again when concurrent or older evidence
-/// exposes another collision. Repetition of any non-capacity-stable canonical
-/// cover returns [`ExactTargetCompactionError::Stalled`].
+/// exposes another collision. Repetition of any non-stable canonical cover
+/// returns [`ExactTargetCompactionError::Stalled`].
 pub fn compact_exact_target<S, Source, Target, H>(
     exact: &ExactDerivedCollection<Source, Target, H>,
     store: &mut S,
@@ -166,7 +167,7 @@ where
             cover,
         )? {
             RoundOutcome::Published => {}
-            RoundOutcome::CapacityStable(cover) => return Ok(cover),
+            RoundOutcome::Stable(cover) => return Ok(cover),
         }
         cover = exact.attach_exact(store, source_cover)?;
         let identity = cover_identity(&cover);
@@ -176,8 +177,8 @@ where
     }
 }
 
-fn target_tier<Target: CollectionEncoding>(artifact: &Target::Artifact) -> u32 {
-    artifact.root().bytes.len().max(1).ilog2()
+fn target_tier<Target: CollectionEncoding>(blob: &Blob<Target>) -> u32 {
+    blob.bytes.len().max(1).ilog2()
 }
 
 fn cover_identity<Target: CollectionEncoding>(
@@ -200,7 +201,7 @@ fn has_tier_collision<Target: CollectionEncoding>(cover: &CoverAttachment<Target
 
 enum RoundOutcome<Target: CollectionEncoding> {
     Published,
-    CapacityStable(CoverAttachment<Target>),
+    Stable(CoverAttachment<Target>),
 }
 
 fn publish_round<S, Target>(
@@ -214,7 +215,7 @@ where
     Target: CollectionEncoding,
     Handle<Target>: InlineEncoding,
 {
-    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Target::Artifact>>::new();
+    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
     let mut locations = BTreeMap::<CollectionData, u32>::new();
     for (data, blob) in cover.members().iter().cloned() {
         let data = Handle::<Target>::to_hash(data);
@@ -223,7 +224,7 @@ where
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
-    let mut outputs = BTreeMap::<CollectionData, Target::Artifact>::new();
+    let mut outputs = BTreeMap::<CollectionData, Blob<Target>>::new();
     let mut claims = Vec::<CollectionMerge>::new();
     loop {
         let Some(tier) = tiers
@@ -242,7 +243,8 @@ where
         locations.remove(&high_data);
 
         let constructed = match Target::join_members(&descriptor, &low, &high) {
-            Ok(constructed) => constructed,
+            Ok(Some(constructed)) => constructed,
+            Ok(None) => return Ok(RoundOutcome::Stable(cover)),
             Err(CollectionOperationError::Fatal(reason)) => {
                 return Err(ExactTargetCompactionError::Merge {
                     low: low_data,
@@ -280,13 +282,13 @@ where
     }
 
     if claims.is_empty() {
-        return Ok(RoundOutcome::CapacityStable(cover));
+        return Ok(RoundOutcome::Stable(cover));
     }
 
     super::descriptor::put_closure(store, &descriptor)
         .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
     for result in outputs.into_values() {
-        result.publish(store).map_err(|error| {
+        store.put::<Target, _>(result).map_err(|error| {
             ExactTargetCompactionError::storage("store compacted target", error)
         })?;
     }
@@ -296,4 +298,130 @@ where
             .map_err(|error| ExactTargetCompactionError::storage("publish target MERGE", error))?;
     }
     Ok(RoundOutcome::Published)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use ed25519_dalek::SigningKey;
+
+    use super::*;
+    use crate::blob::{BlobEncoding, IntoBlob};
+    use crate::collection::{reach, Collection, KIND_COLLECTION_DESCRIPTOR};
+    use crate::id::{ExclusiveId, Id};
+    use crate::id_hex;
+    use crate::inline::Inline;
+    use crate::metadata::MetaDescribe;
+
+    /// Test-only encoding with no directly materialized join.
+    /// Minted with `trible genid` on 2026-08-30.
+    const NO_JOIN_ENCODING_V1: Id = id_hex!("0C6D098C0E9E283EEAD323885B81E784");
+
+    struct NoJoinEncoding;
+
+    impl BlobEncoding for NoJoinEncoding {}
+
+    impl MetaDescribe for NoJoinEncoding {
+        fn describe() -> Fragment {
+            let id = NO_JOIN_ENCODING_V1;
+            crate::macros::entity! { ExclusiveId::force_ref(&id) @
+                crate::metadata::name: "exact-target-no-join-test-v1",
+                crate::metadata::description: "Test-only collection encoding without a directly materialized join.",
+                crate::metadata::tag: crate::metadata::KIND_BLOB_ENCODING,
+            }
+        }
+    }
+
+    impl CollectionEncoding for NoJoinEncoding {
+        fn validate_member<R>(
+            _descriptor: &Fragment,
+            _member: &Blob<Self>,
+            _reader: &R,
+        ) -> Result<(), CollectionOperationError>
+        where
+            R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+        {
+            Ok(())
+        }
+    }
+
+    struct NoWriteStore;
+
+    impl BlobStorePut for NoWriteStore {
+        type PutError = Infallible;
+
+        fn put<S, T>(&mut self, _: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            panic!("stable no-join compaction attempted a blob write")
+        }
+    }
+
+    impl CollectionStore for NoWriteStore {
+        type RecordsError = Infallible;
+        type InsertError = Infallible;
+        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
+
+        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            Ok(Vec::new().into_iter())
+        }
+
+        fn insert(&mut self, _: CollectionRecord) -> Result<(), Self::InsertError> {
+            panic!("stable no-join compaction attempted to publish a MERGE")
+        }
+    }
+
+    fn descriptor() -> Fragment {
+        crate::macros::entity! {
+            crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            crate::collection::collection_name: "exact-target-no-join-test",
+            crate::collection::collection_authority: SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            crate::collection::collection_representation*: <NoJoinEncoding as MetaDescribe>::describe(),
+            crate::collection::collection_reach*: reach::private(),
+        }
+    }
+
+    #[test]
+    fn no_direct_join_leaves_a_colliding_cover_unchanged_without_writes() {
+        let descriptor = descriptor();
+        let collection = Collection::<NoJoinEncoding>::from_descriptor(&descriptor).unwrap();
+        let mut members = vec![
+            Blob::<NoJoinEncoding>::new(vec![1; 8].into()),
+            Blob::<NoJoinEncoding>::new(vec![2; 8].into()),
+        ];
+        members.sort_unstable_by_key(|member| member.get_handle().raw);
+        let cover =
+            Cover::from_members(collection, members.iter().map(|member| member.get_handle()));
+        let original = cover_identity(&CoverAttachment::from_parts(
+            cover.clone(),
+            members
+                .iter()
+                .cloned()
+                .map(|member| (member.get_handle(), member))
+                .collect(),
+        ));
+        let attachment = CoverAttachment::from_parts(
+            cover,
+            members
+                .into_iter()
+                .map(|member| (member.get_handle(), member))
+                .collect(),
+        );
+
+        let result = publish_round(
+            descriptor,
+            collection.handle(),
+            &mut NoWriteStore,
+            attachment,
+        )
+        .unwrap();
+        let RoundOutcome::Stable(result) = result else {
+            panic!("a no-join encoding published a compaction round");
+        };
+        assert_eq!(cover_identity(&result), original);
+    }
 }

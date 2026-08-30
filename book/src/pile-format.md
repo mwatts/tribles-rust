@@ -470,11 +470,12 @@ these algebra records.
 These are the complete native collection-record family: there is no
 accelerator-specific fourth variant. A Rank9-accelerated member is an ordinary
 blob root plus its portable raw child, related to the raw collection by an
-ordinary `DERIVE`; accelerated unions use ordinary `MERGE` records. The
-accelerated root's first 32 bytes name the raw child, so generic blob traversal
-can follow the Merkle dependency without a special pile index. Writers publish
-the child, then the root, then the semantic record. Collection resolution treats
-an incomplete closure as nonresident and later construction may rebuild it.
+ordinary `DERIVE`. The raw Succinct collection owns the direct join; there is no
+Rank9 `MERGE`. The accelerated root's first 32 bytes name the raw child, so
+generic blob traversal can follow the dependency without a special pile index.
+Exact derivation stores the selected raw source before its accelerated root and
+then the semantic record. Collection resolution treats a missing root or child
+as nonresident and later construction may rebuild it.
 The unpublished mapping-evidence record kind was clean-cutover removed after a
 scan found no live records requiring migration.
 

@@ -9,21 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `CollectionArtifact<E>` as the transient attached form of one collection
-  member. Monolithic encodings use their root `Blob<E>` directly; Merkle
-  encodings can retain the root, resolved dependencies, and a validated runtime
-  together while keeping the root handle as the sole durable member identity.
-  Publication is dependency-ordered before the root and before the ordinary
-  `DERIVE` or `MERGE` record.
+- Make every collection member an ordinary typed `Blob<E>`.
+  `CollectionEncoding` validates that blob and may expose one directly
+  materializable canonical join; encodings whose physical compaction belongs
+  in another lattice keep multi-member covers instead. `CollectionMapping`
+  maps blobs to blobs, and exact derivation stores a selected source member
+  before its target image and ordinary `DERIVE` record.
 
 - Add direct typed collection encodings, covers, snapshots, and logical cover
-  views. `CollectionEncoding` attaches canonical validation and join directly
-  to the member encoding; `Collection<E>` and `Cover<E>` retain that encoding
-  through the public API; and generic commit and materialization work for
-  non-`SimpleArchive` collections. Derived descriptors link a concrete
-  mapping entity carrying its algorithm and concrete parameters, while exact
-  derived lifecycles bind one `CollectionMapping<Source, Target>` whose law is
-  a join homomorphism.
+  views. `CollectionEncoding` attaches canonical validation and an optional
+  directly materializable join to the member encoding; `Collection<E>` and
+  `Cover<E>` retain that encoding through the public API; and generic commit
+  and materialization work for non-`SimpleArchive` collections. Derived
+  descriptors link a concrete mapping entity carrying its algorithm and
+  concrete parameters, while exact derived lifecycles bind one
+  `CollectionMapping<Source, Target>` whose law is a join homomorphism.
 
 - Add top-level `capability`, a direct authorization kernel. Keyless canonical
   `SimpleArchive` claims carry one exact action/resource atom, invoke/delegate
@@ -47,8 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Rank9AcceleratedSuccinctArchiveBlob` is now an ABI-qualified Merkle-root
   `CollectionEncoding` whose first 32 bytes name its portable raw
   `SuccinctArchiveBlob` child. `RawToRank9AcceleratedMappingV1` maps raw members
-  through ordinary `DERIVE` records, while accelerated artifact joins use
-  ordinary `MERGE` records. The former `Rank9MappingV1`/`RANK9_MAPPING_V1`,
+  through ordinary `DERIVE` records. Raw Succinct members remain directly
+  joinable; accelerated roots have no direct `MERGE`, so exact maintenance
+  compacts raw first and derives the matching query-ready encoding. Cover-aware
+  views pull the named child through their reader and validate the complete
+  raw/index pair. The former `Rank9MappingV1`/`RANK9_MAPPING_V1`,
   intermediate `Rank9SidecarMappingV1*`, old blob names, and their obsolete id
   family have no compatibility aliases. The separate mapping-evidence record
   kind and store surface were removed after a scan found no live records in

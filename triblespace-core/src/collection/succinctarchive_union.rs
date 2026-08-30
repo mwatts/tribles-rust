@@ -34,48 +34,44 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    merge_ordered_archives, OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive,
-    SuccinctArchiveBlob, SuccinctArchiveError, SuccinctArchiveRawBuildError,
-    SuccinctArchiveRawMergeError,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
+    SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
 };
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
 use crate::id_hex;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::Encodes;
-use crate::metadata::{Describe, MetaDescribe};
-use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut};
+use crate::metadata::MetaDescribe;
+use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
 use super::{
-    CollectionArtifact, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
-    CollectionMapping, CollectionMerge, CollectionOperationError,
+    CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping,
+    CollectionMerge, CollectionOperationError,
 };
 
 mod collection;
 pub use collection::*;
 
 impl CollectionEncoding for SuccinctArchiveBlob {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        SuccinctArchiveBlob::merge(std::slice::from_ref(&member))
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        Ok(member)
+        SuccinctArchiveBlob::merge(std::slice::from_ref(member))
+            .map(|_| ())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
-        join(low, high).map_err(|source| match source {
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        join(low, high).map(Some).map_err(|source| match source {
             SuccinctArchiveRawMergeError::DomainTooWide
             | SuccinctArchiveRawMergeError::TooManyRows => {
                 CollectionOperationError::Capacity(source.to_string())
@@ -88,98 +84,16 @@ impl CollectionEncoding for SuccinctArchiveBlob {
     }
 }
 
-/// One closure-attached accelerated SuccinctArchive collection member.
-///
-/// The accelerated root is the member identity. The portable raw child and
-/// validated runtime are retained with it so queries and joins need neither a
-/// second store lookup nor a rebuild of Rank9/select structures.
-#[derive(Clone)]
-pub struct Rank9AcceleratedSuccinctArchiveArtifact {
-    root: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
-    raw: Blob<SuccinctArchiveBlob>,
-    runtime: SuccinctArchive<OrderedUniverse>,
-}
-
-impl Rank9AcceleratedSuccinctArchiveArtifact {
-    /// Build one complete accelerated artifact from its portable raw member.
-    pub fn from_raw(raw: Blob<SuccinctArchiveBlob>) -> Result<Self, SuccinctArchiveError> {
-        let runtime: SuccinctArchive<OrderedUniverse> = raw.clone().try_from_blob()?;
-        let root = runtime.accelerated_root();
-        Ok(Self { root, raw, runtime })
-    }
-
-    fn from_parts(
-        raw: Blob<SuccinctArchiveBlob>,
-        root: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
-    ) -> Result<Self, SuccinctArchiveError> {
-        let runtime = SuccinctArchive::from_accelerated_parts(raw.clone(), root.clone())?;
-        Ok(Self { root, raw, runtime })
-    }
-
-    /// Validated query runtime retained with this attached Merkle closure.
-    pub fn runtime(&self) -> &SuccinctArchive<OrderedUniverse> {
-        &self.runtime
-    }
-
-    /// Portable child named by this member's root.
-    pub fn raw(&self) -> &Blob<SuccinctArchiveBlob> {
-        &self.raw
-    }
-}
-
-impl Describe for Rank9AcceleratedSuccinctArchiveArtifact {
-    fn describe(&self) -> Fragment {
-        let mut description = Fragment::empty();
-        description.blobs_mut().insert(self.raw.clone());
-        description
-    }
-}
-
-impl Encodes<Rank9AcceleratedSuccinctArchiveArtifact> for Rank9AcceleratedSuccinctArchiveBlob {
-    type Output = Blob<Self>;
-
-    fn encode(source: Rank9AcceleratedSuccinctArchiveArtifact) -> Self::Output {
-        source.root
-    }
-}
-
-impl Encodes<&Rank9AcceleratedSuccinctArchiveArtifact> for Rank9AcceleratedSuccinctArchiveBlob {
-    type Output = Blob<Self>;
-
-    fn encode(source: &Rank9AcceleratedSuccinctArchiveArtifact) -> Self::Output {
-        source.root.clone()
-    }
-}
-
-impl CollectionArtifact<Rank9AcceleratedSuccinctArchiveBlob>
-    for Rank9AcceleratedSuccinctArchiveArtifact
-{
-    fn root(&self) -> &Blob<Rank9AcceleratedSuccinctArchiveBlob> {
-        &self.root
-    }
-
-    fn publish<S>(&self, store: &mut S) -> Result<(), S::PutError>
-    where
-        S: BlobStorePut,
-    {
-        store.put::<SuccinctArchiveBlob, _>(self.raw.clone())?;
-        store.put::<Rank9AcceleratedSuccinctArchiveBlob, _>(self.root.clone())?;
-        Ok(())
-    }
-}
-
 impl CollectionEncoding for Rank9AcceleratedSuccinctArchiveBlob {
-    type Artifact = Rank9AcceleratedSuccinctArchiveArtifact;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
-        let source = Self::source_handle(&member)
+        let source = Self::source_handle(member)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
         let raw = reader
             .get::<Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(source)
@@ -188,18 +102,9 @@ impl CollectionEncoding for Rank9AcceleratedSuccinctArchiveBlob {
                     "accelerated SuccinctArchive raw child is not resident: {source}"
                 ))
             })?;
-        Rank9AcceleratedSuccinctArchiveArtifact::from_parts(raw, member)
+        SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, member.clone())
+            .map(|_| ())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
-    }
-
-    fn join_members(
-        _descriptor: &Fragment,
-        low: &Self::Artifact,
-        high: &Self::Artifact,
-    ) -> Result<Self::Artifact, CollectionOperationError> {
-        let runtime = merge_ordered_archives(&[low.runtime.clone(), high.runtime.clone()]);
-        let (raw, root) = runtime.to_accelerated_parts();
-        Ok(Rank9AcceleratedSuccinctArchiveArtifact { root, raw, runtime })
     }
 }
 
@@ -295,7 +200,7 @@ impl MetaDescribe for RawToRank9AcceleratedMappingV1 {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "raw-to-rank9-accelerated-succinctarchive-v1",
-                metadata::description: "Canonical mapping from a portable SuccinctArchive member to its ABI-qualified Rank9-accelerated Merkle artifact. The mapping preserves union: mapping raw members separately and joining their accelerated artifacts yields the same canonical root as mapping their raw union.",
+                metadata::description: "Canonical mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Compaction joins portable inputs first and then derives the exact source-bound accelerator, so no independent accelerated-side join is required.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -345,8 +250,8 @@ impl CollectionMapping<SuccinctArchiveBlob, Rank9AcceleratedSuccinctArchiveBlob>
     fn map(
         &self,
         source: &Blob<SuccinctArchiveBlob>,
-    ) -> Result<Rank9AcceleratedSuccinctArchiveArtifact, CollectionOperationError> {
-        Rank9AcceleratedSuccinctArchiveArtifact::from_raw(source.clone())
+    ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, CollectionOperationError> {
+        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(source.clone())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }

@@ -12,7 +12,7 @@
 //!   descriptor.
 //!
 //! Logical interpretation is deliberately separate in
-//! [`TryFromCover`](super::TryFromCover). An interpretation may join every
+//! [`TryFromCover`](crate::collection::TryFromCover). An interpretation may join every
 //! physical member eagerly or retain an exact cover of mmap-backed shards.
 
 use std::error::Error;
@@ -20,10 +20,8 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::blob::{Blob, BlobEncoding, IntoBlob};
-use crate::inline::encodings::hash::Handle;
-use crate::inline::InlineEncoding;
 use crate::metadata::MetaDescribe;
-use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut};
+use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::Fragment;
 
 use super::{descriptor, CollectionHandle, RecordDecodeError};
@@ -53,60 +51,18 @@ impl fmt::Display for CollectionOperationError {
 
 impl Error for CollectionOperationError {}
 
-/// One fully attached physical member of a collection encoding.
+/// One canonical physical shape carried by a blob encoding.
 ///
-/// Most encodings are monolithic, so their artifact is simply the root
-/// [`Blob`] itself. Merkle encodings may instead retain the root, its resolved
-/// dependencies, and any runtime reconstructed while validating that closure.
-/// The transient attachment is deliberately not another durable record: its
-/// root remains the sole collection-member identity.
-pub trait CollectionArtifact<E>: Clone
-where
-    E: BlobEncoding,
-    Handle<E>: InlineEncoding,
-{
-    /// Canonical root blob whose content handle names this member.
-    fn root(&self) -> &Blob<E>;
-
-    /// Publish the complete artifact closure, dependencies before root.
-    ///
-    /// Implementations may harmlessly re-put already resident dependencies;
-    /// content addressing makes publication idempotent. Collection equations
-    /// are always inserted by the caller only after every artifact has been
-    /// published.
-    fn publish<S>(&self, store: &mut S) -> Result<(), S::PutError>
-    where
-        S: BlobStorePut;
-}
-
-impl<E> CollectionArtifact<E> for Blob<E>
-where
-    E: BlobEncoding,
-    Handle<E>: InlineEncoding,
-{
-    fn root(&self) -> &Blob<E> {
-        self
-    }
-
-    fn publish<S>(&self, store: &mut S) -> Result<(), S::PutError>
-    where
-        S: BlobStorePut,
-    {
-        store.put::<E, _>(self.clone())?;
-        Ok(())
-    }
-}
-
-/// One canonical join-semilattice carried by a blob encoding.
+/// Collection members are always ordinary typed [`Blob`] values. An encoding
+/// validates its own bytes and may additionally expose one canonical
+/// intra-shape join. Returning `Ok(None)` from [`join_members`](Self::join_members)
+/// means that physical joins are deliberately constructed in another lattice;
+/// the encoding can still form multi-member covers and logical views.
 ///
-/// The encoding is the physical shape *and* its intra-shape join law. This is
-/// intentionally stronger than [`BlobEncoding`]: not every blob format is a
-/// collection member, while every `CollectionEncoding` has one unambiguous
-/// canonical join.
+/// This is intentionally stronger than [`BlobEncoding`]: not every blob format
+/// is a collection member, while every `CollectionEncoding` has an exact
+/// validation boundary.
 pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
-    /// Fully validated, closure-attached runtime form of one member.
-    type Artifact: CollectionArtifact<Self>;
-
     /// Validate encoding-specific context carried by one descriptor.
     ///
     /// Most encodings need no context. An encoding whose canonical bytes are
@@ -117,25 +73,33 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
         Ok(())
     }
 
-    /// Resolve and validate one member independently of its provenance.
+    /// Validate one member independently of its provenance.
     ///
     /// The root bytes have already passed the blob store's content-address
-    /// boundary. A Merkle encoding may load children through `reader`; a
-    /// monolithic encoding normally ignores it and returns the root blob.
-    fn attach_member<R>(
+    /// boundary. A Merkle encoding may inspect children through `reader`; a
+    /// monolithic encoding normally ignores it.
+    fn validate_member<R>(
         descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta;
 
-    /// Compute the exact canonical join of two members.
+    /// Compute the exact canonical join of two members when this encoding owns
+    /// one directly materializable join law.
+    ///
+    /// `Ok(None)` is structural, not a capacity failure: callers should keep a
+    /// multi-member cover or perform maintenance in an upstream joinable
+    /// encoding and derive this representation afterwards.
     fn join_members(
         descriptor: &Fragment,
-        low: &Self::Artifact,
-        high: &Self::Artifact,
-    ) -> Result<Self::Artifact, CollectionOperationError>;
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        let _ = (descriptor, low, high);
+        Ok(None)
+    }
 }
 
 /// One parameterized mapping between collection encodings.
@@ -146,7 +110,10 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
 /// parameters rather than its minting history. Implementations
 /// must be a join homomorphism:
 ///
-/// `map(a join b) = map(a) join map(b)`.
+/// `map(a join b) = map(a) logical_join map(b)`.
+///
+/// The target's logical join may be represented by a multi-member cover even
+/// when its encoding deliberately has no directly materialized physical join.
 pub trait CollectionMapping<Source, Target>
 where
     Source: CollectionEncoding,
@@ -158,7 +125,7 @@ where
         Self: Sized;
 
     /// Compute the canonical target image of one source member.
-    fn map(&self, source: &Source::Artifact) -> Result<Target::Artifact, CollectionOperationError>;
+    fn map(&self, source: &Blob<Source>) -> Result<Blob<Target>, CollectionOperationError>;
 }
 
 /// A descriptor does not denote the encoding requested by its Rust type.

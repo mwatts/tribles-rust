@@ -46,9 +46,10 @@ attribute's exact historical bytes when its old identity cannot be re-derived.
 
 A root collection is identified by the content handle of its descriptor. The
 descriptor carries its UTF-8 name, mandatory authority, member encoding, and
-reach law. The encoding itself owns member validation and canonical join; a
-root needs no mapping. The descriptor is an ordinary self-contained
-`Fragment`; its canonical content handle is the collection identity:
+reach law. The encoding itself owns member validation and may expose one
+directly materializable canonical join; a root needs no mapping. The descriptor
+is an ordinary self-contained `Fragment`; its canonical content handle is the
+collection identity:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
@@ -196,8 +197,8 @@ the chosen backend rather than collection policy.
 - `entity!` builds intrinsic entities and carries required blobs.
 - `Fragment` is the self-contained publication value.
 - `Collection<E>` is a descriptor handle statically bound to the
-  `CollectionEncoding` which owns its member bytes, validation, and join; the
-  store owns all I/O.
+  `CollectionEncoding` which owns its member bytes, validation, and any direct
+  physical join; the store owns all I/O.
 - `store.commit` publishes one signed, independent member without conflating
   local storage with network authorization.
 - `store.snapshot` returns one coherent known-prefix view admitted by the

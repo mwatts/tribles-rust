@@ -83,26 +83,23 @@ impl MetaDescribe for TestSourceBlob {
 }
 
 impl CollectionEncoding for TestSourceBlob {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
         simplearchive_union::validate_element(member.as_transmute::<SimpleArchive>())
-            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
-        Ok(member)
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
         SELECTIVE_POLICY.with(|policy| {
             if let Some(policy) = policy.borrow().as_ref() {
                 policy
@@ -117,6 +114,7 @@ impl CollectionEncoding for TestSourceBlob {
             high.as_transmute::<SimpleArchive>(),
         )
         .map(Blob::transmute::<TestSourceBlob>)
+        .map(Some)
         .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 }
@@ -184,25 +182,22 @@ impl MetaDescribe for TestTargetBlob {
 }
 
 impl CollectionEncoding for TestTargetBlob {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        validate_test_target(&member)?;
-        Ok(member)
+        validate_test_target(member)
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
         let injected = SELECTIVE_POLICY.with(|policy| {
             let policy = policy.borrow();
             let Some(policy) = policy.as_ref() else {
@@ -225,7 +220,7 @@ impl CollectionEncoding for TestTargetBlob {
         if let Some(error) = injected {
             return Err(error);
         }
-        join_test_targets(low, high)
+        join_test_targets(low, high).map(Some)
     }
 }
 
@@ -249,25 +244,22 @@ impl MetaDescribe for SecondTestTargetBlob {
 }
 
 impl CollectionEncoding for SecondTestTargetBlob {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        validate_second_test_target(&member)?;
-        Ok(member)
+        validate_second_test_target(member)
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
         validate_second_test_target(low)?;
         validate_second_test_target(high)?;
         let low =
@@ -278,7 +270,7 @@ impl CollectionEncoding for SecondTestTargetBlob {
         let joined = join_test_targets(&low, &high)?;
         let mut bytes = joined.bytes.as_ref().to_vec();
         bytes.push(0xB6);
-        Ok(Blob::new(bytes.into()))
+        Ok(Some(Blob::new(bytes.into())))
     }
 }
 
@@ -1561,6 +1553,45 @@ fn reader_is_dropped_before_first_write() {
     let source_cover = source_cover(&[commit]);
     kernel().ensure_exact(&mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ensure_stores_source_before_target_and_derive() {
+    let source = archive([(1, 3)]);
+    let mut inner = MemoryRepo::default();
+    let commit = source_commit(&mut inner, 1, &source);
+    let mut store = GuardStore {
+        inner,
+        live: Arc::new(AtomicUsize::new(0)),
+        events: Vec::new(),
+    };
+
+    kernel()
+        .ensure_exact(&mut store, &source_cover(&[commit]))
+        .unwrap();
+
+    let (insert, claim) = store
+        .events
+        .iter()
+        .enumerate()
+        .find_map(|(position, event)| match event {
+            WriteEvent::Insert(CollectionRecord::Derive(claim)) => Some((position, *claim)),
+            _ => None,
+        })
+        .expect("ensure publishes one DERIVE");
+    let source_put = store
+        .events
+        .iter()
+        .position(|event| matches!(event, WriteEvent::Put(data) if *data == claim.input()))
+        .expect("ensure stores the selected source");
+    let target_put = store
+        .events
+        .iter()
+        .position(|event| matches!(event, WriteEvent::Put(data) if *data == claim.output()))
+        .expect("ensure stores the mapped target");
+
+    assert!(source_put < target_put);
+    assert!(target_put < insert);
 }
 
 fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {

@@ -9,22 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `CollectionArtifact<E>` as the transient attached form of one collection
-  member. Monolithic encodings use their root blob directly; Merkle encodings
-  can retain a root, its resolved dependencies, and a validated runtime while
-  preserving the root handle as the sole durable member identity. Publishing
-  an artifact writes dependencies before its root and writes the root before
-  the ordinary `DERIVE` or `MERGE` record.
+- Make every collection member an ordinary typed `Blob<E>`.
+  `CollectionEncoding` validates that blob and may expose one directly
+  materializable canonical join; encodings whose physical compaction belongs
+  in another lattice keep multi-member covers instead. `CollectionMapping`
+  maps blobs to blobs, and exact derivation stores a selected source member
+  before its target image and ordinary `DERIVE` record.
 
 - Add a typed collection API above the representation-neutral wire records.
   `Collection<E>` validates a descriptor's canonical member encoding,
   `Cover<E>` carries only `Handle<E>` members, and `TryFromCover<E>`
   reconstructs either eager values or lazy mmap-backed unions. Generic
   `store.commit`, `cover`, `snapshot`, and `materialize` operations now work
-  across encodings. Each `CollectionEncoding` owns its canonical validation
-  and join, while exact derivations bind one parameterized
-  `CollectionMapping<Source, Target>` whose ordinary trible fragment is
-  embedded in the target descriptor.
+  across encodings. Each `CollectionEncoding` owns canonical validation and
+  may expose one direct physical join, while exact derivations bind one
+  parameterized `CollectionMapping<Source, Target>` whose ordinary trible
+  fragment is embedded in the target descriptor.
 
 - Add an exact maintained last-write-wins register collection. Its canonical
   projection keeps state identity and raw order facts as two independently
@@ -236,15 +236,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths, and network reuse now share this continuation type. Distinct covers
   may have equal support through validated merges; route freedom or exact
   immediate-input requirements belong to the input collection and mapping,
-  including Rank9's exact raw-Succinct input. Exact derivation can reverse-ground a
-  compacted source member through freshly validated MERGE inputs, so `{c}` may
-  reuse resident `{f(a), f(b)}` when `a join b = c`, while forged equations
-  remain inert and fall back to direct construction. The same equivalence lets
-  capacity replanning replace a blocked compacted member with its resident
-  lower shards. Resolution tries the explicit Cover path first and widens into
-  reverse decompositions only when needed; unreadable optional inputs and
-  incomplete Merkle closures cannot poison an otherwise valid replay or turn
-  speculative misses into durable demand.
+  including Rank9's exact raw-Succinct input. For mappings with route freedom,
+  exact derivation can reverse-ground a compacted source member through freshly
+  validated `MERGE` inputs, so `{c}` may reuse resident `{f(a), f(b)}` when
+  `a join b = c`, while forged equations remain inert and fall back to direct
+  construction. Source-bound mappings use the same resolver in exact-member
+  mode: Rank9 acceleration always constructs `f(c)` for the precise raw member
+  `c`. The generic equivalence route also lets capacity replanning replace a
+  blocked compacted member with its resident lower shards. Resolution tries
+  the explicit Cover path first and widens into reverse decompositions only
+  when allowed and needed; unreadable optional inputs and incomplete Merkle
+  closures cannot poison an otherwise valid replay or turn speculative misses
+  into durable demand.
 
 - Port the remaining benchmark, path/network test, macro-instrumentation, and
   benchmark-ledger callers to the store-centric collection API with mandatory
@@ -687,9 +690,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The portable Succinct LSM benchmark now measures the native exact
   collection lifecycle.** Source chunks are published and their cover is
   discovered outside the timer; `build_exact` measures canonical raw
-  construction, deterministic target compaction, accelerated Merkle-artifact
-  publication, and query-ready attachment as one fixed operation. The report
-  replaces legacy fanout/range/manifest counters with exact-cover, raw-cover,
+  construction, deterministic raw target compaction, source-first accelerated
+  derivation, and query-ready view construction as one fixed operation. The
+  report replaces legacy fanout/range/manifest counters with exact-cover, raw-cover,
   serialized-byte, and physical-shard metrics
   while retaining the union-versus-`TribleSet` query identity gates.
 - **The speculative adaptive Succinct rollup wrapper is gone.** Core retains
@@ -703,28 +706,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Derived collections now share one qualified exact-cover lifecycle.**
   `collection::exact_derived::ExactDerivedCollection` supplies strict cover
   discovery, payload validation, deterministic resident covers, residual
-  lowering, descriptors-before-artifacts-before-`DERIVE` publication, and
+  lowering, source-before-target-before-`DERIVE` publication, and
   read-side attachment without `PinStore` or an implicit flush. Regular paths
   and both Succinct stages use this kernel. `SuccinctArchiveCollection` returns
   the accelerated target cover as an owned sharded `UnionArchive`, preserving
-  its physical shape and already-validated runtimes.
+  its physical shape while reconstructing each validated query runtime from
+  the accelerated root and its named raw child.
 
   `Rank9AcceleratedSuccinctArchiveBlob` is an ordinary ABI-qualified
   `CollectionEncoding` and a Merkle root: its first 32 bytes name the exact
   portable raw `SuccinctArchiveBlob` child whose Rank9/select data it carries.
   Four explicitly minted encoding ids and four mapping-algorithm ids distinguish
   32/64-bit and little/big-endian profiles; the current target selects one of
-  each. The raw-to-accelerated stage is an ordinary `DERIVE`, and accelerated
-  joins are ordinary `MERGE` records. `CollectionArtifact` attaches the root,
-  raw child, and query runtime into one transient value, allowing pair-aware
-  joins without pretending the root bytes alone contain their portable input.
-  Publishing writes the raw child, then its root, then the semantic record.
-  Incomplete closures are nonresident and `ensure_exact` reconstructs them by a
-  usable lattice route rather than admitting partial state.
+  each. The raw-to-accelerated stage is an ordinary `DERIVE`. Raw
+  `SuccinctArchiveBlob` members own the joinable lattice; Rank9 roots have no
+  direct `MERGE`, so maintenance compacts raw members first and then derives
+  the matching accelerated member. A cover-aware view reads the embedded raw
+  handle through its reader and validates the exact raw/index pair before
+  constructing the query runtime. Exact derivation stores the selected raw
+  source before its accelerated root and semantic record. Incomplete roots are
+  nonresident and `ensure_exact` reconstructs them from a usable source route
+  rather than admitting partial state.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
   garbage collection. Descriptor-typed lattice methods validate fixed
-  descriptors and terminal artifacts while the evaluator walks backwards from
+  descriptors and terminal blobs while the evaluator walks backwards from
   resident source and target results, then reconstructs every candidate path
   forwards from explicit source-cover leaves. Computed
   intermediates have use-counted scratch lifetimes and are never persisted.

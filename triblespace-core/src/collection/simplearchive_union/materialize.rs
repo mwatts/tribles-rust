@@ -45,7 +45,13 @@ impl Error for FactViewError {
 impl TryFromCover<SimpleArchive> for TribleSet {
     type Error = FactViewError;
 
-    fn try_from_cover(attachment: CoverAttachment<SimpleArchive>) -> Result<Self, Self::Error> {
+    fn try_from_cover<R>(
+        attachment: CoverAttachment<SimpleArchive>,
+        _reader: &R,
+    ) -> Result<Self, Self::Error>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
         let members = attachment.into_members();
         match members.as_slice() {
             [] => Ok(TribleSet::new()),

@@ -211,26 +211,23 @@ Missing derived artifacts are cache misses, not missing facts.
 Route freedom belongs to the input collection expected by the mapping rather
 than to a flag on `Cover`: ordinary Succinct construction may reuse any
 validated equal-support route. Rank9 acceleration is another ordinary derived
-collection, but its members are Merkle closures rather than monolithic blobs.
-`Rank9AcceleratedSuccinctArchiveBlob` is the ABI-qualified root encoding. Its
-first 32 bytes name the exact portable `SuccinctArchiveBlob` child whose
-Rank9/select structures it carries.
+collection. Its members are ordinary
+`Blob<Rank9AcceleratedSuccinctArchiveBlob>` values whose first 32 bytes name the
+exact portable `SuccinctArchiveBlob` child carrying their source rows. The root
+and named child together are a complete source-bound accelerated encoding, not
+a separate sidecar or runtime artifact.
 
-`CollectionArtifact<E>` separates the durable root identity from the transient
-value needed to operate on it. Attaching an accelerated member resolves and
-validates its root, raw child, and query runtime once, then retains all three in
-one artifact. The raw-to-accelerated mapping is an ordinary `DERIVE`, and the
-join law applies to complete attached artifacts:
-
-```text
-(a, R(a)) ⊔ (b, R(b)) = (a ⊔ b, R(a ⊔ b))
-```
-
-The output raw child and accelerated root are published in dependency order
-before the semantic `DERIVE` or `MERGE` record. A root whose raw child is absent
-is an incomplete, nonresident closure; read-only attachment rejects that route,
-while ensuring may reconstruct the canonical artifact through another valid
-route or directly from its source.
+Raw Succinct members own the directly materializable join. Rank9 roots do not
+define another physical join: maintenance compacts raw members first, then the
+ordinary raw-to-accelerated `DERIVE` maps that exact source blob to its query
+index. Thus raw cover `{a, b}` maps to `{f(a), f(b)}` even when resident
+evidence also proves `a join b = c`; only explicit raw compaction to cover
+`{c}` changes the accelerated cover to `{f(c)}`. Exact derivation stores the
+selected source before the target root and semantic record. A cover-aware view
+follows the embedded handle through its reader, validates the exact raw/index
+pair, and only then builds the transient query runtime. A root whose raw child
+is absent is nonresident; ensuring reconstructs the exact accelerated image
+from that raw source.
 
 ## WANT is operational, not semantic
 

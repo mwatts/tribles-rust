@@ -7,10 +7,12 @@
 //!                --DERIVE--> Rank9AcceleratedSuccinctArchiveBlob
 //! ```
 //!
-//! Both stages use the same exact-cover resolver and ordinary `DERIVE`/`MERGE`
-//! records. The accelerated encoding is a Merkle artifact whose root names its
-//! portable raw child; attachment therefore retains the raw blob and query
-//! runtime as one transient value without inventing a sidecar record family.
+//! Both stages use the same exact-cover resolver and ordinary `DERIVE`
+//! records. Raw SuccinctArchive members own the directly materialized `MERGE`;
+//! every accelerated member is instead the exact image of one raw member. The
+//! accelerated encoding is an ordinary blob whose header names its portable
+//! raw source. Attaching it resolves that source and constructs the query
+//! runtime without a sidecar record family or wrapper artifact.
 
 use std::cell::Cell;
 use std::error::Error;
@@ -30,10 +32,11 @@ use crate::collection::exact_target_compaction::{
 };
 use crate::collection::simplearchive_union;
 use crate::collection::{
-    CollectionHandle, CollectionMapping, CollectionOperationError, CollectionStore,
+    CollectionData, CollectionHandle, CollectionMapping, CollectionOperationError, CollectionStore,
     CoverAdvanceError, CoverAttachment, FactCover, TryFromCover,
 };
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
+use crate::inline::encodings::hash::Handle;
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::Fragment;
 
 use super::{RawToRank9AcceleratedMapping, SimpleToSuccinctMapping};
@@ -41,11 +44,15 @@ use super::{RawToRank9AcceleratedMapping, SimpleToSuccinctMapping};
 impl TryFromCover<SuccinctArchiveBlob> for UnionArchive<OrderedUniverse> {
     type Error = SuccinctArchiveError;
 
-    fn try_from_cover(
+    fn try_from_cover<R>(
         attachment: CoverAttachment<SuccinctArchiveBlob>,
-    ) -> Result<Self, Self::Error> {
+        _reader: &R,
+    ) -> Result<Self, Self::Error>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
         let mut segments = attachment
-            .into_artifacts()
+            .into_blobs()
             .map(SuccinctArchive::try_from_blob)
             .collect::<Result<Vec<_>, _>>()?;
         if segments.is_empty() {
@@ -55,19 +62,74 @@ impl TryFromCover<SuccinctArchiveBlob> for UnionArchive<OrderedUniverse> {
     }
 }
 
-impl TryFromCover<Rank9AcceleratedSuccinctArchiveBlob> for UnionArchive<OrderedUniverse> {
-    type Error = SuccinctArchiveError;
+/// Failure to attach one Rank9 root to the raw archive named in its header.
+#[derive(Debug)]
+pub enum Rank9AcceleratedViewError {
+    /// The accelerated root header or exact raw/index pair is invalid.
+    Invalid(SuccinctArchiveError),
+    /// The exact raw child named by an accelerated root is not resident.
+    MissingRaw {
+        /// Accelerated root whose child could not be loaded.
+        member: CollectionData,
+        /// Backend diagnostic.
+        reason: String,
+    },
+}
 
-    fn try_from_cover(
+impl fmt::Display for Rank9AcceleratedViewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(source) => source.fmt(formatter),
+            Self::MissingRaw { member, reason } => write!(
+                formatter,
+                "accelerated SuccinctArchive member {} is missing its raw child: {reason}",
+                hex::encode_upper(member.raw),
+            ),
+        }
+    }
+}
+
+impl Error for Rank9AcceleratedViewError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Invalid(source) => Some(source),
+            Self::MissingRaw { .. } => None,
+        }
+    }
+}
+
+impl TryFromCover<Rank9AcceleratedSuccinctArchiveBlob> for UnionArchive<OrderedUniverse> {
+    type Error = Rank9AcceleratedViewError;
+
+    fn try_from_cover<R>(
         attachment: CoverAttachment<Rank9AcceleratedSuccinctArchiveBlob>,
-    ) -> Result<Self, Self::Error> {
-        let mut segments = attachment
-            .into_artifacts()
-            .map(|artifact| artifact.runtime().clone())
-            .collect::<Vec<_>>();
+        reader: &R,
+    ) -> Result<Self, Self::Error>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        let mut segments = Vec::with_capacity(attachment.len());
+        for root in attachment.into_blobs() {
+            let member = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(root.get_handle());
+            let source = Rank9AcceleratedSuccinctArchiveBlob::source_handle(&root)
+                .map_err(Rank9AcceleratedViewError::Invalid)?;
+            let raw = reader
+                .get::<crate::blob::Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(source)
+                .map_err(|source| Rank9AcceleratedViewError::MissingRaw {
+                    member,
+                    reason: source.to_string(),
+                })?;
+            segments.push(
+                SuccinctArchive::from_accelerated_parts(raw, root)
+                    .map_err(Rank9AcceleratedViewError::Invalid)?,
+            );
+        }
         if segments.is_empty() {
-            let bottom = super::Rank9AcceleratedSuccinctArchiveArtifact::from_raw(super::empty())?;
-            segments.push(bottom.runtime().clone());
+            segments.push(
+                super::empty()
+                    .try_from_blob()
+                    .map_err(Rank9AcceleratedViewError::Invalid)?,
+            );
         }
         Ok(UnionArchive::new(segments))
     }
@@ -81,7 +143,9 @@ pub enum SuccinctArchiveCollectionError {
     /// Explicit raw target compaction failed.
     Compaction(ExactTargetCompactionError),
     /// A freshly attached accelerated cover could not become a query view.
-    View(SuccinctArchiveError),
+    View(Rank9AcceleratedViewError),
+    /// A fresh reader for the just-attached cover could not be opened.
+    Reader(String),
 }
 
 impl fmt::Display for SuccinctArchiveCollectionError {
@@ -90,6 +154,7 @@ impl fmt::Display for SuccinctArchiveCollectionError {
             Self::Exact(source) => source.fmt(formatter),
             Self::Compaction(source) => source.fmt(formatter),
             Self::View(source) => source.fmt(formatter),
+            Self::Reader(source) => write!(formatter, "open accelerated cover reader: {source}"),
         }
     }
 }
@@ -100,6 +165,7 @@ impl Error for SuccinctArchiveCollectionError {
             Self::Exact(source) => Some(source),
             Self::Compaction(source) => Some(source),
             Self::View(source) => Some(source),
+            Self::Reader(_) => None,
         }
     }
 }
@@ -116,10 +182,24 @@ impl From<ExactTargetCompactionError> for SuccinctArchiveCollectionError {
     }
 }
 
-impl From<SuccinctArchiveError> for SuccinctArchiveCollectionError {
-    fn from(source: SuccinctArchiveError) -> Self {
+impl From<Rank9AcceleratedViewError> for SuccinctArchiveCollectionError {
+    fn from(source: Rank9AcceleratedViewError) -> Self {
         Self::View(source)
     }
+}
+
+fn accelerated_view<S>(
+    store: &mut S,
+    attachment: CoverAttachment<Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
+where
+    S: BlobStore,
+    S::Reader: BlobStoreMeta,
+{
+    let reader = store
+        .reader()
+        .map_err(|source| SuccinctArchiveCollectionError::Reader(source.to_string()))?;
+    UnionArchive::try_from_cover(attachment, &reader).map_err(Into::into)
 }
 
 /// Canonical accelerated SuccinctArchive projection of one SimpleArchive union.
@@ -315,9 +395,9 @@ impl SuccinctArchiveView {
         let raw_cover = raw_attachment.cover().clone();
         let accelerated = self
             .collection
-            .accelerated_kernel()?
-            .ensure_exact(store, &raw_cover)?;
-        Ok((UnionArchive::try_from_cover(accelerated)?, work))
+            .rank9_derivation()?
+            .ensure_member_images(store, &raw_cover)?;
+        Ok((accelerated_view(store, accelerated)?, work))
     }
 }
 
@@ -417,8 +497,10 @@ impl SuccinctArchiveCollection {
     {
         let raw_attachment = self.raw_kernel()?.attach_exact(store, source_cover)?;
         let raw_cover = raw_attachment.cover().clone();
-        let accelerated = self.accelerated_kernel()?.attach_exact(store, &raw_cover)?;
-        Ok(UnionArchive::try_from_cover(accelerated)?)
+        let accelerated = self
+            .rank9_derivation()?
+            .attach_member_images(store, &raw_cover)?;
+        accelerated_view(store, accelerated)
     }
 
     /// Ensure both ordinary derivation stages and attach the exact view.
@@ -433,8 +515,10 @@ impl SuccinctArchiveCollection {
     {
         let raw_attachment = self.raw_kernel()?.ensure_exact(store, source_cover)?;
         let raw_cover = raw_attachment.cover().clone();
-        let accelerated = self.accelerated_kernel()?.ensure_exact(store, &raw_cover)?;
-        Ok(UnionArchive::try_from_cover(accelerated)?)
+        let accelerated = self
+            .rank9_derivation()?
+            .ensure_member_images(store, &raw_cover)?;
+        accelerated_view(store, accelerated)
     }
 
     /// Compact the raw target, then ensure the matching accelerated cover.
@@ -449,8 +533,10 @@ impl SuccinctArchiveCollection {
     {
         let raw = compact_exact_target(&self.raw_kernel()?, store, source_cover)?;
         let raw_cover = raw.cover().clone();
-        let accelerated = self.accelerated_kernel()?.ensure_exact(store, &raw_cover)?;
-        Ok(UnionArchive::try_from_cover(accelerated)?)
+        let accelerated = self
+            .rank9_derivation()?
+            .ensure_member_images(store, &raw_cover)?;
+        accelerated_view(store, accelerated)
     }
 
     fn raw_kernel(
@@ -462,7 +548,7 @@ impl SuccinctArchiveCollection {
         ExactDerivedCollection::new(self.source_descriptor(), self.raw_descriptor())
     }
 
-    fn accelerated_kernel(
+    fn rank9_derivation(
         &self,
     ) -> Result<
         ExactDerivedCollection<
@@ -478,18 +564,19 @@ impl SuccinctArchiveCollection {
 
 #[cfg(test)]
 mod tests {
+    use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::succinctarchive::{
-        OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
     use crate::blob::{Blob, IntoBlob};
     use crate::collection::descriptor;
     use crate::collection::reach;
     use crate::collection::{
-        CollectionArtifact, CollectionEncoding, CollectionMapping, CollectionRecord,
-        CollectionStore, FactCover,
+        Collection, CollectionDerive, CollectionEncoding, CollectionMapping, CollectionMerge,
+        CollectionRecord, CollectionStore, Cover, FactCover,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
@@ -497,9 +584,7 @@ mod tests {
     use crate::repo::{BlobStore, BlobStorePut};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
-    use super::super::{
-        join, Rank9AcceleratedSuccinctArchiveArtifact, RawToRank9AcceleratedMapping,
-    };
+    use super::super::RawToRank9AcceleratedMapping;
     use super::*;
 
     fn authority() -> ed25519_dalek::VerifyingKey {
@@ -547,33 +632,6 @@ mod tests {
             descriptor::representation(facade.descriptor().facts()).unwrap(),
             Rank9AcceleratedSuccinctArchiveBlob::id()
         );
-    }
-
-    #[test]
-    fn pair_aware_join_matches_map_after_raw_join() {
-        let left = raw([row(1, 2, 3), row(4, 5, 6)]);
-        let right = raw([row(1, 2, 3), row(7, 8, 9)]);
-        let mapping = RawToRank9AcceleratedMapping;
-        let left_accelerated = mapping.map(&left).unwrap();
-        let right_accelerated = mapping.map(&right).unwrap();
-        let joined = Rank9AcceleratedSuccinctArchiveBlob::join_members(
-            &Fragment::empty(),
-            &left_accelerated,
-            &right_accelerated,
-        )
-        .unwrap();
-        let expected_raw = join(&left, &right).unwrap();
-        let expected: Rank9AcceleratedSuccinctArchiveArtifact = mapping.map(&expected_raw).unwrap();
-        assert_eq!(joined.root().get_handle(), expected.root().get_handle());
-        assert_eq!(joined.raw().get_handle(), expected.raw().get_handle());
-        let expected_rows = SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(
-            expected.raw().clone(),
-            expected.root().clone(),
-        )
-        .unwrap()
-        .iter()
-        .collect::<Vec<_>>();
-        assert_eq!(joined.runtime().iter().collect::<Vec<_>>(), expected_rows);
     }
 
     #[test]
@@ -633,23 +691,186 @@ mod tests {
     }
 
     #[test]
+    fn compacting_raw_constructs_the_exact_accelerated_image() {
+        let facade = SuccinctArchiveCollection::new(
+            "facts",
+            authority(),
+            reach::private(),
+            authority(),
+            reach::private(),
+        );
+        let a: Blob<SimpleArchive> = [row(1, 2, 3)].into_iter().collect::<TribleSet>().to_blob();
+        let b: Blob<SimpleArchive> = [row(4, 5, 6)].into_iter().collect::<TribleSet>().to_blob();
+        let mut store = MemoryRepo::default();
+        store.put::<SimpleArchive, _>(a.clone()).unwrap();
+        store.put::<SimpleArchive, _>(b.clone()).unwrap();
+        let source_collection = crate::collection::Collection::<SimpleArchive>::from_descriptor(
+            &facade.source_descriptor(),
+        )
+        .unwrap();
+        let cover = FactCover::from_data(
+            source_collection,
+            [
+                Handle::<SimpleArchive>::to_hash(a.get_handle()),
+                Handle::<SimpleArchive>::to_hash(b.get_handle()),
+            ],
+        );
+
+        let raw = facade
+            .raw_kernel()
+            .unwrap()
+            .ensure_exact(&mut store, &cover)
+            .unwrap();
+        facade
+            .rank9_derivation()
+            .unwrap()
+            .ensure_member_images(&mut store, raw.cover())
+            .unwrap();
+
+        let archive = facade.compact_exact(&mut store, &cover).unwrap();
+        assert_eq!(archive.iter().count(), 2);
+
+        let records = store
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let compacted_raw = records
+            .iter()
+            .find_map(|record| match record {
+                CollectionRecord::Merge(merge) if merge.collection() == facade.raw_collection() => {
+                    Some(merge.result())
+                }
+                _ => None,
+            })
+            .expect("raw compaction published a MERGE");
+        assert!(records.iter().any(|record| matches!(
+            record,
+            CollectionRecord::Derive(derive)
+                if derive.collection() == facade.collection()
+                    && derive.input() == compacted_raw
+        )));
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            CollectionRecord::Merge(merge) if merge.collection() == facade.collection()
+        )));
+    }
+
+    #[test]
+    fn exact_acceleration_does_not_replace_named_raw_members_with_their_union() {
+        let facade = SuccinctArchiveCollection::new(
+            "facts",
+            authority(),
+            reach::private(),
+            authority(),
+            reach::private(),
+        );
+        let a = raw([row(1, 2, 3)]);
+        let b = raw([row(4, 5, 6)]);
+        let c = super::super::join(&a, &b).unwrap();
+        let a_data = Handle::<SuccinctArchiveBlob>::to_hash(a.get_handle());
+        let b_data = Handle::<SuccinctArchiveBlob>::to_hash(b.get_handle());
+        let c_data = Handle::<SuccinctArchiveBlob>::to_hash(c.get_handle());
+        let fc = RawToRank9AcceleratedMapping.map(&c).unwrap();
+        let fc_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fc.get_handle());
+
+        let mut store = MemoryRepo::default();
+        for member in [a.clone(), b.clone(), c] {
+            store.put::<SuccinctArchiveBlob, _>(member).unwrap();
+        }
+        store
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fc)
+            .unwrap();
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                facade.raw_collection(),
+                a_data,
+                b_data,
+                c_data,
+            )))
+            .unwrap();
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                facade.collection(),
+                c_data,
+                fc_data,
+            )))
+            .unwrap();
+
+        let raw_collection =
+            Collection::<SuccinctArchiveBlob>::from_descriptor(&facade.raw_descriptor()).unwrap();
+        let raw_cover = Cover::from_data(raw_collection, [a_data, b_data]);
+        let attached = facade
+            .rank9_derivation()
+            .unwrap()
+            .ensure_member_images(&mut store, &raw_cover)
+            .unwrap();
+
+        let mut actual = attached.cover().data_members().collect::<Vec<_>>();
+        let mut expected = [a, b]
+            .iter()
+            .map(|raw| {
+                let root = RawToRank9AcceleratedMapping.map(raw).unwrap();
+                Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(root.get_handle())
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(!actual.contains(&fc_data));
+
+        let records = store
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for input in [a_data, b_data] {
+            assert!(records.iter().any(|record| matches!(
+                record,
+                CollectionRecord::Derive(derive)
+                    if derive.collection() == facade.collection() && derive.input() == input
+            )));
+        }
+    }
+
+    #[test]
     fn accelerated_root_without_raw_child_is_not_resident() {
         let raw = raw([row(1, 2, 3)]);
-        let artifact = Rank9AcceleratedSuccinctArchiveArtifact::from_raw(raw).unwrap();
+        let root = RawToRank9AcceleratedMapping.map(&raw).unwrap();
         let mut store = MemoryRepo::default();
         store
-            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(artifact.root().clone())
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(root.clone())
             .unwrap();
         let reader = store.reader().unwrap();
 
         assert!(matches!(
-            Rank9AcceleratedSuccinctArchiveBlob::attach_member(
-                &Fragment::empty(),
-                artifact.root().clone(),
-                &reader,
+            Rank9AcceleratedSuccinctArchiveBlob::validate_member(
+                &Fragment::empty(), &root, &reader,
             ),
             Err(CollectionOperationError::Fatal(reason))
                 if reason.contains("raw child is not resident")
+        ));
+    }
+
+    #[test]
+    fn accelerated_member_validation_rejects_a_corrupt_index() {
+        let raw = raw([row(1, 2, 3)]);
+        let root = RawToRank9AcceleratedMapping.map(&raw).unwrap();
+        let mut bytes = root.bytes.as_ref().to_vec();
+        let last = bytes.last_mut().expect("Rank9 root is not empty");
+        *last ^= 1;
+        let corrupted = Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(Bytes::from_source(bytes));
+        let mut store = MemoryRepo::default();
+        store.put::<SuccinctArchiveBlob, _>(raw).unwrap();
+        let reader = store.reader().unwrap();
+
+        assert!(matches!(
+            Rank9AcceleratedSuccinctArchiveBlob::validate_member(
+                &Fragment::empty(),
+                &corrupted,
+                &reader,
+            ),
+            Err(CollectionOperationError::Fatal(_))
         ));
     }
 }

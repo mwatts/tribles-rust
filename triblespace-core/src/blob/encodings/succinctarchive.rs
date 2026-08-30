@@ -398,7 +398,7 @@ impl MetaDescribe for Rank9AcceleratedSuccinctArchiveBlob {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "rank9-accelerated-succinctarchive",
-                metadata::description: "ABI-qualified accelerated SuccinctArchive member. Its Merkle root names one exact portable SuccinctArchiveBlob in the first 32 bytes and carries the canonical native Rank9/select payload for that source; the root and raw child together form one closure-attached collection artifact.",
+                metadata::description: "ABI-qualified accelerated SuccinctArchive encoding. Its first 32 bytes name one exact portable SuccinctArchiveBlob and the remaining bytes carry that source's canonical native Rank9/select payload. A reader resolves the named raw blob to construct the query runtime.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }

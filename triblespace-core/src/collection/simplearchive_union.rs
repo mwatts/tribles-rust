@@ -66,27 +66,26 @@ pub use collection::*;
 pub use materialize::*;
 
 impl CollectionEncoding for SimpleArchive {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        validate_element(&member)
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        Ok(member)
+        validate_element(member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
-        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        join(low, high)
+            .map(Some)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 

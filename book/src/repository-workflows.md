@@ -227,8 +227,8 @@ records expose those reusable edges across collection lattices.
 The SuccinctArchive facade applies this model as two ordinary derivations:
 
 ```text
-SimpleArchive --DERIVE--> SuccinctArchiveBlob
-               --DERIVE--> Rank9AcceleratedSuccinctArchiveBlob
+SimpleArchive --DERIVE--> SuccinctArchiveBlob --DERIVE-->
+    Rank9AcceleratedSuccinctArchiveBlob
 ```
 
 ```rust,ignore
@@ -249,7 +249,7 @@ let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 
 - `attach_exact` is read-only and requires a complete valid resident cover.
 - `ensure_exact` reuses valid equations, computes missing canonical images, and
-  publishes dependencies before new records.
+  stores each selected source before its target image and new record.
 - `compact_exact` deterministically compacts the raw target cover, then ensures
   the matching accelerated cover and returns its query view.
 
@@ -261,19 +261,21 @@ mixed across representations. `Cover<SimpleArchive>` contains only
 bound `CollectionMapping<Source, Target>` determine route freedom. Ordinary raw
 Succinct derivation may choose any cheapest validated route whose support
 equals the source cover. The accelerated stage maps the exact raw cover selected
-upstream, while its attached artifact retains each root, raw child, and query
-runtime together. Exactness is a property of the mapping, not a mode bit or an
+upstream. Its cover-aware view reads each embedded raw handle through the
+snapshot reader and validates the exact raw/index pair before constructing the
+query runtime. Exactness is a property of the mapping, not a mode bit or an
 untyped hash convention.
 
 None of them signs a replacement root, advances a head, flushes implicitly, or
 adds a special manifest. [Regular-path summaries](regular-path-indexes.md) and
 Rank9 acceleration both use the same collection algebra. The accelerated
 encoding is a Merkle root whose first 32 bytes name its exact portable raw
-child. Its join operates on complete attached artifacts, so mapping and then
-joining produces the same root as joining the raw inputs and mapping once.
-Publication writes child before root before the ordinary `DERIVE` or `MERGE`;
-an incomplete closure is merely a nonresident route which `ensure_exact` can
-reconstruct.
+child, but it does not define a direct Rank9 join. Raw Succinct members are
+joinable, so `compact_exact` and other maintenance compact that upstream
+lattice first and then derive the corresponding accelerated root. Derivation
+stores the selected raw source before the accelerated root and ordinary
+`DERIVE` record. An incomplete source-bound member is merely a nonresident
+route which `ensure_exact` can reconstruct.
 
 ## WANT missing content or computation
 

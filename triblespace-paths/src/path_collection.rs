@@ -32,6 +32,8 @@ pub enum PathSummaryCollectionError {
     Summary(PathSummaryBlobError),
     /// Closing the joined summary into the accepted endpoint relation failed.
     Index(PathError),
+    /// A reader for the attached cover could not be opened.
+    Reader(String),
 }
 
 impl fmt::Display for PathSummaryCollectionError {
@@ -40,6 +42,7 @@ impl fmt::Display for PathSummaryCollectionError {
             Self::Collection(source) => source.fmt(f),
             Self::Summary(source) => source.fmt(f),
             Self::Index(source) => source.fmt(f),
+            Self::Reader(source) => write!(f, "open path-summary cover reader: {source}"),
         }
     }
 }
@@ -50,6 +53,7 @@ impl Error for PathSummaryCollectionError {
             Self::Collection(source) => Some(source),
             Self::Summary(source) => Some(source),
             Self::Index(source) => Some(source),
+            Self::Reader(_) => None,
         }
     }
 }
@@ -167,7 +171,10 @@ impl PathSummaryCollection {
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.attach_exact(store, source_cover)?;
-        self.index_from_cover(cover).map(Arc::new)
+        let reader = store
+            .reader()
+            .map_err(|source| PathSummaryCollectionError::Reader(source.to_string()))?;
+        self.index_from_cover(cover, &reader).map(Arc::new)
     }
 
     /// Ensure and attach the exact endpoint relation for `source_cover`.
@@ -185,7 +192,10 @@ impl PathSummaryCollection {
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;
-        self.index_from_cover(cover).map(Arc::new)
+        let reader = store
+            .reader()
+            .map_err(|source| PathSummaryCollectionError::Reader(source.to_string()))?;
+        self.index_from_cover(cover, &reader).map(Arc::new)
     }
 
     fn kernel(
@@ -197,14 +207,18 @@ impl PathSummaryCollection {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
     }
 
-    fn index_from_cover(
+    fn index_from_cover<R>(
         &self,
         cover: CoverAttachment<PathSummaryBlob>,
-    ) -> Result<PathIndex, PathSummaryCollectionError> {
-        let cover = PathSummaryView::try_from_cover(cover)
+        reader: &R,
+    ) -> Result<PathIndex, PathSummaryCollectionError>
+    where
+        R: triblespace_core::repo::BlobStoreGet + BlobStoreMeta,
+    {
+        let cover = PathSummaryView::try_from_cover(cover, reader)
             .expect("constructing a lazy path-summary view is infallible");
         let mut joined = PathSummaryBlob::empty(&self.automaton);
-        for segment in cover.into_artifacts() {
+        for segment in cover.into_blobs() {
             joined = PathSummaryBlob::join(&joined, &segment, &self.automaton)
                 .map_err(PathSummaryCollectionError::Summary)?;
         }
@@ -493,9 +507,9 @@ mod tests {
         let mut store = CollectionOnly::default();
         let reader = store.reader().unwrap();
         assert!(matches!(
-            <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::attach_member(
+            <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::validate_member(
                 &paths.descriptor(),
-                persisted,
+                &persisted,
                 &reader,
             ),
             Err(triblespace_core::collection::CollectionOperationError::Fatal(_))

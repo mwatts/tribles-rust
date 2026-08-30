@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::BlobEncoding;
+use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
@@ -32,11 +32,10 @@ use crate::trible::Fragment;
 use super::discovery::discover_collection_records_for_derived_cover;
 use super::{
     collection_physical_cover, collection_physical_cover_for, descriptor,
-    resolve_collection_semantics_from_roots, Collection, CollectionArtifact,
-    CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
-    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError,
-    CollectionRecord, CollectionSemantics, CollectionStore, Cover, CoverAttachment,
-    DiscoveredCollectionRecords,
+    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation, CollectionData,
+    CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
+    CollectionOperationError, CollectionRecord, CollectionSemantics, CollectionStore, Cover,
+    CoverAttachment, DiscoveredCollectionRecords,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -56,8 +55,21 @@ impl TypedData {
 }
 
 enum ScratchValue<Source: CollectionEncoding, Target: CollectionEncoding> {
-    Source(Source::Artifact),
-    Target(Target::Artifact),
+    Source(Blob<Source>),
+    Target(Blob<Target>),
+}
+
+#[derive(Clone, Copy)]
+enum SourceRoute {
+    SupportEquivalent,
+    ExactMembers,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProbeScope {
+    Direct,
+    SupportEquivalent,
+    ExactMembers,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -384,7 +396,24 @@ where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        self.attach_with(store, source_cover)
+        self.attach_with_route(store, source_cover, SourceRoute::SupportEquivalent)
+    }
+
+    /// Attach only images of the exact physical source members.
+    ///
+    /// This is crate-private because it is a mapping law, not a caller tuning
+    /// knob. Source-bound encodings such as Rank9 acceleration use it when an
+    /// equal-support decomposition is not the same physical input cover.
+    pub(crate) fn attach_member_images<S>(
+        &self,
+        store: &mut S,
+        source_cover: &Cover<Source>,
+    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Reader: BlobStoreMeta,
+    {
+        self.attach_with_route(store, source_cover, SourceRoute::ExactMembers)
     }
 
     /// Probe an exact cover while treating target handles as speculative
@@ -472,12 +501,50 @@ where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
+        self.ensure_with_route(store, source_cover, SourceRoute::SupportEquivalent)
+    }
+
+    /// Ensure one target image for every exact physical source member.
+    pub(crate) fn ensure_member_images<S>(
+        &self,
+        store: &mut S,
+        source_cover: &Cover<Source>,
+    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    where
+        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S::Reader: BlobStoreMeta,
+    {
+        let mut capture = OfferCapture::new(store);
+        self.ensure_with_route(&mut capture, source_cover, SourceRoute::ExactMembers)
+    }
+
+    fn ensure_with_route<S>(
+        &self,
+        store: &mut S,
+        source_cover: &Cover<Source>,
+        route: SourceRoute,
+    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Reader: BlobStoreMeta,
+    {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
             return Ok(CoverAttachment::empty(self.target_collection));
         }
 
-        let probe = self.probe(store, source_cover, true, &BTreeSet::new())?;
+        let probe = match route {
+            SourceRoute::SupportEquivalent => {
+                self.probe(store, source_cover, true, &BTreeSet::new())?
+            }
+            SourceRoute::ExactMembers => self.probe_once(
+                store,
+                source_cover,
+                true,
+                &BTreeSet::new(),
+                ProbeScope::ExactMembers,
+            )?,
+        };
         if probe.is_complete() {
             return Ok(probe.into_target_cover());
         }
@@ -488,7 +555,7 @@ where
         // Successful images are cached by source identity, but only members of
         // the final feasible plan are ever published.
         let mut blocked = BTreeMap::<CollectionData, String>::new();
-        let mut cached = BTreeMap::<CollectionData, PreparedDerive<Target>>::new();
+        let mut cached = BTreeMap::<CollectionData, PreparedDerive<Source, Target>>::new();
         let prepared = loop {
             let source_cover = probe.source_residual_cover(&blocked)?;
             if source_cover.is_empty() {
@@ -518,7 +585,14 @@ where
                         input_data,
                         output_data,
                     );
-                    cached.insert(input_data, PreparedDerive { output, claim });
+                    cached.insert(
+                        input_data,
+                        PreparedDerive {
+                            input: input.clone(),
+                            output,
+                            claim,
+                        },
+                    );
                 }
                 selected.push(input_data);
             }
@@ -541,9 +615,16 @@ where
         drop(probe);
         self.publish_descriptors(store)?;
         for prepared in &prepared {
-            prepared.output.publish(store).map_err(|error| {
-                ExactDerivedCollectionError::storage("store derived target", error)
-            })?;
+            store
+                .put::<Source, _>(prepared.input.clone())
+                .map_err(|error| {
+                    ExactDerivedCollectionError::storage("store derived source", error)
+                })?;
+            store
+                .put::<Target, _>(prepared.output.clone())
+                .map_err(|error| {
+                    ExactDerivedCollectionError::storage("store derived target", error)
+                })?;
         }
         for prepared in prepared {
             store
@@ -553,13 +634,14 @@ where
 
         // Construction does not change the opaque source cover; a fresh
         // attachment validates the outputs just published.
-        self.attach_with(store, source_cover)
+        self.attach_with_route(store, source_cover, route)
     }
 
-    fn attach_with<S>(
+    fn attach_with_route<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<Source>,
+        route: SourceRoute,
     ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
@@ -569,7 +651,18 @@ where
         if source_cover.is_empty() {
             return Ok(CoverAttachment::empty(self.target_collection));
         }
-        let probe = self.probe(store, source_cover, false, &BTreeSet::new())?;
+        let probe = match route {
+            SourceRoute::SupportEquivalent => {
+                self.probe(store, source_cover, false, &BTreeSet::new())?
+            }
+            SourceRoute::ExactMembers => self.probe_once(
+                store,
+                source_cover,
+                false,
+                &BTreeSet::new(),
+                ProbeScope::ExactMembers,
+            )?,
+        };
         if !probe.is_complete() {
             return Err(probe.incomplete_error());
         }
@@ -607,7 +700,7 @@ where
             source_cover,
             plan_source_residual,
             offered_target,
-            false,
+            ProbeScope::Direct,
         )?;
         if direct.is_complete() {
             return Ok(direct);
@@ -618,7 +711,7 @@ where
             source_cover,
             plan_source_residual,
             offered_target,
-            true,
+            ProbeScope::SupportEquivalent,
         )
     }
 
@@ -628,7 +721,7 @@ where
         source_cover: &Cover<Source>,
         plan_source_residual: bool,
         offered_target: &BTreeSet<CollectionData>,
-        allow_source_decomposition: bool,
+        scope: ProbeScope,
     ) -> Result<ExactProbe<S::Reader, Source, Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
@@ -665,7 +758,21 @@ where
             roots.insert(node);
         }
 
-        let candidates = self.candidates(&discovered);
+        let mut candidates = self.candidates(&discovered);
+        if scope == ProbeScope::ExactMembers {
+            // A source-bound target denotes the image of each named physical
+            // member, not merely any cover with equal logical support. Keep
+            // only direct DERIVEs of those roots: source MERGEs could replace
+            // `{a, b}` with `{a join b}`, while target MERGEs could erase the
+            // one-image-per-member boundary after mapping.
+            candidates.retain(|candidate| {
+                matches!(
+                    candidate,
+                    Candidate::Derive(claim)
+                        if roots.contains(&TypedData::Source(claim.input()))
+                )
+            });
+        }
         let mut producers = BTreeMap::<TypedData, Vec<usize>>::new();
         for (index, candidate) in candidates.iter().copied().enumerate() {
             producers.entry(candidate.result()).or_default().push(index);
@@ -682,7 +789,7 @@ where
         // Restricting this walk to producers of Cover roots prevents unrelated
         // resident source data from becoming semantic support by proximity.
         let mut decomposition_seen = roots.clone();
-        if allow_source_decomposition {
+        if scope == ProbeScope::SupportEquivalent {
             let mut decomposition_queue: VecDeque<_> = roots.iter().copied().collect();
             while let Some(result) = decomposition_queue.pop_front() {
                 for &index in producers.get(&result).into_iter().flatten() {
@@ -714,10 +821,10 @@ where
             let Ok(blob) = reader.get(Handle::<Source>::from_hash(member)) else {
                 continue;
             };
-            let Ok(artifact) = Source::attach_member(&self.source, blob, &reader) else {
+            let Ok(()) = Source::validate_member(&self.source, &blob, &reader) else {
                 continue;
             };
-            known.insert(node, ScratchValue::Source(artifact));
+            known.insert(node, ScratchValue::Source(blob));
             local_results.insert(node);
             resident_results.insert(node);
         }
@@ -1038,8 +1145,9 @@ where
     }
 }
 
-struct PreparedDerive<Target: CollectionEncoding> {
-    output: Target::Artifact,
+struct PreparedDerive<Source: CollectionEncoding, Target: CollectionEncoding> {
+    input: Blob<Source>,
+    output: Blob<Target>,
     claim: CollectionDerive,
 }
 
@@ -1048,7 +1156,7 @@ struct SourcePlan<Source: CollectionEncoding> {
     semantics: CollectionSemantics,
     collection: CollectionHandle,
     resident: BTreeSet<CollectionData>,
-    mandatory: BTreeMap<CollectionData, Source::Artifact>,
+    mandatory: BTreeMap<CollectionData, Blob<Source>>,
     required_members: BTreeSet<CollectionData>,
 }
 
@@ -1091,7 +1199,7 @@ where
     fn source_residual_cover(
         &self,
         blocked: &BTreeMap<CollectionData, String>,
-    ) -> Result<Vec<(CollectionData, Source::Artifact)>, ExactDerivedCollectionError> {
+    ) -> Result<Vec<(CollectionData, Blob<Source>)>, ExactDerivedCollectionError> {
         let Some(plan) = &self.source_plan else {
             return Ok(Vec::new());
         };
@@ -1152,7 +1260,7 @@ where
 struct ValidatedPhysicalCover<E: CollectionEncoding> {
     cover: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,
-    blobs: BTreeMap<CollectionData, E::Artifact>,
+    blobs: BTreeMap<CollectionData, Blob<E>>,
     fetch: BTreeSet<CollectionData>,
 }
 
@@ -1162,7 +1270,7 @@ fn validated_physical_cover<R, E>(
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
     mut resident: BTreeSet<CollectionData>,
-    mandatory: &BTreeMap<CollectionData, E::Artifact>,
+    mandatory: &BTreeMap<CollectionData, Blob<E>>,
     offered: &BTreeSet<CollectionData>,
 ) -> ValidatedPhysicalCover<E>
 where
@@ -1196,9 +1304,9 @@ where
                 }
             }
             match reader.get(handle) {
-                Ok(root) => match E::attach_member(descriptor, root, reader) {
-                    Ok(actual) => {
-                        selected.insert(data, actual);
+                Ok(root) => match E::validate_member(descriptor, &root, reader) {
+                    Ok(()) => {
+                        selected.insert(data, root);
                     }
                     Err(_) => rejected.push(data),
                 },
@@ -1365,7 +1473,13 @@ where
                     "source merge became ready without its high input".to_owned(),
                 ));
             };
-            Source::join_members(source_descriptor, low, high).map(ScratchValue::Source)
+            Source::join_members(source_descriptor, low, high)?
+                .map(ScratchValue::Source)
+                .ok_or_else(|| {
+                    CollectionOperationError::Fatal(
+                        "source encoding has no directly materialized join".to_owned(),
+                    )
+                })
         }
         Candidate::Derive(claim) => {
             let input = claim.input();
@@ -1388,7 +1502,13 @@ where
                     "target merge became ready without its high input".to_owned(),
                 ));
             };
-            Target::join_members(target_descriptor, low, high).map(ScratchValue::Target)
+            Target::join_members(target_descriptor, low, high)?
+                .map(ScratchValue::Target)
+                .ok_or_else(|| {
+                    CollectionOperationError::Fatal(
+                        "target encoding has no directly materialized join".to_owned(),
+                    )
+                })
         }
     }
 }
@@ -1414,7 +1534,7 @@ fn load_candidate<R, E>(
     descriptor: &Fragment,
     data: CollectionData,
     operation: &'static str,
-) -> Result<Option<E::Artifact>, ExactDerivedCollectionError>
+) -> Result<Option<Blob<E>>, ExactDerivedCollectionError>
 where
     R: BlobStoreGet + BlobStoreMeta,
     E: CollectionEncoding,
@@ -1426,8 +1546,8 @@ where
     let root = reader
         .get(Handle::<E>::from_hash(data))
         .map_err(|error| ExactDerivedCollectionError::storage(operation, error))?;
-    E::attach_member(descriptor, root, reader)
-        .map(Some)
+    E::validate_member(descriptor, &root, reader)
+        .map(|()| Some(root))
         .map_err(|error| ExactDerivedCollectionError::RejectedMember {
             member: data,
             reason: match error {
@@ -1439,8 +1559,8 @@ where
         })
 }
 
-pub(super) fn data_identity<E: CollectionEncoding>(artifact: &E::Artifact) -> CollectionData {
-    Handle::<E>::to_hash(artifact.root().get_handle())
+pub(super) fn data_identity<E: CollectionEncoding>(blob: &Blob<E>) -> CollectionData {
+    Handle::<E>::to_hash(blob.get_handle())
 }
 
 #[cfg(test)]

@@ -47,9 +47,9 @@ use super::discovery::{
 use super::simplearchive_union::FactViewError;
 use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
-    resolve_collection_semantics_from_roots, Collection, CollectionArtifact,
-    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDiscoveryError,
-    CollectionEncoding, CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
+    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
+    CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
+    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
     CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
     CoverAttachment, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, ACTION_WRITE,
 };
@@ -1046,20 +1046,19 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
                 .put::<UnknownBlob, _>(blob)
                 .map_err(CollectionCommitError::DependencyPut)?;
         }
-        // Described attachments are now resident, so a Merkle member can
-        // attach its complete closure without an encoding-specific commit
-        // path. Publication is still repeated through the artifact to enforce
-        // dependency-before-root ordering at the semantic record boundary.
+        // Described attachments are resident before the member is validated.
+        // A Merkle member therefore names only dependencies already published
+        // through the ordinary Fragment/Describe path or an earlier derive.
         let reader = store.reader().map_err(|source| {
             CollectionCommitError::Descriptor(CollectionDescriptorError::Reader(source))
         })?;
-        let data = L::attach_member(&loaded.fragment, data_root, &reader)
+        L::validate_member(&loaded.fragment, &data_root, &reader)
             .map_err(CollectionCommitError::InvalidMember)?;
         drop(reader);
 
-        data.publish(&mut store)
+        let data_handle = store
+            .put::<L, _>(data_root)
             .map_err(CollectionCommitError::DependencyPut)?;
-        let data_handle = data.root().get_handle();
         let metadata = store
             .put::<SimpleArchive, _>(metadata)
             .map_err(CollectionCommitError::DependencyPut)?;
@@ -1220,7 +1219,7 @@ where
 
     if cover.is_empty() {
         let snapshot_cover = cover.clone();
-        let value = V::try_from_cover(CoverAttachment::from_parts(cover, Vec::new()))
+        let value = V::try_from_cover(CoverAttachment::from_parts(cover, Vec::new()), &reader)
             .map_err(CollectionMaterializationError::View)?;
         return Ok(Snapshot {
             value,
@@ -1242,9 +1241,9 @@ where
         let blob = reader
             .get(member_handle)
             .map_err(|source| CollectionMaterializationError::MemberGet { member, source })?;
-        let artifact = L::attach_member(descriptor, blob, &reader)
+        L::validate_member(descriptor, &blob, &reader)
             .map_err(|source| CollectionMaterializationError::InvalidMember { member, source })?;
-        known.insert(member, artifact);
+        known.insert(member, blob);
     }
     let roots: BTreeSet<_> = cover.data_members().collect();
     let explicit_roots: BTreeSet<_> = roots
@@ -1341,18 +1340,18 @@ where
             Some(expected)
         } else {
             match (known.get(&low), known.get(&high)) {
-                (Some(low_artifact), Some(high_artifact)) => {
-                    match L::join_members(descriptor, low_artifact, high_artifact) {
-                        Ok(value) => {
-                            let expected = Handle::<L>::to_hash(value.root().get_handle());
+                (Some(low_blob), Some(high_blob)) => {
+                    match L::join_members(descriptor, low_blob, high_blob) {
+                        Ok(Some(value)) => {
+                            let expected = Handle::<L>::to_hash(value.get_handle());
                             expected_hashes.insert(pair, expected);
                             joined = Some(value);
                             Some(expected)
                         }
-                        // `known` contains only structurally validated members,
-                        // so this is a defensive invariant guard around the
-                        // encoding's join implementation.
-                        Err(_) => None,
+                        // `Ok(None)` means this representation deliberately
+                        // performs compaction in another collection lattice.
+                        // Invalid optional cache evidence is equally inert.
+                        Ok(None) | Err(_) => None,
                     }
                 }
                 _ => None,
@@ -1370,17 +1369,16 @@ where
             } else {
                 if joined.is_none() {
                     joined = match (known.get(&low), known.get(&high)) {
-                        (Some(low_artifact), Some(high_artifact)) => {
-                            L::join_members(descriptor, low_artifact, high_artifact).ok()
+                        (Some(low_blob), Some(high_blob)) => {
+                            L::join_members(descriptor, low_blob, high_blob)
+                                .ok()
+                                .flatten()
                         }
                         _ => None,
                     };
                 }
                 if let Some(value) = joined {
-                    debug_assert_eq!(
-                        Handle::<L>::to_hash(value.root().get_handle()),
-                        expected_data,
-                    );
+                    debug_assert_eq!(Handle::<L>::to_hash(value.get_handle()), expected_data,);
                     known.insert(expected_data, value);
                     true
                 } else {
@@ -1469,7 +1467,7 @@ where
         }
     }
 
-    let mut selected = BTreeMap::<CollectionData, L::Artifact>::new();
+    let mut selected = BTreeMap::<CollectionData, Blob<L>>::new();
     let physical_cover = loop {
         let candidate = collection_physical_cover(semantics, collection, &resident);
         if !candidate.missing.is_empty() {
@@ -1487,9 +1485,9 @@ where
             let handle = Handle::<L>::from_hash(data);
             let root: Result<Blob<L>, _> = reader.get(handle);
             match root {
-                Ok(root) => match L::attach_member(descriptor, root, &reader) {
-                    Ok(actual) => {
-                        selected.insert(data, actual);
+                Ok(root) => match L::validate_member(descriptor, &root, &reader) {
+                    Ok(()) => {
+                        selected.insert(data, root);
                     }
                     Err(_) => rejected.push(data),
                 },
@@ -1519,7 +1517,7 @@ where
         members.push((Handle::<L>::from_hash(data), (*blob).clone()));
     }
     let snapshot_cover = cover.clone();
-    let value = V::try_from_cover(CoverAttachment::from_parts(cover, members))
+    let value = V::try_from_cover(CoverAttachment::from_parts(cover, members), &reader)
         .map_err(CollectionMaterializationError::View)?;
     Ok(Snapshot {
         value,

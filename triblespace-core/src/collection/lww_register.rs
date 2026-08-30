@@ -68,7 +68,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::{register_identity, register_orders, RegisterOrder};
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
@@ -425,27 +425,26 @@ fn register_attributes(descriptor: &Fragment) -> Result<(Id, Id), CollectionOper
 }
 
 impl CollectionEncoding for LwwRegisterBlob {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        validate_element(&member)
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        Ok(member)
+        validate_element(member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
-        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        join(low, high)
+            .map(Some)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -581,9 +580,15 @@ impl RegisterOrder for LwwIndex {
 impl TryFromCover<LwwRegisterBlob> for LwwIndex {
     type Error = LwwRegisterError;
 
-    fn try_from_cover(attachment: CoverAttachment<LwwRegisterBlob>) -> Result<Self, Self::Error> {
+    fn try_from_cover<R>(
+        attachment: CoverAttachment<LwwRegisterBlob>,
+        _reader: &R,
+    ) -> Result<Self, Self::Error>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
         let mut combined = Projection::default();
-        for segment in attachment.into_artifacts() {
+        for segment in attachment.into_blobs() {
             combined = combined.union(decode_projection(&segment)?);
         }
         Self::from_projection(combined)
@@ -699,7 +704,10 @@ impl LwwRegisterCollection {
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.attach_exact(store, source_cover)?;
-        LwwIndex::try_from_cover(cover).map_err(LwwRegisterCollectionError::Algebra)
+        let reader = store
+            .reader()
+            .map_err(|source| LwwRegisterCollectionError::Reader(source.to_string()))?;
+        LwwIndex::try_from_cover(cover, &reader).map_err(LwwRegisterCollectionError::Algebra)
     }
 
     /// Ensure and attach the exact projection for `source_cover`.
@@ -713,7 +721,10 @@ impl LwwRegisterCollection {
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;
-        LwwIndex::try_from_cover(cover).map_err(LwwRegisterCollectionError::Algebra)
+        let reader = store
+            .reader()
+            .map_err(|source| LwwRegisterCollectionError::Reader(source.to_string()))?;
+        LwwIndex::try_from_cover(cover, &reader).map_err(LwwRegisterCollectionError::Algebra)
     }
 
     fn kernel(
@@ -733,6 +744,8 @@ pub enum LwwRegisterCollectionError {
     Collection(ExactDerivedCollectionError),
     /// Canonical projection construction or joining failed.
     Algebra(LwwRegisterError),
+    /// A reader for the attached cover could not be opened.
+    Reader(String),
 }
 
 impl fmt::Display for LwwRegisterCollectionError {
@@ -740,6 +753,7 @@ impl fmt::Display for LwwRegisterCollectionError {
         match self {
             Self::Collection(source) => source.fmt(formatter),
             Self::Algebra(source) => source.fmt(formatter),
+            Self::Reader(source) => write!(formatter, "open LWW cover reader: {source}"),
         }
     }
 }
@@ -749,6 +763,7 @@ impl Error for LwwRegisterCollectionError {
         match self {
             Self::Collection(source) => Some(source),
             Self::Algebra(source) => Some(source),
+            Self::Reader(_) => None,
         }
     }
 }

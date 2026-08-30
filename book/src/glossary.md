@@ -109,24 +109,26 @@ resolve its meaning through the ordinary blob store. A derived descriptor
 states its own authority and never inherits one through its source.
 
 ### Collection Encoding
-A `BlobEncoding` with one canonical member validation rule and one canonical
-join, exposed by `CollectionEncoding`. The encoding is both the physical byte
-shape and its intra-collection join law, so the public type names that meaning
-directly.
+A `BlobEncoding` with one canonical member validation rule, exposed by
+`CollectionEncoding`. Every member is an ordinary typed blob. The encoding may
+also expose one directly materializable canonical join; when it does not,
+physical compaction happens in another collection lattice while multi-member
+covers and logical views remain valid.
 
-### Collection Artifact
-The transient, closure-attached form of one collection member. Monolithic
-encodings use their root blob directly; Merkle encodings retain the root,
-resolved dependencies, and any validated runtime rebuilt from them. Only the
-root handle is durable collection identity. Publishing an artifact stores its
-dependencies before that root and records the ordinary collection equation
-only after the complete closure is resident.
+### Collection Member
+One ordinary typed `Blob<E>` admitted into a `Collection<E>`. A source-bound
+encoding may name another blob in its bytes; validation and cover-aware views
+follow that handle through a reader rather than wrapping the member in another
+runtime artifact. For Rank9-accelerated SuccinctArchive, the root embeds its
+exact raw source handle, has no direct join, and is derived after the raw
+Succinct lattice is compacted.
 
 ### Collection Mapping
 A parameterized source-to-target conversion exposed by
 `CollectionMapping<Source, Target>`. Its mapping entity is embedded in the
 target descriptor and names both a stable algorithm and its concrete
-parameters. The mathematical contract is a join homomorphism:
+parameters. It maps ordinary source blobs to ordinary target blobs. The
+mathematical contract is a join homomorphism over their logical values:
 `f(a ⊔ b) = f(a) ⊔ f(b)`.
 
 ### Collection Store

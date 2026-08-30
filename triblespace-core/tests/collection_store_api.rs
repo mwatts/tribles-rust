@@ -5,7 +5,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
@@ -16,12 +16,10 @@ use triblespace_core::collection::records::{
     collection_authority, collection_name, collection_representation, KIND_COLLECTION_DESCRIPTOR,
 };
 use triblespace_core::collection::simplearchive_union;
-use triblespace_core::collection::succinctarchive_union::{
-    self, Rank9AcceleratedSuccinctArchiveArtifact, SuccinctArchiveCollection,
-};
+use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace_core::collection::{
-    reach, Collection, CollectionArtifact, CollectionRecord, CollectionRecordSelector,
-    CollectionStore, CollectionStoreExt, ACTION_WRITE,
+    reach, Collection, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -575,9 +573,9 @@ fn pile_reopen_discovers_resident_delegation_proof_and_claims() {
 }
 
 #[test]
-fn pile_commit_reopens_complete_rank9_accelerated_artifact() {
+fn pile_reopens_source_first_rank9_derivation() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("accelerated-artifact-commit.pile");
+    let path = directory.path().join("source-first-rank9-derive.pile");
     std::fs::File::create(&path).unwrap();
 
     let authority = SigningKey::from_bytes(&[19; 32]);
@@ -588,36 +586,65 @@ fn pile_commit_reopens_complete_rank9_accelerated_artifact() {
         authority.verifying_key(),
         reach::private(),
     );
-    let raw = succinctarchive_union::derive_element(&fragment(4).into_facts().to_blob()).unwrap();
-    let artifact = Rank9AcceleratedSuccinctArchiveArtifact::from_raw(raw.clone()).unwrap();
-    let root = artifact.root().clone();
-
     let mut pile = Pile::open(&path).unwrap();
-    let collection = pile
-        .collection::<Rank9AcceleratedSuccinctArchiveBlob>(facade.descriptor())
+    let source_collection = pile
+        .collection::<SimpleArchive>(facade.source_descriptor())
         .unwrap();
-    let committed = pile.commit(collection, &authority, artifact).unwrap();
+    pile.commit(source_collection, &authority, fragment(4))
+        .unwrap();
+    let source_cover = pile.cover(source_collection).unwrap();
     assert_eq!(
-        committed.data(),
-        Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(root.get_handle())
+        facade
+            .ensure_exact(&mut pile, &source_cover)
+            .unwrap()
+            .iter()
+            .count(),
+        1
     );
+
+    let records = pile
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let raw = records
+        .iter()
+        .find_map(|record| match record {
+            CollectionRecord::Derive(derive) if derive.collection() == facade.raw_collection() => {
+                Some(derive.output())
+            }
+            _ => None,
+        })
+        .expect("raw DERIVE was published");
+    let root = records
+        .iter()
+        .find_map(|record| match record {
+            CollectionRecord::Derive(derive) if derive.collection() == facade.collection() => {
+                assert_eq!(derive.input(), raw);
+                Some(derive.output())
+            }
+            _ => None,
+        })
+        .expect("Rank9 DERIVE was published");
     pile.close().unwrap();
 
     let mut reopened = Pile::open(&path).unwrap();
     let reader = reopened.reader().unwrap();
     reader
-        .get::<Blob<SuccinctArchiveBlob>, _>(raw.get_handle())
+        .get::<Blob<SuccinctArchiveBlob>, _>(Handle::from_hash(raw))
         .unwrap();
     reader
-        .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, _>(root.get_handle())
+        .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, _>(Handle::from_hash(root))
         .unwrap();
     drop(reader);
-    let snapshot: triblespace_core::collection::Snapshot<
-        Rank9AcceleratedSuccinctArchiveBlob,
-        UnionArchive<OrderedUniverse>,
-        _,
-    > = reopened.snapshot(collection).unwrap();
-    assert_eq!(snapshot.value().iter().count(), 1);
+    assert_eq!(
+        facade
+            .attach_exact(&mut reopened, &source_cover)
+            .unwrap()
+            .iter()
+            .count(),
+        1
+    );
     reopened.close().unwrap();
 }
 

@@ -7,8 +7,10 @@
 
 use std::error::Error;
 
+use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
+use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
 use super::{Collection, CollectionEncoding, Cover};
 
@@ -19,7 +21,7 @@ use super::{Collection, CollectionEncoding, Cover};
 /// collection stages; attached blobs merely avoid rereading selected members.
 pub struct CoverAttachment<L: CollectionEncoding> {
     cover: Cover<L>,
-    members: Vec<(Inline<Handle<L>>, L::Artifact)>,
+    members: Vec<(Inline<Handle<L>>, Blob<L>)>,
 }
 
 impl<L: CollectionEncoding> CoverAttachment<L> {
@@ -30,10 +32,7 @@ impl<L: CollectionEncoding> CoverAttachment<L> {
         }
     }
 
-    pub(crate) fn from_parts(
-        cover: Cover<L>,
-        members: Vec<(Inline<Handle<L>>, L::Artifact)>,
-    ) -> Self {
+    pub(crate) fn from_parts(cover: Cover<L>, members: Vec<(Inline<Handle<L>>, Blob<L>)>) -> Self {
         Self { cover, members }
     }
 
@@ -53,18 +52,18 @@ impl<L: CollectionEncoding> CoverAttachment<L> {
     }
 
     /// Borrow the ordered physical members.
-    pub fn members(&self) -> &[(Inline<Handle<L>>, L::Artifact)] {
+    pub fn members(&self) -> &[(Inline<Handle<L>>, Blob<L>)] {
         &self.members
     }
 
     /// Consume the ordered physical members.
-    pub fn into_members(self) -> Vec<(Inline<Handle<L>>, L::Artifact)> {
+    pub fn into_members(self) -> Vec<(Inline<Handle<L>>, Blob<L>)> {
         self.members
     }
 
-    /// Consume just the ordered attached artifacts.
-    pub fn into_artifacts(self) -> impl ExactSizeIterator<Item = L::Artifact> {
-        self.members.into_iter().map(|(_, artifact)| artifact)
+    /// Consume just the ordered attached blobs.
+    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<L>> {
+        self.members.into_iter().map(|(_, blob)| blob)
     }
 }
 
@@ -78,5 +77,7 @@ pub trait TryFromCover<L: CollectionEncoding>: Sized {
     type Error: Error + Send + Sync + 'static;
 
     /// Consume the exact attachment into its logical value.
-    fn try_from_cover(attachment: CoverAttachment<L>) -> Result<Self, Self::Error>;
+    fn try_from_cover<R>(attachment: CoverAttachment<L>, reader: &R) -> Result<Self, Self::Error>
+    where
+        R: BlobStoreGet + BlobStoreMeta;
 }

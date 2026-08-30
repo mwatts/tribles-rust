@@ -158,27 +158,28 @@ The crate also ships with these blob encodings:
   native Rank9/select data for that child. Separate encoding and mapping ids
   pin pointer width, byte order, the accelerated-root format, and the builder
   epoch. A change that can alter canonical bytes requires a newly minted id.
-  Attaching validates the embedded child handle, native format, and exact
-  raw/index structure, then retains root, raw child, and reconstructed runtime
-  together as a `Rank9AcceleratedSuccinctArchiveArtifact`. This encoding is an
-  ordinary `CollectionEncoding`: its join consumes complete attached artifacts
-  and produces the same canonical accelerated root as mapping the raw union.
-  Raw-to-accelerated conversion is therefore an ordinary `DERIVE`, and joins
-  are ordinary `MERGE` records. Publication writes the raw child before its
-  Merkle root and writes both before the semantic record. If the raw child is
-  absent, the closure is nonresident and can be reconstructed rather than
-  treated as a usable accelerated member.
+  This is a complete source-bound accelerated encoding, not a sidecar. Member
+  validation follows the embedded handle and requires the raw child to be
+  resident. A cover-aware query view then loads that child through its reader,
+  validates the exact raw/index pair, and reconstructs the runtime. The raw
+  `SuccinctArchiveBlob` lattice owns canonical union; accelerated roots have no
+  direct join. Maintenance therefore compacts raw members first and maps the
+  resulting raw blob through an ordinary `DERIVE`. Exact derivation stores the
+  selected raw source before its accelerated root and semantic record. If the
+  raw child is absent, the member is nonresident and can be reconstructed from
+  its source rather than treated as usable partial state.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 
 `BlobEncoding` says what bytes mean. `CollectionEncoding` is the stronger
-contract for formats used as collection members: the encoding itself owns
-canonical member validation and join. Its `CollectionArtifact` may be the
-monolithic root blob or a transient closure containing resolved Merkle
-dependencies and runtime state. `SimpleArchive`, `SuccinctArchiveBlob`,
-`Rank9AcceleratedSuccinctArchiveBlob`, and the maintained collection encodings
-implement that contract directly; there is no separate public lattice type to
-pair with them.
+contract for formats used as collection members: every member is an ordinary
+typed `Blob`, the encoding owns canonical member validation, and it may expose
+one directly materializable join. Returning no direct join means that physical
+compaction belongs in another lattice; multi-member covers and logical views
+remain valid. `SimpleArchive` and `SuccinctArchiveBlob` are directly joinable,
+while `Rank9AcceleratedSuccinctArchiveBlob` is derived after raw compaction.
+The maintained collection encodings implement the same contract directly;
+there is no separate public artifact or lattice wrapper to pair with them.
 
 ```rust
 use triblespace::core::metadata::MetaDescribe;

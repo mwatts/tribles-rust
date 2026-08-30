@@ -134,13 +134,11 @@ impl MetaDescribe for NetworkTestBlob {
 }
 
 impl CollectionEncoding for NetworkTestBlob {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        target: Blob<Self>,
+        target: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
@@ -151,20 +149,21 @@ impl CollectionEncoding for NetworkTestBlob {
         };
         simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
-        Ok(target)
+        Ok(())
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
         let low =
             Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
         let high =
             Blob::<SimpleArchive>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
         simplearchive_union::join(&low, &high)
             .map(|joined| derive_test_target(&joined))
+            .map(Some)
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 }
@@ -647,8 +646,9 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             derive_test_target(&sources[0]),
             derive_test_target(&sources[1]),
         ];
-        let upper =
-            NetworkTestBlob::join_members(&target_descriptor, &targets[0], &targets[1]).unwrap();
+        let upper = NetworkTestBlob::join_members(&target_descriptor, &targets[0], &targets[1])
+            .unwrap()
+            .expect("network test encoding has a direct join");
 
         let mut client_store = empty_store();
         let source_collection = client_store

@@ -84,7 +84,7 @@ use super::{
     simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
     CollectionStore, CoverAttachment, FactCover, TryFromCover,
 };
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
 
 /// Width of one stored id.
 const ID_LEN: usize = 16;
@@ -308,27 +308,26 @@ fn observed_attribute(descriptor: &Fragment) -> Result<Id, CollectionOperationEr
 }
 
 impl CollectionEncoding for ObservedSetBlob {
-    type Artifact = Blob<Self>;
-
-    fn attach_member<R>(
+    fn validate_member<R>(
         _descriptor: &Fragment,
-        member: Blob<Self>,
+        member: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Self::Artifact, CollectionOperationError>
+    ) -> Result<(), CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        validate_element(&member)
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        Ok(member)
+        validate_element(member)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
     fn join_members(
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-    ) -> Result<Blob<Self>, CollectionOperationError> {
-        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError> {
+        join(low, high)
+            .map(Some)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -410,9 +409,15 @@ impl RegisterOrder for ObservedIndex {
 impl TryFromCover<ObservedSetBlob> for ObservedIndex {
     type Error = ObservedSetError;
 
-    fn try_from_cover(attachment: CoverAttachment<ObservedSetBlob>) -> Result<Self, Self::Error> {
+    fn try_from_cover<R>(
+        attachment: CoverAttachment<ObservedSetBlob>,
+        _reader: &R,
+    ) -> Result<Self, Self::Error>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
         let mut joined = empty();
-        for segment in attachment.into_artifacts() {
+        for segment in attachment.into_blobs() {
             joined = join(&joined, &segment)?;
         }
         Self::decode(&joined)
@@ -523,7 +528,10 @@ impl ObservedSetCollection {
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.attach_exact(store, source_cover)?;
-        ObservedIndex::try_from_cover(cover).map_err(ObservedSetCollectionError::Algebra)
+        let reader = store
+            .reader()
+            .map_err(|source| ObservedSetCollectionError::Reader(source.to_string()))?;
+        ObservedIndex::try_from_cover(cover, &reader).map_err(ObservedSetCollectionError::Algebra)
     }
 
     /// Ensure and attach the observed set for `source_cover`.
@@ -537,7 +545,10 @@ impl ObservedSetCollection {
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;
-        ObservedIndex::try_from_cover(cover).map_err(ObservedSetCollectionError::Algebra)
+        let reader = store
+            .reader()
+            .map_err(|source| ObservedSetCollectionError::Reader(source.to_string()))?;
+        ObservedIndex::try_from_cover(cover, &reader).map_err(ObservedSetCollectionError::Algebra)
     }
 
     fn kernel(
@@ -557,6 +568,8 @@ pub enum ObservedSetCollectionError {
     Collection(ExactDerivedCollectionError),
     /// Canonical observed-set construction failed.
     Algebra(ObservedSetError),
+    /// A reader for the attached cover could not be opened.
+    Reader(String),
 }
 
 impl fmt::Display for ObservedSetCollectionError {
@@ -564,6 +577,7 @@ impl fmt::Display for ObservedSetCollectionError {
         match self {
             Self::Collection(source) => source.fmt(formatter),
             Self::Algebra(source) => source.fmt(formatter),
+            Self::Reader(source) => write!(formatter, "open observed-set cover reader: {source}"),
         }
     }
 }
@@ -573,6 +587,7 @@ impl Error for ObservedSetCollectionError {
         match self {
             Self::Collection(source) => Some(source),
             Self::Algebra(source) => Some(source),
+            Self::Reader(_) => None,
         }
     }
 }
