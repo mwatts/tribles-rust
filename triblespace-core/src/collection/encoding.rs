@@ -121,15 +121,20 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
 ///
 /// The target's logical join may be represented by a multi-member cover even
 /// when its encoding deliberately has no directly materialized physical join.
-pub trait CollectionMapping<Source, Target>
-where
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-{
+pub trait CollectionMapping: Sized {
+    /// Canonical source encoding.
+    type Source: CollectionEncoding;
+    /// Canonical target encoding.
+    type Target: CollectionEncoding;
+
+    /// Canonical concrete mapping fragment embedded in a target descriptor.
+    ///
+    /// Parameterized mappings carry their parameters in `self`; zero-sized
+    /// mappings simply return their one canonical algorithm fragment.
+    fn fragment(&self) -> Fragment;
+
     /// Bind and validate the concrete mapping named by the target descriptor.
-    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError>
-    where
-        Self: Sized;
+    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError>;
 
     /// Compute the canonical target image of one source member.
     ///
@@ -139,9 +144,9 @@ where
     /// inputs to the mapping.
     fn map<R>(
         &self,
-        source: &Blob<Source>,
+        source: &Blob<Self::Source>,
         reader: &R,
-    ) -> Result<Blob<Target>, CollectionOperationError>
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta;
 }

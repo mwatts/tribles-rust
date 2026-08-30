@@ -6,17 +6,11 @@
 //! Signatures and metadata remain queryable provenance over those payloads and
 //! are not coordinates of the materialized value.
 
-// Reach arrives here as a builder argument; only the tests name a
-// particular one.
-#[cfg(test)]
-use crate::collection::reach;
-use ed25519_dalek::VerifyingKey;
-
 use std::convert::Infallible;
 
 use crate::collection::api::{resolve_cover_from_observation, FactCover, FactMaterializationError};
 use crate::collection::discovery::discover_collection_equations_for_cover;
-use crate::collection::{Collection, CollectionRead, TryFromCover};
+use crate::collection::{Collection, CollectionPolicy, CollectionRead, TryFromCover};
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, TribleSet};
 
@@ -28,27 +22,18 @@ use crate::trible::{Fragment, TribleSet};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleArchiveCollection {
     name: String,
-    authority: VerifyingKey,
-    reach: Fragment,
+    policy: CollectionPolicy,
 }
 
 impl SimpleArchiveCollection {
     /// Construct a read-only exact-cover facade for one named root.
     ///
-    /// `reach` is not decoration on a read facade: it is part of the
-    /// descriptor this facade hashes, so a facade that names the wrong reach
-    /// names a different collection and matches no cover.
-    pub fn new(name: impl Into<String>, authority: VerifyingKey, reach: Fragment) -> Self {
+    /// Policy is part of the descriptor identity rather than ambient state.
+    pub fn new(name: impl Into<String>, policy: CollectionPolicy) -> Self {
         Self {
             name: name.into(),
-            authority,
-            reach,
+            policy,
         }
-    }
-
-    /// How far this collection may travel.
-    pub fn reach(&self) -> &Fragment {
-        &self.reach
     }
 
     /// Human-readable name of this root collection.
@@ -56,14 +41,14 @@ impl SimpleArchiveCollection {
         self.name.as_str()
     }
 
-    /// Mandatory capability trust root in this descriptor.
-    pub fn authority(&self) -> VerifyingKey {
-        self.authority
+    /// Immutable authorization policy in this descriptor.
+    pub const fn policy(&self) -> &CollectionPolicy {
+        &self.policy
     }
 
     /// Canonical `SimpleArchive` set-union descriptor facts.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(&self.name, self.authority, self.reach.clone())
+        super::descriptor(&self.name, self.policy.clone())
     }
 
     /// Content identity of this collection's descriptor.
@@ -158,8 +143,14 @@ mod tests {
     fn test_facade(name: &str) -> SimpleArchiveCollection {
         SimpleArchiveCollection::new(
             name.to_owned(),
-            SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            reach::private(),
+            CollectionPolicy::new(
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+            ),
         )
     }
 
@@ -389,7 +380,7 @@ mod tests {
             facts(1)
         );
 
-        let claims = requested.claims(&snapshot).unwrap();
+        let claims = requested.commits(&snapshot).unwrap();
         assert_eq!(claims.len(), 3);
         assert!(claims.contains(&first));
         assert!(claims.contains(&missing_metadata_claim));

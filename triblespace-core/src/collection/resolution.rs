@@ -1193,8 +1193,6 @@ fn check_functional(
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::reach;
-
     /// Resolve with a stated lineage.
     ///
     /// A derive record no longer names its source -- the target's descriptor
@@ -2567,8 +2565,14 @@ mod tests {
     fn simplearchive_union_validation_integrates_with_discovery_and_resolution() {
         let definition = simplearchive_union::descriptor(
             "resolved",
-            SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            reach::private(),
+            crate::collection::CollectionPolicy::new(
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+            ),
         );
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);

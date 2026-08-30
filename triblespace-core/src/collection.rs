@@ -14,6 +14,12 @@ use crate::id::{id_hex, Id};
 /// stable action with one exact collection descriptor handle.
 pub const ACTION_WRITE: Id = id_hex!("66B660A5481E04E552A1FA96AA9ECC48");
 
+/// The exact action required to receive or inspect one collection.
+///
+/// Minted with `trible genid` on 2026-08-30. Capability policies pair this
+/// stable action with one exact collection descriptor handle.
+pub const ACTION_READ: Id = id_hex!("76583A671BBD61A6A8E66405DE75873F");
+
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
 /// Reading one collection descriptor's facts.
@@ -30,8 +36,8 @@ pub mod lww_register;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.
 pub mod observed_union;
-/// How far a collection may travel, as a fragment rather than a flag.
-pub mod reach;
+/// Immutable collection-local READ and WRITE authorization ceilings.
+pub mod policy;
 pub mod records;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
 pub mod resolution;
@@ -46,17 +52,17 @@ pub mod succinctarchive_union;
 /// Logical values reconstructed from typed physical covers.
 pub mod view;
 
-/// Ed25519 public key, re-exported.
+/// Ed25519 public key, re-exported for collection admission policies.
 ///
-/// Root descriptors use public keys for their identity namespace and may use
-/// another as an external capability trust root. Downstream crates should not
-/// have to take a direct `ed25519-dalek` dependency to name a type this API
-/// demands of them.
+/// Each action policy may name one or more capability trust roots. Downstream
+/// crates should not need a direct `ed25519-dalek` dependency merely to state
+/// those roots.
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
 pub use discovery::*;
 pub use encoding::*;
+pub use policy::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;

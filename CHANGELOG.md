@@ -9,12 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `CollectionStoreExt::writer_is_admitted` as a read-only
-  pre-publication check. Descriptor authorities succeed directly; delegated
-  writers require resident, valid evidence for exact `ACTION_WRITE` on the
-  descriptor handle, without scanning collection commits.
+- Add self-contained independent READ and WRITE admission policies to every
+  collection descriptor. Each action is either `Open` or a validated quorum
+  over a canonical root set with separate invocation and optional downstream
+  delegation thresholds. Exact proof-forest evaluation counts distinct roots,
+  admits configured roots directly, supports direct root grants even when
+  redelegation is disabled, and adds the distinct `ACTION_READ` boundary.
 
-- Add `Collection::admitted_with_claims` for consumers which need the exact
+- Add the lean store-owned construction API:
+  `store.collection(name, policy)` creates a root `SimpleArchive` collection,
+  `store.derive(source, mapping, policy)` creates any derived collection from
+  a mapping value with associated `Source`/`Target` encodings, and
+  `register_collection::<E>(descriptor)` remains the explicit raw boundary.
+  `Collection::admitted_with_commits` returns the exact signed COMMIT roots
+  selected by the same admission decision.
+
+- Add `CollectionStoreExt::writer_is_admitted` as a read-only
+  pre-publication check. Open policies and subjects satisfying the descriptor's
+  WRITE quorum succeed without scanning collection commits.
+
+- Add `Collection::admitted_with_commits` for consumers which need the exact
   strictly verified COMMIT roots selected by one admission decision. The
   returned roots stay narrower than later provenance queries over the same
   cover and immutable store snapshot.

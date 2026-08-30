@@ -14,21 +14,13 @@
 //! authority to construction records. `DERIVE` and `MERGE` remain unsigned,
 //! reproducible evidence.
 
-use crate::id::ExclusiveId;
-// Reach arrives here as a builder argument; only the tests name a
-// particular one.
 use super::descriptor as descriptor_facts;
-use super::records::{
-    collection_authority, collection_mapping, collection_reach, collection_representation,
-    collection_source, mapping_algorithm, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
-    KIND_COLLECTION_MAPPING,
-};
-#[cfg(test)]
-use crate::collection::reach;
+use super::records::{mapping_algorithm, RecordDecodeError, KIND_COLLECTION_MAPPING};
+use super::CollectionPolicy;
+use crate::id::ExclusiveId;
 use crate::metadata;
 use crate::prelude::entity;
 use crate::trible::Fragment;
-use ed25519_dalek::VerifyingKey;
 use std::error::Error;
 use std::fmt;
 
@@ -140,9 +132,17 @@ fn mapping_fragment() -> Fragment {
 }
 
 /// Bound canonical SimpleArchive-to-SuccinctArchive mapping.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SimpleToSuccinctMapping;
 
-impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for SimpleToSuccinctMapping {
+impl CollectionMapping for SimpleToSuccinctMapping {
+    type Source = SimpleArchive;
+    type Target = SuccinctArchiveBlob;
+
+    fn fragment(&self) -> Fragment {
+        mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         let actual = descriptor_facts::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
@@ -236,11 +236,17 @@ fn rank9_accelerated_mapping_fragment() -> Fragment {
 }
 
 /// Bound canonical raw-to-accelerated SuccinctArchive mapping.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RawToRank9AcceleratedMapping;
 
-impl CollectionMapping<SuccinctArchiveBlob, Rank9AcceleratedSuccinctArchiveBlob>
-    for RawToRank9AcceleratedMapping
-{
+impl CollectionMapping for RawToRank9AcceleratedMapping {
+    type Source = SuccinctArchiveBlob;
+    type Target = Rank9AcceleratedSuccinctArchiveBlob;
+
+    fn fragment(&self) -> Fragment {
+        rank9_accelerated_mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         let actual = descriptor_facts::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
@@ -460,32 +466,14 @@ impl Error for SuccinctArchiveUnionValidationError {
 /// mandatory and local: the target names its own trust root rather than
 /// inheriting one from the source.
 ///
-pub fn descriptor(source: CollectionHandle, authority: VerifyingKey, reach: Fragment) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_source: source,
-        collection_authority: authority,
-        collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
-        collection_mapping*: mapping_fragment(),
-        collection_reach*: reach,
-    }
+pub fn descriptor(source: CollectionHandle, policy: CollectionPolicy) -> Fragment {
+    descriptor_facts::deriving(source, &SimpleToSuccinctMapping, policy)
 }
 
 /// Describe the Rank9-accelerated collection derived from one exact raw
 /// SuccinctArchive collection.
-pub fn accelerated_descriptor(
-    source: CollectionHandle,
-    authority: VerifyingKey,
-    reach: Fragment,
-) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_source: source,
-        collection_authority: authority,
-        collection_representation*: <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::describe(),
-        collection_mapping*: rank9_accelerated_mapping_fragment(),
-        collection_reach*: reach,
-    }
+pub fn accelerated_descriptor(source: CollectionHandle, policy: CollectionPolicy) -> Fragment {
+    descriptor_facts::deriving(source, &RawToRank9AcceleratedMapping, policy)
 }
 
 /// Return the canonical empty raw SuccinctArchive artifact.
@@ -615,7 +603,7 @@ fn validate_descriptor_parts(
     expected_representation: Id,
     expected_mapping: Option<Id>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    descriptor_facts::authority(descriptor.facts())?;
+    descriptor_facts::validate(descriptor.facts())?;
     let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {
         return Err(SuccinctArchiveUnionValidationError::WrongRepresentation {
@@ -683,9 +671,16 @@ mod tests {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
+    fn direct_policy() -> CollectionPolicy {
+        CollectionPolicy::new(
+            crate::collection::AdmissionPolicy::direct(authority()),
+            crate::collection::AdmissionPolicy::direct(authority()),
+        )
+    }
+
     /// The named `SimpleArchive` root these tests derive from.
     fn raw_root(name: &str) -> Fragment {
-        simplearchive_union::descriptor(name, authority(), reach::private())
+        simplearchive_union::descriptor(name, direct_policy())
     }
 
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {
@@ -723,7 +718,7 @@ mod tests {
     #[test]
     fn the_index_derives_from_the_raw_collection_through_its_mapping() {
         let source = raw_root("first");
-        let target = descriptor(identity_for_tests(&source), authority(), reach::private());
+        let target = descriptor(identity_for_tests(&source), direct_policy());
 
         // The target points at exactly this source, and carries no anchor of
         // its own: what it derives from is what anchors it.
@@ -749,8 +744,7 @@ mod tests {
             identity_for_tests(&target),
             identity_for_tests(&descriptor(
                 identity_for_tests(&raw_root("second")),
-                authority(),
-                reach::private()
+                direct_policy(),
             ))
         );
 
@@ -776,11 +770,7 @@ mod tests {
     #[test]
     fn canonical_empty_is_the_derived_bottom_and_merge_identity() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(
-            identity_for_tests(&raw_root("first")),
-            authority(),
-            reach::private(),
-        );
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let derived_empty = derive_element(&source_empty).unwrap();
         let canonical_empty = empty();
@@ -821,11 +811,7 @@ mod tests {
     #[test]
     fn derive_and_merge_commute_to_identical_canonical_bytes() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(
-            identity_for_tests(&raw_root("first")),
-            authority(),
-            reach::private(),
-        );
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
         let shared = row(3, 10, 40);
         let left = archive([row(2, 10, 60), shared]);
         let right = archive([row(1, 10, 20), shared]);
@@ -875,11 +861,7 @@ mod tests {
     #[test]
     fn validators_reject_valid_but_wrong_canonical_outputs() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(
-            identity_for_tests(&raw_root("first")),
-            authority(),
-            reach::private(),
-        );
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
         let input = archive([row(1, 9, 3)]);
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
@@ -921,11 +903,7 @@ mod tests {
     #[test]
     fn malformed_target_is_rejected_before_equation_admission() {
         let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(
-            identity_for_tests(&raw_root("first")),
-            authority(),
-            reach::private(),
-        );
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
         let claim = CollectionDerive::new(

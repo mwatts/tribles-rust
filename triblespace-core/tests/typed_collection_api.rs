@@ -1,14 +1,14 @@
 use ed25519_dalek::SigningKey;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
-};
+use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
-use triblespace_core::collection::{reach, CollectionStoreExt, TryFromCover};
 use triblespace_core::collection::{simplearchive_union, succinctarchive_union};
+use triblespace_core::collection::{
+    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, TryFromCover,
+};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::SnapshotSource;
@@ -26,14 +26,17 @@ fn one_fact(seed: u8) -> TribleSet {
 #[test]
 fn simplearchive_collection_round_trips_typed_views() {
     let authority = SigningKey::from_bytes(&[41; 32]);
-    let descriptor =
-        simplearchive_union::descriptor("typed-api", authority.verifying_key(), reach::private());
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let descriptor = simplearchive_union::descriptor("typed-api", policy.clone());
     let descriptor_handle = descriptor.facts().clone().to_blob().get_handle();
     let expected = one_fact(7);
     let expected_member = expected.clone().to_blob().get_handle();
     let mut store = MemoryRepo::default();
 
-    let collection = store.collection::<SimpleArchive>(descriptor).unwrap();
+    let collection = store.collection("typed-api", policy).unwrap();
     assert_eq!(collection.handle(), descriptor_handle);
 
     let commit = store
@@ -62,21 +65,18 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     let raw_handle = raw.get_handle();
     let mut store = MemoryRepo::default();
 
-    let source_descriptor = simplearchive_union::descriptor(
-        "typed-api-source",
-        authority.verifying_key(),
-        reach::private(),
+    let source_policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
     );
-    let source = store
-        .collection::<SimpleArchive>(source_descriptor.clone())
-        .unwrap();
-    let target_descriptor = succinctarchive_union::descriptor(
-        source.handle(),
-        authority.verifying_key(),
-        reach::private(),
-    );
+    let target_policy = source_policy.clone();
+    let source_descriptor =
+        simplearchive_union::descriptor("typed-api-source", source_policy.clone());
+    let source = store.collection("typed-api-source", source_policy).unwrap();
+    let target_descriptor =
+        succinctarchive_union::descriptor(source.handle(), target_policy.clone());
     let target = store
-        .collection::<SuccinctArchiveBlob>(target_descriptor.clone())
+        .derive(source, SimpleToSuccinctMapping, target_policy)
         .unwrap();
 
     store
@@ -84,11 +84,10 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
         .unwrap();
     let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
-    let derived = ExactDerivedCollection::<
-        SimpleArchive,
-        SuccinctArchiveBlob,
-        SimpleToSuccinctMapping,
-    >::new(source_descriptor, target_descriptor)
+    let derived = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(
+        source_descriptor,
+        target_descriptor,
+    )
     .unwrap();
     let cover = derived.ensure_exact(&mut store, &source_cover).unwrap();
     assert_eq!(cover.collection(), target);

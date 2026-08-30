@@ -39,6 +39,8 @@ use super::{
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
+type MappingSource<M> = <M as CollectionMapping>::Source;
+type MappingTarget<M> = <M as CollectionMapping>::Target;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum TypedData {
@@ -253,25 +255,15 @@ impl Error for ExactDerivedCollectionError {
 
 /// Exact-cover lifecycle for one fixed source-to-target mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExactDerivedCollection<Source, Target, Mapping>
-where
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-    Mapping: CollectionMapping<Source, Target>,
-{
+pub struct ExactDerivedCollection<Mapping: CollectionMapping> {
     source: Fragment,
-    source_collection: Collection<Source>,
+    source_collection: Collection<MappingSource<Mapping>>,
     target: Fragment,
-    target_collection: Collection<Target>,
+    target_collection: Collection<MappingTarget<Mapping>>,
     mapping: Mapping,
 }
 
-impl<Source, Target, Mapping> ExactDerivedCollection<Source, Target, Mapping>
-where
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-    Mapping: CollectionMapping<Source, Target>,
-{
+impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
     /// Bind one mapping to two exact typed descriptors.
     pub fn new(source: Fragment, target: Fragment) -> Result<Self, ExactDerivedCollectionError> {
         let (source_collection, target_collection) = Self::validate_descriptors(&source, &target)?;
@@ -310,15 +302,21 @@ where
     fn validate_descriptors(
         source: &Fragment,
         target: &Fragment,
-    ) -> Result<(Collection<Source>, Collection<Target>), ExactDerivedCollectionError> {
-        let source_collection =
-            Collection::<Source>::from_descriptor(&source).map_err(|error| {
+    ) -> Result<
+        (
+            Collection<MappingSource<Mapping>>,
+            Collection<MappingTarget<Mapping>>,
+        ),
+        ExactDerivedCollectionError,
+    > {
+        let source_collection = Collection::<MappingSource<Mapping>>::from_descriptor(&source)
+            .map_err(|error| {
                 ExactDerivedCollectionError::Resolution(format!(
                     "invalid exact source descriptor: {error}"
                 ))
             })?;
-        let target_collection =
-            Collection::<Target>::from_descriptor(&target).map_err(|error| {
+        let target_collection = Collection::<MappingTarget<Mapping>>::from_descriptor(&target)
+            .map_err(|error| {
                 ExactDerivedCollectionError::Resolution(format!(
                     "invalid exact target descriptor: {error}"
                 ))
@@ -355,12 +353,12 @@ where
     }
 
     /// Identity of the source collection.
-    pub fn source_collection(&self) -> Collection<Source> {
+    pub fn source_collection(&self) -> Collection<MappingSource<Mapping>> {
         self.source_collection
     }
 
     /// Identity of the target collection.
-    pub fn target_collection(&self) -> Collection<Target> {
+    pub fn target_collection(&self) -> Collection<MappingTarget<Mapping>> {
         self.target_collection
     }
 
@@ -370,7 +368,7 @@ where
 
     fn require_source_cover(
         &self,
-        source_cover: &Cover<Source>,
+        source_cover: &Cover<MappingSource<Mapping>>,
     ) -> Result<(), ExactDerivedCollectionError> {
         if source_cover.collection() == self.source_collection {
             return Ok(());
@@ -390,8 +388,8 @@ where
     pub fn attach_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
-    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
+        source_cover: &Cover<MappingSource<Mapping>>,
+    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -407,8 +405,8 @@ where
     pub(crate) fn attach_member_images<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
-    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
+        source_cover: &Cover<MappingSource<Mapping>>,
+    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -433,9 +431,9 @@ where
     pub fn probe_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
-        offered_target: &BTreeSet<Inline<Handle<Target>>>,
-    ) -> Result<ExactAttachPlan<Target>, ExactDerivedCollectionError>
+        source_cover: &Cover<MappingSource<Mapping>>,
+        offered_target: &BTreeSet<Inline<Handle<MappingTarget<Mapping>>>>,
+    ) -> Result<ExactAttachPlan<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -450,7 +448,7 @@ where
         let offered_target = offered_target
             .iter()
             .copied()
-            .map(Handle::<Target>::to_hash)
+            .map(Handle::<MappingTarget<Mapping>>::to_hash)
             .collect();
         let probe = self.probe(store, source_cover, false, &offered_target)?;
         if probe.is_complete() {
@@ -465,7 +463,7 @@ where
                     .target_fetch
                     .iter()
                     .copied()
-                    .map(Handle::<Target>::from_hash)
+                    .map(Handle::<MappingTarget<Mapping>>::from_hash)
                     .collect(),
             ));
         }
@@ -483,8 +481,8 @@ where
     pub fn ensure_exact<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
-    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
+        source_cover: &Cover<MappingSource<Mapping>>,
+    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -496,8 +494,8 @@ where
     pub(crate) fn ensure_exact_unoffered<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
-    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
+        source_cover: &Cover<MappingSource<Mapping>>,
+    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -509,8 +507,8 @@ where
     pub(crate) fn ensure_member_images<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
-    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
+        source_cover: &Cover<MappingSource<Mapping>>,
+    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -522,9 +520,9 @@ where
     fn ensure_with_route<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
+        source_cover: &Cover<MappingSource<Mapping>>,
         route: SourceRoute,
-    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -556,7 +554,10 @@ where
         // Successful images are cached by source identity, but only members of
         // the final feasible plan are ever published.
         let mut blocked = BTreeMap::<CollectionData, String>::new();
-        let mut cached = BTreeMap::<CollectionData, PreparedDerive<Source, Target>>::new();
+        let mut cached = BTreeMap::<
+            CollectionData,
+            PreparedDerive<MappingSource<Mapping>, MappingTarget<Mapping>>,
+        >::new();
         let prepared = loop {
             let source_cover = probe.source_residual_cover(&blocked)?;
             if source_cover.is_empty() {
@@ -580,7 +581,7 @@ where
                             break;
                         }
                     };
-                    let output_data = data_identity::<Target>(&output);
+                    let output_data = data_identity::<MappingTarget<Mapping>>(&output);
                     let claim = CollectionDerive::new(
                         self.target_collection.handle(),
                         input_data,
@@ -617,12 +618,12 @@ where
         self.publish_descriptors(store)?;
         for prepared in &prepared {
             store
-                .put::<Source, _>(prepared.input.clone())
+                .put::<MappingSource<Mapping>, _>(prepared.input.clone())
                 .map_err(|error| {
                     ExactDerivedCollectionError::storage("store derived source", error)
                 })?;
             store
-                .put::<Target, _>(prepared.output.clone())
+                .put::<MappingTarget<Mapping>, _>(prepared.output.clone())
                 .map_err(|error| {
                     ExactDerivedCollectionError::storage("store derived target", error)
                 })?;
@@ -641,9 +642,9 @@ where
     fn attach_with_route<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
+        source_cover: &Cover<MappingSource<Mapping>>,
         route: SourceRoute,
-    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -684,10 +685,13 @@ where
     fn probe<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
+        source_cover: &Cover<MappingSource<Mapping>>,
         plan_source_residual: bool,
         offered_target: &BTreeSet<CollectionData>,
-    ) -> Result<ExactProbe<S::Snapshot, Source, Target>, ExactDerivedCollectionError>
+    ) -> Result<
+        ExactProbe<S::Snapshot, MappingSource<Mapping>, MappingTarget<Mapping>>,
+        ExactDerivedCollectionError,
+    >
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -719,11 +723,14 @@ where
     fn probe_once<S>(
         &self,
         store: &mut S,
-        source_cover: &Cover<Source>,
+        source_cover: &Cover<MappingSource<Mapping>>,
         plan_source_residual: bool,
         offered_target: &BTreeSet<CollectionData>,
         scope: ProbeScope,
-    ) -> Result<ExactProbe<S::Snapshot, Source, Target>, ExactDerivedCollectionError>
+    ) -> Result<
+        ExactProbe<S::Snapshot, MappingSource<Mapping>, MappingTarget<Mapping>>,
+        ExactDerivedCollectionError,
+    >
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -739,13 +746,16 @@ where
         )
         .map_err(|error| ExactDerivedCollectionError::storage("discover exact cover", error))?;
 
-        let mut known = BTreeMap::<TypedData, ScratchValue<Source, Target>>::new();
+        let mut known = BTreeMap::<
+            TypedData,
+            ScratchValue<MappingSource<Mapping>, MappingTarget<Mapping>>,
+        >::new();
         let mut roots = BTreeSet::new();
         for member_handle in source_cover.members() {
-            let member = Handle::<Source>::to_hash(member_handle);
+            let member = Handle::<MappingSource<Mapping>>::to_hash(member_handle);
             let node = TypedData::Source(member);
             if !known.contains_key(&node) {
-                let Some(artifact) = load_candidate::<_, Source>(
+                let Some(artifact) = load_candidate::<_, MappingSource<Mapping>>(
                     &reader,
                     &self.source,
                     member,
@@ -816,13 +826,15 @@ where
             // Decomposition inputs are optional local cache evidence. Never
             // route an absent input through a reader whose miss semantics may
             // record a durable WANT (for example `LazyReader`).
-            let Ok(Some(_)) = reader.metadata(Handle::<Source>::from_hash(member)) else {
+            let Ok(Some(_)) = reader.metadata(Handle::<MappingSource<Mapping>>::from_hash(member))
+            else {
                 continue;
             };
-            let Ok(blob) = reader.get(Handle::<Source>::from_hash(member)) else {
+            let Ok(blob) = reader.get(Handle::<MappingSource<Mapping>>::from_hash(member)) else {
                 continue;
             };
-            let Ok(()) = Source::validate_member(&self.source, &blob, &reader) else {
+            let Ok(()) = MappingSource::<Mapping>::validate_member(&self.source, &blob, &reader)
+            else {
                 continue;
             };
             known.insert(node, ScratchValue::Source(blob));
@@ -987,15 +999,16 @@ where
             .copied()
             .filter(|data| local_results.contains(&TypedData::Target(*data)))
             .collect();
-        let local_physical: ValidatedPhysicalCover<Target> = validated_physical_cover(
-            &reader,
-            &self.target,
-            resolution.semantics(),
-            target,
-            target_local,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let local_physical: ValidatedPhysicalCover<MappingTarget<Mapping>> =
+            validated_physical_cover(
+                &reader,
+                &self.target,
+                resolution.semantics(),
+                target,
+                target_local,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            );
         // A speculative offer must never displace a complete resident cover.
         // Only widen physical selection to offered members when local bytes do
         // not already answer the exact cover without network I/O.
@@ -1118,12 +1131,12 @@ where
     fn contains_typed<R: BlobStoreMeta>(&self, reader: &R, data: TypedData) -> bool {
         match data {
             TypedData::Source(data) => reader
-                .metadata(Handle::<Source>::from_hash(data))
+                .metadata(Handle::<MappingSource<Mapping>>::from_hash(data))
                 .ok()
                 .flatten()
                 .is_some(),
             TypedData::Target(data) => reader
-                .metadata(Handle::<Target>::from_hash(data))
+                .metadata(Handle::<MappingTarget<Mapping>>::from_hash(data))
                 .ok()
                 .flatten()
                 .is_some(),
@@ -1332,7 +1345,7 @@ fn evaluate_candidates<Source, Target, Mapping>(
 where
     Source: CollectionEncoding,
     Target: CollectionEncoding,
-    Mapping: CollectionMapping<Source, Target>,
+    Mapping: CollectionMapping<Source = Source, Target = Target>,
 {
     let mut missing = vec![u8::MAX; candidates.len()];
     let mut waiters = BTreeMap::<TypedData, Vec<usize>>::new();
@@ -1447,7 +1460,7 @@ fn evaluate_candidate<Source, Target, Mapping>(
 where
     Source: CollectionEncoding,
     Target: CollectionEncoding,
-    Mapping: CollectionMapping<Source, Target>,
+    Mapping: CollectionMapping<Source = Source, Target = Target>,
 {
     match candidate {
         Candidate::SourceMerge(claim) => {

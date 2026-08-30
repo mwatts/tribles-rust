@@ -181,8 +181,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::collection::reach;
-
     fn lineage_from_derives(
         _records: &DiscoveredCollectionRecords,
     ) -> std::collections::BTreeMap<CollectionHandle, CollectionHandle> {
@@ -220,8 +218,14 @@ mod tests {
     fn test_root(name: &str) -> Fragment {
         simplearchive_union::descriptor(
             name,
-            SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            reach::private(),
+            crate::collection::CollectionPolicy::new(
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+            ),
         )
     }
 

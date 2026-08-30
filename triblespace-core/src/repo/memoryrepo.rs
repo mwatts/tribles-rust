@@ -545,10 +545,8 @@ mod tests {
         CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
         CapabilityResource,
     };
-    use crate::collection::reach;
-
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
-    use crate::collection::{CollectionDerive, CollectionMerge};
+    use crate::collection::{CollectionDerive, CollectionMerge, CollectionPolicy};
 
     fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
         Inline::new([byte; 32])
@@ -784,11 +782,14 @@ mod tests {
         let fragment = entity! { crate::metadata::name: child };
         let name = "owned";
         let key = SigningKey::from_bytes(&[23; 32]);
-        let team = key.verifying_key();
-        let descriptor = simplearchive_union::descriptor(name, team, reach::private());
+        let policy = CollectionPolicy::new(
+            crate::collection::AdmissionPolicy::direct(key.verifying_key()),
+            crate::collection::AdmissionPolicy::direct(key.verifying_key()),
+        );
+        let descriptor = simplearchive_union::descriptor(name, policy.clone());
         let expected_collection = identity_for_tests(&descriptor);
         let collection: crate::collection::Collection<SimpleArchive> =
-            repo.collection(descriptor).unwrap();
+            repo.collection(name, policy).unwrap();
         assert_eq!(collection.handle(), expected_collection);
         let commit = repo.commit(collection, &key, fragment).unwrap();
         let orphan = repo.put::<UTF8String, _>("orphan".to_owned()).unwrap();

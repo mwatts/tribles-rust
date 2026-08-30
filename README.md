@@ -54,7 +54,7 @@ blob with the facts that reference it.
 ```rust
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::collection::{reach, simplearchive_union};
+use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 use triblespace::prelude::*;
 
 mod literature {
@@ -79,11 +79,14 @@ mod literature {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = SigningKey::generate(&mut OsRng);
     let mut storage = MemoryRepo::default();
-    let library = storage.collection(simplearchive_union::descriptor(
+    let root = key.verifying_key();
+    let library = storage.collection(
         "library",
-        key.verifying_key(),
-        reach::private(),
-    ))?;
+        CollectionPolicy::new(
+            AdmissionPolicy::direct(root),
+            AdmissionPolicy::direct(root),
+        ),
+    )?;
 
     let author = entity! {
         literature::firstname: "Frank",
@@ -128,14 +131,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The descriptor's mandatory authority participates in the collection identity
-and is admitted directly. Other strictly verified signers become visible only
-when `library.admitted(&snapshot)` observes root-to-leaf proofs for exact
-`ACTION_WRITE` on this descriptor handle in the same immutable store snapshot;
-it never scans storage for ambient grants. Identical retries deduplicate by
-intrinsic record identity, distinct commits coexist, and `TryFromCover`
-materializes every admitted author's union. Call the
-store's `flush` operation when an application needs an explicit durability
+The descriptor's independent READ and WRITE policies participate in collection
+identity. Here both are one-root direct policies: the root acts directly and
+may grant another principal the exact action, while grantees cannot redelegate.
+Other strictly verified signers become visible only when
+`library.admitted(&snapshot)` observes sufficient root support for exact
+`ACTION_WRITE` on this descriptor handle in the same immutable store snapshot.
+Identical retries deduplicate by intrinsic record identity, distinct commits
+coexist, and `TryFromCover` materializes every admitted author's union. Call
+the store's `flush` operation when an application needs an explicit durability
 barrier.
 
 The [Getting Started](https://triblespace.github.io/triblespace-rs/getting-started.html)

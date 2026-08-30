@@ -3,7 +3,7 @@
 //! elements.
 //!
 //! This is the first concrete production collection encoding. A collection
-//! pairs a UTF-8 name and mandatory authority with the existing
+//! pairs a UTF-8 name and immutable collection policy with the existing
 //! `SimpleArchive` representation. Every element is an exact, canonical EAV-ordered stream of
 //! 64-byte tribles. Its join is ordinary set union, so canonical output bytes
 //! and their Blake3 identity are associative, commutative, and idempotent.
@@ -15,18 +15,8 @@
 //! equation until its three blobs are resident, then call
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
-// Reach arrives here as a builder argument; only the tests name a
-// particular one.
-#[cfg(test)]
-use crate::collection::reach;
-use crate::metadata;
-use crate::prelude::entity;
-use ed25519_dalek::VerifyingKey;
-
-use super::records::{
-    collection_authority, collection_name, collection_reach, collection_representation,
-    RecordDecodeError, KIND_COLLECTION_DESCRIPTOR,
-};
+use super::policy::CollectionPolicy;
+use super::records::RecordDecodeError;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::convert::Infallible;
@@ -479,14 +469,8 @@ where
 /// side effect of naming one rather than a second thing to remember. Hashing
 /// a descriptor you never stored would leave a phantom collection: records
 /// that reference it, and nothing that can decode what they reference.
-pub fn descriptor(name: &str, authority: VerifyingKey, reach: Fragment) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_name: name.to_owned(),
-        collection_authority: authority,
-        collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
-        collection_reach*: reach,
-    }
+pub fn descriptor(name: &str, policy: CollectionPolicy) -> Fragment {
+    super::descriptor::naming::<SimpleArchive>(name, policy)
 }
 
 /// Validate one canonical `SimpleArchive` collection element without decoding
@@ -1044,7 +1028,7 @@ where
 }
 
 fn validate_descriptor(descriptor: &Fragment) -> Result<(), SimpleArchiveUnionValidationError> {
-    descriptor_facts::authority(descriptor.facts())?;
+    descriptor_facts::validate(descriptor.facts())?;
     let expected_representation = <SimpleArchive as MetaDescribe>::id();
     let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {
@@ -1227,18 +1211,19 @@ mod tests {
 
     /// One named root of this collection kind.
     fn root(name: &str) -> Fragment {
-        super::descriptor(name, test_team(), reach::private())
+        super::descriptor(
+            name,
+            CollectionPolicy::new(
+                crate::collection::AdmissionPolicy::direct(test_team()),
+                crate::collection::AdmissionPolicy::direct(test_team()),
+            ),
+        )
     }
 
     /// The same anchor as `root("first")`, but naming a different physical
     /// encoding: a collection this implementation does not accept.
     fn test_naming(representation: Id) -> Fragment {
-        crate::collection::descriptor::naming(
-            "first",
-            test_team(),
-            representation,
-            reach::private(),
-        )
+        crate::collection::descriptor::named_for_tests("first", representation)
     }
 
     mod fragment_ns {
@@ -2282,8 +2267,11 @@ mod tests {
             id_hex!("8F4A27C8581DADCBA1ADA8BA228069B6")
         );
         assert_eq!(
-            crate::collection::descriptor::authority(descriptor.facts()).unwrap(),
-            test_team()
+            crate::collection::descriptor::policy(descriptor.facts()).unwrap(),
+            CollectionPolicy::new(
+                crate::collection::AdmissionPolicy::direct(test_team()),
+                crate::collection::AdmissionPolicy::direct(test_team()),
+            )
         );
         let name = crate::collection::descriptor::name(descriptor.facts())
             .unwrap()

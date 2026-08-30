@@ -256,7 +256,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collection::reach;
 
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -407,8 +406,14 @@ mod tests {
     fn root(name: &str) -> Fragment {
         super::super::descriptor(
             name,
-            SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            reach::private(),
+            crate::collection::CollectionPolicy::new(
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                ),
+            ),
         )
     }
 

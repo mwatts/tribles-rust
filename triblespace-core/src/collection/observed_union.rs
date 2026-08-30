@@ -52,8 +52,6 @@
 //! different edges are distinct mappings and therefore distinct collections,
 //! and cannot be confused for one another's maintained artifacts.
 
-use ed25519_dalek::VerifyingKey;
-
 use anybytes::Bytes;
 use std::convert::Infallible;
 use std::error::Error;
@@ -67,24 +65,16 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::macros::entity;
-// Reach arrives here as a builder argument; only the tests name a
-// particular one.
-#[cfg(test)]
-use crate::collection::reach;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::RegisterOrder;
 use crate::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
-use super::records::{
-    collection_authority, collection_mapping, collection_reach, collection_representation,
-    collection_source, mapping_algorithm, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
-    KIND_COLLECTION_MAPPING,
-};
+use super::records::{mapping_algorithm, CollectionHandle, KIND_COLLECTION_MAPPING};
 use super::{
     simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
-    CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    CollectionPolicy, CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
 
@@ -245,21 +235,10 @@ pub fn join(
 
 /// Construct the observed-set collection for one source and edge.
 ///
-/// The target's mandatory authority is explicit and independent of its source.
-pub fn descriptor(
-    source: CollectionHandle,
-    observes: Id,
-    authority: VerifyingKey,
-    reach: Fragment,
-) -> Fragment {
-    entity! { _ @
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_source: source,
-        collection_authority: authority,
-        collection_representation*: <ObservedSetBlob as MetaDescribe>::describe(),
-        collection_mapping*: mapping_fragment(observes),
-        collection_reach*: reach,
-    }
+/// The target's independent READ and WRITE policies are explicit rather than
+/// inherited from its source.
+pub fn descriptor(source: CollectionHandle, observes: Id, policy: CollectionPolicy) -> Fragment {
+    crate::collection::descriptor::deriving(source, &ObserveStatesMapping::new(observes), policy)
 }
 
 /// Canonical fact-to-observed-state mapping algorithm, version 1.
@@ -343,7 +322,21 @@ pub struct ObserveStatesMapping {
     observes: Id,
 }
 
-impl CollectionMapping<SimpleArchive, ObservedSetBlob> for ObserveStatesMapping {
+impl ObserveStatesMapping {
+    /// Project subjects that carry this observation-edge attribute.
+    pub const fn new(observes: Id) -> Self {
+        Self { observes }
+    }
+}
+
+impl CollectionMapping for ObserveStatesMapping {
+    type Source = SimpleArchive;
+    type Target = ObservedSetBlob;
+
+    fn fragment(&self) -> Fragment {
+        mapping_fragment(self.observes)
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         let observes = observed_attribute(target)?;
         let actual = crate::collection::descriptor::mapping_algorithm(target.facts())
@@ -443,47 +436,28 @@ impl TryFromCover<ObservedSetBlob> for ObservedIndex {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedSetCollection {
     name: String,
-    source_authority: VerifyingKey,
+    source_policy: CollectionPolicy,
     observes: Id,
-    source_reach: Fragment,
-    authority: VerifyingKey,
-    reach: Fragment,
+    policy: CollectionPolicy,
 }
 
 impl ObservedSetCollection {
     /// Construct the observed-set projection over one named root.
     ///
-    /// `source_reach` completes the root's identity; `reach` is this
-    /// projection's own. A derivation never inherits its source's reach --
-    /// see [`reach::travels`](crate::collection::reach::travels).
-    /// `source_authority` must match the root descriptor exactly; `authority`
-    /// independently declares the derived collection's mandatory trust root.
+    /// Source and target policies are independent parts of their respective
+    /// descriptor identities.
     pub fn new(
         name: impl Into<String>,
-        source_authority: VerifyingKey,
+        source_policy: CollectionPolicy,
         observes: Id,
-        source_reach: Fragment,
-        authority: VerifyingKey,
-        reach: Fragment,
+        policy: CollectionPolicy,
     ) -> Self {
         Self {
             name: name.into(),
-            source_authority,
+            source_policy,
             observes,
-            source_reach,
-            authority,
-            reach,
+            policy,
         }
-    }
-
-    /// How far the source collection may travel.
-    pub fn source_reach(&self) -> &Fragment {
-        &self.source_reach
-    }
-
-    /// How far this projection may travel.
-    pub fn reach(&self) -> &Fragment {
-        &self.reach
     }
 
     /// Name of the root collection this projection is taken over.
@@ -491,14 +465,14 @@ impl ObservedSetCollection {
         self.name.as_str()
     }
 
-    /// Mandatory capability trust root declared by the source descriptor.
-    pub fn source_authority(&self) -> VerifyingKey {
-        self.source_authority
+    /// Source authorization policy.
+    pub fn source_policy(&self) -> &CollectionPolicy {
+        &self.source_policy
     }
 
-    /// Mandatory capability trust root declared by this derived collection.
-    pub fn authority(&self) -> VerifyingKey {
-        self.authority
+    /// Derived authorization policy.
+    pub fn policy(&self) -> &CollectionPolicy {
+        &self.policy
     }
 
     /// The observation attribute this collection reads.
@@ -508,11 +482,7 @@ impl ObservedSetCollection {
 
     /// Canonical source `SimpleArchive` collection descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(
-            &self.name,
-            self.source_authority,
-            self.source_reach.clone(),
-        )
+        simplearchive_union::descriptor(&self.name, self.source_policy.clone())
     }
 
     /// Identity of the source collection this projection reads.
@@ -523,12 +493,7 @@ impl ObservedSetCollection {
 
     /// Canonical target observed-set collection descriptor.
     pub fn descriptor(&self) -> Fragment {
-        descriptor(
-            self.source_collection(),
-            self.observes,
-            self.authority,
-            self.reach.clone(),
-        )
+        descriptor(self.source_collection(), self.observes, self.policy.clone())
     }
 
     /// Attach the observed set already resident for `source_cover`.
@@ -577,10 +542,7 @@ impl ObservedSetCollection {
 
     fn kernel(
         &self,
-    ) -> Result<
-        ExactDerivedCollection<SimpleArchive, ObservedSetBlob, ObserveStatesMapping>,
-        ExactDerivedCollectionError,
-    > {
+    ) -> Result<ExactDerivedCollection<ObserveStatesMapping>, ExactDerivedCollectionError> {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
     }
 }
@@ -627,6 +589,13 @@ impl From<ExactDerivedCollectionError> for ObservedSetCollectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
+        CollectionPolicy::new(
+            crate::collection::AdmissionPolicy::direct(root),
+            crate::collection::AdmissionPolicy::direct(root),
+        )
+    }
     use crate::prelude::*;
     use crate::query::register::{resolve, ObservationOrder};
     use crate::trible::TribleSet;
@@ -742,19 +711,15 @@ mod tests {
         use crate::collection::descriptor as descriptor_facts;
 
         let authority = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let policy = || direct_policy(authority);
         let root = |name: &str| {
             crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-                simplearchive_union::descriptor(name, authority, reach::private()).into_facts(),
+                simplearchive_union::descriptor(name, policy()).into_facts(),
             )
             .get_handle()
         };
         let source = root("source");
-        let observed = descriptor(
-            source,
-            metadata::supersedes.id(),
-            authority,
-            reach::private(),
-        );
+        let observed = descriptor(source, metadata::supersedes.id(), policy());
         assert_eq!(
             descriptor_facts::mapping_argument(observed.facts(), register_observes.id()),
             Ok(Some(
@@ -767,15 +732,15 @@ mod tests {
         );
         assert_ne!(
             observed,
-            descriptor(source, metadata::tag.id(), authority, reach::private()),
+            descriptor(source, metadata::tag.id(), policy()),
             "two registers over different edges are different collections"
         );
         // A derived collection carries no anchor of its own; two derivations
         // of the same shape differ exactly when their sources differ.
         let other = root("other-source");
         assert_ne!(
-            descriptor(source, metadata::tag.id(), authority, reach::private()),
-            descriptor(other, metadata::tag.id(), authority, reach::private()),
+            descriptor(source, metadata::tag.id(), policy()),
+            descriptor(other, metadata::tag.id(), policy()),
             "the same derivation over different sources is a different collection"
         );
         // ... and the derivation genuinely reads the attribute it is told to.
@@ -788,32 +753,32 @@ mod tests {
     }
 
     #[test]
-    fn source_and_derived_descriptors_carry_independent_mandatory_authorities() {
+    fn source_and_derived_descriptors_carry_independent_policies() {
         use crate::collection::descriptor as descriptor_facts;
 
-        let source_authority = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
-        let target_authority = ed25519_dalek::SigningKey::from_bytes(&[10; 32]).verifying_key();
+        let source_root = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let target_root = ed25519_dalek::SigningKey::from_bytes(&[10; 32]).verifying_key();
         let name = "observed-source".to_owned();
+        let source_policy = direct_policy(source_root);
+        let target_policy = direct_policy(target_root);
         let collection = ObservedSetCollection::new(
             name.clone(),
-            source_authority,
+            source_policy.clone(),
             metadata::supersedes.id(),
-            reach::private(),
-            target_authority,
-            reach::private(),
+            target_policy.clone(),
         );
 
         assert_eq!(
             collection.source_descriptor(),
-            simplearchive_union::descriptor(&name, source_authority, reach::private())
+            simplearchive_union::descriptor(&name, source_policy.clone())
         );
         assert_eq!(
-            descriptor_facts::authority(collection.source_descriptor().facts()),
-            Ok(source_authority)
+            descriptor_facts::policy(collection.source_descriptor().facts()),
+            Ok(source_policy)
         );
         assert_eq!(
-            descriptor_facts::authority(collection.descriptor().facts()),
-            Ok(target_authority)
+            descriptor_facts::policy(collection.descriptor().facts()),
+            Ok(target_policy)
         );
     }
 

@@ -1,5 +1,4 @@
 use super::*;
-use crate::collection::reach;
 
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -17,6 +16,7 @@ use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
 use crate::collection::simplearchive_union;
+use crate::collection::{AdmissionPolicy, CollectionPolicy};
 use crate::collection::{CollectionCommit, CollectionRead, CollectionStoreExt};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -62,6 +62,13 @@ inert_test_offers!(
 /// The one team every collection in these tests belongs to.
 fn test_team() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[1; 32]).verifying_key()
+}
+
+fn test_policy() -> CollectionPolicy {
+    CollectionPolicy::new(
+        AdmissionPolicy::direct(test_team()),
+        AdmissionPolicy::direct(test_team()),
+    )
 }
 
 /// Test-only SimpleArchive-compatible source encoding. It is deliberately
@@ -128,13 +135,7 @@ impl CollectionEncoding for TestSourceBlob {
 }
 
 fn source_descriptor(name: &str) -> Fragment {
-    crate::macros::entity! {
-        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
-        crate::collection::collection_name: name.to_owned(),
-        crate::collection::collection_authority: test_team(),
-        crate::collection::collection_representation*: <TestSourceBlob as MetaDescribe>::describe(),
-        crate::collection::collection_reach*: reach::private(),
-    }
+    descriptor::naming::<TestSourceBlob>(name, test_policy())
 }
 
 fn source_root() -> Fragment {
@@ -248,19 +249,19 @@ fn attached_text_mapping_fragment() -> Fragment {
 }
 
 fn attached_text_target(source: CollectionHandle) -> Fragment {
-    crate::macros::entity! { _ @
-        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
-        crate::collection::collection_source: source,
-        crate::collection::collection_authority: test_team(),
-        crate::collection::collection_representation*: <AttachedTextBlob as MetaDescribe>::describe(),
-        crate::collection::collection_mapping*: attached_text_mapping_fragment(),
-        crate::collection::collection_reach*: reach::private(),
-    }
+    descriptor::deriving(source, &AttachedTextMapping, test_policy())
 }
 
 struct AttachedTextMapping;
 
-impl CollectionMapping<SimpleArchive, AttachedTextBlob> for AttachedTextMapping {
+impl CollectionMapping for AttachedTextMapping {
+    type Source = SimpleArchive;
+    type Target = AttachedTextBlob;
+
+    fn fragment(&self) -> Fragment {
+        attached_text_mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         require_mapping(target, ATTACHED_TEXT_MAPPING_V1, "attached text")?;
         Ok(Self)
@@ -490,25 +491,11 @@ fn second_test_suffix_mapping_fragment() -> Fragment {
 }
 
 fn target_root(source: CollectionHandle) -> Fragment {
-    crate::macros::entity! { _ @
-        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
-        crate::collection::collection_source: source,
-        crate::collection::collection_authority: test_team(),
-        crate::collection::collection_representation*: <TestTargetBlob as MetaDescribe>::describe(),
-        crate::collection::collection_mapping*: test_suffix_mapping_fragment(),
-        crate::collection::collection_reach*: reach::private(),
-    }
+    descriptor::deriving(source, &TestSuffixMapping, test_policy())
 }
 
 fn second_target_root(source: CollectionHandle) -> Fragment {
-    crate::macros::entity! { _ @
-        crate::metadata::tag: crate::collection::KIND_COLLECTION_DESCRIPTOR,
-        crate::collection::collection_source: source,
-        crate::collection::collection_authority: test_team(),
-        crate::collection::collection_representation*: <SecondTestTargetBlob as MetaDescribe>::describe(),
-        crate::collection::collection_mapping*: second_test_suffix_mapping_fragment(),
-        crate::collection::collection_reach*: reach::private(),
-    }
+    descriptor::deriving(source, &SecondTestSuffixMapping, test_policy())
 }
 
 fn substitute_mapping_entity(target: Fragment, replacement: Id) -> Fragment {
@@ -536,7 +523,7 @@ fn substitute_mapping_entity(target: Fragment, replacement: Id) -> Fragment {
     Fragment::rooted_from_parts(descriptor_root, substituted, metafacts, blobs)
 }
 
-fn kernel() -> ExactDerivedCollection<TestSourceBlob, TestTargetBlob, TestSuffixMapping> {
+fn kernel() -> ExactDerivedCollection<TestSuffixMapping> {
     let source = source_root();
     let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
     ExactDerivedCollection::new(source, target_root(source_collection.handle())).unwrap()
@@ -559,11 +546,8 @@ fn mapping_entity_id_substitution_preserves_binding_semantics() {
         descriptor::mapping_algorithm(substituted.facts()),
         Ok(Some(TEST_SUFFIX_MAPPING_V1))
     );
-    ExactDerivedCollection::<TestSourceBlob, TestTargetBlob, TestSuffixMapping>::new(
-        source,
-        substituted,
-    )
-    .expect("binding depends on mapping facts, not intrinsic-id minting history");
+    ExactDerivedCollection::<TestSuffixMapping>::new(source, substituted)
+        .expect("binding depends on mapping facts, not intrinsic-id minting history");
 }
 
 #[test]
@@ -571,18 +555,19 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
     let authority = SigningKey::from_bytes(&[1; 32]);
     let source_descriptor = simplearchive_union::descriptor(
         "reader-aware-source",
-        authority.verifying_key(),
-        reach::private(),
+        CollectionPolicy::new(
+            AdmissionPolicy::direct(authority.verifying_key()),
+            AdmissionPolicy::direct(authority.verifying_key()),
+        ),
     );
     let source_collection =
         Collection::<SimpleArchive>::from_descriptor(&source_descriptor).unwrap();
     let target_descriptor = attached_text_target(source_collection.handle());
-    let exact =
-        ExactDerivedCollection::<SimpleArchive, AttachedTextBlob, AttachedTextMapping>::new(
-            source_descriptor.clone(),
-            target_descriptor,
-        )
-        .unwrap();
+    let exact = ExactDerivedCollection::<AttachedTextMapping>::new(
+        source_descriptor.clone(),
+        target_descriptor,
+    )
+    .unwrap();
     let expected = "the attachment is part of the source closure";
     let source = crate::macros::entity! {
         crate::metadata::description: expected.to_owned(),
@@ -590,7 +575,7 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
 
     let mut store = MemoryRepo::default();
     let registered = store
-        .collection::<SimpleArchive>(source_descriptor)
+        .register_collection::<SimpleArchive>(source_descriptor)
         .unwrap();
     assert_eq!(registered, source_collection);
     let commit = store.commit(registered, &authority, source).unwrap();
@@ -612,17 +597,14 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
     assert_eq!(reattached_blob.bytes.as_ref(), expected.as_bytes());
 }
 
-fn selective_kernel(
-    mapping: SelectiveMapping,
-) -> ExactDerivedCollection<TestSourceBlob, TestTargetBlob, SelectiveMapping> {
+fn selective_kernel(mapping: SelectiveMapping) -> ExactDerivedCollection<SelectiveMapping> {
     let source = source_root();
     let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
     ExactDerivedCollection::with_mapping(source, target_root(source_collection.handle()), mapping)
         .unwrap()
 }
 
-fn second_kernel(
-) -> ExactDerivedCollection<TestTargetBlob, SecondTestTargetBlob, SecondTestSuffixMapping> {
+fn second_kernel() -> ExactDerivedCollection<SecondTestSuffixMapping> {
     let source = kernel().target_descriptor().clone();
     let source_collection = Collection::<TestTargetBlob>::from_descriptor(&source).unwrap();
     ExactDerivedCollection::new(source, second_target_root(source_collection.handle())).unwrap()
@@ -640,9 +622,7 @@ impl Drop for SelectivePolicyGuard {
 
 fn with_selective<R>(
     mapping: &SelectiveMapping,
-    operation: impl FnOnce(
-        &ExactDerivedCollection<TestSourceBlob, TestTargetBlob, SelectiveMapping>,
-    ) -> R,
+    operation: impl FnOnce(&ExactDerivedCollection<SelectiveMapping>) -> R,
 ) -> R {
     let previous = SELECTIVE_POLICY.with(|policy| policy.replace(Some(mapping.clone())));
     let _guard = SelectivePolicyGuard(previous);
@@ -675,7 +655,14 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TestSuffixMapping;
 
-impl CollectionMapping<TestSourceBlob, TestTargetBlob> for TestSuffixMapping {
+impl CollectionMapping for TestSuffixMapping {
+    type Source = TestSourceBlob;
+    type Target = TestTargetBlob;
+
+    fn fragment(&self) -> Fragment {
+        test_suffix_mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         require_mapping(target, TEST_SUFFIX_MAPPING_V1, "test suffix")?;
         Ok(Self)
@@ -696,7 +683,14 @@ impl CollectionMapping<TestSourceBlob, TestTargetBlob> for TestSuffixMapping {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SecondTestSuffixMapping;
 
-impl CollectionMapping<TestTargetBlob, SecondTestTargetBlob> for SecondTestSuffixMapping {
+impl CollectionMapping for SecondTestSuffixMapping {
+    type Source = TestTargetBlob;
+    type Target = SecondTestTargetBlob;
+
+    fn fragment(&self) -> Fragment {
+        second_test_suffix_mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         require_mapping(target, SECOND_TEST_SUFFIX_MAPPING_V1, "second test suffix")?;
         Ok(Self)
@@ -718,7 +712,14 @@ impl CollectionMapping<TestTargetBlob, SecondTestTargetBlob> for SecondTestSuffi
 
 struct IdentityMapping;
 
-impl CollectionMapping<TestSourceBlob, TestSourceBlob> for IdentityMapping {
+impl CollectionMapping for IdentityMapping {
+    type Source = TestSourceBlob;
+    type Target = TestSourceBlob;
+
+    fn fragment(&self) -> Fragment {
+        Fragment::empty()
+    }
+
     fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionOperationError> {
         Ok(Self)
     }
@@ -735,7 +736,14 @@ impl CollectionMapping<TestSourceBlob, TestSourceBlob> for IdentityMapping {
     }
 }
 
-impl CollectionMapping<TestSourceBlob, TestTargetBlob> for SelectiveMapping {
+impl CollectionMapping for SelectiveMapping {
+    type Source = TestSourceBlob;
+    type Target = TestTargetBlob;
+
+    fn fragment(&self) -> Fragment {
+        test_suffix_mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         require_mapping(target, TEST_SUFFIX_MAPPING_V1, "test suffix")?;
         Ok(Self::default())
@@ -2651,13 +2659,8 @@ fn ungrounded_source_superset_cannot_escape_the_cover() {
 
 #[test]
 fn typed_lifecycle_rejects_a_lying_source_descriptor() {
-    let lying_source = descriptor::naming(
-        "source",
-        test_team(),
-        <TestTargetBlob as MetaDescribe>::id(),
-        reach::private(),
-    );
-    let result = ExactDerivedCollection::<TestSourceBlob, TestTargetBlob, TestSuffixMapping>::new(
+    let lying_source = descriptor::naming::<TestTargetBlob>("source", test_policy());
+    let result = ExactDerivedCollection::<TestSuffixMapping>::new(
         lying_source,
         kernel().target_descriptor().clone(),
     );
@@ -2670,10 +2673,7 @@ fn typed_lifecycle_rejects_a_lying_source_descriptor() {
 #[test]
 fn identity_descriptor_pair_is_rejected() {
     let descriptor = source_root();
-    let result = ExactDerivedCollection::<TestSourceBlob, TestSourceBlob, IdentityMapping>::new(
-        descriptor.clone(),
-        descriptor,
-    );
+    let result = ExactDerivedCollection::<IdentityMapping>::new(descriptor.clone(), descriptor);
     assert!(matches!(
         result,
         Err(ExactDerivedCollectionError::Resolution(reason))

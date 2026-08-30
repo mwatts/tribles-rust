@@ -1,43 +1,36 @@
 //! Store-centric publication and immutable reads for canonical collections.
 //!
 //! A collection is its descriptor handle. Registering a descriptor through
-//! [`CollectionStoreExt::collection`] stores and offers its complete
-//! attachment closure, while later operations take only that handle. The
-//! descriptor's mandatory authority is therefore part of the collection's
+//! [`CollectionStoreExt::register_collection`] stores its complete attachment
+//! closure, while later operations take only that handle. The
+//! descriptor's mandatory policy is therefore part of the collection's
 //! identity rather than a caller-supplied policy which could disagree with it.
 //!
 //! Local publication is deliberately unconditional: a store may record any
 //! structurally valid, strictly signed commit. Authority is enforced when a
-//! admitted cover or logical value is constructed. The descriptor authority's own commits
-//! are admitted directly; delegated writers are admitted when the store holds
-//! a valid proof for [`ACTION_WRITE`] on that exact descriptor handle.
+//! an admitted cover or logical value is constructed. The descriptor policy
+//! independently governs READ and WRITE admission.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, IntoBlob};
 use crate::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle,
-    CapabilityRequest, CapabilityResource,
+    capability_quorum_authorizes, CapabilityAction, CapabilityAtom, CapabilityMode,
+    CapabilityProof, CapabilityProofBundle, CapabilityRequest, CapabilityResource,
 };
 use crate::clock;
-use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
-use crate::repo::{
-    ArtifactHandle, ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut,
-    CapabilityProofRead, OfferCapture, OfferCaptureInsertError, SnapshotSource,
-};
-// Reach arrives here as a builder argument; only the tests name a
-// particular one.
+use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
@@ -50,8 +43,10 @@ use super::{
     CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
     CollectionFunctionalConflict, CollectionHandle, CollectionOperationError, CollectionRead,
     CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
-    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_WRITE,
+    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ,
+    ACTION_WRITE,
 };
+use super::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
 
 /// Failure to discover the resident capability evidence used for collection
 /// admission.
@@ -146,10 +141,10 @@ where
     }
 }
 
-/// Failure to decide whether one writer is currently admitted to a collection.
+/// Failure to decide whether one subject is currently admitted to a collection.
 ///
-/// Descriptor failures mean that the collection's authority could not be
-/// established. Evidence failures mean that the resident capability-proof
+/// Descriptor failures mean that the collection's admission policy could not
+/// be established. Evidence failures mean that the resident capability-proof
 /// observation itself was unavailable; invalid or irrelevant individual
 /// proofs merely fail to admit their subjects and are not errors.
 #[derive(Debug)]
@@ -186,36 +181,20 @@ where
     }
 }
 
-/// Failure to register and advertise a self-contained collection descriptor.
+/// Failure to register a self-contained collection descriptor.
 #[derive(Debug)]
-pub enum CollectionRegistrationError<PutError, OfferError> {
+pub enum CollectionRegistrationError<PutError> {
     /// The descriptor names another encoding or invalid encoding context.
     WrongType(CollectionTypeError),
     /// Descriptor facts did not have the mandatory generic shape.
     InvalidDescriptor(RecordDecodeError),
-    /// A mandatory descriptor attachment was absent or did not match the
-    /// handle carried by the descriptor facts.
-    InvalidAttachment {
-        /// Semantic role of the mandatory attachment.
-        role: &'static str,
-        /// Content identity named by the descriptor.
-        artifact: ArtifactHandle,
-    },
     /// One attachment or the canonical descriptor archive could not be stored.
     DependencyPut(PutError),
-    /// The complete stored closure could not be advertised.
-    Offer {
-        /// Backend offer failure.
-        source: OfferError,
-        /// Canonical retry-all batch. Some members may already be offered.
-        artifacts: Vec<ArtifactHandle>,
-    },
 }
 
-impl<PutError, OfferError> fmt::Display for CollectionRegistrationError<PutError, OfferError>
+impl<PutError> fmt::Display for CollectionRegistrationError<PutError>
 where
     PutError: fmt::Display,
-    OfferError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -223,38 +202,25 @@ where
             Self::InvalidDescriptor(source) => {
                 write!(formatter, "invalid collection descriptor: {source}")
             }
-            Self::InvalidAttachment { role, artifact } => write!(
-                formatter,
-                "collection descriptor's {role} attachment {} is missing or invalid",
-                hex::encode_upper(artifact.raw),
-            ),
             Self::DependencyPut(source) => {
                 write!(
                     formatter,
                     "failed to store collection descriptor closure: {source}"
                 )
             }
-            Self::Offer { source, artifacts } => write!(
-                formatter,
-                "failed to offer {} collection descriptor artifact(s): {source}",
-                artifacts.len(),
-            ),
         }
     }
 }
 
-impl<PutError, OfferError> Error for CollectionRegistrationError<PutError, OfferError>
+impl<PutError> Error for CollectionRegistrationError<PutError>
 where
     PutError: Error + 'static,
-    OfferError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::WrongType(source) => Some(source),
             Self::InvalidDescriptor(source) => Some(source),
-            Self::InvalidAttachment { .. } => None,
             Self::DependencyPut(source) => Some(source),
-            Self::Offer { source, .. } => Some(source),
         }
     }
 }
@@ -477,38 +443,20 @@ where
 
 /// Failure to publish one collection element into local storage.
 #[derive(Debug)]
-pub enum CollectionCommitError<SnapshotError, GetError, PutError, InsertError> {
-    /// A store snapshot needed by the mutable publication convenience could
-    /// not be frozen.
-    Snapshot(SnapshotError),
-    /// The named collection descriptor was unavailable or malformed.
-    Descriptor(CollectionDescriptorError<GetError>),
-    /// The encoded member is not a canonical element of the collection lattice.
-    InvalidMember(CollectionOperationError),
+pub enum CollectionCommitError<PutError, InsertError> {
     /// A described attachment, member, or metadata archive could not be stored.
     DependencyPut(PutError),
     /// The signed visibility record could not be inserted after its dependencies.
     RecordInsert(InsertError),
 }
 
-impl<SnapshotError, GetError, PutError, InsertError> fmt::Display
-    for CollectionCommitError<SnapshotError, GetError, PutError, InsertError>
+impl<PutError, InsertError> fmt::Display for CollectionCommitError<PutError, InsertError>
 where
-    SnapshotError: fmt::Display,
-    GetError: fmt::Display,
     PutError: fmt::Display,
     InsertError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Snapshot(source) => {
-                write!(
-                    formatter,
-                    "failed to freeze collection store snapshot: {source}"
-                )
-            }
-            Self::Descriptor(source) => source.fmt(formatter),
-            Self::InvalidMember(source) => write!(formatter, "invalid collection member: {source}"),
             Self::DependencyPut(source) => {
                 write!(formatter, "failed to store collection dependency: {source}")
             }
@@ -519,19 +467,13 @@ where
     }
 }
 
-impl<SnapshotError, GetError, PutError, InsertError> Error
-    for CollectionCommitError<SnapshotError, GetError, PutError, InsertError>
+impl<PutError, InsertError> Error for CollectionCommitError<PutError, InsertError>
 where
-    SnapshotError: Error + 'static,
-    GetError: Error + 'static,
     PutError: Error + 'static,
     InsertError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Snapshot(source) => Some(source),
-            Self::Descriptor(source) => Some(source),
-            Self::InvalidMember(source) => Some(source),
             Self::DependencyPut(source) => Some(source),
             Self::RecordInsert(source) => Some(source),
         }
@@ -725,69 +667,25 @@ where
     }
 }
 
-fn validate_generic_descriptor(facts: &TribleSet) -> Result<VerifyingKey, RecordDecodeError> {
+fn validate_generic_descriptor(facts: &TribleSet) -> Result<CollectionPolicy, RecordDecodeError> {
     descriptor::validate(facts)
 }
 
-fn register_collection<S>(
+fn store_descriptor_closure<S>(
     store: &mut S,
     descriptor: Fragment,
-) -> Result<(), CollectionRegistrationError<S::PutError, S::OfferError>>
+) -> Result<(), CollectionRegistrationError<S::PutError>>
 where
-    S: BlobStorePut + ArtifactOfferStore,
+    S: BlobStorePut,
 {
-    let name = descriptor::name(descriptor.facts())
-        .expect("typed collection descriptor was structurally validated");
-    let (_, facts, _, mut blobs) = descriptor.into_parts();
-    if let Some(name) = name {
-        let snapshot = blobs
-            .snapshot()
-            .expect("MemoryBlobStore::snapshot is infallible");
-        let valid = snapshot
-            .get::<Blob<UTF8String>, UTF8String>(name)
-            .ok()
-            .and_then(|blob| blob.try_from_blob::<anybytes::View<str>>().ok())
-            .is_some();
-        if !valid {
-            return Err(CollectionRegistrationError::InvalidAttachment {
-                role: "name",
-                artifact: name.transmute(),
-            });
-        }
-    }
-    let mut embedded: Vec<Blob<UnknownBlob>> = blobs
-        .snapshot()
-        .expect("MemoryBlobStore::snapshot is infallible")
-        .into_iter()
-        .map(|(_, blob)| blob)
-        .collect();
-    embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
-
-    // Registration is the only operation which still owns descriptor
-    // attachment bytes. Capture and advertise the complete closure now;
-    // later handle-only commits can re-offer the descriptor archive but cannot
-    // reconstruct its UTF-8 name or description blobs from bare facts.
-    let mut capture = OfferCapture::new(store);
-    for blob in embedded {
-        capture
-            .put::<UnknownBlob, _>(blob)
-            .map_err(CollectionRegistrationError::DependencyPut)?;
-    }
-    capture
-        .put::<SimpleArchive, _>(facts)
+    descriptor::put_closure(store, &descriptor)
         .map_err(CollectionRegistrationError::DependencyPut)?;
-    if let Err(source) = capture.offer_pending() {
-        return Err(CollectionRegistrationError::Offer {
-            source,
-            artifacts: capture.pending().collect(),
-        });
-    }
     Ok(())
 }
 
 struct LoadedCollectionDescriptor {
     fragment: Fragment,
-    authority: VerifyingKey,
+    policy: CollectionPolicy,
 }
 
 fn load_collection_descriptor<R>(
@@ -806,67 +704,123 @@ where
                 collection,
                 source: RecordDecodeError::from(source),
             })?;
-    let authority = validate_generic_descriptor(&facts)
+    let policy = validate_generic_descriptor(&facts)
         .map_err(|source| CollectionDescriptorError::Invalid { collection, source })?;
     Ok(LoadedCollectionDescriptor {
         fragment: Fragment::from(facts),
-        authority,
+        policy,
     })
 }
 
-fn admitted_subjects_at<R>(
+enum AdmissionEvidence {
+    Open,
+    Quorum {
+        roots: Vec<VerifyingKey>,
+        invoke_threshold: NonZeroUsize,
+        delegate_threshold: Option<NonZeroUsize>,
+        request: CapabilityRequest,
+        bundles: Vec<CapabilityProofBundle>,
+    },
+}
+
+impl AdmissionEvidence {
+    fn authorizes(&self, subject: VerifyingKey, instant: hifitime::Epoch) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Quorum {
+                roots,
+                invoke_threshold,
+                delegate_threshold,
+                request,
+                bundles,
+            } => capability_quorum_authorizes(
+                bundles,
+                roots.iter().copied(),
+                instant,
+                subject,
+                *request,
+                *invoke_threshold,
+                *delegate_threshold,
+            ),
+        }
+    }
+}
+
+fn admission_evidence_at<R>(
     reader: &R,
-    authority: VerifyingKey,
+    policy: &AdmissionPolicy,
+    action: crate::id::Id,
+    required: CapabilityMode,
     collection: CollectionHandle,
-    instant: hifitime::Epoch,
     proofs: impl IntoIterator<Item = CapabilityProof>,
-) -> BTreeSet<Inline<ED25519PublicKey>>
+) -> AdmissionEvidence
 where
     R: BlobStoreGet,
 {
+    let AdmissionPolicy::Quorum {
+        roots,
+        invoke_threshold,
+        delegate_threshold,
+    } = policy
+    else {
+        return AdmissionEvidence::Open;
+    };
     let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
+        CapabilityAction::new(action),
         CapabilityResource::from(collection),
     );
-    let request = CapabilityRequest::new(atom, CapabilityMode::Invoke);
-    let mut admitted = BTreeSet::from([Inline::new(authority.to_bytes())]);
-    for proof in proofs {
-        if proof.root_key() != authority {
-            continue;
-        }
-
-        let claims: Option<Vec<Blob<SimpleArchive>>> = proof
-            .claim_handles()
-            .map(|claim| reader.get::<Blob<SimpleArchive>, SimpleArchive>(claim).ok())
-            .collect();
-        let Some(claims) = claims else {
-            continue;
-        };
-        let leaf = proof.leaf_key();
-        let bundle = CapabilityProofBundle::new(proof, claims);
-        if bundle.verify(authority, instant, leaf, request).is_ok() {
-            admitted.insert(Inline::new(leaf.to_bytes()));
-        }
+    let request = CapabilityRequest::new(atom, required);
+    let bundles = proofs
+        .into_iter()
+        .filter_map(|proof| {
+            let claims = proof
+                .claim_handles()
+                .map(|claim| reader.get::<Blob<SimpleArchive>, SimpleArchive>(claim).ok())
+                .collect::<Option<Vec<_>>>()?;
+            Some(CapabilityProofBundle::new(proof, claims))
+        })
+        .collect();
+    AdmissionEvidence::Quorum {
+        roots: roots.clone(),
+        invoke_threshold: NonZeroUsize::new(*invoke_threshold as usize)
+            .expect("validated collection policy has a nonzero invoke threshold"),
+        delegate_threshold: delegate_threshold.map(|threshold| {
+            NonZeroUsize::new(threshold as usize)
+                .expect("validated collection policy has a nonzero delegate threshold")
+        }),
+        request,
+        bundles,
     }
-    admitted
 }
 
-fn discover_admitted_subjects_at<S>(
+fn discover_admission_evidence_at<S>(
     snapshot: &S,
-    authority: VerifyingKey,
+    policy: &AdmissionPolicy,
+    action: crate::id::Id,
+    required: CapabilityMode,
     collection: CollectionHandle,
-    instant: hifitime::Epoch,
-) -> Result<BTreeSet<Inline<ED25519PublicKey>>, CollectionEvidenceDiscoveryError<S::ProofsError>>
+) -> Result<AdmissionEvidence, CollectionEvidenceDiscoveryError<S::ProofsError>>
 where
     S: BlobStoreGet + CapabilityProofRead,
 {
+    let needs_proofs = matches!(policy, AdmissionPolicy::Quorum { .. });
+    if !needs_proofs {
+        return Ok(admission_evidence_at(
+            snapshot,
+            policy,
+            action,
+            required,
+            collection,
+            [],
+        ));
+    }
     let proofs = snapshot
         .proofs()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?;
-    Ok(admitted_subjects_at(
-        snapshot, authority, collection, instant, proofs,
+    Ok(admission_evidence_at(
+        snapshot, policy, action, required, collection, proofs,
     ))
 }
 
@@ -884,12 +838,22 @@ where
 {
     let loaded = load_collection_descriptor(snapshot, collection.handle())
         .map_err(CollectionCoverError::Descriptor)?;
-    let admitted =
-        discover_admitted_subjects_at(snapshot, loaded.authority, collection.handle(), instant)
-            .map_err(CollectionCoverError::Evidence)?;
+    let evidence = discover_admission_evidence_at(
+        snapshot,
+        loaded.policy.write(),
+        ACTION_WRITE,
+        CapabilityMode::Invoke,
+        collection.handle(),
+    )
+    .map_err(CollectionCoverError::Evidence)?;
+    let mut authorized = BTreeMap::<[u8; 32], bool>::new();
     let discovered =
         discover_collection_records_authorized(snapshot, collection.handle(), |subject| {
-            admitted.contains(subject)
+            *authorized.entry(subject.raw).or_insert_with(|| {
+                VerifyingKey::from_bytes(&subject.raw)
+                    .map(|subject| evidence.authorizes(subject, instant))
+                    .unwrap_or(false)
+            })
         })
         .map_err(CollectionCoverError::Discovery)?;
     let cover = Cover::from_data(
@@ -902,9 +866,9 @@ where
 impl<L: CollectionEncoding> Collection<L> {
     /// Decide whether `subject` is admitted as a writer at `instant`.
     ///
-    /// The descriptor authority is admitted directly. Other subjects require
-    /// a complete proof for exact [`ACTION_WRITE`] on this collection in the
-    /// same immutable store observation.
+    /// Open policy admits every subject. A quorum admits the subject only when
+    /// the exact-action proof forest carries support from enough distinct
+    /// configured roots.
     pub fn writer_is_admitted_at<S>(
         self,
         snapshot: &S,
@@ -916,13 +880,15 @@ impl<L: CollectionEncoding> Collection<L> {
     {
         let loaded = load_collection_descriptor(snapshot, self.handle())
             .map_err(CollectionAdmissionError::Descriptor)?;
-        if subject == loaded.authority {
-            return Ok(true);
-        }
-        let admitted =
-            discover_admitted_subjects_at(snapshot, loaded.authority, self.handle(), instant)
-                .map_err(CollectionAdmissionError::Evidence)?;
-        Ok(admitted.contains(&Inline::new(subject.to_bytes())))
+        let evidence = discover_admission_evidence_at(
+            snapshot,
+            loaded.policy.write(),
+            ACTION_WRITE,
+            CapabilityMode::Invoke,
+            self.handle(),
+        )
+        .map_err(CollectionAdmissionError::Evidence)?;
+        Ok(evidence.authorizes(subject, instant))
     }
 
     /// Decide whether `subject` is admitted at the current clock instant.
@@ -935,6 +901,45 @@ impl<L: CollectionEncoding> Collection<L> {
         S: BlobStoreGet + CapabilityProofRead,
     {
         self.writer_is_admitted_at(snapshot, subject, clock::epoch_now())
+    }
+
+    /// Decide whether `subject` is admitted as a reader at `instant`.
+    ///
+    /// This is the disclosure boundary corresponding to the descriptor's READ
+    /// ceiling. Local materialization remains caller-controlled because a
+    /// local store cannot infer which external principal will receive bytes.
+    pub fn reader_is_admitted_at<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+        instant: hifitime::Epoch,
+    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+    where
+        S: BlobStoreGet + CapabilityProofRead,
+    {
+        let loaded = load_collection_descriptor(snapshot, self.handle())
+            .map_err(CollectionAdmissionError::Descriptor)?;
+        let evidence = discover_admission_evidence_at(
+            snapshot,
+            loaded.policy.read(),
+            ACTION_READ,
+            CapabilityMode::Invoke,
+            self.handle(),
+        )
+        .map_err(CollectionAdmissionError::Evidence)?;
+        Ok(evidence.authorizes(subject, instant))
+    }
+
+    /// Decide whether `subject` is admitted as a reader now.
+    pub fn reader_is_admitted<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+    where
+        S: BlobStoreGet + CapabilityProofRead,
+    {
+        self.reader_is_admitted_at(snapshot, subject, clock::epoch_now())
     }
 
     /// Discover the exact payload cover admitted at `instant`.
@@ -972,7 +977,7 @@ impl<L: CollectionEncoding> Collection<L> {
 
     /// Discover an admitted cover and the exact COMMIT roots selected by the
     /// same authorization decision.
-    pub fn admitted_with_claims_at<S>(
+    pub fn admitted_with_commits_at<S>(
         self,
         snapshot: &S,
         instant: hifitime::Epoch,
@@ -988,7 +993,7 @@ impl<L: CollectionEncoding> Collection<L> {
     }
 
     /// Discover an admitted cover and its exact roots at the current instant.
-    pub fn admitted_with_claims<S>(
+    pub fn admitted_with_commits<S>(
         self,
         snapshot: &S,
     ) -> Result<
@@ -998,7 +1003,7 @@ impl<L: CollectionEncoding> Collection<L> {
     where
         S: BlobStoreGet + CapabilityProofRead + CollectionRead,
     {
-        self.admitted_with_claims_at(snapshot, clock::epoch_now())
+        self.admitted_with_commits_at(snapshot, clock::epoch_now())
     }
 
     /// Read one logical value admitted at `instant` through one immutable
@@ -1077,9 +1082,9 @@ impl<L: CollectionEncoding> Cover<L> {
         )
     }
 
-    /// Return every strictly verified provenance claim currently present for
+    /// Return every strictly verified provenance COMMIT currently present for
     /// these payload members in `snapshot`.
-    pub fn claims<S>(
+    pub fn commits<S>(
         &self,
         snapshot: &S,
     ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<S::RecordsError>>
@@ -1096,19 +1101,16 @@ impl<L: CollectionEncoding> Cover<L> {
 /// The trait carries no state and is blanket-implemented. Its purpose is only
 /// method syntax: collections remain plain descriptor handles and stores
 /// retain their native ownership, flushing, and closing APIs.
-pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore + Sized {
-    /// Register and advertise one self-contained descriptor, returning the
-    /// handle produced by the store for its canonical facts.
-    fn collection<L>(
+pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
+    /// Register a complete custom descriptor at the raw typed boundary.
+    ///
+    /// Normal root and derived construction should use [`collection`](Self::collection)
+    /// and [`derive`](Self::derive), which make canonical descriptors by
+    /// construction.
+    fn register_collection<L>(
         &mut self,
         descriptor: Fragment,
-    ) -> Result<
-        Collection<L>,
-        CollectionRegistrationError<
-            <Self as BlobStorePut>::PutError,
-            <Self as ArtifactOfferStore>::OfferError,
-        >,
-    >
+    ) -> Result<Collection<L>, CollectionRegistrationError<<Self as BlobStorePut>::PutError>>
     where
         L: CollectionEncoding,
     {
@@ -1119,17 +1121,49 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
                 }
                 source => CollectionRegistrationError::WrongType(source),
             })?;
-        register_collection(self, descriptor)?;
+        store_descriptor_closure(self, descriptor)?;
         Ok(collection)
+    }
+
+    /// Create and register one named root fact collection.
+    fn collection(
+        &mut self,
+        name: &str,
+        policy: CollectionPolicy,
+    ) -> Result<
+        Collection<SimpleArchive>,
+        CollectionRegistrationError<<Self as BlobStorePut>::PutError>,
+    > {
+        self.register_collection::<SimpleArchive>(descriptor::naming::<SimpleArchive>(name, policy))
+    }
+
+    /// Create and register one canonical derived collection.
+    ///
+    /// The mapping value owns its concrete parameters and description; its
+    /// associated target encoding owns the target representation.
+    fn derive<M>(
+        &mut self,
+        source: Collection<M::Source>,
+        mapping: M,
+        policy: CollectionPolicy,
+    ) -> Result<Collection<M::Target>, CollectionRegistrationError<<Self as BlobStorePut>::PutError>>
+    where
+        M: CollectionMapping,
+    {
+        self.register_collection::<M::Target>(descriptor::deriving(
+            source.handle(),
+            &mapping,
+            policy,
+        ))
     }
 
     /// Publish one signed fragment into an already registered collection.
     ///
-    /// This performs no capability check. Local storage is a grow-only claim
-    /// ledger; authority is applied by [`Collection::admitted`] when an
-    /// immutable store snapshot is read. The descriptor is fetched and
-    /// structurally decoded before dependencies are staged, and the signed
-    /// record is inserted last without an implicit durability flush.
+    /// This performs no capability or descriptor check. Local storage is a
+    /// grow-only claim ledger; authority and descriptor validity are applied
+    /// at untrusted read and synchronization boundaries. Fragment attachments,
+    /// data, and metadata are stored before the signed record is inserted,
+    /// without an implicit durability flush.
     fn commit(
         &mut self,
         collection: Collection<SimpleArchive>,
@@ -1138,23 +1172,10 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     ) -> Result<
         CollectionCommit,
         CollectionCommitError<
-            <Self as SnapshotSource>::SnapshotError,
-            <<Self as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
             <Self as BlobStorePut>::PutError,
-            OfferCaptureInsertError<
-                <Self as ArtifactOfferStore>::OfferError,
-                <Self as CollectionStore>::InsertError,
-            >,
+            <Self as CollectionStore>::InsertError,
         >,
-    >
-    where
-        <Self as SnapshotSource>::Snapshot: BlobStoreMeta,
-    {
-        let snapshot = self.snapshot().map_err(CollectionCommitError::Snapshot)?;
-        let loaded = load_collection_descriptor(&snapshot, collection.handle())
-            .map_err(CollectionCommitError::Descriptor)?;
-        drop(snapshot);
-
+    > {
         // A signed commit introduces authored graph facts. Other collection
         // encodings are reproducible representations introduced through
         // DERIVE and MERGE records, not alternative signed leaf formats.
@@ -1169,24 +1190,14 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
             .collect();
         attachments.sort_unstable_by_key(|blob| blob.get_handle().raw);
 
-        let mut store = OfferCapture::new(self);
         for blob in attachments {
-            store
-                .put::<UnknownBlob, _>(blob)
+            self.put::<UnknownBlob, _>(blob)
                 .map_err(CollectionCommitError::DependencyPut)?;
         }
-        // Fragment attachments are resident before the authored member is
-        // validated, so every handle named by its facts or metafacts already
-        // has a published target.
-        let snapshot = store.snapshot().map_err(CollectionCommitError::Snapshot)?;
-        SimpleArchive::validate_member(&loaded.fragment, &data_root, &snapshot)
-            .map_err(CollectionCommitError::InvalidMember)?;
-        drop(snapshot);
-
-        let data_handle = store
+        let data_handle = self
             .put::<SimpleArchive, _>(data_root)
             .map_err(CollectionCommitError::DependencyPut)?;
-        let metadata = store
+        let metadata = self
             .put::<SimpleArchive, _>(metadata)
             .map_err(CollectionCommitError::DependencyPut)?;
         let commit = CollectionCommit::sign(
@@ -1195,14 +1206,13 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
             Handle::<SimpleArchive>::to_hash(data_handle),
             metadata,
         );
-        store
-            .insert(super::CollectionRecord::Commit(commit))
+        self.insert(super::CollectionRecord::Commit(commit))
             .map_err(CollectionCommitError::RecordInsert)?;
         Ok(commit)
     }
 }
 
-impl<S> CollectionStoreExt for S where S: BlobStore + CollectionStore + ArtifactOfferStore {}
+impl<S> CollectionStoreExt for S where S: BlobStorePut + CollectionStore {}
 
 /// Resolve one already-discovered exact payload cover.
 ///

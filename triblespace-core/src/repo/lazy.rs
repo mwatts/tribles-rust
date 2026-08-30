@@ -934,12 +934,10 @@ mod tests {
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
-    use crate::collection::reach;
     use crate::collection::{CollectionHandle, CollectionMerge, CollectionRecordSelector};
     use crate::id::Id;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
-    use ed25519_dalek::SigningKey;
     use futures::executor::block_on;
     use futures::task::{waker, ArcWake};
     use std::sync::atomic::AtomicUsize;
@@ -958,8 +956,7 @@ mod tests {
     #[test]
     fn collection_records_forward_through_the_store_mutex() {
         let id = |byte| Id::new([byte; 16]).unwrap();
-        let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let facts = descriptor::naming("lazy", team, id(2), reach::private()).into_facts();
+        let facts = descriptor::named_for_tests("lazy", id(2)).into_facts();
         // Nothing stores this descriptor: the test needs an identity to file
         // records under, not a resolvable collection.
         let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add independent descriptor-local READ and WRITE admission policies. Each is
+  `Open` or a canonical multi-root quorum with invocation and optional
+  delegation thresholds; the proof-forest evaluator counts distinct roots and
+  adds exact `ACTION_READ` authorization beside `ACTION_WRITE`.
+
+- Add store-owned collection construction:
+  `collection(name, policy)`, `derive(source, mapping, policy)`, and the raw
+  `register_collection::<E>(descriptor)` boundary. `CollectionMapping` now
+  carries associated `Source` and `Target` encodings plus its concrete mapping
+  fragment, and `ExactDerivedCollection` needs only the mapping type.
+
 - Make every collection member an ordinary typed `Blob<E>`.
   `CollectionEncoding` validates that blob and may expose one directly
   materializable canonical join; encodings whose physical compaction belongs
@@ -43,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proof presence alone grants no authority.
 
 ### Changed
+
+- Make local `commit(collection, signer, fragment)` correct by construction:
+  it stores attachments, data, and metadata before inserting the native signed
+  COMMIT, without rereading a descriptor, revalidating the generated archive,
+  or implicitly advertising OFFER state. Admission remains a read/sync-boundary
+  decision.
 
 - Make Yard reclaim derive its final store-scope and opaque-record safety
   decisions from one refreshed Pile state, so an opaque record appended during

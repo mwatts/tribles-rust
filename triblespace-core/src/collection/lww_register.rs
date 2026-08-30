@@ -56,9 +56,6 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use anybytes::Bytes;
-use ed25519_dalek::VerifyingKey;
-
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
@@ -72,16 +69,13 @@ use crate::metadata::MetaDescribe;
 use crate::query::register::{register_identity, register_orders, RegisterOrder};
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
+use anybytes::Bytes;
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
-use super::records::{
-    collection_authority, collection_mapping, collection_reach, collection_representation,
-    collection_source, mapping_algorithm, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
-    KIND_COLLECTION_MAPPING,
-};
+use super::records::{mapping_algorithm, CollectionHandle, KIND_COLLECTION_MAPPING};
 use super::{
     simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
-    CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    CollectionPolicy, CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 
 const ID_LEN: usize = 16;
@@ -357,22 +351,19 @@ pub fn join(
 
 /// Construct the maintained LWW register descriptor for one source collection.
 ///
-/// The target's mandatory authority is explicit and independent of its source.
+/// The target's independent READ and WRITE policies are explicit rather than
+/// inherited from its source.
 pub fn descriptor(
     source: CollectionHandle,
     identity: Id,
     orders: Id,
-    authority: VerifyingKey,
-    reach: Fragment,
+    policy: CollectionPolicy,
 ) -> Fragment {
-    entity! { _ @
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_source: source,
-        collection_authority: authority,
-        collection_representation*: <LwwRegisterBlob as MetaDescribe>::describe(),
-        collection_mapping*: mapping_fragment(identity, orders),
-        collection_reach*: reach,
-    }
+    crate::collection::descriptor::deriving(
+        source,
+        &RegisterCoordinatesMapping::new(identity, orders),
+        policy,
+    )
 }
 
 /// Canonical stated-register coordinate projection algorithm, version 1.
@@ -461,7 +452,21 @@ pub struct RegisterCoordinatesMapping {
     orders: Id,
 }
 
-impl CollectionMapping<SimpleArchive, LwwRegisterBlob> for RegisterCoordinatesMapping {
+impl RegisterCoordinatesMapping {
+    /// Project these identity and ordering attributes into register coordinates.
+    pub const fn new(identity: Id, orders: Id) -> Self {
+        Self { identity, orders }
+    }
+}
+
+impl CollectionMapping for RegisterCoordinatesMapping {
+    type Source = SimpleArchive;
+    type Target = LwwRegisterBlob;
+
+    fn fragment(&self) -> Fragment {
+        mapping_fragment(self.identity, self.orders)
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         let (identity, orders) = register_attributes(target)?;
         let actual = crate::collection::descriptor::mapping_algorithm(target.facts())
@@ -614,36 +619,30 @@ impl TryFromCover<LwwRegisterBlob> for LwwIndex {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LwwRegisterCollection {
     name: String,
-    source_authority: VerifyingKey,
+    source_policy: CollectionPolicy,
     identity: Id,
     orders: Id,
-    source_reach: Fragment,
-    authority: VerifyingKey,
-    reach: Fragment,
+    policy: CollectionPolicy,
 }
 
 impl LwwRegisterCollection {
     /// Construct a maintained LWW register over one named root collection.
     ///
-    /// `source_authority` must match the root descriptor exactly, while
-    /// `authority` independently controls this derived collection.
+    /// Source and target policies are independent parts of their respective
+    /// descriptor identities.
     pub fn new(
         name: impl Into<String>,
-        source_authority: VerifyingKey,
+        source_policy: CollectionPolicy,
         identity: Id,
         orders: Id,
-        source_reach: Fragment,
-        authority: VerifyingKey,
-        reach: Fragment,
+        policy: CollectionPolicy,
     ) -> Self {
         Self {
             name: name.into(),
-            source_authority,
+            source_policy,
             identity,
             orders,
-            source_reach,
-            authority,
-            reach,
+            policy,
         }
     }
 
@@ -652,14 +651,14 @@ impl LwwRegisterCollection {
         self.name.as_str()
     }
 
-    /// Mandatory capability trust root declared by the source descriptor.
-    pub fn source_authority(&self) -> VerifyingKey {
-        self.source_authority
+    /// Source authorization policy.
+    pub fn source_policy(&self) -> &CollectionPolicy {
+        &self.source_policy
     }
 
-    /// Mandatory capability trust root declared by this derived collection.
-    pub fn authority(&self) -> VerifyingKey {
-        self.authority
+    /// Derived authorization policy.
+    pub fn policy(&self) -> &CollectionPolicy {
+        &self.policy
     }
 
     /// Attribute which states register identity.
@@ -672,23 +671,9 @@ impl LwwRegisterCollection {
         self.orders
     }
 
-    /// How far the source collection may travel.
-    pub fn source_reach(&self) -> &Fragment {
-        &self.source_reach
-    }
-
-    /// How far this derived collection may travel.
-    pub fn reach(&self) -> &Fragment {
-        &self.reach
-    }
-
     /// Canonical source `SimpleArchive` collection descriptor.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(
-            &self.name,
-            self.source_authority,
-            self.source_reach.clone(),
-        )
+        simplearchive_union::descriptor(&self.name, self.source_policy.clone())
     }
 
     /// Identity of the source collection.
@@ -703,8 +688,7 @@ impl LwwRegisterCollection {
             self.source_collection(),
             self.identity,
             self.orders,
-            self.authority,
-            self.reach.clone(),
+            self.policy.clone(),
         )
     }
 
@@ -754,10 +738,8 @@ impl LwwRegisterCollection {
 
     fn kernel(
         &self,
-    ) -> Result<
-        ExactDerivedCollection<SimpleArchive, LwwRegisterBlob, RegisterCoordinatesMapping>,
-        ExactDerivedCollectionError,
-    > {
+    ) -> Result<ExactDerivedCollection<RegisterCoordinatesMapping>, ExactDerivedCollectionError>
+    {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
     }
 }
@@ -802,7 +784,13 @@ impl From<ExactDerivedCollectionError> for LwwRegisterCollectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collection::reach;
+
+    fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
+        CollectionPolicy::new(
+            crate::collection::AdmissionPolicy::direct(root),
+            crate::collection::AdmissionPolicy::direct(root),
+        )
+    }
     use crate::inline::encodings::time::{i128_to_ordered_be, NsTAIInterval};
     use crate::inline::Inline;
     use crate::prelude::*;
@@ -1060,17 +1048,12 @@ mod tests {
         use crate::collection::descriptor as descriptor_facts;
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let policy = || direct_policy(key);
         let source = crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-            simplearchive_union::descriptor("source", key, reach::private()).into_facts(),
+            simplearchive_union::descriptor("source", policy()).into_facts(),
         )
         .get_handle();
-        let stated = descriptor(
-            source,
-            state_of.id(),
-            written_at.id(),
-            key,
-            reach::private(),
-        );
+        let stated = descriptor(source, state_of.id(), written_at.id(), policy());
         assert_eq!(
             descriptor_facts::mapping_argument(stated.facts(), register_identity.id()),
             Ok(Some(
@@ -1091,13 +1074,7 @@ mod tests {
         );
         assert_ne!(
             stated,
-            descriptor(
-                source,
-                metadata::tag.id(),
-                written_at.id(),
-                key,
-                reach::private(),
-            )
+            descriptor(source, metadata::tag.id(), written_at.id(), policy(),)
         );
         assert_eq!(
             descriptor_facts::mapping_algorithm(stated.facts()),
@@ -1106,33 +1083,33 @@ mod tests {
     }
 
     #[test]
-    fn source_and_derived_descriptors_carry_independent_mandatory_authorities() {
+    fn source_and_derived_descriptors_carry_independent_policies() {
         use crate::collection::descriptor as descriptor_facts;
 
-        let source_authority = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key();
-        let target_authority = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let source_root = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key();
+        let target_root = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
         let name = "lww-source".to_owned();
+        let source_policy = direct_policy(source_root);
+        let target_policy = direct_policy(target_root);
         let collection = LwwRegisterCollection::new(
             name.clone(),
-            source_authority,
+            source_policy.clone(),
             state_of.id(),
             written_at.id(),
-            reach::private(),
-            target_authority,
-            reach::private(),
+            target_policy.clone(),
         );
 
         assert_eq!(
             collection.source_descriptor(),
-            simplearchive_union::descriptor(&name, source_authority, reach::private())
+            simplearchive_union::descriptor(&name, source_policy.clone())
         );
         assert_eq!(
-            descriptor_facts::authority(collection.source_descriptor().facts()),
-            Ok(source_authority)
+            descriptor_facts::policy(collection.source_descriptor().facts()),
+            Ok(source_policy)
         );
         assert_eq!(
-            descriptor_facts::authority(collection.descriptor().facts()),
-            Ok(target_authority)
+            descriptor_facts::policy(collection.descriptor().facts()),
+            Ok(target_policy)
         );
     }
 
@@ -1142,12 +1119,10 @@ mod tests {
         let team = signing_key.verifying_key();
         let collection = LwwRegisterCollection::new(
             "maintained-lww".to_owned(),
-            team,
+            direct_policy(team),
             state_of.id(),
             written_at.id(),
-            reach::private(),
-            team,
-            reach::private(),
+            direct_policy(team),
         );
         let register = ufoid();
         let state = ufoid();

@@ -411,11 +411,11 @@ where
 pub fn discover_collection_records_authorized<S, F>(
     snapshot: &S,
     collection: CollectionHandle,
-    is_member: F,
+    mut is_member: F,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionRead,
-    F: Fn(&Inline<ED25519PublicKey>) -> bool,
+    F: FnMut(&Inline<ED25519PublicKey>) -> bool,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
@@ -473,7 +473,7 @@ where
 ///
 /// This is a deliberately low-level admission seam. Unlike
 /// [`crate::collection::Collection::admitted`], it does not discover or
-/// verify capability proofs and does not load the descriptor authority. A
+/// verify capability proofs and does not load the descriptor policy. A
 /// caller using this helper is responsible for supplying an authorization
 /// predicate appropriate to its own already-verified boundary.
 pub fn discover_collection_cover_authorized<S, L, F>(

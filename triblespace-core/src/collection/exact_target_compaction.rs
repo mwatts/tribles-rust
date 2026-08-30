@@ -119,44 +119,40 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// selected covers are compacted again when concurrent or older evidence
 /// exposes another collision. Repetition of any non-stable canonical cover
 /// returns [`ExactTargetCompactionError::Stalled`].
-pub fn compact_exact_target<S, Source, Target, H>(
-    exact: &ExactDerivedCollection<Source, Target, H>,
+pub fn compact_exact_target<S, H>(
+    exact: &ExactDerivedCollection<H>,
     store: &mut S,
-    source_cover: &Cover<Source>,
-) -> Result<Cover<Target>, ExactTargetCompactionError>
+    source_cover: &Cover<H::Source>,
+) -> Result<Cover<H::Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore + ArtifactOfferStore,
     S::Snapshot: BlobStoreMeta + CollectionRead,
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-    Handle<Source>: InlineEncoding,
-    Handle<Target>: InlineEncoding,
-    H: CollectionMapping<Source, Target>,
+    H: CollectionMapping,
+    Handle<H::Source>: InlineEncoding,
+    Handle<H::Target>: InlineEncoding,
 {
     let mut capture = OfferCapture::new(store);
     compact_exact_target_unoffered(exact, &mut capture, source_cover)
 }
 
-pub(crate) fn compact_exact_target_unoffered<S, Source, Target, H>(
-    exact: &ExactDerivedCollection<Source, Target, H>,
+pub(crate) fn compact_exact_target_unoffered<S, H>(
+    exact: &ExactDerivedCollection<H>,
     store: &mut S,
-    source_cover: &Cover<Source>,
-) -> Result<Cover<Target>, ExactTargetCompactionError>
+    source_cover: &Cover<H::Source>,
+) -> Result<Cover<H::Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore,
     S::Snapshot: BlobStoreMeta + CollectionRead,
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-    Handle<Source>: InlineEncoding,
-    Handle<Target>: InlineEncoding,
-    H: CollectionMapping<Source, Target>,
+    H: CollectionMapping,
+    Handle<H::Source>: InlineEncoding,
+    Handle<H::Target>: InlineEncoding,
 {
     let mut cover = exact.ensure_exact_unoffered(store, source_cover)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 
     loop {
-        match publish_round::<S, Target>(
+        match publish_round::<S, H::Target>(
             exact.target_descriptor().clone(),
             exact.target_collection().handle(),
             store,
@@ -305,7 +301,7 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobEncoding, IntoBlob};
-    use crate::collection::{reach, Collection, KIND_COLLECTION_DESCRIPTOR};
+    use crate::collection::{Collection, CollectionPolicy};
     use crate::id::{ExclusiveId, Id};
     use crate::id_hex;
     use crate::inline::Inline;
@@ -381,13 +377,17 @@ mod tests {
     }
 
     fn descriptor() -> Fragment {
-        crate::macros::entity! {
-            crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            crate::collection::collection_name: "exact-target-no-join-test",
-            crate::collection::collection_authority: SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            crate::collection::collection_representation*: <NoJoinEncoding as MetaDescribe>::describe(),
-            crate::collection::collection_reach*: reach::private(),
-        }
+        crate::collection::descriptor::naming::<NoJoinEncoding>(
+            "exact-target-no-join-test",
+            CollectionPolicy::new(
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                ),
+                crate::collection::AdmissionPolicy::direct(
+                    SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                ),
+            ),
+        )
     }
 
     #[test]

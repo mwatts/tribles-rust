@@ -1,42 +1,29 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
+use std::collections::BTreeMap;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
-use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
+use triblespace_core::blob::encodings::utf8string::UTF8String;
+use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofBundle, CapabilityResource, CapabilityValidity,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+    CapabilityRequest, CapabilityResource,
 };
-use triblespace_core::collection::records::{
-    collection_authority, collection_name, collection_representation, KIND_COLLECTION_DESCRIPTOR,
-};
-use triblespace_core::collection::simplearchive_union;
-use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
+use triblespace_core::collection::descriptor;
 use triblespace_core::collection::{
-    reach, Collection, CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
-    ACTION_WRITE,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionRecord, CollectionStore,
+    CollectionStoreExt, ACTION_READ, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
-use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::prelude::entity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{
-    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStoreGet, BlobStorePut,
-    CapabilityProofStore, SnapshotSource,
-};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreEvent {
     Put([u8; 32]),
-    Offer(Vec<[u8; 32]>),
     Insert(triblespace_core::id::Id),
 }
 
@@ -63,22 +50,13 @@ impl BlobStorePut for CountingRepo {
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
         S: BlobEncoding + 'static,
-        T: IntoBlob<S>,
+        T: triblespace_core::blob::IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
         let handle = self.inner.put(item)?;
         *self.puts.entry(handle.raw).or_default() += 1;
         self.events.push(StoreEvent::Put(handle.raw));
         Ok(handle)
-    }
-}
-
-impl SnapshotSource for CountingRepo {
-    type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
-    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
-
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.inner.snapshot()
     }
 }
 
@@ -91,66 +69,34 @@ impl CollectionStore for CountingRepo {
     }
 }
 
-impl CapabilityProofStore for CountingRepo {
-    type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
-
-    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
-        self.inner.insert_proof(proof)
-    }
+fn key(byte: u8) -> SigningKey {
+    SigningKey::from_bytes(&[byte; 32])
 }
 
-impl ArtifactOfferStore for CountingRepo {
-    type OfferError = <MemoryRepo as ArtifactOfferStore>::OfferError;
-
-    fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
-    where
-        I: IntoIterator<Item = ArtifactHandle>,
-    {
-        let handles = handles.into_iter().collect::<Vec<_>>();
-        self.events.push(StoreEvent::Offer(
-            handles.iter().map(|handle| handle.raw).collect(),
-        ));
-        self.inner.offer_all(handles)
-    }
-
-    fn offers_snapshot(&mut self) -> Result<ArtifactOfferSnapshot, Self::OfferError> {
-        self.inner.offers_snapshot()
-    }
+fn policy(root: VerifyingKey) -> CollectionPolicy {
+    CollectionPolicy::new(
+        AdmissionPolicy::delegable(root),
+        AdmissionPolicy::direct(root),
+    )
 }
 
 fn fragment(entity: u8) -> Fragment {
     let mut row = [entity; TRIBLE_LEN];
-    row[16..32].fill(1);
+    row[16..32].fill(entity.wrapping_add(1));
+    row[32..].fill(entity.wrapping_add(2));
     let mut facts = TribleSet::new();
     facts.insert(&Trible::force_raw(row).unwrap());
     Fragment::from(facts)
 }
 
-fn store_write_proof<S>(
-    store: &mut S,
-    authority: &SigningKey,
-    writer: VerifyingKey,
-    collection: Collection<SimpleArchive>,
-) where
-    S: BlobStorePut + CapabilityProofStore,
-{
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
+fn atom(action: triblespace_core::id::Id, collection: Collection<SimpleArchive>) -> CapabilityAtom {
+    CapabilityAtom::new(
+        CapabilityAction::new(action),
         CapabilityResource::from(collection.handle()),
-    );
-    let bundle = CapabilityProofBundle::issue_root(
-        authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-        writer,
     )
-    .unwrap();
-    store_proof_bundle(store, bundle);
 }
 
-fn store_proof_bundle<S>(store: &mut S, bundle: CapabilityProofBundle)
-where
-    S: BlobStorePut + CapabilityProofStore,
-{
+fn store_bundle(store: &mut MemoryRepo, bundle: CapabilityProofBundle) {
     let (proof, claims) = bundle.into_parts();
     for claim in claims {
         store.put::<SimpleArchive, _>(claim).unwrap();
@@ -159,619 +105,170 @@ where
 }
 
 #[test]
-fn registration_offers_the_complete_descriptor_closure_once() {
-    let authority = SigningKey::from_bytes(&[1; 32]);
+fn root_creation_registers_a_self_contained_descriptor() {
+    let root = key(1);
+    let expected_policy = policy(root.verifying_key());
+    let mut store = MemoryRepo::default();
+
+    let collection = store
+        .collection("collection-store-api", expected_policy.clone())
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let descriptor_blob = snapshot
+        .get::<TribleSet, SimpleArchive>(collection.handle())
+        .unwrap();
+
+    assert_eq!(descriptor::policy(&descriptor_blob), Ok(expected_policy));
+    let name = descriptor::name(&descriptor_blob).unwrap().unwrap();
+    let name: anybytes::View<str> = snapshot.get::<_, UTF8String>(name).unwrap();
+    assert_eq!(&*name, "collection-store-api");
+}
+
+#[test]
+fn commit_is_local_and_correct_by_construction() {
+    let root = key(2);
     let descriptor =
-        simplearchive_union::descriptor("closure", authority.verifying_key(), reach::private());
-    let mut attachments = descriptor.blobs().clone();
-    let attachment_handles: Vec<_> = attachments
-        .snapshot()
-        .unwrap()
-        .into_iter()
-        .map(|(handle, _)| handle)
-        .collect();
-    assert!(!attachment_handles.is_empty());
-
+        descriptor::naming::<SimpleArchive>("not-registered", policy(root.verifying_key()));
+    let collection = Collection::<SimpleArchive>::from_descriptor(&descriptor).unwrap();
     let mut store = CountingRepo::default();
-    let collection = store.collection::<SimpleArchive>(descriptor).unwrap();
-    let offers = store.offers_snapshot().unwrap();
 
-    assert!(offers.contains(collection.handle().transmute()));
-    for attachment in attachment_handles {
-        assert!(offers.contains(attachment));
-    }
-    assert_eq!(store.puts_for(collection.handle()), 1);
+    let expected_data = fragment(7).facts().clone().to_blob().get_handle();
+    let commit = store.commit(collection, &root, fragment(7)).unwrap();
+
+    assert_eq!(
+        Handle::<SimpleArchive>::from_hash(commit.data()),
+        expected_data
+    );
+    assert_eq!(store.puts_for(collection.handle()), 0);
+    assert_eq!(store.events.last(), Some(&StoreEvent::Insert(commit.id())));
 }
 
 #[test]
-fn direct_stage_retains_descriptor_attachments_and_publishes_commit_last() {
-    use triblespace_core::blob::encodings::utf8string::UTF8String;
-    use triblespace_core::collection::descriptor;
-
-    let signer = SigningKey::from_bytes(&[11; 32]);
-    let collection_descriptor = simplearchive_union::descriptor(
-        "direct-stage-name",
-        signer.verifying_key(),
-        reach::private(),
-    );
-    let name = descriptor::name(collection_descriptor.facts())
-        .unwrap()
-        .expect("root descriptor name");
-    let collection: Inline<Handle<SimpleArchive>> =
-        collection_descriptor.facts().clone().to_blob().get_handle();
-    let empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
-    let prepared = simplearchive_union::prepare_commit(&collection_descriptor, &empty, &empty)
-        .expect("prepare direct commit");
-    let mut store = CountingRepo::default();
-
-    let mut staged = prepared.stage(&mut store, &signer).unwrap();
-    let commit = *staged.commit();
-    let staged_snapshot = staged.store_mut().snapshot().unwrap();
-    assert!(staged_snapshot
-        .records()
-        .unwrap()
-        .collect::<Result<Vec<_>, Infallible>>()
-        .unwrap()
-        .is_empty());
-    staged.finalize().unwrap();
-
-    let name_put = store
-        .events
-        .iter()
-        .position(|event| matches!(event, StoreEvent::Put(raw) if *raw == name.raw))
-        .expect("name attachment put");
-    let descriptor_put = store
-        .events
-        .iter()
-        .position(|event| matches!(event, StoreEvent::Put(raw) if *raw == collection.raw))
-        .expect("descriptor put");
-    let insert = store
-        .events
-        .iter()
-        .position(|event| matches!(event, StoreEvent::Insert(id) if *id == commit.id()))
-        .expect("commit insert");
-    assert!(name_put < descriptor_put && descriptor_put < insert);
-
-    let snapshot = store.snapshot().unwrap();
-    let stored_name: Blob<UTF8String> = snapshot.get(name).unwrap();
-    assert_eq!(
-        std::str::from_utf8(&stored_name.bytes).unwrap(),
-        "direct-stage-name"
-    );
-    let offers = store.offers_snapshot().unwrap();
-    assert!(offers.contains(name.transmute()));
-    assert!(offers.contains(collection.transmute()));
-}
-
-#[test]
-fn commit_does_not_rewrite_the_registered_descriptor() {
-    let authority = SigningKey::from_bytes(&[2; 32]);
-    let mut store = CountingRepo::default();
-    let collection = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "no-reput",
-            authority.verifying_key(),
-            reach::private(),
-        ))
-        .unwrap();
-    let descriptor_puts = store.puts_for(collection.handle());
-
-    store.commit(collection, &authority, fragment(1)).unwrap();
-
-    assert_eq!(store.puts_for(collection.handle()), descriptor_puts);
-}
-
-#[test]
-fn commit_offers_every_dependency_before_one_idempotent_record() {
-    let authority = SigningKey::from_bytes(&[9; 32]);
-    let mut store = CountingRepo::default();
-    let collection = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "publication-order",
-            authority.verifying_key(),
-            reach::private(),
-        ))
-        .unwrap();
-    store.events.clear();
-
-    let mut committed = fragment(1);
-    *committed.metafacts_mut() += fragment(2).into_facts();
-    let attachment = committed
-        .put::<triblespace_core::blob::encodings::utf8string::UTF8String, _>("attached".to_owned());
-    let data: Inline<Handle<SimpleArchive>> = committed.facts().clone().to_blob().get_handle();
-    let metadata: Inline<Handle<SimpleArchive>> =
-        committed.metafacts().clone().to_blob().get_handle();
-
-    let first = store
-        .commit(collection, &authority, committed.clone())
-        .unwrap();
-    let insert = store
-        .events
-        .iter()
-        .position(|event| matches!(event, StoreEvent::Insert(id) if *id == first.id()))
-        .unwrap();
-    let offered = store.events[..insert]
-        .iter()
-        .find_map(|event| match event {
-            StoreEvent::Offer(handles) => Some(handles),
-            _ => None,
-        })
-        .unwrap();
-    let expected_offers: [ArtifactHandle; 3] = [
-        attachment.transmute(),
-        data.transmute(),
-        metadata.transmute(),
-    ];
-    for handle in expected_offers {
-        assert!(offered.contains(&handle.raw));
-    }
-    assert!(!store.events[..insert]
-        .iter()
-        .any(|event| matches!(event, StoreEvent::Put(raw) if *raw == collection.handle().raw)));
-
-    let repeated = store.commit(collection, &authority, committed).unwrap();
-    assert_eq!(repeated, first);
-    assert_eq!(
-        store
-            .snapshot()
-            .unwrap()
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, Infallible>>()
-            .unwrap()
-            .len(),
-        1,
-    );
-}
-
-#[test]
-fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
-    let authority = SigningKey::from_bytes(&[3; 32]);
-    let delegate = SigningKey::from_bytes(&[4; 32]);
-    let mut store = CountingRepo::default();
-    let collection = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "authority",
-            authority.verifying_key(),
-            reach::private(),
-        ))
-        .unwrap();
-
-    let delegated = store.commit(collection, &delegate, fragment(2)).unwrap();
-    let snapshot = store.snapshot().unwrap();
-    assert!(collection.admitted(&snapshot).unwrap().is_empty());
-
-    let root = store.commit(collection, &authority, fragment(1)).unwrap();
-    let snapshot = store.snapshot().unwrap();
-    let authority_cover = collection.admitted(&snapshot).unwrap();
-    assert_eq!(authority_cover.collection(), collection);
-    assert_eq!(
-        authority_cover.members().collect::<Vec<_>>(),
-        vec![Handle::<SimpleArchive>::from_hash(root.data())]
-    );
-
-    store_write_proof(&mut store, &authority, delegate.verifying_key(), collection);
-    let snapshot = store.snapshot().unwrap();
-    let cover_before_duplicate = collection.admitted(&snapshot).unwrap();
-    assert_eq!(cover_before_duplicate.len(), 2);
-
-    // A second authorized signer may attest the same payload with a distinct
-    // signed record. Provenance grows, but the payload lattice point does not.
-    let duplicate = store.commit(collection, &delegate, fragment(1)).unwrap();
-    assert_ne!(duplicate.id(), root.id());
-    assert_eq!(duplicate.data(), root.data());
-
-    // A valid signature by a writer with no resident delegation remains
-    // queryable provenance, but is not one of this observation's admission
-    // roots even though it names an already-admitted payload.
-    let foreign = SigningKey::from_bytes(&[22; 32]);
-    let foreign_duplicate = store.commit(collection, &foreign, fragment(1)).unwrap();
-    assert_eq!(foreign_duplicate.data(), root.data());
-
-    let snapshot = store.snapshot().unwrap();
-    let cover = collection.admitted(&snapshot).unwrap();
-    assert_eq!(cover, cover_before_duplicate);
-    assert_eq!(cover.collection(), collection);
-    assert_eq!(cover.len(), 2);
-    assert_eq!(
-        cover.members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            Handle::<SimpleArchive>::from_hash(root.data()),
-            Handle::<SimpleArchive>::from_hash(delegated.data()),
-        ]),
-    );
-    assert_eq!(
-        cover
-            .claims(&snapshot)
-            .unwrap()
-            .into_iter()
-            .map(|claim| claim.id())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            root.id(),
-            delegated.id(),
-            duplicate.id(),
-            foreign_duplicate.id(),
-        ]),
-    );
-
-    let (admitted_cover, admitted_commits) = collection.admitted_with_claims(&snapshot).unwrap();
-    assert_eq!(
-        admitted_commits
-            .iter()
-            .map(|commit| commit.id())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([root.id(), delegated.id(), duplicate.id()]),
-    );
-    let mut expected = fragment(1).into_facts();
-    expected += fragment(2).into_facts();
-    assert_eq!(admitted_cover, cover);
-    let materialized: TribleSet = collection.read(&snapshot).unwrap();
-    assert_eq!(materialized, expected);
-}
-
-#[test]
-fn writer_admission_uses_authority_and_exact_resident_proofs_without_commits() {
-    let authority = SigningKey::from_bytes(&[23; 32]);
-    let delegate = SigningKey::from_bytes(&[24; 32]);
-    let foreign = SigningKey::from_bytes(&[25; 32]);
-    let expired = SigningKey::from_bytes(&[26; 32]);
+fn read_and_write_policies_are_independent() {
+    let root = key(3);
+    let stranger = key(4);
     let mut store = MemoryRepo::default();
     let collection = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "writer-admission",
-            authority.verifying_key(),
-            reach::private(),
-        ))
-        .unwrap();
-
-    let snapshot = store.snapshot().unwrap();
-    assert!(collection
-        .writer_is_admitted(&snapshot, authority.verifying_key())
-        .unwrap());
-    assert!(!collection
-        .writer_is_admitted(&snapshot, delegate.verifying_key())
-        .unwrap());
-    assert!(!collection
-        .writer_is_admitted(&snapshot, foreign.verifying_key())
-        .unwrap());
-
-    store_write_proof(&mut store, &authority, delegate.verifying_key(), collection);
-    let snapshot = store.snapshot().unwrap();
-    assert!(collection
-        .writer_is_admitted(&snapshot, delegate.verifying_key())
-        .unwrap());
-
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(collection.handle()),
-    );
-    let validity = CapabilityValidity::new(
-        hifitime::Epoch::from_tai_seconds(0.0),
-        hifitime::Epoch::from_tai_seconds(1.0),
-    )
-    .unwrap();
-    let bundle = CapabilityProofBundle::issue_root(
-        &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, Some(validity)),
-        expired.verifying_key(),
-    )
-    .unwrap();
-    store_proof_bundle(&mut store, bundle);
-
-    let snapshot = store.snapshot().unwrap();
-    assert!(!collection
-        .writer_is_admitted(&snapshot, expired.verifying_key())
-        .unwrap());
-    assert!(!collection
-        .writer_is_admitted(&snapshot, foreign.verifying_key())
-        .unwrap());
-    assert_eq!(
-        snapshot
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, Infallible>>()
-            .unwrap(),
-        Vec::<CollectionRecord>::new(),
-    );
-}
-
-#[test]
-fn invalid_resident_proof_grants_nothing_without_poisoning_valid_evidence() {
-    let authority = SigningKey::from_bytes(&[5; 32]);
-    let wrong_resource = SigningKey::from_bytes(&[6; 32]);
-    let valid_delegate = SigningKey::from_bytes(&[16; 32]);
-    let missing_claim = SigningKey::from_bytes(&[19; 32]);
-    let expired = SigningKey::from_bytes(&[20; 32]);
-    let invalid_signature = SigningKey::from_bytes(&[21; 32]);
-    let mut store = MemoryRepo::default();
-    let collection = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "target",
-            authority.verifying_key(),
-            reach::private(),
-        ))
-        .unwrap();
-    let other = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "other",
-            authority.verifying_key(),
-            reach::private(),
-        ))
-        .unwrap();
-    let valid_commit = store
-        .commit(collection, &valid_delegate, fragment(1))
-        .unwrap();
-    store
-        .commit(collection, &wrong_resource, fragment(2))
-        .unwrap();
-    store
-        .commit(collection, &missing_claim, fragment(3))
-        .unwrap();
-    store.commit(collection, &expired, fragment(4)).unwrap();
-    store
-        .commit(collection, &invalid_signature, fragment(5))
-        .unwrap();
-
-    store_write_proof(
-        &mut store,
-        &authority,
-        wrong_resource.verifying_key(),
-        other,
-    );
-    store_write_proof(
-        &mut store,
-        &authority,
-        valid_delegate.verifying_key(),
-        collection,
-    );
-
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(collection.handle()),
-    );
-    let missing_bundle = CapabilityProofBundle::issue_root(
-        &authority,
-        CapabilityClaim::root(
-            atom,
-            CapabilityMode::Invoke,
-            Some(
-                CapabilityValidity::new(
-                    hifitime::Epoch::from_tai_seconds(0.0),
-                    hifitime::Epoch::from_tai_seconds(1_000_000_000_000.0),
-                )
-                .unwrap(),
+        .collection(
+            "independent-actions",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(root.verifying_key()),
             ),
-        ),
-        missing_claim.verifying_key(),
-    )
-    .unwrap();
-    store.insert_proof(missing_bundle.into_parts().0).unwrap();
-
-    let expired_validity = CapabilityValidity::new(
-        hifitime::Epoch::from_tai_seconds(0.0),
-        hifitime::Epoch::from_tai_seconds(1.0),
-    )
-    .unwrap();
-    let expired_bundle = CapabilityProofBundle::issue_root(
-        &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, Some(expired_validity)),
-        expired.verifying_key(),
-    )
-    .unwrap();
-    store_proof_bundle(&mut store, expired_bundle);
-
-    let tampered_bundle = CapabilityProofBundle::issue_root(
-        &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-        invalid_signature.verifying_key(),
-    )
-    .unwrap();
-    let (proof, claims) = tampered_bundle.into_parts();
-    let mut proof_bytes = proof.into_bytes();
-    proof_bytes[32] ^= 0x80;
-    let tampered = CapabilityProof::from_bytes(&proof_bytes).unwrap();
-    store_proof_bundle(&mut store, CapabilityProofBundle::new(tampered, claims));
+        )
+        .unwrap();
+    store.commit(collection, &root, fragment(1)).unwrap();
+    store.commit(collection, &stranger, fragment(2)).unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let cover = collection.admitted(&snapshot).unwrap();
-    assert_eq!(
-        cover.members().collect::<Vec<_>>(),
-        vec![Handle::<SimpleArchive>::from_hash(valid_commit.data())]
-    );
+    assert!(collection
+        .reader_is_admitted_at(
+            &snapshot,
+            stranger.verifying_key(),
+            Epoch::from_tai_seconds(0.0)
+        )
+        .unwrap());
+    assert!(!collection
+        .writer_is_admitted_at(
+            &snapshot,
+            stranger.verifying_key(),
+            Epoch::from_tai_seconds(0.0)
+        )
+        .unwrap());
+    let (cover, commits) = collection
+        .admitted_with_commits_at(&snapshot, Epoch::from_tai_seconds(0.0))
+        .unwrap();
+    assert_eq!(cover.len(), 1);
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].public_key().raw, root.verifying_key().to_bytes());
 }
 
 #[test]
-fn pile_reopen_discovers_resident_delegation_proof_and_claims() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("automatic-collection-auth.pile");
-    std::fs::File::create(&path).unwrap();
-
-    let authority = SigningKey::from_bytes(&[17; 32]);
-    let delegate = SigningKey::from_bytes(&[18; 32]);
-    let mut pile = Pile::open(&path).unwrap();
-    let collection = pile
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "reopen-auth",
-            authority.verifying_key(),
-            reach::private(),
-        ))
+fn direct_policy_accepts_root_grants_but_blocks_redelegation() {
+    let root = key(5);
+    let intermediary = key(6);
+    let leaf = key(7);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection(
+            "direct-only",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(root.verifying_key()),
+                AdmissionPolicy::direct(root.verifying_key()),
+            ),
+        )
         .unwrap();
-    let committed = pile.commit(collection, &delegate, fragment(3)).unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(collection.handle()),
-    );
-    let bundle = CapabilityProofBundle::issue_root(
-        &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-        delegate.verifying_key(),
+    let write_atom = atom(ACTION_WRITE, collection);
+    let parent_bundle = CapabilityProofBundle::issue_root(
+        &root,
+        CapabilityClaim::root(write_atom, CapabilityMode::InvokeAndDelegate, None),
+        intermediary.verifying_key(),
     )
     .unwrap();
-    let (proof, claims) = bundle.into_parts();
-    for claim in claims {
-        pile.put::<SimpleArchive, _>(claim).unwrap();
-    }
-    pile.insert_proof(proof).unwrap();
-    pile.close().unwrap();
-
-    let mut reopened = Pile::open(&path).unwrap();
-    reopened.refresh().unwrap();
-    let snapshot = reopened.snapshot().unwrap();
-    let cover = collection.admitted(&snapshot).unwrap();
-    assert_eq!(
-        cover.members().collect::<Vec<_>>(),
-        vec![Handle::<SimpleArchive>::from_hash(committed.data())]
-    );
-    let materialized: TribleSet = collection.read(&snapshot).unwrap();
-    assert_eq!(materialized, fragment(3).into_facts());
-    reopened.close().unwrap();
-}
-
-#[test]
-fn pile_reopens_source_first_rank9_derivation() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("source-first-rank9-derive.pile");
-    std::fs::File::create(&path).unwrap();
-
-    let authority = SigningKey::from_bytes(&[19; 32]);
-    let facade = SuccinctArchiveCollection::new(
-        "direct-accelerated",
-        authority.verifying_key(),
-        reach::private(),
-        authority.verifying_key(),
-        reach::private(),
-    );
-    let mut pile = Pile::open(&path).unwrap();
-    let source_collection = pile
-        .collection::<SimpleArchive>(facade.source_descriptor())
-        .unwrap();
-    pile.commit(source_collection, &authority, fragment(4))
-        .unwrap();
-    let snapshot = pile.snapshot().unwrap();
-    let source_cover = source_collection.admitted(&snapshot).unwrap();
-    assert_eq!(
-        facade
-            .ensure_exact(&mut pile, &source_cover)
-            .unwrap()
-            .iter()
-            .count(),
-        1
-    );
-
-    let snapshot = pile.snapshot().unwrap();
-    let records = snapshot
-        .records()
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let raw = records
-        .iter()
-        .find_map(|record| match record {
-            CollectionRecord::Derive(derive) if derive.collection() == facade.raw_collection() => {
-                Some(derive.output())
-            }
-            _ => None,
-        })
-        .expect("raw DERIVE was published");
-    let root = records
-        .iter()
-        .find_map(|record| match record {
-            CollectionRecord::Derive(derive) if derive.collection() == facade.collection() => {
-                assert_eq!(derive.input(), raw);
-                Some(derive.output())
-            }
-            _ => None,
-        })
-        .expect("Rank9 DERIVE was published");
-    pile.close().unwrap();
-
-    let mut reopened = Pile::open(&path).unwrap();
-    let snapshot = reopened.snapshot().unwrap();
-    snapshot
-        .get::<Blob<SuccinctArchiveBlob>, _>(Handle::from_hash(raw))
-        .unwrap();
-    snapshot
-        .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, _>(Handle::from_hash(root))
-        .unwrap();
-    assert_eq!(
-        facade
-            .attach_exact(&mut reopened, &source_cover)
-            .unwrap()
-            .iter()
-            .count(),
-        1
-    );
-    reopened.close().unwrap();
-}
-
-#[test]
-fn anchorless_descriptor_is_rejected_before_storage() {
-    let authority = SigningKey::from_bytes(&[7; 32]).verifying_key();
-    let anchorless = entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_authority: authority,
-        collection_representation: <SimpleArchive as MetaDescribe>::id(),
-    };
-    let mut store = CountingRepo::default();
-
-    assert!(matches!(
-        store.collection::<SimpleArchive>(anchorless),
-        Err(
-            triblespace_core::collection::CollectionRegistrationError::InvalidDescriptor(
-                triblespace_core::collection::RecordDecodeError::MissingField(_)
-            )
+    let parent = parent_bundle
+        .verify(
+            root.verifying_key(),
+            Epoch::from_tai_seconds(0.0),
+            intermediary.verifying_key(),
+            CapabilityRequest::new(write_atom, CapabilityMode::InvokeAndDelegate),
         )
-    ));
-    assert!(store.puts.is_empty());
+        .unwrap();
+    let child_bundle = parent
+        .delegate(
+            &intermediary,
+            CapabilityClaim::delegated(
+                parent.claim_handle(),
+                write_atom,
+                CapabilityMode::Invoke,
+                None,
+            ),
+            leaf.verifying_key(),
+        )
+        .unwrap();
+    store_bundle(&mut store, parent_bundle);
+    store_bundle(&mut store, child_bundle);
+
+    let snapshot = store.snapshot().unwrap();
+    let instant = Epoch::from_tai_seconds(0.0);
+    assert!(collection
+        .writer_is_admitted_at(&snapshot, intermediary.verifying_key(), instant)
+        .unwrap());
+    assert!(!collection
+        .writer_is_admitted_at(&snapshot, leaf.verifying_key(), instant)
+        .unwrap());
 }
 
 #[test]
-fn root_descriptor_without_its_name_blob_is_rejected_before_storage() {
-    let authority = SigningKey::from_bytes(&[8; 32]);
-    let descriptor = simplearchive_union::descriptor(
-        "stripped-name",
-        authority.verifying_key(),
-        reach::private(),
+fn read_grants_use_the_distinct_read_action() {
+    let root = key(8);
+    let reader = key(9);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection(
+            "read-action",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(root.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let read_atom = atom(ACTION_READ, collection);
+    store_bundle(
+        &mut store,
+        CapabilityProofBundle::issue_root(
+            &root,
+            CapabilityClaim::root(read_atom, CapabilityMode::Invoke, None),
+            reader.verifying_key(),
+        )
+        .unwrap(),
     );
-    let (_, facts, metafacts, _) = descriptor.into_parts();
-    let stripped = Fragment::from_parts(facts, metafacts, Default::default());
-    let mut store = CountingRepo::default();
 
-    assert!(matches!(
-        store.collection::<SimpleArchive>(stripped),
-        Err(
-            triblespace_core::collection::CollectionRegistrationError::InvalidAttachment {
-                role: "name",
-                ..
-            }
-        )
-    ));
-    assert!(store.puts.is_empty());
+    let snapshot = store.snapshot().unwrap();
+    let instant = Epoch::from_tai_seconds(0.0);
+    assert!(collection
+        .reader_is_admitted_at(&snapshot, reader.verifying_key(), instant)
+        .unwrap());
+    assert!(collection
+        .writer_is_admitted_at(&snapshot, reader.verifying_key(), instant)
+        .unwrap());
 }
-
-#[test]
-fn descriptor_without_authority_is_rejected_before_storage() {
-    let missing_authority = entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_name: "missing-authority".to_owned(),
-        collection_representation: <SimpleArchive as MetaDescribe>::id(),
-    };
-    let mut store = CountingRepo::default();
-
-    assert!(matches!(
-        store.collection::<SimpleArchive>(missing_authority),
-        Err(
-            triblespace_core::collection::CollectionRegistrationError::InvalidDescriptor(
-                triblespace_core::collection::RecordDecodeError::MissingField(
-                    "collection_authority"
-                )
-            )
-        )
-    ));
-    assert!(store.puts.is_empty());
-}
-
-// Keep the projected memory-repository error in this test crate's type graph;
-// it catches accidental changes to the blanket extension's concrete bounds.
-const _: Option<Infallible> = None;

@@ -33,11 +33,12 @@ use crate::inline::encodings::genid::GenId;
 #[cfg(test)]
 use crate::inline::encodings::genid::IdParseError;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
+use crate::inline::encodings::iu256::U256;
 use crate::inline::Inline;
 #[cfg(test)]
 use crate::inline::InlineEncoding;
 use crate::prelude::attributes;
-use crate::trible::{TribleSet, TRIBLE_LEN};
+use crate::trible::TribleSet;
 
 /// Tag identifying a canonical collection descriptor.
 ///
@@ -74,11 +75,9 @@ pub const KIND_COLLECTION_DERIVE_V1: Id = id_hex!("6DB0214CB4F3BD8259F0117CDC127
 /// Retired semantic kind of a signed collection-gossip grant.
 ///
 /// A grant was an author-signed, irrevocable permission to redistribute that
-/// author's commits in one collection. It is gone because reach moved into the
-/// descriptor: committing into a collection whose identity says it travels
-/// *is* the consent, and cannot be given by accident, since a collection that
-/// stays put is a different collection with a different handle. The grant only
-/// ever restated what the descriptor now declares.
+/// author's commits in one collection. It is gone because discovery and
+/// dissemination are now governed by the descriptor's READ policy and exact
+/// capability evidence, independently of any one COMMIT author.
 ///
 /// No pile has ever held one -- 21.2 GB across six piles were scanned for the
 /// record marker before the kind was removed, and the same scan found commit
@@ -90,14 +89,6 @@ pub const KIND_COLLECTION_DERIVE_V1: Id = id_hex!("6DB0214CB4F3BD8259F0117CDC127
 /// the id is not minted twice.
 pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B5CA");
 
-/// Byte length of a canonical bare root collection-descriptor `SimpleArchive`.
-///
-/// Four facts: the kind tag, name, mandatory authority, and encoding. A
-/// descriptor that embeds its encoding's description or declares reach is
-/// longer. A derived descriptor additionally embeds one mapping instance. The
-/// name's UTF-8 bytes are a separate attachment and do not contribute rows to
-/// the archive.
-pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (4 * TRIBLE_LEN) as u64;
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a dense merge equation.
@@ -115,22 +106,42 @@ attributes! {
     /// The human-readable name of a root collection.
     ///
     /// The UTF-8 bytes live in an attachment so the identity has no arbitrary
-    /// 32-byte ceiling. The collection's mandatory authority provides the
-    /// globally unique scope; the name is descriptive identity within it, not
-    /// a second authorization mechanism.
+    /// 32-byte ceiling. Independent READ and WRITE policy fragments provide
+    /// the authorization context; the name remains descriptive rather than an
+    /// ambient namespace.
     ///
     /// Anchor minted with `trible genid` on 2026-08-28:
     /// `A2EEF06D4E1AA4B17B745AA2E8C37867`.
     "A2EEF06D4E1AA4B17B745AA2E8C37867" as pub collection_name: Handle<UTF8String>;
-    /// External capability trust root for this exact collection.
+    /// Self-contained READ policy entity.
     ///
-    /// Every descriptor names exactly one authority directly. It is not
-    /// inherited through [`collection_source`], and the authority key itself
-    /// is the sovereign signer while delegates prove exact collection rights.
+    /// The linked entity is embedded through Fragment spread, so every root
+    /// and threshold participates directly in collection identity.
     ///
-    /// Anchor minted with `trible genid` on 2026-08-24:
-    /// `7C31D328E9C369CCB6049D05CC8E8C77`.
-    "7C31D328E9C369CCB6049D05CC8E8C77" as pub collection_authority: ED25519PublicKey;
+    /// Anchor minted with `trible genid` on 2026-08-30:
+    /// `4108A59A03E8F8EC9DCDCC3C8597A292`.
+    "4108A59A03E8F8EC9DCDCC3C8597A292" as pub collection_read_policy: GenId;
+    /// Self-contained WRITE policy entity.
+    ///
+    /// Anchor minted with `trible genid` on 2026-08-30:
+    /// `06930EAD5B83C83A30B6061B53A2840B`.
+    "06930EAD5B83C83A30B6061B53A2840B" as pub collection_write_policy: GenId;
+    /// One distinct trust root of a quorum admission policy.
+    ///
+    /// Anchor minted with `trible genid` on 2026-08-30:
+    /// `E9AC4E4749FD219705E9533B02AAA405`.
+    "E9AC4E4749FD219705E9533B02AAA405" as pub admission_policy_root: ED25519PublicKey;
+    /// Number of distinct roots required to invoke the governed action.
+    ///
+    /// Anchor minted with `trible genid` on 2026-08-30:
+    /// `AF874E4D44C3A6565754D3EE8EDE48B5`.
+    "AF874E4D44C3A6565754D3EE8EDE48B5" as pub admission_invoke_threshold: U256;
+    /// Number of distinct roots required for a non-root principal to delegate.
+    ///
+    /// Absence means that downstream delegation is disabled.
+    /// Anchor minted with `trible genid` on 2026-08-30:
+    /// `1300EF404FE61D26FC091B0CEC1C41EC`.
+    "1300EF404FE61D26FC091B0CEC1C41EC" as pub admission_delegate_threshold: U256;
     /// The collection this one derives from, by descriptor handle.
     ///
     /// This says *what* a derived collection is computed from; which state of
@@ -160,37 +171,6 @@ attributes! {
     /// Anchor minted with `trible genid` on 2026-08-29:
     /// `AF43D02D710977411CA7DA164BDA5CD9`.
     "AF43D02D710977411CA7DA164BDA5CD9" as pub mapping_algorithm: GenId;
-    /// How far this collection may travel, by the id of a *reach law*.
-    ///
-    /// This is the descriptor's answer to "may these bytes be relayed?", and
-    /// putting it here is what makes the answer unforgeable. Reach used to be
-    /// a separately signed record any keyholder could mint later, so "private"
-    /// meant only "nobody has signed one yet". Named in the descriptor, reach
-    /// is part of the collection's identity: a private collection and a public
-    /// one are *different collections* with different handles, and publishing
-    /// something after the fact is not forbidden but meaningless, because it
-    /// would have to name a handle whose own descriptor refuses to travel.
-    ///
-    /// This names a *law* rather than a value. A
-    /// law admits an "I do not implement that" answer, which a boolean cannot:
-    /// a reader meeting a mode it has never heard of denies rather than
-    /// guesses, so the fail-closed rule extends to modes invented after this
-    /// binary was built. Any arguments a richer mode needs -- an audience, a
-    /// subset of a team -- are further attributes on this same entity, read
-    /// through [`descriptor::argument`](crate::collection::descriptor::argument).
-    ///
-    /// The attribute is optional, and absence means *no reach*: a descriptor
-    /// that predates this field, or declines to declare, does not travel. That
-    /// direction is not a default chosen for convenience -- the opposite
-    /// default would silently publish every collection written before reach
-    /// existed, which is the exact hazard this field removes.
-    ///
-    /// Anchor minted with `trible genid` on 2026-08-21. Declared with the
-    /// anchored `as` form rather than the pinned `unsafe as` form used by its
-    /// neighbours: those preserve byte identities already written into piles,
-    /// whereas no row has ever carried this attribute, so its encoding is free
-    /// to participate in its identity.
-    "7CCF99CCE4657117EE8CDD1B8E11FDA3" as pub collection_reach: GenId;
 }
 
 /// Type-erased content identity of one collection element.
@@ -854,16 +834,10 @@ fn one_inline<S: InlineEncoding>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collection::reach;
 
     use hex_literal::hex;
 
     use crate::blob::TryFromBlob;
-    use crate::id::Id;
-
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
 
     fn hash(byte: u8) -> CollectionData {
         Inline::new([byte; 32])
@@ -875,52 +849,6 @@ mod tests {
 
     fn fixture_key() -> SigningKey {
         SigningKey::from_bytes(&[7; 32])
-    }
-
-    /// A root is named under one mandatory authority. Name, authority,
-    /// representation, and reach all participate in descriptor identity.
-    #[test]
-    fn collection_descriptor_is_anchor_specific_and_roundtrips() {
-        use crate::collection::descriptor;
-
-        let authority = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let other_authority = SigningKey::from_bytes(&[2; 32]).verifying_key();
-
-        let a_fragment = descriptor::naming("first", authority, id(2), reach::private());
-        let expected_name = descriptor::name(a_fragment.facts()).unwrap().unwrap();
-        let a = a_fragment.into_facts();
-        let renamed = descriptor::naming("second", authority, id(2), reach::private()).into_facts();
-        let reauthorized =
-            descriptor::naming("first", other_authority, id(2), reach::private()).into_facts();
-        let other_representation =
-            descriptor::naming("first", authority, id(4), reach::private()).into_facts();
-        let other_reach =
-            descriptor::naming("first", authority, id(2), reach::public()).into_facts();
-
-        let handle = |facts: &TribleSet| {
-            <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
-        };
-        assert_ne!(handle(&a), handle(&renamed));
-        assert_ne!(handle(&a), handle(&reauthorized));
-        assert_ne!(handle(&a), handle(&other_representation));
-        assert_ne!(handle(&a), handle(&other_reach));
-
-        // The descriptor is its own archive: encoding and decoding is the
-        // identity, because there is no second model of it to drift.
-        let blob = <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(a.clone());
-        assert_eq!(
-            <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob).unwrap(),
-            a
-        );
-        let root = descriptor::entity(&a).unwrap();
-        assert!(a.iter().all(|fact| fact.e() == &root));
-
-        assert_eq!(
-            descriptor::name(&a).unwrap().unwrap(),
-            expected_name,
-            "the anchor reads back as what was written"
-        );
-        assert_eq!(descriptor::authority(&a), Ok(authority));
     }
 
     #[test]
@@ -1125,27 +1053,11 @@ mod tests {
             collection_name_anchor,
             "the anchored form must not pin the anchor as the attribute id"
         );
-        let descriptor = crate::collection::descriptor::naming(
-            "first",
-            SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            id(2),
-            reach::private(),
-        )
-        .into_facts();
-        let descriptor_blob =
-            <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(descriptor.clone());
         let commit =
             CollectionCommit::sign(&fixture_key(), collection(1), hash(2), Inline::new([3; 32]));
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
         let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
 
-        // Pin the bare-root row count. The descriptor/entity/blob identities
-        // deliberately moved in this epoch: namespace was removed, authority
-        // became mandatory, and the name became a UTF-8 blob handle.
-        assert_eq!(
-            descriptor_blob.bytes.len() as u64,
-            COLLECTION_DESCRIPTOR_ARCHIVE_LEN
-        );
         assert_eq!(commit.to_bytes().len(), COLLECTION_COMMIT_BYTES_LEN);
         assert_eq!(merge.to_bytes().len(), COLLECTION_MERGE_BYTES_LEN);
         assert_eq!(derive.to_bytes().len(), COLLECTION_DERIVE_BYTES_LEN);
