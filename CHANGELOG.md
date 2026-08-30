@@ -2095,6 +2095,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Replace the global 8-bit provider-cover rendezvous with exact full-width
+  derived-key DHT PUT/GET leases. Directory requests still never carry bearer
+  blob handles, while unrelated artifacts no longer collapse onto 256 fixed
+  hotspots. The explicit publication input remains separate from the mechanic:
+  derived keys do not protect guessable plaintext, so the collection-policy
+  cut must globally publish only READ-open reachability and keep restricted
+  availability inside its authorized overlay. The incompatible wire is now
+  pile-sync ALPN v16.
+
 - Make nonempty exact-derived network attachment fail closed when refreshing
   discovers a conflicting store scope, rather than clearing the serving view
   and then continuing against that physical store. Speculative remote cover

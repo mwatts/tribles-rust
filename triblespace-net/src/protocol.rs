@@ -13,8 +13,7 @@
 //! Operations:
 //!   AUTH       bundle_len:u32 bundle:bytes → resp:u8 server_bundle
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
-//!   PROVIDER_PROBE prefix:u8 digest:32 count:u32 → KNOWN/NEED/FULL
-//!   PROVIDER_BODY prefix:u8 digest:32 count:u32 keys:[32; count] → OK/FULL
+//!   PROVIDER_PUT key:32 → OK/FULL
 //!   PROVIDER_GET key:32 → count:u8 provider:[32; count]
 //!   FIND_NODE target:32 → count:u8 peer:[32; count]
 //!   INVENTORY_AUTH, MANIFEST, NODE, and BLOB_RANGE are defined by
@@ -30,10 +29,10 @@
 //! zero-knowledge credential. No SYNC proof, artifact ID, query, or data request
 //! is sent until reciprocal CONNECT verification succeeds.
 //! Content and inventory operations additionally wait for reciprocal SYNC_TEAM.
-//! Provider-cover writes bind the TLS-authenticated caller to receiver-local
-//! prefix-shard leases and never accept a claimed provider identity.
+//! Provider writes bind the TLS-authenticated caller to receiver-local exact
+//! leases and never accept a claimed provider identity.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/15";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/16";
 
 use ed25519_dalek::VerifyingKey;
 use hifitime::Epoch;
@@ -70,14 +69,13 @@ pub const OP_GET_BLOB: u8 = 0x02;
 /// capability proof. A successful response carries the server's own bounded
 /// CONNECT proof immediately after `AUTH_OK`.
 pub const OP_AUTH: u8 = 0x05;
-/// Probe or renew one provider-cover prefix root.
-pub const OP_PROVIDER_PROBE: u8 = 0x06;
+/// Install or renew one exact opaque provider key.
+pub const OP_PROVIDER_PUT: u8 = 0x06;
 /// Query live provider leases for one already-known opaque global artifact key.
 pub const OP_PROVIDER_GET: u8 = 0x07;
 /// Query up to K directly verified routes nearest one arbitrary XOR key.
 pub const OP_FIND_NODE: u8 = 0x0C;
-/// Install a changed provider-cover prefix body after a NEED response.
-pub const OP_PROVIDER_BODY: u8 = 0x0D;
+// 0x0D was the retired provider-cover body operation.
 
 /// Auth response: CONNECT capability verified. Subsequent direct RPCs on this
 /// connection may proceed.
@@ -86,11 +84,8 @@ pub const AUTH_OK: u8 = 0x00;
 /// peer to CONNECT. The connection should be closed by the client.
 pub const AUTH_REJECTED: u8 = 0x01;
 
-pub const PROVIDER_PROBE_KNOWN: u8 = 0x00;
-pub const PROVIDER_PROBE_NEED: u8 = 0x01;
-pub const PROVIDER_PROBE_FULL: u8 = 0x02;
-pub const PROVIDER_BODY_OK: u8 = 0x00;
-pub const PROVIDER_BODY_FULL: u8 = 0x01;
+pub const PROVIDER_PUT_OK: u8 = 0x00;
+pub const PROVIDER_PUT_FULL: u8 = 0x01;
 
 pub type RawHash = [u8; 32];
 
@@ -291,56 +286,18 @@ pub async fn op_get_blob<C: Conn>(conn: &C, hash: &RawHash) -> Result<Option<Vec
     recv_blob_response(&mut recv).await
 }
 
-/// Probe one canonical provider-cover prefix root. A matching root renews its
-/// lease without transferring or walking the body.
-pub(crate) async fn op_provider_probe<C: Conn>(
-    conn: &C,
-    prefix: u8,
-    digest: &RawHash,
-    count: u32,
-) -> Result<crate::provider::ProviderProbe> {
+/// PROVIDER_PUT: install or renew one exact opaque provider key. The provider
+/// identity is the authenticated transport caller and is absent from the body.
+pub(crate) async fn op_provider_put<C: Conn>(conn: &C, key: &RawHash) -> Result<bool> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_PROVIDER_PROBE).await?;
-    send_u8(&mut send, prefix).await?;
-    send_hash(&mut send, digest).await?;
-    send_u32_be(&mut send, count).await?;
-    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
-
-    let response = match recv_u8(&mut recv).await? {
-        PROVIDER_PROBE_KNOWN => crate::provider::ProviderProbe::Known,
-        PROVIDER_PROBE_NEED => crate::provider::ProviderProbe::Need,
-        PROVIDER_PROBE_FULL => crate::provider::ProviderProbe::Full,
-        other => return Err(anyhow!("unknown provider-probe response: {other:#x}")),
-    };
-    require_response_eof(&mut recv).await?;
-    Ok(response)
-}
-
-/// Transfer one complete changed provider-cover prefix. Keys must be strictly
-/// ascending full rendezvous keys; the receiver rebuilds and checks the PATCH
-/// root before atomically replacing its old shard.
-pub(crate) async fn op_provider_body<C: Conn>(
-    conn: &C,
-    prefix: u8,
-    digest: &RawHash,
-    keys: &[[u8; 32]],
-) -> Result<bool> {
-    let count =
-        u32::try_from(keys.len()).map_err(|_| anyhow!("provider-cover shard count exceeds u32"))?;
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_PROVIDER_BODY).await?;
-    send_u8(&mut send, prefix).await?;
-    send_hash(&mut send, digest).await?;
-    send_u32_be(&mut send, count).await?;
-    for key in keys {
-        send_hash(&mut send, key).await?;
-    }
+    send_u8(&mut send, OP_PROVIDER_PUT).await?;
+    send_hash(&mut send, key).await?;
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let stored = match recv_u8(&mut recv).await? {
-        PROVIDER_BODY_OK => true,
-        PROVIDER_BODY_FULL => false,
-        other => return Err(anyhow!("unknown provider-body response: {other:#x}")),
+        PROVIDER_PUT_OK => true,
+        PROVIDER_PUT_FULL => false,
+        other => return Err(anyhow!("unknown provider-put response: {other:#x}")),
     };
     require_response_eof(&mut recv).await?;
     Ok(stored)
@@ -748,6 +705,24 @@ mod bounds_tests {
         bytes.extend_from_slice(&payload);
         let mut input = bytes.as_slice();
         assert_eq!(recv_blob_response(&mut input).await.unwrap(), Some(payload));
+    }
+
+    #[tokio::test]
+    async fn provider_put_wire_carries_one_exact_derived_key() {
+        let artifact = [0xD1; 32];
+        let key = crate::provider::provider_key(artifact);
+        assert_ne!(key, artifact);
+        let request = Arc::new(Mutex::new(None));
+        let conn = CapturingProviderGetConn {
+            request: request.clone(),
+        };
+
+        assert!(op_provider_put(&conn, &key).await.unwrap());
+        let request = request.lock().unwrap().take().unwrap();
+        assert_eq!(request.len(), 1 + key.len());
+        assert_eq!(request[0], OP_PROVIDER_PUT);
+        assert_eq!(&request[1..], &key);
+        assert_ne!(&request[1..], &artifact);
     }
 
     #[tokio::test]

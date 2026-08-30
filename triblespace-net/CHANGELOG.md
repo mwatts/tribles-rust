@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Route provider PUT and GET through the full 256-bit derived key instead of
+  one of 256 fixed global prefix targets. Provider publication now uses bounded
+  exact soft leases and a fair exact-key scheduler; the explicit publication
+  input remains a fail-closed policy seam because derived keys do not protect
+  guessable plaintext from dictionary confirmation. Replace the prefix
+  PROBE/BODY exchange with one exact `PROVIDER_PUT` and move the incompatible
+  pile-sync wire protocol to ALPN `/triblespace/pile-sync/16`.
+
 - Keep bearer blob handles out of provider-directory queries. `PROVIDER_GET`
   now carries an opaque global provider key derived only from the handle; its
   DHT prefix target is global as well. Only the final provider-facing

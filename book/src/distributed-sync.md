@@ -228,57 +228,44 @@ snapshot with the Blob keys in its current immutable serving snapshot. Only
 that intersection is published, and only under a serving direction.
 
 Newly active offers are announced immediately. The host derives a global opaque
-provider key `r = provider_key(c)` for every active artifact, builds one
-canonical BLAKE3-Merkle PATCH, and groups its keys by the fixed first byte of
-`r`. Publication therefore has at most 256 prefix shards regardless of the
-number of offered artifacts. Each shard is routed under a separate global
-prefix DHT key to the `K` closest responsive nodes. A node with no
-remote routing evidence treats its local shard leases as a sane success.
+provider key `r = provider_key(c)` for every selected artifact and routes that
+exact full-width key to the `K` closest responsive nodes. Unrelated artifacts
+therefore occupy independent DHT locations instead of collapsing into 256
+fixed prefix hotspots. A node with no
+remote routing evidence treats its local exact leases as a sane success.
 Once any configured, synchronized, or learned remote route exists, at least
 one remote directory must accept the announcement: local self-insertion alone
 does not turn an outage into an apparent replicated success. Failed or
 capacity-rejected replication retries with bounded exponential backoff.
 
-Publication first probes `(prefix, digest, count)`. An equal root renews the
-receiver-local lease without transferring or walking membership. A changed
-root requests one strictly ascending body of full 32-byte provider keys. The
-receiver checks the authenticated provider identity, prefix, count, bounds,
-ordering, and rebuilt PATCH digest before atomically replacing the shard and
-its prefix-directory entry. Capacity or validation failure preserves the old
-valid shard. Missing prefixes receive no imperative removal; their leases
-simply expire. Expiry reclamation is bounded per request, while deadline checks
-prevent unreclaimed stale shards from being returned. A pathologically
-oversized single prefix is reported and omitted while neighboring exact shards
-continue to publish and renew.
+`PROVIDER_PUT(r)` installs or renews one receiver-local exact lease whose
+provider identity is the authenticated transport caller. The wire accepts no
+claimed provider id and never carries `c`. Capacity failure leaves existing
+memberships intact. Expiry reclamation is bounded per request, while deadline
+checks prevent unreclaimed stale memberships from being returned.
 
-Successful prefix leases are renewed at half their lifetime. An ordered
-due-time scheduler admits at most `alpha = 3` changed or due prefixes at once,
-uses fair backoff, and retains successful deadlines across changed-root retry.
-Cover reconstruction is keyed by the durable OFFER snapshot and the immutable
-Blob-component root: peer, record, or proof churn reuses the existing cover
-instead of rehashing every offer. Restart reobserves the durable OFFER snapshot.
+Successful exact leases are renewed at half their lifetime. An ordered
+due-time scheduler admits at most `alpha = 3` changed or due keys at once, uses
+fair backoff, and preserves deadlines across equivalent serving snapshots.
+The selection is keyed by the durable OFFER snapshot and immutable
+Blob-component root: peer, record, or proof churn reuses the existing set.
+Restart reobserves the durable OFFER snapshot.
 An absent artifact, a cleared serving snapshot, or `ReadOnly` direction leaves
 the offer dormant; if residency or a serving view later returns, normal
 snapshot observation activates it. In-flight stale hints need no cancellation
 protocol because receivers expire leases.
 
-Receiver admission is bounded only by the aggregate directory weight
-`(live shards, live memberships) <= (65,536, 2^24)`. It is work-conserving:
-any provider may use capacity which is presently free, with no lower
-per-provider ceiling. Replacement computes the weight after removing the old
-shard and adding its candidate, so a same-weight replacement remains possible
-at either exact boundary. A prefix rejected because the aggregate directory is
-full remains soft unknown and retries after capacity expires. Admission is
-therefore first-arrival: one authorized provider may occupy the whole bounded
-directory until its leases expire. Principal fairness is intentionally outside
-this soft discovery primitive.
+Receiver admission is bounded by `2^24` aggregate live exact memberships. It
+is work-conserving: any provider may use free capacity, and an existing
+membership can renew even at the bound. A new membership rejected because the
+directory is full remains soft unknown and retries after capacity expires.
+Principal fairness is intentionally outside this discovery primitive.
 
 A reader that already knows `c` derives `r`, performs iterative `FIND_NODE`, and
-asks those replicas for the corresponding global prefix directory by sending
-only `r` in `PROVIDER_GET`. The rendezvous key and prefix target do not depend
-on the transport's current team session. The raw artifact handle is reserved
-for the final provider-facing `GET_BLOB`. Each replica returns only providers whose live
-sorted prefix shard contains that exact key. Both the
+asks those exact-key replicas by sending only `r` in `PROVIDER_GET`. The
+rendezvous target does not depend on the transport's current team session. The
+raw artifact handle is reserved for the final provider-facing `GET_BLOB`. Each
+replica returns only providers with a live lease for that exact key. Both the
 candidate scan and result fan-out are bounded and rotate across calls without
 capping stored memberships. Because this is a soft directory, one lookup may
 return fewer hints (including none) under adversarially dense occupancy; it
@@ -290,6 +277,21 @@ bytes hash to `c`. A holder without an active resident OFFER is honestly
 unavailable, and the implementation never falls back to probing every known
 peer. OFFER itself grants no authority, retention, demand, or inventory
 membership.
+
+Deriving `r` hides the bearer handle from directory peers, but it does not make
+guessable plaintext confidential: anyone who can guess `c` can derive the same
+key and confirm availability. Global publication eligibility must therefore be
+explicit and fail closed; it must never be inferred from size or apparent
+entropy. The clean collection-policy baseline is
+`globally_bearer(H) := exists admitted C: READ(C)=Open && H is in the resident
+disclosure closure of C`. The ephemeral exact-key selection index can be built
+from those witnesses without a global collection registry or enumeration; an
+Open collection gossips only after its identity is learned. The same `H` in any
+Open witness is irreversibly public. Restricted-READ availability remains
+inside that collection's authorized overlay. Deliberate release is a
+WRITE-admitted COMMIT of selected references into a separate READ-open
+publication collection, never an unsigned DERIVE. Constructing that closure
+index and scoped private fetch are intentionally outside this wire-only cut.
 
 ## Local quality of service
 
@@ -368,23 +370,23 @@ compute reuse without weakening this boundary.
 ## Wire surface
 
 All direct operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/15"`. One QUIC stream carries one
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/16"`. One QUIC stream carries one
 strictly framed operation:
 
 | Operation | Byte | Purpose |
 |---|---:|---|
 | `GET_BLOB` | `0x02` | read one exact current blob after both authorizations |
 | `OP_AUTH` | `0x05` | exchange subject-bound CONNECT bundles; mandatory first stream only |
-| `PROVIDER_PROBE` | `0x06` | compare or renew one authenticated provider-prefix root |
+| `PROVIDER_PUT` | `0x06` | install or renew one authenticated exact provider-key lease |
 | `PROVIDER_GET` | `0x07` | read live hints for one already-known artifact |
 | `INVENTORY_AUTH` | `0x08` | exchange SYNC_TEAM bundles and install one connection-local session |
 | `INVENTORY_MANIFEST` | `0x09` | read the four ordered component roots and generation |
 | `INVENTORY_NODE` | `0x0A` | read one expected-digest node from a pinned component |
 | `INVENTORY_BLOB_RANGE` | `0x0B` | read at most one bounded range from a pinned Blob root |
 | `FIND_NODE` | `0x0C` | read up to `K` directly verified routes nearest one XOR key |
-| `PROVIDER_BODY` | `0x0D` | atomically install one changed canonical prefix body |
+| `0x0D` | retired | former provider-cover body operation |
 
-Provider-cover leases are bounded receiver-local soft state; there is no remote
+Exact provider leases are bounded receiver-local soft state; there is no remote
 semantic write, collection-evidence, operation-receipt, blob-child, custody, or
 replica operation. Receivers admit strictly checked results through their own
 local store boundary.

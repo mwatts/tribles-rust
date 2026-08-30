@@ -646,7 +646,7 @@ mod tests {
                 "blob_root",
             ]
         );
-        assert!(output.contains("protocol:            /triblespace/pile-sync/15\n"));
+        assert!(output.contains("protocol:            /triblespace/pile-sync/16\n"));
         assert!(output.contains("peer_count: 1\n"));
         assert!(output.contains("collection_record_count: 0\n"));
         assert!(output.contains("collection_record_root:  empty\n"));

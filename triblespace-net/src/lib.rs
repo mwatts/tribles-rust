@@ -10,10 +10,12 @@
 //! resolver select an exact physical cover from speculative remote artifacts,
 //! so callers can fetch only useful materializations without creating WANTs.
 //! A bounded, global opaque provider directory can locate peers for an
-//! already-known immutable artifact handle. Providers publish at most 256
-//! canonical prefix-cover leases rather than one lease per artifact; exact
-//! membership checks remain bounded soft routing state, not an enumeration or
-//! artifact-discovery plane.
+//! already-known immutable artifact handle. Each selected artifact publishes
+//! one exact full-width derived-key lease at its K closest DHT nodes; directory
+//! requests never carry the bearer handle, and unrelated keys do not collapse
+//! into fixed prefix hotspots. Publication policy remains separate because a
+//! derived key alone cannot protect low-entropy plaintext from dictionary
+//! confirmation.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
