@@ -70,11 +70,36 @@ pub enum AdmissionPolicy {
     Open,
     /// Distinct roots jointly support invocation and, optionally, downstream
     /// delegation.
-    Quorum {
-        roots: Vec<VerifyingKey>,
-        invoke_threshold: u32,
-        delegate_threshold: Option<u32>,
-    },
+    Quorum(ValidatedQuorum),
+}
+
+/// Canonical, structurally valid quorum geometry.
+///
+/// The fields are deliberately private: sorting, deduplication, and the
+/// threshold bounds are invariants of the value rather than checks every
+/// consumer must remember to repeat.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedQuorum {
+    roots: Vec<VerifyingKey>,
+    invoke_threshold: u32,
+    delegate_threshold: Option<u32>,
+}
+
+impl ValidatedQuorum {
+    /// Distinct roots in canonical public-key order.
+    pub fn roots(&self) -> &[VerifyingKey] {
+        &self.roots
+    }
+
+    /// Number of distinct roots required to invoke the action.
+    pub const fn invoke_threshold(&self) -> u32 {
+        self.invoke_threshold
+    }
+
+    /// Number of distinct roots required to extend authority, when allowed.
+    pub const fn delegate_threshold(&self) -> Option<u32> {
+        self.delegate_threshold
+    }
 }
 
 impl AdmissionPolicy {
@@ -94,11 +119,11 @@ impl AdmissionPolicy {
         if let Some(threshold) = delegate_threshold {
             validate_threshold("delegate", threshold, roots.len())?;
         }
-        Ok(Self::Quorum {
+        Ok(Self::Quorum(ValidatedQuorum {
             roots,
             invoke_threshold,
             delegate_threshold,
-        })
+        }))
     }
 
     /// One root may invoke or issue direct grants; grantees cannot redelegate.
@@ -118,17 +143,13 @@ impl AdmissionPolicy {
                 let kind = KIND_ADMISSION_POLICY_OPEN;
                 entity! { _ @ metadata::tag: kind }
             }
-            Self::Quorum {
-                roots,
-                invoke_threshold,
-                delegate_threshold,
-            } => {
+            Self::Quorum(quorum) => {
                 let kind = KIND_ADMISSION_POLICY_QUORUM;
                 entity! { _ @
                     metadata::tag: kind,
-                    admission_policy_root*: roots.iter().copied(),
-                    admission_invoke_threshold: *invoke_threshold,
-                    admission_delegate_threshold?: *delegate_threshold,
+                    admission_policy_root*: quorum.roots.iter().copied(),
+                    admission_invoke_threshold: quorum.invoke_threshold,
+                    admission_delegate_threshold?: quorum.delegate_threshold,
                 }
             }
         }
@@ -138,7 +159,7 @@ impl AdmissionPolicy {
     pub fn roots(&self) -> Option<&[VerifyingKey]> {
         match self {
             Self::Open => None,
-            Self::Quorum { roots, .. } => Some(roots),
+            Self::Quorum(quorum) => Some(quorum.roots()),
         }
     }
 
@@ -146,9 +167,7 @@ impl AdmissionPolicy {
     pub const fn invoke_threshold(&self) -> Option<u32> {
         match self {
             Self::Open => None,
-            Self::Quorum {
-                invoke_threshold, ..
-            } => Some(*invoke_threshold),
+            Self::Quorum(quorum) => Some(quorum.invoke_threshold()),
         }
     }
 
@@ -157,9 +176,7 @@ impl AdmissionPolicy {
     pub const fn delegate_threshold(&self) -> Option<u32> {
         match self {
             Self::Open => None,
-            Self::Quorum {
-                delegate_threshold, ..
-            } => *delegate_threshold,
+            Self::Quorum(quorum) => quorum.delegate_threshold(),
         }
     }
 }

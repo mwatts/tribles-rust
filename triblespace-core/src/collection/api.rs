@@ -757,12 +757,7 @@ fn admission_evidence_at<R>(
 where
     R: BlobStoreGet,
 {
-    let AdmissionPolicy::Quorum {
-        roots,
-        invoke_threshold,
-        delegate_threshold,
-    } = policy
-    else {
+    let AdmissionPolicy::Quorum(quorum) = policy else {
         return AdmissionEvidence::Open;
     };
     let atom = CapabilityAtom::new(
@@ -781,10 +776,10 @@ where
         })
         .collect();
     AdmissionEvidence::Quorum {
-        roots: roots.clone(),
-        invoke_threshold: NonZeroUsize::new(*invoke_threshold as usize)
+        roots: quorum.roots().to_vec(),
+        invoke_threshold: NonZeroUsize::new(quorum.invoke_threshold() as usize)
             .expect("validated collection policy has a nonzero invoke threshold"),
-        delegate_threshold: delegate_threshold.map(|threshold| {
+        delegate_threshold: quorum.delegate_threshold().map(|threshold| {
             NonZeroUsize::new(threshold as usize)
                 .expect("validated collection policy has a nonzero delegate threshold")
         }),
@@ -803,7 +798,7 @@ fn discover_admission_evidence_at<S>(
 where
     S: BlobStoreGet + CapabilityProofRead,
 {
-    let needs_proofs = matches!(policy, AdmissionPolicy::Quorum { .. });
+    let needs_proofs = matches!(policy, AdmissionPolicy::Quorum(_));
     if !needs_proofs {
         return Ok(admission_evidence_at(
             snapshot,
