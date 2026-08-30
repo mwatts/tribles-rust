@@ -22,6 +22,7 @@
 //! All store traits stay sync. Async is jailed inside the network thread.
 
 mod channel;
+pub mod collection_activation;
 pub mod collection_delta;
 pub(crate) mod collection_session;
 pub(crate) mod collection_wire;

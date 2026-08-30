@@ -62,6 +62,10 @@ impl CollectionRecordPatch {
                 .expect("an ordered per-collection PATCH key retains its record value")
         })
     }
+
+    pub(crate) const fn patch(&self) -> &PATCH<16, IdentitySchema, CollectionRecord, Blake3Merkle> {
+        &self.records
+    }
 }
 
 /// Failure while constructing an exact per-collection record PATCH.

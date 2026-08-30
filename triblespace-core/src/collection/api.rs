@@ -900,6 +900,55 @@ where
     Ok((loaded.fragment, discovered, cover))
 }
 
+/// Decide READ admission for an untyped collection handle from explicitly
+/// supplied portable proof bundles.
+///
+/// Network discovery starts from the descriptor handle carried on the wire,
+/// before its member encoding is known. This boundary therefore validates the
+/// generic descriptor and its READ policy without manufacturing a typed
+/// [`Collection`]. It neither enumerates nor persists ambient proof state.
+pub fn collection_reader_is_admitted_by_at<S>(
+    snapshot: &S,
+    collection: CollectionHandle,
+    subject: VerifyingKey,
+    bundles: &[CapabilityProofBundle],
+    instant: hifitime::Epoch,
+) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
+where
+    S: BlobStoreGet,
+{
+    let loaded = load_collection_descriptor(snapshot, collection)?;
+    Ok(collection_reader_is_admitted_by_policy_at(
+        collection,
+        &loaded.policy,
+        subject,
+        bundles,
+        instant,
+    ))
+}
+
+/// Decide READ admission against one already validated collection policy.
+///
+/// This is the pure seam for a network host which pinned the descriptor policy
+/// while constructing its immutable per-collection activation overlay. It
+/// performs no store access, proof discovery, persistence, or clock sampling.
+pub fn collection_reader_is_admitted_by_policy_at(
+    collection: CollectionHandle,
+    policy: &CollectionPolicy,
+    subject: VerifyingKey,
+    bundles: &[CapabilityProofBundle],
+    instant: hifitime::Epoch,
+) -> bool {
+    let evidence = admission_evidence_from_bundles(
+        policy.read(),
+        ACTION_READ,
+        CapabilityMode::Invoke,
+        collection,
+        bundles.to_vec().into(),
+    );
+    evidence.authorizes(subject, instant)
+}
+
 impl<L: CollectionEncoding> Collection<L> {
     /// Decide whether `subject` is admitted as a writer at `instant`.
     ///
@@ -965,6 +1014,26 @@ impl<L: CollectionEncoding> Collection<L> {
         )
         .map_err(CollectionAdmissionError::Evidence)?;
         Ok(evidence.authorizes(subject, instant))
+    }
+
+    /// Decide READ admission from one explicitly supplied portable proof set.
+    ///
+    /// This is the network-facing counterpart of [`Self::reader_is_admitted_at`].
+    /// It loads only the immutable collection descriptor from `snapshot`; it
+    /// neither enumerates nor persists ambient proof-store state. An open READ
+    /// policy therefore succeeds with an empty bundle slice, while a quorum is
+    /// evaluated over every supplied bundle as one fixed-point proof forest.
+    pub fn reader_is_admitted_by_at<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+        bundles: &[CapabilityProofBundle],
+        instant: hifitime::Epoch,
+    ) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
+    where
+        S: BlobStoreGet,
+    {
+        collection_reader_is_admitted_by_at(snapshot, self.handle(), subject, bundles, instant)
     }
 
     /// Decide whether `subject` is admitted as a reader now.

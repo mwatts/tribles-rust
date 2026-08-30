@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint origin and opaque anti-entropy root. Payload synchronization remains
   separate and capability-gated.
 
+- Add an immutable per-collection activation overlay: exact collection records
+  and every complete, structurally valid WRITE proof bundle relevant to the
+  descriptor policy form two canonical grow-only PATCHes and one opaque,
+  domain-separated wake digest. Portable bundle framing is strict and bounded,
+  evidence inventory is deliberately independent of wall-clock expiry, and
+  request-supplied READ proof forests now have pure untyped admission and
+  deterministic bounded selection seams for collection networking.
+
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies
   embedded COMMIT signatures without deciding WRITE activation, preserves

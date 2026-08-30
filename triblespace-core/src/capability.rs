@@ -1097,6 +1097,34 @@ impl CapabilityProofBundle {
         Ok(Self { proof, claims })
     }
 
+    /// Validate one portable proof as time-independent evidence for `atom`.
+    ///
+    /// This checks the complete signature and claim-handle chain, closed claim
+    /// shapes, parent links, exact action/resource atom, mode attenuation, and
+    /// that all bounded validity intervals have a nonempty intersection. It
+    /// deliberately does **not** ask whether that interval contains a clock
+    /// instant. A grow-only evidence inventory must retain an expired or
+    /// not-yet-valid proof: time changes whether it authorizes an operation,
+    /// not whether the immutable proof exists.
+    ///
+    /// The caller remains responsible for checking [`CapabilityProof::root_key`]
+    /// against its policy. Keeping that policy-shaped selection outside the
+    /// capability kernel lets the same canonical bundle participate in more
+    /// than one independently described authorization context.
+    pub fn validate_structure_for_atom(
+        &self,
+        atom: CapabilityAtom,
+    ) -> Result<(), CapabilityProofError> {
+        let path = self.validate_path(None)?;
+        if path.effective_atom != atom {
+            return Err(CapabilityProofError::WrongAtom {
+                expected: atom,
+                actual: path.effective_atom,
+            });
+        }
+        Ok(())
+    }
+
     /// Verify this exact closure against an external root and request.
     pub fn verify(
         &self,
@@ -1111,6 +1139,38 @@ impl CapabilityProofBundle {
                 actual: self.proof.root_key().to_bytes(),
             });
         }
+        let path = self.validate_path(Some(instant))?;
+        let actual_leaf = path.leaf;
+        if actual_leaf != expected_leaf {
+            return Err(CapabilityProofError::WrongLeaf {
+                expected: expected_leaf.to_bytes(),
+                actual: actual_leaf.to_bytes(),
+            });
+        }
+        if request.atom() != path.effective_atom
+            || !path.effective_mode.satisfies(request.required())
+        {
+            return Err(CapabilityProofError::RequestMismatch {
+                requested: request,
+                effective_atom: path.effective_atom,
+                effective_mode: path.effective_mode,
+            });
+        }
+        Ok(VerifiedCapability {
+            bundle: self.clone(),
+            claim: path.leaf_claim,
+            claim_handle: path.leaf_claim_handle,
+            subject: actual_leaf,
+            effective_atom: path.effective_atom,
+            effective_mode: path.effective_mode,
+            effective_validity: path.effective_validity,
+        })
+    }
+
+    fn validate_path(
+        &self,
+        instant: Option<Epoch>,
+    ) -> Result<ValidatedCapabilityPath, CapabilityProofError> {
         if self.claims.len() != self.proof.step_count() {
             return Err(CapabilityProofError::ClaimCount {
                 expected: self.proof.step_count(),
@@ -1120,7 +1180,7 @@ impl CapabilityProofBundle {
 
         self.proof.verify_signatures()?;
 
-        let instant_ns = instant.to_tai_duration().total_nanoseconds();
+        let instant_ns = instant.map(|instant| instant.to_tai_duration().total_nanoseconds());
         let mut previous_handle = None;
         let mut effective_atom: Option<CapabilityAtom> = None;
         let mut effective_mode: Option<CapabilityMode> = None;
@@ -1172,11 +1232,13 @@ impl CapabilityProofBundle {
 
             if let Some(validity) = claim.validity() {
                 let (lower, upper) = validity.bounds_ns();
-                if instant_ns < lower {
-                    return Err(CapabilityProofError::NotYetValid { step, lower });
-                }
-                if instant_ns > upper {
-                    return Err(CapabilityProofError::Expired { step, upper });
+                if let Some(instant_ns) = instant_ns {
+                    if instant_ns < lower {
+                        return Err(CapabilityProofError::NotYetValid { step, lower });
+                    }
+                    if instant_ns > upper {
+                        return Err(CapabilityProofError::Expired { step, upper });
+                    }
                 }
                 effective_validity = Some(match effective_validity {
                     None => (lower, upper),
@@ -1194,34 +1256,25 @@ impl CapabilityProofBundle {
             leaf_claim = Some(claim);
         }
 
-        let actual_leaf = self.proof.leaf_key();
-        if actual_leaf != expected_leaf {
-            return Err(CapabilityProofError::WrongLeaf {
-                expected: expected_leaf.to_bytes(),
-                actual: actual_leaf.to_bytes(),
-            });
-        }
-        let effective_atom = effective_atom.expect("nonempty proof has an effective atom");
-        let effective_mode = effective_mode.expect("nonempty proof has an effective mode");
-        if request.atom() != effective_atom || !effective_mode.satisfies(request.required()) {
-            return Err(CapabilityProofError::RequestMismatch {
-                requested: request,
-                effective_atom,
-                effective_mode,
-            });
-        }
-        let leaf_claim = leaf_claim.expect("nonempty proof has a leaf claim");
-        Ok(VerifiedCapability {
-            bundle: self.clone(),
-            claim: leaf_claim,
-            claim_handle: previous_handle.expect("nonempty proof has a leaf handle"),
-            subject: actual_leaf,
-            effective_atom,
-            effective_mode,
+        Ok(ValidatedCapabilityPath {
+            leaf: self.proof.leaf_key(),
+            leaf_claim: leaf_claim.expect("nonempty proof has a leaf claim"),
+            leaf_claim_handle: previous_handle.expect("nonempty proof has a leaf handle"),
+            effective_atom: effective_atom.expect("nonempty proof has an effective atom"),
+            effective_mode: effective_mode.expect("nonempty proof has an effective mode"),
             effective_validity: effective_validity
                 .map(|(lower, upper)| CapabilityValidity::from_bounds_ns(lower, upper)),
         })
     }
+}
+
+struct ValidatedCapabilityPath {
+    leaf: VerifyingKey,
+    leaf_claim: CapabilityClaim,
+    leaf_claim_handle: CapabilityClaimHandle,
+    effective_atom: CapabilityAtom,
+    effective_mode: CapabilityMode,
+    effective_validity: Option<CapabilityValidity>,
 }
 
 /// Decide one exact capability request from a finite forest of direct proofs.
@@ -1799,6 +1852,10 @@ pub enum CapabilityProofError {
         parent: CapabilityAtom,
         child: CapabilityAtom,
     },
+    WrongAtom {
+        expected: CapabilityAtom,
+        actual: CapabilityAtom,
+    },
     EmptyMode {
         step: usize,
     },
@@ -1864,6 +1921,9 @@ impl fmt::Display for CapabilityProofError {
                 formatter,
                 "capability proof claim {step} has an empty atom meet"
             ),
+            Self::WrongAtom { .. } => {
+                formatter.write_str("capability proof describes a different exact atom")
+            }
             Self::EmptyMode { step } => write!(
                 formatter,
                 "capability proof claim {step} has an empty mode meet"
