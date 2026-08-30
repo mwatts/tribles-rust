@@ -138,7 +138,9 @@ idempotent by intrinsic record ID; combining two stores is set union.
 ### Collection Snapshot
 One coherent known-prefix observation `Snapshot<E, V, R>` containing a logical
 view `V`, the exact typed payload `Cover<E>` which names it, and the blob reader
-which validated its dependencies. `TryFromCover<E>` controls whether `V`
+which validated its dependencies. `snapshot_with_admission` additionally
+returns the exact strictly verified COMMIT roots selected during the same
+observation when a consumer needs them. `TryFromCover<E>` controls whether `V`
 eagerly joins member bytes or retains them as a lazy sharded view.
 
 ### CONNECT

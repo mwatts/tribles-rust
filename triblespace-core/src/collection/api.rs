@@ -1127,6 +1127,46 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         snapshot_from_observation(self, &descriptor, discovered, cover)
     }
 
+    /// Capture one snapshot together with its exact admitted COMMIT roots.
+    ///
+    /// This performs the same single capability-aware discovery and
+    /// materialization as [`snapshot`](Self::snapshot), while additionally
+    /// retaining the strictly verified COMMIT records selected by that
+    /// admission event. It is opt-in because each record is substantially
+    /// larger than its deduplicated payload handle. The returned roots are
+    /// intentionally narrower than a later [`claims`](Self::claims) query:
+    /// unauthorized or newly arrived duplicate claims over an admitted
+    /// payload are not retroactive roots of this observation.
+    fn snapshot_with_admission<V, L>(
+        &mut self,
+        collection: Collection<L>,
+    ) -> Result<
+        (
+            Snapshot<L, V, <Self as BlobStore>::Reader>,
+            Vec<CollectionCommit>,
+        ),
+        CollectionSnapshotError<
+            <Self as CollectionStore>::RecordsError,
+            <Self as CapabilityProofStore>::ProofsError,
+            <Self as BlobStore>::ReaderError,
+            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
+            V::Error,
+        >,
+    >
+    where
+        Self: CapabilityProofStore,
+        <Self as BlobStore>::Reader: BlobStoreMeta,
+        L: CollectionEncoding,
+        V: TryFromCover<L>,
+    {
+        let (descriptor, discovered, cover) =
+            discover_admitted_cover_at(self, collection, clock::epoch_now())
+                .map_err(CollectionMaterializationError::from)?;
+        let admitted_commits = discovered.commits().to_vec();
+        let snapshot = snapshot_from_observation(self, &descriptor, discovered, cover)?;
+        Ok((snapshot, admitted_commits))
+    }
+
     /// Replay one opaque exact cover against this store.
     ///
     /// Unlike [`snapshot`](Self::snapshot), this performs no capability or

@@ -163,9 +163,12 @@ for (first, last, quote) in find!(
 resident delegation proofs at one clock instant. It opens one target blob-reader
 view and materializes facts solely from the resulting exact payload cover. The
 returned `Snapshot<SimpleArchive, TribleSet, R>` keeps the logical fact view,
-its typed `Cover<SimpleArchive>`, and reader together. A concurrent commit may
-appear on this call or a later call, but physically visible blobs from an
-unobserved commit cannot leak into the snapshot's admitted set.
+its typed `Cover<SimpleArchive>`, and reader together. Consumers which also
+need the exact strictly verified COMMIT roots can opt into
+`storage.snapshot_with_admission(library)`; those roots are intentionally
+narrower than a later `storage.claims(&cover)` provenance query. A concurrent
+commit may appear on this call or a later call, but physically visible blobs
+from an unobserved commit cannot leak into the snapshot's admitted set.
 
 Use `storage.cover(library)` when only the exact payload frontier is needed. It
 discovers and verifies resident proofs, then scans native collection

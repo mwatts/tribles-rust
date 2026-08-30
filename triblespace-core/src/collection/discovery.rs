@@ -456,6 +456,36 @@ where
     Ok(discovered)
 }
 
+/// Discover one typed payload cover under a caller-supplied signer policy.
+///
+/// The callback decides which claimed signing keys the caller admits. Every
+/// matching COMMIT still undergoes strict Ed25519 verification before its
+/// payload enters the returned cover; invalid signatures and commits outside
+/// the exact collection remain inert. Duplicate claims over one payload
+/// collapse through the cover's set semantics.
+///
+/// This is a deliberately low-level admission seam. Unlike
+/// [`crate::collection::CollectionStoreExt::cover`], it does not discover or
+/// verify capability proofs and does not load the descriptor authority. A
+/// caller using this helper is responsible for supplying an authorization
+/// predicate appropriate to its own already-verified boundary.
+pub fn discover_collection_cover_authorized<S, L, F>(
+    store: &mut S,
+    collection: super::Collection<L>,
+    is_member: F,
+) -> Result<Cover<L>, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+    L: CollectionEncoding,
+    F: Fn(&Inline<ED25519PublicKey>) -> bool,
+{
+    let discovered = discover_collection_records_authorized(store, collection.handle(), is_member)?;
+    Ok(Cover::from_data(
+        collection,
+        discovered.commits().iter().map(CollectionCommit::data),
+    ))
+}
+
 #[cfg(feature = "parallel")]
 fn verify_matching_commits<V>(
     commits: &[CollectionCommit],
@@ -772,6 +802,59 @@ mod tests {
         assert!(discovered.merges().contains(&target_merge));
         assert!(discovered.merges().contains(&other_merge));
         assert_eq!(discovered.derives(), &[crossing_derive]);
+    }
+
+    #[test]
+    fn authorized_cover_applies_caller_policy_and_strict_signature_checks() {
+        let target = collection(1);
+        let authorized_key = SigningKey::from_bytes(&[17; 32]);
+        let foreign_key = SigningKey::from_bytes(&[18; 32]);
+        let admitted = CollectionCommit::sign(
+            &authorized_key,
+            target.handle(),
+            data(1),
+            empty_metadata_handle(),
+        );
+        let duplicate = CollectionCommit::sign(
+            &authorized_key,
+            target.handle(),
+            data(1),
+            Inline::new([9; 32]),
+        );
+        let unauthorized = CollectionCommit::sign(
+            &foreign_key,
+            target.handle(),
+            data(2),
+            empty_metadata_handle(),
+        );
+        let invalid = invalid_signature(CollectionCommit::sign(
+            &authorized_key,
+            target.handle(),
+            data(3),
+            empty_metadata_handle(),
+        ));
+        let mut store = ProbeStore {
+            records: [
+                CollectionRecord::Commit(unauthorized),
+                CollectionRecord::Commit(invalid),
+                CollectionRecord::Commit(duplicate),
+                CollectionRecord::Commit(admitted),
+            ]
+            .into_iter()
+            .map(Ok)
+            .collect(),
+            ..ProbeStore::default()
+        };
+
+        let cover = discover_collection_cover_authorized(&mut store, target, |subject| {
+            *subject == signer(&authorized_key)
+        })
+        .unwrap();
+        assert_eq!(cover.collection(), target);
+        assert_eq!(
+            cover.members().collect::<Vec<_>>(),
+            vec![Handle::<SimpleArchive>::from_hash(admitted.data())],
+        );
     }
 
     #[test]

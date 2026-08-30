@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add opt-in `snapshot_with_admission` for consumers which need the exact
+  strictly verified COMMIT roots used by one capability-aware snapshot. The
+  ordinary snapshot stays lean, while the returned roots stay narrower than
+  later provenance queries over the same cover.
+
+- Add `discover_collection_cover_authorized` as a narrow low-level bridge from
+  a caller-supplied signer policy to a typed, strictly verified payload cover,
+  without exposing `Cover` constructors or implicitly discovering capability
+  proofs.
+
 - Give collection validation, canonical joins, mappings, and cover views one
   frozen blob-reader boundary. Encodings and mappings may resolve immutable
   content-addressed dependencies named by their source members without making

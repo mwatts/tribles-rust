@@ -162,7 +162,11 @@ Their distinct data handles form a `Cover<E>`. It opens one target reader and
 constructs a logical view from only that payload set. The returned
 `Snapshot<E, V, R>` keeps the logical view `V`, exact cover, and reader together
 so downstream code cannot accidentally pair one logical frontier with a
-different physical view. For a
+different physical view. Consumers which need the exact strictly verified
+COMMIT roots selected during the same capability-aware admission event use
+`snapshot_with_admission`; later claims over the same payload remain broader
+provenance rather than retroactive roots. Ordinary snapshots do not retain one
+192-byte record per attestation. For a
 `SimpleArchive`, `V = TribleSet`; for a `SuccinctArchiveBlob`, `V` may be
 an mmap-backed `UnionArchive` retaining all selected shards.
 

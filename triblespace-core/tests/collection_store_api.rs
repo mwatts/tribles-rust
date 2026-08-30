@@ -390,6 +390,13 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     assert_ne!(duplicate.id(), root.id());
     assert_eq!(duplicate.data(), root.data());
 
+    // A valid signature by a writer with no resident delegation remains
+    // queryable provenance, but is not one of this observation's admission
+    // roots even though it names an already-admitted payload.
+    let foreign = SigningKey::from_bytes(&[22; 32]);
+    let foreign_duplicate = store.commit(collection, &foreign, fragment(1)).unwrap();
+    assert_eq!(foreign_duplicate.data(), root.data());
+
     let cover = store.cover(collection).unwrap();
     assert_eq!(cover, cover_before_duplicate);
     assert_eq!(cover.collection(), collection);
@@ -408,10 +415,22 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
             .into_iter()
             .map(|claim| claim.id())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([root.id(), delegated.id(), duplicate.id()]),
+        BTreeSet::from([
+            root.id(),
+            delegated.id(),
+            duplicate.id(),
+            foreign_duplicate.id(),
+        ]),
     );
 
-    let snapshot = store.snapshot(collection).unwrap();
+    let (snapshot, admitted_commits) = store.snapshot_with_admission(collection).unwrap();
+    assert_eq!(
+        admitted_commits
+            .iter()
+            .map(|commit| commit.id())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([root.id(), delegated.id(), duplicate.id()]),
+    );
     let mut expected = fragment(1).into_facts();
     expected += fragment(2).into_facts();
     assert_eq!(snapshot.facts(), &expected);
