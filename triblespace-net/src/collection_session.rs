@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{CapabilityProofBundle, CapabilityProofId};
@@ -336,7 +336,6 @@ mod tests {
         AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRecord,
         CollectionStore, CollectionStoreExt, empty_metadata_handle,
     };
-    use triblespace_core::inline::Inline;
     use triblespace_core::repo::SnapshotSource;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
