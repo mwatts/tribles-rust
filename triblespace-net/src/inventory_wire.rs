@@ -19,12 +19,16 @@ use triblespace_core::capability::{
     MAX_CAPABILITY_PROOF_STEPS, VerifiedCapability,
 };
 use triblespace_core::collection::{COLLECTION_COMMIT_BYTES_LEN, CollectionRecord};
-use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH, PatchHash};
+use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use triblespace_core::repo::peer::{PEER_EVIDENCE_BYTES_LEN, PeerEvidence};
 
 use crate::inventory::{
     AuthorizedInventorySession, ComponentManifest, InventoryComponent, InventoryGeneration,
     InventoryManifest, sync_team_capability_atom,
+};
+use crate::patch_repair::{
+    PatchBranch, PatchChild, PatchLeaf, PatchNode, PatchNodeResponse, PatchRepairRequest,
+    PatchSummary, patch_node_response, validate_patch_node,
 };
 use crate::protocol::{
     recv_capability_proof_bundle, recv_hash, recv_proof_response, recv_u8, recv_u32_be,
@@ -188,8 +192,8 @@ pub(crate) async fn send_manifest<W: AsyncWrite + Unpin>(
     send_hash(send, &manifest.generation().into_bytes()).await?;
     for component in manifest.components() {
         send_u8(send, component.component() as u8).await?;
-        send_u64_be(send, component.leaf_count()).await?;
-        match component.root() {
+        send_u64_be(send, component.summary().leaf_count()).await?;
+        match component.summary().root() {
             None => send_u8(send, 0).await?,
             Some(root) => {
                 send_u8(send, 1).await?;
@@ -217,10 +221,8 @@ async fn recv_manifest<R: AsyncRead + Unpin>(
             1 => Some(recv_hash(recv).await?),
             marker => bail!("invalid inventory root marker {marker:#x}"),
         };
-        if root.is_none() != (leaf_count == 0) {
-            bail!("empty inventory root and leaf count disagree");
-        }
-        components.push(ComponentManifest::from_wire(component, leaf_count, root)?);
+        let summary = PatchSummary::new(root, leaf_count)?;
+        components.push(ComponentManifest::from_wire(component, summary));
     }
     require_eof(recv).await?;
     let components: [ComponentManifest; 4] = components
@@ -245,82 +247,41 @@ pub(crate) async fn op_inventory_manifest<C: Conn>(
     recv_manifest(&mut recv, team).await
 }
 
-/// Exact request for one node in a pinned component tree.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InventoryNodeRequest {
-    pub(crate) component: InventoryComponent,
-    /// Exact non-empty component root advertised by the manifest.
-    pub(crate) root: [u8; 32],
-    /// Manifest count committed by `root`.
-    pub(crate) leaf_count: u64,
-    /// Prefix relative to the authorized component base.
-    pub(crate) prefix: Vec<u8>,
-    /// Digest the caller expects at this exact prefix.
-    pub(crate) expected_digest: [u8; 32],
-}
-
-impl InventoryNodeRequest {
-    pub(crate) fn new(
-        team: ed25519_dalek::VerifyingKey,
-        component: InventoryComponent,
-        root: [u8; 32],
-        leaf_count: u64,
-        prefix: Vec<u8>,
-        expected_digest: [u8; 32],
-    ) -> Result<Self> {
-        if leaf_count == 0 {
-            bail!("a node request cannot pin an empty component");
-        }
-        let maximum = component.relative_key_len(component.base_prefix(team));
-        if prefix.len() > maximum {
-            bail!(
-                "inventory prefix is {} bytes; component-relative key is {maximum} bytes",
-                prefix.len()
-            );
-        }
-        if prefix.is_empty() && expected_digest != root {
-            bail!("component-root request digest does not match its pinned root");
-        }
-        Ok(Self {
-            component,
-            root,
-            leaf_count,
-            prefix,
-            expected_digest,
-        })
-    }
-}
-
 async fn send_node_request<W: AsyncWrite + Unpin>(
     send: &mut W,
-    request: &InventoryNodeRequest,
+    request: &PatchRepairRequest<InventoryComponent>,
 ) -> Result<()> {
     send_u8(send, OP_INVENTORY_NODE).await?;
-    send_u8(send, request.component as u8).await?;
-    send_hash(send, &request.root).await?;
-    send_u64_be(send, request.leaf_count).await?;
-    send_u8(
+    send_u8(send, *request.scope() as u8).await?;
+    send_hash(
         send,
-        u8::try_from(request.prefix.len()).expect("inventory keys are at most 64 bytes"),
+        &request
+            .summary()
+            .root()
+            .expect("a repair request has a nonempty summary"),
     )
     .await?;
-    send.write_all(&request.prefix)
+    send_u64_be(send, request.summary().leaf_count()).await?;
+    send_u8(
+        send,
+        u8::try_from(request.prefix().len()).expect("inventory keys are at most 64 bytes"),
+    )
+    .await?;
+    send.write_all(request.prefix())
         .await
         .map_err(|error| anyhow!("send inventory prefix: {error}"))?;
-    send_hash(send, &request.expected_digest).await
+    send_hash(send, &request.expected_digest()).await
 }
 
 /// Decode one node request relative to the connection's authorized base.
 pub(crate) async fn recv_node_request<R: AsyncRead + Unpin>(
     recv: &mut R,
     authorized: AuthorizedInventorySession,
-) -> Result<InventoryNodeRequest> {
+) -> Result<PatchRepairRequest<InventoryComponent>> {
     let component = InventoryComponent::from_byte(recv_u8(recv).await?)?;
     let root = recv_hash(recv).await?;
     let leaf_count = recv_u64_be(recv).await?;
-    if leaf_count == 0 {
-        bail!("a node request cannot pin an empty component");
-    }
+    let summary = PatchSummary::new(Some(root), leaf_count)?;
     let prefix_length = recv_u8(recv).await? as usize;
     let maximum = component.relative_key_len(authorized.base_prefix(component));
     if prefix_length > maximum {
@@ -331,16 +292,7 @@ pub(crate) async fn recv_node_request<R: AsyncRead + Unpin>(
     let prefix = recv_exact_vec(recv, prefix_length, "inventory prefix").await?;
     let expected_digest = recv_hash(recv).await?;
     require_eof(recv).await?;
-    if prefix.is_empty() && expected_digest != root {
-        bail!("component-root request digest does not match its pinned root");
-    }
-    Ok(InventoryNodeRequest {
-        component,
-        root,
-        leaf_count,
-        prefix,
-        expected_digest,
-    })
+    PatchRepairRequest::new(component, summary, maximum, prefix, expected_digest)
 }
 
 /// Value carried by one inventory leaf. Keys remain the only hashed input.
@@ -367,158 +319,34 @@ impl InventoryLeafValue {
     }
 }
 
-/// One canonical PATCH leaf.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InventoryLeaf {
-    /// Complete key relative to the authorized component base.
-    pub(crate) key: Vec<u8>,
-    pub(crate) value: InventoryLeafValue,
-}
-
-/// Authenticated summary of one child edge.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InventoryChild {
-    pub(crate) edge: u8,
-    pub(crate) digest: [u8; 32],
-    pub(crate) leaf_count: u64,
-}
-
-/// One canonical PATCH branch. Depth and representative are relative to the
-/// authorized component base; child edges are strictly ascending.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InventoryBranch {
-    pub(crate) representative: Vec<u8>,
-    pub(crate) end_depth: u8,
-    pub(crate) children: Vec<InventoryChild>,
-}
-
-/// One authenticated PATCH node returned by the server.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InventoryNode {
-    Leaf {
-        digest: [u8; 32],
-        leaf: InventoryLeaf,
-    },
-    Branch {
-        digest: [u8; 32],
-        leaf_count: u64,
-        branch: InventoryBranch,
-    },
-}
-
-impl InventoryNode {
-    pub(crate) const fn digest(&self) -> [u8; 32] {
-        match self {
-            Self::Leaf { digest, .. } | Self::Branch { digest, .. } => *digest,
-        }
-    }
-
-    pub(crate) const fn leaf_count(&self) -> u64 {
-        match self {
-            Self::Leaf { .. } => 1,
-            Self::Branch { leaf_count, .. } => *leaf_count,
-        }
-    }
-}
-
-/// Result of one pinned node lookup.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InventoryNodeResponse {
-    Found(InventoryNode),
-    /// The exact `(team, component, root)` snapshot is no longer cached.
-    SnapshotUnavailable,
-    /// No node exists at the requested prefix in the pinned snapshot.
-    PrefixAbsent,
-}
-
-pub(crate) fn key_node_response<const KEY_LEN: usize, V>(
+pub(crate) fn inventory_node_response<const KEY_LEN: usize, V>(
     inventory: &PATCH<KEY_LEN, IdentitySchema, V, Blake3Merkle>,
     team: ed25519_dalek::VerifyingKey,
     component: InventoryComponent,
     relative_prefix: &[u8],
     resolve: impl FnOnce([u8; KEY_LEN], &V) -> Result<InventoryLeafValue>,
-) -> Result<InventoryNodeResponse> {
+) -> Result<PatchNodeResponse<InventoryLeafValue>> {
     let base = component.base_prefix(team);
-    let mut absolute_prefix = Vec::with_capacity(base.as_bytes().len() + relative_prefix.len());
-    absolute_prefix.extend_from_slice(base.as_bytes());
-    absolute_prefix.extend_from_slice(relative_prefix);
-    let Some(node) = inventory.merkle_node(&absolute_prefix) else {
-        return Ok(InventoryNodeResponse::PrefixAbsent);
-    };
-
-    let digest = node.digest();
-    if node.is_leaf() {
-        let absolute = *node.representative();
-        let value = inventory
-            .get(&absolute)
-            .ok_or_else(|| anyhow!("inventory Merkle leaf has no matching PATCH value"))?;
-        let value = resolve(absolute, value)?;
-        let key = base.relative_key(component, &absolute)?.to_vec();
-        return Ok(InventoryNodeResponse::Found(InventoryNode::Leaf {
-            digest,
-            leaf: InventoryLeaf { key, value },
-        }));
-    }
-
-    let representative = base
-        .relative_key(component, node.representative())?
-        .to_vec();
-    let end_depth = node
-        .end_depth()
-        .checked_sub(base.as_bytes().len())
-        .ok_or_else(|| anyhow!("inventory Merkle node precedes its component base"))?;
-    let end_depth = u8::try_from(end_depth)
-        .map_err(|_| anyhow!("inventory Merkle depth does not fit the wire frame"))?;
-    let children = node
-        .children()
-        .map(|(edge, child)| InventoryChild {
-            edge,
-            digest: child.digest(),
-            leaf_count: child.leaf_count(),
-        })
-        .collect();
-    Ok(InventoryNodeResponse::Found(InventoryNode::Branch {
-        digest,
-        leaf_count: node.leaf_count(),
-        branch: InventoryBranch {
-            representative,
-            end_depth,
-            children,
-        },
-    }))
+    patch_node_response(inventory, base.as_bytes(), relative_prefix, resolve)
 }
 
 fn validate_node(
     team: ed25519_dalek::VerifyingKey,
-    request: &InventoryNodeRequest,
-    node: &InventoryNode,
+    request: &PatchRepairRequest<InventoryComponent>,
+    node: &PatchNode<InventoryLeafValue>,
 ) -> Result<()> {
-    if node.digest() != request.expected_digest {
-        bail!("inventory node digest does not match the requested digest");
-    }
-    if node.leaf_count() > request.leaf_count {
-        bail!("inventory node exceeds its pinned component leaf count");
-    }
-    if request.prefix.is_empty() && node.leaf_count() != request.leaf_count {
-        bail!("inventory root node count does not match its pinned manifest count");
-    }
-    let component = request.component;
+    let component = *request.scope();
     let base = component.base_prefix(team);
-    let relative_key_len = component.relative_key_len(base);
-    match node {
-        InventoryNode::Leaf { digest, leaf } => {
-            if leaf.value.component() != component {
+    validate_patch_node(
+        request,
+        component.key_len(),
+        base.as_bytes(),
+        node,
+        |absolute, value| {
+            if value.component() != component {
                 bail!("inventory leaf value does not match requested component");
             }
-            if leaf.key.len() != relative_key_len || !leaf.key.starts_with(&request.prefix) {
-                bail!("inventory leaf key is outside the requested relative prefix");
-            }
-            let absolute = base.absolute_key(component, &leaf.key)?;
-            let expected = <Blake3Merkle as PatchHash>::leaf(&absolute);
-            if digest != &expected {
-                bail!("inventory leaf digest does not bind its full PATCH key");
-            }
-            match &leaf.value {
+            match value {
                 InventoryLeafValue::Peer => {
                     let bytes: [u8; PEER_EVIDENCE_BYTES_LEN] = absolute
                         .try_into()
@@ -537,73 +365,9 @@ fn validate_node(
                 }
                 InventoryLeafValue::Blob => {}
             }
-        }
-        InventoryNode::Branch {
-            digest,
-            leaf_count,
-            branch,
-        } => {
-            let end_depth = branch.end_depth as usize;
-            if branch.representative.len() != relative_key_len
-                || !branch.representative.starts_with(&request.prefix)
-            {
-                bail!("inventory branch representative is outside the requested prefix");
-            }
-            if end_depth < request.prefix.len() || end_depth >= relative_key_len {
-                bail!("inventory branch end depth is outside its relative key");
-            }
-            if !(2..=256).contains(&branch.children.len()) {
-                bail!("inventory branch fanout is not canonical");
-            }
-            if branch.children[0].edge != branch.representative[end_depth] {
-                bail!("inventory branch representative is not in its first child");
-            }
-            let mut previous = None;
-            let mut summed_count = 0u64;
-            for child in &branch.children {
-                if previous.is_some_and(|edge| child.edge <= edge) {
-                    bail!("inventory branch child edges are not strictly ascending");
-                }
-                if child.leaf_count == 0 {
-                    bail!("inventory branch child has zero leaves");
-                }
-                previous = Some(child.edge);
-                summed_count = summed_count
-                    .checked_add(child.leaf_count)
-                    .ok_or_else(|| anyhow!("inventory branch leaf count overflow"))?;
-            }
-            if summed_count != *leaf_count {
-                bail!("inventory branch child counts do not match its leaf count");
-            }
-            let absolute = base.absolute_key(component, &branch.representative)?;
-            let absolute_end_depth = base.as_bytes().len() + end_depth;
-            // Every inventory PATCH uses IdentitySchema, so trie depth and
-            // key-byte depth are identical. Reconstruct that mapping here to
-            // recompute the complete authenticated branch descriptor from the
-            // wire shape.
-            let tree_to_key: Vec<usize> = (0..absolute.len()).collect();
-            let mut state = <Blake3Merkle as PatchHash>::begin_branch(
-                &absolute,
-                &tree_to_key,
-                absolute_end_depth,
-                branch.children.len(),
-                *leaf_count,
-            );
-            for child in &branch.children {
-                <Blake3Merkle as PatchHash>::push_child(
-                    &mut state,
-                    child.edge,
-                    child.leaf_count,
-                    child.digest,
-                );
-            }
-            let expected = <Blake3Merkle as PatchHash>::finish_branch(state);
-            if digest != &expected {
-                bail!("inventory branch digest does not bind its canonical child summaries");
-            }
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 async fn send_leaf_value<W: AsyncWrite + Unpin>(
@@ -670,22 +434,22 @@ async fn recv_leaf_value<R: AsyncRead + Unpin>(
 pub(crate) async fn send_node_response<W: AsyncWrite + Unpin>(
     send: &mut W,
     team: ed25519_dalek::VerifyingKey,
-    request: &InventoryNodeRequest,
-    response: &InventoryNodeResponse,
+    request: &PatchRepairRequest<InventoryComponent>,
+    response: &PatchNodeResponse<InventoryLeafValue>,
 ) -> Result<()> {
     let node = match response {
-        InventoryNodeResponse::SnapshotUnavailable => {
+        PatchNodeResponse::SnapshotUnavailable => {
             return send_u8(send, NODE_SNAPSHOT_UNAVAILABLE).await;
         }
-        InventoryNodeResponse::PrefixAbsent => {
+        PatchNodeResponse::PrefixAbsent => {
             return send_u8(send, NODE_PREFIX_ABSENT).await;
         }
-        InventoryNodeResponse::Found(node) => node,
+        PatchNodeResponse::Found(node) => node,
     };
     validate_node(team, request, node)?;
     send_u8(send, NODE_FOUND).await?;
     match node {
-        InventoryNode::Leaf { digest, leaf } => {
+        PatchNode::Leaf { digest, leaf } => {
             send_u8(send, NODE_LEAF).await?;
             send_hash(send, digest).await?;
             send_u64_be(send, 1).await?;
@@ -694,7 +458,7 @@ pub(crate) async fn send_node_response<W: AsyncWrite + Unpin>(
                 .map_err(|error| anyhow!("send inventory leaf key: {error}"))?;
             send_leaf_value(send, &leaf.value).await
         }
-        InventoryNode::Branch {
+        PatchNode::Branch {
             digest,
             leaf_count,
             branch,
@@ -724,35 +488,34 @@ pub(crate) async fn send_node_response<W: AsyncWrite + Unpin>(
 async fn recv_node_response<R: AsyncRead + Unpin>(
     recv: &mut R,
     team: ed25519_dalek::VerifyingKey,
-    request: &InventoryNodeRequest,
-) -> Result<InventoryNodeResponse> {
+    request: &PatchRepairRequest<InventoryComponent>,
+) -> Result<PatchNodeResponse<InventoryLeafValue>> {
     let kind = match recv_u8(recv).await? {
         NODE_SNAPSHOT_UNAVAILABLE => {
             require_eof(recv).await?;
-            return Ok(InventoryNodeResponse::SnapshotUnavailable);
+            return Ok(PatchNodeResponse::SnapshotUnavailable);
         }
         NODE_PREFIX_ABSENT => {
             require_eof(recv).await?;
-            return Ok(InventoryNodeResponse::PrefixAbsent);
+            return Ok(PatchNodeResponse::PrefixAbsent);
         }
         NODE_FOUND => recv_u8(recv).await?,
         status => bail!("unknown inventory node response {status:#x}"),
     };
     let digest = recv_hash(recv).await?;
     let leaf_count = recv_u64_be(recv).await?;
-    let relative_key_len = request
-        .component
-        .relative_key_len(request.component.base_prefix(team));
+    let component = *request.scope();
+    let relative_key_len = component.relative_key_len(component.base_prefix(team));
     let node = match kind {
         NODE_LEAF => {
             if leaf_count != 1 {
                 bail!("inventory leaf advertises {leaf_count} leaves");
             }
             let key = recv_exact_vec(recv, relative_key_len, "inventory leaf key").await?;
-            let value = recv_leaf_value(recv, request.component).await?;
-            InventoryNode::Leaf {
+            let value = recv_leaf_value(recv, component).await?;
+            PatchNode::Leaf {
                 digest,
-                leaf: InventoryLeaf { key, value },
+                leaf: PatchLeaf { key, value },
             }
         }
         NODE_BRANCH => {
@@ -768,16 +531,16 @@ async fn recv_node_response<R: AsyncRead + Unpin>(
                 .try_reserve_exact(child_count)
                 .map_err(|error| anyhow!("cannot allocate inventory children: {error}"))?;
             for _ in 0..child_count {
-                children.push(InventoryChild {
+                children.push(PatchChild {
                     edge: recv_u8(recv).await?,
                     digest: recv_hash(recv).await?,
                     leaf_count: recv_u64_be(recv).await?,
                 });
             }
-            InventoryNode::Branch {
+            PatchNode::Branch {
                 digest,
                 leaf_count,
-                branch: InventoryBranch {
+                branch: PatchBranch {
                     representative,
                     end_depth,
                     children,
@@ -788,15 +551,15 @@ async fn recv_node_response<R: AsyncRead + Unpin>(
     };
     require_eof(recv).await?;
     validate_node(team, request, &node)?;
-    Ok(InventoryNodeResponse::Found(node))
+    Ok(PatchNodeResponse::Found(node))
 }
 
 /// Fetch one node from an exact immutable component snapshot.
 pub(crate) async fn op_inventory_node<C: Conn>(
     connection: &C,
     team: ed25519_dalek::VerifyingKey,
-    request: &InventoryNodeRequest,
-) -> Result<InventoryNodeResponse> {
+    request: &PatchRepairRequest<InventoryComponent>,
+) -> Result<PatchNodeResponse<InventoryLeafValue>> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -973,6 +736,7 @@ pub(crate) async fn op_inventory_blob_range<C: Conn>(
 mod tests {
     use ed25519_dalek::SigningKey;
     use tokio::io::{AsyncWriteExt, duplex};
+    use triblespace_core::patch::PatchHash;
 
     use super::*;
 
@@ -980,12 +744,34 @@ mod tests {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
+    fn request(
+        team: ed25519_dalek::VerifyingKey,
+        component: InventoryComponent,
+        root: [u8; 32],
+        leaf_count: u64,
+        prefix: Vec<u8>,
+        expected_digest: [u8; 32],
+    ) -> PatchRepairRequest<InventoryComponent> {
+        let base = component.base_prefix(team);
+        PatchRepairRequest::new(
+            component,
+            PatchSummary::new(Some(root), leaf_count).unwrap(),
+            component.relative_key_len(base),
+            prefix,
+            expected_digest,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn manifest_codec_binds_team_roots_counts_and_generation() {
         let team = team();
         let components = InventoryComponent::ALL.map(|component| {
             let count = component as u64;
-            ComponentManifest::new(component, count, Some([component as u8; 32]))
+            ComponentManifest::new(
+                component,
+                PatchSummary::new(Some([component as u8; 32]), count).unwrap(),
+            )
         });
         let manifest = InventoryManifest::new(team, components);
         let (mut writer, mut reader) = duplex(4096);
@@ -1001,18 +787,17 @@ mod tests {
         let peer = SigningKey::from_bytes(&[2; 32]).verifying_key();
         let absolute = PeerEvidence::new(team, peer).to_bytes();
         let digest = <Blake3Merkle as PatchHash>::leaf(&absolute);
-        let request = InventoryNodeRequest::new(
+        let request = request(
             team,
             InventoryComponent::Peer,
             digest,
             1,
             Vec::new(),
             digest,
-        )
-        .unwrap();
-        let response = InventoryNodeResponse::Found(InventoryNode::Leaf {
+        );
+        let response = PatchNodeResponse::Found(PatchNode::Leaf {
             digest,
-            leaf: InventoryLeaf {
+            leaf: PatchLeaf {
                 key: peer.to_bytes().to_vec(),
                 value: InventoryLeafValue::Peer,
             },
@@ -1038,12 +823,12 @@ mod tests {
         let first_digest = <Blake3Merkle as PatchHash>::leaf(&first_key);
         let second_digest = <Blake3Merkle as PatchHash>::leaf(&second_key);
         let children = vec![
-            InventoryChild {
+            PatchChild {
                 edge: 0x10,
                 digest: first_digest,
                 leaf_count: 1,
             },
-            InventoryChild {
+            PatchChild {
                 edge: 0x20,
                 digest: second_digest,
                 leaf_count: 1,
@@ -1061,19 +846,18 @@ mod tests {
             );
         }
         let digest = <Blake3Merkle as PatchHash>::finish_branch(state);
-        let request = InventoryNodeRequest::new(
+        let request = request(
             team,
             InventoryComponent::Blob,
             digest,
             2,
             Vec::new(),
             digest,
-        )
-        .unwrap();
-        let response = InventoryNodeResponse::Found(InventoryNode::Branch {
+        );
+        let response = PatchNodeResponse::Found(PatchNode::Branch {
             digest,
             leaf_count: 2,
-            branch: InventoryBranch {
+            branch: PatchBranch {
                 representative: first_key.to_vec(),
                 end_depth: 0,
                 children,
@@ -1095,28 +879,27 @@ mod tests {
     #[tokio::test]
     async fn malformed_branch_counts_are_rejected_before_send() {
         let team = team();
-        let request = InventoryNodeRequest::new(
+        let request = request(
             team,
             InventoryComponent::Blob,
             [9; 32],
             3,
             Vec::new(),
             [9; 32],
-        )
-        .unwrap();
-        let response = InventoryNodeResponse::Found(InventoryNode::Branch {
+        );
+        let response = PatchNodeResponse::Found(PatchNode::Branch {
             digest: [9; 32],
             leaf_count: 3,
-            branch: InventoryBranch {
+            branch: PatchBranch {
                 representative: vec![0; 32],
                 end_depth: 0,
                 children: vec![
-                    InventoryChild {
+                    PatchChild {
                         edge: 0,
                         digest: [1; 32],
                         leaf_count: 1,
                     },
-                    InventoryChild {
+                    PatchChild {
                         edge: 1,
                         digest: [2; 32],
                         leaf_count: 1,
@@ -1137,12 +920,12 @@ mod tests {
         let team = team();
         let representative = [0x10; 32];
         let mut children = vec![
-            InventoryChild {
+            PatchChild {
                 edge: 0x10,
                 digest: [1; 32],
                 leaf_count: 3,
             },
-            InventoryChild {
+            PatchChild {
                 edge: 0x20,
                 digest: [2; 32],
                 leaf_count: 1,
@@ -1165,22 +948,21 @@ mod tests {
             );
         }
         let digest = <Blake3Merkle as PatchHash>::finish_branch(state);
-        let request = InventoryNodeRequest::new(
+        let request = request(
             team,
             InventoryComponent::Blob,
             digest,
             4,
             Vec::new(),
             digest,
-        )
-        .unwrap();
+        );
 
         children[0].leaf_count = 2;
         children[1].leaf_count = 2;
-        let forged = InventoryNodeResponse::Found(InventoryNode::Branch {
+        let forged = PatchNodeResponse::Found(PatchNode::Branch {
             digest,
             leaf_count: 4,
-            branch: InventoryBranch {
+            branch: PatchBranch {
                 representative: representative.to_vec(),
                 end_depth: 0,
                 children,

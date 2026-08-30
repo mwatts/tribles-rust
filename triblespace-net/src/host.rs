@@ -38,15 +38,17 @@ use crate::inventory::{
     PeerInventory, ReconcileQos, build_key_inventory, build_proof_inventory,
     build_record_inventory, sync_team_capability_atom,
 };
-use crate::inventory_reconcile::InventoryWalker;
 use crate::inventory_wire::{
     BLOB_TRANSFER_CHUNK_BYTES, InventoryBlobRangeRequest, InventoryBlobRangeResponse,
-    InventoryLeaf, InventoryLeafValue, InventoryNodeRequest, InventoryNodeResponse,
-    OP_INVENTORY_AUTH, OP_INVENTORY_BLOB_RANGE, OP_INVENTORY_MANIFEST, OP_INVENTORY_NODE,
-    key_node_response, op_inventory_auth, op_inventory_blob_range, op_inventory_manifest,
-    op_inventory_node, recv_blob_range_request, recv_inventory_auth_request, recv_manifest_request,
-    recv_node_request, send_blob_not_in_snapshot, send_blob_range, send_blob_snapshot_unavailable,
-    send_inventory_auth_ok, send_inventory_auth_rejected, send_manifest, send_node_response,
+    InventoryLeafValue, OP_INVENTORY_AUTH, OP_INVENTORY_BLOB_RANGE, OP_INVENTORY_MANIFEST,
+    OP_INVENTORY_NODE, inventory_node_response, op_inventory_auth, op_inventory_blob_range,
+    op_inventory_manifest, op_inventory_node, recv_blob_range_request, recv_inventory_auth_request,
+    recv_manifest_request, recv_node_request, send_blob_not_in_snapshot, send_blob_range,
+    send_blob_snapshot_unavailable, send_inventory_auth_ok, send_inventory_auth_rejected,
+    send_manifest, send_node_response,
+};
+use crate::patch_repair::{
+    PatchLeaf, PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary,
 };
 use crate::protocol::*;
 use crate::provider::{
@@ -147,14 +149,15 @@ struct InventoryComponentSnapshot {
 }
 
 impl InventoryComponentSnapshot {
-    fn node_summary(&self, relative_prefix: &[u8]) -> Option<([u8; 32], u64)> {
+    fn node_summary(&self, relative_prefix: &[u8]) -> Option<PatchSummary> {
         fn summary<const KEY_LEN: usize, V>(
             inventory: &PATCH<KEY_LEN, IdentitySchema, V, triblespace_core::patch::Blake3Merkle>,
             prefix: &[u8],
-        ) -> Option<([u8; 32], u64)> {
-            inventory
-                .merkle_node(prefix)
-                .map(|node| (node.digest(), node.leaf_count()))
+        ) -> Option<PatchSummary> {
+            inventory.merkle_node(prefix).map(|node| {
+                PatchSummary::new(Some(node.digest()), node.leaf_count())
+                    .expect("a PATCH node is nonempty")
+            })
         }
 
         let component = self.manifest.component();
@@ -205,26 +208,27 @@ impl InventoryComponentSnapshot {
 
     fn inventory_node(
         &self,
-        request: &InventoryNodeRequest,
-    ) -> anyhow::Result<InventoryNodeResponse> {
-        if request.component != self.manifest.component()
-            || self.manifest.root() != Some(request.root)
-            || self.manifest.leaf_count() != request.leaf_count
+        request: &PatchRepairRequest<InventoryComponent>,
+    ) -> anyhow::Result<PatchNodeResponse<InventoryLeafValue>> {
+        if *request.scope() != self.manifest.component()
+            || self.manifest.summary() != request.summary()
         {
-            return Ok(InventoryNodeResponse::SnapshotUnavailable);
+            return Ok(PatchNodeResponse::SnapshotUnavailable);
         }
         let component = self.manifest.component();
         match &self.data {
-            InventoryComponentData::Peer(inventory) => {
-                key_node_response(inventory, self.team, component, &request.prefix, |_, ()| {
-                    Ok(InventoryLeafValue::Peer)
-                })
-            }
-            InventoryComponentData::CollectionRecord(inventory) => key_node_response(
+            InventoryComponentData::Peer(inventory) => inventory_node_response(
                 inventory,
                 self.team,
                 component,
-                &request.prefix,
+                request.prefix(),
+                |_, ()| Ok(InventoryLeafValue::Peer),
+            ),
+            InventoryComponentData::CollectionRecord(inventory) => inventory_node_response(
+                inventory,
+                self.team,
+                component,
+                request.prefix(),
                 |key, record| {
                     let id = Id::new(key).ok_or_else(|| {
                         anyhow::anyhow!("inventory contains the reserved nil record id")
@@ -237,11 +241,11 @@ impl InventoryComponentSnapshot {
                     Ok(InventoryLeafValue::CollectionRecord(*record))
                 },
             ),
-            InventoryComponentData::CapabilityProof(inventory) => key_node_response(
+            InventoryComponentData::CapabilityProof(inventory) => inventory_node_response(
                 inventory,
                 self.team,
                 component,
-                &request.prefix,
+                request.prefix(),
                 |key, proof| {
                     if proof.id() != CapabilityProofId::new(key) {
                         anyhow::bail!(
@@ -251,11 +255,13 @@ impl InventoryComponentSnapshot {
                     Ok(InventoryLeafValue::CapabilityProof(proof.clone()))
                 },
             ),
-            InventoryComponentData::Blob { inventory, .. } => {
-                key_node_response(inventory, self.team, component, &request.prefix, |_, ()| {
-                    Ok(InventoryLeafValue::Blob)
-                })
-            }
+            InventoryComponentData::Blob { inventory, .. } => inventory_node_response(
+                inventory,
+                self.team,
+                component,
+                request.prefix(),
+                |_, ()| Ok(InventoryLeafValue::Blob),
+            ),
         }
     }
 
@@ -273,8 +279,8 @@ impl InventoryComponentSnapshot {
         let InventoryComponentData::Blob { inventory, reader } = &self.data else {
             return PinnedBlob::SnapshotUnavailable;
         };
-        if self.manifest.root() != Some(request.root)
-            || self.manifest.leaf_count() != request.leaf_count
+        if self.manifest.summary().root() != Some(request.root)
+            || self.manifest.summary().leaf_count() != request.leaf_count
         {
             return PinnedBlob::SnapshotUnavailable;
         }
@@ -374,8 +380,10 @@ impl StoreSnapshot {
                     team,
                     manifest: crate::inventory::ComponentManifest::new(
                         InventoryComponent::Peer,
-                        root.map_or(0, |node| node.leaf_count()),
-                        root.map(|node| node.digest()),
+                        PatchSummary::new(
+                            root.map(|node| node.digest()),
+                            root.map_or(0, |node| node.leaf_count()),
+                        )?,
                     ),
                     data: InventoryComponentData::Peer(inventory),
                 }),
@@ -400,8 +408,7 @@ impl StoreSnapshot {
                 team,
                 manifest: crate::inventory::ComponentManifest::new(
                     InventoryComponent::CollectionRecord,
-                    inventory.len(),
-                    inventory.merkle_root(),
+                    PatchSummary::from_patch(&inventory),
                 ),
                 data: InventoryComponentData::CollectionRecord(inventory),
             })
@@ -423,8 +430,7 @@ impl StoreSnapshot {
                 team,
                 manifest: crate::inventory::ComponentManifest::new(
                     InventoryComponent::CapabilityProof,
-                    inventory.len(),
-                    inventory.merkle_root(),
+                    PatchSummary::from_patch(&inventory),
                 ),
                 data: InventoryComponentData::CapabilityProof(inventory),
             })
@@ -444,8 +450,7 @@ impl StoreSnapshot {
             let inventory = Arc::new(build_key_inventory(blob_keys));
             let manifest = crate::inventory::ComponentManifest::new(
                 InventoryComponent::Blob,
-                inventory.len(),
-                inventory.merkle_root(),
+                PatchSummary::from_patch(&inventory),
             );
             (inventory, manifest)
         } else {
@@ -539,7 +544,7 @@ impl StoreSnapshot {
         &self,
         component: InventoryComponent,
         relative_prefix: &[u8],
-    ) -> Option<([u8; 32], u64)> {
+    ) -> Option<PatchSummary> {
         self.component(component).node_summary(relative_prefix)
     }
 
@@ -590,7 +595,7 @@ impl InventorySnapshotCache {
     ) -> Option<SharedComponentSnapshot> {
         let component = InventoryComponent::Blob;
         let current = snapshot.component(component);
-        let Some(root) = current.manifest.root() else {
+        let Some(root) = current.manifest.summary().root() else {
             return None;
         };
         let key = InventoryCacheKey {
@@ -613,7 +618,7 @@ impl InventorySnapshotCache {
     ) -> Vec<SharedComponentSnapshot> {
         let mut retired = Vec::new();
         for entry in manifest.components() {
-            let Some(root) = entry.root() else {
+            let Some(root) = entry.summary().root() else {
                 continue;
             };
             let key = InventoryCacheKey {
@@ -1887,12 +1892,17 @@ async fn reconcile_authenticated_peer<C: Conn>(
             continue;
         }
         let advertised = manifest.component(component);
-        let mut walker = InventoryWalker::new(team, advertised)?;
+        let base = component.base_prefix(team);
+        let mut walker = PatchRepairWalker::new(
+            component,
+            advertised.summary(),
+            component.relative_key_len(base),
+        )?;
         let mut in_flight = FuturesUnordered::new();
         loop {
             while in_flight.len() < INVENTORY_NODE_WINDOW {
                 let request = walker
-                    .next_request(|component, prefix| local.node_summary(component, prefix))?;
+                    .next_request(|component, prefix| local.node_summary(*component, prefix))?;
                 let Some(request) = request else {
                     break;
                 };
@@ -1912,7 +1922,7 @@ async fn reconcile_authenticated_peer<C: Conn>(
             };
             let (request, response) = result?;
             let missing = walker.accept(&request, response, |component, key| {
-                local.contains_relative_key(component, key)
+                local.contains_relative_key(*component, key)
             })?;
             if let Some(leaf) = missing {
                 let event = remote_leaf_event(connection.conn(), team, advertised, leaf).await?;
@@ -1932,7 +1942,7 @@ async fn remote_leaf_event<C: Conn>(
     connection: &C,
     team: VerifyingKey,
     advertised: crate::inventory::ComponentManifest,
-    leaf: InventoryLeaf,
+    leaf: PatchLeaf<InventoryLeafValue>,
 ) -> anyhow::Result<NetEvent> {
     let event = match leaf.value {
         InventoryLeafValue::Peer => {
@@ -1952,10 +1962,12 @@ async fn remote_leaf_event<C: Conn>(
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Blob inventory key has the wrong length"))?;
             let root = advertised
+                .summary()
                 .root()
                 .ok_or_else(|| anyhow::anyhow!("a missing blob came from an empty manifest"))?;
             let bytes =
-                fetch_inventory_blob(connection, root, advertised.leaf_count(), hash).await?;
+                fetch_inventory_blob(connection, root, advertised.summary().leaf_count(), hash)
+                    .await?;
             NetEvent::Blob { hash, bytes }
         }
     };
@@ -2815,11 +2827,14 @@ impl SnapshotHandler {
                     &self.snapshot,
                     &self.snapshots,
                     session.team(),
-                    request.component,
-                    request.root,
+                    *request.scope(),
+                    request
+                        .summary()
+                        .root()
+                        .expect("a repair request has a nonempty summary"),
                 );
                 let response = match pinned {
-                    None => InventoryNodeResponse::SnapshotUnavailable,
+                    None => PatchNodeResponse::SnapshotUnavailable,
                     Some(pinned) => pinned.inventory_node(&request)?,
                 };
                 send_node_response(send, session.team(), &request, &response).await?;
@@ -3768,6 +3783,7 @@ mod tests {
         let component = InventoryComponent::Peer;
         let root = manifest
             .component(component)
+            .summary()
             .root()
             .expect("nonempty peer inventory has a root");
         let current = Arc::new(Mutex::new(Some(snapshot.clone())));
@@ -3806,12 +3822,12 @@ mod tests {
         let component = snapshot
             .manifest()
             .component(InventoryComponent::CollectionRecord);
-        let root = component.root().unwrap();
-        let request = InventoryNodeRequest::new(
-            team,
+        let root = component.summary().root().unwrap();
+        let request = PatchRepairRequest::new(
             InventoryComponent::CollectionRecord,
-            root,
-            component.leaf_count(),
+            component.summary(),
+            InventoryComponent::CollectionRecord
+                .relative_key_len(InventoryComponent::CollectionRecord.base_prefix(team)),
             Vec::new(),
             root,
         )
@@ -3821,20 +3837,20 @@ mod tests {
             .component(InventoryComponent::CollectionRecord)
             .inventory_node(&request)
             .unwrap();
-        let InventoryNodeResponse::Found(crate::inventory_wire::InventoryNode::Leaf {
-            leaf, ..
-        }) = response
+        let PatchNodeResponse::Found(crate::patch_repair::PatchNode::Leaf { leaf, .. }) = response
         else {
             panic!("single-record production component must resolve to one leaf")
         };
         assert_eq!(leaf.key, record.id().raw());
         assert_eq!(leaf.value, InventoryLeafValue::CollectionRecord(record));
 
-        let unavailable = InventoryNodeRequest::new(
-            team,
+        let unavailable_summary =
+            PatchSummary::new(Some([9; 32]), component.summary().leaf_count()).unwrap();
+        let unavailable = PatchRepairRequest::new(
             InventoryComponent::CollectionRecord,
-            [9; 32],
-            component.leaf_count(),
+            unavailable_summary,
+            InventoryComponent::CollectionRecord
+                .relative_key_len(InventoryComponent::CollectionRecord.base_prefix(team)),
             Vec::new(),
             [9; 32],
         )
@@ -3844,7 +3860,7 @@ mod tests {
                 .component(InventoryComponent::CollectionRecord)
                 .inventory_node(&unavailable)
                 .unwrap(),
-            InventoryNodeResponse::SnapshotUnavailable
+            PatchNodeResponse::SnapshotUnavailable
         );
     }
 
@@ -3958,6 +3974,7 @@ mod tests {
         let manifest = snapshot.manifest();
         let record_root = manifest
             .component(InventoryComponent::CollectionRecord)
+            .summary()
             .root()
             .unwrap();
         let mut cache = InventorySnapshotCache::default();
@@ -4025,7 +4042,11 @@ mod tests {
         );
         let old_blob = Arc::downgrade(old.component(InventoryComponent::Blob));
         let manifest = old.manifest();
-        let blob_root = manifest.component(InventoryComponent::Blob).root().unwrap();
+        let blob_root = manifest
+            .component(InventoryComponent::Blob)
+            .summary()
+            .root()
+            .unwrap();
         sender.update_snapshot(old);
         {
             let current = sender.snapshot.lock().unwrap().as_ref().unwrap().clone();
@@ -4139,8 +4160,7 @@ mod tests {
             team,
             manifest: crate::inventory::ComponentManifest::new(
                 InventoryComponent::Blob,
-                1,
-                inventory.merkle_root(),
+                PatchSummary::from_patch(&inventory),
             ),
             data: InventoryComponentData::Blob {
                 inventory: Arc::new(inventory),

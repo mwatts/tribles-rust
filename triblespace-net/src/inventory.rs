@@ -32,6 +32,8 @@ use triblespace_core::repo::{
     BlobStoreGet, BlobStoreList, CapabilityProofRead, PeerRead, SnapshotSource,
 };
 
+use crate::patch_repair::PatchSummary;
+
 /// Permission to synchronize one server-selected team inventory.
 ///
 /// Minted on 2026-08-26 CEST with the exact command `trible genid`, whose
@@ -94,27 +96,6 @@ impl InventoryBasePrefix {
         absolute.extend_from_slice(self.as_bytes());
         absolute.extend_from_slice(relative);
         Ok(absolute)
-    }
-
-    /// Borrow the protocol-relative suffix of one canonical full PATCH key.
-    pub(crate) fn relative_key<'a>(
-        self,
-        component: InventoryComponent,
-        absolute: &'a [u8],
-    ) -> Result<&'a [u8]> {
-        if absolute.len() != component.key_len() {
-            bail!(
-                "inventory absolute key has length {}; expected {} for {:?}",
-                absolute.len(),
-                component.key_len(),
-                component
-            );
-        }
-        let base = self.as_bytes();
-        if !absolute.starts_with(base) {
-            bail!("inventory key is outside its authorized component base");
-        }
-        Ok(&absolute[base.len()..])
     }
 }
 
@@ -269,37 +250,16 @@ impl InventoryComponent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComponentManifest {
     component: InventoryComponent,
-    leaf_count: u64,
-    root: Option<[u8; 32]>,
+    summary: PatchSummary,
 }
 
 impl ComponentManifest {
-    pub(crate) fn new(
-        component: InventoryComponent,
-        leaf_count: u64,
-        root: Option<[u8; 32]>,
-    ) -> Self {
-        debug_assert_eq!(root.is_none(), leaf_count == 0);
-        Self {
-            component,
-            leaf_count,
-            root,
-        }
+    pub(crate) const fn new(component: InventoryComponent, summary: PatchSummary) -> Self {
+        Self { component, summary }
     }
 
-    pub(crate) fn from_wire(
-        component: InventoryComponent,
-        leaf_count: u64,
-        root: Option<[u8; 32]>,
-    ) -> Result<Self> {
-        if root.is_none() != (leaf_count == 0) {
-            bail!("empty inventory root and leaf count disagree");
-        }
-        Ok(Self {
-            component,
-            leaf_count,
-            root,
-        })
+    pub(crate) const fn from_wire(component: InventoryComponent, summary: PatchSummary) -> Self {
+        Self { component, summary }
     }
 
     /// Component described by this entry.
@@ -307,14 +267,9 @@ impl ComponentManifest {
         self.component
     }
 
-    /// Authenticated number of leaves expected below the root.
-    pub const fn leaf_count(self) -> u64 {
-        self.leaf_count
-    }
-
-    /// Canonical PATCH Merkle root; `None` is the unique empty set.
-    pub const fn root(self) -> Option<[u8; 32]> {
-        self.root
+    /// Exact immutable PATCH summary for this component.
+    pub const fn summary(self) -> PatchSummary {
+        self.summary
     }
 }
 
@@ -336,8 +291,8 @@ impl InventoryGeneration {
         hasher.update(&team.to_bytes());
         for component in components {
             hasher.update(&[component.component as u8]);
-            hasher.update(&component.leaf_count.to_be_bytes());
-            match component.root {
+            hasher.update(&component.summary.leaf_count().to_be_bytes());
+            match component.summary.root() {
                 None => {
                     hasher.update(&[0]);
                 }
@@ -673,23 +628,22 @@ where
         let components = [
             ComponentManifest::new(
                 InventoryComponent::Peer,
-                peer_root.map_or(0, |node| node.leaf_count()),
-                peer_root.map(|node| node.digest()),
+                PatchSummary::new(
+                    peer_root.map(|node| node.digest()),
+                    peer_root.map_or(0, |node| node.leaf_count()),
+                )?,
             ),
             ComponentManifest::new(
                 InventoryComponent::CollectionRecord,
-                record_inventory.len(),
-                record_inventory.merkle_root(),
+                PatchSummary::from_patch(&record_inventory),
             ),
             ComponentManifest::new(
                 InventoryComponent::CapabilityProof,
-                proof_inventory.len(),
-                proof_inventory.merkle_root(),
+                PatchSummary::from_patch(&proof_inventory),
             ),
             ComponentManifest::new(
                 InventoryComponent::Blob,
-                blob_inventory.len(),
-                blob_inventory.merkle_root(),
+                PatchSummary::from_patch(&blob_inventory),
             ),
         ];
         let manifest = InventoryManifest::new(team, components);
@@ -920,6 +874,7 @@ mod tests {
             snapshot
                 .manifest()
                 .component(InventoryComponent::Peer)
+                .summary()
                 .leaf_count(),
             2
         );
@@ -927,6 +882,7 @@ mod tests {
             snapshot
                 .manifest()
                 .component(InventoryComponent::CollectionRecord)
+                .summary()
                 .leaf_count(),
             1
         );

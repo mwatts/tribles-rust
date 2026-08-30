@@ -23,6 +23,13 @@ use super::{CollectionData, CollectionHandle, CollectionRecord};
 pub enum CollectionRecordSelector {
     /// Select one record by its intrinsic content-derived id.
     Id(Id),
+    /// Select every record whose intrinsic collection is exactly `C`.
+    ///
+    /// This is the canonical construction route for one collection's sparse
+    /// overlay inventory. It includes signed `COMMIT`s and unsigned `MERGE`
+    /// and `DERIVE` equations without exposing or enumerating unrelated
+    /// collections.
+    Collection(CollectionHandle),
     /// Select every signed membership claim for one exact collection element.
     ///
     /// Several authors or metadata archives may attest the same data member;
@@ -61,6 +68,14 @@ pub(crate) fn selectors_match_record(
     record: CollectionRecord,
 ) -> bool {
     if selectors.contains(&CollectionRecordSelector::Id(record.id())) {
+        return true;
+    }
+    let collection = match record {
+        CollectionRecord::Commit(commit) => commit.collection(),
+        CollectionRecord::Merge(merge) => merge.collection(),
+        CollectionRecord::Derive(derive) => derive.collection(),
+    };
+    if selectors.contains(&CollectionRecordSelector::Collection(collection)) {
         return true;
     }
     match record {
@@ -365,6 +380,56 @@ mod tests {
             CollectionRecord::Derive(derive) => derive.collection() == target,
             _ => false,
         }));
+    }
+
+    #[test]
+    fn exact_collection_selection_includes_every_record_kind_and_no_other_collection() {
+        let expected = collection(1);
+        let other = collection(2);
+        let author = SigningKey::from_bytes(&[9; 32]);
+        let mut records = vec![
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &author,
+                expected,
+                data(1),
+                empty_metadata_handle(),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(expected, data(1), data(2), data(3))),
+            CollectionRecord::Derive(CollectionDerive::new(expected, data(3), data(4))),
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &author,
+                other,
+                data(1),
+                empty_metadata_handle(),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(other, data(1), data(2), data(3))),
+            CollectionRecord::Derive(CollectionDerive::new(other, data(3), data(4))),
+        ];
+        records.sort_unstable_by_key(CollectionRecord::id);
+        let store = FallbackStore {
+            records,
+            ..FallbackStore::default()
+        };
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(expected)]);
+
+        let selected = store.select_records(&selectors).unwrap();
+
+        assert_eq!(selected.len(), 3);
+        assert!(selected
+            .iter()
+            .any(|record| matches!(record, CollectionRecord::Commit(_))));
+        assert!(selected
+            .iter()
+            .any(|record| matches!(record, CollectionRecord::Merge(_))));
+        assert!(selected
+            .iter()
+            .any(|record| matches!(record, CollectionRecord::Derive(_))));
+        assert!(selected.iter().all(|record| match record {
+            CollectionRecord::Commit(record) => record.collection() == expected,
+            CollectionRecord::Merge(record) => record.collection() == expected,
+            CollectionRecord::Derive(record) => record.collection() == expected,
+        }));
+        assert_eq!(store.enumerations.get(), 1);
     }
 
     #[test]

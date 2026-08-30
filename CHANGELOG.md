@@ -12,9 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies
   embedded COMMIT signatures without deciding WRITE activation, preserves
-  MERGE/DERIVE as structurally canonical inert evidence, and uses a valued
-  PATCH to select only bounded canonical `current - previous` deltas. A
-  startup or large gap yields a PATCH-repair decision instead of full flooding.
+  MERGE/DERIVE as structurally canonical inert evidence, constructs one opaque
+  valued PATCH through an exact collection selector, and selects only bounded
+  canonical `current - previous` deltas between patches for that same
+  collection. A startup or large gap yields a PATCH-repair decision instead of
+  full flooding.
+
+- Extract root-and-count PATCH summaries, node proofs, validation, and the
+  pipelined repair walker from the legacy inventory vocabulary. Existing
+  inventory reconciliation now uses the overlay-neutral machinery directly
+  while preserving pinned snapshots, compressed paths, out-of-order traversal,
+  exact count accounting, and fail-closed adversarial checks.
 
 - Add self-contained independent READ and WRITE admission policies to every
   collection descriptor. Each action is either `Open` or a validated quorum
