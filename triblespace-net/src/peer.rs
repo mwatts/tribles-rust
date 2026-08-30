@@ -31,6 +31,7 @@ use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 use crate::provider::{ArtifactId, ProviderObservation};
+use crate::wake::CollectionWakePlane;
 
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
@@ -145,6 +146,7 @@ where
     store: Arc<Mutex<S>>,
     sender: NetSender,
     receiver: NetReceiver,
+    wake_plane: Option<CollectionWakePlane>,
     team: VerifyingKey,
     qos: ReconcileQos,
     /// Network admissions stay outside the advertised snapshot until their
@@ -184,8 +186,9 @@ where
         let team = config.team;
         let qos = config.qos;
         Self::validate_store_scope(&mut store, team)?;
-        let (sender, receiver) = host::spawn(key, config).map_err(PeerOpenError::HostStartup)?;
-        Self::assemble(store, team, qos, sender, receiver)
+        let (sender, receiver, wake_plane) =
+            host::spawn(key, config).map_err(PeerOpenError::HostStartup)?;
+        Self::assemble(store, team, qos, sender, receiver, Some(wake_plane))
     }
 
     /// Attach a store to a caller-owned host, most commonly the deterministic
@@ -200,7 +203,7 @@ where
     ) -> Result<Self, PeerOpenError<S::ScopeError>> {
         let mut store = store;
         Self::validate_store_scope(&mut store, team)?;
-        Self::assemble(store, team, qos, sender, receiver)
+        Self::assemble(store, team, qos, sender, receiver, None)
     }
 
     fn validate_store_scope(
@@ -216,6 +219,7 @@ where
         qos: ReconcileQos,
         sender: NetSender,
         receiver: NetReceiver,
+        wake_plane: Option<CollectionWakePlane>,
     ) -> Result<Self, PeerOpenError<S::ScopeError>> {
         let endpoint = VerifyingKey::from_bytes(sender.id().as_bytes())
             .expect("an endpoint id is an Ed25519 public key");
@@ -238,6 +242,7 @@ where
             store: Arc::new(Mutex::new(store)),
             sender,
             receiver,
+            wake_plane,
             team,
             qos,
             pending_network_flush,
@@ -253,6 +258,15 @@ where
 
     pub fn id(&self) -> EndpointId {
         self.sender.id()
+    }
+
+    /// Stock gossip wake plane for a production iroh peer.
+    ///
+    /// Caller-owned wiring has no implicit wake handle and returns `None`.
+    /// Collection possession is enough to join a production topic; following a
+    /// wake into anti-entropy remains separately authorized.
+    pub fn wake_plane(&self) -> Option<CollectionWakePlane> {
+        self.wake_plane.clone()
     }
 
     pub const fn team(&self) -> VerifyingKey {

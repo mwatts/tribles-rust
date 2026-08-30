@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a stock `iroh-gossip` collection wake plane on the existing endpoint and
+  router. The collection handle is exactly the topic and its discovery
+  capability; a dense non-serde envelope carries only a strictly signed
+  endpoint origin and opaque anti-entropy root. Payload synchronization remains
+  separate and capability-gated.
+
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies
   embedded COMMIT signatures without deciding WRITE activation, preserves

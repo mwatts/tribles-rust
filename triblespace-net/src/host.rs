@@ -57,6 +57,7 @@ use crate::provider::{
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
+use crate::wake::CollectionWakePlane;
 
 /// Configuration for a peer attached to one single-team store.
 ///
@@ -1137,7 +1138,10 @@ pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wir
 /// The startup rendezvous is deliberately synchronous: returning a sender for
 /// a thread that already failed would make a dead peer indistinguishable from
 /// a temporarily quiet one.
-pub fn spawn(key: SigningKey, config: PeerConfig) -> anyhow::Result<(NetSender, NetReceiver)> {
+pub fn spawn(
+    key: SigningKey,
+    config: PeerConfig,
+) -> anyhow::Result<(NetSender, NetReceiver, CollectionWakePlane)> {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
     let endpoint = VerifyingKey::from_bytes(id.as_bytes())
@@ -1165,17 +1169,18 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> anyhow::Result<(NetSender, 
                         return;
                     }
                 };
-                if startup_tx.send(Ok(())).is_err() {
+                let wake_plane = harness.transport.wake_plane();
+                if startup_tx.send(Ok(wake_plane)).is_err() {
                     return;
                 }
                 run_host(harness, config, wiring).await;
             });
         })
         .map_err(|error| anyhow::Error::new(error).context("spawn triblespace-net thread"))?;
-    startup_rx
+    let wake_plane = startup_rx
         .recv()
         .map_err(|_| anyhow::anyhow!("network host stopped during startup"))??;
-    Ok((sender, receiver))
+    Ok((sender, receiver, wake_plane))
 }
 
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
