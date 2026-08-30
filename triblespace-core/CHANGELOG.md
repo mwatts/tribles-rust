@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make Yard reclaim derive its final store-scope and opaque-record safety
+  decisions from one refreshed Pile state, so an opaque record appended during
+  rewrite planning is refused instead of being projected away.
+
 - Clean-cutover the unpublished Rank9 API and identities.
   `Rank9AcceleratedSuccinctArchiveBlob` is now an ABI-qualified Merkle-root
   `CollectionEncoding` whose first 32 bytes name its portable raw

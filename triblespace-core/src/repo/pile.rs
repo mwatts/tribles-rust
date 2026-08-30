@@ -3545,16 +3545,6 @@ impl Pile {
         Ok(self.opaque_records)
     }
 
-    /// Number of opaque records in the prefix most recently replayed into
-    /// this `Pile`, without performing another refresh.
-    ///
-    /// Physical rewrite guards use this immediately after another operation
-    /// refreshed and validated related state (notably [`StoreScope::store_scope`])
-    /// so both decisions come from one exact replayed prefix.
-    pub(crate) const fn observed_opaque_record_count(&self) -> usize {
-        self.opaque_records
-    }
-
     /// Copy every byte-distinct inert legacy V3 collection header into
     /// `destination`.
     ///
@@ -3930,6 +3920,18 @@ impl Pile {
         let second = VerifyingKey::from_bytes(second)
             .expect("Pile only indexes structurally decoded store-scope keys");
         Err(StoreScopeError::conflict(first, second))
+    }
+
+    /// Refresh once and return the two fail-closed conditions for a physical
+    /// rewrite from that exact applied prefix.
+    pub(crate) fn physical_rewrite_guard(
+        &mut self,
+    ) -> Result<(Option<VerifyingKey>, usize), StoreScopeError<PileWriteError>> {
+        self.refresh()
+            .map_err(PileWriteError::from)
+            .map_err(StoreScopeError::Backend)?;
+        let store_scope = self.observed_store_scope()?;
+        Ok((store_scope, self.opaque_records))
     }
 }
 

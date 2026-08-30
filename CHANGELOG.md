@@ -248,6 +248,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make Yard reclaim derive its final store-scope and opaque-record safety
+  decisions from one refreshed Pile state, so an opaque record appended during
+  rewrite planning is refused instead of being projected away.
+
 - Replace split reader/revision APIs with one coherent immutable store
   observation. `SnapshotSource::snapshot` freezes Blob access, collection
   records, capability proofs, and PEER evidence together; the resulting

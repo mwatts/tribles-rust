@@ -1405,8 +1405,21 @@ fn reclaim_generation(
     path: &Path,
     temp_path: &Path,
     live: &HandleSet,
-    mut old_pile: Pile,
+    old_pile: Pile,
 ) -> Result<Pile, YardReclaimError> {
+    reclaim_generation_with_final_guard_hook(path, temp_path, live, old_pile, || {})
+}
+
+fn reclaim_generation_with_final_guard_hook<F>(
+    path: &Path,
+    temp_path: &Path,
+    live: &HandleSet,
+    mut old_pile: Pile,
+    before_final_guard: F,
+) -> Result<Pile, YardReclaimError>
+where
+    F: FnOnce(),
+{
     let reader = old_pile.snapshot().map_err(YardReclaimError::Pile)?;
     let opaque_records = reader.opaque_record_count();
     if opaque_records != 0 {
@@ -1453,20 +1466,21 @@ fn reclaim_generation(
     old_pile
         .preserve_legacy_collection_headers_into(&mut new_pile)
         .map_err(YardReclaimError::CollectionRecord)?;
-    // `preserve_legacy_collection_headers_into` refreshes the source. Observe
-    // scope with the final source refresh, then inspect the opaque count from
-    // that exact replayed prefix. A conflicting scope or opaque addition made
-    // during planning must fail closed rather than be projected away.
-    let store_scope = match old_pile.store_scope() {
-        Ok(scope) => scope,
+    before_final_guard();
+    // Scope conflict and opaque-record refusal must come from one final source
+    // refresh. An opaque addition observed while checking scope must not escape
+    // an earlier opaque count and then be projected away by the rewrite.
+    let (store_scope, opaque_records) = match old_pile.physical_rewrite_guard() {
+        Ok(guard) => guard,
         Err(error) => {
             let _ = new_pile.close();
+            let _ = old_pile.close();
             return Err(YardReclaimError::StoreScope(error));
         }
     };
-    let opaque_records = old_pile.observed_opaque_record_count();
     if opaque_records != 0 {
         let _ = new_pile.close();
+        let _ = old_pile.close();
         return Err(YardReclaimError::OpaqueRecords {
             count: opaque_records,
         });
@@ -1728,6 +1742,8 @@ mod tests {
     use crate::trible::TribleSet;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     fn yard_with_paths(
         generations: usize,
@@ -2634,6 +2650,49 @@ mod tests {
         yard.reclaim().unwrap();
         assert_eq!(fs::metadata(&paths[0]).unwrap().len(), after_size);
         assert_eq!(pile_blob_count(&paths[0]), after_count);
+    }
+
+    #[test]
+    fn reclaim_final_guard_refuses_opaque_record_appended_during_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opaque-during-reclaim.pile");
+        File::create(&path).unwrap();
+        let temp_path = reclaim_temp_path(&path, 0);
+        let mut pile = Pile::open(&path).unwrap();
+        let handle = pile
+            .put::<RawBytes, _>(Bytes::from_source(b"still owned".to_vec()))
+            .unwrap();
+        crate::repo::StorageFlush::flush(&mut pile).unwrap();
+
+        let mut live = HandleSet::new();
+        let unknown: Inline<Handle<UnknownBlob>> = handle.transmute();
+        live.insert(&Entry::new(&unknown.raw));
+
+        let mut opaque = [0u8; 256];
+        opaque[..28].copy_from_slice(&hex_literal::hex!(
+            "0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B"
+        ));
+        opaque[28..32].copy_from_slice(&1u32.to_le_bytes());
+        opaque[32..64].fill(0xA5);
+
+        let result =
+            reclaim_generation_with_final_guard_hook(&path, &temp_path, &live, pile, || {
+                let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+                external.write_all(&opaque).unwrap();
+                external.sync_all().unwrap();
+            });
+
+        assert!(matches!(
+            result,
+            Err(YardReclaimError::OpaqueRecords { count: 1 })
+        ));
+        assert!(fs::read(&path).unwrap().ends_with(&opaque));
+
+        let mut reopened = Pile::open(&path).unwrap();
+        assert_eq!(reopened.opaque_record_count().unwrap(), 1);
+        let stored: Bytes = reopened.snapshot().unwrap().get(handle).unwrap();
+        assert_eq!(stored.as_ref(), b"still owned");
+        reopened.close().unwrap();
     }
 
     /// The amnesia regression: wants are durable pile records, so
