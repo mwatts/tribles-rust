@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies
   embedded COMMIT signatures without deciding WRITE activation, preserves
-  MERGE/DERIVE as structurally canonical inert evidence, and selects only a
-  bounded canonical `current - previous` delta from coherent snapshots. A
+  MERGE/DERIVE as structurally canonical inert evidence, and uses a valued
+  PATCH to select only bounded canonical `current - previous` deltas. A
   startup or large gap yields a PATCH-repair decision instead of full flooding.
 
 - Add self-contained independent READ and WRITE admission policies to every

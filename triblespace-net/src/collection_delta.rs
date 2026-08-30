@@ -7,7 +7,6 @@
 //! authorized overlay can therefore store sparse MERGE/DERIVE equations as
 //! inert evidence and apply semantic validation only when a resolver uses one.
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -15,6 +14,9 @@ use triblespace_core::collection::{
     CollectionHandle, CollectionRecord, CommitVerificationError, RecordDecodeError,
 };
 use triblespace_core::id::Id;
+use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
+
+type CollectionRecordPatch = PATCH<16, IdentitySchema, CollectionRecord, Blake3Merkle>;
 
 /// Result of comparing two coherent, monotone collection-record snapshots.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,20 +108,26 @@ pub fn select_bounded_delta(
     let previous = canonical_records(expected, previous)?;
     let current = canonical_records(expected, current)?;
     if previous
-        .iter()
-        .any(|(id, record)| current.get(id) != Some(record))
+        .iter_ordered()
+        .any(|id| current.get(id) != previous.get(id))
     {
         return Err(CollectionDeltaError::NonMonotoneSnapshot);
     }
 
-    let missing = current.len() - previous.len();
+    let delta = current.difference(&previous);
+    let missing = usize::try_from(delta.len())
+        .expect("a PATCH built from one process-local iterator fits usize");
     if missing > max_push_records {
         return Ok(CollectionDeltaSelection::Repair { missing });
     }
     Ok(CollectionDeltaSelection::Push(
-        current
-            .into_iter()
-            .filter_map(|(id, record)| (!previous.contains_key(&id)).then_some(record))
+        delta
+            .iter_ordered()
+            .map(|id| {
+                *delta
+                    .get(id)
+                    .expect("an ordered PATCH key retains its record value")
+            })
             .collect(),
     ))
 }
@@ -150,16 +158,19 @@ fn record_collection(record: CollectionRecord) -> CollectionHandle {
 fn canonical_records(
     expected: CollectionHandle,
     records: impl IntoIterator<Item = CollectionRecord>,
-) -> Result<BTreeMap<Id, CollectionRecord>, CollectionDeltaError> {
-    let mut canonical = BTreeMap::new();
+) -> Result<CollectionRecordPatch, CollectionDeltaError> {
+    let mut canonical = CollectionRecordPatch::new();
     for record in records {
         validate_record(expected, record)?;
         let id = record.id();
-        if let Some(existing) = canonical.insert(id, record)
-            && existing != record
-        {
-            return Err(CollectionDeltaError::IntrinsicIdCollision(id));
+        let key = id.raw();
+        if let Some(existing) = canonical.get(&key) {
+            if existing != &record {
+                return Err(CollectionDeltaError::IntrinsicIdCollision(id));
+            }
+            continue;
         }
+        canonical.insert(&PatchEntry::with_value(&key, record));
     }
     Ok(canonical)
 }
