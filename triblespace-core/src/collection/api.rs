@@ -16,6 +16,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
@@ -700,19 +701,19 @@ where
     })
 }
 
-enum AdmissionEvidence {
+pub(crate) enum AdmissionEvidence {
     Open,
     Quorum {
         roots: Vec<VerifyingKey>,
         invoke_threshold: NonZeroUsize,
         delegate_threshold: Option<NonZeroUsize>,
         request: CapabilityRequest,
-        bundles: Vec<CapabilityProofBundle>,
+        bundles: Arc<[CapabilityProofBundle]>,
     },
 }
 
 impl AdmissionEvidence {
-    fn authorizes(&self, subject: VerifyingKey, instant: hifitime::Epoch) -> bool {
+    pub(crate) fn authorizes(&self, subject: VerifyingKey, instant: hifitime::Epoch) -> bool {
         match self {
             Self::Open => true,
             Self::Quorum {
@@ -722,7 +723,7 @@ impl AdmissionEvidence {
                 request,
                 bundles,
             } => capability_quorum_authorizes(
-                bundles,
+                bundles.iter(),
                 roots.iter().copied(),
                 instant,
                 subject,
@@ -731,6 +732,54 @@ impl AdmissionEvidence {
                 *delegate_threshold,
             ),
         }
+    }
+}
+
+pub(crate) fn load_resident_proof_bundles<R>(
+    reader: &R,
+    proofs: impl IntoIterator<Item = CapabilityProof>,
+) -> Arc<[CapabilityProofBundle]>
+where
+    R: BlobStoreGet,
+{
+    proofs
+        .into_iter()
+        .filter_map(|proof| {
+            let claims = proof
+                .claim_handles()
+                .map(|claim| reader.get::<Blob<SimpleArchive>, SimpleArchive>(claim).ok())
+                .collect::<Option<Vec<_>>>()?;
+            Some(CapabilityProofBundle::new(proof, claims))
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+pub(crate) fn admission_evidence_from_bundles(
+    policy: &AdmissionPolicy,
+    action: crate::id::Id,
+    required: CapabilityMode,
+    collection: CollectionHandle,
+    bundles: Arc<[CapabilityProofBundle]>,
+) -> AdmissionEvidence {
+    let AdmissionPolicy::Quorum(quorum) = policy else {
+        return AdmissionEvidence::Open;
+    };
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(action),
+        CapabilityResource::from(collection),
+    );
+    let request = CapabilityRequest::new(atom, required);
+    AdmissionEvidence::Quorum {
+        roots: quorum.roots().to_vec(),
+        invoke_threshold: NonZeroUsize::new(quorum.invoke_threshold() as usize)
+            .expect("validated collection policy has a nonzero invoke threshold"),
+        delegate_threshold: quorum.delegate_threshold().map(|threshold| {
+            NonZeroUsize::new(threshold as usize)
+                .expect("validated collection policy has a nonzero delegate threshold")
+        }),
+        request,
+        bundles,
     }
 }
 
@@ -745,35 +794,13 @@ fn admission_evidence_at<R>(
 where
     R: BlobStoreGet,
 {
-    let AdmissionPolicy::Quorum(quorum) = policy else {
-        return AdmissionEvidence::Open;
-    };
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(action),
-        CapabilityResource::from(collection),
-    );
-    let request = CapabilityRequest::new(atom, required);
-    let bundles = proofs
-        .into_iter()
-        .filter_map(|proof| {
-            let claims = proof
-                .claim_handles()
-                .map(|claim| reader.get::<Blob<SimpleArchive>, SimpleArchive>(claim).ok())
-                .collect::<Option<Vec<_>>>()?;
-            Some(CapabilityProofBundle::new(proof, claims))
-        })
-        .collect();
-    AdmissionEvidence::Quorum {
-        roots: quorum.roots().to_vec(),
-        invoke_threshold: NonZeroUsize::new(quorum.invoke_threshold() as usize)
-            .expect("validated collection policy has a nonzero invoke threshold"),
-        delegate_threshold: quorum.delegate_threshold().map(|threshold| {
-            NonZeroUsize::new(threshold as usize)
-                .expect("validated collection policy has a nonzero delegate threshold")
-        }),
-        request,
-        bundles,
-    }
+    admission_evidence_from_bundles(
+        policy,
+        action,
+        required,
+        collection,
+        load_resident_proof_bundles(reader, proofs),
+    )
 }
 
 fn discover_admission_evidence_at<S>(
