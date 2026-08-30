@@ -152,6 +152,12 @@ admits them only when the target encoding, declared mapping algorithm and
 parameters, and content identities validate. An invalid or unavailable result is a cache miss and
 cannot suppress an explicit cover member.
 
+Local publication remains unconditional. A publisher which needs to predict
+whether an authority-aware reader will admit a signer can call
+`store.writer_is_admitted(collection, signer)`: it checks the descriptor
+authority and resident exact WRITE evidence at one instant without scanning
+collection commits or publishing anything.
+
 ## Known-prefix snapshots and covers
 
 `store.snapshot(collection)` observes one clock instant, discovers resident

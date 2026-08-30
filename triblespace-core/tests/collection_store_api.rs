@@ -440,6 +440,69 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
 }
 
 #[test]
+fn writer_admission_uses_authority_and_exact_resident_proofs_without_commits() {
+    let authority = SigningKey::from_bytes(&[23; 32]);
+    let delegate = SigningKey::from_bytes(&[24; 32]);
+    let foreign = SigningKey::from_bytes(&[25; 32]);
+    let expired = SigningKey::from_bytes(&[26; 32]);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection::<SimpleArchive>(simplearchive_union::descriptor(
+            "writer-admission",
+            authority.verifying_key(),
+            reach::private(),
+        ))
+        .unwrap();
+
+    assert!(store
+        .writer_is_admitted(collection, authority.verifying_key())
+        .unwrap());
+    assert!(!store
+        .writer_is_admitted(collection, delegate.verifying_key())
+        .unwrap());
+    assert!(!store
+        .writer_is_admitted(collection, foreign.verifying_key())
+        .unwrap());
+
+    store_write_proof(&mut store, &authority, delegate.verifying_key(), collection);
+    assert!(store
+        .writer_is_admitted(collection, delegate.verifying_key())
+        .unwrap());
+
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(collection.handle()),
+    );
+    let validity = CapabilityValidity::new(
+        hifitime::Epoch::from_tai_seconds(0.0),
+        hifitime::Epoch::from_tai_seconds(1.0),
+    )
+    .unwrap();
+    let bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, Some(validity)),
+        expired.verifying_key(),
+    )
+    .unwrap();
+    store_proof_bundle(&mut store, bundle);
+
+    assert!(!store
+        .writer_is_admitted(collection, expired.verifying_key())
+        .unwrap());
+    assert!(!store
+        .writer_is_admitted(collection, foreign.verifying_key())
+        .unwrap());
+    assert_eq!(
+        store
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, Infallible>>()
+            .unwrap(),
+        Vec::<CollectionRecord>::new(),
+    );
+}
+
+#[test]
 fn invalid_resident_proof_grants_nothing_without_poisoning_valid_evidence() {
     let authority = SigningKey::from_bytes(&[5; 32]);
     let wrong_resource = SigningKey::from_bytes(&[6; 32]);

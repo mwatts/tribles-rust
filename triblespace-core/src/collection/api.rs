@@ -168,6 +168,50 @@ where
     }
 }
 
+/// Failure to decide whether one writer is currently admitted to a collection.
+///
+/// Descriptor failures mean that the collection's authority could not be
+/// established. Evidence failures mean that the resident capability-proof
+/// observation itself was unavailable; invalid or irrelevant individual
+/// proofs merely fail to admit their subjects and are not errors.
+#[derive(Debug)]
+pub enum CollectionAdmissionError<ProofsError, ReaderError, GetError> {
+    /// The collection descriptor was unavailable or malformed.
+    Descriptor(CollectionDescriptorError<ReaderError, GetError>),
+    /// The resident capability-proof observation could not be completed.
+    Evidence(CollectionEvidenceDiscoveryError<ProofsError, ReaderError>),
+}
+
+impl<ProofsError, ReaderError, GetError> fmt::Display
+    for CollectionAdmissionError<ProofsError, ReaderError, GetError>
+where
+    ProofsError: fmt::Display,
+    ReaderError: fmt::Display,
+    GetError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Descriptor(source) => source.fmt(formatter),
+            Self::Evidence(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<ProofsError, ReaderError, GetError> Error
+    for CollectionAdmissionError<ProofsError, ReaderError, GetError>
+where
+    ProofsError: Error + 'static,
+    ReaderError: Error + 'static,
+    GetError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Descriptor(source) => Some(source),
+            Self::Evidence(source) => Some(source),
+        }
+    }
+}
+
 /// Failure to register and advertise a self-contained collection descriptor.
 #[derive(Debug)]
 pub enum CollectionRegistrationError<PutError, OfferError> {
@@ -908,6 +952,34 @@ where
     admitted
 }
 
+fn discover_admitted_subjects_at<S>(
+    store: &mut S,
+    authority: VerifyingKey,
+    collection: CollectionHandle,
+    instant: hifitime::Epoch,
+) -> Result<
+    BTreeSet<Inline<ED25519PublicKey>>,
+    CollectionEvidenceDiscoveryError<S::ProofsError, S::ReaderError>,
+>
+where
+    S: BlobStore + CapabilityProofStore,
+{
+    // Proof publication stores every claim blob before its proof record.
+    // Freeze proof membership first, then open one reader: every observed
+    // proof's prior claim closure is consequently visible in that reader.
+    let proofs = store
+        .proofs()
+        .map_err(CollectionEvidenceDiscoveryError::Proofs)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CollectionEvidenceDiscoveryError::Proofs)?;
+    let reader = store
+        .reader()
+        .map_err(CollectionEvidenceDiscoveryError::Reader)?;
+    Ok(admitted_subjects_at(
+        &reader, authority, collection, instant, proofs,
+    ))
+}
+
 fn discover_admitted_cover_at<S, L>(
     store: &mut S,
     collection: Collection<L>,
@@ -927,27 +999,9 @@ where
 {
     let loaded = load_collection_descriptor(store, collection.handle())
         .map_err(CollectionCoverError::Descriptor)?;
-    // Proof publication stores every claim blob before its proof record.
-    // Freeze proof membership first, then open one reader: every observed
-    // proof's prior claim closure is consequently visible in that reader.
-    let proofs = store
-        .proofs()
-        .map_err(CollectionEvidenceDiscoveryError::Proofs)
-        .map_err(CollectionCoverError::Evidence)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(CollectionEvidenceDiscoveryError::Proofs)
-        .map_err(CollectionCoverError::Evidence)?;
-    let reader = store
-        .reader()
-        .map_err(CollectionEvidenceDiscoveryError::Reader)
-        .map_err(CollectionCoverError::Evidence)?;
-    let admitted = admitted_subjects_at(
-        &reader,
-        loaded.authority,
-        collection.handle(),
-        instant,
-        proofs,
-    );
+    let admitted =
+        discover_admitted_subjects_at(store, loaded.authority, collection.handle(), instant)
+            .map_err(CollectionCoverError::Evidence)?;
     let discovered =
         discover_collection_records_authorized(store, collection.handle(), |subject| {
             admitted.contains(subject)
@@ -1072,6 +1126,44 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
             .insert(super::CollectionRecord::Commit(commit))
             .map_err(CollectionCommitError::RecordInsert)?;
         Ok(commit)
+    }
+
+    /// Decide whether `subject` would be admitted as a writer at this instant.
+    ///
+    /// The descriptor authority is admitted directly. Other subjects require
+    /// resident, valid evidence for exact [`ACTION_WRITE`] on this descriptor
+    /// handle. This pre-publication check neither scans collection commits nor
+    /// publishes anything; it applies the same proof rule as ordinary
+    /// capability-aware cover and snapshot discovery.
+    fn writer_is_admitted<L>(
+        &mut self,
+        collection: Collection<L>,
+        subject: VerifyingKey,
+    ) -> Result<
+        bool,
+        CollectionAdmissionError<
+            <Self as CapabilityProofStore>::ProofsError,
+            <Self as BlobStore>::ReaderError,
+            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
+        >,
+    >
+    where
+        Self: CapabilityProofStore,
+        L: CollectionEncoding,
+    {
+        let loaded = load_collection_descriptor(self, collection.handle())
+            .map_err(CollectionAdmissionError::Descriptor)?;
+        if subject == loaded.authority {
+            return Ok(true);
+        }
+        let admitted = discover_admitted_subjects_at(
+            self,
+            loaded.authority,
+            collection.handle(),
+            clock::epoch_now(),
+        )
+        .map_err(CollectionAdmissionError::Evidence)?;
+        Ok(admitted.contains(&Inline::new(subject.to_bytes())))
     }
 
     /// Discover one canonical admitted payload cover.

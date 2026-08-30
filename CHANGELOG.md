@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `CollectionStoreExt::writer_is_admitted` as a read-only
+  pre-publication check. Descriptor authorities succeed directly; delegated
+  writers require resident, valid evidence for exact `ACTION_WRITE` on the
+  descriptor handle, without scanning collection commits.
+
 - Add opt-in `snapshot_with_admission` for consumers which need the exact
   strictly verified COMMIT roots used by one capability-aware snapshot. The
   ordinary snapshot stays lean, while the returned roots stay narrower than
