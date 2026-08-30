@@ -20,6 +20,7 @@
 //! All store traits stay sync. Async is jailed inside the network thread.
 
 mod channel;
+pub mod collection_delta;
 
 /// Base backoff for failed WANT fulfillment in [`reconcile::Reconciler`];
 /// doubles per attempt up to

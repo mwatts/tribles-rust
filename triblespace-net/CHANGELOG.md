@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add policy-independent collection-record delta mechanics for the forthcoming
+  READ-authorized overlay: strict sparse-record framing and COMMIT signatures,
+  collection matching, canonical intrinsic-id deduplication, and bounded
+  monotone old/new selection. Large gaps return a repair decision instead of
+  a full-set flood; MERGE/DERIVE content validation and READ/WRITE decisions
+  deliberately remain outside this evidence codec.
+
 - Make both connection authorization phases mutual without another handshake:
   successful CONNECT and SYNC_TEAM responses carry the server's bounded proof,
   verified against the configured team, exact action/resource, current time,
