@@ -257,6 +257,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make store registration the sole source of typed collection values.
+  `register_collection` validates a raw descriptor and returns the exact handle
+  produced while storing its attachment closure; canonical root/derive builders
+  are internal, `Collection::from_descriptor` and the phantom SimpleArchive
+  facade are removed, and derived maintenance binds only store-issued source
+  and target values while reloading and validating their lineage at use time.
+
 - Make Yard reclaim derive its final store-scope and opaque-record safety
   decisions from one refreshed Pile state, so an opaque record appended during
   rewrite planning is refused instead of being projected away.

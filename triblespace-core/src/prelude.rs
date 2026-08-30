@@ -41,7 +41,7 @@ pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
 pub use crate::collection::{
     Collection, CollectionEncoding, CollectionRead, CollectionStore, CollectionStoreExt, Cover,
-    FactCover, SimpleArchiveCollection, TryFromCover, TryFromCoverError, VerifyingKey,
+    FactCover, TryFromCover, TryFromCoverError, VerifyingKey,
 };
 pub use crate::id::fucid;
 pub use crate::id::genid;

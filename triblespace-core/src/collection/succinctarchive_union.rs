@@ -16,6 +16,7 @@
 
 use super::descriptor as descriptor_facts;
 use super::records::{mapping_algorithm, RecordDecodeError, KIND_COLLECTION_MAPPING};
+#[cfg(test)]
 use super::CollectionPolicy;
 use crate::id::ExclusiveId;
 use crate::metadata;
@@ -466,14 +467,9 @@ impl Error for SuccinctArchiveUnionValidationError {
 /// mandatory and local: the target names its own trust root rather than
 /// inheriting one from the source.
 ///
-pub fn descriptor(source: CollectionHandle, policy: CollectionPolicy) -> Fragment {
+#[cfg(test)]
+pub(crate) fn descriptor(source: CollectionHandle, policy: CollectionPolicy) -> Fragment {
     descriptor_facts::deriving(source, &SimpleToSuccinctMapping, policy)
-}
-
-/// Describe the Rank9-accelerated collection derived from one exact raw
-/// SuccinctArchive collection.
-pub fn accelerated_descriptor(source: CollectionHandle, policy: CollectionPolicy) -> Fragment {
-    descriptor_facts::deriving(source, &RawToRank9AcceleratedMapping, policy)
 }
 
 /// Return the canonical empty raw SuccinctArchive artifact.

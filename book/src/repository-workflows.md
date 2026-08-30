@@ -259,15 +259,15 @@ SimpleArchive --DERIVE--> SuccinctArchiveBlob --DERIVE-->
 ```
 
 ```rust,ignore
-use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
+use triblespace::core::collection::succinctarchive_union::{
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
+    SuccinctArchiveCollection,
+};
 
-let succinct = SuccinctArchiveCollection::new(
-    "models",
-    team,
-    reach::private(), // source reach, and therefore source identity
-    team,
-    reach::private(), // target reach
-);
+let source = storage.collection("models", source_policy)?;
+let raw = storage.derive(source, SimpleToSuccinctMapping, raw_policy)?;
+let accelerated = storage.derive(raw, RawToRank9AcceleratedMapping, accelerated_policy)?;
+let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
 
 let archive = succinct.ensure_exact(&mut storage, &cover)?;
 let same_archive = succinct.attach_exact(&mut storage, &cover)?;

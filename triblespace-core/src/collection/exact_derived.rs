@@ -24,14 +24,12 @@ use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
-use crate::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, OfferCapture,
-};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, OfferCapture};
 use crate::trible::Fragment;
 
 use super::discovery::discover_collection_records_for_derived_cover;
 use super::{
-    collection_physical_cover, collection_physical_cover_for, descriptor,
+    collection_physical_cover, collection_physical_cover_for,
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation, CollectionData,
     CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
     CollectionOperationError, CollectionRead, CollectionRecord, CollectionSemantics,
@@ -256,100 +254,105 @@ impl Error for ExactDerivedCollectionError {
 /// Exact-cover lifecycle for one fixed source-to-target mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExactDerivedCollection<Mapping: CollectionMapping> {
-    source: Fragment,
     source_collection: Collection<MappingSource<Mapping>>,
-    target: Fragment,
     target_collection: Collection<MappingTarget<Mapping>>,
-    mapping: Mapping,
+    mapping_override: Option<Mapping>,
 }
 
 impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
-    /// Bind one mapping to two exact typed descriptors.
-    pub fn new(source: Fragment, target: Fragment) -> Result<Self, ExactDerivedCollectionError> {
-        let (source_collection, target_collection) = Self::validate_descriptors(&source, &target)?;
-        let mapping = Mapping::bind(&source, &target).map_err(|error| {
-            ExactDerivedCollectionError::Resolution(format!(
-                "invalid exact collection mapping: {error}"
-            ))
-        })?;
-        Ok(Self {
-            source,
-            source_collection,
-            target,
-            target_collection,
-            mapping,
-        })
+    /// Bind exact maintenance to two collections returned by store lifecycle APIs.
+    ///
+    /// Descriptor bytes and mapping parameters are loaded and validated from
+    /// the operation's immutable store snapshot. This constructor never hashes
+    /// or reconstructs a descriptor from caller-supplied facts.
+    pub fn new(
+        source_collection: Collection<MappingSource<Mapping>>,
+        target_collection: Collection<MappingTarget<Mapping>>,
+    ) -> Result<Self, ExactDerivedCollectionError> {
+        Self::construct(source_collection, target_collection, None)
     }
 
     /// Bind an already constructed observational mapping implementation.
     /// Kept crate-private so public callers cannot swap semantic behavior
     /// between operations on one typed lifecycle.
     pub(crate) fn with_mapping(
-        source: Fragment,
-        target: Fragment,
+        source_collection: Collection<MappingSource<Mapping>>,
+        target_collection: Collection<MappingTarget<Mapping>>,
         mapping: Mapping,
     ) -> Result<Self, ExactDerivedCollectionError> {
-        let (source_collection, target_collection) = Self::validate_descriptors(&source, &target)?;
-        Ok(Self {
-            source,
-            source_collection,
-            target,
-            target_collection,
-            mapping,
-        })
+        Self::construct(source_collection, target_collection, Some(mapping))
     }
 
-    fn validate_descriptors(
-        source: &Fragment,
-        target: &Fragment,
-    ) -> Result<
-        (
-            Collection<MappingSource<Mapping>>,
-            Collection<MappingTarget<Mapping>>,
-        ),
-        ExactDerivedCollectionError,
-    > {
-        let source_collection = Collection::<MappingSource<Mapping>>::from_descriptor(&source)
-            .map_err(|error| {
-                ExactDerivedCollectionError::Resolution(format!(
-                    "invalid exact source descriptor: {error}"
-                ))
-            })?;
-        let target_collection = Collection::<MappingTarget<Mapping>>::from_descriptor(&target)
-            .map_err(|error| {
-                ExactDerivedCollectionError::Resolution(format!(
-                    "invalid exact target descriptor: {error}"
-                ))
-            })?;
+    fn construct(
+        source_collection: Collection<MappingSource<Mapping>>,
+        target_collection: Collection<MappingTarget<Mapping>>,
+        mapping_override: Option<Mapping>,
+    ) -> Result<Self, ExactDerivedCollectionError> {
         if source_collection.handle() == target_collection.handle() {
             return Err(ExactDerivedCollectionError::Resolution(
                 "exact derived collection requires distinct source and target descriptors"
                     .to_owned(),
             ));
         }
+        Ok(Self {
+            source_collection,
+            target_collection,
+            mapping_override,
+        })
+    }
+
+    fn load_descriptors<R>(
+        &self,
+        reader: &R,
+    ) -> Result<(Fragment, Fragment), ExactDerivedCollectionError>
+    where
+        R: BlobStoreGet,
+    {
+        let source =
+            super::api::load_collection_descriptor(reader, self.source_collection.handle())
+                .map_err(|error| {
+                    ExactDerivedCollectionError::Resolution(format!(
+                        "load exact source descriptor: {error}"
+                    ))
+                })?
+                .fragment;
+        super::encoding::validate_descriptor_type::<MappingSource<Mapping>>(&source).map_err(
+            |error| {
+                ExactDerivedCollectionError::Resolution(format!(
+                    "invalid exact source descriptor: {error}"
+                ))
+            },
+        )?;
+
+        let target =
+            super::api::load_collection_descriptor(reader, self.target_collection.handle())
+                .map_err(|error| {
+                    ExactDerivedCollectionError::Resolution(format!(
+                        "load exact target descriptor: {error}"
+                    ))
+                })?
+                .fragment;
+        super::encoding::validate_descriptor_type::<MappingTarget<Mapping>>(&target).map_err(
+            |error| {
+                ExactDerivedCollectionError::Resolution(format!(
+                    "invalid exact target descriptor: {error}"
+                ))
+            },
+        )?;
+
         let declared_source = super::descriptor::source(target.facts()).map_err(|error| {
             ExactDerivedCollectionError::Resolution(format!(
                 "invalid target collection_source: {error}"
             ))
         })?;
-        if declared_source != Some(source_collection.handle()) {
+        if declared_source != Some(self.source_collection.handle()) {
             return Err(ExactDerivedCollectionError::Resolution(format!(
                 "target collection_source {:?} does not match source descriptor {}",
                 declared_source.map(|handle| hex::encode_upper(handle.raw)),
-                hex::encode_upper(source_collection.handle().raw),
+                hex::encode_upper(self.source_collection.handle().raw),
             )));
         }
-        Ok((source_collection, target_collection))
-    }
-
-    /// Source descriptor.
-    pub fn source_descriptor(&self) -> &Fragment {
-        &self.source
-    }
-
-    /// Target descriptor.
-    pub fn target_descriptor(&self) -> &Fragment {
-        &self.target
+        Ok((source, target))
     }
 
     /// Identity of the source collection.
@@ -362,8 +365,8 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         self.target_collection
     }
 
-    pub(crate) fn mapping(&self) -> &Mapping {
-        &self.mapping
+    pub(crate) fn mapping_override(&self) -> Option<&Mapping> {
+        self.mapping_override.as_ref()
     }
 
     fn require_source_cover(
@@ -547,6 +550,13 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         if probe.is_complete() {
             return Ok(probe.into_target_cover());
         }
+        let bound_mapping = Mapping::bind(&probe.source_descriptor, &probe.target_descriptor)
+            .map_err(|error| {
+                ExactDerivedCollectionError::Resolution(format!(
+                    "invalid exact collection mapping: {error}"
+                ))
+            })?;
+        let mapping = self.mapping_override.as_ref().unwrap_or(&bound_mapping);
         // Capacity belongs to a selected physical source member, not to its
         // logical support. Excluding that member can expose a completely
         // different overlap-aware cover, so every capacity result restarts
@@ -568,7 +578,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             let mut replan = None;
             for (input_data, input) in source_cover {
                 if !cached.contains_key(&input_data) {
-                    let output = match self.mapping.map(&input, &probe.reader) {
+                    let output = match mapping.map(&input, &probe.reader) {
                         Ok(output) => output,
                         Err(CollectionOperationError::Fatal(reason)) => {
                             return Err(ExactDerivedCollectionError::Derive {
@@ -615,7 +625,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
 
         // Never retain an observed store snapshot across publication.
         drop(probe);
-        self.publish_descriptors(store)?;
         for prepared in &prepared {
             store
                 .put::<MappingSource<Mapping>, _>(prepared.input.clone())
@@ -669,17 +678,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             return Err(probe.incomplete_error());
         }
         Ok(probe.into_target_cover())
-    }
-
-    fn publish_descriptors<S: BlobStorePut>(
-        &self,
-        store: &mut S,
-    ) -> Result<(), ExactDerivedCollectionError> {
-        for descriptor in [&self.source, &self.target] {
-            descriptor::put_closure(store, descriptor)
-                .map_err(|error| ExactDerivedCollectionError::storage("store descriptor", error))?;
-        }
-        Ok(())
     }
 
     fn probe<S>(
@@ -739,6 +737,14 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         let reader = store.snapshot().map_err(|error| {
             ExactDerivedCollectionError::storage("open exact-cover snapshot", error)
         })?;
+        let (source_descriptor, target_descriptor) = self.load_descriptors(&reader)?;
+        let bound_mapping =
+            Mapping::bind(&source_descriptor, &target_descriptor).map_err(|error| {
+                ExactDerivedCollectionError::Resolution(format!(
+                    "invalid exact collection mapping: {error}"
+                ))
+            })?;
+        let mapping = self.mapping_override.as_ref().unwrap_or(&bound_mapping);
         let discovered = discover_collection_records_for_derived_cover(
             &reader,
             source_cover,
@@ -757,7 +763,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             if !known.contains_key(&node) {
                 let Some(artifact) = load_candidate::<_, MappingSource<Mapping>>(
                     &reader,
-                    &self.source,
+                    &source_descriptor,
                     member,
                     "read source cover member",
                 )?
@@ -833,7 +839,8 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             let Ok(blob) = reader.get(Handle::<MappingSource<Mapping>>::from_hash(member)) else {
                 continue;
             };
-            let Ok(()) = MappingSource::<Mapping>::validate_member(&self.source, &blob, &reader)
+            let Ok(()) =
+                MappingSource::<Mapping>::validate_member(&source_descriptor, &blob, &reader)
             else {
                 continue;
             };
@@ -887,9 +894,9 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             &candidate_indices,
             &roots,
             &mut known,
-            &self.source,
-            &self.target,
-            &self.mapping,
+            &source_descriptor,
+            &target_descriptor,
+            mapping,
             &reader,
         );
 
@@ -1002,7 +1009,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         let local_physical: ValidatedPhysicalCover<MappingTarget<Mapping>> =
             validated_physical_cover(
                 &reader,
-                &self.target,
+                &target_descriptor,
                 resolution.semantics(),
                 target,
                 target_local,
@@ -1026,7 +1033,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                 .collect();
             validated_physical_cover(
                 &reader,
-                &self.target,
+                &target_descriptor,
                 resolution.semantics(),
                 target,
                 target_resident,
@@ -1074,7 +1081,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         let source_plan =
             source_plan_parts.map(|(collection, resident, mandatory, required_members)| {
                 SourcePlan {
-                    descriptor: self.source.clone(),
+                    descriptor: source_descriptor.clone(),
                     semantics: resolution.into_semantics(),
                     collection,
                     resident,
@@ -1085,6 +1092,8 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
 
         Ok(ExactProbe {
             reader,
+            source_descriptor,
+            target_descriptor,
             target_cover: target_physical.fetch.is_empty().then(|| {
                 Cover::from_data(
                     self.target_collection,
@@ -1161,6 +1170,8 @@ struct SourcePlan<Source: CollectionEncoding> {
 
 struct ExactProbe<R, Source: CollectionEncoding, Target: CollectionEncoding> {
     reader: R,
+    source_descriptor: Fragment,
+    target_descriptor: Fragment,
     target_cover: Option<Cover<Target>>,
     target_fetch: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,

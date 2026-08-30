@@ -29,11 +29,9 @@ use crate::collection::exact_derived::{ExactDerivedCollection, ExactDerivedColle
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
-use crate::collection::simplearchive_union;
 use crate::collection::{
-    CollectionData, CollectionHandle, CollectionMapping, CollectionOperationError,
-    CollectionPolicy, CollectionStore, Cover, CoverAdvanceError, FactCover, TryFromCover,
-    TryFromCoverError,
+    Collection, CollectionData, CollectionMapping, CollectionOperationError, CollectionStore,
+    Cover, CoverAdvanceError, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -241,9 +239,9 @@ where
 /// Canonical accelerated SuccinctArchive projection of one SimpleArchive union.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccinctArchiveCollection {
-    name: String,
-    source_policy: CollectionPolicy,
-    policy: CollectionPolicy,
+    source: Collection<SimpleArchive>,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
 }
 
 /// Exact work performed by one successful [`SuccinctArchiveView::ensure`].
@@ -429,14 +427,18 @@ impl SuccinctArchiveView {
         S: BlobStore + CollectionStore + ArtifactOfferStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
-        let source = self.collection.source_descriptor();
-        let raw = self.collection.raw_descriptor();
-        let inner = SimpleToSuccinctMapping::bind(&source, &raw)
-            .map_err(|error| ExactDerivedCollectionError::Resolution(error.to_string()))?;
-        let measured = MeasuredSuccinctHomomorphism::new(inner, work);
-        let raw_kernel = ExactDerivedCollection::with_mapping(source, raw, measured)?;
+        let measured = MeasuredSuccinctHomomorphism::new(SimpleToSuccinctMapping, work);
+        let raw_kernel = ExactDerivedCollection::with_mapping(
+            self.collection.source,
+            self.collection.raw,
+            measured,
+        )?;
         let raw_cover = raw_kernel.ensure_exact(store, cover)?;
-        let work = raw_kernel.mapping().work.get();
+        let work = raw_kernel
+            .mapping_override()
+            .expect("measured kernel retains its explicit mapping")
+            .work
+            .get();
         let accelerated = self
             .collection
             .rank9_derivation()?
@@ -449,16 +451,16 @@ impl SuccinctArchiveView {
 }
 
 impl SuccinctArchiveCollection {
-    /// Construct the canonical accelerated projection for one named root.
+    /// Bind the facade to its three store-created lifecycle values.
     pub fn new(
-        name: impl Into<String>,
-        source_policy: CollectionPolicy,
-        policy: CollectionPolicy,
+        source: Collection<SimpleArchive>,
+        raw: Collection<SuccinctArchiveBlob>,
+        accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     ) -> Self {
         Self {
-            name: name.into(),
-            source_policy,
-            policy,
+            source,
+            raw,
+            accelerated,
         }
     }
 
@@ -467,51 +469,19 @@ impl SuccinctArchiveCollection {
         SuccinctArchiveView::new(self.clone())
     }
 
-    /// Name of the source collection this projection is taken over.
-    pub fn name(&self) -> &str {
-        self.name.as_str()
+    /// Store-issued source collection.
+    pub fn source_collection(&self) -> Collection<SimpleArchive> {
+        self.source
     }
 
-    /// Source authorization policy.
-    pub fn source_policy(&self) -> &CollectionPolicy {
-        &self.source_policy
+    /// Store-issued raw intermediate collection.
+    pub fn raw_collection(&self) -> Collection<SuccinctArchiveBlob> {
+        self.raw
     }
 
-    /// Policy shared by the two derived collections.
-    pub fn policy(&self) -> &CollectionPolicy {
-        &self.policy
-    }
-
-    /// Canonical source SimpleArchive-union descriptor facts.
-    pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.source_policy.clone())
-    }
-
-    /// Identity of the source collection this projection reads.
-    pub fn source_collection(&self) -> CollectionHandle {
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.source_descriptor().into_facts())
-            .get_handle()
-    }
-
-    /// Canonical intermediate raw-SuccinctArchive descriptor.
-    pub fn raw_descriptor(&self) -> Fragment {
-        super::descriptor(self.source_collection(), self.policy.clone())
-    }
-
-    /// Identity of the intermediate raw SuccinctArchive collection.
-    pub fn raw_collection(&self) -> CollectionHandle {
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.raw_descriptor().into_facts())
-            .get_handle()
-    }
-
-    /// Canonical public Rank9-accelerated SuccinctArchive descriptor.
-    pub fn descriptor(&self) -> Fragment {
-        super::accelerated_descriptor(self.raw_collection(), self.policy.clone())
-    }
-
-    /// Identity of the accelerated collection this facade maintains.
-    pub fn collection(&self) -> CollectionHandle {
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts()).get_handle()
+    /// Store-issued accelerated collection.
+    pub fn collection(&self) -> Collection<Rank9AcceleratedSuccinctArchiveBlob> {
+        self.accelerated
     }
 
     /// Attach the exact accelerated cover without writing.
@@ -575,14 +545,14 @@ impl SuccinctArchiveCollection {
     fn raw_kernel(
         &self,
     ) -> Result<ExactDerivedCollection<SimpleToSuccinctMapping>, ExactDerivedCollectionError> {
-        ExactDerivedCollection::new(self.source_descriptor(), self.raw_descriptor())
+        ExactDerivedCollection::new(self.source, self.raw)
     }
 
     fn rank9_derivation(
         &self,
     ) -> Result<ExactDerivedCollection<RawToRank9AcceleratedMapping>, ExactDerivedCollectionError>
     {
-        ExactDerivedCollection::new(self.raw_descriptor(), self.descriptor())
+        ExactDerivedCollection::new(self.raw, self.accelerated)
     }
 }
 
@@ -598,8 +568,8 @@ mod tests {
     use crate::blob::{Blob, IntoBlob};
     use crate::collection::descriptor;
     use crate::collection::{
-        Collection, CollectionDerive, CollectionEncoding, CollectionMapping, CollectionMerge,
-        CollectionRead, CollectionRecord, CollectionStore, Cover, FactCover,
+        CollectionDerive, CollectionEncoding, CollectionMapping, CollectionMerge, CollectionPolicy,
+        CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, Cover, FactCover,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
@@ -619,6 +589,17 @@ mod tests {
             crate::collection::AdmissionPolicy::direct(authority()),
             crate::collection::AdmissionPolicy::direct(authority()),
         )
+    }
+
+    fn facade(store: &mut MemoryRepo) -> SuccinctArchiveCollection {
+        let source = store.collection("facts", direct_policy()).unwrap();
+        let raw = store
+            .derive(source, SimpleToSuccinctMapping, direct_policy())
+            .unwrap();
+        let accelerated = store
+            .derive(raw, RawToRank9AcceleratedMapping, direct_policy())
+            .unwrap();
+        SuccinctArchiveCollection::new(source, raw, accelerated)
     }
 
     fn row(entity: u8, attribute: u8, value: u8) -> Trible {
@@ -644,41 +625,51 @@ mod tests {
     }
 
     #[test]
-    fn facade_descriptor_is_a_two_stage_ordinary_derivation() {
-        let facade = SuccinctArchiveCollection::new("facts", direct_policy(), direct_policy());
+    fn facade_lifecycle_is_a_two_stage_ordinary_derivation() {
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
+        let snapshot = store.snapshot().unwrap();
+        let raw_descriptor = crate::collection::api::load_collection_descriptor(
+            &snapshot,
+            facade.raw_collection().handle(),
+        )
+        .unwrap()
+        .fragment;
+        let accelerated_descriptor = crate::collection::api::load_collection_descriptor(
+            &snapshot,
+            facade.collection().handle(),
+        )
+        .unwrap()
+        .fragment;
         assert_eq!(
-            descriptor::source(facade.raw_descriptor().facts()).unwrap(),
-            Some(facade.source_collection())
+            descriptor::source(raw_descriptor.facts()).unwrap(),
+            Some(facade.source_collection().handle())
         );
         assert_eq!(
-            descriptor::source(facade.descriptor().facts()).unwrap(),
-            Some(facade.raw_collection())
+            descriptor::source(accelerated_descriptor.facts()).unwrap(),
+            Some(facade.raw_collection().handle())
         );
         assert_eq!(
-            descriptor::representation(facade.raw_descriptor().facts()).unwrap(),
+            descriptor::representation(raw_descriptor.facts()).unwrap(),
             SuccinctArchiveBlob::id()
         );
         assert_eq!(
-            descriptor::representation(facade.descriptor().facts()).unwrap(),
+            descriptor::representation(accelerated_descriptor.facts()).unwrap(),
             Rank9AcceleratedSuccinctArchiveBlob::id()
         );
     }
 
     #[test]
     fn ensure_uses_ordinary_derives_for_both_stages() {
-        let facade = SuccinctArchiveCollection::new("facts", direct_policy(), direct_policy());
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
         let source: Blob<SimpleArchive> = [row(1, 2, 3), row(4, 5, 6)]
             .into_iter()
             .collect::<TribleSet>()
             .to_blob();
-        let mut store = MemoryRepo::default();
         store.put::<SimpleArchive, _>(source.clone()).unwrap();
-        let source_collection = crate::collection::Collection::<SimpleArchive>::from_descriptor(
-            &facade.source_descriptor(),
-        )
-        .unwrap();
         let cover = FactCover::from_data(
-            source_collection,
+            facade.source_collection(),
             [Handle::<SimpleArchive>::to_hash(source.get_handle())],
         );
 
@@ -695,7 +686,7 @@ mod tests {
             .iter()
             .find_map(|record| match record {
                 CollectionRecord::Derive(derive)
-                    if derive.collection() == facade.raw_collection() =>
+                    if derive.collection() == facade.raw_collection().handle() =>
                 {
                     Some(derive.output())
                 }
@@ -705,7 +696,9 @@ mod tests {
         let accelerated = records
             .iter()
             .find_map(|record| match record {
-                CollectionRecord::Derive(derive) if derive.collection() == facade.collection() => {
+                CollectionRecord::Derive(derive)
+                    if derive.collection() == facade.collection().handle() =>
+                {
                     assert_eq!(derive.input(), raw);
                     Some(derive.output())
                 }
@@ -717,18 +710,14 @@ mod tests {
 
     #[test]
     fn compacting_raw_constructs_the_exact_accelerated_image() {
-        let facade = SuccinctArchiveCollection::new("facts", direct_policy(), direct_policy());
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
         let a: Blob<SimpleArchive> = [row(1, 2, 3)].into_iter().collect::<TribleSet>().to_blob();
         let b: Blob<SimpleArchive> = [row(4, 5, 6)].into_iter().collect::<TribleSet>().to_blob();
-        let mut store = MemoryRepo::default();
         store.put::<SimpleArchive, _>(a.clone()).unwrap();
         store.put::<SimpleArchive, _>(b.clone()).unwrap();
-        let source_collection = crate::collection::Collection::<SimpleArchive>::from_descriptor(
-            &facade.source_descriptor(),
-        )
-        .unwrap();
         let cover = FactCover::from_data(
-            source_collection,
+            facade.source_collection(),
             [
                 Handle::<SimpleArchive>::to_hash(a.get_handle()),
                 Handle::<SimpleArchive>::to_hash(b.get_handle()),
@@ -758,7 +747,9 @@ mod tests {
         let compacted_raw = records
             .iter()
             .find_map(|record| match record {
-                CollectionRecord::Merge(merge) if merge.collection() == facade.raw_collection() => {
+                CollectionRecord::Merge(merge)
+                    if merge.collection() == facade.raw_collection().handle() =>
+                {
                     Some(merge.result())
                 }
                 _ => None,
@@ -767,18 +758,20 @@ mod tests {
         assert!(records.iter().any(|record| matches!(
             record,
             CollectionRecord::Derive(derive)
-                if derive.collection() == facade.collection()
+                if derive.collection() == facade.collection().handle()
                     && derive.input() == compacted_raw
         )));
         assert!(!records.iter().any(|record| matches!(
             record,
-            CollectionRecord::Merge(merge) if merge.collection() == facade.collection()
+            CollectionRecord::Merge(merge)
+                if merge.collection() == facade.collection().handle()
         )));
     }
 
     #[test]
     fn exact_acceleration_does_not_replace_named_raw_members_with_their_union() {
-        let facade = SuccinctArchiveCollection::new("facts", direct_policy(), direct_policy());
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
         let a = raw([row(1, 2, 3)]);
         let b = raw([row(4, 5, 6)]);
         let c = super::super::join(&a, &b).unwrap();
@@ -788,7 +781,6 @@ mod tests {
         let fc = accelerated(&c);
         let fc_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fc.get_handle());
 
-        let mut store = MemoryRepo::default();
         for member in [a.clone(), b.clone(), c] {
             store.put::<SuccinctArchiveBlob, _>(member).unwrap();
         }
@@ -797,7 +789,7 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                facade.raw_collection(),
+                facade.raw_collection().handle(),
                 a_data,
                 b_data,
                 c_data,
@@ -805,15 +797,13 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                facade.collection(),
+                facade.collection().handle(),
                 c_data,
                 fc_data,
             )))
             .unwrap();
 
-        let raw_collection =
-            Collection::<SuccinctArchiveBlob>::from_descriptor(&facade.raw_descriptor()).unwrap();
-        let raw_cover = Cover::from_data(raw_collection, [a_data, b_data]);
+        let raw_cover = Cover::from_data(facade.raw_collection(), [a_data, b_data]);
         let attached = facade
             .rank9_derivation()
             .unwrap()
@@ -843,7 +833,8 @@ mod tests {
             assert!(records.iter().any(|record| matches!(
                 record,
                 CollectionRecord::Derive(derive)
-                    if derive.collection() == facade.collection() && derive.input() == input
+                    if derive.collection() == facade.collection().handle()
+                        && derive.input() == input
             )));
         }
     }

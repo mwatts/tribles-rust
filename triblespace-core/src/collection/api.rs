@@ -671,24 +671,12 @@ fn validate_generic_descriptor(facts: &TribleSet) -> Result<CollectionPolicy, Re
     descriptor::validate(facts)
 }
 
-fn store_descriptor_closure<S>(
-    store: &mut S,
-    descriptor: Fragment,
-) -> Result<(), CollectionRegistrationError<S::PutError>>
-where
-    S: BlobStorePut,
-{
-    descriptor::put_closure(store, &descriptor)
-        .map_err(CollectionRegistrationError::DependencyPut)?;
-    Ok(())
+pub(crate) struct LoadedCollectionDescriptor {
+    pub(crate) fragment: Fragment,
+    pub(crate) policy: CollectionPolicy,
 }
 
-struct LoadedCollectionDescriptor {
-    fragment: Fragment,
-    policy: CollectionPolicy,
-}
-
-fn load_collection_descriptor<R>(
+pub(crate) fn load_collection_descriptor<R>(
     snapshot: &R,
     collection: CollectionHandle,
 ) -> Result<LoadedCollectionDescriptor, CollectionDescriptorError<R::GetError<Infallible>>>
@@ -1109,15 +1097,17 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     where
         L: CollectionEncoding,
     {
-        let collection =
-            Collection::<L>::from_descriptor(&descriptor).map_err(|source| match source {
+        super::encoding::validate_descriptor_type::<L>(&descriptor).map_err(
+            |source| match source {
                 CollectionTypeError::Malformed(source) => {
                     CollectionRegistrationError::InvalidDescriptor(source)
                 }
                 source => CollectionRegistrationError::WrongType(source),
-            })?;
-        store_descriptor_closure(self, descriptor)?;
-        Ok(collection)
+            },
+        )?;
+        let handle = descriptor::put_closure(self, &descriptor)
+            .map_err(CollectionRegistrationError::DependencyPut)?;
+        Ok(Collection::from_handle(handle))
     }
 
     /// Create and register one named root fact collection.

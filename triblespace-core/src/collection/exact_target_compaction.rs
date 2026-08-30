@@ -14,11 +14,10 @@ use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, OfferCapture};
-use crate::trible::Fragment;
 
 use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
 use super::{
-    CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
+    Collection, CollectionData, CollectionEncoding, CollectionMapping, CollectionMerge,
     CollectionOperationError, CollectionRead, CollectionRecord, CollectionStore, Cover,
 };
 
@@ -114,8 +113,9 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// Each maintenance round first stages its complete deterministic carry in
 /// memory. Fatal construction errors and rounds with no successful join write
 /// nothing. Otherwise, after the attachment reader has been dropped, the target
-/// descriptor and every staged result are stored before the topologically
-/// ordered `MERGE` records. A fresh read pass then validates the result. Freshly
+/// stored descriptor is loaded from the same snapshot, then every staged
+/// result is stored before the topologically ordered `MERGE` records. A fresh
+/// read pass then validates the result. Freshly
 /// selected covers are compacted again when concurrent or older evidence
 /// exposes another collision. Repetition of any non-stable canonical cover
 /// returns [`ExactTargetCompactionError::Stalled`].
@@ -152,12 +152,7 @@ where
     seen.insert(cover_identity(&cover));
 
     loop {
-        match publish_round::<S, H::Target>(
-            exact.target_descriptor().clone(),
-            exact.target_collection().handle(),
-            store,
-            cover,
-        )? {
+        match publish_round::<S, H::Target>(exact.target_collection(), store, cover)? {
             RoundOutcome::Published => {}
             RoundOutcome::Stable(cover) => return Ok(cover),
         }
@@ -183,8 +178,7 @@ enum RoundOutcome<Target: CollectionEncoding> {
 }
 
 fn publish_round<S, Target>(
-    descriptor: Fragment,
-    collection: CollectionHandle,
+    collection: Collection<Target>,
     store: &mut S,
     cover: Cover<Target>,
 ) -> Result<RoundOutcome<Target>, ExactTargetCompactionError>
@@ -200,6 +194,18 @@ where
 
     let reader = store.snapshot().map_err(|source| {
         ExactTargetCompactionError::storage("open target-compaction snapshot", source)
+    })?;
+    let descriptor = super::api::load_collection_descriptor(&reader, collection.handle())
+        .map_err(|error| {
+            ExactTargetCompactionError::Exact(ExactDerivedCollectionError::Resolution(format!(
+                "load exact target descriptor: {error}"
+            )))
+        })?
+        .fragment;
+    super::encoding::validate_descriptor_type::<Target>(&descriptor).map_err(|error| {
+        ExactTargetCompactionError::Exact(ExactDerivedCollectionError::Resolution(format!(
+            "invalid exact target descriptor: {error}"
+        )))
     })?;
     let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
     let mut locations = BTreeMap::<CollectionData, u32>::new();
@@ -249,7 +255,7 @@ where
         };
         let result_data = data_identity::<Target>(&constructed);
         let result = constructed;
-        let claim = CollectionMerge::new(collection, low_data, high_data, result_data);
+        let claim = CollectionMerge::new(collection.handle(), low_data, high_data, result_data);
 
         if let Some(existing_tier) = locations.remove(&result_data) {
             let existing_bin = tiers
@@ -278,8 +284,6 @@ where
     // retain it across publication.
     drop(reader);
 
-    super::descriptor::put_closure(store, &descriptor)
-        .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
     for result in outputs.into_values() {
         store.put::<Target, _>(result).map_err(|error| {
             ExactTargetCompactionError::storage("store compacted target", error)
@@ -301,13 +305,14 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobEncoding, IntoBlob};
-    use crate::collection::{Collection, CollectionPolicy};
+    use crate::collection::{CollectionPolicy, CollectionStoreExt};
     use crate::id::{ExclusiveId, Id};
     use crate::id_hex;
     use crate::inline::Inline;
     use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::BlobStorePut;
+    use crate::trible::Fragment;
 
     /// Test-only encoding with no directly materialized join.
     /// Minted with `trible genid` on 2026-08-30.
@@ -393,7 +398,10 @@ mod tests {
     #[test]
     fn no_direct_join_leaves_a_colliding_cover_unchanged_without_writes() {
         let descriptor = descriptor();
-        let collection = Collection::<NoJoinEncoding>::from_descriptor(&descriptor).unwrap();
+        let mut blobs = MemoryRepo::default();
+        let collection = blobs
+            .register_collection::<NoJoinEncoding>(descriptor)
+            .unwrap();
         let mut members = vec![
             Blob::<NoJoinEncoding>::new(vec![1; 8].into()),
             Blob::<NoJoinEncoding>::new(vec![2; 8].into()),
@@ -402,18 +410,11 @@ mod tests {
         let cover =
             Cover::from_members(collection, members.iter().map(|member| member.get_handle()));
         let original = cover_identity(&cover);
-        let mut blobs = MemoryRepo::default();
         for member in members {
             blobs.put::<NoJoinEncoding, _>(member).unwrap();
         }
 
-        let result = publish_round(
-            descriptor,
-            collection.handle(),
-            &mut NoWriteStore { blobs },
-            cover,
-        )
-        .unwrap();
+        let result = publish_round(collection, &mut NoWriteStore { blobs }, cover).unwrap();
         let RoundOutcome::Stable(result) = result else {
             panic!("a no-join encoding published a compaction round");
         };

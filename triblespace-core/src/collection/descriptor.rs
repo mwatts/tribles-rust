@@ -95,7 +95,7 @@ where
 /// Policy is mandatory and contributes to collection identity. Actual
 /// delegated principals remain external capability proofs so invitations can
 /// grow without renaming the collection.
-pub fn naming<E>(name: &str, policy: CollectionPolicy) -> Fragment
+pub(crate) fn naming<E>(name: &str, policy: CollectionPolicy) -> Fragment
 where
     E: CollectionEncoding,
 {
@@ -113,7 +113,11 @@ where
 /// The mapping Fragment is spread into the same descriptor archive. Its root
 /// is linked from the descriptor and all algorithm descriptions, parameters,
 /// and attachments therefore travel with the collection identity.
-pub fn deriving<M>(source: CollectionHandle, mapping: &M, policy: CollectionPolicy) -> Fragment
+pub(crate) fn deriving<M>(
+    source: CollectionHandle,
+    mapping: &M,
+    policy: CollectionPolicy,
+) -> Fragment
 where
     M: CollectionMapping,
 {

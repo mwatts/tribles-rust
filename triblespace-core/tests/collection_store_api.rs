@@ -127,10 +127,12 @@ fn root_creation_registers_a_self_contained_descriptor() {
 #[test]
 fn commit_is_local_and_correct_by_construction() {
     let root = key(2);
-    let descriptor =
-        descriptor::naming::<SimpleArchive>("not-registered", policy(root.verifying_key()));
-    let collection = Collection::<SimpleArchive>::from_descriptor(&descriptor).unwrap();
     let mut store = CountingRepo::default();
+    let collection = store
+        .collection("registered", policy(root.verifying_key()))
+        .unwrap();
+    let descriptor_puts = store.puts_for(collection.handle());
+    store.events.clear();
 
     let expected_data = fragment(7).facts().clone().to_blob().get_handle();
     let commit = store.commit(collection, &root, fragment(7)).unwrap();
@@ -139,7 +141,8 @@ fn commit_is_local_and_correct_by_construction() {
         Handle::<SimpleArchive>::from_hash(commit.data()),
         expected_data
     );
-    assert_eq!(store.puts_for(collection.handle()), 0);
+    assert_eq!(descriptor_puts, 1);
+    assert_eq!(store.puts_for(collection.handle()), descriptor_puts);
     assert_eq!(store.events.last(), Some(&StoreEvent::Insert(commit.id())));
 }
 

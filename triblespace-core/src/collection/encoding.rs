@@ -19,7 +19,7 @@ use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::blob::{Blob, BlobEncoding, IntoBlob};
+use crate::blob::{Blob, BlobEncoding};
 use crate::metadata::MetaDescribe;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::Fragment;
@@ -225,20 +225,6 @@ impl<E: CollectionEncoding> Collection<E> {
             handle,
             encoding: PhantomData,
         }
-    }
-
-    /// Validate and type one self-contained descriptor without storing it.
-    ///
-    /// Use [`CollectionStoreExt::collection`](super::CollectionStoreExt::collection)
-    /// when the descriptor and its attachment closure should also be registered
-    /// in a store.
-    pub fn from_descriptor(descriptor_fragment: &Fragment) -> Result<Self, CollectionTypeError> {
-        validate_descriptor_type::<E>(descriptor_fragment)?;
-        let handle = IntoBlob::<crate::blob::encodings::simplearchive::SimpleArchive>::to_blob(
-            descriptor_fragment,
-        )
-        .get_handle();
-        Ok(Self::from_handle(handle))
     }
 
     /// Representation-neutral descriptor handle stored in dense records.

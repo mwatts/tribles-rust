@@ -72,10 +72,16 @@ use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
 use anybytes::Bytes;
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
-use super::records::{mapping_algorithm, CollectionHandle, KIND_COLLECTION_MAPPING};
+#[cfg(test)]
+use super::records::CollectionHandle;
+use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
+#[cfg(test)]
+use super::simplearchive_union;
+#[cfg(test)]
+use super::CollectionPolicy;
 use super::{
-    simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
-    CollectionPolicy, CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
+    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 
 const ID_LEN: usize = 16;
@@ -353,7 +359,8 @@ pub fn join(
 ///
 /// The target's independent READ and WRITE policies are explicit rather than
 /// inherited from its source.
-pub fn descriptor(
+#[cfg(test)]
+pub(crate) fn descriptor(
     source: CollectionHandle,
     identity: Id,
     orders: Id,
@@ -618,78 +625,24 @@ impl TryFromCover<LwwRegisterBlob> for LwwIndex {
 /// Exact maintained LWW projection of one named root collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LwwRegisterCollection {
-    name: String,
-    source_policy: CollectionPolicy,
-    identity: Id,
-    orders: Id,
-    policy: CollectionPolicy,
+    source: Collection<SimpleArchive>,
+    target: Collection<LwwRegisterBlob>,
 }
 
 impl LwwRegisterCollection {
-    /// Construct a maintained LWW register over one named root collection.
-    ///
-    /// Source and target policies are independent parts of their respective
-    /// descriptor identities.
-    pub fn new(
-        name: impl Into<String>,
-        source_policy: CollectionPolicy,
-        identity: Id,
-        orders: Id,
-        policy: CollectionPolicy,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            source_policy,
-            identity,
-            orders,
-            policy,
-        }
+    /// Bind the maintained register facade to store-created source and target values.
+    pub fn new(source: Collection<SimpleArchive>, target: Collection<LwwRegisterBlob>) -> Self {
+        Self { source, target }
     }
 
-    /// Name of the source root collection.
-    pub fn name(&self) -> &str {
-        self.name.as_str()
+    /// Store-issued source collection.
+    pub fn source_collection(&self) -> Collection<SimpleArchive> {
+        self.source
     }
 
-    /// Source authorization policy.
-    pub fn source_policy(&self) -> &CollectionPolicy {
-        &self.source_policy
-    }
-
-    /// Derived authorization policy.
-    pub fn policy(&self) -> &CollectionPolicy {
-        &self.policy
-    }
-
-    /// Attribute which states register identity.
-    pub fn identity(&self) -> Id {
-        self.identity
-    }
-
-    /// Attribute which states raw order values.
-    pub fn orders(&self) -> Id {
-        self.orders
-    }
-
-    /// Canonical source `SimpleArchive` collection descriptor.
-    pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.source_policy.clone())
-    }
-
-    /// Identity of the source collection.
-    pub fn source_collection(&self) -> CollectionHandle {
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.source_descriptor().into_facts())
-            .get_handle()
-    }
-
-    /// Canonical target collection descriptor.
-    pub fn descriptor(&self) -> Fragment {
-        descriptor(
-            self.source_collection(),
-            self.identity,
-            self.orders,
-            self.policy.clone(),
-        )
+    /// Store-issued target collection.
+    pub fn target_collection(&self) -> Collection<LwwRegisterBlob> {
+        self.target
     }
 
     /// Attach an already resident exact projection for `source_cover`.
@@ -740,7 +693,7 @@ impl LwwRegisterCollection {
         &self,
     ) -> Result<ExactDerivedCollection<RegisterCoordinatesMapping>, ExactDerivedCollectionError>
     {
-        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
+        ExactDerivedCollection::new(self.source, self.target)
     }
 }
 
@@ -1091,24 +1044,36 @@ mod tests {
         let name = "lww-source".to_owned();
         let source_policy = direct_policy(source_root);
         let target_policy = direct_policy(target_root);
-        let collection = LwwRegisterCollection::new(
-            name.clone(),
-            source_policy.clone(),
-            state_of.id(),
-            written_at.id(),
-            target_policy.clone(),
-        );
+        let mut store = MemoryRepo::default();
+        let source = store.collection(&name, source_policy.clone()).unwrap();
+        let target = store
+            .derive(
+                source,
+                RegisterCoordinatesMapping::new(state_of.id(), written_at.id()),
+                target_policy.clone(),
+            )
+            .unwrap();
+        let collection = LwwRegisterCollection::new(source, target);
+        let snapshot = store.snapshot().unwrap();
+        let source_descriptor = crate::collection::api::load_collection_descriptor(
+            &snapshot,
+            collection.source_collection().handle(),
+        )
+        .unwrap()
+        .fragment;
+        let target_descriptor = crate::collection::api::load_collection_descriptor(
+            &snapshot,
+            collection.target_collection().handle(),
+        )
+        .unwrap()
+        .fragment;
 
         assert_eq!(
-            collection.source_descriptor(),
-            simplearchive_union::descriptor(&name, source_policy.clone())
-        );
-        assert_eq!(
-            descriptor_facts::policy(collection.source_descriptor().facts()),
+            descriptor_facts::policy(source_descriptor.facts()),
             Ok(source_policy)
         );
         assert_eq!(
-            descriptor_facts::policy(collection.descriptor().facts()),
+            descriptor_facts::policy(target_descriptor.facts()),
             Ok(target_policy)
         );
     }
@@ -1117,22 +1082,32 @@ mod tests {
     fn exact_collection_lifecycle_joins_fact_halves_from_distinct_commits() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         let team = signing_key.verifying_key();
-        let collection = LwwRegisterCollection::new(
-            "maintained-lww".to_owned(),
-            direct_policy(team),
-            state_of.id(),
-            written_at.id(),
-            direct_policy(team),
-        );
+        let mut store = MemoryRepo::default();
+        let source = store
+            .collection("maintained-lww", direct_policy(team))
+            .unwrap();
+        let target = store
+            .derive(
+                source,
+                RegisterCoordinatesMapping::new(state_of.id(), written_at.id()),
+                direct_policy(team),
+            )
+            .unwrap();
+        let collection = LwwRegisterCollection::new(source, target);
+        let snapshot = store.snapshot().unwrap();
+        let source_descriptor =
+            crate::collection::api::load_collection_descriptor(&snapshot, source.handle())
+                .unwrap()
+                .fragment;
+        drop(snapshot);
         let register = ufoid();
         let state = ufoid();
         let identity_data = archive(&identity(&state, &register));
         let order_data = archive(&order(&state, 42));
         let metadata = TribleSet::new().to_blob();
-        let mut store = MemoryRepo::default();
         let identity_commit = simplearchive_union::publish_commit(
             &mut store,
-            &collection.source_descriptor(),
+            &source_descriptor,
             &identity_data,
             &metadata,
             &signing_key,
@@ -1140,14 +1115,14 @@ mod tests {
         .unwrap();
         let order_commit = simplearchive_union::publish_commit(
             &mut store,
-            &collection.source_descriptor(),
+            &source_descriptor,
             &order_data,
             &metadata,
             &signing_key,
         )
         .unwrap();
         let source_cover = FactCover::from_data(
-            collection.kernel().unwrap().source_collection(),
+            collection.source_collection(),
             [identity_commit.data(), order_commit.data()],
         );
 

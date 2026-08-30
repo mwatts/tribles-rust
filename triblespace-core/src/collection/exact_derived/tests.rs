@@ -248,10 +248,6 @@ fn attached_text_mapping_fragment() -> Fragment {
     }
 }
 
-fn attached_text_target(source: CollectionHandle) -> Fragment {
-    descriptor::deriving(source, &AttachedTextMapping, test_policy())
-}
-
 struct AttachedTextMapping;
 
 impl CollectionMapping for AttachedTextMapping {
@@ -494,10 +490,6 @@ fn target_root(source: CollectionHandle) -> Fragment {
     descriptor::deriving(source, &TestSuffixMapping, test_policy())
 }
 
-fn second_target_root(source: CollectionHandle) -> Fragment {
-    descriptor::deriving(source, &SecondTestSuffixMapping, test_policy())
-}
-
 fn substitute_mapping_entity(target: Fragment, replacement: Id) -> Fragment {
     let descriptor_root = target.root().expect("target descriptor root");
     let mapping = descriptor::mapping(target.facts())
@@ -523,17 +515,27 @@ fn substitute_mapping_entity(target: Fragment, replacement: Id) -> Fragment {
     Fragment::rooted_from_parts(descriptor_root, substituted, metafacts, blobs)
 }
 
+fn register_kernel(store: &mut MemoryRepo) -> ExactDerivedCollection<TestSuffixMapping> {
+    let source = store
+        .register_collection::<TestSourceBlob>(source_root())
+        .unwrap();
+    let target = store
+        .derive(source, TestSuffixMapping, test_policy())
+        .unwrap();
+    ExactDerivedCollection::new(source, target).unwrap()
+}
+
 fn kernel() -> ExactDerivedCollection<TestSuffixMapping> {
-    let source = source_root();
-    let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
-    ExactDerivedCollection::new(source, target_root(source_collection.handle())).unwrap()
+    register_kernel(&mut MemoryRepo::default())
 }
 
 #[test]
 fn mapping_entity_id_substitution_preserves_binding_semantics() {
-    let source = source_root();
-    let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
-    let canonical = target_root(source_collection.handle());
+    let mut store = MemoryRepo::default();
+    let source = store
+        .register_collection::<TestSourceBlob>(source_root())
+        .unwrap();
+    let canonical = target_root(source.handle());
     let original_mapping = descriptor::mapping(canonical.facts()).unwrap().unwrap();
     let substituted = substitute_mapping_entity(canonical, SUBSTITUTED_MAPPING_ENTITY);
 
@@ -546,7 +548,15 @@ fn mapping_entity_id_substitution_preserves_binding_semantics() {
         descriptor::mapping_algorithm(substituted.facts()),
         Ok(Some(TEST_SUFFIX_MAPPING_V1))
     );
-    ExactDerivedCollection::<TestSuffixMapping>::new(source, substituted)
+    let target = store
+        .register_collection::<TestTargetBlob>(substituted)
+        .unwrap();
+    let exact = ExactDerivedCollection::<TestSuffixMapping>::new(source, target).unwrap();
+    let input = archive([(1, 2)]);
+    store.put::<TestSourceBlob, _>(input.clone()).unwrap();
+    let cover = Cover::from_members(source, [input.get_handle()]);
+    exact
+        .ensure_exact(&mut store, &cover)
         .expect("binding depends on mapping facts, not intrinsic-id minting history");
 }
 
@@ -560,25 +570,22 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
             AdmissionPolicy::direct(authority.verifying_key()),
         ),
     );
-    let source_collection =
-        Collection::<SimpleArchive>::from_descriptor(&source_descriptor).unwrap();
-    let target_descriptor = attached_text_target(source_collection.handle());
-    let exact = ExactDerivedCollection::<AttachedTextMapping>::new(
-        source_descriptor.clone(),
-        target_descriptor,
-    )
-    .unwrap();
     let expected = "the attachment is part of the source closure";
     let source = crate::macros::entity! {
         crate::metadata::description: expected.to_owned(),
     };
 
     let mut store = MemoryRepo::default();
-    let registered = store
+    let source_collection = store
         .register_collection::<SimpleArchive>(source_descriptor)
         .unwrap();
-    assert_eq!(registered, source_collection);
-    let commit = store.commit(registered, &authority, source).unwrap();
+    let target_collection = store
+        .derive(source_collection, AttachedTextMapping, test_policy())
+        .unwrap();
+    let exact =
+        ExactDerivedCollection::<AttachedTextMapping>::new(source_collection, target_collection)
+            .unwrap();
+    let commit = store.commit(source_collection, &authority, source).unwrap();
     let cover = Cover::from_data(source_collection, [commit.data()]);
 
     let attached = exact.ensure_exact(&mut store, &cover).unwrap();
@@ -598,16 +605,28 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
 }
 
 fn selective_kernel(mapping: SelectiveMapping) -> ExactDerivedCollection<SelectiveMapping> {
-    let source = source_root();
-    let source_collection = Collection::<TestSourceBlob>::from_descriptor(&source).unwrap();
-    ExactDerivedCollection::with_mapping(source, target_root(source_collection.handle()), mapping)
-        .unwrap()
+    let mut store = MemoryRepo::default();
+    let source = store
+        .register_collection::<TestSourceBlob>(source_root())
+        .unwrap();
+    let target = store
+        .derive(source, mapping.clone(), test_policy())
+        .unwrap();
+    ExactDerivedCollection::with_mapping(source, target, mapping).unwrap()
 }
 
-fn second_kernel() -> ExactDerivedCollection<SecondTestSuffixMapping> {
-    let source = kernel().target_descriptor().clone();
-    let source_collection = Collection::<TestTargetBlob>::from_descriptor(&source).unwrap();
-    ExactDerivedCollection::new(source, second_target_root(source_collection.handle())).unwrap()
+fn register_second_kernel(
+    store: &mut MemoryRepo,
+) -> ExactDerivedCollection<SecondTestSuffixMapping> {
+    let first = register_kernel(store);
+    let target = store
+        .derive(
+            first.target_collection(),
+            SecondTestSuffixMapping,
+            test_policy(),
+        )
+        .unwrap();
+    ExactDerivedCollection::new(first.target_collection(), target).unwrap()
 }
 
 struct SelectivePolicyGuard(Option<SelectiveMapping>);
@@ -796,13 +815,14 @@ fn derive(source: &Blob<TestSourceBlob>) -> Result<Blob<TestTargetBlob>, Infalli
 }
 
 fn source_commit(store: &mut MemoryRepo, key: u8, blob: &Blob<TestSourceBlob>) -> CollectionCommit {
+    let exact = register_kernel(store);
     store.put::<TestSourceBlob, _>(blob.clone()).unwrap();
     let metadata = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
         .unwrap();
     let commit = CollectionCommit::sign(
         &SigningKey::from_bytes(&[key; 32]),
-        kernel().source_collection().handle(),
+        exact.source_collection().handle(),
         data(blob),
         metadata,
     );
@@ -821,11 +841,12 @@ fn source_cover(commits: &[CollectionCommit]) -> Cover<TestSourceBlob> {
 }
 
 fn publish_derive(store: &mut MemoryRepo, input: &Blob<TestSourceBlob>) -> Blob<TestTargetBlob> {
+    let exact = register_kernel(store);
     let output = derive(input).unwrap();
     store.put::<TestTargetBlob, _>(output.clone()).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_collection().handle(),
+            exact.target_collection().handle(),
             data(input),
             data(&output),
         )))
@@ -838,11 +859,12 @@ fn publish_source_merge(
     low: &Blob<TestSourceBlob>,
     high: &Blob<TestSourceBlob>,
 ) -> Blob<TestSourceBlob> {
+    let exact = register_kernel(store);
     let result = join_test_sources(low, high);
     store.put::<TestSourceBlob, _>(result.clone()).unwrap();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_collection().handle(),
+            exact.source_collection().handle(),
             data(low),
             data(high),
             data(&result),
@@ -934,9 +956,9 @@ fn empty_cover_performs_no_store_operation() {
 #[test]
 fn empty_cover_still_belongs_to_one_exact_collection() {
     let mut store = PanicStore;
-    let foreign_descriptor = source_descriptor("foreign");
-    let foreign_collection =
-        Collection::<TestSourceBlob>::from_descriptor(&foreign_descriptor).unwrap();
+    let foreign_collection = MemoryRepo::default()
+        .register_collection::<TestSourceBlob>(source_descriptor("foreign"))
+        .unwrap();
     let foreign = Cover::from_members(foreign_collection, []);
     for result in [
         kernel().attach_exact(&mut store, &foreign),
@@ -1116,17 +1138,18 @@ fn complete_probe_ensure_performs_zero_writes() {
 }
 
 #[test]
-fn ensure_publishes_the_complete_descriptor_attachment_closure() {
-    let exact = kernel();
-    let source = archive([(1, 3)]);
+fn registration_publishes_the_complete_descriptor_attachment_closure() {
     let mut store = MemoryRepo::default();
-    source_commit(&mut store, 1, &source);
-    let source_cover = Cover::from_members(exact.source_collection(), [source.get_handle()]);
-
-    exact.ensure_exact(&mut store, &source_cover).unwrap();
+    let exact = register_kernel(&mut store);
 
     let snapshot = store.snapshot().unwrap();
-    for descriptor in [exact.source_descriptor(), exact.target_descriptor()] {
+    for collection in [
+        exact.source_collection().handle(),
+        exact.target_collection().handle(),
+    ] {
+        let descriptor = crate::collection::api::load_collection_descriptor(&snapshot, collection)
+            .unwrap()
+            .fragment;
         let stored_descriptor: Blob<SimpleArchive> = snapshot
             .get(
                 crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
@@ -1284,6 +1307,7 @@ fn unrelated_optional_result_metadata_failure_is_inert() {
 fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
     let c = archive([(9, 9)]);
     let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
     inner.put::<TestSourceBlob, _>(c.clone()).unwrap();
     let missing_a = Inline::<Hash<Blake3>>::new([0x31; 32]);
     let missing_b = Inline::<Hash<Blake3>>::new([0x42; 32]);
@@ -1387,7 +1411,8 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
         "the first algebra result must remain unsigned equation evidence",
     );
 
-    let second = second_kernel().ensure_exact(&mut store, &first).unwrap();
+    let second_exact = register_second_kernel(&mut store);
+    let second = second_exact.ensure_exact(&mut store, &first).unwrap();
     assert_eq!(second.len(), 1);
     let mut expected = derive(&source).unwrap().bytes.as_ref().to_vec();
     expected.push(0xB6);
@@ -2126,7 +2151,7 @@ fn compaction_is_cover_order_deterministic_and_repeatedly_idempotent() {
 }
 
 #[test]
-fn compaction_drops_readers_and_puts_all_results_before_the_first_merge() {
+fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor() {
     let sources = [
         archive([(1, 3)]),
         archive([(2, 4)]),
@@ -2159,7 +2184,8 @@ fn compaction_drops_readers_and_puts_all_results_before_the_first_merge() {
         .position(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
         .expect("colliding cover publishes a MERGE");
     let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection().handle());
-    assert!(store.events[..first_merge]
+    assert!(!store
+        .events
         .iter()
         .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
     let results: Vec<_> = store
@@ -2204,7 +2230,7 @@ impl BlobStorePut for RejectPutStore {
         Handle<S>: InlineEncoding,
     {
         self.puts += 1;
-        if self.puts == 2 {
+        if self.puts == 1 {
             Err(RejectedPut)
         } else {
             Ok(self
@@ -2660,20 +2686,20 @@ fn ungrounded_source_superset_cannot_escape_the_cover() {
 #[test]
 fn typed_lifecycle_rejects_a_lying_source_descriptor() {
     let lying_source = descriptor::naming::<TestTargetBlob>("source", test_policy());
-    let result = ExactDerivedCollection::<TestSuffixMapping>::new(
-        lying_source,
-        kernel().target_descriptor().clone(),
-    );
+    let result = MemoryRepo::default().register_collection::<TestSourceBlob>(lying_source);
     assert!(matches!(
         result,
-        Err(ExactDerivedCollectionError::Resolution(_))
+        Err(crate::collection::CollectionRegistrationError::WrongType(_))
     ));
 }
 
 #[test]
 fn identity_descriptor_pair_is_rejected() {
-    let descriptor = source_root();
-    let result = ExactDerivedCollection::<IdentityMapping>::new(descriptor.clone(), descriptor);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .register_collection::<TestSourceBlob>(source_root())
+        .unwrap();
+    let result = ExactDerivedCollection::<IdentityMapping>::new(collection, collection);
     assert!(matches!(
         result,
         Err(ExactDerivedCollectionError::Resolution(reason))

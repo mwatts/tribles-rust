@@ -71,10 +71,14 @@ use crate::query::register::RegisterOrder;
 use crate::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
-use super::records::{mapping_algorithm, CollectionHandle, KIND_COLLECTION_MAPPING};
+#[cfg(test)]
+use super::records::CollectionHandle;
+use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
+#[cfg(test)]
+use super::CollectionPolicy;
 use super::{
-    simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
-    CollectionPolicy, CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
+    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
 
@@ -237,7 +241,12 @@ pub fn join(
 ///
 /// The target's independent READ and WRITE policies are explicit rather than
 /// inherited from its source.
-pub fn descriptor(source: CollectionHandle, observes: Id, policy: CollectionPolicy) -> Fragment {
+#[cfg(test)]
+pub(crate) fn descriptor(
+    source: CollectionHandle,
+    observes: Id,
+    policy: CollectionPolicy,
+) -> Fragment {
     crate::collection::descriptor::deriving(source, &ObserveStatesMapping::new(observes), policy)
 }
 
@@ -435,65 +444,24 @@ impl TryFromCover<ObservedSetBlob> for ObservedIndex {
 /// collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedSetCollection {
-    name: String,
-    source_policy: CollectionPolicy,
-    observes: Id,
-    policy: CollectionPolicy,
+    source: Collection<SimpleArchive>,
+    target: Collection<ObservedSetBlob>,
 }
 
 impl ObservedSetCollection {
-    /// Construct the observed-set projection over one named root.
-    ///
-    /// Source and target policies are independent parts of their respective
-    /// descriptor identities.
-    pub fn new(
-        name: impl Into<String>,
-        source_policy: CollectionPolicy,
-        observes: Id,
-        policy: CollectionPolicy,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            source_policy,
-            observes,
-            policy,
-        }
+    /// Bind the observed-set facade to store-created source and target values.
+    pub fn new(source: Collection<SimpleArchive>, target: Collection<ObservedSetBlob>) -> Self {
+        Self { source, target }
     }
 
-    /// Name of the root collection this projection is taken over.
-    pub fn name(&self) -> &str {
-        self.name.as_str()
+    /// Store-issued source collection.
+    pub fn source_collection(&self) -> Collection<SimpleArchive> {
+        self.source
     }
 
-    /// Source authorization policy.
-    pub fn source_policy(&self) -> &CollectionPolicy {
-        &self.source_policy
-    }
-
-    /// Derived authorization policy.
-    pub fn policy(&self) -> &CollectionPolicy {
-        &self.policy
-    }
-
-    /// The observation attribute this collection reads.
-    pub fn observes(&self) -> Id {
-        self.observes
-    }
-
-    /// Canonical source `SimpleArchive` collection descriptor facts.
-    pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.source_policy.clone())
-    }
-
-    /// Identity of the source collection this projection reads.
-    pub fn source_collection(&self) -> CollectionHandle {
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.source_descriptor().into_facts())
-            .get_handle()
-    }
-
-    /// Canonical target observed-set collection descriptor.
-    pub fn descriptor(&self) -> Fragment {
-        descriptor(self.source_collection(), self.observes, self.policy.clone())
+    /// Store-issued target collection.
+    pub fn target_collection(&self) -> Collection<ObservedSetBlob> {
+        self.target
     }
 
     /// Attach the observed set already resident for `source_cover`.
@@ -543,7 +511,7 @@ impl ObservedSetCollection {
     fn kernel(
         &self,
     ) -> Result<ExactDerivedCollection<ObserveStatesMapping>, ExactDerivedCollectionError> {
-        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
+        ExactDerivedCollection::new(self.source, self.target)
     }
 }
 
@@ -714,7 +682,7 @@ mod tests {
         let policy = || direct_policy(authority);
         let root = |name: &str| {
             crate::blob::IntoBlob::<SimpleArchive>::to_blob(
-                simplearchive_union::descriptor(name, policy()).into_facts(),
+                crate::collection::simplearchive_union::descriptor(name, policy()).into_facts(),
             )
             .get_handle()
         };
@@ -761,23 +729,36 @@ mod tests {
         let name = "observed-source".to_owned();
         let source_policy = direct_policy(source_root);
         let target_policy = direct_policy(target_root);
-        let collection = ObservedSetCollection::new(
-            name.clone(),
-            source_policy.clone(),
-            metadata::supersedes.id(),
-            target_policy.clone(),
-        );
+        let mut store = MemoryRepo::default();
+        let source = store.collection(&name, source_policy.clone()).unwrap();
+        let target = store
+            .derive(
+                source,
+                ObserveStatesMapping::new(metadata::supersedes.id()),
+                target_policy.clone(),
+            )
+            .unwrap();
+        let collection = ObservedSetCollection::new(source, target);
+        let snapshot = store.snapshot().unwrap();
+        let source_descriptor = crate::collection::api::load_collection_descriptor(
+            &snapshot,
+            collection.source_collection().handle(),
+        )
+        .unwrap()
+        .fragment;
+        let target_descriptor = crate::collection::api::load_collection_descriptor(
+            &snapshot,
+            collection.target_collection().handle(),
+        )
+        .unwrap()
+        .fragment;
 
         assert_eq!(
-            collection.source_descriptor(),
-            simplearchive_union::descriptor(&name, source_policy.clone())
-        );
-        assert_eq!(
-            descriptor_facts::policy(collection.source_descriptor().facts()),
+            descriptor_facts::policy(source_descriptor.facts()),
             Ok(source_policy)
         );
         assert_eq!(
-            descriptor_facts::policy(collection.descriptor().facts()),
+            descriptor_facts::policy(target_descriptor.facts()),
             Ok(target_policy)
         );
     }

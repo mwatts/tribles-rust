@@ -15,6 +15,7 @@
 //! equation until its three blobs are resident, then call
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
+#[cfg(test)]
 use super::policy::CollectionPolicy;
 use super::records::RecordDecodeError;
 use std::cmp::Reverse;
@@ -50,9 +51,7 @@ use super::{
     CollectionOperationError, CollectionRecord, CollectionStore,
 };
 
-mod collection;
 mod materialize;
-pub use collection::*;
 pub use materialize::*;
 
 impl CollectionEncoding for SimpleArchive {
@@ -469,7 +468,8 @@ where
 /// side effect of naming one rather than a second thing to remember. Hashing
 /// a descriptor you never stored would leave a phantom collection: records
 /// that reference it, and nothing that can decode what they reference.
-pub fn descriptor(name: &str, policy: CollectionPolicy) -> Fragment {
+#[cfg(test)]
+pub(crate) fn descriptor(name: &str, policy: CollectionPolicy) -> Fragment {
     super::descriptor::naming::<SimpleArchive>(name, policy)
 }
 
