@@ -24,8 +24,9 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, IntoBlob};
 use crate::capability::{
-    capability_quorum_authorizes, CapabilityAction, CapabilityAtom, CapabilityMode,
-    CapabilityProof, CapabilityProofBundle, CapabilityRequest, CapabilityResource,
+    capability_quorum_authorizes, capability_quorum_observation_valid_through, CapabilityAction,
+    CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityRequest,
+    CapabilityResource,
 };
 use crate::clock;
 use crate::inline::encodings::hash::Handle;
@@ -730,6 +731,32 @@ impl AdmissionEvidence {
                 *request,
                 *invoke_threshold,
                 *delegate_threshold,
+            ),
+        }
+    }
+
+    /// Conservative inclusive bound on this immutable authority observation.
+    ///
+    /// `None` means no currently usable proof path is time-bounded. A returned
+    /// bound can precede the actual loss of authorization when another proof
+    /// path is redundant; callers should reobserve rather than infer
+    /// revocation.
+    pub(crate) fn observation_valid_through(
+        &self,
+        instant: hifitime::Epoch,
+    ) -> Option<hifitime::Epoch> {
+        match self {
+            Self::Open => None,
+            Self::Quorum {
+                roots,
+                request,
+                bundles,
+                ..
+            } => capability_quorum_observation_valid_through(
+                bundles.iter(),
+                roots.iter().copied(),
+                instant,
+                request.atom(),
             ),
         }
     }

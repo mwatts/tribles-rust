@@ -29,18 +29,19 @@ use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::TestNetwork;
 use iroh_base::{EndpointAddr, EndpointId, SecretKey};
+use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{
-    ArtifactHandle, ArtifactOfferStore, BlobStoreGet, BlobStorePut, SnapshotSource, StoreScope,
-    WantRequest, WantStore,
+    BlobStoreGet, BlobStorePut, SnapshotSource, StoreScope, WantRequest, WantStore,
 };
-use triblespace_core::trible::TribleSet;
+use triblespace_core::trible::{Fragment, TribleSet};
 use triblespace_net::host;
 use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
 use triblespace_net::peer::{Peer, PeerConfig};
@@ -207,7 +208,8 @@ async fn want_fetches_from_holder_over_iroh() {
     let ka = key(0xA1);
     let kb = key(0xB1);
 
-    // The lazy payload: an otherwise unreferenced blob in pile A.
+    // The payload starts resident only in pile A and is published through one
+    // READ-open collection commit after the peers are online.
     let payload: TribleSet = {
         use triblespace_core::id::{ExclusiveId, ufoid};
         use triblespace_core::macros::entity;
@@ -218,7 +220,7 @@ async fn want_fetches_from_holder_over_iroh() {
             triblespace_core::metadata::tag: tag,
         })
     };
-    let blob: Blob<SimpleArchive> = payload.to_blob();
+    let blob: Blob<SimpleArchive> = payload.clone().to_blob();
     let hash = blob.get_handle().raw;
 
     let TwoNodes {
@@ -233,10 +235,17 @@ async fn want_fetches_from_holder_over_iroh() {
     .await;
     {
         let mut store = peer_a.store();
+        let collection = store
+            .collection(
+                "transport-public-artifacts",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .expect("register public collection");
+        let fragment = Fragment::from_parts(payload, TribleSet::new(), MemoryBlobStore::new());
         store
-            .offer(ArtifactHandle::new(hash))
-            .expect("record artifact offer");
-        store.flush().expect("flush artifact offer");
+            .commit(collection, &ka, fragment)
+            .expect("commit public artifact");
+        store.flush().expect("flush public artifact commit");
     }
     peer_a.refresh();
 
@@ -247,7 +256,7 @@ async fn want_fetches_from_holder_over_iroh() {
             BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash));
         assert!(
             held.is_err(),
-            "precondition: B must NOT hold the never-committed payload"
+            "precondition: B must NOT hold the payload before exact fetch"
         );
     }
 

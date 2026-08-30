@@ -96,6 +96,7 @@ where
 pub struct DisclosureSnapshot {
     by_collection: CollectionDisclosureIndex,
     public: PublicDisclosureIndex,
+    public_valid_through: Option<Epoch>,
 }
 
 impl DisclosureSnapshot {
@@ -140,6 +141,7 @@ impl DisclosureSnapshot {
 
         let mut by_collection = CollectionDisclosureIndex::new();
         let mut public = PublicDisclosureIndex::new();
+        let mut public_valid_through = None;
         let mut start = 0;
         while start < commits.len() {
             let collection = commits[start].collection();
@@ -155,6 +157,7 @@ impl DisclosureSnapshot {
                 Arc::clone(&bundles),
                 &mut by_collection,
                 &mut public,
+                &mut public_valid_through,
             );
             start = end;
         }
@@ -162,6 +165,7 @@ impl DisclosureSnapshot {
         Ok(Self {
             by_collection,
             public,
+            public_valid_through,
         })
     }
 
@@ -173,6 +177,7 @@ impl DisclosureSnapshot {
         bundles: Arc<[crate::capability::CapabilityProofBundle]>,
         by_collection: &mut CollectionDisclosureIndex,
         public: &mut PublicDisclosureIndex,
+        public_valid_through: &mut Option<Epoch>,
     ) where
         S: BlobChildren,
     {
@@ -210,6 +215,16 @@ impl DisclosureSnapshot {
                 if snapshot.get::<Blob<UnknownBlob>, UnknownBlob>(root).is_ok() {
                     roots.push(root);
                 }
+            }
+        }
+
+        if read_is_open && !roots.is_empty() {
+            if let Some(bound) = write.observation_valid_through(instant) {
+                *public_valid_through = Some(
+                    public_valid_through
+                        .map(|current| current.min(bound))
+                        .unwrap_or(bound),
+                );
             }
         }
 
@@ -262,6 +277,16 @@ impl DisclosureSnapshot {
         self.public
             .iter_ordered()
             .map(|raw| Inline::<Handle<UnknownBlob>>::new(*raw))
+    }
+
+    /// Conservative inclusive validity bound of this public observation.
+    ///
+    /// The bound is the earliest expiry among currently usable WRITE proof
+    /// paths which contributed a resident READ-open closure. Another path may
+    /// keep the same handles publishable afterward, so reaching it means
+    /// "reobserve", not "revoked". `None` is unbounded.
+    pub fn public_valid_through(&self) -> Option<Epoch> {
+        self.public_valid_through
     }
 }
 
@@ -534,7 +559,12 @@ mod tests {
         let during = build(&mut store, 5.0);
         let after = build(&mut store, 11.0);
         assert!(during.public_contains(member));
+        assert_eq!(
+            during.public_valid_through(),
+            Some(Epoch::from_tai_seconds(10.0))
+        );
         assert!(!after.public_contains(member));
+        assert_eq!(after.public_valid_through(), None);
         assert!(during.public_contains(member));
     }
 

@@ -26,7 +26,7 @@ use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
-use triblespace_core::repo::{ArtifactOfferSnapshot, BlobStoreGet, StoreChanges, StoreRead};
+use triblespace_core::repo::{BlobStoreGet, StoreChanges, StoreRead};
 
 use crate::channel::{
     MAX_ADMISSION_BRIDGE_BATCHES, NetCommand, NetEvent, NetEventBatch, SnapshotNotice,
@@ -52,7 +52,8 @@ use crate::patch_repair::{
 };
 use crate::protocol::*;
 use crate::provider::{
-    ArtifactId, PROVIDER_LEASE_LIFETIME, ProviderDirectory, ProviderKey, ProviderSet, provider_key,
+    ArtifactId, PROVIDER_LEASE_LIFETIME, ProviderDirectory, ProviderKey, ProviderObservation,
+    ProviderSet, provider_key,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
@@ -988,7 +989,7 @@ impl NetSender {
         let manifest = snapshot.manifest();
         let notice = SnapshotNotice {
             peers: snapshot.routing_peers(),
-            blob: Some(manifest.component(InventoryComponent::Blob)),
+            installed: true,
         };
         let snapshot = Arc::new(snapshot);
         let retired_blob_reader = self
@@ -1009,8 +1010,10 @@ impl NetSender {
         }
     }
 
-    pub(crate) fn update_artifact_offers(&self, offers: ArtifactOfferSnapshot) {
-        let _ = self.cmd_tx.send(NetCommand::ArtifactOffersUpdated(offers));
+    pub(crate) fn update_public_providers(&self, providers: ProviderObservation) {
+        let _ = self
+            .cmd_tx
+            .send(NetCommand::PublicProvidersUpdated(providers));
     }
 
     pub fn clear_snapshot(&self) {
@@ -1023,9 +1026,10 @@ impl NetSender {
                 .cmd_tx
                 .send(NetCommand::SnapshotChanged(SnapshotNotice {
                     peers: Vec::new(),
-                    blob: None,
+                    installed: false,
                 }));
         }
+        self.update_public_providers(ProviderObservation::default());
     }
 
     #[cfg(test)]
@@ -1344,6 +1348,9 @@ impl ProviderPublication {
 /// immediately and removed keys simply stop renewing their soft leases.
 struct ProviderSetScheduler {
     set: ProviderSet,
+    /// Inclusive authority bound of the current store-side observation.
+    /// This is deliberately independent from receiver-selected soft leases.
+    observation_valid_through: Option<hifitime::Epoch>,
     due: BTreeSet<(crate::clock::Mono, ProviderKey)>,
     due_by_key: HashMap<ProviderKey, crate::clock::Mono>,
     lease_deadlines: BTreeSet<(crate::clock::Mono, ProviderKey)>,
@@ -1357,6 +1364,7 @@ impl ProviderSetScheduler {
     fn new() -> Self {
         Self {
             set: ProviderSet::default(),
+            observation_valid_through: None,
             due: BTreeSet::new(),
             due_by_key: HashMap::new(),
             lease_deadlines: BTreeSet::new(),
@@ -1367,7 +1375,13 @@ impl ProviderSetScheduler {
         }
     }
 
-    fn observe_set(&mut self, set: ProviderSet, now: crate::clock::Mono) {
+    fn observe(&mut self, observation: ProviderObservation, now: crate::clock::Mono) {
+        let (set, valid_through) = observation.into_parts();
+        self.observation_valid_through = valid_through;
+        self.replace_set(set, now);
+    }
+
+    fn replace_set(&mut self, set: ProviderSet, now: crate::clock::Mono) {
         if self.set == set {
             return;
         }
@@ -1386,6 +1400,26 @@ impl ProviderSetScheduler {
                 self.schedule(key, now);
             }
         }
+    }
+
+    /// Stop autonomous publication once the immutable disclosure observation
+    /// is no longer valid. A later store-side refresh may install a new
+    /// observation, but receiver leases are never treated as authority to
+    /// renew themselves.
+    fn expire_observation(&mut self, now: hifitime::Epoch, mono_now: crate::clock::Mono) {
+        if self
+            .observation_valid_through
+            .is_some_and(|valid_through| now > valid_through)
+        {
+            self.observation_valid_through = None;
+            self.replace_set(ProviderSet::default(), mono_now);
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_set(&mut self, set: ProviderSet, now: crate::clock::Mono) {
+        self.observation_valid_through = None;
+        self.replace_set(set, now);
     }
 
     fn schedule(&mut self, key: ProviderKey, due: crate::clock::Mono) {
@@ -1500,28 +1534,6 @@ impl ProviderSetScheduler {
     }
 }
 
-fn active_provider_set(
-    offers: &ArtifactOfferSnapshot,
-    snapshot: &SnapshotSlot,
-    serves: bool,
-) -> ProviderSet {
-    if !serves {
-        return ProviderSet::default();
-    }
-    let current = snapshot.lock().unwrap().as_ref().cloned();
-    let Some(current) = current else {
-        return ProviderSet::default();
-    };
-    // `ArtifactOfferSnapshot` remains the explicit publication-policy seam:
-    // deriving a key hides H from directory peers, but does not make a
-    // low-entropy plaintext artifact resistant to offline dictionary checks.
-    ProviderSet::from_artifacts(offers.iter().filter_map(|handle| {
-        current
-            .contains_relative_key(InventoryComponent::Blob, &handle.raw)
-            .then_some(handle.raw)
-    }))
-}
-
 async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
     let Harness {
         transport,
@@ -1612,14 +1624,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut sweeps = SweepScheduler::new();
     let (provider_tx, mut provider_rx) =
         tokio::sync::mpsc::unbounded_channel::<ProviderAnnouncementOutcome>();
-    let mut artifact_offers = ArtifactOfferSnapshot::default();
     let mut provider_scheduler = ProviderSetScheduler::new();
-    let mut publication_blob = None;
     let commands = commands;
 
     loop {
         let mut disconnected = false;
-        let mut publication_inputs_changed = false;
         loop {
             match commands.try_recv() {
                 Ok(NetCommand::SnapshotChanged(notice)) => {
@@ -1632,17 +1641,12 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     // immediately. Later local generations update stored-peer
                     // evidence but cannot reset or multiply the fixed periodic
                     // work budget.
-                    if notice.blob.is_some() {
+                    if notice.installed {
                         sweeps.observe_snapshot(crate::clock::mono_now());
                     }
-                    if publication_blob != notice.blob {
-                        publication_blob = notice.blob;
-                        publication_inputs_changed = true;
-                    }
                 }
-                Ok(NetCommand::ArtifactOffersUpdated(offers)) => {
-                    artifact_offers = offers;
-                    publication_inputs_changed = true;
+                Ok(NetCommand::PublicProvidersUpdated(observation)) => {
+                    provider_scheduler.observe(observation, crate::clock::mono_now());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1655,12 +1659,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             transport.shutdown().await;
             return;
         }
-        if publication_inputs_changed {
-            let set =
-                active_provider_set(&artifact_offers, &snapshot, config.qos.direction.serves());
-            provider_scheduler.observe_set(set, crate::clock::mono_now());
-        }
-
         while let Ok(outcome) = sweep_rx.try_recv() {
             in_flight.remove(&outcome.peer);
             if outcome.success {
@@ -1683,6 +1681,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         let now = crate::clock::mono_now();
+        provider_scheduler.expire_observation(crate::clock::epoch_now(), now);
         if let Some((key, deadline)) = provider_scheduler.warnable_expired_lease(now) {
             warn!(
                 key = %hex::encode(&key[..4]),
@@ -3030,8 +3029,7 @@ mod tests {
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{
-        ArtifactHandle, ArtifactOfferStore, BlobStorePut, PeerStore, SnapshotSource,
-        StoreSnapshot as CoreStoreSnapshot,
+        BlobStorePut, PeerStore, SnapshotSource, StoreSnapshot as CoreStoreSnapshot,
     };
 
     use super::*;
@@ -3488,6 +3486,46 @@ mod tests {
     }
 
     #[test]
+    fn expired_disclosure_observation_cannot_renew_without_store_refresh() {
+        let mono = crate::clock::mono_now();
+        let valid_through = hifitime::Epoch::from_tai_seconds(10.0);
+        let set = provider_set(1);
+        let key = set.iter().next().unwrap();
+        let mut scheduler = ProviderSetScheduler::new();
+        scheduler.observe(
+            ProviderObservation::with_valid_through(set, Some(valid_through)),
+            mono,
+        );
+
+        assert_eq!(scheduler.pop_due(mono), Some(key));
+        scheduler.complete(
+            ProviderAnnouncementOutcome {
+                key,
+                attempted_at: mono,
+                publication: ProviderPublication {
+                    local_accepted: true,
+                    ..ProviderPublication::default()
+                },
+            },
+            mono,
+        );
+        assert!(scheduler.next_due(key).is_some());
+
+        scheduler.expire_observation(valid_through, mono);
+        assert_eq!(scheduler.active_len(), 1, "the validity bound is inclusive");
+
+        scheduler.expire_observation(hifitime::Epoch::from_tai_seconds(11.0), mono);
+        assert_eq!(scheduler.active_len(), 0);
+        assert_eq!(scheduler.next_due(key), None);
+        assert_eq!(scheduler.lease_deadline(key), None);
+        assert_eq!(
+            scheduler.pop_due(mono + PROVIDER_RENEWAL_INTERVAL),
+            None,
+            "an idle Peer cannot leave the host renewing expired authority"
+        );
+    }
+
+    #[test]
     fn provider_set_scheduler_preserves_deadlines_across_equivalent_snapshots() {
         let now = crate::clock::mono_now();
         let set = provider_set(1);
@@ -3594,36 +3632,6 @@ mod tests {
         assert_eq!(
             scheduler.warnable_expired_lease(deadline + PROVIDER_BACKLOG_WARNING_INTERVAL),
             Some((key, deadline))
-        );
-    }
-
-    #[test]
-    fn active_offers_are_exactly_policy_intersect_resident_snapshot() {
-        let team = key(1);
-        let mut store = MemoryRepo::default();
-        let resident = store
-            .put::<UnknownBlob, _>(Bytes::from_source(vec![7; 257]))
-            .unwrap()
-            .raw;
-        let absent = [9; 32];
-        store
-            .offer_all([ArtifactHandle::new(resident), ArtifactHandle::new(absent)])
-            .unwrap();
-        let offers = store.offers_snapshot().unwrap();
-        let snapshot = Arc::new(StoreSnapshot::from_store(&mut store, team).unwrap());
-        let slot = Arc::new(Mutex::new(Some(snapshot)));
-
-        let active = active_provider_set(&offers, &slot, true);
-        let expected = ProviderSet::from_artifacts([resident]);
-        assert_eq!(active, expected);
-        assert_eq!(
-            active_provider_set(&offers, &slot, false),
-            ProviderSet::default()
-        );
-        slot.lock().unwrap().take();
-        assert_eq!(
-            active_provider_set(&offers, &slot, true),
-            ProviderSet::default()
         );
     }
 

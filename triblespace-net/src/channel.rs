@@ -10,11 +10,10 @@ use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
     CollectionRecord,
 };
-use triblespace_core::repo::ArtifactOfferSnapshot;
 use triblespace_core::repo::peer::PeerEvidence;
 
-use crate::inventory::ComponentManifest;
 use crate::protocol::RawHash;
+use crate::provider::ProviderObservation;
 use crate::transport::PeerId;
 
 /// A changed immutable local serving observation.
@@ -24,20 +23,17 @@ use crate::transport::PeerId;
 /// to learn newly stored PEER evidence; periodic scheduling remains bounded.
 pub(crate) struct SnapshotNotice {
     pub(crate) peers: Vec<PeerId>,
-    /// Exact Blob component now installed, or `None` when the serving snapshot
-    /// was cleared. Other component changes do not affect provider covers.
-    pub(crate) blob: Option<ComponentManifest>,
+    /// Whether an immutable serving snapshot is now installed.
+    pub(crate) installed: bool,
 }
 
 /// Commands sent from [`crate::peer::Peer`] to the host runtime.
 pub(crate) enum NetCommand {
     SnapshotChanged(SnapshotNotice),
-    /// Replace the host's local publication policy observation.
-    ///
-    /// Offers are operational service intent, not another synchronized
-    /// inventory component. The host intersects this set with its current
-    /// immutable Blob serving snapshot before publishing any provider hint.
-    ArtifactOffersUpdated(ArtifactOfferSnapshot),
+    /// Replace the exact provider keys selected by the current public
+    /// disclosure observation. Restricted collection handles never cross this
+    /// boundary.
+    PublicProvidersUpdated(ProviderObservation),
 }
 
 /// Authenticated, structurally canonical inventory items returned by a walk.

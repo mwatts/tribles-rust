@@ -18,8 +18,8 @@ use triblespace_core::collection::{
     CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
 };
 use triblespace_core::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, CapabilityProofStore, PeerStore,
-    SnapshotSource, StorageFlush, StoreRead, StoreScope, WantRequest, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, PeerStore, SnapshotSource,
+    StorageFlush, StoreRead, StoreScope, WantRequest, WantStore,
 };
 
 use crate::peer::Peer;
@@ -81,13 +81,12 @@ impl Reconciler {
             + CollectionStore
             + CapabilityProofStore
             + PeerStore
-            + ArtifactOfferStore
             + StoreScope
             + WantStore
             + StorageFlush
             + Send
             + 'static,
-        S::Snapshot: StoreRead + BlobStoreMeta,
+        S::Snapshot: StoreRead + BlobChildren,
     {
         let mut stats = ReconcileStats::default();
 

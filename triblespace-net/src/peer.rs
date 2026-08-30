@@ -15,22 +15,22 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use triblespace_core::collection::{CollectionRead, CollectionStore};
+use triblespace_core::collection::{CollectionRead, CollectionStore, DisclosureSnapshot};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
-    ArtifactOfferSnapshot, ArtifactOfferStore, BlobChildren, BlobStore, BlobStoreGet,
-    BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
-    PeerRead, PeerStore, SnapshotSource, StorageFlush, StoreChanges, StoreRead, StoreScope,
-    StoreScopeError, StoreSnapshot as CoreStoreSnapshot, WantRequest, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
+    CapabilityProofRead, CapabilityProofStore, PeerRead, PeerStore, SnapshotSource, StorageFlush,
+    StoreChanges, StoreRead, StoreScope, StoreScopeError, StoreSnapshot as CoreStoreSnapshot,
+    WantRequest, WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
-use crate::provider::ArtifactId;
+use crate::provider::{ArtifactId, ProviderObservation};
 
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
@@ -136,12 +136,11 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
-        + ArtifactOfferStore
         + WantStore
         + StorageFlush
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobChildren,
 {
     store: Arc<Mutex<S>>,
     sender: NetSender,
@@ -156,10 +155,10 @@ where
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
     last_store_snapshot: Option<S::Snapshot>,
-    /// Last durable local publication policy sent to the host. Offers are
-    /// deliberately observed independently of the four-component inventory
-    /// revision because changing them must not rebuild semantic inventory.
-    last_artifact_offers: Option<ArtifactOfferSnapshot>,
+    /// Last snapshot-bound public provider set sent to the host. Rebuilding it
+    /// on every refresh lets proof expiry narrow publication even when the
+    /// store prefix itself did not change.
+    last_provider_observation: ProviderObservation,
     last_event_at: crate::clock::Mono,
 }
 
@@ -169,13 +168,12 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
-        + ArtifactOfferStore
         + StoreScope
         + WantStore
         + StorageFlush
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobChildren,
 {
     /// Spawn a production host and attach `store` to exactly `config.team`.
     pub fn new(
@@ -244,7 +242,7 @@ where
             qos,
             pending_network_flush,
             last_store_snapshot: None,
-            last_artifact_offers: None,
+            last_provider_observation: ProviderObservation::default(),
             last_event_at: crate::clock::mono_now(),
         };
         // Reobserve once after assembly so external pile appends that raced
@@ -318,6 +316,7 @@ where
             // with no snapshot merely because the sync-visible revision did
             // not change before the next successful refresh.
             self.last_store_snapshot = None;
+            self.last_provider_observation = ProviderObservation::default();
         }
         result
     }
@@ -414,16 +413,20 @@ where
                         ?error,
                         "store snapshot unavailable; keeping prior inventory"
                     );
-                    // Offer observation is an independent local policy lane.
-                    // Keep the previous semantic inventory, but do not skip a
-                    // newly appended offer merely because its unrelated
-                    // invalidation token is temporarily unavailable.
-                    Self::observe_artifact_offers(
+                    // Keep serving the previous immutable snapshot, but
+                    // reevaluate its disclosure boundary at the current time
+                    // so an expiring WRITE proof cannot renew forever merely
+                    // because a later physical snapshot is unavailable.
+                    Self::validate_store_scope(&mut *store, self.team)?;
+                    let provider_observation = Self::provider_observation_from_snapshot(
+                        self.last_store_snapshot.as_ref(),
+                        self.qos.direction.serves(),
+                    );
+                    Self::observe_provider_observation(
                         &self.sender,
-                        self.team,
-                        &mut self.last_artifact_offers,
-                        &mut *store,
-                    )?;
+                        &mut self.last_provider_observation,
+                        provider_observation,
+                    );
                     return Ok(());
                 }
             };
@@ -431,6 +434,10 @@ where
             // is intentionally absent from that sync-visible token, so check
             // it again before an equality fast-path can retain a serving view.
             Self::validate_store_scope(&mut *store, self.team)?;
+            let provider_observation = Self::provider_observation_from_snapshot(
+                Some(&snapshot),
+                self.qos.direction.serves(),
+            );
             let previous_snapshot = self.sender.current_snapshot();
             let changes = if previous_snapshot.is_none() {
                 StoreChanges::ALL
@@ -454,47 +461,60 @@ where
                 changes,
             )? {
                 self.last_store_snapshot = Some(snapshot);
+                Self::observe_provider_observation(
+                    &self.sender,
+                    &mut self.last_provider_observation,
+                    provider_observation,
+                );
+            } else {
+                Self::observe_provider_observation(
+                    &self.sender,
+                    &mut self.last_provider_observation,
+                    ProviderObservation::default(),
+                );
             }
+        } else {
+            // A failed admission flush withholds a new snapshot, but the
+            // already-installed prefix remains a valid read lease. Recompute
+            // only its time-sensitive disclosure boundary.
+            let provider_observation = Self::provider_observation_from_snapshot(
+                self.last_store_snapshot.as_ref(),
+                self.qos.direction.serves(),
+            );
+            Self::observe_provider_observation(
+                &self.sender,
+                &mut self.last_provider_observation,
+                provider_observation,
+            );
         }
-        Self::observe_artifact_offers(
-            &self.sender,
-            self.team,
-            &mut self.last_artifact_offers,
-            &mut *store,
-        )?;
         Ok(())
     }
 
-    fn observe_artifact_offers(
-        sender: &NetSender,
-        team: VerifyingKey,
-        last_artifact_offers: &mut Option<ArtifactOfferSnapshot>,
-        store: &mut S,
-    ) -> Result<(), PeerOpenError<S::ScopeError>> {
-        let offers = match store.offers_snapshot() {
-            Ok(offers) => offers,
-            Err(error) => {
-                // The failed observation may still have re-read externally
-                // appended records. Recheck scope before retaining the prior
-                // host view; a policy read failure must not mask a newly
-                // visible cross-team assertion.
-                Self::validate_store_scope(store, team)?;
-                // Offers are grow-only. Retaining the last coherent snapshot
-                // across a transient observation failure is conservative and
-                // cannot resurrect retracted intent.
-                tracing::warn!(?error, "artifact-offer snapshot unavailable");
-                return Ok(());
-            }
+    fn provider_observation_from_snapshot(
+        snapshot: Option<&S::Snapshot>,
+        serves: bool,
+    ) -> ProviderObservation {
+        let Some(snapshot) = snapshot else {
+            return ProviderObservation::default();
         };
-        // File-backed offer observation may itself reobserve an externally
-        // appended scope conflict. Never hand policy to the team-scoped host
-        // before checking that boundary again.
-        Self::validate_store_scope(store, team)?;
-        if last_artifact_offers.as_ref() != Some(&offers) {
-            sender.update_artifact_offers(offers.clone());
-            *last_artifact_offers = Some(offers);
+        match DisclosureSnapshot::build_at(snapshot, crate::clock::epoch_now()) {
+            Ok(disclosure) => ProviderObservation::from_disclosure(&disclosure, serves),
+            Err(error) => {
+                tracing::warn!(%error, "collection disclosure snapshot unavailable");
+                ProviderObservation::default()
+            }
         }
-        Ok(())
+    }
+
+    fn observe_provider_observation(
+        sender: &NetSender,
+        last: &mut ProviderObservation,
+        observation: ProviderObservation,
+    ) {
+        if *last != observation {
+            sender.update_public_providers(observation.clone());
+            *last = observation;
+        }
     }
 
     fn install_validated_snapshot(
@@ -584,13 +604,12 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
-        + ArtifactOfferStore
         + StoreScope
         + WantStore
         + StorageFlush
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobChildren,
 {
     type PutError = S::PutError;
 
@@ -611,13 +630,12 @@ where
         + CollectionStore
         + CapabilityProofStore
         + PeerStore
-        + ArtifactOfferStore
         + StoreScope
         + WantStore
         + StorageFlush
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobChildren,
 {
     type Snapshot = PeerSnapshot<S::Snapshot>;
     type SnapshotError = PeerSnapshotError<S::SnapshotError, S::ScopeError>;

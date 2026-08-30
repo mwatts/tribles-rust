@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStoreKeep, BlobStorePut};
+use triblespace_core::repo::{ArtifactHandle, BlobStorePut};
 use triblespace_net::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
@@ -27,7 +27,7 @@ async fn settle(
 }
 
 #[test]
-fn automatic_offer_retries_remote_replication_after_partition() {
+fn automatic_publication_retries_remote_replication_after_partition() {
     let _guard = sim_guard();
     run_paused(0xD1AE_C701, async {
         let net = SimNet::new(0xD1AE_C701, SimConfig::default());
@@ -60,7 +60,7 @@ fn automatic_offer_retries_remote_replication_after_partition() {
         settle(&mut [&mut a, &mut b]).await;
 
         net.partition(pk(&key_a), pk(&key_b));
-        offer_resident(&mut a, artifact).await;
+        publish_resident(&mut a, artifact).await;
         assert!(
             b.find_artifact_providers(artifact).await.is_empty(),
             "a missed lease is a temporary unknown, never a fabricated answer"
@@ -95,7 +95,7 @@ fn the_same_artifact_id_does_not_cross_team_authorization() {
             .put::<UnknownBlob, _>(Bytes::from_source(bytes))
             .unwrap()
             .raw;
-        store_a.offer(ArtifactHandle::new(artifact)).unwrap();
+        commit_public_artifact(&mut store_a, artifact);
         let mut a = bring_up_with_peers(
             &net,
             &key_a,
@@ -157,7 +157,7 @@ fn unannounced_holder_is_not_discovered_from_known_peer_evidence() {
 }
 
 #[test]
-fn offer_only_change_publishes_an_already_resident_blob() {
+fn public_commit_publishes_an_already_resident_blob() {
     let _guard = sim_guard();
     run_paused(0xD1AE_C707, async {
         let net = SimNet::new(0xD1AE_C707, SimConfig::default());
@@ -190,7 +190,7 @@ fn offer_only_change_publishes_an_already_resident_blob() {
         settle(&mut [&mut source, &mut reader]).await;
         assert!(reader.find_artifact_providers(artifact).await.is_empty());
 
-        offer_resident(&mut source, artifact).await;
+        publish_resident(&mut source, artifact).await;
         assert_eq!(
             reader.find_artifact_providers(artifact).await,
             vec![source.id()]
@@ -200,7 +200,7 @@ fn offer_only_change_publishes_an_already_resident_blob() {
 }
 
 #[test]
-fn offered_absent_blob_stays_dormant_until_resident() {
+fn committed_absent_blob_stays_dormant_until_resident() {
     let _guard = sim_guard();
     run_paused(0xD1AE_C708, async {
         let net = SimNet::new(0xD1AE_C708, SimConfig::default());
@@ -228,7 +228,10 @@ fn offered_absent_blob_stays_dormant_until_resident() {
         );
         settle(&mut [&mut source, &mut reader]).await;
 
-        source.store().offer(ArtifactHandle::new(artifact)).unwrap();
+        {
+            let mut store = source.store();
+            commit_public_artifact(&mut store, artifact);
+        }
         source.refresh();
         settle(&mut [&mut source, &mut reader]).await;
         assert!(reader.find_artifact_providers(artifact).await.is_empty());
@@ -249,7 +252,7 @@ fn offered_absent_blob_stays_dormant_until_resident() {
 }
 
 #[test]
-fn readonly_offer_is_dormant() {
+fn readonly_publication_is_dormant() {
     let _guard = sim_guard();
     run_paused(0xD1AE_C709, async {
         let net = SimNet::new(0xD1AE_C709, SimConfig::default());
@@ -262,7 +265,7 @@ fn readonly_offer_is_dormant() {
             .put::<UnknownBlob, _>(Bytes::from_source(vec![0x89; 257]))
             .unwrap()
             .raw;
-        source_store.offer(ArtifactHandle::new(artifact)).unwrap();
+        commit_public_artifact(&mut source_store, artifact);
         let mut source = bring_up_with_qos(
             &net,
             &source_key,
@@ -303,7 +306,7 @@ fn automatic_publication_renews_before_provider_lease_expiry() {
             .put::<UnknownBlob, _>(Bytes::from_source(vec![0x8A; 257]))
             .unwrap()
             .raw;
-        source_store.offer(ArtifactHandle::new(artifact)).unwrap();
+        commit_public_artifact(&mut source_store, artifact);
         let mut source = bring_up_with_peers(
             &net,
             &source_key,
@@ -393,7 +396,7 @@ fn sparse_line_discovers_and_fetches_an_artifact_across_multiple_hops() {
         );
         settle(&mut [&mut a, &mut b, &mut c, &mut d]).await;
 
-        offer_resident(&mut a, artifact).await;
+        publish_resident(&mut a, artifact).await;
         let providers = d.find_artifact_providers(artifact).await;
         assert_eq!(providers, vec![a.id()]);
         assert_eq!(d.fetch_blob(artifact).await, Some(bytes));
@@ -455,7 +458,7 @@ fn stalled_seed_does_not_block_a_healthy_referral() {
         settle(&mut [&mut stalled, &mut healthy, &mut referred, &mut source]).await;
         net.stall_dials(pk(&stalled_key));
 
-        offer_resident(&mut source, artifact).await;
+        publish_resident(&mut source, artifact).await;
         SimNet::step(&vclock(), Duration::from_secs(4)).await;
         settle(&mut [&mut stalled, &mut healthy, &mut referred, &mut source]).await;
 
@@ -484,19 +487,19 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
         let requester_key = key(0xB6);
         let team = root.verifying_key();
         let bytes = vec![0x86; 257];
-        let make_offered_store = || {
+        let make_published_store = || {
             let mut store = empty_store();
             let artifact = store
                 .put::<UnknownBlob, _>(Bytes::from_source(bytes.clone()))
                 .unwrap()
                 .raw;
-            store.offer(ArtifactHandle::new(artifact)).unwrap();
+            commit_public_artifact(&mut store, artifact);
             (store, artifact)
         };
-        let (bad_store, artifact) = make_offered_store();
-        let (bad_store_2, artifact_2) = make_offered_store();
-        let (bad_store_3, artifact_3) = make_offered_store();
-        let (good_store, good_artifact) = make_offered_store();
+        let (bad_store, artifact) = make_published_store();
+        let (bad_store_2, artifact_2) = make_published_store();
+        let (bad_store_3, artifact_3) = make_published_store();
+        let (good_store, good_artifact) = make_published_store();
         assert_eq!([artifact_2, artifact_3, good_artifact], [artifact; 3]);
 
         let mut directory = bring_up_with_peers(
@@ -546,15 +549,17 @@ fn alpha_black_holed_providers_do_not_starve_a_healthy_exact_fetch() {
         for provider in [bad.id(), bad_2.id(), bad_3.id(), good.id()] {
             assert!(
                 published.contains(&provider),
-                "all truthful offers must reach the shared directory before eviction; missing {provider} from {published:?}"
+                "all truthful public disclosures must reach the shared directory before eviction; missing {provider} from {published:?}"
             );
         }
 
         // A stale lease is production-realistic: each bad provider really
-        // offered resident bytes, then evicted them without a non-monotone
-        // unpublish operation. The directory hint remains soft until expiry.
+        // disclosed resident bytes, then lost its physical cache without a
+        // non-monotone directory withdrawal. Bypass MemoryRepo's conservative
+        // COMMIT retention deliberately to model that lower-layer loss; the
+        // directory hint remains soft until expiry.
         for peer in [&mut bad, &mut bad_2, &mut bad_3] {
-            peer.store().keep(Vec::<ArtifactHandle>::new());
+            peer.store().blobs.keep(Vec::<ArtifactHandle>::new());
             peer.refresh();
             assert!(peer.try_local(artifact).is_none());
         }

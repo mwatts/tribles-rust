@@ -23,7 +23,7 @@ use triblespace_core::collection::{
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreMeta, CapabilityProofStore, PeerStore, SnapshotSource,
+    ArtifactOfferStore, BlobChildren, BlobStore, CapabilityProofStore, PeerStore, SnapshotSource,
     StorageFlush, StoreRead, StoreScope, WantStore,
 };
 
@@ -122,7 +122,7 @@ where
         + StorageFlush
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobChildren,
     Mapping: CollectionMapping,
     Handle<Mapping::Source>: InlineEncoding,
     Handle<Mapping::Target>: InlineEncoding,

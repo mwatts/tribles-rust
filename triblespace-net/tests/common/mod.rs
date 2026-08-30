@@ -9,13 +9,19 @@ use std::sync::{Arc, OnceLock};
 
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
+use triblespace_core::blob::MemoryBlobStore;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::{
     CapabilityClaim, CapabilityMode, CapabilityProofBundle, CapabilityValidity,
 };
 use triblespace_core::clock::{self, VirtualClock};
-use triblespace_core::id::rngid::seed_ids;
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace_core::id::{fucid, rngid::seed_ids};
+use triblespace_core::inline::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::repo::StoreScope;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, StoreScope};
+use triblespace_core::trible::{Fragment, Trible, TribleSet};
 use triblespace_net::host;
 use triblespace_net::inventory::{ReconcileQos, sync_team_capability_atom};
 use triblespace_net::peer::{Peer, PeerConfig};
@@ -197,14 +203,32 @@ pub fn empty_store() -> MemoryRepo {
     MemoryRepo::default()
 }
 
-/// Persist one local service offer, expose it through `Peer::refresh`, and
-/// give the automatic DHT publisher a bounded deterministic window to run.
-/// The caller must already have landed the exact bytes: ordinary tests use the
-/// same truthful production path as applications.
-pub async fn offer_resident(peer: &mut Peer<MemoryRepo>, hash: [u8; 32]) {
-    peer.store()
-        .offer(ArtifactHandle::new(hash))
-        .expect("memory store accepts artifact offer");
+/// Commit one exact artifact reference into the shared READ-open publication
+/// collection. The referenced bytes may arrive later; disclosure remains
+/// strictly resident and therefore publishes it only after that happens.
+pub fn commit_public_artifact(store: &mut MemoryRepo, hash: [u8; 32]) {
+    let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+    let collection = store
+        .collection("simulation-public-artifacts", policy)
+        .expect("memory store accepts the public collection descriptor");
+    let entity = fucid();
+    let attribute = fucid();
+    let value = Inline::<Handle<UnknownBlob>>::new(hash);
+    let mut facts = TribleSet::new();
+    facts.insert(&Trible::new(&entity, &attribute, &value));
+    let fragment = Fragment::from_parts(facts, TribleSet::new(), MemoryBlobStore::new());
+    store
+        .commit(collection, &key(0x5E), fragment)
+        .expect("memory store accepts the public collection commit");
+}
+
+/// Publish one already-resident artifact through the collection disclosure
+/// path, then give the automatic DHT publisher a bounded deterministic window.
+pub async fn publish_resident(peer: &mut Peer<MemoryRepo>, hash: [u8; 32]) {
+    {
+        let mut store = peer.store();
+        commit_public_artifact(&mut store, hash);
+    }
     peer.refresh();
     for _ in 0..20 {
         SimNet::step(&vclock(), std::time::Duration::from_millis(20)).await;

@@ -8,6 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use hifitime::Epoch;
+use triblespace_core::collection::DisclosureSnapshot;
+
 use crate::clock::Mono;
 use crate::transport::PeerId;
 
@@ -44,6 +47,39 @@ pub(crate) fn provider_key(artifact: ArtifactId) -> ProviderKey {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProviderSet {
     keys: BTreeSet<ProviderKey>,
+}
+
+/// One snapshot-bound authorization to publish an exact provider set.
+///
+/// `valid_through` is an inclusive, conservative bound on the disclosure
+/// observation, not a property of remote provider leases. Once it passes, the
+/// host must stop autonomous renewal until the store side sends a fresh
+/// observation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProviderObservation {
+    set: ProviderSet,
+    valid_through: Option<Epoch>,
+}
+
+impl ProviderObservation {
+    pub(crate) fn from_disclosure(disclosure: &DisclosureSnapshot, serves: bool) -> Self {
+        if !serves {
+            return Self::default();
+        }
+        Self {
+            set: ProviderSet::from_artifacts(disclosure.public_handles().map(|handle| handle.raw)),
+            valid_through: disclosure.public_valid_through(),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (ProviderSet, Option<Epoch>) {
+        (self.set, self.valid_through)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_valid_through(set: ProviderSet, valid_through: Option<Epoch>) -> Self {
+        Self { set, valid_through }
+    }
 }
 
 impl ProviderSet {
@@ -212,7 +248,68 @@ impl ProviderDirectory {
 
 #[cfg(test)]
 mod tests {
+    use anybytes::Bytes;
+    use ed25519_dalek::SigningKey;
+    use hifitime::Epoch;
+    use triblespace_core::blob::encodings::UnknownBlob;
+    use triblespace_core::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource, CapabilityValidity,
+    };
+    use triblespace_core::collection::{
+        ACTION_WRITE, AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle,
+        CollectionPolicy, CollectionRecord, CollectionStore, CollectionStoreExt,
+        DisclosureSnapshot,
+    };
+    use triblespace_core::inline::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
+    use triblespace_core::trible::TribleSet;
+
     use super::*;
+
+    type BlobHandle = Inline<Handle<UnknownBlob>>;
+
+    fn signing_key(byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[byte; 32])
+    }
+
+    fn put_blob(store: &mut MemoryRepo, byte: u8) -> BlobHandle {
+        store
+            .put::<UnknownBlob, _>(Bytes::from_source(vec![byte; 257]))
+            .unwrap()
+    }
+
+    fn commit(
+        store: &mut MemoryRepo,
+        collection: CollectionHandle,
+        signer: &SigningKey,
+        member: BlobHandle,
+    ) {
+        let metadata = store
+            .put::<triblespace_core::blob::encodings::simplearchive::SimpleArchive, _>(
+                TribleSet::new(),
+            )
+            .unwrap();
+        let commit = CollectionCommit::sign(
+            signer,
+            collection,
+            CollectionData::new(member.raw),
+            metadata,
+        );
+        store.insert(CollectionRecord::Commit(commit)).unwrap();
+    }
+
+    fn store_bundle(store: &mut MemoryRepo, bundle: CapabilityProofBundle) {
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+
+        let (proof, claims) = bundle.into_parts();
+        for claim in claims {
+            store.put::<SimpleArchive, _>(claim).unwrap();
+        }
+        store.insert_proof(proof).unwrap();
+    }
 
     #[test]
     fn provider_keys_are_deterministic_global_and_opaque() {
@@ -234,6 +331,112 @@ mod tests {
             expected.sort_unstable();
             expected
         });
+    }
+
+    #[test]
+    fn publication_set_is_exactly_the_open_admitted_resident_projection() {
+        let writer = signing_key(11);
+        let write_root = signing_key(12);
+        let mut store = MemoryRepo::default();
+        let open = store
+            .collection(
+                "open",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let restricted = store
+            .collection(
+                "restricted",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(signing_key(13).verifying_key()),
+                    AdmissionPolicy::Open,
+                ),
+            )
+            .unwrap();
+        let unauthorized = store
+            .collection(
+                "unauthorized",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(write_root.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let public_member = put_blob(&mut store, 21);
+        let restricted_member = put_blob(&mut store, 22);
+        let unauthorized_member = put_blob(&mut store, 23);
+        let uncommitted_resident = put_blob(&mut store, 24);
+        commit(&mut store, open.handle(), &writer, public_member);
+        commit(&mut store, restricted.handle(), &writer, restricted_member);
+        commit(
+            &mut store,
+            unauthorized.handle(),
+            &writer,
+            unauthorized_member,
+        );
+
+        let snapshot = store.snapshot().unwrap();
+        let disclosure =
+            DisclosureSnapshot::build_at(&snapshot, Epoch::from_tai_seconds(0.0)).unwrap();
+        let (set, valid_through) =
+            ProviderObservation::from_disclosure(&disclosure, true).into_parts();
+
+        assert!(set.contains(&provider_key(public_member.raw)));
+        assert_eq!(valid_through, None);
+        for hidden in [restricted_member, unauthorized_member, uncommitted_resident] {
+            assert!(!set.contains(&provider_key(hidden.raw)));
+        }
+        assert_eq!(
+            ProviderObservation::from_disclosure(&disclosure, false),
+            ProviderObservation::default(),
+            "non-serving QoS cannot publish even an open disclosure"
+        );
+    }
+
+    #[test]
+    fn expired_write_evidence_is_removed_from_the_future_renewal_set() {
+        let root = signing_key(31);
+        let writer = signing_key(32);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "expiring",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(root.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let write = CapabilityAtom::new(
+            CapabilityAction::new(ACTION_WRITE),
+            CapabilityResource::from(collection.handle()),
+        );
+        let validity =
+            CapabilityValidity::new(Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(10.0))
+                .unwrap();
+        store_bundle(
+            &mut store,
+            CapabilityProofBundle::issue_root(
+                &root,
+                CapabilityClaim::root(write, CapabilityMode::Invoke, Some(validity)),
+                writer.verifying_key(),
+            )
+            .unwrap(),
+        );
+        let member = put_blob(&mut store, 33);
+        commit(&mut store, collection.handle(), &writer, member);
+
+        let snapshot = store.snapshot().unwrap();
+        let during = DisclosureSnapshot::build_at(&snapshot, Epoch::from_tai_seconds(5.0)).unwrap();
+        let after = DisclosureSnapshot::build_at(&snapshot, Epoch::from_tai_seconds(11.0)).unwrap();
+        let (during_set, during_valid_through) =
+            ProviderObservation::from_disclosure(&during, true).into_parts();
+        let (after_set, after_valid_through) =
+            ProviderObservation::from_disclosure(&after, true).into_parts();
+        assert!(during_set.contains(&provider_key(member.raw)));
+        assert_eq!(during_valid_through, Some(Epoch::from_tai_seconds(10.0)));
+        assert!(!after_set.contains(&provider_key(member.raw)));
+        assert_eq!(after_valid_through, None);
     }
 
     #[test]

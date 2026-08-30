@@ -152,20 +152,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining or manufacturing the named blob. OFFER grants no authority,
   demand, reach, collection evidence, or synchronized-inventory membership.
 
-- Drive DHT provider publication exclusively from durable OFFER intent
-  intersected with the current resident Blob serving snapshot. `Peer` observes
-  offers outside the coherent semantic `StoreSnapshot`; serving hosts announce
-  additions immediately and renew successful receiver-local leases at
-  half-life through a bounded fair due-time scheduler. Absent blobs, cleared
-  snapshots, and read-only peers remain dormant, while failed or
-  capacity-rejected attempts
-  use bounded backoff. When any configured, synchronized, or learned remote
-  route exists, local self-insertion alone no longer masks failed DHT
-  replication; true singleton nodes still renew their self lease normally.
-  Lease deadlines expose a rate-limited warning if fair backlog ever exhausts
-  the half-life margin. Remove the imperative announcement bypass completely,
-  including from the simulator.
-
 - Add a transport-independent bounded XOR routing core. Its 256 Kademlia-style
   buckets retain at most 20 learned peers each and distinguish remotely named
   candidates from direct authenticated responders. Explicit bootstrap
@@ -177,9 +163,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Route immutable-artifact provider placement and lookup through authenticated
   alpha-3 FIND_NODE walks. Exact fetch no longer probes the learned peer set:
-  serving holders publish the resident subset of their durable OFFERs through
-  the DHT, while unoffered artifacts remain clean misses. Wire protocol
-  identity advances to pile-sync ALPN v13.
+  serving holders publish only their snapshot-bound READ-open collection
+  disclosure through the DHT, while undisclosed artifacts remain clean misses.
+  Wire protocol identity advances to pile-sync ALPN v13.
 
 - Add lattice-aware exact derived-collection reuse over the existing team
   transport. The core resolver accepts speculative remote target handles,
@@ -271,6 +257,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   during sampling.
 
 ### Changed
+
+- Derive global DHT provider publication from one immutable collection
+  disclosure observation instead of durable `OFFER` intent. Only resident
+  closure beneath strict, currently WRITE-admitted COMMITs in READ-open
+  collections is published; restricted and unauthorized handles remain absent.
+  A conservative proof-expiry bound stops autonomous lease renewal until the
+  store is reobserved, while raw artifact serving remains behind the existing
+  authenticated team session.
 
 - Make store registration the sole source of typed collection values.
   `register_collection` validates a raw descriptor and returns the exact handle

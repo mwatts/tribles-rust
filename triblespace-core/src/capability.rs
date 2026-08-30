@@ -1356,6 +1356,30 @@ pub fn capability_quorum_authorizes<'a>(
     }
 }
 
+/// Earliest inclusive upper validity bound among currently usable proof paths.
+///
+/// This is deliberately conservative: a path which expires at the returned
+/// instant may be redundant with another path, so authorization can remain
+/// valid afterward. Consumers may use the bound to stop autonomous work and
+/// reobserve authority; they must not interpret it as a revocation claim.
+pub(crate) fn capability_quorum_observation_valid_through<'a>(
+    bundles: impl IntoIterator<Item = &'a CapabilityProofBundle>,
+    trust_roots: impl IntoIterator<Item = VerifyingKey>,
+    instant: Epoch,
+    atom: CapabilityAtom,
+) -> Option<Epoch> {
+    let roots: BTreeSet<[u8; PUBLIC_KEY_LEN]> = trust_roots
+        .into_iter()
+        .map(|root| root.to_bytes())
+        .collect();
+    bundles
+        .into_iter()
+        .filter_map(|bundle| validated_forest_path(bundle, &roots, instant, atom))
+        .filter_map(|path| path.valid_through_ns)
+        .min()
+        .map(|upper| Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper)))
+}
+
 fn forest_issuer_support(
     roots: &BTreeSet<[u8; PUBLIC_KEY_LEN]>,
     authority: &BTreeMap<[u8; PUBLIC_KEY_LEN], BTreeMap<[u8; PUBLIC_KEY_LEN], CapabilityMode>>,
@@ -1442,6 +1466,7 @@ struct CapabilityForestPath {
     root: [u8; PUBLIC_KEY_LEN],
     proof_id: [u8; 32],
     steps: Vec<CapabilityForestStep>,
+    valid_through_ns: Option<i128>,
 }
 
 fn validated_forest_path(
@@ -1511,6 +1536,7 @@ fn validated_forest_path(
         root,
         proof_id: bundle.proof.id().raw,
         steps,
+        valid_through_ns: effective_validity.map(|(_, upper)| upper),
     })
 }
 
