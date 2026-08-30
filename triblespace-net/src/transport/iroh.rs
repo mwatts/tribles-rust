@@ -159,6 +159,10 @@ impl Transport for IrohTransport {
             warn!(%error, "iroh router shutdown failed");
         }
     }
+
+    fn collection_wake_plane(&self) -> Option<CollectionWakePlane> {
+        Some(self.wake_plane.clone())
+    }
 }
 
 /// Thin `ProtocolHandler` that forwards accepted connections (tagged

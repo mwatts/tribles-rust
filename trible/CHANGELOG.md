@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add explicit `pile net sync --collection HANDLE` activation for
+  collection-scoped repair. Repeat `--collection` to activate more than one
+  exact descriptor.
+
+### Changed
+
+- Make each repair request carry the local endpoint's portable READ(C)
+  evidence. Transport connections no longer require team-wide CONNECT or
+  SYNC_TEAM proofs.
+
+### Removed
+
+- Remove the unshipped `pile net inventory`, `pile net status`, team capability
+  command family, team-scoped sync arguments, and blob mirror mode.
+
+### Superseded during development
+
 - Add `pile net inventory <PILE>`, a read-only probe that prints the bound team,
   canonical `/14` inventory generation, and count/root pair for PEER evidence,
   collection records, capability proofs, and blobs. Sampling fails closed if
@@ -22,7 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   missing references without WANTs, and fails before writing on corrupt
   candidates.
 
-### Changed
+#### Changed
 
 - Keep team bootstrap one-step while separating transport from synchronization
   authority. `team create` now issues distinct CONNECT and SYNC_TEAM founder

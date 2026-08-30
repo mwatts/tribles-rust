@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add collection-scoped anti-entropy over one direct stream. Each request
+  carries portable READ(C) evidence and pins the exact product of the native
+  record PATCH and portable WRITE-evidence PATCH.
+- Add stock `iroh-gossip` wake subscriptions keyed exactly by collection
+  handle. Signed origin plus opaque activation-root mismatches accelerate the
+  same repair path; periodic anti-entropy remains authoritative.
+
+### Changed
+
+- Replace team-scoped connection authorization and global inventory with
+  immutable per-collection activation overlays. DHT routing, provider lookup,
+  and exact GET by a known handle remain bearer/public; provider advertising
+  now follows collection disclosure policy.
+- Move the incompatible direct protocol to ALPN
+  `/triblespace/pile-sync/17`.
+
+### Removed
+
+- Remove CONNECT/SYNC_TEAM exchanges, `StoreScope`, durable PEER routing,
+  broad blob mirroring, and the global PEER/record/proof/blob inventory wire
+  protocol from the network host.
+
+### Superseded during development
+
 - Add policy-independent collection-record delta mechanics for the forthcoming
   READ-authorized overlay: strict sparse-record framing and COMMIT signatures,
   collection matching, valued-PATCH intrinsic-id deduplication, and bounded
@@ -35,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   followed by exact reads, and `Mirror` also traverses and fetches the complete
   blob inventory.
 
-### Fixed
+#### Fixed
 
 - Route provider PUT and GET through the full 256-bit derived key instead of
   one of 256 fixed global prefix targets. Provider publication now uses bounded
@@ -79,7 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serve local inventory nor blobs; write-only peers never pull, demand-fetch,
   or admit inbound readers as durable PEER evidence.
 
-### Changed
+#### Changed
 
 - Bound the shared outbound connection pool to 64 fully reciprocal
   CONNECT+SYNC_TEAM-authorized sessions. Successful sessions use deterministic

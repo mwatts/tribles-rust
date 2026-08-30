@@ -2,8 +2,8 @@
 //!
 //! [`SimNet`] is a process-local network: nodes join it, get a
 //! [`Harness<SimTransport>`] back, and from there the *entire*
-//! production protocol stack — host loop, CONNECT/SYNC_TEAM-authorized
-//! inventory reads, and DHT provider operations — runs unmodified over
+//! production protocol stack — host loop, collection-authorized repair,
+//! and bearer DHT/provider operations — runs unmodified over
 //! in-memory pipes instead of iroh QUIC.
 //!
 //! # Determinism contract
@@ -32,7 +32,7 @@
 //! [`SimNet::crash`] takes a node off the network entirely until
 //! [`SimNet::revive`]. Faults affect *delivery*, never identity —
 //! `Conn::remote_id` always reports the true dialer, so
-//! identity-dependent OP_AUTH subject binding is exercised honestly.
+//! identity-dependent per-request READ(C) subject binding is exercised honestly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;

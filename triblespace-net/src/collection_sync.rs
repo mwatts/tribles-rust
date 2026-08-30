@@ -1,4 +1,4 @@
-//! Lattice-aware exact collection attachment over the generic team transport.
+//! Lattice-aware exact collection attachment over bearer artifact lookup.
 //!
 //! The network layer never plans collection semantics. It freezes the target
 //! artifact identities named by the already-converged record inventory, lets
@@ -23,8 +23,8 @@ use triblespace_core::collection::{
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, CapabilityProofStore, PeerStore, SnapshotSource, StorageFlush,
-    StoreRead, StoreScope, WantStore,
+    BlobChildren, BlobStore, CapabilityProofStore, SnapshotSource, StorageFlush, StoreRead,
+    WantStore,
 };
 
 use crate::peer::Peer;
@@ -36,7 +36,7 @@ fn remaining_fetch_budget(deadline: tokio::time::Instant) -> Option<std::time::D
     (!remaining.is_zero()).then_some(remaining)
 }
 
-/// Failure while obtaining one exact derived cover from local or team state.
+/// Failure while obtaining one exact derived cover from local or remote state.
 #[derive(Debug)]
 pub enum ExactDerivedSyncError {
     /// Exact-cover resolution, validation, or construction failed.
@@ -97,7 +97,7 @@ impl From<ExactDerivedCollectionError> for ExactDerivedSyncError {
     }
 }
 
-/// Ensure one exact derived cover, opportunistically reusing a team member's
+/// Ensure one exact derived cover, opportunistically reusing a remote peer's
 /// physical cover before reconstructing missing target artifacts locally.
 ///
 /// The source cover and all source dependencies must already be resident; a
@@ -115,8 +115,6 @@ where
     S: BlobStore
         + CollectionStore
         + CapabilityProofStore
-        + PeerStore
-        + StoreScope
         + WantStore
         + StorageFlush
         + Send

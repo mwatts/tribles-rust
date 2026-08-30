@@ -1,8 +1,8 @@
-//! Authorized team-inventory synchronization for triblespace.
+//! Collection-scoped anti-entropy for triblespace.
 //!
-//! [`Peer<S>`](peer::Peer) wraps one single-team store. Periodic authenticated
-//! PATCH walks converge peer-routing evidence, collection records, complete
-//! capability proofs, and optionally resident blobs. A separate stock-gossip
+//! [`Peer<S>`](peer::Peer) wraps one store. Periodic per-request authorized
+//! PATCH walks converge one explicitly active collection's records and
+//! portable WRITE evidence. A separate stock-gossip
 //! wake plane carries only a signed endpoint origin and opaque per-collection
 //! anti-entropy root; knowing the collection handle is its discovery
 //! capability, while every useful byte remains capability-gated. Exact content
@@ -40,7 +40,6 @@ pub mod collection_sync;
 pub mod host;
 pub mod identity;
 pub mod inventory;
-pub(crate) mod inventory_wire;
 pub mod patch_repair;
 pub mod peer;
 pub mod protocol;

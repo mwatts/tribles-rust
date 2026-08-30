@@ -27,15 +27,8 @@ use crate::transport::Conn;
 /// Evidence missing from the caller's immutable local observation.
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionRepairDelta {
-    pub(crate) remote: CollectionRepairManifest,
     pub(crate) records: Vec<CollectionRecord>,
     pub(crate) write_evidence: Vec<CapabilityProofBundle>,
-}
-
-impl CollectionRepairDelta {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.records.is_empty() && self.write_evidence.is_empty()
-    }
 }
 
 /// Serve the body of one collection-repair operation after its operation byte
@@ -192,7 +185,6 @@ where
     send.shutdown().await?;
     require_eof(recv).await?;
     Ok(CollectionRepairDelta {
-        remote,
         records,
         write_evidence,
     })
@@ -361,8 +353,6 @@ mod tests {
         let server = Arc::new(
             collection_activation_overlay(&server_snapshot, server_collection.handle()).unwrap(),
         );
-        let expected_wake_root = server.wake_root();
-
         let mut client_store = MemoryRepo::default();
         let client_collection = client_store.collection("shared", policy).unwrap();
         assert_eq!(client_collection.handle(), server_collection.handle());
@@ -391,10 +381,8 @@ mod tests {
         let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![])
             .await
             .unwrap();
-        assert_eq!(delta.remote.wake_root, expected_wake_root);
         assert_eq!(delta.records.len(), 1);
         assert!(delta.write_evidence.is_empty());
-        assert!(!delta.is_empty());
         server_task.await.unwrap();
     }
 }

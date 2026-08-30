@@ -108,41 +108,26 @@ with the encoding and mapping-algorithm descriptions.
 
 ### Distributed pile sync
 
-Built on `triblespace-net` (authenticated iroh QUIC, bounded PATCH
-anti-entropy, and DHT provider lookup). A node presents two independent exact
-proofs rooted at the team public key: CONNECT admits the transport connection
-and SYNC_TEAM authorizes disclosure and reconciliation of that team's
-inventory. The local pile must contain both selected native proofs and every
-claim blob they name.
+Built on `triblespace-net` (authenticated iroh QUIC, collection-scoped PATCH
+anti-entropy, stock-gossip wakeups, and DHT provider lookup). Opening a
+transport connection grants no collection authority. Each repair request names
+one exact collection and carries the caller's portable READ(C) proof bundles;
+the server checks them before disclosing a manifest or PATCH leaf.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
-- `pile net inventory <PILE>` — print the pile's bound team and canonical `/14`
-  inventory generation plus exact count/root evidence for every synchronized
-  component. The read fails if semantic inventory changes while sampled.
-- `pile net status <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--key PATH]` — load both exact native bundles, verify CONNECT and SYNC_TEAM for the local key at the current time, and print their IDs and step counts.
-- `pile net sync <PILE> --team-root HEX --connect-proof ID --sync-proof ID [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only] [--blobs demand|mirror]` — run authorized periodic anti-entropy. PEER evidence, native collection records, and capability proofs converge by set union. `demand` (the default) fetches blobs only for durable WANTs after DHT provider lookup; `mirror` also walks the complete blob inventory. `read-only` pulls but does not serve local data, while `write-only` serves but never pulls or demand-fetches. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+- `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve, while `write-only` serves admitted readers but does not pull or service local WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
-The pile is one team-scoped store: records, proofs, and blobs do not carry a
-separate team label. Configured peers are bootstrap routes, and successful
-authorized synchronization carries monotone `PEER(team, peer)` routing
-evidence. Bounded fair pairwise PATCH reconciliation is the epidemic exchange;
-there is no publisherless broadcast wake plane.
+The exact repair state is the product of the collection's native record PATCH
+and its portable WRITE-evidence PATCH. A later WRITE proof can therefore
+activate an older commit without inventing a second synchronization protocol.
+Production peers subscribe to stock `iroh-gossip` topics keyed exactly by
+collection handle; signed opaque-root mismatches accelerate ordinary repair,
+while periodic anti-entropy remains authoritative.
 
-### Team capabilities
-
-A team is identified by an Ed25519 trust-root public key, whose exact 32 bytes
-are the resource for two distinct capabilities: CONNECT admits transport and
-SYNC_TEAM permits inventory disclosure and reconciliation. Semantic
-restrictions are keyless canonical claim blobs linked by parent claim handles.
-Each independent `K0 (S C K)+` proof binds issuer key, exact claim handle, and
-delegate key; its BLAKE3 digest is the exact lookup id. One versioned invite
-artifact packages the bounded CONNECT and SYNC_TEAM proof bundles in fixed
-order so joining remains one operation without conflating their authority.
-
-- `team create --pile PATH [--key KEY_PATH] [--root-key ROOT_KEY_PATH] [--valid-from RFC3339 --valid-until RFC3339]` — initialize a durable offline team-root key, issue and store founder CONNECT and SYNC_TEAM proofs in `invoke+delegate` mode, and print both exact proof IDs.
-- `team invite --pile PATH --team-root HEX --connect-parent-proof ID --sync-parent-proof ID --key ISSUER --invitee HEX [--delegate] [--valid-from RFC3339 --valid-until RFC3339] --out FILE` — verify and extend both exact resident delegation chains, then write one portable invite artifact. Without `--delegate`, the child may connect and synchronize but cannot invite.
-- `team join --pile PATH --team-root HEX --key INVITEE --invite FILE` — validate both bundles against the externally supplied root, expected leaf, exact action, minimum invoke mode, and current validity before the first idempotent store write. It prints both accepted proof IDs.
-- `team show --pile PATH --team-root HEX --proof ID` — load, verify, and print one exact CONNECT or SYNC_TEAM proof and its claim ancestry.
+DHT routing, provider lookup, and direct GET by a known immutable handle are
+bearer/public. Provider advertising follows collection disclosure policy, so
+restricted resident artifacts are not announced. The network host neither
+uses nor writes durable team/PEER routing state.
 
 ### Work with remote stores
 
@@ -159,4 +144,4 @@ See `INVENTORY.md` for notes on possible cleanup and future functionality.
 ## Development
 
 Command implementations live in `src/cli/`, with pile, collection, migration,
-network, team, and remote-blob modules. Contributions are always welcome!
+network, and remote-blob modules. Contributions are always welcome!

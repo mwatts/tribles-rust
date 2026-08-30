@@ -2,8 +2,8 @@
 //! network, as traits.
 //!
 //! This module exists so the *entire* protocol stack above it — the
-//! host loop, CONNECT/SYNC_TEAM authorization, Merkle inventory reads, and
-//! DHT provider operations — can run
+//! host loop, collection-authorized repair, and bearer DHT/provider operations
+//! — can run
 //! unmodified against either:
 //!
 //! - [`crate::transport::iroh`]: the production iroh QUIC adapter, or
@@ -13,7 +13,7 @@
 //!
 //! Design rule: the seam carries network capabilities, not protocol. Anything
 //! that decides what bytes mean (ALPN dispatch targets, frame layouts,
-//! auth semantics, scope checks) lives above; anything that decides how
+//! request admission) lives above; anything that decides how
 //! bytes move (QUIC, relays, and NAT traversal) lives below.
 //! The week-of-2026-06-04 bug hunt found every
 //! protocol bug *above* this line (snapshot ordering and authentication
@@ -51,8 +51,8 @@ pub trait Conn: Clone + Send + Sync + 'static {
     type RecvHalf: AsyncRead + Unpin + Send + 'static;
 
     /// The remote peer's verified identity. In production this is
-    /// iroh's TLS-level `remote_id` — the value the
-    /// CONNECT proof's subject binding trusts.
+    /// iroh's TLS-level `remote_id` — the subject checked by each
+    /// request-supplied READ(C) proof bundle.
     /// The simulator forges nothing: it returns the actual id of the
     /// node that dialed, so identity-dependent protocol logic is
     /// exercised honestly.
@@ -101,6 +101,13 @@ pub trait Transport: Clone + Send + Sync + 'static {
     /// loses every owner. Production QUIC needs an awaited close so peers do
     /// not mistake a clean daemon stop for a failed connection.
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Stock collection wake plane when this transport shares an iroh
+    /// endpoint with `iroh-gossip`. Deterministic transports return `None`;
+    /// periodic collection repair remains the authoritative anti-entropy path.
+    fn collection_wake_plane(&self) -> Option<crate::wake::CollectionWakePlane> {
+        None
+    }
 }
 
 /// An accepted inbound connection, tagged with the ALPN it arrived on.

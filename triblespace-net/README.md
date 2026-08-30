@@ -1,18 +1,16 @@
 # triblespace-net
 
-Authorized team inventory synchronization for TribleSpace over
-[iroh](https://www.iroh.computer). A peer periodically reconciles four
-monotone store components—PEER routing evidence, collection records,
-capability proofs, and optionally blobs—through authenticated Merkle walks.
-These bounded pairwise PATCH unions are the epidemic exchange itself; there is
-no separate broadcast wake plane. Exact artifacts are located through the
-authenticated DHT after explicit provider publication.
+Collection-scoped anti-entropy for TribleSpace over
+[iroh](https://www.iroh.computer). A peer retains an immutable activation
+overlay for each explicitly active collection. One repair stream reconciles
+the exact product of two grow-only PATCHes: native collection records and
+portable WRITE-evidence bundles.
 
 The user-facing surface is `Peer<S>`, a synchronous store wrapper backed by an
-async host. `Peer::refresh` drains verified network events, crosses one storage
-flush barrier, and only then replaces the immutable snapshot served to other
-peers. No remote mutable head, receipt RPC, replica roster, or second authority
-database is involved.
+async host. `Peer::refresh` drains verified repair events, crosses one storage
+flush barrier, and only then replaces the immutable snapshots served to other
+peers. There is no global team inventory, remote mutable head, replica roster,
+or separate authority database.
 
 ## Getting started
 
@@ -25,79 +23,80 @@ triblespace = { version = "0.47", features = ["net"] }
 
 ```rust,ignore
 use triblespace::net::peer::{
-    BlobReconcileMode, Peer, PeerConfig, ReconcileDirection, ReconcileQos,
+    Peer, PeerConfig, ReconcileDirection, ReconcileQos,
 };
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
-let mut peer = Peer::new(pile, signing_key.clone(), PeerConfig {
-    peers: vec![bootstrap_endpoint],
-    team: team_root,
-    connect_proof,
-    sync_proof,
-    qos: ReconcileQos {
-        direction: ReconcileDirection::Bidirectional,
-        blobs: BlobReconcileMode::Demand,
+let mut peer = Peer::new(
+    pile,
+    signing_key,
+    PeerConfig {
+        peers: vec![bootstrap_endpoint],
+        qos: ReconcileQos {
+            direction: ReconcileDirection::Bidirectional,
+        },
     },
-})?;
+)?;
+peer.activate_collection(collection_handle);
 
-peer.refresh();
+loop {
+    peer.refresh();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
 ```
 
-`team` is the exact Ed25519 trust root and inventory scope. The backing store
-must be dedicated to that team because collection records, proofs, and blobs
-have content identities but no intrinsic team label.
+Activation is ephemeral process state. It writes no OFFER/GOSSIP marker and
+does not create an ambient collection registry.
 
-Every connection first presents a complete CONNECT proof bound to its
-transport key, and the server returns its own bounded CONNECT proof in the same
-round trip. Before any inventory or blob disclosure, the client and server
-repeat that reciprocal exchange for SYNC_TEAM exactly once on the connection.
-Both sides' proofs must be rooted at `team`, invoke their exact action for the
-TLS-authenticated endpoint key, and be current. Startup rejects local proof
-configuration for another endpoint, team, action, or validity interval.
+## Authority and disclosure
 
-The initiating CONNECT proof necessarily reaches the exact dialed TLS identity
-before that endpoint proves CONNECT authority. It is non-bearer evidence bound
-to the initiator's key and sent over TLS to the identity the client intended to
-dial; the proof itself is not cryptographically bound to the receiver key. It
-is not a confidential or zero-knowledge credential. No SYNC proof, element
-identity, query, or data request is sent until the returned CONNECT proof
-verifies; useful requests additionally wait for reciprocal SYNC_TEAM. Knowing
-a team root or content hash, or holding PEER evidence, is not sufficient.
+The QUIC/TLS connection authenticates endpoint identities but grants no team
+or collection authority. Every collection repair request names exactly one
+collection and carries the caller's complete portable READ(C) proof bundles.
+The server verifies those bundles against the collection descriptor before it
+reveals the repair manifest or any PATCH leaf. An endpoint with WRITE(C) but
+without READ(C) cannot learn collection records, WRITE evidence, or roots.
 
-## Reconciliation policy
+DHT `FIND_NODE`, provider-directory operations, and exact `GET_BLOB` by an
+already-known immutable handle remain bearer/public mechanisms. Provider
+advertising is built only from the store's collection disclosure snapshot, so
+restricted material is never published as a provider hint merely because the
+bytes are resident.
 
-PEER, collection-record, and capability-proof inventories always converge when
-pulling is enabled. Blob behavior is local policy:
+## Repair and wake
 
-- `Demand` skips the broad blob inventory. Durable blob WANTs locate an
-  explicitly published provider through the DHT, then use exact,
-  SYNC_TEAM-authorized `GET_BLOB`.
-- `Mirror` also walks the complete authorized blob inventory and fetches
-  missing bytes in bounded ranges. Mirroring is a synchronization policy, not
-  a retention promise; an evicting store may discard bytes later.
+Periodic pairwise repair is authoritative anti-entropy. For each active
+collection, the caller opens one bidirectional stream, presents READ(C), pins
+the returned record and WRITE-evidence roots, and walks only missing PATCH
+nodes. Complete proof bundles include their claim bytes, so landing later
+WRITE evidence can activate an older record without a separate claim-fetch
+protocol.
 
-Direction is also local policy:
+Production iroh peers also subscribe to stock `iroh-gossip` topics keyed
+exactly by the 32-byte collection handle. A wake contains only a signed origin
+endpoint and the opaque activation root. A root mismatch schedules ordinary
+READ-authorized repair from that signed origin; the wake itself carries no
+authority or collection state. Missed or lagged wakes are harmless because
+the periodic repair path remains active.
 
-- `Bidirectional` pulls and admits remote inventory, serves its local
-  inventory, and learns authenticated inbound peers.
-- `ReadOnly` pulls and services local WANTs but does not serve local data.
-- `WriteOnly` serves local data but never pulls, demand-fetches, or admits
-  inbound readers as local PEER evidence.
+Direction is local policy:
 
-Configured endpoint addresses are bootstrap routes. Successful authorized
-sessions and synchronized `PEER(team, peer)` evidence can add routing
-candidates. Every 30-second period admits at most `K = 20` candidates from a
-fair rotating cursor, with at most eight live sweeps. Slow or failed peers
-therefore cannot create an unbounded pending scan, while every stored or
-configured peer in an eventually stable set is revisited after backoff. A first
-installed snapshot starts one period immediately; later snapshots cannot
-manufacture extra budget.
+- `Bidirectional` pulls active collections and serves admitted readers.
+- `ReadOnly` pulls but does not serve local collection state or bearer data.
+- `WriteOnly` serves admitted readers and bearer data but does not initiate
+  repair or service local WANTs.
 
-Collection-operation WANTs need no special RPC. Since every native collection
-record is already part of the team inventory, the reconciler refreshes the
-peer and uses the store's indexed record selection to observe matching MERGE
-or DERIVE receipts. Absence stays pending; conflicting answers remain in the
-grow-only record set.
+Configured endpoint addresses are bootstrap repair targets. DHT referrals and
+wake origins may provide transient routes, but no durable PEER record is
+created or consumed by the network host.
+
+## Exact content
+
+Durable blob WANTs use the authenticated DHT to find policy-approved provider
+hints and then fetch the exact known handle. Exact reads are independent of
+collection repair: no broad blob inventory or mirror mode exists. Collection
+operation WANTs observe matching records through the local indexed record
+selection after `Peer::refresh`.
 
 The full model, wire formats, authorization boundaries, and CLI surface live
 in the book's [Distributed Sync](https://docs.rs/triblespace/latest/triblespace/)
@@ -105,12 +104,13 @@ chapter.
 
 ## Crate layout
 
-- `peer` — synchronous store wrapper, durable admission, and Demand reads
-- `inventory` — four canonical team-scoped PATCH inventories and QoS policy
-- `inventory_reconcile` — root-pinned Merkle difference walker
-- `inventory_wire` — bounded SYNC_TEAM authorization, node, and blob-range codecs
+- `collection_activation` — per-collection record and WRITE-evidence PATCHes
+- `collection_session` / `collection_wire` — one READ-authorized repair stream
+- `patch_repair` — root-pinned Merkle difference walker
+- `peer` — synchronous store wrapper, durable admission, and exact WANT reads
 - `reconcile` — durable WANT observation and exact blob fulfillment
-- `protocol` — CONNECT authentication and exact blob framing
-- `host` — transport, snapshots, connection pool, and periodic scheduler
+- `provider` / `routing` — bounded bearer provider directory and XOR routing
+- `protocol` — public direct-operation framing
+- `host` — immutable overlays, connection pool, wake bridge, and scheduler
 - `transport` — production iroh and deterministic simulation transports
 - `identity` — persistent network signing-key handling

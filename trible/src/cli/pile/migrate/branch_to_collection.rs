@@ -57,7 +57,7 @@ pub(super) fn run(
     let signer = load_signing_key(&Some(signing_key))?;
     let authority = authority
         .as_deref()
-        .map(|value| crate::cli::team::parse_public_key(value, "authority"))
+        .map(|value| parse_public_key(value, "authority"))
         .transpose()?
         .unwrap_or_else(|| signer.verifying_key());
 
@@ -76,6 +76,15 @@ pub(super) fn run(
         &mappings,
     );
     Ok(())
+}
+
+fn parse_public_key(text: &str, label: &str) -> Result<VerifyingKey> {
+    let bytes = hex::decode(text).map_err(|error| anyhow!("decode {label} hex: {error}"))?;
+    let raw: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("{label} must be 32 bytes"))?;
+    VerifyingKey::from_bytes(&raw).map_err(|error| anyhow!("invalid {label}: {error}"))
 }
 
 fn migrate(

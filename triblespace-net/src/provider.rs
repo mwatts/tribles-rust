@@ -75,11 +75,6 @@ impl ProviderObservation {
     pub(crate) fn into_parts(self) -> (ProviderSet, Option<Epoch>) {
         (self.set, self.valid_through)
     }
-
-    #[cfg(test)]
-    pub(crate) fn with_valid_through(set: ProviderSet, valid_through: Option<Epoch>) -> Self {
-        Self { set, valid_through }
-    }
 }
 
 impl ProviderSet {

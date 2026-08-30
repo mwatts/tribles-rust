@@ -8,7 +8,6 @@ use tracing_subscriber::EnvFilter;
 mod cli;
 use cli::pile::PileCommand;
 use cli::store::StoreCommand;
-use cli::team::Command as TeamCommand;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -31,11 +30,6 @@ enum TribleCli {
     Store {
         #[command(subcommand)]
         cmd: StoreCommand,
-    },
-    /// Exact, proof-carrying team capability management.
-    Team {
-        #[command(subcommand)]
-        cmd: TeamCommand,
     },
 }
 
@@ -65,7 +59,6 @@ fn main() -> Result<()> {
         }
         TribleCli::Pile { cmd } => cli::pile::run(cmd)?,
         TribleCli::Store { cmd } => cli::store::run(cmd)?,
-        TribleCli::Team { cmd } => cli::team::run(cmd)?,
     }
     Ok(())
 }

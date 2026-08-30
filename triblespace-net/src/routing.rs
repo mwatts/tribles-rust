@@ -49,9 +49,6 @@ pub(crate) struct RoutingTable {
     /// state. It remains available even if the corresponding learned route is
     /// evicted or a connection attempt fails.
     configured: BTreeSet<PeerId>,
-    /// Stored PEER/snapshot evidence eligible for periodic anti-entropy.
-    /// DHT referrals never enter this set.
-    sync: BTreeSet<PeerId>,
     buckets: [Bucket; BUCKET_COUNT],
 }
 
@@ -69,7 +66,6 @@ impl RoutingTable {
         Self {
             local,
             configured,
-            sync: BTreeSet::new(),
             buckets: std::array::from_fn(|_| Bucket::default()),
         }
     }
@@ -80,16 +76,6 @@ impl RoutingTable {
         if self.configured.contains(&peer) {
             return true;
         }
-        self.insert(peer, RouteState::Candidate)
-    }
-
-    /// Remember explicit stored PEER evidence as both a route and a periodic
-    /// anti-entropy target. This provenance is distinct from DHT referrals.
-    pub(crate) fn note_sync_candidate(&mut self, peer: PeerId) -> bool {
-        if self.configured.contains(&peer) {
-            return true;
-        }
-        self.sync.insert(peer);
         self.insert(peer, RouteState::Candidate)
     }
 
@@ -159,25 +145,6 @@ impl RoutingTable {
         peers.sort_unstable_by(|a, b| distance_cmp(target, *a, *b));
         peers.truncate(limit);
         peers
-    }
-
-    /// Explicit anti-entropy targets only: local configuration plus stored
-    /// PEER/snapshot evidence, never identities learned solely through DHT.
-    pub(crate) fn sync_candidates(&self) -> Vec<PeerId> {
-        let mut peers = self.configured.clone();
-        peers.extend(self.sync.iter().copied());
-        peers.into_iter().collect()
-    }
-
-    /// Whether this node has any durable seed, synchronized peer evidence, or
-    /// learned DHT route from which remote replication can reasonably be
-    /// expected. Failed learned routes may leave their synchronized
-    /// provenance behind, so an outage cannot silently turn a replicated
-    /// publication into a singleton publication on its next retry.
-    pub(crate) fn expects_remote(&self) -> bool {
-        !self.configured.is_empty()
-            || !self.sync.is_empty()
-            || self.buckets.iter().any(|bucket| !bucket.entries.is_empty())
     }
 
     fn all(&self) -> Vec<PeerId> {
@@ -511,21 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn durable_peer_provenance_keeps_remote_replication_expected_during_outage() {
-        let local = id(1);
-        let remote = id(2);
-        let mut table = RoutingTable::new(local, []);
-        assert!(!table.expects_remote());
-        assert!(table.note_sync_candidate(remote));
-        assert!(table.expects_remote());
-        assert!(table.remove(remote));
-        assert!(
-            table.expects_remote(),
-            "a failed route must not silently turn a replicated publication into a singleton"
-        );
-    }
-
-    #[test]
     fn direct_response_promotes_only_the_responder() {
         let local = id(0);
         let seed = id(1);
@@ -725,47 +677,6 @@ mod tests {
         assert!(routes.remove(configured));
         assert_eq!(routes.state(configured), Some(RouteState::Candidate));
         assert!(routes.closest(configured, K).contains(&configured));
-    }
-
-    #[test]
-    fn dht_referrals_never_become_anti_entropy_targets() {
-        let local = [0; 32];
-        let configured = [id(1)];
-        let stored_peer = id(2);
-        let dht_peer = id(3);
-        let mut routes = RoutingTable::new(local, configured);
-
-        assert!(routes.note_sync_candidate(stored_peer));
-        assert!(routes.note_candidate(dht_peer));
-        assert!(routes.promote_authenticated(dht_peer));
-        assert_eq!(routes.sync_candidates(), vec![configured[0], stored_peer]);
-
-        assert!(routes.remove(stored_peer));
-        assert_eq!(routes.state(stored_peer), None);
-        assert_eq!(routes.sync_candidates(), vec![configured[0], stored_peer]);
-    }
-
-    #[test]
-    fn sync_provenance_survives_bucket_eviction_without_outranking_routes() {
-        let local = [0; 32];
-        let mut routes = RoutingTable::new(local, []);
-        let mut sync_peers = Vec::new();
-        for suffix in 1..=K + 1 {
-            let mut peer = [0; 32];
-            peer[0] = 0x80;
-            peer[30..].copy_from_slice(&(suffix as u16).to_be_bytes());
-            routes.note_sync_candidate(peer);
-            sync_peers.push(peer);
-        }
-        for suffix in 100..100 + K {
-            let mut peer = [0; 32];
-            peer[0] = 0x80;
-            peer[30..].copy_from_slice(&(suffix as u16).to_be_bytes());
-            routes.promote_authenticated(peer);
-        }
-
-        assert_eq!(routes.closest_verified([0; 32], K).len(), K);
-        assert_eq!(routes.sync_candidates(), sync_peers);
     }
 
     #[test]

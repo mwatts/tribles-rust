@@ -1,8 +1,7 @@
 //! Service durable exact-content and collection-operation WANTs.
 //!
-//! Broad team inventory already converges every collection record, including
-//! all conflicting MERGE/DERIVE receipts. This reconciler therefore performs
-//! no second record RPC and never claims global absence: an operation WANT is
+//! Collection repair converges relevant records, including conflicting
+//! MERGE/DERIVE receipts. This reconciler never claims global absence: an operation WANT is
 //! satisfied iff at least one matching local receipt is visible; otherwise it
 //! remains pending while periodic inventory sweeps continue. Blob WANTs retain
 //! their explicit DHT-provider lookup, exact authenticated fetch, and
@@ -18,8 +17,8 @@ use triblespace_core::collection::{
     CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
 };
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, PeerStore, SnapshotSource,
-    StorageFlush, StoreRead, StoreScope, WantRequest, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, SnapshotSource, StorageFlush,
+    StoreRead, WantRequest, WantStore,
 };
 
 use crate::peer::Peer;
@@ -80,8 +79,6 @@ impl Reconciler {
         S: BlobStore
             + CollectionStore
             + CapabilityProofStore
-            + PeerStore
-            + StoreScope
             + WantStore
             + StorageFlush
             + Send

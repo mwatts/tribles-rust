@@ -1,28 +1,23 @@
 //! Messages crossing the synchronous store / asynchronous host boundary.
 //!
-//! Inventory admission is monotone. The host streams authenticated leaves to
+//! Collection repair admission is monotone. The host streams authenticated leaves to
 //! the store side in bounded batches, where one refresh drain inserts all
 //! available batches and crosses a single durability barrier.
 
-use anybytes::Bytes;
-use triblespace_core::capability::CapabilityProof;
+use crate::provider::ProviderObservation;
+use triblespace_core::capability::CapabilityProofBundle;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
     CollectionRecord,
 };
-use triblespace_core::repo::peer::PeerEvidence;
-
-use crate::protocol::RawHash;
-use crate::provider::ProviderObservation;
-use crate::transport::PeerId;
 
 /// A changed immutable local serving observation.
 ///
 /// The snapshot slot is replaced before this command is sent. The host uses
-/// the first notice to start anti-entropy immediately and later notices only
-/// to learn newly stored PEER evidence; periodic scheduling remains bounded.
+/// notices update exact-handle wake subscriptions and periodic repair roots.
 pub(crate) struct SnapshotNotice {
-    pub(crate) peers: Vec<PeerId>,
+    /// Exact active collection handles and their opaque activation roots.
+    pub(crate) collections: Vec<(triblespace_core::collection::CollectionHandle, [u8; 32])>,
     /// Whether an immutable serving snapshot is now installed.
     pub(crate) installed: bool,
 }
@@ -36,27 +31,26 @@ pub(crate) enum NetCommand {
     PublicProvidersUpdated(ProviderObservation),
 }
 
-/// Authenticated, structurally canonical inventory items returned by a walk.
+/// Authenticated, structurally canonical collection items returned by repair.
 ///
-/// These values remain inert evidence. In particular, a proof is not used as
-/// ambient authority and PEER is only a routing hint.
+/// These values remain inert evidence. In particular, transferred WRITE
+/// proofs are never reused as ambient READ authority.
 #[derive(Debug)]
 pub(crate) enum NetEvent {
-    Peer(PeerEvidence),
     CollectionRecord(CollectionRecord),
-    CapabilityProof(CapabilityProof),
-    Blob { hash: RawHash, bytes: Bytes },
+    /// Complete portable WRITE evidence, including its exact claim closure.
+    CapabilityProofBundle(CapabilityProofBundle),
 }
 
 impl NetEvent {
     fn admission_bytes(&self) -> usize {
         match self {
-            Self::Peer(_) => 64,
             Self::CollectionRecord(CollectionRecord::Commit(_)) => 1 + COLLECTION_COMMIT_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Merge(_)) => 1 + COLLECTION_MERGE_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Derive(_)) => 1 + COLLECTION_DERIVE_BYTES_LEN,
-            Self::CapabilityProof(proof) => proof.as_bytes().len(),
-            Self::Blob { bytes, .. } => 32usize.saturating_add(bytes.len()),
+            Self::CapabilityProofBundle(bundle) => {
+                bundle.to_bytes().map_or(usize::MAX, |bytes| bytes.len())
+            }
         }
     }
 }
@@ -82,14 +76,6 @@ pub(crate) struct NetEventBatch {
 }
 
 impl NetEventBatch {
-    pub(crate) fn singleton(event: NetEvent) -> Self {
-        let bytes = event.admission_bytes();
-        Self {
-            events: vec![event],
-            bytes,
-        }
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
@@ -128,52 +114,35 @@ impl NetEventBatch {
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
-    use triblespace_core::repo::peer::PeerEvidence;
+    use triblespace_core::collection::{
+        CollectionCommit, CollectionData, CollectionRecord, empty_metadata_handle,
+    };
 
     use super::*;
 
-    fn peer(byte: u8) -> NetEvent {
-        NetEvent::Peer(PeerEvidence::new(
-            SigningKey::from_bytes(&[0xA5; 32]).verifying_key(),
-            SigningKey::from_bytes(&[byte; 32]).verifying_key(),
-        ))
+    fn record(byte: u8) -> NetEvent {
+        NetEvent::CollectionRecord(CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[byte; 32]),
+            triblespace_core::collection::CollectionHandle::new([0xA5; 32]),
+            CollectionData::new([byte; 32]),
+            empty_metadata_handle(),
+        )))
     }
 
     #[test]
     fn admission_batches_enforce_count_and_byte_bounds() {
         let mut count_bounded = NetEventBatch::default();
         for byte in 0..MAX_ADMISSION_BATCH_ITEMS {
-            count_bounded.try_push(peer(byte as u8)).unwrap();
+            count_bounded.try_push(record(byte as u8)).unwrap();
         }
         assert!(count_bounded.is_full());
-        assert!(count_bounded.try_push(peer(0xFF)).is_err());
-
-        let mut byte_bounded = NetEventBatch::default();
-        let almost_half = vec![0x11; MAX_ADMISSION_BATCH_BYTES / 2];
-        byte_bounded
-            .try_push(NetEvent::Blob {
-                hash: [0x11; 32],
-                bytes: Bytes::from_source(almost_half.clone()),
-            })
-            .unwrap();
-        let rejected = NetEvent::Blob {
-            hash: [0x22; 32],
-            bytes: Bytes::from_source(almost_half),
-        };
-        assert!(byte_bounded.try_push(rejected).is_err());
+        assert!(count_bounded.try_push(record(0xFF)).is_err());
     }
 
     #[test]
-    fn indivisible_oversized_blob_is_a_singleton() {
+    fn record_batching_keeps_items_bounded() {
         let mut batch = NetEventBatch::default();
-        batch
-            .try_push(NetEvent::Blob {
-                hash: [0x33; 32],
-                bytes: Bytes::from_source(vec![0x33; MAX_ADMISSION_BATCH_BYTES + 1]),
-            })
-            .unwrap();
+        batch.try_push(record(0x33)).unwrap();
         assert_eq!(batch.len(), 1);
-        assert!(batch.is_full());
-        assert!(batch.try_push(peer(0x44)).is_err());
     }
 }
