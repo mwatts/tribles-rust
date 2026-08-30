@@ -65,7 +65,6 @@
 //! compilation (the design point of this file), never emulated at runtime.
 
 use std::time::Instant;
-use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -73,9 +72,9 @@ use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::{
-    SimpleToSuccinctMapping, SuccinctArchiveCollection,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
 };
-use triblespace_core::collection::{simplearchive_union, CollectionStoreExt};
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
@@ -746,12 +745,9 @@ fn main() {
     // admission setup cost, not part of Succinct construction.
     let name = benchmark_name();
     let authority = benchmark_authority();
-    let succinct = SuccinctArchiveCollection::new(
-        name,
-        authority,
-        reach::private(),
-        authority,
-        reach::private(),
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
     );
     let signing_key = SigningKey::from_bytes(&[0x5A; 32]);
     let mut all: Vec<(String, Outcome)> = Vec::new();
@@ -763,12 +759,15 @@ fn main() {
             let recording = i >= build_warmup;
             let mut store = MemoryRepo::default();
             let source = store
-                .collection(simplearchive_union::descriptor(
-                    name,
-                    authority,
-                    reach::private(),
-                ))
+                .collection(name, policy.clone())
                 .expect("register source collection");
+            let raw = store
+                .derive(source, SimpleToSuccinctMapping, policy.clone())
+                .expect("register raw Succinct projection");
+            let accelerated = store
+                .derive(raw, RawToRank9AcceleratedMapping, policy.clone())
+                .expect("register accelerated Succinct projection");
+            let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
             for chunk in &chunks {
                 store
                     .commit(source, &signing_key, Fragment::from(chunk.content.clone()))
@@ -790,12 +789,8 @@ fn main() {
             // Inspect the raw physical cover outside the timer. This reports
             // construction shape without charging validation a second time to
             // the build metric.
-            let exact = ExactDerivedCollection::<
-                SimpleArchive,
-                SuccinctArchiveBlob,
-                SimpleToSuccinctMapping,
-            >::new(succinct.source_descriptor(), succinct.descriptor())
-            .expect("bind exact raw Succinct projection");
+            let exact = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw)
+                .expect("bind exact raw Succinct projection");
             let raw_cover = exact
                 .attach_exact(&mut store, &cover)
                 .expect("reattach exact raw cover for metrics");

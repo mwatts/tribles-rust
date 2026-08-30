@@ -10,10 +10,11 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::succinctarchive_union::{
-    SuccinctArchiveCollection, SuccinctArchiveView,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
+    SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    reach, simplearchive_union, Collection, CollectionStoreExt, Cover, SimpleArchiveCollection,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt, Cover, TryFromCover,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -23,7 +24,6 @@ use triblespace::prelude::*;
 fn observe(
     store: &mut MemoryRepo,
     collection: Collection<SimpleArchive>,
-    simple: &SimpleArchiveCollection,
     full_view: &mut SuccinctArchiveView,
     checkpoint: &mut Option<Cover<SimpleArchive>>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
@@ -39,7 +39,7 @@ fn observe(
     // admits only new support. The small SimpleArchive delta stays independent
     // because it drives the change query and advances only after consumption.
     let full = full_view.ensure(store, &current)?;
-    let changed = simple.attach_exact(&snapshot, &added)?;
+    let changed = TribleSet::try_from_cover(&added, &snapshot)?;
 
     let mut titles = Vec::new();
     for title in find!(
@@ -68,14 +68,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let signing_key = SigningKey::generate(&mut OsRng);
     let authority = signing_key.verifying_key();
     let name = "incremental-literature";
-    let source_reach = reach::private();
-    let simple = SimpleArchiveCollection::new(name, authority, source_reach.clone());
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    );
     let mut store = MemoryRepo::default();
-    let collection = store.collection::<SimpleArchive>(simplearchive_union::descriptor(
-        name,
-        authority,
-        source_reach.clone(),
-    ))?;
+    let collection = store.collection(name, policy.clone())?;
 
     let author = entity! {
         literature::firstname: "Frank",
@@ -92,15 +90,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    let succinct =
-        SuccinctArchiveCollection::new(name, authority, source_reach, authority, reach::private());
+    let raw = store.derive(collection, SimpleToSuccinctMapping, policy.clone())?;
+    let accelerated = store.derive(raw, RawToRank9AcceleratedMapping, policy)?;
+    let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
     let mut full_view = succinct.exact_view();
     let mut checkpoint = None;
 
     let first = observe(
         &mut store,
         collection,
-        &simple,
         &mut full_view,
         &mut checkpoint,
         |_| Ok(()),
@@ -120,7 +118,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let failed = observe(
         &mut store,
         collection,
-        &simple,
         &mut full_view,
         &mut checkpoint,
         |_| Err(io::Error::other("simulated consumer failure").into()),
@@ -131,7 +128,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retry = observe(
         &mut store,
         collection,
-        &simple,
         &mut full_view,
         &mut checkpoint,
         |_| Ok(()),
@@ -141,7 +137,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let unchanged = observe(
         &mut store,
         collection,
-        &simple,
         &mut full_view,
         &mut checkpoint,
         |_| Ok(()),

@@ -15,7 +15,7 @@ use triblespace::core::blob::encodings::succinctarchive::CachedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::CompressedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::collection::{reach, simplearchive_union, CollectionStoreExt};
+use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::BlobStorePut;
 
@@ -958,12 +958,12 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
         let mut storage = MemoryRepo::default();
         let signing_key = SigningKey::generate(&mut OsRng);
         let authority = signing_key.verifying_key();
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(authority),
+            AdmissionPolicy::direct(authority),
+        );
         let collection = storage
-            .collection::<SimpleArchive>(simplearchive_union::descriptor(
-                "materialize-bench",
-                authority,
-                reach::private(),
-            ))
+            .collection("materialize-bench", policy)
             .expect("register benchmark collection");
 
         let mut total_tribles: u64 = 0;

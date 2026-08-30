@@ -37,10 +37,11 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::succinctarchive_union::{
-    SuccinctArchiveCollection, SuccinctArchiveView,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
+    SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    reach, simplearchive_union, CollectionStoreExt, Cover, SimpleArchiveCollection,
+    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, Cover, TryFromCover,
 };
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
@@ -55,7 +56,6 @@ struct Fixture {
     seed_cover: Cover<SimpleArchive>,
     covers: Vec<Cover<SimpleArchive>>,
     expected_batches: Vec<Vec<Row>>,
-    simple: SimpleArchiveCollection,
     succinct: SuccinctArchiveCollection,
 }
 
@@ -71,13 +71,13 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     let signing_key = benchmark_key();
     let authority = signing_key.verifying_key();
     let name = benchmark_name();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    );
     let mut store = MemoryRepo::default();
     let collection = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            name,
-            authority,
-            reach::private(),
-        ))
+        .collection(name, policy.clone())
         .expect("register benchmark collection");
 
     let author = entity! {
@@ -123,21 +123,19 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         expected_batches.push(expected);
     }
 
-    let simple = SimpleArchiveCollection::new(name, authority, reach::private());
-    let succinct = SuccinctArchiveCollection::new(
-        name,
-        authority,
-        reach::private(),
-        authority,
-        reach::private(),
-    );
+    let raw = store
+        .derive(collection, SimpleToSuccinctMapping, policy.clone())
+        .expect("register raw Succinct projection");
+    let accelerated = store
+        .derive(raw, RawToRank9AcceleratedMapping, policy)
+        .expect("register accelerated Succinct projection");
+    let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
 
     Fixture {
         store,
         seed_cover,
         covers,
         expected_batches,
-        simple,
         succinct,
     }
 }
@@ -215,7 +213,7 @@ impl IncrementalState {
         }
     }
 
-    fn observe(&mut self, fixture: &Fixture, cover: &Cover<SimpleArchive>) -> Step {
+    fn observe(&mut self, cover: &Cover<SimpleArchive>) -> Step {
         let start = Instant::now();
         let added = cover
             .additions_since(&self.checkpoint)
@@ -226,10 +224,8 @@ impl IncrementalState {
             .ensure(&mut self.store, cover)
             .expect("advance incremental full view");
         let snapshot = self.store.snapshot().expect("freeze delta snapshot");
-        let changed = fixture
-            .simple
-            .attach_exact(&snapshot, &added)
-            .expect("attach exact support delta");
+        let changed =
+            TribleSet::try_from_cover(&added, &snapshot).expect("attach exact support delta");
 
         let mut raw_rows = 0usize;
         let mut batch = BTreeSet::new();
@@ -335,7 +331,7 @@ fn run_incremental(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
         .enumerate()
     {
         expected.extend(batch.iter().cloned());
-        let step = state.observe(fixture, cover);
+        let step = state.observe(cover);
         assert_eq!(step.raw_rows, batch.len());
         assert_eq!(step.distinct_rows, batch.len());
         assert_eq!(state.results, expected);

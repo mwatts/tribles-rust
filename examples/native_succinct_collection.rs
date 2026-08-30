@@ -5,9 +5,10 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
-use triblespace::core::collection::{reach, simplearchive_union, CollectionStoreExt};
+use triblespace::core::collection::succinctarchive_union::{
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
+};
+use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
 
@@ -20,17 +21,16 @@ fn main() {
     pile.refresh().expect("load pile");
 
     // A root collection is the handle of a self-contained descriptor. Its
-    // mandatory authority participates in that content identity.
+    // independent READ and WRITE policies participate in that content identity.
     let name = "literature";
     let signing_key = SigningKey::generate(&mut OsRng);
     let authority = signing_key.verifying_key();
-    let source_reach = reach::private();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    );
     let collection = pile
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            name,
-            authority,
-            source_reach.clone(),
-        ))
+        .collection(name, policy.clone())
         .expect("register source collection");
 
     // Each fragment is one independent signed collection member. Omitting an
@@ -54,8 +54,13 @@ fn main() {
 
     // Build any missing canonical raw Succinct shards and their exact Rank9
     // fibers, then query the admitted physical cover directly.
-    let succinct =
-        SuccinctArchiveCollection::new(name, authority, source_reach, authority, reach::private());
+    let raw = pile
+        .derive(collection, SimpleToSuccinctMapping, policy.clone())
+        .expect("register raw Succinct projection");
+    let accelerated = pile
+        .derive(raw, RawToRank9AcceleratedMapping, policy)
+        .expect("register Rank9-accelerated projection");
+    let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
     let archive = succinct
         .ensure_exact(&mut pile, &cover)
         .expect("ensure exact Succinct projection");

@@ -50,14 +50,13 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
-use triblespace_core::collection::reach;
 use triblespace_core::collection::succinctarchive_union::{
-    SimpleToSuccinctMapping, SuccinctArchiveCollection, SuccinctArchiveView,
-    SuccinctArchiveViewWork,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
+    SuccinctArchiveView, SuccinctArchiveViewWork,
 };
 use triblespace_core::collection::{
-    simplearchive_union, Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
-    CollectionRead, CollectionRecord, CollectionStoreExt, Cover,
+    AdmissionPolicy, Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
+    CollectionPolicy, CollectionRead, CollectionRecord, CollectionStoreExt, Cover,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
@@ -86,7 +85,14 @@ struct CountingSuccinctMapping {
     inner: SimpleToSuccinctMapping,
 }
 
-impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for CountingSuccinctMapping {
+impl CollectionMapping for CountingSuccinctMapping {
+    type Source = SimpleArchive;
+    type Target = SuccinctArchiveBlob;
+
+    fn fragment(&self) -> Fragment {
+        self.inner.fragment()
+    }
+
     fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         Ok(Self {
             inner: SimpleToSuccinctMapping::bind(source, target)?,
@@ -323,7 +329,7 @@ struct RunContext<'a> {
     newly_supported_rows: u64,
     expected: RelationIdentity,
     succinct: &'a SuccinctArchiveCollection,
-    exact: &'a ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob, CountingSuccinctMapping>,
+    exact: &'a ExactDerivedCollection<CountingSuccinctMapping>,
     collections: &'a Collections,
 }
 
@@ -343,7 +349,7 @@ fn time_operation(
 fn diagnose_raw(
     store: &mut MemoryRepo,
     cover: &Cover<SimpleArchive>,
-    exact: &ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob, CountingSuccinctMapping>,
+    exact: &ExactDerivedCollection<CountingSuccinctMapping>,
 ) -> (MappingCalls, CoverIdentity) {
     // This is outside the timer and must be a zero-write operation: it measures
     // the scratch proof graph needed to revalidate the exact raw cover now held
@@ -619,16 +625,30 @@ fn benchmark_authority() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[0x71; 32]).verifying_key()
 }
 
-fn new_source_store(source: Collection<SimpleArchive>) -> MemoryRepo {
-    let mut store = MemoryRepo::default();
-    let registered = store
-        .collection(simplearchive_union::descriptor(
-            benchmark_name(),
-            benchmark_authority(),
-            reach::private(),
-        ))
+fn benchmark_policy() -> CollectionPolicy {
+    CollectionPolicy::new(
+        AdmissionPolicy::direct(benchmark_authority()),
+        AdmissionPolicy::direct(benchmark_authority()),
+    )
+}
+
+fn register_collections(store: &mut MemoryRepo) -> SuccinctArchiveCollection {
+    let policy = benchmark_policy();
+    let source = store
+        .collection(benchmark_name(), policy.clone())
         .expect("register benchmark source collection");
-    assert_eq!(registered, source);
+    let raw = store
+        .derive(source, SimpleToSuccinctMapping, policy.clone())
+        .expect("register raw Succinct projection");
+    let accelerated = store
+        .derive(raw, RawToRank9AcceleratedMapping, policy)
+        .expect("register accelerated Succinct projection");
+    SuccinctArchiveCollection::new(source, raw, accelerated)
+}
+
+fn new_source_store(expected: &SuccinctArchiveCollection) -> MemoryRepo {
+    let mut store = MemoryRepo::default();
+    assert_eq!(&register_collections(&mut store), expected);
     store
 }
 
@@ -662,25 +682,24 @@ fn run_iteration(
     succinct: &SuccinctArchiveCollection,
 ) -> Vec<Sample> {
     let mut exact_view = succinct.exact_view();
-    let exact =
-        ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob, CountingSuccinctMapping>::new(
-            succinct.source_descriptor(),
-            succinct.raw_descriptor(),
-        )
-        .expect("bind measured raw Succinct projection");
+    let exact = ExactDerivedCollection::<CountingSuccinctMapping>::new(
+        succinct.source_collection(),
+        succinct.raw_collection(),
+    )
+    .expect("bind measured raw Succinct projection");
     let source = exact.source_collection();
     let collections = Collections {
         source: source.handle(),
-        raw: succinct.raw_collection(),
-        accelerated: succinct.collection(),
+        raw: succinct.raw_collection().handle(),
+        accelerated: succinct.collection().handle(),
     };
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
-    let mut source_accounting = new_source_store(source);
-    let mut cold_ensure_source = new_source_store(source);
-    let mut cold_compact_source = new_source_store(source);
-    let mut warm_ensure = new_source_store(source);
-    let mut exact_view_source = new_source_store(source);
-    let mut warm_compact = new_source_store(source);
+    let mut source_accounting = new_source_store(succinct);
+    let mut cold_ensure_source = new_source_store(succinct);
+    let mut cold_compact_source = new_source_store(succinct);
+    let mut warm_ensure = new_source_store(succinct);
+    let mut exact_view_source = new_source_store(succinct);
+    let mut warm_compact = new_source_store(succinct);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;
@@ -904,13 +923,8 @@ fn main() {
     let chunks: Vec<_> = (0..commits)
         .map(|commit| make_chunk(commit, rows_per_commit))
         .collect();
-    let succinct = SuccinctArchiveCollection::new(
-        benchmark_name(),
-        benchmark_authority(),
-        reach::private(),
-        benchmark_authority(),
-        reach::private(),
-    );
+    let mut descriptor_store = MemoryRepo::default();
+    let succinct = register_collections(&mut descriptor_store);
     println!(
         "config   : commits={commits} rows/commit={rows_per_commit} warmup={warmup} iters={iterations} checkpoints={checkpoints:?}"
     );

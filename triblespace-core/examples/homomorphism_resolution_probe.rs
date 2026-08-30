@@ -2,21 +2,21 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::blob::IntoBlob;
-use triblespace_core::collection::descriptor;
+use triblespace_core::blob::Blob;
 use triblespace_core::collection::{
-    discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
-    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
-    CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore,
-    CollectionValidationRequest, KIND_COLLECTION_MAPPING,
+    discover_collection_records, empty_metadata_handle, mapping_algorithm,
+    resolve_collection_semantics, AdmissionPolicy, CollectionClaimValidation, CollectionCommit,
+    CollectionData, CollectionDerive, CollectionHandle, CollectionMapping, CollectionMerge,
+    CollectionOperationError, CollectionPolicy, CollectionRecord, CollectionStore,
+    CollectionStoreExt, CollectionValidationRequest, KIND_COLLECTION_MAPPING,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::prelude::blobencodings::SimpleArchive;
-use triblespace_core::repo::{memoryrepo::MemoryRepo, BlobStorePut, SnapshotSource};
+use triblespace_core::repo::{memoryrepo::MemoryRepo, BlobStoreGet, BlobStoreMeta, SnapshotSource};
+use triblespace_core::trible::Fragment;
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
@@ -30,6 +30,36 @@ enum Mapping {
     Endpoints,
     Leaves,
     All,
+}
+
+#[derive(Clone, Copy)]
+struct ProbeMapping;
+
+impl CollectionMapping for ProbeMapping {
+    type Source = SimpleArchive;
+    type Target = SimpleArchive;
+
+    fn fragment(&self) -> Fragment {
+        triblespace_core::prelude::entity! {
+            triblespace_core::metadata::tag: KIND_COLLECTION_MAPPING,
+            mapping_algorithm: id(6),
+        }
+    }
+
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionOperationError> {
+        Ok(Self)
+    }
+
+    fn map<R>(
+        &self,
+        source: &Blob<SimpleArchive>,
+        _reader: &R,
+    ) -> Result<Blob<SimpleArchive>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        Ok(source.clone())
+    }
 }
 
 fn id(byte: u8) -> Id {
@@ -68,24 +98,16 @@ fn build(
     }
 
     let signing_key = SigningKey::from_bytes(&[7; 32]);
-    let team = signing_key.verifying_key();
-    let source = descriptor::naming("source", team, id(2), reach::private()).into_facts();
-    let source_collection: CollectionHandle =
-        IntoBlob::<SimpleArchive>::to_blob(source.clone()).get_handle();
-    let mapping_fragment = triblespace_core::prelude::entity! {
-        triblespace_core::metadata::tag: KIND_COLLECTION_MAPPING,
-        triblespace_core::collection::mapping_algorithm: id(6),
-    };
-    let target = descriptor::deriving(
-        source_collection,
-        team,
-        id(5),
-        mapping_fragment,
-        reach::private(),
-    )
-    .into_facts();
-    let target_collection: CollectionHandle =
-        IntoBlob::<SimpleArchive>::to_blob(target.clone()).get_handle();
+    let authority = signing_key.verifying_key();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    );
+    let mut store = MemoryRepo::default();
+    let source = store.collection("source", policy.clone()).unwrap();
+    let target = store.derive(source, ProbeMapping, policy).unwrap();
+    let source_collection = source.handle();
+    let target_collection = target.handle();
     let leaf_data: Vec<_> = (0..leaves)
         .map(|i| data(b"source-leaf-v1", i as u64, &[]))
         .collect();
@@ -161,19 +183,6 @@ fn build(
         .map(|input| CollectionDerive::new(target_collection, *input, mapped(*input)))
         .collect();
 
-    let mut store = MemoryRepo::default();
-    assert_eq!(
-        store
-            .put::<SimpleArchive, _>(IntoBlob::<SimpleArchive>::to_blob(source))
-            .unwrap(),
-        source_collection
-    );
-    assert_eq!(
-        store
-            .put::<SimpleArchive, _>(IntoBlob::<SimpleArchive>::to_blob(target))
-            .unwrap(),
-        target_collection
-    );
     for record in &commits {
         CollectionStore::insert(&mut store, CollectionRecord::Commit(*record)).unwrap();
     }
