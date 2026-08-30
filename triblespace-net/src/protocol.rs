@@ -72,7 +72,7 @@ pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_AUTH: u8 = 0x05;
 /// Probe or renew one provider-cover prefix root.
 pub const OP_PROVIDER_PROBE: u8 = 0x06;
-/// Query live provider leases for one already-known, team-scoped artifact key.
+/// Query live provider leases for one already-known opaque global artifact key.
 pub const OP_PROVIDER_GET: u8 = 0x07;
 /// Query up to K directly verified routes nearest one arbitrary XOR key.
 pub const OP_FIND_NODE: u8 = 0x0C;
@@ -752,9 +752,8 @@ mod bounds_tests {
 
     #[tokio::test]
     async fn provider_get_wire_carries_the_derived_key_not_the_bearer_handle() {
-        let team = SigningKey::from_bytes(&[0xE1; 32]).verifying_key();
         let artifact = [0xE2; 32];
-        let key = crate::provider::provider_key(team, artifact);
+        let key = crate::provider::provider_key(artifact);
         assert_ne!(key, artifact);
         let request = Arc::new(Mutex::new(None));
         let conn = CapturingProviderGetConn {

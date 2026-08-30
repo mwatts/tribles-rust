@@ -1,7 +1,7 @@
 //! Receiver-local provider covers for already-known immutable artifacts.
 //!
 //! One provider publishes at most one immutable shard for each first byte of
-//! its team-scoped rendezvous keys. Shards are soft state: a matching Merkle
+//! its global opaque rendezvous keys. Shards are soft state: a matching Merkle
 //! root renews one receiver-local lease, a changed root atomically replaces the
 //! old shard, and an omitted prefix disappears when its old lease expires.
 
@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use ed25519_dalek::VerifyingKey;
 use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 
 use crate::clock::Mono;
@@ -19,7 +18,7 @@ use crate::transport::PeerId;
 /// Bare physical identity of one data artifact.
 pub type ArtifactId = [u8; 32];
 
-/// Opaque team-scoped rendezvous key for exact provider membership.
+/// Opaque global rendezvous key for exact provider membership.
 pub(crate) type ProviderKey = [u8; 32];
 /// DHT target shared by every artifact in one provider-cover prefix.
 pub(crate) type ProviderPrefixKey = [u8; 32];
@@ -30,7 +29,7 @@ pub(crate) const PROVIDER_LEASE_LIFETIME: Duration = Duration::from_secs(24 * 60
 pub(crate) const MAX_PROVIDERS_PER_KEY: usize = 64;
 const _: () = assert!(MAX_PROVIDERS_PER_KEY <= u8::MAX as usize);
 
-/// A single shard body is bounded near 2 MiB. Uniform team-scoped provider
+/// A single shard body is bounded near 2 MiB. Uniform opaque provider
 /// keys spread across 256 prefixes, so the mean shard reaches this limit only
 /// around 16.7 million active offers; pathological skew is omitted explicitly.
 pub(crate) const MAX_PROVIDER_SHARD_MEMBERS: usize = 1 << 16;
@@ -50,18 +49,16 @@ const MAX_EXPIRED_PROVIDER_SHARDS_PER_CALL: usize = 64;
 
 type ProviderPatch = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 
-/// Derive an exact lookup key without exposing cross-team content overlap.
-pub(crate) fn provider_key(team: VerifyingKey, artifact: ArtifactId) -> ProviderKey {
-    let mut hasher = blake3::Hasher::new_derive_key("triblespace.net/provider-key/v1");
-    hasher.update(team.as_bytes());
+/// Derive an exact global lookup key without disclosing the bearer handle.
+pub(crate) fn provider_key(artifact: ArtifactId) -> ProviderKey {
+    let mut hasher = blake3::Hasher::new_derive_key("triblespace.net/provider-key/v2");
     hasher.update(&artifact);
     *hasher.finalize().as_bytes()
 }
 
 /// Derive the DHT target for one fixed first-byte shard.
-pub(crate) fn provider_prefix_key(team: VerifyingKey, prefix: u8) -> ProviderPrefixKey {
-    let mut hasher = blake3::Hasher::new_derive_key("triblespace.net/provider-prefix/v1");
-    hasher.update(team.as_bytes());
+pub(crate) fn provider_prefix_key(prefix: u8) -> ProviderPrefixKey {
+    let mut hasher = blake3::Hasher::new_derive_key("triblespace.net/provider-prefix/v2");
     hasher.update(&[prefix]);
     *hasher.finalize().as_bytes()
 }
@@ -118,22 +115,17 @@ pub(crate) struct ProviderCoverBuild {
 
 impl ProviderCover {
     pub(crate) fn from_artifacts(
-        team: VerifyingKey,
         artifacts: impl IntoIterator<Item = ArtifactId>,
     ) -> ProviderCoverBuild {
-        Self::from_artifacts_with_shard_limit(team, artifacts, MAX_PROVIDER_SHARD_MEMBERS)
+        Self::from_artifacts_with_shard_limit(artifacts, MAX_PROVIDER_SHARD_MEMBERS)
     }
 
     pub(crate) fn from_artifacts_with_shard_limit(
-        team: VerifyingKey,
         artifacts: impl IntoIterator<Item = ArtifactId>,
         shard_limit: usize,
     ) -> ProviderCoverBuild {
         debug_assert!(shard_limit > 0);
-        let mut keys: Vec<_> = artifacts
-            .into_iter()
-            .map(|artifact| provider_key(team, artifact))
-            .collect();
+        let mut keys: Vec<_> = artifacts.into_iter().map(provider_key).collect();
         keys.sort_unstable();
         keys.dedup();
 
@@ -497,7 +489,6 @@ impl ProviderDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
 
     fn candidate(prefix: u8, suffixes: impl IntoIterator<Item = u32>) -> ProviderShardCandidate {
         let keys: Vec<_> = suffixes
@@ -535,43 +526,20 @@ mod tests {
     }
 
     #[test]
-    fn keys_and_prefix_routes_are_deterministic_and_team_scoped() {
-        let team_a = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let team_b = SigningKey::from_bytes(&[2; 32]).verifying_key();
+    fn keys_and_prefix_routes_are_deterministic_and_global() {
         let artifact = [3; 32];
-        assert_eq!(
-            provider_key(team_a, artifact),
-            provider_key(team_a, artifact)
-        );
-        assert_ne!(
-            provider_key(team_a, artifact),
-            provider_key(team_b, artifact)
-        );
-        assert_ne!(
-            provider_key(team_a, artifact),
-            provider_key(team_a, [4; 32])
-        );
-        assert_eq!(
-            provider_prefix_key(team_a, 7),
-            provider_prefix_key(team_a, 7)
-        );
-        assert_ne!(
-            provider_prefix_key(team_a, 7),
-            provider_prefix_key(team_b, 7)
-        );
-        assert_ne!(
-            provider_prefix_key(team_a, 7),
-            provider_prefix_key(team_a, 8)
-        );
+        assert_eq!(provider_key(artifact), provider_key(artifact));
+        assert_ne!(provider_key(artifact), provider_key([4; 32]));
+        assert_eq!(provider_prefix_key(7), provider_prefix_key(7));
+        assert_ne!(provider_prefix_key(7), provider_prefix_key(8));
     }
 
     #[test]
     fn directory_membership_is_addressed_by_provider_key_not_raw_artifact() {
-        let team = SigningKey::from_bytes(&[5; 32]).verifying_key();
         let artifact = [6; 32];
-        let key = provider_key(team, artifact);
+        let key = provider_key(artifact);
         assert_ne!(key, artifact);
-        let build = ProviderCover::from_artifacts(team, [artifact]);
+        let build = ProviderCover::from_artifacts([artifact]);
         let shard = build.cover.iter().next().unwrap().1;
         let candidate = ProviderShardCandidate::validate(
             shard.prefix(),
@@ -591,15 +559,11 @@ mod tests {
 
     #[test]
     fn a_large_offer_set_collapses_to_at_most_256_publication_units() {
-        let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let build = ProviderCover::from_artifacts(
-            team,
-            (0..243_955_u64).map(|index| {
-                let mut artifact = [0; 32];
-                artifact[24..].copy_from_slice(&index.to_be_bytes());
-                artifact
-            }),
-        );
+        let build = ProviderCover::from_artifacts((0..243_955_u64).map(|index| {
+            let mut artifact = [0; 32];
+            artifact[24..].copy_from_slice(&index.to_be_bytes());
+            artifact
+        }));
         assert!(build.omitted.is_empty());
         let cover = build.cover;
         assert!(cover.shard_count() <= 256);
@@ -614,15 +578,11 @@ mod tests {
 
     #[test]
     fn full_patch_prefix_digests_equal_standalone_shard_roots() {
-        let team = SigningKey::from_bytes(&[5; 32]).verifying_key();
-        let build = ProviderCover::from_artifacts(
-            team,
-            (0..1000_u64).map(|index| {
-                let mut artifact = [0; 32];
-                artifact[24..].copy_from_slice(&index.to_be_bytes());
-                artifact
-            }),
-        );
+        let build = ProviderCover::from_artifacts((0..1000_u64).map(|index| {
+            let mut artifact = [0; 32];
+            artifact[24..].copy_from_slice(&index.to_be_bytes());
+            artifact
+        }));
         assert!(build.omitted.is_empty());
         let cover = build.cover;
         for (_, shard) in cover.iter() {

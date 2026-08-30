@@ -9,7 +9,7 @@
 //! inventory mirroring. [`collection_sync`] lets the core collection
 //! resolver select an exact physical cover from speculative remote artifacts,
 //! so callers can fetch only useful materializations without creating WANTs.
-//! A bounded, team-scoped provider directory can locate peers for an
+//! A bounded, global opaque provider directory can locate peers for an
 //! already-known immutable artifact handle. Providers publish at most 256
 //! canonical prefix-cover leases rather than one lease per artifact; exact
 //! membership checks remain bounded soft routing state, not an enumeration or

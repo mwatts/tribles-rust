@@ -31,9 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Keep bearer blob handles out of provider-directory queries. `PROVIDER_GET`
-  now carries the already-derived team-scoped provider key; only the final
-  provider-facing `GET_BLOB` receives the raw handle. Move the incompatible
-  pile-sync wire protocol to ALPN `/triblespace/pile-sync/15`.
+  now carries an opaque global provider key derived only from the handle; its
+  DHT prefix target is global as well. Only the final provider-facing
+  `GET_BLOB` receives the raw handle. Move the incompatible pile-sync wire
+  protocol to ALPN `/triblespace/pile-sync/15`.
 
 - Report checked-refresh scope conflicts to nonempty exact-derived attachment
   before ticket discovery or mutation, while preserving the same serving-view

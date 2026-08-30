@@ -448,7 +448,7 @@ impl ReconcileDirection {
 /// Local blob synchronization policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlobReconcileMode {
-    /// Skip blob inventory. Durable blob WANTs use team-scoped DHT provider
+    /// Skip blob inventory. Durable blob WANTs use opaque global DHT provider
     /// lookup followed by authenticated `GET_BLOB`, independently of the walk.
     #[default]
     Demand,

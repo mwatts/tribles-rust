@@ -227,12 +227,12 @@ not rebuild semantic inventory. The host intersects the complete OFFER
 snapshot with the Blob keys in its current immutable serving snapshot. Only
 that intersection is published, and only under a serving direction.
 
-Newly active offers are announced immediately. The host derives a team-scoped
-provider key `r = provider_key(team, c)` for every active artifact, builds one
+Newly active offers are announced immediately. The host derives a global opaque
+provider key `r = provider_key(c)` for every active artifact, builds one
 canonical BLAKE3-Merkle PATCH, and groups its keys by the fixed first byte of
 `r`. Publication therefore has at most 256 prefix shards regardless of the
-number of offered artifacts. Each shard is routed under a separate
-team-and-prefix DHT key to the `K` closest responsive nodes. A node with no
+number of offered artifacts. Each shard is routed under a separate global
+prefix DHT key to the `K` closest responsive nodes. A node with no
 remote routing evidence treats its local shard leases as a sane success.
 Once any configured, synchronized, or learned remote route exists, at least
 one remote directory must accept the announcement: local self-insertion alone
@@ -274,9 +274,10 @@ directory until its leases expire. Principal fairness is intentionally outside
 this soft discovery primitive.
 
 A reader that already knows `c` derives `r`, performs iterative `FIND_NODE`, and
-asks those replicas for the corresponding team-and-prefix directory by sending
-only `r` in `PROVIDER_GET`. The raw artifact handle is reserved for the final
-provider-facing `GET_BLOB`. Each replica returns only providers whose live
+asks those replicas for the corresponding global prefix directory by sending
+only `r` in `PROVIDER_GET`. The rendezvous key and prefix target do not depend
+on the transport's current team session. The raw artifact handle is reserved
+for the final provider-facing `GET_BLOB`. Each replica returns only providers whose live
 sorted prefix shard contains that exact key. Both the
 candidate scan and result fan-out are bounded and rotate across calls without
 capping stored memberships. Because this is a soft directory, one lookup may
