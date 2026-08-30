@@ -23,6 +23,7 @@
 
 mod channel;
 pub mod collection_delta;
+pub(crate) mod collection_wire;
 
 /// Base backoff for failed WANT fulfillment in [`reconcile::Reconciler`];
 /// doubles per attempt up to
