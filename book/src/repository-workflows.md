@@ -13,7 +13,8 @@ merge or derivation equations provide reusable physical work.
 - **`CollectionStore`** — a grow-only set of native `COMMIT`, `MERGE`, and
   `DERIVE` records.
 - **Collection descriptor** — a canonical `SimpleArchive` which describes a
-  collection's anchor, member encoding, and reach law. A derived descriptor
+  collection's anchor, member encoding, and independent READ and WRITE
+  admission policies. A derived descriptor
   additionally links one concrete mapping entity carrying its algorithm and
   concrete parameters. The descriptor's content handle is the
   `CollectionHandle`.
@@ -48,7 +49,7 @@ use triblespace::core::capability::{
 };
 use triblespace::core::{
     blob::encodings::simplearchive::SimpleArchive,
-    collection::{reach, simplearchive_union, ACTION_WRITE},
+    collection::{AdmissionPolicy, CollectionPolicy, ACTION_WRITE},
     repo::CapabilityProofStore,
 };
 use triblespace::prelude::*;
@@ -58,14 +59,16 @@ let writer = SigningKey::generate(&mut OsRng);
 let team = team_key.verifying_key();
 let writer_subject = writer.verifying_key();
 let mut storage = MemoryRepo::default();
-let models = storage.collection::<SimpleArchive>(simplearchive_union::descriptor(
+let models = storage.collection(
     "models",
-    team,
-    reach::private(),
-))?;
+    CollectionPolicy::new(
+        AdmissionPolicy::direct(team),
+        AdmissionPolicy::direct(team),
+    ),
+)?;
 let atom = CapabilityAtom::new(
     CapabilityAction::new(ACTION_WRITE),
-    CapabilityResource::from(models),
+    CapabilityResource::from(models.handle()),
 );
 let bundle = CapabilityProofBundle::issue_root(
     &team_key,
@@ -91,20 +94,18 @@ storage.flush()?;
 
 Local publication deliberately performs no authorization check: the local
 store is a grow-only claim ledger, not an access-control boundary. Observation
-loads the mandatory authority from the descriptor. Commits self-signed by that
-authority are admitted directly; every delegated author needs a resident proof
-for exact `ACTION_WRITE` on this descriptor. Each operation observes the clock
-once and verifies every matching proof. Invalid, expired, irrelevant, or
-incomplete candidate evidence grants nothing; inability to enumerate the proof
-store remains an error.
+loads the independent policies from the descriptor. A policy root is admitted
+directly; every other author needs enough resident proof paths for exact
+`ACTION_WRITE` on this descriptor. Each operation observes the clock once and
+verifies every matching proof. Invalid, expired, irrelevant, or incomplete
+candidate evidence grants nothing; inability to enumerate the proof store
+remains an error.
 
-The reach argument is explicit because it participates in collection identity.
-`reach::private()` declares no permissionless relay; `reach::public()` states
-that any holder may relay verified commits. A derived collection states its
-own reach independently of its source. Reach is distinct from explicit
-team-store synchronization: SYNC_TEAM authority admits the complete inventory
-of a store already dedicated to that team, including records for private
-descriptors.
+READ and WRITE are explicit because both participate in collection identity.
+Either may be `Open` or a canonical quorum over capability roots, with
+independent invoke and delegation thresholds. Derived collections state their
+own policies rather than inheriting ambient authority from a source or a
+network-wide team scope.
 
 ### What publication writes
 
@@ -155,7 +156,7 @@ cannot suppress an explicit cover member.
 Local publication remains unconditional. A publisher which needs to predict
 whether an authority-aware observation will admit a signer can freeze a store
 snapshot and call `collection.writer_is_admitted(&snapshot, signer)`: it checks
-the descriptor authority and resident exact WRITE evidence without scanning
+the descriptor WRITE policy and resident exact WRITE evidence without scanning
 collection commits or publishing anything.
 
 ## Known-prefix snapshots and covers
@@ -171,8 +172,8 @@ let physical = admitted.resolve(&snapshot)?;
 let value = V::try_from_cover(&physical, &snapshot)?;
 ```
 
-`admitted` is the semantic COMMIT frontier: it discovers proofs rooted at the
-descriptor authority, verifies the exact collection write request, and forms a
+`admitted` is the semantic COMMIT frontier: it verifies the descriptor's exact
+WRITE policy and forms a
 `Cover<E>` from distinct payload handles signed by the admitted subjects.
 `resolve` may select a resident support-equivalent decomposition using validated
 `MERGE` and `DERIVE` evidence. `TryFromCover<E>` then constructs the logical
@@ -183,7 +184,7 @@ three steps. For a `SimpleArchive`, `V = TribleSet`; for a
 shards.
 
 Consumers which need the exact strictly verified COMMIT roots selected during
-admission use `collection.admitted_with_claims(&snapshot)`; later claims over
+admission use `collection.admitted_with_commits(&snapshot)`; later claims over
 the same payload remain broader provenance rather than retroactive roots.
 
 This is a coherent **known-prefix** observation, not a global latest
@@ -204,8 +205,8 @@ let facts = TribleSet::try_from_cover(&physical, &snapshot)?;
 
 Exact replay does not need a publishing key, re-run admission, or retain any
 signed commit or metadata. The opaque cover itself names the exact descriptor
-and payload members to validate. Use `cover.claims(&snapshot)` when currently
-resident authorship and metadata provenance matters; zero claims is a valid
+and payload members to validate. Use `cover.commits(&snapshot)` when currently
+resident authorship and metadata provenance matters; zero commits is a valid
 answer and does not invalidate replay. Commits whose data handles are absent
 from the cover remain inert. Replaying an opaque payload frontier still uses a
 single store snapshot for resolution and member reads.
@@ -234,7 +235,7 @@ never a second history or a new authority root.
 ## Derive another representation
 
 Suppose `f` is a canonical join homomorphism, represented in the API by a
-`CollectionMapping<Source, Target>`:
+`CollectionMapping` whose associated types are `Source` and `Target`:
 
 ```text
 f(a ⊔ b) = f(a) ⊔ f(b)
@@ -282,7 +283,7 @@ mixed across representations. `Cover<SimpleArchive>` contains only
 `Handle<SimpleArchive>`; `Cover<SuccinctArchiveBlob>` contains only
 `Handle<SuccinctArchiveBlob>`; the second stage uses
 `Handle<Rank9AcceleratedSuccinctArchiveBlob>`. The target descriptor and its
-bound `CollectionMapping<Source, Target>` determine route freedom. Ordinary raw
+bound `CollectionMapping` determine route freedom. Ordinary raw
 Succinct derivation may choose any cheapest validated route whose support
 equals the source cover. The accelerated stage maps the exact raw cover selected
 upstream. Its cover-aware view reads each embedded raw handle through the
@@ -337,12 +338,12 @@ DAG, and converts each authored node into a native commit using its exact
 to the canonical empty archive. Contentless merge wrappers are validated but do
 not become members.
 
-With no further options the target descriptor's mandatory authority is the
-migration signing key. The resulting commits are therefore admitted directly
-by ordinary collection admission against a store snapshot.
+With no further options the target descriptor gives the migration signing key
+one-root direct READ and WRITE policies. The resulting commits are therefore
+admitted directly by ordinary collection admission against a store snapshot.
 
-To register the migrated collection under a different authority, name that
-trust root explicitly:
+The migration-only `--authority` option instead uses another trust root for
+both direct policies:
 
 ```text
 trible pile migrate data.pile branch-to-collection \
@@ -354,7 +355,7 @@ trible pile migrate data.pile branch-to-collection \
 
 Local publication remains unconditional, so this form still writes commits
 signed by the migration key. A later read admits them only when the store holds
-an exact root-to-signer `ACTION_WRITE` proof for the resulting
+enough exact root-to-signer `ACTION_WRITE` evidence for the resulting
 descriptor handle. The migration command does not invent, scan for, or store
 that delegation.
 
@@ -378,7 +379,7 @@ branch. New code publishes directly to collections.
   when its descriptor or data is absent or invalid. Signed commits and metadata
   are unnecessary for replay and remain lazy provenance queried separately.
 - Treat unsigned equations as optional, freshly validated cache evidence.
-- Keep reach, trust, retention, and WANT policy orthogonal.
+- Keep admission, retention, and WANT policy orthogonal.
 - Carry exact covers across derivation boundaries instead of asking for an
   ambient “latest”.
 - Flush at explicit application durability boundaries.

@@ -434,10 +434,12 @@ The descriptor archive holds a descriptor entity carrying:
   no name of its own: its source already anchors it. Naming the
   source by handle rather than by a shared label means a descriptor cannot claim
   a lineage it does not have;
-- exactly one `collection_authority`, the descriptor-local capability trust
-  root for this exact collection. Roots and derivations state it independently;
-  source walking never supplies authority. As an ordinary descriptor fact it
-  participates directly in the descriptor handle;
+- `collection_read_policy` and `collection_write_policy`, each linking one
+  self-contained policy entity. An open policy needs no proof. A quorum policy
+  carries a canonical nonempty set of Ed25519 roots, an invoke threshold, and
+  an optional delegation threshold. Roots and derivations state both policies
+  independently; source walking never supplies authority. Their ordinary
+  facts participate directly in the descriptor handle;
 - `collection_representation`, naming the canonical member encoding. The
   encoding owns validation and the intra-encoding join;
 - on a derivation, `collection_mapping`, linking a concrete mapping entity.
@@ -542,9 +544,10 @@ an invalidly signed proof roots nothing. Full semantic verification still
 needs the external trust root, expected leaf, instant, request, and exact
 ordered claim blobs.
 
-## Native Peer Evidence Records
+## Legacy Peer Evidence Records
 
-`PeerStore` is a grow-only set of routing hints. Each member is exactly
+Earlier network hosts used `PeerStore` as a grow-only set of routing hints.
+Each historical member is exactly
 `PEER(team_public_key, peer_public_key)`, where both fields are validated
 Ed25519 public keys. The canonical dense body is the 64-byte concatenation
 `team || peer`; its optional physical selector is a domain-separated BLAKE3
@@ -562,10 +565,12 @@ transport state, or another registry.
 
 There is no `UNPEER` record. Duplicate insertion is a no-op, concatenating
 piles unions their peer evidence, and replay enumerates the set in canonical
-body order through a PATCH index. Presence is deliberately weak: it grants no
-authority and proves no liveness, reachability, content residency, retention,
-or current membership. Conservative rewrites preserve the evidence record but
-do not turn either key into a blob root.
+body order through a PATCH index. Current collection-scoped networking does not
+create, synchronize, or route from these records: bootstrap peers are process
+configuration, while DHT referrals and liveness are process-local soft state.
+Conservative rewrites preserve the historical record bytes, but presence
+grants no authority and proves no liveness, reachability, content residency,
+retention, or current membership.
 
 ## Retired: Collection Publication Grants
 
@@ -576,16 +581,12 @@ beside the collection calculus. It is gone, and nothing in a pile refers to one:
 the same scan found ordinary commit records, so the absence was the grant's
 rather than the scan's.
 
-Reach now lives in the collection descriptor, as the optional
-`collection_reach` attribute naming a reach law. That makes publication part of
-a collection's *identity*: a collection that refuses permissionless relay and
-one that permits it hash differently, so a grant could no longer contradict a
-descriptor, and committing into a collection whose name permits relay is
-itself the consent. An absent declaration is a refusal, so every descriptor
-written before the attribute existed keeps that policy and — because the
-attribute is optional — keeps byte-for-byte the handle it already had. This
-law is orthogonal to an explicitly authorized full-team inventory: SYNC_TEAM
-access is granted for a dedicated store, not inferred from collection reach.
+An intermediate design replaced grants with a `collection_reach` descriptor
+attribute. That design is retired too. Current descriptors carry mandatory,
+independent READ and WRITE policies; collection-scoped repair proves READ(C),
+commit admission proves WRITE(C), and open READ is also the condition for
+permissionless provider publication. There is no ambient full-team inventory
+or separate durable gossip permission.
 
 The semantic kind ID `9BB5B1F4D6FD8FB850B494C2CF51B5CA` (minted 2026-08-12,
 retired 2026-08-21) and its record kind

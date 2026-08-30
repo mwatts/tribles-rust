@@ -45,43 +45,44 @@ attribute's exact historical bytes when its old identity cannot be re-derived.
 ## 3. Register a collection
 
 A root collection is identified by the content handle of its descriptor. The
-descriptor carries its UTF-8 name, mandatory authority, member encoding, and
-reach law. The encoding itself owns member validation and may expose one
-directly materializable canonical join; a root needs no mapping. The descriptor
-is an ordinary self-contained `Fragment`; its canonical content handle is the
-collection identity:
+descriptor carries its UTF-8 name, member encoding, and independent READ and
+WRITE admission policies. The encoding itself owns member validation and may
+expose one directly materializable canonical join; a root needs no mapping. The descriptor
+is an ordinary self-contained `Fragment`, but applications ask the store to
+construct and register it rather than assembling its facts manually. Its
+canonical content handle is the collection identity:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::{
-    blob::encodings::simplearchive::SimpleArchive,
-    collection::{reach, simplearchive_union, Collection},
-};
+use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 use triblespace::prelude::*;
 
 let key = SigningKey::generate(&mut OsRng);
 let mut storage = MemoryRepo::default();
-let descriptor = simplearchive_union::descriptor(
+let root = key.verifying_key();
+let library = storage.collection(
     "library",
-    key.verifying_key(),
-    reach::private(),
-);
-let library: Collection<SimpleArchive> = storage.collection(descriptor)?;
+    CollectionPolicy::new(
+        AdmissionPolicy::direct(root),
+        AdmissionPolicy::direct(root),
+    ),
+)?;
 ```
 
-`reach::private()` declares no permissionless relay. Use `reach::public()` only
-when the collection's identity should state that any holder may relay its
-verified commits. Reach does not partition an explicitly authorized team
-inventory: a store attached to `triblespace-net` is dedicated to one team, and
-SYNC_TEAM reconciliation includes every resident collection record.
+Each policy is either `Open` or a canonical threshold over capability roots.
+`AdmissionPolicy::direct(root)` admits that root and direct grants it signs,
+without letting a grantee redelegate. The two policies are deliberately
+independent: a collection can have many writers but few readers, or public
+READ with tightly held WRITE. Both policies participate in the descriptor
+handle, so there is no ambient team scope or separate reach flag.
 
 Local publication is unconditional: any process may append a structurally
-valid self-signed commit to its own store. Reading applies authority. Commits by
-the descriptor authority are admitted automatically; delegated authors become
-visible only when the same store snapshot contains a root-to-leaf proof for
-exact `ACTION_WRITE` on this descriptor. Invalid resident evidence grants
-nothing.
+valid self-signed commit to its own store. Reading applies the descriptor's
+WRITE policy. Commits by a policy root are admitted directly; other authors
+become visible only when the same store snapshot contains enough valid proof
+paths for exact `ACTION_WRITE` on this descriptor. Invalid resident evidence
+grants nothing.
 
 ## 4. Build a self-contained fragment
 
@@ -164,17 +165,17 @@ for (first, last, quote) in find!(
 ```
 
 `storage.snapshot()` freezes blobs, collection records, capability proofs, and
-peer evidence at one coherent known prefix. `library.admitted(&snapshot)` then
-admits the descriptor authority plus writers authorized by proofs in that same
-observation and returns the exact semantic payload cover. `resolve` may replace
+backend state at one coherent known prefix. `library.admitted(&snapshot)` then
+applies the descriptor's WRITE policy in that same observation and returns the
+exact semantic payload cover. `resolve` may replace
 that cover with any resident physical decomposition proven to have equal
 support, and `TryFromCover` constructs the logical value from exactly those
 members through the same immutable snapshot. `library.read(&snapshot)` is the
 convenience form of admission, resolution, and logical reconstruction.
 
 Consumers which need the exact strictly verified COMMIT roots selected by the
-admission decision can call `library.admitted_with_claims(&snapshot)`. Later
-provenance for an exact cover is available through `cover.claims(&snapshot)`.
+admission decision can call `library.admitted_with_commits(&snapshot)`. Later
+provenance for an exact cover is available through `cover.commits(&snapshot)`.
 Duplicate signed claims for one payload collapse to one cover member; authors,
 signatures, and metadata remain provenance rather than payload identity.
 

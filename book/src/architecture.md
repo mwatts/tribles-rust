@@ -41,14 +41,14 @@ because it is convenient, and why collecting an accelerator does not erase the
 committed facts from which it can be rebuilt.
 
 Who may make that signed assertion can be proven without making storage a
-policy oracle. A capability-guarded descriptor names an external trust root,
-while the facade discovers resident `K0 (S C K)+` proofs rooted there. The
-native proof binds each issuer,
+policy oracle. A descriptor carries independent READ and WRITE policies. Each
+is open or a canonical quorum over external trust roots, with separate invoke
+and delegation thresholds. Resident `K0 (S C K)+` paths bind each issuer,
 exact keyless claim handle, and delegate key; the ordered claim blobs carry the
 action/resource, mode, validity, and parent-claim restrictions. Ordinary
-collection operations verify the resulting meet directly at one clock
-instant against exact `ACTION_WRITE` on the descriptor. Merely finding an
-unverified or irrelevant proof in storage grants nothing.
+collection operations evaluate the proof forest directly at one clock instant
+against exact `ACTION_WRITE` on the descriptor. Merely finding an unverified
+or irrelevant proof in storage grants nothing.
 
 ## Architectural layers
 
@@ -65,7 +65,7 @@ unverified or irrelevant proof in storage grants nothing.
 ├──────────────────────────────────────────────────┤
 │ Storage                                          │
 │ CollectionStore · BlobStore · WantStore          │
-│ CapabilityProofStore · PeerStore                 │
+│ CapabilityProofStore                             │
 ├──────────────────────────────────────────────────┤
 │ Data and representations                         │
 │ TribleSet/PATCH · SimpleArchive · SuccinctArchive│
@@ -121,16 +121,15 @@ A collection descriptor is an ordinary `TribleSet`, encoded as a canonical
 normally states:
 
 - a human-readable UTF-8 name;
-- one mandatory descriptor-local authority;
 - the canonical member encoding; and
-- a reach law governing permissionless relay.
+- independent descriptor-local READ and WRITE admission policies.
 
 A derived descriptor replaces the name with its source collection and one
 concrete mapping entity. Canonical builders derive that entity's id, while
 readers preserve the substitution rule by validating its algorithm and
 parameters instead of its minting history. The entity names a mapping algorithm
-and carries its concrete parameters as ordinary tribles. The target encoding and
-mandatory authority remain local to the derived descriptor; authority never
+and carries its concrete parameters as ordinary tribles. The target encoding
+and both policies remain local to the derived descriptor; policy never
 inherits from the source. Descriptions of the encoding and mapping algorithm
 travel in the same archive, so a record naming the descriptor remains
 interpretable without a separate registry entry.
@@ -156,22 +155,22 @@ above it.
 
 ## Publishing and observing
 
-The collection value is its canonical descriptor handle. The descriptor
-carries one mandatory local authority, and the storage backend owns I/O and
-durability. `store.collection(descriptor_fragment)` registers and stores the
-descriptor's complete attachment closure. `store.commit(collection, signer,
-fragment)` then loads and structurally validates that descriptor and publishes attachments,
-canonical data, canonical metadata, and the signed native record in dependency
-order. Local publication performs no authorization check and no implicit
-flush: authorization governs which resident claims another operation admits,
-not what a process may append to its own store.
+The collection value is its canonical descriptor handle, and the storage
+backend owns I/O and durability. `store.collection(name, policy)` constructs
+and registers a canonical root descriptor. `store.derive(source, mapping,
+policy)` does the same for a derived descriptor. `store.commit(collection,
+signer, fragment)` publishes attachments, canonical data, canonical metadata,
+and the signed native record in dependency order. Local publication performs
+no authorization check and no implicit flush: authorization governs which
+resident claims another operation admits, not what a process may append to its
+own store.
 
 Reads are exact about what they observed, not magical about global time:
 
 - `store.snapshot()` freezes blob bytes, collection records, capability proofs,
-  and peer evidence from one coherent known prefix;
-- `collection.admitted(&snapshot)` applies the descriptor authority and
-  resident delegation proofs to obtain one semantic `Cover<E>` without
+  and backend state from one coherent known prefix;
+- `collection.admitted(&snapshot)` applies the descriptor WRITE policy and
+  resident capability evidence to obtain one semantic `Cover<E>` without
   fetching member data;
 - `cover.resolve(&snapshot)` selects a resident support-equivalent physical
   decomposition; and
@@ -187,7 +186,7 @@ payload does not change the cover or repeat data work.
 Each store snapshot observes one known prefix of an append-only store. A
 concurrent commit may appear now or on the next call, but one observation never
 combines records from one prefix with payloads from another. The
-descriptor authority and every delegate authorized by a valid resident proof
+WRITE-policy roots and every signer with sufficient valid resident support
 participate; unauthorized commits remain inert.
 
 ## Derived physical representations
@@ -237,32 +236,32 @@ authors, retain all referenced data, or force another node to perform work.
 They are durable coordination-free questions which a reconciler may satisfy by
 fetching content or unioning a matching native equation into the local store.
 
-Keeping WANT orthogonal prevents metadata convergence from becoming
-involuntary blob mirroring. A peer can learn its authorized team's collection
-record frontier, then decide which blobs and derived representations are
+Keeping WANT orthogonal prevents evidence convergence from becoming
+involuntary blob mirroring. A peer can repair a READ-authorized collection's
+activation overlay, then decide which blobs and derived representations are
 useful locally.
 
-## Peer evidence is topology, not authority
+## Routing is soft state, not semantic evidence
 
-`PeerStore` holds positive `PEER(team_public_key, peer_public_key)` routing
-facts as another grow-only set. A fact is only a candidate edge for discovery:
-it does not authorize the peer, prove that it is live or reachable, promise
-that it stores any content, or retain a blob. There is no retraction record.
-That weak monotone meaning lets independently learned topology converge by
-union without coupling transport policy to capability verification.
+Bootstrap peers are process configuration. Gossip origins, DHT referrals,
+connection liveness, provider leases, and backoff are bounded process-local
+state. Restarting may forget them without changing a collection, and none of
+them authorize a peer, promise content residency, or retain a blob. Historical
+PEER records remain physically decodable for old piles but do not participate
+in current synchronization.
 
 ## Storage and synchronization compose by union
 
-`Pile` stores blobs, native collection records, capability proofs, peer
-evidence, and WANT records in one
+`Pile` stores blobs, native collection records, capability proofs, and WANT
+records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
-content-derived object keys. The network layer uses authenticated Merkle walks
-to union one team's PEER evidence, collection records, proofs, and optionally
-blobs. Bounded fair pairwise PATCH reconciliation is the epidemic exchange,
-while an authenticated DHT locates explicitly published providers of an exact
-artifact handle. Merge/derive questions are answered from the converged local
-record index. In every case convergence means unioning evidence; it does not
-mean electing a winner.
+content-derived object keys. The network layer uses an opaque collection-topic
+wake and READ(C)-authorized Merkle walks to union that collection's records and
+activation-relevant WRITE proof bundles. Blob handles remain lazy bearer
+capabilities; an opaque XOR DHT locates providers for openly disclosed exact
+artifacts. Merge/derive questions are answered from the converged local record
+index. In every case convergence means unioning evidence; it does not mean
+electing a winner.
 
 Legacy branch and pin records remain decodable only so old piles can be
 inspected, conservatively retained, and explicitly migrated. They are not part

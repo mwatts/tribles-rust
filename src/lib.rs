@@ -111,15 +111,15 @@ mod readme_example {
 
     #[test]
     fn readme_example() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::core::collection::{reach, simplearchive_union};
+        use crate::core::collection::{AdmissionPolicy, CollectionPolicy};
 
         let mut storage = MemoryRepo::default();
         let key = SigningKey::generate(&mut OsRng);
-        let library = storage.collection(simplearchive_union::descriptor(
+        let root = key.verifying_key();
+        let library = storage.collection(
             "library",
-            key.verifying_key(),
-            reach::private(),
-        ))?;
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root)),
+        )?;
 
         let mut initial = entity! {
             literature::firstname: "Frank",

@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::blob::encodings::simplearchive::SimpleArchive;
-use crate::core::collection::{reach, simplearchive_union, Collection, CollectionStoreExt};
+use crate::core::collection::{AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt};
 use crate::core::metadata;
 use crate::core::repo::pile::{Pile, ReadError};
 use crate::prelude::blobencodings::UTF8String;
@@ -59,10 +59,10 @@ use ed25519_dalek::SigningKey;
 use rand_core06::OsRng;
 use thread_local::ThreadLocal;
 use tracing::Subscriber;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::EnvFilter;
 
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
 const ENV_TELEMETRY_COLLECTION_NAME: &str = "TELEMETRY_COLLECTION_NAME";
@@ -605,15 +605,14 @@ impl Telemetry {
             return None;
         }
 
-        // The sink generates its own authority and signing key per session.
-        // Its descriptor carries that authority directly.
+        // The sink generates its own signing key per session. Both collection
+        // actions use that key as their one-root direct admission policy.
         let signing_key = SigningKey::generate(&mut OsRng);
-        let descriptor = simplearchive_union::descriptor(
+        let root = signing_key.verifying_key();
+        let collection = match pile.collection(
             collection_name,
-            signing_key.verifying_key(),
-            reach::private(),
-        );
-        let collection = match pile.collection(descriptor) {
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root)),
+        ) {
             Ok(collection) => collection,
             Err(error) => {
                 log::warn!("telemetry descriptor registration failed: {error:?}");
@@ -793,8 +792,8 @@ fn span_end(batch: &mut Fragment, span_id: Id, at_ns: u64, duration_ns: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::blob::encodings::simplearchive::SimpleArchive;
     use crate::core::blob::encodings::UnknownBlob;
+    use crate::core::blob::encodings::simplearchive::SimpleArchive;
     use crate::core::collection::CollectionRead;
     use crate::core::repo::SnapshotSource;
 
@@ -834,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_from_env_uses_an_open_process_local_collection() {
+    fn layer_from_env_uses_a_direct_process_local_collection() {
         let _env = TELEMETRY_ENV.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.pile");

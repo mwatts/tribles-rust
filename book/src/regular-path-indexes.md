@@ -204,7 +204,7 @@ resident canonical source data.
 
 Distinct signed claims that name identical data collapse to one cover member
 and one unit of derivation work. Their authorship, signatures, and metadata are
-queryable, possibly absent provenance through `cover.claims(&snapshot)` and are
+queryable, possibly absent provenance through `cover.commits(&snapshot)` and are
 intentionally unnecessary for replay or path semantics.
 
 `attach_exact` never writes. It admits existing canonical source `MERGE`,
@@ -250,9 +250,10 @@ would miss such paths. Merge order remains irrelevant because closure is
 derived only after the canonical semilattice join.
 
 The low-level `path_summary_union` module exposes the concrete law directly.
-`descriptor(source, automaton)` identifies one target lattice by the handle of
-the collection it summarises, the `PathSummaryBlob` representation, and the
-canonical automaton fingerprint.
+`store.derive(source, RegularPathMapping::new(automaton), policy)` identifies
+one target lattice by the handle of the collection it summarises, the
+`PathSummaryBlob` representation, the canonical automaton fingerprint, and its
+independent policy.
 `derive_element` lowers one canonical `SimpleArchive` into direct product arcs,
 `join` unions two summaries, and `validate_derive` / `validate_merge` bind all
 supplied blobs to the record's exact identities and recompute the claimed

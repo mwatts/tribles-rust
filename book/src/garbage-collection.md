@@ -32,8 +32,8 @@ descriptor, signed data, and metadata handles are recursive roots, so all of
 their resident attachments remain owned. This conservatism matters because a
 later positive grant may activate an already-resident commit. The descriptor is
 the canonical collection anchor, representation, optional source mapping, and
-reach description encoded as a `SimpleArchive`; its 32-byte content
-handle is the `CollectionHandle` carried by the commit. The native commit record
+independent READ/WRITE policy description encoded as a `SimpleArchive`; its
+32-byte content handle is the `CollectionHandle` carried by the commit. The native commit record
 is preserved by `CollectionStore` rather than represented as a blob root.
 Planning an explicitly selected authoritative view fails if any required
 descriptor, data, or metadata blob is absent.

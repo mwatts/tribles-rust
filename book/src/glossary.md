@@ -7,8 +7,7 @@ relate to one another in TribleSpace.
 ### Action
 An uninterpreted 128-bit identifier naming one exact operation. Actions do not
 form a hierarchy and never imply one another. For example, `ACTION_WRITE` and
-`ACTION_CONNECT` are separate atoms even when they concern collections
-associated with the same team.
+`ACTION_READ` are separate atoms even when they concern the same collection.
 
 ### Attribute
 A property that describes some aspect of an entity. Attributes occupy the
@@ -51,8 +50,8 @@ proof presence.
 
 ### Capability Proof Bundle
 A complete portable capability proof plus the exact claim blobs it names in
-root-to-leaf order. Invites, CONNECT, and SYNC_TEAM authorization carry this
-bounded self-contained form, so verification needs no pre-auth fetch or
+root-to-leaf order. Collection READ requests and portable WRITE evidence carry
+this bounded self-contained form, so verification needs no pre-auth fetch or
 ambient lookup.
 
 ### Capability Proof Store
@@ -92,21 +91,22 @@ produce them rather than accepting caller-forged hash sets.
 
 ### Collection Admission
 The read-time signer decision performed by
-`collection.admitted(&store_snapshot)`. The descriptor authority is admitted directly; each
-resident proof rooted at that authority is considered at one clock instant for
-the exact `ACTION_WRITE`/collection atom. Every valid proof admits its leaf;
-invalid, expired, irrelevant, or incomplete candidates grant nothing without
-poisoning other evidence.
+`collection.admitted(&store_snapshot)`. Each WRITE-policy root acts directly;
+resident proof paths rooted in the policy's canonical root set are considered
+at one clock instant for the exact `ACTION_WRITE`/collection atom. A writer is
+admitted only when it has the policy's required distinct root support. Invalid,
+expired, irrelevant, or incomplete candidates grant nothing without poisoning
+other evidence.
 
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's UTF-8 root name or exact
-derived source, mandatory descriptor-local authority, member encoding, and
-reach law. A derived descriptor also links one concrete mapping entity carrying
-its algorithm and parameters. Canonical builders normally use an intrinsic id,
-but an equivalent extrinsic-id substitution has the same meaning. Its content handle is
-the `CollectionHandle`, so every native record which names a collection can
-resolve its meaning through the ordinary blob store. A derived descriptor
-states its own authority and never inherits one through its source.
+derived source, member encoding, and independent READ and WRITE admission
+policies. Each policy is open or a canonical quorum over capability roots with
+separate invoke and delegation thresholds. A derived descriptor also links one
+concrete mapping entity carrying its algorithm and parameters. Its content
+handle is the `CollectionHandle`, so every native record which names a
+collection can resolve its meaning through the ordinary blob store. A derived
+descriptor states its own policies and never inherits them through its source.
 
 ### Collection Encoding
 A `BlobEncoding` with one canonical member validation rule, exposed by
@@ -124,9 +124,9 @@ SuccinctArchive, the root embeds its exact raw source handle, has no direct
 join, and is derived after the raw Succinct lattice is compacted.
 
 ### Collection Mapping
-A parameterized source-to-target conversion exposed by
-`CollectionMapping<Source, Target>`. Its mapping entity is embedded in the
-target descriptor and names both a stable algorithm and its concrete
+A parameterized source-to-target conversion exposed by `CollectionMapping`
+through its associated `Source` and `Target` encodings. Its mapping entity is
+embedded in the target descriptor and names both a stable algorithm and its concrete
 parameters. It maps ordinary source blobs to ordinary target blobs. The
 mathematical contract is a join homomorphism over their logical values:
 `f(a ⊔ b) = f(a) ⊔ f(b)`.
@@ -144,15 +144,14 @@ admission produces a semantic `Cover<E>` from it; `Cover::resolve` selects a
 resident physical cover; and `TryFromCover<E>` reconstructs either an eager
 value or a lazy sharded view through the same snapshot.
 
-### CONNECT
-The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a
-direct-RPC session. Its resource is the team's exact 32-byte trust-root public
-key, and its claimed subject must equal the transport peer key. CONNECT grants
-no WRITE, generic READ, inventory disclosure, collection reach, semantic
-trust, or retention authority. Protocol v12 exchanges complete subject-bound
-proof bundles on the connection's first `OP_AUTH` stream. A separate reciprocal
-SYNC_TEAM exchange for the same team and endpoints must authorize inventory and
-blob reads.
+### Collection READ
+The exact `ACTION_READ` capability over one collection descriptor handle.
+Network repair presents a bounded proof forest for the authenticated endpoint
+and the descriptor's READ policy. Knowing the collection handle permits joining
+its opaque wake topic, but does not reveal records, proofs, counts, or blobs;
+those cross only after READ(C) admission. `Open` READ needs no proof and also
+permits permissionless provider publication for that collection's disclosed
+closure.
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
@@ -215,8 +214,8 @@ segments relevant to their bindings, further described in
 
 ### Pile
 An append-only collection of blobs, native collection records, native
-capability proofs, positive peer-routing evidence, and WANT records stored in
-one file. Piles are memory
+capability proofs, WANT records, and possibly legacy peer-routing evidence
+stored in one file. Piles are memory
 mapped, recoverable after interrupted appends, and mergeable by byte
 concatenation. Legacy pin records remain decodable only for conservative
 retention and explicit migration.
@@ -230,22 +229,26 @@ native types; **blob encodings** describe arbitrarily long payloads so tribles
 referencing those blobs stay portable. The corresponding traits are
 `InlineEncoding` and `BlobEncoding`.
 
-### Team Root
-The external Ed25519 key expected as `K0` in a team's direct capability proofs.
-Its exact 32 public bytes are the resource for both CONNECT and SYNC_TEAM, the
-scope prefix for the four-component inventory, and the namespace for provider
-DHT keys. These shared bytes do not conflate authority: routing knowledge or
-holding one proof never implies the other proof or any data access. Keeping the
-secret offline after bootstrap is operational practice, not a one-use rule:
-anyone holding it can issue another independent root proof.
+### Policy Root
+One Ed25519 key named by an admission policy. Roots have inherent support for
+their policy's action and may issue capability paths according to its
+delegation threshold. A collection may name several roots and require a quorum;
+READ and WRITE have independent root sets and thresholds. A root is not a
+network namespace, routing scope, roster, or mutable owner.
 
-### SYNC_TEAM
-The exact `ACTION_SYNC_TEAM` atom used by `triblespace-net` to authorize one
-team inventory session after CONNECT. Invoke authority for the authenticated
-transport key permits disclosure of that team's PEER, collection-record,
-capability-proof, and blob inventory. It is connection-local, validity-bounded,
-and independent of routing evidence, DHT participation, and local
-Demand/Mirror or direction policy.
+### Collection WRITE
+The exact `ACTION_WRITE` capability over one collection descriptor handle.
+Signed COMMITs are active only when their author satisfies the descriptor's
+WRITE policy in the observed proof forest. Local stores may retain inactive
+claims; synchronization and concatenation remain monotone because later proof
+evidence can activate them without retracting bytes.
+
+### Collection Wake
+A fixed signed `iroh-gossip` message on the collection-handle topic. It names
+the endpoint origin and one opaque activation root, but contains no records,
+proofs, blob handles, counts, or component roots. A changed wake prompts a
+separate READ(C)-authorized exact PATCH repair; gossip is a latency hint, not
+the source of truth.
 
 ### Trible
 A three-part tuple of entity, attribute, and value stored in a fixed 64-byte

@@ -129,84 +129,71 @@ enough. The storage layer publishes claim blobs before the proof record so an
 observer never mistakes a partially written local bundle for complete local
 evidence.
 
-## CONNECT
+## Collection-local admission
 
-For direct TribleSpace RPC, the requested atom is:
+Collection descriptors carry two independent policies. Each policy is either
+open or a quorum over a canonical set of Ed25519 roots, with separate invoke
+and optional delegation thresholds:
 
 ```text
-action   = ACTION_CONNECT
-resource = configured trust-root public-key bytes
-mode     = Invoke
-leaf     = authenticated transport peer key
+READ(C)  = CapabilityAtom(ACTION_READ,  resource = C)
+WRITE(C) = CapabilityAtom(ACTION_WRITE, resource = C)
 ```
 
-Protocol v12 carries one length-prefixed `CapabilityProofBundle` in the first
-`OP_AUTH` stream and returns the server's own bounded bundle after the success
-status. Each side supplies its configured team root, one current TAI instant,
-and the other endpoint's TLS-authenticated key to verification. The client
-checks that the connection identity is the endpoint it intended to dial before
-sending its proof. Rejection closes the connection; a bounded accepted session
-is discarded after either effective inclusive upper validity bound.
+The resource is the exact 32-byte collection descriptor handle. There is no
+ambient team, owner field, wildcard namespace, or transport-wide inventory
+grant. A derived collection states its own policies; neither source ancestry
+nor possession of another collection's proof implies anything about it.
 
-This first exchange is mutual authentication, not credential secrecy. The
-initiator's proof necessarily reaches the dialed TLS endpoint before that
-endpoint proves its own CONNECT capability. Because the proof is bound to the
-initiator's exact key it is non-bearer evidence. The client sends it over TLS
-to the identity it intended to dial, but the proof itself is not
-cryptographically bound to that receiver key; the protocol is neither
-confidential nor zero knowledge at the capability-bundle layer. No later proof,
-element identity, query, or data request crosses until the reciprocal CONNECT
-proof verifies.
+A policy root contributes inherent support. Other principals contribute only
+through strictly verified proof paths beginning at canonical policy roots.
+Quorum evaluation unions the distinct roots which support the requested leaf
+at one instant; two paths from the same root do not count twice. Invoke and
+delegate support are evaluated separately, so permission to use an action need
+not permit issuing another grant.
 
-CONNECT admits only the transport connection. It grants no collection
-`ACTION_WRITE`, generic read policy, inventory disclosure, semantic trust,
-retention, or blob availability. A second exact atom,
-`ACTION_SYNC_TEAM(team_root)` in Invoke mode for the same transport key, must
-be exchanged once through `INVENTORY_AUTH` before manifests, nodes, provider
-operations, blob ranges, or even a known-hash `GET_BLOB` may be served. The
-client verifies the returned server proof against the same TLS endpoint before
-sending any useful request. These two proofs may have different delegation
-paths and validity bounds.
+WRITE(C) decides which signed COMMITs are active when a store snapshot is
+observed. Local insertion remains unconditional: a store may retain an inactive
+claim, and later proof evidence may activate it monotonically. READ(C) is the
+network disclosure boundary. A collection repair request carries the bounded
+proof forest needed to admit the TLS-authenticated iroh endpoint; the server
+does not search for or fetch a credential on the caller's behalf.
 
-There is no pre-auth fetch. The presenter sends each complete bundle inline.
-After both authorizations, collection records converge independently of blob
-policy: a `COMMIT` does not pull its referenced blobs in Demand mode, and an
-observed handle does not create a WANT.
+The iroh connection itself already authenticates endpoint keys. TribleSpace
+therefore adds no generic CONNECT capability and no second team-inventory
+session. Every collection request is authorized against the exact descriptor
+it names.
 
 ## WANT and synchronization boundaries
 
 Capability proof records are durable local set evidence, but the capability
-layer defines no proof-specific replication or WANT. Authorized team inventory may
-union resident proofs like any other inert evidence; that still does not make
-them active authority. Portable bundles are transferred explicitly when they
-must authorize an operation, such as in an invite or one of the two connection
-handshakes. Claim blobs use the ordinary authorized blob transport and may be
-requested by their exact handles when local policy wants them.
+layer defines no proof-specific replication or WANT. Collection-scoped repair
+unions the exact WRITE evidence which can change activation for that
+collection; resident proof presence alone still does not make it authority.
+Portable bundles are presented explicitly when they authorize an operation,
+including READ(C) repair. Claim blobs named by the transferred bundles arrive
+inline, avoiding a pre-authorization fetch cycle.
 
 This separation is intentional:
 
 - proof presence is not authority;
-- routing or DHT presence is not team membership;
+- routing, gossip, or DHT presence is not authorization;
 - WANT is local demand, not authorization; and
 - blob availability is not semantic validity.
 
-## Team bootstrap
+## Bootstrap and grants
 
-A team is named by its Ed25519 trust-root public key. `team create` issues two
-root claims for the founder's key—CONNECT and SYNC_TEAM, both initially in
-invoke-and-delegate mode—stores their claims and proofs, and reports both proof
-IDs. The root key is created as a private durable file (or loaded from
-`--root-key`) so it can remain offline without depending on terminal output for
-recovery.
+Collection bootstrap is descriptor construction. The creator chooses READ and
+WRITE policies explicitly, registers the canonical descriptor, and retains the
+root signing keys needed by those policies. An open action needs no grant. A
+root acting directly needs no stored proof. A delegated principal receives a
+self-contained proof bundle whose atom names the exact action and collection.
 
-`team invite` loads one exact parent proof for each action, verifies current
-delegation, extends both paths for the invitee, and writes one versioned
-portable artifact. `team join` requires the expected team-root public key
-separately, verifies both bundles against that external root and the invitee
-key, then inserts all claims and both native proofs in one idempotent operation.
-The artifact therefore never gets to nominate its own authority. `team show`
-loads one exact proof ID and its named claims; it never scans for a roster or
-chooses among paths implicitly.
+The recipient verifies the bundle against the descriptor's externally known
+root set and its own expected key before storing it. The artifact therefore
+cannot nominate its own authority, collection, or subject. There is no global
+roster to enumerate and no requirement that two collections share roots or
+delegation geometry.
 
 Validity bounds are optional monotone restrictions, not mutable revocation.
 Ending an unexpired grant requires changing the served trust root or another
