@@ -1228,12 +1228,13 @@ impl CapabilityProofBundle {
 ///
 /// `trust_roots` is canonicalized as a set, and support is counted by distinct
 /// root key rather than by proof. Duplicate roots and duplicate proof bundles
-/// therefore cannot inflate either quorum. A configured root originates an
-/// edge with its own singleton support. Every non-root issuer is accepted only
-/// after `delegate_threshold` distinct roots have already established its
-/// effective delegation authority for the same exact atom at `instant`; one
-/// valid grant by that issuer then carries the whole established support set.
-/// `None` disables non-root delegation entirely.
+/// therefore cannot inflate either quorum. A configured root always originates
+/// an edge with its own inherent support. Carrying another root's support is
+/// delegation even when the issuer is also a root, so that additional support
+/// propagates only after `delegate_threshold` distinct roots have established
+/// delegation authority for the issuer. A non-root has no inherent support and
+/// is accepted only after the same threshold. `None` consequently restricts
+/// delegation to each configured root's own direct grants.
 ///
 /// A child edge remains constrained by the effective mode of the exact claim
 /// ancestry named in its bundle. The issuer's signed intent may be activated by
@@ -1249,6 +1250,12 @@ impl CapabilityProofBundle {
 /// contributes no authority. An invoke threshold larger than the root set can
 /// never pass; an oversized delegate threshold merely disables non-root paths
 /// while direct root grants remain usable.
+///
+/// Final authorization is policy-shaped: `Invoke` requires
+/// `invoke_threshold`; a non-root `Delegate` requires `delegate_threshold`; and
+/// a non-root `InvokeAndDelegate` requires both. Configured roots retain
+/// inherent delegation authority. When `delegate_threshold` is `None`, only a
+/// configured root satisfies a final request containing `Delegate`.
 pub fn capability_quorum_authorizes<'a>(
     bundles: impl IntoIterator<Item = &'a CapabilityProofBundle>,
     trust_roots: impl IntoIterator<Item = VerifyingKey>,
@@ -1262,7 +1269,8 @@ pub fn capability_quorum_authorizes<'a>(
         .into_iter()
         .map(|root| root.to_bytes())
         .collect();
-    if roots.len() < invoke_threshold.get() {
+    if request.required().satisfies(CapabilityMode::Invoke) && roots.len() < invoke_threshold.get()
+    {
         return false;
     }
 
@@ -1299,21 +1307,11 @@ pub fn capability_quorum_authorizes<'a>(
                     break;
                 }
 
-                let issuer_support = if roots.contains(&step.issuer) {
-                    vec![(step.issuer, CapabilityMode::InvokeAndDelegate)]
-                } else if let Some(support) = delegate_threshold.and_then(|threshold| {
-                    let support = authority.get(&step.issuer)?;
-                    (support.values().filter(|mode| mode.delegates()).count() >= threshold.get())
-                        .then_some(support)
-                }) {
-                    support
-                        .iter()
-                        .filter(|(_, mode)| mode.delegates())
-                        .map(|(root, mode)| (*root, *mode))
-                        .collect()
-                } else {
+                let issuer_support =
+                    forest_issuer_support(&roots, &authority, step.issuer, delegate_threshold);
+                if issuer_support.is_empty() {
                     break;
-                };
+                }
 
                 if step_index == reached[path_index] {
                     reached[path_index] += 1;
@@ -1342,19 +1340,89 @@ pub fn capability_quorum_authorizes<'a>(
             }
         }
 
-        if authority
-            .get(&expected_subject)
-            .into_iter()
-            .flat_map(|support| support.values())
-            .filter(|mode| mode.satisfies(request.required()))
-            .count()
-            >= invoke_threshold.get()
-        {
+        if forest_subject_authorized(
+            &roots,
+            &authority,
+            expected_subject,
+            request.required(),
+            invoke_threshold,
+            delegate_threshold,
+        ) {
             return true;
         }
         if !changed {
             return false;
         }
+    }
+}
+
+fn forest_issuer_support(
+    roots: &BTreeSet<[u8; PUBLIC_KEY_LEN]>,
+    authority: &BTreeMap<[u8; PUBLIC_KEY_LEN], BTreeMap<[u8; PUBLIC_KEY_LEN], CapabilityMode>>,
+    issuer: [u8; PUBLIC_KEY_LEN],
+    delegate_threshold: Option<NonZeroUsize>,
+) -> Vec<([u8; PUBLIC_KEY_LEN], CapabilityMode)> {
+    let is_root = roots.contains(&issuer);
+    let support = authority.get(&issuer);
+    let delegation_quorum = delegate_threshold.is_some_and(|threshold| {
+        support.is_some_and(|support| {
+            support.values().filter(|mode| mode.delegates()).count() >= threshold.get()
+        })
+    });
+
+    if delegation_quorum {
+        return support
+            .expect("a delegation quorum has resident support")
+            .iter()
+            .filter(|(_, mode)| mode.delegates())
+            .map(|(root, mode)| (*root, *mode))
+            .collect();
+    }
+    if is_root {
+        vec![(issuer, CapabilityMode::InvokeAndDelegate)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn forest_subject_authorized(
+    roots: &BTreeSet<[u8; PUBLIC_KEY_LEN]>,
+    authority: &BTreeMap<[u8; PUBLIC_KEY_LEN], BTreeMap<[u8; PUBLIC_KEY_LEN], CapabilityMode>>,
+    subject: [u8; PUBLIC_KEY_LEN],
+    required: CapabilityMode,
+    invoke_threshold: NonZeroUsize,
+    delegate_threshold: Option<NonZeroUsize>,
+) -> bool {
+    let support = authority.get(&subject);
+    let invokes = || {
+        support
+            .into_iter()
+            .flat_map(|support| support.values())
+            .filter(|mode| mode.satisfies(CapabilityMode::Invoke))
+            .count()
+            >= invoke_threshold.get()
+    };
+    let delegates = || {
+        if roots.contains(&subject) {
+            return true;
+        }
+        match delegate_threshold {
+            Some(threshold) => {
+                support
+                    .into_iter()
+                    .flat_map(|support| support.values())
+                    .filter(|mode| mode.satisfies(CapabilityMode::Delegate))
+                    .count()
+                    >= threshold.get()
+            }
+            None => false,
+        }
+    };
+
+    match required {
+        CapabilityMode::Invoke => invokes(),
+        CapabilityMode::Delegate => delegates(),
+        CapabilityMode::InvokeAndDelegate => invokes() && delegates(),
     }
 }
 
@@ -2532,6 +2600,100 @@ mod tests {
             request(atom, CapabilityMode::InvokeAndDelegate),
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1),
+        ));
+    }
+
+    #[test]
+    fn proof_forest_root_issuer_carries_additional_delegated_support() {
+        let root_a = key(163);
+        let root_b = key(164);
+        let subject = key(165);
+        let atom = atom(166, 167);
+        let a_supports_b = root_bundle(
+            &root_a,
+            &root_b,
+            atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let b_grants_subject = root_bundle(&root_b, &subject, atom, CapabilityMode::Invoke, None);
+        let roots = [root_a.verifying_key(), root_b.verifying_key()];
+        let invoke_two = NonZeroUsize::new(2).unwrap();
+
+        assert!(!capability_quorum_authorizes(
+            [&b_grants_subject],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            invoke_two,
+            NonZeroUsize::new(2),
+        ));
+        assert!(!capability_quorum_authorizes(
+            [&b_grants_subject, &a_supports_b],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            invoke_two,
+            None,
+        ));
+        assert!(capability_quorum_authorizes(
+            [&b_grants_subject, &a_supports_b],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            invoke_two,
+            NonZeroUsize::new(2),
+        ));
+    }
+
+    #[test]
+    fn proof_forest_final_delegate_request_uses_delegate_policy() {
+        let root_a = key(168);
+        let root_b = key(169);
+        let subject = key(170);
+        let atom = atom(171, 172);
+        let a = root_bundle(&root_a, &subject, atom, CapabilityMode::Delegate, None);
+        let b = root_bundle(&root_b, &subject, atom, CapabilityMode::Delegate, None);
+        let roots = [root_a.verifying_key(), root_b.verifying_key()];
+
+        assert!(!capability_quorum_authorizes(
+            [&a],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Delegate),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2),
+        ));
+        assert!(capability_quorum_authorizes(
+            [&a, &b],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Delegate),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2),
+        ));
+        assert!(!capability_quorum_authorizes(
+            [&a, &b],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Delegate),
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ));
+        assert!(capability_quorum_authorizes(
+            [],
+            roots,
+            epoch(0.0),
+            root_a.verifying_key(),
+            request(atom, CapabilityMode::Delegate),
+            NonZeroUsize::new(1).unwrap(),
+            None,
         ));
     }
 
