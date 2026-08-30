@@ -14,27 +14,20 @@
 //! performed once when a [`PathIndex`](crate::PathIndex) is materialized, so
 //! paths whose edges live in different source fragments remain discoverable.
 
-// Reach arrives here as a builder argument; only the tests name a
-// particular one.
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-#[cfg(test)]
-use triblespace_core::collection::reach;
 use triblespace_core::prelude::entity;
 
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::descriptor;
-use triblespace_core::collection::records::{
-    collection_authority, collection_mapping, collection_reach, collection_representation,
-    collection_source, mapping_algorithm, KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
-};
+use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    CollectionEncoding, CollectionHandle, CollectionMapping, CollectionOperationError, Cover,
-    TryFromCover, TryFromCoverError, VerifyingKey,
+    CollectionEncoding, CollectionMapping, CollectionOperationError, Cover, TryFromCover,
+    TryFromCoverError,
 };
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
@@ -101,44 +94,6 @@ impl MetaDescribe for RegularPathMappingV1 {
     }
 }
 
-/// Construct the path-summary collection for one dataset scope and automaton.
-///
-/// The complete automaton lives on an embedded mapping entity. The constructor
-/// gives that entity a content-derived id, which participates in descriptor
-/// identity, so two path expressions over the same source remain distinct
-/// target collections without any out-of-band runtime argument. Readers still
-/// obey ordinary entity-id substitution: they validate the mapping facts, not
-/// how the entity id was minted. This intentionally replaces the unshipped
-/// descriptor-root argument layout.
-pub fn descriptor(
-    source: CollectionHandle,
-    automaton: &Automaton,
-    authority: VerifyingKey,
-    reach: Fragment,
-) -> Fragment {
-    let fingerprint = automaton_fingerprint(automaton);
-    descriptor_with_fingerprint(source, automaton, authority, reach, fingerprint)
-}
-
-fn descriptor_with_fingerprint(
-    source: CollectionHandle,
-    automaton: &Automaton,
-    authority: VerifyingKey,
-    reach: Fragment,
-    fingerprint: Inline<Hash<Blake3>>,
-) -> Fragment {
-    let mapping = mapping_fragment_with_fingerprint(automaton, fingerprint);
-    entity! { _ @
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_source: source,
-        collection_authority: authority,
-        collection_representation*: <PathSummaryBlob as MetaDescribe>::describe(),
-        collection_mapping*: mapping,
-        collection_reach*: reach,
-    }
-}
-
-#[cfg(test)]
 fn mapping_fragment(automaton: &Automaton) -> Fragment {
     mapping_fragment_with_fingerprint(automaton, automaton_fingerprint(automaton))
 }
@@ -236,7 +191,26 @@ pub struct RegularPathMapping {
     automaton: Automaton,
 }
 
-impl CollectionMapping<SimpleArchive, PathSummaryBlob> for RegularPathMapping {
+impl RegularPathMapping {
+    /// Bind one canonical regular-path mapping to its complete automaton.
+    pub fn new(automaton: Automaton) -> Self {
+        Self { automaton }
+    }
+
+    /// Automaton carried by this concrete mapping instance.
+    pub fn automaton(&self) -> &Automaton {
+        &self.automaton
+    }
+}
+
+impl CollectionMapping for RegularPathMapping {
+    type Source = SimpleArchive;
+    type Target = PathSummaryBlob;
+
+    fn fragment(&self) -> Fragment {
+        mapping_fragment(&self.automaton)
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         require_regular_path_mapping(target)?;
         Ok(Self {
@@ -250,7 +224,7 @@ impl CollectionMapping<SimpleArchive, PathSummaryBlob> for RegularPathMapping {
         _reader: &R,
     ) -> Result<Blob<PathSummaryBlob>, CollectionOperationError>
     where
-        R: triblespace_core::repo::BlobStoreGet,
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
     {
         derive_element(source, &self.automaton).map_err(|source| match source {
             RegularPathMappingError::Summary(PathSummaryBlobError::CapacityOverflow) => {
@@ -522,6 +496,11 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::VerifyingKey;
     use triblespace_core::blob::IntoBlob;
+    use triblespace_core::collection::records::{
+        collection_mapping, collection_name, collection_read_policy, collection_representation,
+        collection_source, collection_write_policy, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    };
+    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::RawInline;
     use triblespace_core::metadata;
@@ -540,15 +519,52 @@ mod tests {
         SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
+    fn policy() -> CollectionPolicy {
+        CollectionPolicy::new(
+            AdmissionPolicy::direct(authority()),
+            AdmissionPolicy::direct(authority()),
+        )
+    }
+
     /// The source collection these tests summarise.
     fn source_collection() -> Fragment {
-        simplearchive_union::descriptor("edges", authority(), reach::private())
+        source_descriptor("edges", policy())
     }
 
     /// These tests only need identities to bind claims to; nothing stores the
     /// descriptors they come from.
     fn collection_of(descriptor: &Fragment) -> CollectionHandle {
         IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle()
+    }
+
+    fn source_descriptor(name: &str, policy: CollectionPolicy) -> Fragment {
+        entity! { _ @
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_name: name.to_owned(),
+            collection_read_policy*: policy.read().fragment(),
+            collection_write_policy*: policy.write().fragment(),
+            collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
+        }
+    }
+
+    fn summary_descriptor(source: CollectionHandle, automaton: &Automaton) -> Fragment {
+        summary_descriptor_with_fingerprint(source, automaton, automaton_fingerprint(automaton))
+    }
+
+    fn summary_descriptor_with_fingerprint(
+        source: CollectionHandle,
+        automaton: &Automaton,
+        fingerprint: Inline<Hash<Blake3>>,
+    ) -> Fragment {
+        let policy = policy();
+        entity! { _ @
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: source,
+            collection_read_policy*: policy.read().fragment(),
+            collection_write_policy*: policy.write().fragment(),
+            collection_representation*: <PathSummaryBlob as MetaDescribe>::describe(),
+            collection_mapping*: mapping_fragment_with_fingerprint(automaton, fingerprint),
+        }
     }
 
     fn label(byte: u8) -> [u8; 16] {
@@ -583,24 +599,9 @@ mod tests {
         let first_automaton = plus(label(7));
         let second_automaton = plus(label(8));
         let source = source_collection();
-        let first = descriptor(
-            collection_of(&source),
-            &first_automaton,
-            authority(),
-            reach::private(),
-        );
-        let repeated = descriptor(
-            collection_of(&source),
-            &first_automaton,
-            authority(),
-            reach::private(),
-        );
-        let second = descriptor(
-            collection_of(&source),
-            &second_automaton,
-            authority(),
-            reach::private(),
-        );
+        let first = summary_descriptor(collection_of(&source), &first_automaton);
+        let repeated = summary_descriptor(collection_of(&source), &first_automaton);
+        let second = summary_descriptor(collection_of(&source), &second_automaton);
 
         assert_eq!(first, repeated);
         // A summary names the collection it summarises, and carries no anchor
@@ -613,16 +614,10 @@ mod tests {
             descriptor::name(first.facts()).unwrap().is_none(),
             "a derivation needs no anchor"
         );
-        assert_eq!(descriptor::authority(first.facts()), Ok(authority()));
-        let other_source = descriptor(
-            collection_of(&simplearchive_union::descriptor(
-                "other-edges",
-                authority(),
-                reach::private(),
-            )),
+        assert_eq!(descriptor::policy(first.facts()), Ok(policy()));
+        let other_source = summary_descriptor(
+            collection_of(&source_descriptor("other-edges", policy())),
             &first_automaton,
-            authority(),
-            reach::private(),
         );
         // Source scope changes the collection but not the reusable mapping.
         assert_ne!(collection_of(&first), collection_of(&other_source));
@@ -674,7 +669,7 @@ mod tests {
         )
         .unwrap();
         let source = collection_of(&source_collection());
-        let descriptor = descriptor(source, &automaton, authority(), reach::private());
+        let descriptor = summary_descriptor(source, &automaton);
 
         assert_eq!(
             descriptor::mapping(descriptor.facts()),
@@ -701,13 +696,8 @@ mod tests {
             "annotations do not change a mapping's operational meaning",
         );
 
-        let mismatched = descriptor_with_fingerprint(
-            source,
-            &automaton,
-            authority(),
-            reach::private(),
-            Inline::new([0xA5; 32]),
-        );
+        let mismatched =
+            summary_descriptor_with_fingerprint(source, &automaton, Inline::new([0xA5; 32]));
         assert!(matches!(
             <PathSummaryBlob as CollectionEncoding>::validate_descriptor(&mismatched),
             Err(CollectionOperationError::Fatal(reason))

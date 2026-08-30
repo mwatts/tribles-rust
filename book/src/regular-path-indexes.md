@@ -160,20 +160,27 @@ multiplicity through their other witnesses.
 ## Persist through the native collection algebra
 
 A durable path index is identified by the exact source descriptor, one
-automaton, and its own descriptor authority and reach:
+automaton, and the independent READ/WRITE policies of its derived descriptor:
 
 ```rust,ignore
-use triblespace::core::collection::reach;
+use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 use triblespace_paths::PathSummaryCollection;
 
-let path_collection = PathSummaryCollection::new(
-    "social",
-    source_authority,
-    friend_automaton.clone(),
-    source_reach,
-    index_authority,
-    reach::private(),
+let source_policy = CollectionPolicy::new(
+    AdmissionPolicy::direct(source_reader),
+    AdmissionPolicy::direct(source_writer),
 );
+let index_policy = CollectionPolicy::new(
+    AdmissionPolicy::direct(index_reader),
+    AdmissionPolicy::direct(index_writer),
+);
+let path_collection = PathSummaryCollection::create(
+    &mut store,
+    "social",
+    source_policy,
+    friend_automaton.clone(),
+    index_policy,
+)?;
 
 // `cover` is the admitted PATCH set of distinct source payload handles.
 let paths = path_collection.ensure_exact(&mut store, &cover)?;
@@ -192,7 +199,7 @@ any validated combination of source merges, target merges, and derivations
 with that support, so route choice is not encoded as a cover mode.
 
 The opaque cover is the value boundary. It must name the canonical
-authority-bearing `SimpleArchive` source descriptor, and every member must name
+policy-bearing `SimpleArchive` source descriptor, and every member must name
 resident canonical source data.
 
 Distinct signed claims that name identical data collapse to one cover member

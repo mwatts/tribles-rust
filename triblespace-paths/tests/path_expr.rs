@@ -1,21 +1,16 @@
 use std::collections::BTreeSet;
-use triblespace_core::collection::reach;
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::IntoBlob;
-use triblespace_core::collection::{
-    simplearchive_union, CollectionCommit, CollectionRecord, CollectionStore, CollectionStoreExt,
-};
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::id::{ExclusiveId, Id};
-use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata;
 use triblespace_core::query::{Binding, Query, Variable};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStorePut, SnapshotSource};
+use triblespace_core::repo::SnapshotSource;
+use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
 use triblespace_paths::{
     automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathSummaryCollection, Step,
@@ -93,38 +88,31 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     let signing_key = SigningKey::from_bytes(&[17; 32]);
     let authority = signing_key.verifying_key();
     let name = "graph";
-    let paths = PathSummaryCollection::new(
-        name,
-        authority,
-        expression.compile(),
-        reach::private(),
-        authority,
-        reach::private(),
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
     );
     let mut store = MemoryRepo::default();
+    let paths = PathSummaryCollection::create(
+        &mut store,
+        name,
+        policy.clone(),
+        expression.compile(),
+        policy,
+    )
+    .unwrap();
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
-    let data = store.put::<SimpleArchive, _>(graph.to_blob()).unwrap();
-    let metadata = store
-        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+    store
+        .commit(
+            paths.source_collection(),
+            &signing_key,
+            Fragment::from(graph),
+        )
         .unwrap();
-    let source = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            name,
-            authority,
-            reach::private(),
-        ))
-        .unwrap();
-    let commit = CollectionCommit::sign(
-        &signing_key,
-        source.handle(),
-        Handle::<SimpleArchive>::to_hash(data),
-        metadata,
-    );
-    store.insert(CollectionRecord::Commit(commit)).unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let cover = source.admitted(&snapshot).unwrap();
+    let cover = paths.source_collection().admitted(&snapshot).unwrap();
     let index = paths.ensure_exact(&mut store, &cover).unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));
