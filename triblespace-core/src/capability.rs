@@ -18,9 +18,11 @@
 //! authorization state. The caller supplies one external trust root, one
 //! expected leaf key, one explicit instant, and one exact request.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use anybytes::Bytes;
 use ed25519::signature::Signer;
@@ -1222,6 +1224,228 @@ impl CapabilityProofBundle {
     }
 }
 
+/// Decide one exact capability request from a finite forest of direct proofs.
+///
+/// `trust_roots` is canonicalized as a set, and support is counted by distinct
+/// root key rather than by proof. Duplicate roots and duplicate proof bundles
+/// therefore cannot inflate either quorum. A configured root originates an
+/// edge with its own singleton support. Every non-root issuer is accepted only
+/// after `delegate_threshold` distinct roots have already established its
+/// effective delegation authority for the same exact atom at `instant`; one
+/// valid grant by that issuer then carries the whole established support set.
+/// `None` disables non-root delegation entirely.
+///
+/// A child edge remains constrained by the effective mode of the exact claim
+/// ancestry named in its bundle. The issuer's signed intent may be activated by
+/// root support learned through other parent claims, but each such root's mode
+/// is met with that named ancestry before it propagates. The forest therefore
+/// does not reinterpret `claim.parent` as a multi-parent lineage or restore a
+/// permission bit removed on either side.
+///
+/// Evaluation computes the least fixed point of those rules, so neither proof
+/// arrival order nor input iteration order affects the decision. A bundle that
+/// is malformed, incorrectly signed, rooted outside `trust_roots`, expired, or
+/// about another atom is inert as a whole; a valid prefix of an invalid bundle
+/// contributes no authority. An invoke threshold larger than the root set can
+/// never pass; an oversized delegate threshold merely disables non-root paths
+/// while direct root grants remain usable.
+pub fn capability_quorum_authorizes<'a>(
+    bundles: impl IntoIterator<Item = &'a CapabilityProofBundle>,
+    trust_roots: impl IntoIterator<Item = VerifyingKey>,
+    instant: Epoch,
+    expected_subject: VerifyingKey,
+    request: CapabilityRequest,
+    invoke_threshold: NonZeroUsize,
+    delegate_threshold: Option<NonZeroUsize>,
+) -> bool {
+    let roots: BTreeSet<[u8; PUBLIC_KEY_LEN]> = trust_roots
+        .into_iter()
+        .map(|root| root.to_bytes())
+        .collect();
+    if roots.len() < invoke_threshold.get() {
+        return false;
+    }
+
+    let mut paths = bundles
+        .into_iter()
+        .filter_map(|bundle| validated_forest_path(bundle, &roots, instant, request.atom()))
+        .collect::<Vec<_>>();
+    paths.sort_unstable_by(|left, right| {
+        left.root
+            .cmp(&right.root)
+            .then_with(|| left.proof_id.cmp(&right.proof_id))
+    });
+
+    let expected_subject = expected_subject.to_bytes();
+    let mut authority: BTreeMap<
+        [u8; PUBLIC_KEY_LEN],
+        BTreeMap<[u8; PUBLIC_KEY_LEN], CapabilityMode>,
+    > = roots
+        .iter()
+        .map(|root| {
+            (
+                *root,
+                BTreeMap::from([(*root, CapabilityMode::InvokeAndDelegate)]),
+            )
+        })
+        .collect();
+    let mut reached = vec![0usize; paths.len()];
+
+    loop {
+        let mut changed = false;
+        for (path_index, path) in paths.iter().enumerate() {
+            for (step_index, step) in path.steps.iter().enumerate() {
+                if step_index > reached[path_index] {
+                    break;
+                }
+
+                let issuer_support = if roots.contains(&step.issuer) {
+                    vec![(step.issuer, CapabilityMode::InvokeAndDelegate)]
+                } else if let Some(support) = delegate_threshold.and_then(|threshold| {
+                    let support = authority.get(&step.issuer)?;
+                    (support.values().filter(|mode| mode.delegates()).count() >= threshold.get())
+                        .then_some(support)
+                }) {
+                    support
+                        .iter()
+                        .filter(|(_, mode)| mode.delegates())
+                        .map(|(root, mode)| (*root, *mode))
+                        .collect()
+                } else {
+                    break;
+                };
+
+                if step_index == reached[path_index] {
+                    reached[path_index] += 1;
+                    changed = true;
+                }
+
+                let subject_support = authority.entry(step.subject).or_default();
+                for (root, issuer_mode) in issuer_support {
+                    let Some(propagated) = issuer_mode.meet(step.ancestry_mode) else {
+                        continue;
+                    };
+                    match subject_support.entry(root) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(propagated);
+                            changed = true;
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let joined = join_capability_modes(*entry.get(), propagated);
+                            if joined != *entry.get() {
+                                entry.insert(joined);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if authority
+            .get(&expected_subject)
+            .into_iter()
+            .flat_map(|support| support.values())
+            .filter(|mode| mode.satisfies(request.required()))
+            .count()
+            >= invoke_threshold.get()
+        {
+            return true;
+        }
+        if !changed {
+            return false;
+        }
+    }
+}
+
+fn join_capability_modes(left: CapabilityMode, right: CapabilityMode) -> CapabilityMode {
+    CapabilityMode::from_bits(left.bits() | right.bits())
+        .expect("the union of nonempty capability modes is nonempty")
+}
+
+#[derive(Clone, Copy)]
+struct CapabilityForestStep {
+    issuer: [u8; PUBLIC_KEY_LEN],
+    subject: [u8; PUBLIC_KEY_LEN],
+    ancestry_mode: CapabilityMode,
+}
+
+struct CapabilityForestPath {
+    root: [u8; PUBLIC_KEY_LEN],
+    proof_id: [u8; 32],
+    steps: Vec<CapabilityForestStep>,
+}
+
+fn validated_forest_path(
+    bundle: &CapabilityProofBundle,
+    roots: &BTreeSet<[u8; PUBLIC_KEY_LEN]>,
+    instant: Epoch,
+    atom: CapabilityAtom,
+) -> Option<CapabilityForestPath> {
+    let root = bundle.proof.root_key().to_bytes();
+    if !roots.contains(&root) || bundle.claims.len() != bundle.proof.step_count() {
+        return None;
+    }
+    bundle.proof.verify_signatures().ok()?;
+
+    let instant_ns = instant.to_tai_duration().total_nanoseconds();
+    let mut issuer = root;
+    let mut previous_handle = None;
+    let mut effective_mode: Option<CapabilityMode> = None;
+    let mut effective_validity: Option<(i128, i128)> = None;
+    let mut steps = Vec::with_capacity(bundle.proof.step_count());
+
+    for (edge, claim_blob) in bundle.proof.edges().zip(&bundle.claims) {
+        let actual_handle = content_handle(claim_blob);
+        if edge.claim != actual_handle {
+            return None;
+        }
+        let claim = CapabilityClaim::from_blob(claim_blob.clone()).ok()?;
+        if claim.parent() != previous_handle || claim.atom() != atom {
+            return None;
+        }
+        if effective_mode.is_some_and(|mode| !mode.delegates()) {
+            return None;
+        }
+
+        effective_mode = Some(match effective_mode {
+            None => claim.mode(),
+            Some(parent) => parent.meet(claim.mode())?,
+        });
+        if let Some(validity) = claim.validity() {
+            let (lower, upper) = validity.bounds_ns();
+            if instant_ns < lower || instant_ns > upper {
+                return None;
+            }
+            effective_validity = Some(match effective_validity {
+                None => (lower, upper),
+                Some((parent_lower, parent_upper)) => {
+                    let intersection = (parent_lower.max(lower), parent_upper.min(upper));
+                    if intersection.0 > intersection.1 {
+                        return None;
+                    }
+                    intersection
+                }
+            });
+        }
+
+        let subject = edge.delegate.to_bytes();
+        steps.push(CapabilityForestStep {
+            issuer,
+            subject,
+            ancestry_mode: effective_mode.expect("one claim establishes one nonempty mode"),
+        });
+        issuer = subject;
+        previous_handle = Some(actual_handle);
+    }
+
+    Some(CapabilityForestPath {
+        root,
+        proof_id: bundle.proof.id().raw,
+        steps,
+    })
+}
+
 /// Structural failure in the bounded proof-bundle codec.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CapabilityProofBundleError {
@@ -2085,6 +2309,344 @@ mod tests {
             hex::encode(proof.id().raw),
             "a774a63f4f40ec235e9eb73ed843647459a7af8b95540f05e7083da02f6b0959"
         );
+    }
+
+    #[test]
+    fn proof_forest_requires_two_distinct_roots_for_two_of_two_invoke() {
+        let root_a = key(120);
+        let root_b = key(121);
+        let subject = key(122);
+        let atom = atom(123, 124);
+        let a = root_bundle(&root_a, &subject, atom, CapabilityMode::Invoke, None);
+        let b = root_bundle(&root_b, &subject, atom, CapabilityMode::Invoke, None);
+        let roots = [root_a.verifying_key(), root_b.verifying_key()];
+
+        assert!(!capability_quorum_authorizes(
+            [&a],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(2).unwrap(),
+            None,
+        ));
+        assert!(capability_quorum_authorizes(
+            [&a, &b],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(2).unwrap(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn proof_forest_accepts_one_of_two_invoke() {
+        let root_a = key(125);
+        let root_b = key(126);
+        let subject = key(127);
+        let atom = atom(128, 129);
+        let proof = root_bundle(&root_b, &subject, atom, CapabilityMode::Invoke, None);
+
+        assert!(capability_quorum_authorizes(
+            [&proof],
+            [root_a.verifying_key(), root_b.verifying_key()],
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn proof_forest_rejects_one_root_bypass_of_two_root_delegation() {
+        let root_a = key(130);
+        let root_b = key(131);
+        let issuer = key(132);
+        let subject = key(133);
+        let atom = atom(134, 135);
+        let parent_a = root_bundle(
+            &root_a,
+            &issuer,
+            atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let verified_a = parent_a
+            .verify(
+                root_a.verifying_key(),
+                epoch(0.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        let child = verified_a
+            .delegate(
+                &issuer,
+                CapabilityClaim::delegated(
+                    verified_a.claim_handle(),
+                    atom,
+                    CapabilityMode::Invoke,
+                    None,
+                ),
+                subject.verifying_key(),
+            )
+            .unwrap();
+        let roots = [root_a.verifying_key(), root_b.verifying_key()];
+
+        assert!(!capability_quorum_authorizes(
+            [&child],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2),
+        ));
+        assert!(!capability_quorum_authorizes(
+            [&child],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ));
+
+        let parent_b = root_bundle(&root_b, &issuer, atom, CapabilityMode::Delegate, None);
+        assert!(capability_quorum_authorizes(
+            [&child, &parent_b],
+            roots,
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2),
+        ));
+    }
+
+    #[test]
+    fn proof_forest_propagates_the_delegating_issuers_whole_quorum() {
+        let root_a = key(152);
+        let root_b = key(153);
+        let issuer = key(154);
+        let subject = key(155);
+        let atom = atom(156, 157);
+        let parent_a = root_bundle(
+            &root_a,
+            &issuer,
+            atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let verified_a = parent_a
+            .verify(
+                root_a.verifying_key(),
+                epoch(0.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        let child = verified_a
+            .delegate(
+                &issuer,
+                CapabilityClaim::delegated(
+                    verified_a.claim_handle(),
+                    atom,
+                    CapabilityMode::Invoke,
+                    None,
+                ),
+                subject.verifying_key(),
+            )
+            .unwrap();
+        let delegate_only_b = root_bundle(&root_b, &issuer, atom, CapabilityMode::Delegate, None);
+        assert!(!capability_quorum_authorizes(
+            [&child, &delegate_only_b],
+            [root_a.verifying_key(), root_b.verifying_key()],
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2),
+        ));
+
+        let invoke_and_delegate_b = root_bundle(
+            &root_b,
+            &issuer,
+            atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        assert!(capability_quorum_authorizes(
+            [&child, &invoke_and_delegate_b],
+            [root_a.verifying_key(), root_b.verifying_key()],
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2),
+        ));
+    }
+
+    #[test]
+    fn proof_forest_records_intermediate_subject_support() {
+        let root = key(158);
+        let issuer = key(159);
+        let subject = key(160);
+        let atom = atom(161, 162);
+        let parent = root_bundle(
+            &root,
+            &issuer,
+            atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let verified = parent
+            .verify(
+                root.verifying_key(),
+                epoch(0.0),
+                issuer.verifying_key(),
+                request(atom, CapabilityMode::Delegate),
+            )
+            .unwrap();
+        let longer = verified
+            .delegate(
+                &issuer,
+                CapabilityClaim::delegated(
+                    verified.claim_handle(),
+                    atom,
+                    CapabilityMode::Invoke,
+                    None,
+                ),
+                subject.verifying_key(),
+            )
+            .unwrap();
+
+        assert!(capability_quorum_authorizes(
+            [&longer],
+            [root.verifying_key()],
+            epoch(0.0),
+            issuer.verifying_key(),
+            request(atom, CapabilityMode::InvokeAndDelegate),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1),
+        ));
+    }
+
+    #[test]
+    fn proof_forest_is_order_and_duplicate_invariant() {
+        let root_a = key(136);
+        let root_b = key(137);
+        let subject = key(138);
+        let atom = atom(139, 140);
+        let a = root_bundle(&root_a, &subject, atom, CapabilityMode::Invoke, None);
+        let b = root_bundle(&root_b, &subject, atom, CapabilityMode::Invoke, None);
+        let threshold = NonZeroUsize::new(2).unwrap();
+        let expected = capability_quorum_authorizes(
+            [&a, &b],
+            [root_a.verifying_key(), root_b.verifying_key()],
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            threshold,
+            None,
+        );
+        assert!(expected);
+        assert_eq!(
+            capability_quorum_authorizes(
+                [&b, &a, &a, &b],
+                [
+                    root_b.verifying_key(),
+                    root_a.verifying_key(),
+                    root_b.verifying_key(),
+                ],
+                epoch(0.0),
+                subject.verifying_key(),
+                request(atom, CapabilityMode::Invoke),
+                threshold,
+                None,
+            ),
+            expected
+        );
+        assert!(!capability_quorum_authorizes(
+            [&a, &a],
+            [
+                root_a.verifying_key(),
+                root_b.verifying_key(),
+                root_a.verifying_key(),
+            ],
+            epoch(0.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            threshold,
+            None,
+        ));
+    }
+
+    #[test]
+    fn proof_forest_treats_expired_bundles_as_inert() {
+        let root_a = key(141);
+        let root_b = key(142);
+        let subject = key(143);
+        let atom = atom(144, 145);
+        let a = root_bundle(
+            &root_a,
+            &subject,
+            atom,
+            CapabilityMode::Invoke,
+            Some(validity(0.0, 20.0)),
+        );
+        let b = root_bundle(
+            &root_b,
+            &subject,
+            atom,
+            CapabilityMode::Invoke,
+            Some(validity(0.0, 10.0)),
+        );
+        let roots = [root_a.verifying_key(), root_b.verifying_key()];
+        let threshold = NonZeroUsize::new(2).unwrap();
+
+        assert!(capability_quorum_authorizes(
+            [&a, &b],
+            roots,
+            epoch(10.0),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            threshold,
+            None,
+        ));
+        assert!(!capability_quorum_authorizes(
+            [&a, &b],
+            roots,
+            epoch(10.1),
+            subject.verifying_key(),
+            request(atom, CapabilityMode::Invoke),
+            threshold,
+            None,
+        ));
+    }
+
+    #[test]
+    fn proof_forest_never_combines_distinct_atoms() {
+        let root_a = key(146);
+        let root_b = key(147);
+        let subject = key(148);
+        let wanted = atom(149, 150);
+        let other = atom(151, 150);
+        let a = root_bundle(&root_a, &subject, wanted, CapabilityMode::Invoke, None);
+        let b = root_bundle(&root_b, &subject, other, CapabilityMode::Invoke, None);
+
+        assert!(!capability_quorum_authorizes(
+            [&a, &b],
+            [root_a.verifying_key(), root_b.verifying_key()],
+            epoch(0.0),
+            subject.verifying_key(),
+            request(wanted, CapabilityMode::Invoke),
+            NonZeroUsize::new(2).unwrap(),
+            None,
+        ));
     }
 
     #[test]
