@@ -39,12 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add a typed collection API above the representation-neutral wire records.
   `Collection<E>` validates a descriptor's canonical member encoding,
   `Cover<E>` carries only `Handle<E>` members, and `TryFromCover<E>`
-  reconstructs either eager values or lazy mmap-backed unions. Generic
-  `store.commit`, `cover`, `snapshot`, and `materialize` operations now work
-  across encodings. Each `CollectionEncoding` owns canonical validation and
-  may expose one direct physical join, while exact derivations bind one
-  parameterized `CollectionMapping<Source, Target>` whose ordinary trible
-  fragment is embedded in the target descriptor.
+  reconstructs either eager values or lazy mmap-backed unions. Signed
+  `store.commit` introduces authored `Fragment` leaves into `SimpleArchive`
+  source collections; typed covers, snapshots, and materialization work across
+  encodings. Each `CollectionEncoding` owns canonical validation and may expose
+  one direct physical join, while exact derivations bind one parameterized
+  `CollectionMapping<Source, Target>` whose ordinary trible fragment is
+  embedded in the target descriptor.
 
 - Add an exact maintained last-write-wins register collection. Its canonical
   projection keeps state identity and raw order facts as two independently

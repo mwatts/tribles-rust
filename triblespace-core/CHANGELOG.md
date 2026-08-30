@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add direct typed collection encodings, covers, snapshots, and logical cover
   views. `CollectionEncoding` attaches canonical validation and an optional
   directly materializable join to the member encoding; `Collection<E>` and
-  `Cover<E>` retain that encoding through the public API; and generic commit
-  and materialization work for non-`SimpleArchive` collections. Derived
+  `Cover<E>` retain that encoding through the public API; signed commits accept
+  authored `Fragment` values in `SimpleArchive` source collections, while
+  typed materialization works for non-`SimpleArchive` collections. Derived
   descriptors link a concrete mapping entity carrying its algorithm and
   concrete parameters, while exact derived lifecycles bind one
   `CollectionMapping<Source, Target>` whose law is a join homomorphism.

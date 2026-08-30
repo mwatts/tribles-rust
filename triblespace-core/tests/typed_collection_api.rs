@@ -5,11 +5,11 @@ use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::collection::exact_derived::ExactDerivedCollection;
+use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
 use triblespace_core::collection::{reach, CollectionStoreExt};
 use triblespace_core::collection::{simplearchive_union, succinctarchive_union};
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::Encodes;
-use triblespace_core::metadata::Describe;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -23,7 +23,7 @@ fn one_fact(seed: u8) -> TribleSet {
 }
 
 #[test]
-fn generic_simplearchive_collection_round_trips_typed_views() {
+fn simplearchive_collection_round_trips_typed_views() {
     let authority = SigningKey::from_bytes(&[41; 32]);
     let descriptor =
         simplearchive_union::descriptor("typed-api", authority.verifying_key(), reach::private());
@@ -55,22 +55,6 @@ fn generic_simplearchive_collection_round_trips_typed_views() {
     assert_eq!(materialized, expected);
 }
 
-struct DescribedSuccinct(Blob<SuccinctArchiveBlob>);
-
-impl Describe for DescribedSuccinct {
-    fn describe(&self) -> Fragment {
-        Fragment::empty()
-    }
-}
-
-impl Encodes<DescribedSuccinct> for SuccinctArchiveBlob {
-    type Output = Blob<SuccinctArchiveBlob>;
-
-    fn encode(source: DescribedSuccinct) -> Self::Output {
-        source.0
-    }
-}
-
 #[test]
 fn succinct_cover_materializes_as_a_typed_union_archive() {
     let authority = SigningKey::from_bytes(&[42; 32]);
@@ -80,32 +64,37 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     let raw_handle = raw.get_handle();
     let mut store = MemoryRepo::default();
 
+    let source_descriptor = simplearchive_union::descriptor(
+        "typed-api-source",
+        authority.verifying_key(),
+        reach::private(),
+    );
     let source = store
-        .collection::<SimpleArchive>(simplearchive_union::descriptor(
-            "typed-api-source",
-            authority.verifying_key(),
-            reach::private(),
-        ))
+        .collection::<SimpleArchive>(source_descriptor.clone())
         .unwrap();
+    let target_descriptor = succinctarchive_union::descriptor(
+        source.handle(),
+        authority.verifying_key(),
+        reach::private(),
+    );
     let target = store
-        .collection::<SuccinctArchiveBlob>(succinctarchive_union::descriptor(
-            source.handle(),
-            authority.verifying_key(),
-            reach::private(),
-        ))
+        .collection::<SuccinctArchiveBlob>(target_descriptor.clone())
         .unwrap();
 
     store
-        .commit(target, &authority, DescribedSuccinct(raw))
+        .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
-    let cover = store.cover(target).unwrap();
+    let source_cover = store.cover(source).unwrap();
+    let derived = ExactDerivedCollection::<
+        SimpleArchive,
+        SuccinctArchiveBlob,
+        SimpleToSuccinctMapping,
+    >::new(source_descriptor, target_descriptor)
+    .unwrap();
+    let attachment = derived.ensure_exact(&mut store, &source_cover).unwrap();
+    let cover = attachment.cover().clone();
+    assert_eq!(cover.collection(), target);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
-
-    let snapshot = store
-        .snapshot::<UnionArchive<OrderedUniverse>, _>(target)
-        .unwrap();
-    assert_eq!(snapshot.cover(), &cover);
-    assert_eq!(snapshot.value().iter().collect::<TribleSet>(), expected);
 
     let materialized = store
         .materialize::<UnionArchive<OrderedUniverse>, _>(&cover)

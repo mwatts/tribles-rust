@@ -249,8 +249,8 @@ impl Describe for Fragment {
     ///
     /// Metafacts become the description's content facts. The shared blob store
     /// is retained conservatively because it owns attachments referenced by
-    /// both the content and its description; this lets a generic publication
-    /// path stage the complete closure before consuming the original value.
+    /// both the content and its description, so the returned fragment remains
+    /// self-contained.
     fn describe(&self) -> Fragment {
         Fragment::from_facts_and_blobs(self.metafacts.clone(), self.blobs.clone())
     }

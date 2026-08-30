@@ -115,7 +115,7 @@ One `store.commit(collection, signer, fragment)` performs these semantic steps:
 
 1. fetch and structurally validate the already registered descriptor;
 2. store the fragment's attachments;
-3. encode the value using `E`'s canonical member encoding;
+3. encode the fragment's facts as the canonical `SimpleArchive` member;
 4. encode metafacts as the mandatory canonical metadata `SimpleArchive`;
 5. durably offer those dependencies; and
 6. insert a signed `COMMIT` naming the descriptor, data, and metadata handles.
@@ -125,6 +125,10 @@ not flush implicitly. Call `flush()` at the application's chosen durability
 boundary or explicitly close the backend. Repeating the same fragment with the
 same identity produces the same intrinsic record and is a no-op; different
 commits coexist.
+
+`COMMIT` is deliberately a source operation over authored `Fragment` values.
+Other collection encodings enter the lattice through reproducible `DERIVE` and
+`MERGE` records rather than alternative signed leaf formats.
 
 ## The native algebra
 

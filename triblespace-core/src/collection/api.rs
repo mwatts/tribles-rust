@@ -31,7 +31,6 @@ use crate::clock;
 use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
-use crate::metadata::Describe;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::{
     ArtifactHandle, ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut,
@@ -1053,11 +1052,11 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     /// [`snapshot`](Self::snapshot). The descriptor is fetched and structurally
     /// decoded before dependencies are staged, and the signed record is
     /// inserted last without an implicit durability flush.
-    fn commit<L, T>(
+    fn commit(
         &mut self,
-        collection: Collection<L>,
+        collection: Collection<SimpleArchive>,
         signing_key: &SigningKey,
-        value: T,
+        fragment: Fragment,
     ) -> Result<
         CollectionCommit,
         CollectionCommitError<
@@ -1071,22 +1070,18 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         >,
     >
     where
-        L: CollectionEncoding,
-        T: Describe + IntoBlob<L>,
         Self::Reader: BlobStoreMeta,
     {
         let loaded = load_collection_descriptor(self, collection.handle())
             .map_err(CollectionCommitError::Descriptor)?;
 
-        // Description happens before the value is consumed by its encoding.
-        // A Fragment description deliberately retains its shared blob store,
-        // so data and metadata attachments travel through this one generic
-        // path without an encoding-specific side channel.
-        let description = value.describe();
-        let data_root = value.to_blob();
-        let (_, metadata_facts, _, mut described_blobs) = description.into_parts();
+        // A signed commit introduces authored graph facts. Other collection
+        // encodings are reproducible representations introduced through
+        // DERIVE and MERGE records, not alternative signed leaf formats.
+        let (_, facts, metadata_facts, mut fragment_blobs) = fragment.into_parts();
+        let data_root: Blob<SimpleArchive> = facts.to_blob();
         let metadata: Blob<SimpleArchive> = metadata_facts.to_blob();
-        let mut attachments: Vec<Blob<UnknownBlob>> = described_blobs
+        let mut attachments: Vec<Blob<UnknownBlob>> = fragment_blobs
             .reader()
             .expect("MemoryBlobStore::reader is infallible")
             .into_iter()
@@ -1100,18 +1095,18 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
                 .put::<UnknownBlob, _>(blob)
                 .map_err(CollectionCommitError::DependencyPut)?;
         }
-        // Described attachments are resident before the member is validated.
-        // A Merkle member therefore names only dependencies already published
-        // through the ordinary Fragment/Describe path or an earlier derive.
+        // Fragment attachments are resident before the authored member is
+        // validated, so every handle named by its facts or metafacts already
+        // has a published target.
         let reader = store.reader().map_err(|source| {
             CollectionCommitError::Descriptor(CollectionDescriptorError::Reader(source))
         })?;
-        L::validate_member(&loaded.fragment, &data_root, &reader)
+        SimpleArchive::validate_member(&loaded.fragment, &data_root, &reader)
             .map_err(CollectionCommitError::InvalidMember)?;
         drop(reader);
 
         let data_handle = store
-            .put::<L, _>(data_root)
+            .put::<SimpleArchive, _>(data_root)
             .map_err(CollectionCommitError::DependencyPut)?;
         let metadata = store
             .put::<SimpleArchive, _>(metadata)
@@ -1119,7 +1114,7 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         let commit = CollectionCommit::sign(
             signing_key,
             collection.handle(),
-            Handle::<L>::to_hash(data_handle),
+            Handle::<SimpleArchive>::to_hash(data_handle),
             metadata,
         );
         store
