@@ -248,7 +248,7 @@ fn read_grants_use_the_distinct_read_action() {
             "read-action",
             CollectionPolicy::new(
                 AdmissionPolicy::direct(root.verifying_key()),
-                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(root.verifying_key()),
             ),
         )
         .unwrap();
@@ -268,7 +268,57 @@ fn read_grants_use_the_distinct_read_action() {
     assert!(collection
         .reader_is_admitted_at(&snapshot, reader.verifying_key(), instant)
         .unwrap());
-    assert!(collection
+    assert!(!collection
         .writer_is_admitted_at(&snapshot, reader.verifying_key(), instant)
+        .unwrap());
+}
+
+#[test]
+fn collection_quorum_needs_support_from_distinct_roots() {
+    let first_root = key(10);
+    let second_root = key(11);
+    let writer = key(12);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection(
+            "two-root-write-quorum",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::quorum(
+                    [first_root.verifying_key(), second_root.verifying_key()],
+                    2,
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let write_atom = atom(ACTION_WRITE, collection);
+    let instant = Epoch::from_tai_seconds(0.0);
+
+    store_bundle(
+        &mut store,
+        CapabilityProofBundle::issue_root(
+            &first_root,
+            CapabilityClaim::root(write_atom, CapabilityMode::Invoke, None),
+            writer.verifying_key(),
+        )
+        .unwrap(),
+    );
+    assert!(!collection
+        .writer_is_admitted_at(&store.snapshot().unwrap(), writer.verifying_key(), instant)
+        .unwrap());
+
+    store_bundle(
+        &mut store,
+        CapabilityProofBundle::issue_root(
+            &second_root,
+            CapabilityClaim::root(write_atom, CapabilityMode::Invoke, None),
+            writer.verifying_key(),
+        )
+        .unwrap(),
+    );
+    assert!(collection
+        .writer_is_admitted_at(&store.snapshot().unwrap(), writer.verifying_key(), instant)
         .unwrap());
 }
