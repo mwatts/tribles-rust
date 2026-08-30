@@ -29,36 +29,6 @@ use crate::repo::{
 };
 use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
-macro_rules! inert_test_offers {
-    ($($store:ty),+ $(,)?) => {$(
-        impl crate::repo::ArtifactOfferStore for $store {
-            type OfferError = Infallible;
-
-            fn offer_all<I>(&mut self, _: I) -> Result<(), Self::OfferError>
-            where
-                I: IntoIterator<Item = crate::repo::ArtifactHandle>,
-            {
-                Ok(())
-            }
-
-            fn offers_snapshot(
-                &mut self,
-            ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
-                Ok(crate::repo::ArtifactOfferSnapshot::default())
-            }
-        }
-    )+};
-}
-
-inert_test_offers!(
-    PanicStore,
-    CountingStore,
-    GuardStore,
-    RejectPutStore,
-    DropMergeStore,
-    LossyStore,
-);
-
 /// The one team every collection in these tests belongs to.
 fn test_team() -> ed25519_dalek::VerifyingKey {
     SigningKey::from_bytes(&[1; 32]).verifying_key()

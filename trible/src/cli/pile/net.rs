@@ -548,7 +548,6 @@ mod tests {
     use iroh_base::{SecretKey, TransportAddr};
     use tempfile::NamedTempFile;
     use triblespace_core::blob::{encodings::UnknownBlob, Bytes};
-    use triblespace_core::repo::offer::{ArtifactHandle, ArtifactOfferStore};
     use triblespace_core::repo::peer::{PeerEvidence, PeerStore};
     use triblespace_core::repo::BlobStorePut;
 
@@ -579,14 +578,13 @@ mod tests {
     }
 
     #[test]
-    fn inventory_evidence_derives_scope_and_ignores_local_offer_intent() {
+    fn inventory_evidence_derives_scope_stably() {
         let file = NamedTempFile::new().unwrap();
         let mut pile = Pile::open(file.path()).unwrap();
         let team = SigningKey::from_bytes(&[0x51; 32]).verifying_key();
         pile.bind_store_scope(team).unwrap();
         let (observed_team, before) = stable_inventory_manifest(&mut pile).unwrap();
 
-        pile.offer(ArtifactHandle::new([0xA7; 32])).unwrap();
         let (_, after) = stable_inventory_manifest(&mut pile).unwrap();
 
         assert_eq!(observed_team, team);

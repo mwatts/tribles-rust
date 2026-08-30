@@ -67,7 +67,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::{register_identity, register_orders, RegisterOrder};
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
 use anybytes::Bytes;
 
@@ -674,7 +674,7 @@ impl LwwRegisterCollection {
         source_cover: &FactCover,
     ) -> Result<LwwIndex, LwwRegisterCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;

@@ -39,10 +39,7 @@ use crate::inline::encodings::hash::{Blake3, Hash};
 #[cfg(test)]
 use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
-use crate::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStorePut, OfferCapture,
-    OfferCaptureInsertError, SnapshotSource,
-};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, SnapshotSource};
 use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::descriptor as descriptor_facts;
@@ -248,12 +245,9 @@ impl PreparedCollectionCommit {
         self,
         store: &'store mut S,
         signing_key: &SigningKey,
-    ) -> Result<
-        StagedCollectionCommit<'store, S>,
-        PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
-    >
+    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::InsertError>>
     where
-        S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+        S: BlobStorePut + CollectionStore,
     {
         let collection =
             crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor.facts().clone())
@@ -267,18 +261,15 @@ impl PreparedCollectionCommit {
     /// It first binds `collection` to the prepared descriptor's canonical
     /// identity, then writes embedded fragment blobs, data, and metadata before
     /// signing. The descriptor and its attachment closure must already have
-    /// been registered and offered by the caller.
+    /// been registered by the caller.
     pub fn stage_for<'store, S>(
         self,
         store: &'store mut S,
         collection: CollectionHandle,
         signing_key: &SigningKey,
-    ) -> Result<
-        StagedCollectionCommit<'store, S>,
-        PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
-    >
+    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::InsertError>>
     where
-        S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+        S: BlobStorePut + CollectionStore,
     {
         self.stage_inner(store, collection, false, signing_key)
     }
@@ -289,12 +280,9 @@ impl PreparedCollectionCommit {
         mut collection: CollectionHandle,
         put_descriptor: bool,
         signing_key: &SigningKey,
-    ) -> Result<
-        StagedCollectionCommit<'store, S>,
-        PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
-    >
+    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::InsertError>>
     where
-        S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+        S: BlobStorePut + CollectionStore,
     {
         let Self {
             embedded,
@@ -304,7 +292,6 @@ impl PreparedCollectionCommit {
         } = self;
         let (_, descriptor_facts, _, mut descriptor_blobs) = descriptor.into_parts();
 
-        let mut store = OfferCapture::new(store);
         if put_descriptor {
             let mut attachments: Vec<Blob<UnknownBlob>> = descriptor_blobs
                 .snapshot()
@@ -357,40 +344,36 @@ impl PreparedCollectionCommit {
 
 /// A canonical commit whose complete dependency set has been written first.
 ///
-/// This type holds an OFFER-capturing facade over the exact store borrow used
-/// for staging. [`store_mut`](Self::store_mut) exposes only that facade, so
-/// reproducible unsigned equations and their artifacts can be appended before
-/// the source membership root becomes visible without escaping publication
-/// capture. Only consuming [`finalize`](Self::finalize) appends the signed
-/// `COMMIT` record. Drop is deliberately inert and never auto-finalizes.
+/// This type holds the exact store borrow used for staging, so reproducible
+/// unsigned equations and their artifacts can be appended before the source
+/// membership root becomes visible. Only consuming
+/// [`finalize`](Self::finalize) appends the signed `COMMIT` record. Drop is
+/// deliberately inert and never auto-finalizes.
 #[must_use = "dropping a staged collection commit leaves its dependencies inert; call finalize to publish it"]
 pub struct StagedCollectionCommit<'store, S>
 where
-    S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+    S: BlobStorePut + CollectionStore,
 {
-    store: OfferCapture<&'store mut S>,
+    store: &'store mut S,
     commit: CollectionCommit,
 }
 
 impl<'store, S> StagedCollectionCommit<'store, S>
 where
-    S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+    S: BlobStorePut + CollectionStore,
 {
     /// Inspect the exact commit that remains withheld from the store.
     pub fn commit(&self) -> &CollectionCommit {
         &self.commit
     }
 
-    /// Borrow the staged publication's capturing destination for intervening
-    /// artifacts.
+    /// Borrow the staged publication's destination for intervening artifacts.
     ///
     /// Writes performed here occur after the dependency writes and before the
-    /// final commit append. Successful puts cannot escape the scope: the next
-    /// unsigned record, or final COMMIT when no intervening record exists,
-    /// first records the complete pending OFFER batch. The caller remains
-    /// responsible for validity and dependency ordering.
-    pub fn store_mut(&mut self) -> &mut OfferCapture<&'store mut S> {
-        &mut self.store
+    /// final commit append. The caller remains responsible for validity and
+    /// dependency ordering.
+    pub fn store_mut(&mut self) -> &mut S {
+        self.store
     }
 
     /// Append the canonical signed commit last.
@@ -400,11 +383,8 @@ where
     /// Durability remains an explicit caller-selected store operation.
     pub fn finalize(
         self,
-    ) -> Result<
-        CollectionCommit,
-        PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
-    > {
-        let Self { mut store, commit } = self;
+    ) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>> {
+        let Self { store, commit } = self;
         store
             .insert(CollectionRecord::Commit(commit))
             .map_err(PublicationError::RecordInsert)?;
@@ -858,12 +838,9 @@ pub fn publish_commit<S>(
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
     signing_key: &SigningKey,
-) -> Result<
-    CollectionCommit,
-    PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
->
+) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>>
 where
-    S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+    S: BlobStorePut + CollectionStore,
 {
     let prepared = prepare_commit(descriptor, data, metadata).map_err(widen_preparation_error)?;
     prepared.stage(store, signing_key)?.finalize()
@@ -886,12 +863,9 @@ pub fn publish_fragment_commit<S>(
     descriptor: &Fragment,
     fragment: Fragment,
     signing_key: &SigningKey,
-) -> Result<
-    CollectionCommit,
-    PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
->
+) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>>
 where
-    S: BlobStorePut + CollectionStore + ArtifactOfferStore,
+    S: BlobStorePut + CollectionStore,
 {
     let prepared =
         prepare_fragment_commit(descriptor, fragment).map_err(widen_preparation_error)?;
@@ -920,9 +894,8 @@ where
 ///
 /// The input handles are read and validated but never rewritten. The
 /// collection descriptor and canonical union result are written first, then
-/// offered as one canonical batch immediately before the `MERGE` record that
-/// names them. The returned pair is `(canonical record, canonical result
-/// blob)`.
+/// the `MERGE` record names them. The returned pair is `(canonical record,
+/// canonical result blob)`.
 ///
 /// No durability flush is implied. Failed backend I/O may require recovery
 /// according to that backend's contract; after recovery, replay with the same
@@ -932,18 +905,14 @@ pub fn publish_merge<S>(
     descriptor: &Fragment,
     low: CollectionData,
     high: CollectionData,
-) -> Result<
-    (CollectionMerge, Blob<SimpleArchive>),
-    PublicationError<S::PutError, OfferCaptureInsertError<S::OfferError, S::InsertError>>,
->
+) -> Result<(CollectionMerge, Blob<SimpleArchive>), PublicationError<S::PutError, S::InsertError>>
 where
-    S: BlobStore + CollectionStore + ArtifactOfferStore,
+    S: BlobStore + CollectionStore,
 {
-    let mut capture = OfferCapture::new(store);
-    publish_merge_unoffered(&mut capture, descriptor, low, high)
+    publish_merge_inner(store, descriptor, low, high)
 }
 
-fn publish_merge_unoffered<S>(
+fn publish_merge_inner<S>(
     store: &mut S,
     descriptor: &Fragment,
     low: CollectionData,
@@ -1250,7 +1219,6 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum ProbeEvent {
         Put([u8; 32]),
-        Offer(Vec<[u8; 32]>),
         Insert(Id),
     }
 
@@ -1258,7 +1226,6 @@ mod tests {
     struct ProbeStore {
         events: Vec<ProbeEvent>,
         known: BTreeSet<[u8; 32]>,
-        offered: BTreeSet<[u8; 32]>,
         records: BTreeMap<Id, CollectionRecord>,
         fail_at: Option<usize>,
         // The probe records the *sequence* of store operations; the bytes are
@@ -1302,29 +1269,6 @@ mod tests {
 
         fn recover(&mut self) {
             self.fail_at = None;
-        }
-    }
-
-    impl crate::repo::ArtifactOfferStore for ProbeStore {
-        type OfferError = ProbeFailure;
-
-        fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
-        where
-            I: IntoIterator<Item = crate::repo::ArtifactHandle>,
-        {
-            let handles = handles
-                .into_iter()
-                .map(|handle| handle.raw)
-                .collect::<Vec<_>>();
-            self.attempt(ProbeEvent::Offer(handles.clone()))?;
-            self.offered.extend(handles);
-            Ok(())
-        }
-
-        fn offers_snapshot(
-            &mut self,
-        ) -> Result<crate::repo::ArtifactOfferSnapshot, Self::OfferError> {
-            Ok(crate::repo::ArtifactOfferSnapshot::default())
         }
     }
 
@@ -1417,19 +1361,6 @@ mod tests {
         ProbeEvent::Insert(record.id())
     }
 
-    fn offer_event(events: &[ProbeEvent]) -> ProbeEvent {
-        let handles = events
-            .iter()
-            .filter_map(|event| match event {
-                ProbeEvent::Put(handle) => Some(*handle),
-                ProbeEvent::Offer(_) | ProbeEvent::Insert(_) => None,
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        ProbeEvent::Offer(handles)
-    }
-
     fn fragment_fixture() -> (
         Fragment,
         Inline<Handle<UTF8String>>,
@@ -1514,7 +1445,6 @@ mod tests {
             vec![put_event(&content_archive), put_event(&metadata_archive)],
         ]
         .concat();
-        sequence.push(offer_event(&sequence));
         sequence.push(insert_event(derive_record));
         sequence.push(insert_event(commit_record));
 
@@ -1623,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_stage_retains_and_offers_the_descriptor_name_before_commit() {
+    fn direct_stage_retains_the_descriptor_name_before_commit() {
         let descriptor = root("attached descriptor name");
         let name_handle = descriptor_facts::name(descriptor.facts())
             .unwrap()
@@ -1646,12 +1576,8 @@ mod tests {
             .commits()
             .is_empty());
         drop(snapshot);
-        assert!(staged.store_mut().offers_snapshot().unwrap().is_empty());
-
         staged.finalize().unwrap();
 
-        let offers = store.offers_snapshot().unwrap();
-        assert!(offers.contains(name_handle.transmute()));
         let snapshot = store.snapshot().unwrap();
         let discovered = discover_collection_records(&snapshot).unwrap();
         assert_eq!(discovered.commits(), &[commit]);
@@ -1684,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_commit_withholds_offers_until_finalize_and_cannot_expose_raw_store() {
+    fn staged_commit_withholds_the_record_until_finalize() {
         let descriptor = root("first");
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let (fragment, _, _) = fragment_fixture();
@@ -1692,73 +1618,38 @@ mod tests {
         let mut store = MemoryRepo::default();
 
         let mut staged = prepared.stage(&mut store, &signing_key).unwrap();
-        let pending = staged.store_mut().pending().collect::<Vec<_>>();
-        assert!(
-            pending.len() >= 4,
-            "descriptor, attachment(s), data, metadata"
-        );
-        assert!(staged.store_mut().offers_snapshot().unwrap().is_empty());
+        let commit = *staged.commit();
+        let snapshot = staged.store_mut().snapshot().unwrap();
+        assert!(discover_collection_records(&snapshot)
+            .unwrap()
+            .commits()
+            .is_empty());
+        drop(snapshot);
         staged.finalize().unwrap();
 
-        let offers = store.offers_snapshot().unwrap();
-        assert!(pending.into_iter().all(|handle| offers.contains(handle)));
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(
+            discover_collection_records(&snapshot).unwrap().commits(),
+            &[commit]
+        );
     }
 
     #[test]
-    fn staged_finalize_offer_failure_withholds_commit() {
+    fn staged_finalize_insert_failure_withholds_commit() {
         let descriptor = root("first");
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let prepared = prepare_fragment_commit(&descriptor, Fragment::empty()).unwrap();
-        // Descriptor attachments, descriptor, data, metadata, then OFFER.
-        let offer_at = embedded_put_events(&descriptor).len() + 4;
-        let mut store = ProbeStore::failing_before_effect_at(offer_at);
+        // Descriptor attachments, descriptor, data, metadata, then COMMIT.
+        let insert_at = embedded_put_events(&descriptor).len() + 4;
+        let mut store = ProbeStore::failing_before_effect_at(insert_at);
         let staged = prepared.stage(&mut store, &signing_key).unwrap();
         let commit = *staged.commit();
 
         assert!(matches!(
             staged.finalize(),
-            Err(PublicationError::RecordInsert(
-                OfferCaptureInsertError::Offer {
-                    source: ProbeFailure(at),
-                    ..
-                }
-            )) if at == offer_at
+            Err(PublicationError::RecordInsert(ProbeFailure(at))) if at == insert_at
         ));
         assert!(!store.records.contains_key(&commit.id()));
-    }
-
-    #[test]
-    fn staged_intervening_insert_is_offer_gated() {
-        let descriptor = root("first");
-        let target = root("second");
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (fragment, _, _) = fragment_fixture();
-        let descriptor_count = embedded_put_events(&descriptor).len();
-        let embedded_count = embedded_put_events(&fragment).len();
-        let prepared = prepare_fragment_commit(&descriptor, fragment).unwrap();
-        let offer_at = descriptor_count + embedded_count + 4;
-        let mut store = ProbeStore::failing_before_effect_at(offer_at);
-        let mut staged = prepared.stage(&mut store, &signing_key).unwrap();
-        let derive = CollectionDerive::new(
-            identity_for_tests(&target),
-            staged.commit().data(),
-            Inline::new([0x42; 32]),
-        );
-
-        assert!(matches!(
-            staged
-                .store_mut()
-                .insert(CollectionRecord::Derive(derive)),
-            Err(OfferCaptureInsertError::Offer {
-                source: ProbeFailure(at),
-                ..
-            }) if at == offer_at
-        ));
-        assert!(!staged
-            .store_mut()
-            .inner()
-            .records
-            .contains_key(&derive.id()));
     }
 
     #[test]
@@ -1776,7 +1667,6 @@ mod tests {
             ],
         ]
         .concat();
-        sequence.push(offer_event(&sequence));
         sequence.push(insert_event(CollectionRecord::Commit(expected)));
 
         let mut store = ProbeStore::default();
@@ -1799,7 +1689,7 @@ mod tests {
             .into_iter()
             .map(|event| match event {
                 ProbeEvent::Put(handle) => handle,
-                ProbeEvent::Offer(_) | ProbeEvent::Insert(_) => unreachable!(),
+                ProbeEvent::Insert(_) => unreachable!(),
             })
             .collect();
         expected_handles.extend([
@@ -1838,7 +1728,6 @@ mod tests {
             vec![put_event(&content_archive), put_event(&metadata_archive)],
         ]
         .concat();
-        sequence.push(offer_event(&sequence));
         sequence.push(insert_event(CollectionRecord::Commit(expected)));
 
         let mut store = ProbeStore::default();
@@ -1859,7 +1748,7 @@ mod tests {
             .chain(embedded)
             .map(|event| match event {
                 ProbeEvent::Put(handle) => handle,
-                ProbeEvent::Offer(_) | ProbeEvent::Insert(_) => {
+                ProbeEvent::Insert(_) => {
                     unreachable!("embedded events are puts")
                 }
             })
@@ -1901,14 +1790,13 @@ mod tests {
             data(&expected_result),
         );
         // The inputs are already states of the collection, so the merge
-        // writes only what it computed, offers those outputs, then publishes.
+        // writes only what it computed, then publishes.
         let mut sequence = vec![
             put_event(&IntoBlob::<SimpleArchive>::to_blob(
                 descriptor.facts().clone(),
             )),
             put_event(&expected_result),
         ];
-        sequence.push(offer_event(&sequence));
         sequence.push(insert_event(CollectionRecord::Merge(expected_merge)));
 
         let mut store = ProbeStore::default();
@@ -1941,41 +1829,24 @@ mod tests {
     fn commit_publication_orders_completed_prefixes_and_replays_after_recovery() {
         let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
         let descriptor_count = embedded_put_events(&descriptor).len();
-        let offer_at = descriptor_count + 4;
-        let insert_at = offer_at + 1;
+        let insert_at = descriptor_count + 4;
         for fail_at in 1..=insert_at {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
             let error =
                 publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key)
                     .unwrap_err();
             match (fail_at, error) {
-                (at, PublicationError::DependencyPut(ProbeFailure(observed))) if at < offer_at => {
+                (at, PublicationError::DependencyPut(ProbeFailure(observed))) if at < insert_at => {
                     assert_eq!(observed, fail_at)
                 }
-                (
-                    at,
-                    PublicationError::RecordInsert(OfferCaptureInsertError::Offer {
-                        source: ProbeFailure(observed),
-                        artifacts,
-                    }),
-                ) if at == offer_at => {
-                    assert_eq!(observed, fail_at);
-                    assert_eq!(artifacts.len(), descriptor_count + 3);
-                    assert!(store.offered.is_empty());
-                }
-                (
-                    at,
-                    PublicationError::RecordInsert(OfferCaptureInsertError::Insert(ProbeFailure(
-                        observed,
-                    ))),
-                ) if at == insert_at => {
+                (at, PublicationError::RecordInsert(ProbeFailure(observed))) if at == insert_at => {
                     assert_eq!(observed, fail_at)
                 }
                 (_, error) => panic!("unexpected publication error: {error}"),
             }
 
             assert!(!store.records.contains_key(&expected.id()));
-            if fail_at <= offer_at {
+            if fail_at < insert_at {
                 assert!(!store.events.contains(&ProbeEvent::Insert(expected.id())));
             }
 
@@ -1986,31 +1857,6 @@ mod tests {
             assert_eq!(retried, expected);
             assert!(store.records.contains_key(&expected.id()));
         }
-    }
-
-    #[test]
-    fn fragment_commit_offer_failure_withholds_commit_with_full_retry_batch() {
-        let descriptor = root("first");
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (fragment, _, _) = fragment_fixture();
-        let descriptor_count = embedded_put_events(&descriptor).len();
-        let embedded_count = embedded_put_events(&fragment).len();
-        let offer_at = descriptor_count + embedded_count + 4;
-        let mut store = ProbeStore::failing_before_effect_at(offer_at);
-
-        let error =
-            publish_fragment_commit(&mut store, &descriptor, fragment, &signing_key).unwrap_err();
-        let PublicationError::RecordInsert(OfferCaptureInsertError::Offer {
-            source: ProbeFailure(at),
-            artifacts,
-        }) = error
-        else {
-            panic!("unexpected publication error: {error}");
-        };
-        assert_eq!(at, offer_at);
-        assert_eq!(artifacts.len(), descriptor_count + embedded_count + 3);
-        assert!(store.records.is_empty());
-        assert!(store.offered.is_empty());
     }
 
     #[test]
@@ -2026,9 +1872,9 @@ mod tests {
             data(high),
             data(&result),
         );
-        // Descriptor/result puts, one OFFER batch, then the record. Inputs are
-        // read, not written.
-        for fail_at in 1..=4 {
+        // Descriptor/result puts, then the record. Inputs are read, not
+        // written.
+        for fail_at in 1..=3 {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
             store.seed(&left);
             store.seed(&right);
@@ -2038,30 +1884,14 @@ mod tests {
                 (1..=2, PublicationError::DependencyPut(ProbeFailure(at))) => {
                     assert_eq!(at, fail_at)
                 }
-                (
-                    3,
-                    PublicationError::RecordInsert(crate::repo::OfferCaptureInsertError::Offer {
-                        source: ProbeFailure(at),
-                        artifacts,
-                    }),
-                ) => {
-                    assert_eq!(at, fail_at);
-                    assert_eq!(artifacts.len(), 2);
-                    assert!(store.offered.is_empty());
-                }
-                (
-                    4,
-                    PublicationError::RecordInsert(crate::repo::OfferCaptureInsertError::Insert(
-                        ProbeFailure(at),
-                    )),
-                ) => {
+                (3, PublicationError::RecordInsert(ProbeFailure(at))) => {
                     assert_eq!(at, fail_at)
                 }
                 (_, error) => panic!("unexpected publication error: {error}"),
             }
 
             assert!(!store.records.contains_key(&expected.id()));
-            if fail_at <= 3 {
+            if fail_at < 3 {
                 assert!(!store.events.contains(&ProbeEvent::Insert(expected.id())));
             }
 

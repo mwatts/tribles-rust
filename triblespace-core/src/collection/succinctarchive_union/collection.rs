@@ -34,7 +34,7 @@ use crate::collection::{
     Cover, CoverAdvanceError, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::inline::encodings::hash::Handle;
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::Fragment;
 
 use super::{RawToRank9AcceleratedMapping, SimpleToSuccinctMapping};
@@ -356,7 +356,7 @@ impl SuccinctArchiveView {
         current: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         if self.cover.as_ref() == Some(current) {
@@ -424,7 +424,7 @@ impl SuccinctArchiveView {
         SuccinctArchiveCollectionError,
     >
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let measured = MeasuredSuccinctHomomorphism::new(SimpleToSuccinctMapping, work);
@@ -511,7 +511,7 @@ impl SuccinctArchiveCollection {
         source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let raw_cover = self.raw_kernel()?.ensure_exact(store, source_cover)?;
@@ -531,7 +531,7 @@ impl SuccinctArchiveCollection {
         source_cover: &FactCover,
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let raw = compact_exact_target(&self.raw_kernel()?, store, source_cover)?;

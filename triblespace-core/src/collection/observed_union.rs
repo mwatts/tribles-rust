@@ -80,7 +80,7 @@ use super::{
     Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
     CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 
 /// Width of one stored id.
 const ID_LEN: usize = 16;
@@ -493,7 +493,7 @@ impl ObservedSetCollection {
         source_cover: &FactCover,
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;

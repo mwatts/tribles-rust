@@ -29,8 +29,6 @@ merge or derivation equations provide reusable physical work.
   query their union lazily.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
-- **OFFER** — positive local willingness to serve an artifact; it is neither
-  residency, demand, synchronized inventory, retention, nor authority.
 
 `MemoryRepo`, `Pile`, and the storage composition wrappers implement both the
 blob and native collection surfaces. A collection is its descriptor handle;
@@ -116,8 +114,7 @@ One `store.commit(collection, signer, fragment)` performs these semantic steps:
 2. store the fragment's attachments;
 3. encode the fragment's facts as the canonical `SimpleArchive` member;
 4. encode metafacts as the mandatory canonical metadata `SimpleArchive`;
-5. durably offer those dependencies; and
-6. insert a signed `COMMIT` naming the descriptor, data, and metadata handles.
+5. insert a signed `COMMIT` naming the descriptor, data, and metadata handles.
 
 Dependencies precede the record which gives them authority. Publication does
 not flush implicitly. Call `flush()` at the application's chosen durability
@@ -319,42 +316,6 @@ A reconciler may satisfy those questions from local workers or peers. The
 answer to an operation WANT is the ordinary native equation; obtaining its
 result bytes is a separate blob WANT. A WANT grants no authority and does not
 change the value of any collection.
-
-## OFFER local service intent
-
-`ArtifactOfferStore` durably records a grow-only set of handles this store is
-willing to serve. `offer_all` is the primary operation so callers can publish a
-whole successful workflow batch through one backend boundary; repeated handles
-and already-known offers are idempotent. `offers_snapshot` is a cheap immutable
-deterministic observation for local service policy.
-
-OFFER is intentionally not a second collection or network inventory. It says
-nothing about authority, reach, current residency, retention, or demand. A
-conservative rewrite carries the marker forward but may collect the artifact,
-leaving dormant intent that becomes effective if identical content returns.
-
-Piles populated before OFFER was part of normal publication can recover this
-local intent explicitly:
-
-```text
-trible pile migrate data.pile seed-artifact-offers --dry-run
-trible pile migrate data.pile seed-artifact-offers
-```
-
-The command freezes native collection records, then observes one resident-blob
-and one existing-OFFER snapshot. A strictly signed COMMIT contributes the
-resident conservative closure of its collection descriptor, data, and
-metadata, including resident attachments. MERGE contributes only its resident
-descriptor and result; DERIVE contributes only its resident target descriptor
-and output. Inputs are reproducible provenance rather than serving intent.
-Invalid commits are inert, missing references are counted without creating
-WANTs, corrupt selected content fails the run before any new OFFER is written,
-and unrelated resident blobs are never scanned. Re-running is idempotent.
-
-This is intentionally a dedicated operator action rather than part of generic
-schema migration: it states willingness to serve historical artifacts. It does
-not add collection evidence, bind a team, require a cover, or turn OFFER into
-a garbage-collection root.
 
 ## Migrate a legacy branch explicitly
 

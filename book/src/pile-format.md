@@ -1,7 +1,7 @@
 # Pile Format
 
 The on-disk pile keeps blobs, native collection records, native capability
-proofs, positive peer-routing evidence, artifact offers, wants, and decodable legacy pin
+proofs, positive peer-routing evidence, wants, and decodable legacy pin
 evidence in one
 append-only file. The write-ahead log *is*
 the database: all indices are
@@ -71,7 +71,6 @@ their canonical body.
 
 A collection descriptor and every capability claim remain ordinary blobs.
 Peer-routing evidence is a separate native grow-only set.
-Artifact offers are a separate local grow-only set.
 Typed WANT assertions and retractions have their own kinds; historical pin
 records remain readable for explicit migration and conservative retention.
 
@@ -114,8 +113,8 @@ cannot conservatively mean “no effect”—requires a new frame magic instead.
 Concatenation is associative ordered composition, not universally commutative:
 WANT assertions/retractions and decoded legacy pins are right-biased logs.
 Opaque filtering is sound because it leaves the relative order of every known
-record unchanged; native collection, capability-proof, peer-evidence, and
-artifact-offer records additionally collapse to
+record unchanged; native collection, capability-proof, and peer-evidence
+records additionally collapse to
 order-independent set union.
 
 ### Compatibility surface: v0.46.4, and a reframe for everything else
@@ -141,8 +140,7 @@ The re-encode is semantic and in source order, which is what makes it faithful:
   the moment of a rewrite is not a fact about when a blob arrived.
 - Legacy pins and WANT state are replayed in order, so the result's immutable
   compatibility snapshot and operational request projection equal the source's.
-- Collection records, capability proofs, peer-routing evidence, and artifact
-  offers are
+- Collection records, capability proofs, and peer-routing evidence are
   grow-only sets, so order is irrelevant and re-insertion is idempotent.
 - Records that never carried live state are dropped and counted: inert legacy
   V3 collection headers, retired local cells, and kinds no longer interpreted.
@@ -200,13 +198,13 @@ refreshing state.
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
    `applied_length`, and rebuilds the blob, collection-record,
-   capability-proof, peer-evidence, artifact-offer, WANT, and legacy pin-snapshot indices
+   capability-proof, peer-evidence, WANT, and legacy pin-snapshot indices
    in memory. It **fails loud** on a corrupt or torn record
    (`ReadError::CorruptPile { valid_length }`). It skips bounded unknown
    envelope kinds as opaque records and distinguishes an unknown legacy marker
    as `ReadError::UnsupportedRecord { offset, marker }`. It never mutates the
    file. Callers rarely need to invoke it directly:
-   `Pile::snapshot` and collection/OFFER/WANT/pin-snapshot observations refresh internally
+   `Pile::snapshot` and collection/WANT/pin-snapshot observations refresh internally
    before observing records, so external writers are visible without a
    standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
@@ -223,13 +221,12 @@ refreshing state.
    exclusive file lock, so an intervening repair cannot move the boundary
    between validation and mutation.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
-   `CollectionStore::insert`, `PeerStore::insert_peer`, `ArtifactOfferStore`,
-   and `WantStore`
+   `CollectionStore::insert`, `PeerStore::insert_peer`, and `WantStore`
    operations extend the file. Each
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
    Blob records use a single `write_vectored` call; fixed-width collection,
-   WANT, OFFER, and peer records use one append of their 256-byte frame, and native proof records
+   WANT and peer records use one append of their 256-byte frame, and native proof records
    append their complete bounded frame once.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
@@ -569,26 +566,6 @@ body order through a PATCH index. Presence is deliberately weak: it grants no
 authority and proves no liveness, reachability, content residency, retention,
 or current membership. Conservative rewrites preserve the evidence record but
 do not turn either key into a blob root.
-
-## Native Artifact Offer Records
-
-`ArtifactOfferStore` is a grow-only set of local willingness-to-serve markers.
-Each member names one content-addressed artifact handle:
-
-| Offset | Width | Field |
-|---:|---:|---|
-| `0..28` | 28 | Framing magic |
-| `28..32` | 4 | Span `1`, little-endian |
-| `32..64` | 32 | OFFER kind `EA7B185AC83955D2249F4D8C83B6910D44D01C61B4E497C1B66E1B75C3ADCB6F`, rooted at `6EE89EEA7E6ECB2463FA5EE9C955B378` (minted with `trible genid` on 2026-08-27) |
-| `64..96` | 32 | Artifact BLAKE3 handle |
-| `96..256` | 160 | Reserved zeros |
-
-There is no `UNOFFER` record. Bulk insertion deduplicates the request and
-already-observed handles, pile concatenation unions the set, and snapshots
-iterate in canonical handle order. OFFER is store-local service intent: it is
-not authority, collection evidence, reach, WANT, residency proof, synchronized
-inventory, or a garbage-collection root. Reframe and conservative Pile/Yard
-rewrites preserve the marker even when the named blob is absent or collected.
 
 ## Retired: Collection Publication Grants
 

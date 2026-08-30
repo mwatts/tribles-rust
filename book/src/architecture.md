@@ -65,8 +65,7 @@ unverified or irrelevant proof in storage grants nothing.
 ├──────────────────────────────────────────────────┤
 │ Storage                                          │
 │ CollectionStore · BlobStore · WantStore          │
-│ ArtifactOfferStore · CapabilityProofStore         │
-│ PeerStore                                        │
+│ CapabilityProofStore · PeerStore                 │
 ├──────────────────────────────────────────────────┤
 │ Data and representations                         │
 │ TribleSet/PATCH · SimpleArchive · SuccinctArchive│
@@ -159,7 +158,7 @@ above it.
 
 The collection value is its canonical descriptor handle. The descriptor
 carries one mandatory local authority, and the storage backend owns I/O and
-durability. `store.collection(descriptor_fragment)` registers and offers the
+durability. `store.collection(descriptor_fragment)` registers and stores the
 descriptor's complete attachment closure. `store.commit(collection, signer,
 fragment)` then loads and structurally validates that descriptor and publishes attachments,
 canonical data, canonical metadata, and the signed native record in dependency
@@ -243,16 +242,6 @@ involuntary blob mirroring. A peer can learn its authorized team's collection
 record frontier, then decide which blobs and derived representations are
 useful locally.
 
-## OFFER is local service intent
-
-An `ArtifactOfferStore` is the positive, grow-only set of artifact handles this
-store is willing to serve. OFFER is deliberately weaker than both residency
-and WANT: it neither proves that bytes are currently present nor requests that
-they be fetched. It grants no authority, contributes no collection evidence,
-does not join synchronized inventory, and never becomes a garbage-collection
-root. This narrow meaning lets store-local publication intent survive restart
-and conservative rewriting without turning policy into ownership.
-
 ## Peer evidence is topology, not authority
 
 `PeerStore` holds positive `PEER(team_public_key, peer_public_key)` routing
@@ -265,7 +254,7 @@ union without coupling transport policy to capability verification.
 ## Storage and synchronization compose by union
 
 `Pile` stores blobs, native collection records, capability proofs, peer
-evidence, OFFER records, and WANT records in one
+evidence, and WANT records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
 content-derived object keys. The network layer uses authenticated Merkle walks
 to union one team's PEER evidence, collection records, proofs, and optionally

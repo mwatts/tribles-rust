@@ -13,7 +13,7 @@ use std::fmt;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, OfferCapture};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 
 use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
 use super::{
@@ -125,29 +125,13 @@ pub fn compact_exact_target<S, H>(
     source_cover: &Cover<H::Source>,
 ) -> Result<Cover<H::Target>, ExactTargetCompactionError>
 where
-    S: BlobStore + CollectionStore + ArtifactOfferStore,
-    S::Snapshot: BlobStoreMeta + CollectionRead,
-    H: CollectionMapping,
-    Handle<H::Source>: InlineEncoding,
-    Handle<H::Target>: InlineEncoding,
-{
-    let mut capture = OfferCapture::new(store);
-    compact_exact_target_unoffered(exact, &mut capture, source_cover)
-}
-
-pub(crate) fn compact_exact_target_unoffered<S, H>(
-    exact: &ExactDerivedCollection<H>,
-    store: &mut S,
-    source_cover: &Cover<H::Source>,
-) -> Result<Cover<H::Target>, ExactTargetCompactionError>
-where
     S: BlobStore + CollectionStore,
     S::Snapshot: BlobStoreMeta + CollectionRead,
     H: CollectionMapping,
     Handle<H::Source>: InlineEncoding,
     Handle<H::Target>: InlineEncoding,
 {
-    let mut cover = exact.ensure_exact_unoffered(store, source_cover)?;
+    let mut cover = exact.ensure_exact(store, source_cover)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 

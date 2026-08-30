@@ -46,7 +46,6 @@ fn legacy_mutation_commands_are_absent() {
     let migrate = help(&["pile", "migrate", "unused.pile"]);
     assert!(has_command(&migrate, "branch-to-collection"));
     assert!(has_command(&migrate, "reframe"));
-    assert!(has_command(&migrate, "seed-artifact-offers"));
     let branch_to_collection = help(&["pile", "migrate", "unused.pile", "branch-to-collection"]);
     assert!(branch_to_collection.contains("--collection-name"));
     assert!(branch_to_collection.contains("--authority"));
@@ -57,10 +56,6 @@ fn legacy_mutation_commands_are_absent() {
     let run = help(&["pile", "migrate", "unused.pile", "run"]);
     assert!(!run.contains("branch-metadata-name"));
     assert!(!run.contains("no-rename-duplicates"));
-    let seed = help(&["pile", "migrate", "unused.pile", "seed-artifact-offers"]);
-    assert!(seed.contains("--dry-run"));
-    assert!(!seed.contains("--team"));
-    assert!(!seed.contains("--ticket"));
 }
 
 #[test]

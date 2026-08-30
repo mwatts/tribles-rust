@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
 //! Content-addressed blob storage, complete capability proofs, collection
-//! records, positive peer-routing evidence, durable wants and artifact offers,
+//! records, positive peer-routing evidence, durable wants,
 //! and read-only access to legacy named-pin snapshots.
 //!
 //! Collections are the mutable-history replacement. Legacy pin and commit
@@ -17,12 +17,6 @@ pub mod hybridstore;
 pub mod lazy;
 /// Fully in-memory storage implementation for tests and ephemeral use.
 pub mod memoryrepo;
-/// Grow-only local willingness to serve content-addressed artifacts.
-pub mod offer;
-pub use offer::{
-    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, OfferCapture,
-    OfferCaptureInsertError,
-};
 #[cfg(feature = "object-store")]
 /// Storage backed by an `object_store`-compatible remote (S3, local FS, etc.).
 pub mod objectstore;

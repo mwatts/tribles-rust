@@ -61,7 +61,7 @@ use triblespace_core::collection::{
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
-use triblespace_core::repo::{ArtifactOfferStore, BlobStoreGet, BlobStoreList};
+use triblespace_core::repo::{BlobStoreGet, BlobStoreList};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MappingCalls {
@@ -115,7 +115,6 @@ impl CollectionMapping<SimpleArchive, SuccinctArchiveBlob> for CountingSuccinctM
 struct StoreShape {
     blobs: u64,
     blob_bytes: u64,
-    offers: u64,
     commits: u64,
     source_merges: u64,
     raw_derives: u64,
@@ -129,7 +128,6 @@ impl StoreShape {
         Self {
             blobs: self.blobs + other.blobs,
             blob_bytes: self.blob_bytes + other.blob_bytes,
-            offers: self.offers + other.offers,
             commits: self.commits + other.commits,
             source_merges: self.source_merges + other.source_merges,
             raw_derives: self.raw_derives + other.raw_derives,
@@ -143,7 +141,6 @@ impl StoreShape {
         Self {
             blobs: self.blobs - before.blobs,
             blob_bytes: self.blob_bytes - before.blob_bytes,
-            offers: self.offers - before.offers,
             commits: self.commits - before.commits,
             source_merges: self.source_merges - before.source_merges,
             raw_derives: self.raw_derives - before.raw_derives,
@@ -192,10 +189,6 @@ fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape 
         shape.blobs += 1;
         shape.blob_bytes += info.length;
     }
-    shape.offers = store
-        .offers_snapshot()
-        .expect("MemoryRepo offer snapshot is infallible")
-        .len();
     shape
 }
 
@@ -359,9 +352,6 @@ fn diagnose_raw(
     let diagnostic_before = store
         .snapshot()
         .expect("freeze pre-diagnostic store snapshot");
-    let offers_before = store
-        .offers_snapshot()
-        .expect("snapshot pre-diagnostic artifact offers");
     reset_mapping_calls();
     let raw_cover = exact
         .ensure_exact(store, cover)
@@ -376,13 +366,6 @@ fn diagnose_raw(
             .changes_since(&diagnostic_before)
             .is_empty(),
         "post-operation raw mapping diagnostic wrote sync-visible storage"
-    );
-    assert_eq!(
-        store
-            .offers_snapshot()
-            .expect("snapshot post-diagnostic artifact offers"),
-        offers_before,
-        "post-operation raw mapping diagnostic published an artifact offer"
     );
     (projection_calls, cover)
 }
@@ -424,26 +407,16 @@ fn run_warm_pair(
     let snapshot_after_warm = store
         .snapshot()
         .expect("freeze snapshot between warm and no-op calls");
-    let offers_after_warm = store
-        .offers_snapshot()
-        .expect("snapshot offers between warm and no-op calls");
 
     // Keep these public calls adjacent. In particular, do not materialize the
     // first result or replay the exact proof before timing the unchanged call.
     let timed_noop = time_operation(operation, store, context.cover, context.succinct);
     let snapshot_after_noop = store.snapshot().expect("freeze snapshot after no-op call");
-    let offers_after_noop = store
-        .offers_snapshot()
-        .expect("snapshot offers after no-op call");
     assert!(
         snapshot_after_noop
             .changes_since(&snapshot_after_warm)
             .is_empty(),
         "an unchanged public operation changed sync-visible storage"
-    );
-    assert_eq!(
-        offers_after_noop, offers_after_warm,
-        "an unchanged public operation published an artifact offer"
     );
 
     let after = store_shape(store, context.collections);
@@ -560,9 +533,6 @@ fn run_exact_view_pair(
     let snapshot_after_advance = store
         .snapshot()
         .expect("freeze snapshot between view advance and no-op");
-    let offers_after_advance = store
-        .offers_snapshot()
-        .expect("snapshot offers between view advance and no-op");
 
     let timed_noop = time_exact_view(view, store, context.cover);
     let noop_work = view
@@ -585,13 +555,6 @@ fn run_exact_view_pair(
             .changes_since(&snapshot_after_advance)
             .is_empty(),
         "an unchanged exact view changed sync-visible storage",
-    );
-    assert_eq!(
-        store
-            .offers_snapshot()
-            .expect("snapshot offers after view no-op"),
-        offers_after_advance,
-        "an unchanged exact view published an artifact offer",
     );
 
     let after = store_shape(store, context.collections);
@@ -1003,21 +966,11 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +O=offers, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; maps=canonical source-to-target mapping calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; maps=canonical source-to-target mapping calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
     );
     println!(
-        "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
-        "commits",
-        "arm",
-        "+B",
-        "+bytes",
-        "+O",
-        "+D",
-        "+M",
-        "+A",
-        "support",
-        "projection maps",
-        "arg-MiB",
+        "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
+        "commits", "arm", "+B", "+bytes", "+D", "+M", "+A", "support", "projection maps", "arg-MiB",
     );
     for &checkpoint in &checkpoints {
         for arm in arms {
@@ -1037,12 +990,11 @@ fn main() {
                     ),
                 };
             println!(
-                "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
+                "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
                 checkpoint,
                 arm.label(),
                 work.blobs,
                 work.blob_bytes,
-                work.offers,
                 work.raw_derives,
                 work.raw_merges,
                 work.accelerated_records,

@@ -98,7 +98,6 @@ pub use crate::repo::WantRequest;
 pub use crate::repo::WantRequestDecodeError;
 pub use crate::repo::WantStore;
 pub use crate::repo::WANT_REQUEST_BYTES_LEN;
-pub use crate::repo::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 pub use crate::repo::{BlobInfo, BlobStoreList};
 pub use crate::trible::Fragment;
 pub use crate::trible::Spread;

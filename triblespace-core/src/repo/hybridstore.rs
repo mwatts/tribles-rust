@@ -22,19 +22,18 @@ use crate::repo::SnapshotSource;
 use crate::repo::StorageFlush;
 use crate::repo::StoreChanges;
 use crate::repo::StoreSnapshot;
-use crate::repo::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 use crate::repo::{WantRequest, WantStore};
 use std::error::Error;
 use std::fmt;
 
-/// Store that delegates blob/want/offer and collection-record operations to two
+/// Store that delegates blob/want and collection-record operations to two
 /// independent stores.
 ///
 /// This allows mixing different storage implementations, for example an
 /// on-disk blob store with an in-memory collection-record store.
 #[derive(Debug)]
 pub struct HybridStore<B, R> {
-    /// Storage for content-addressed blobs, durable typed wants, and offers.
+    /// Storage for content-addressed blobs and durable typed wants.
     pub blobs: B,
     /// Storage for native collection records.
     pub records: R,
@@ -44,8 +43,8 @@ pub struct HybridStore<B, R> {
 /// [`HybridStore`].
 ///
 /// Blob capabilities come exclusively from `blobs`; collection, proof, and
-/// peer capabilities come exclusively from `records`. Offers and wants remain
-/// mutable local operational state and are intentionally absent. The record
+/// peer capabilities come exclusively from `records`. Wants remain mutable
+/// local operational state and are intentionally absent. The record
 /// half is sampled first and the blob half second, mirroring dependency-first
 /// publication: every semantic record observed by a conforming writer can
 /// therefore see the blobs published before it.
@@ -118,24 +117,6 @@ where
             Self::Blobs(error) => Some(error),
             Self::Records(error) => Some(error),
         }
-    }
-}
-
-impl<B, R> ArtifactOfferStore for HybridStore<B, R>
-where
-    B: ArtifactOfferStore,
-{
-    type OfferError = B::OfferError;
-
-    fn offer_all<I>(&mut self, handles: I) -> Result<(), Self::OfferError>
-    where
-        I: IntoIterator<Item = ArtifactHandle>,
-    {
-        self.blobs.offer_all(handles)
-    }
-
-    fn offers_snapshot(&mut self) -> Result<ArtifactOfferSnapshot, Self::OfferError> {
-        self.blobs.offers_snapshot()
     }
 }
 
@@ -494,17 +475,6 @@ mod tests {
         assert_eq!(record_snapshot.records().unwrap().count(), 1);
         let blob_snapshot = hybrid.blobs.snapshot().unwrap();
         assert_eq!(blob_snapshot.records().unwrap().count(), 0);
-    }
-
-    #[test]
-    fn artifact_offers_delegate_only_to_the_blob_side() {
-        let offered = ArtifactHandle::new([31; 32]);
-        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
-
-        hybrid.offer(offered).unwrap();
-        assert!(hybrid.offers_snapshot().unwrap().contains(offered));
-        assert!(hybrid.blobs.offers_snapshot().unwrap().contains(offered));
-        assert!(hybrid.records.offers_snapshot().unwrap().is_empty());
     }
 
     #[test]

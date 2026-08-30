@@ -24,7 +24,7 @@ use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, OfferCapture};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::Fragment;
 
 use super::discovery::discover_collection_records_for_derived_cover;
@@ -487,19 +487,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         source_cover: &Cover<MappingSource<Mapping>>,
     ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let mut capture = OfferCapture::new(store);
-        self.ensure_exact_unoffered(&mut capture, source_cover)
-    }
-
-    pub(crate) fn ensure_exact_unoffered<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
@@ -513,11 +500,10 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         source_cover: &Cover<MappingSource<Mapping>>,
     ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
-        S: BlobStore + CollectionStore + ArtifactOfferStore,
+        S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let mut capture = OfferCapture::new(store);
-        self.ensure_with_route(&mut capture, source_cover, SourceRoute::ExactMembers)
+        self.ensure_with_route(store, source_cover, SourceRoute::ExactMembers)
     }
 
     fn ensure_with_route<S>(
