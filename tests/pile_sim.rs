@@ -2,7 +2,9 @@ use anybytes::Bytes;
 use proptest::prelude::*;
 use std::collections::HashMap;
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::collection::{CollectionMerge, CollectionRecord, CollectionStore};
+use triblespace::core::collection::{
+    CollectionMerge, CollectionRead, CollectionRecord, CollectionStore,
+};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
@@ -86,7 +88,9 @@ fn scenario_strategy(max_actors: usize) -> impl Strategy<Value = Scenario> {
 
 fn observed_records(pile: &mut Pile) -> Vec<CollectionRecord> {
     pile.refresh().unwrap();
-    pile.records()
+    pile.snapshot()
+        .unwrap()
+        .records()
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
@@ -137,7 +141,7 @@ proptest! {
                         if let Some(handle) = handles.get(index % handles.len().max(1)).copied() {
                             piles[actor].refresh().unwrap();
                             if let Ok(blob) = piles[actor]
-                                .reader()
+                                .snapshot()
                                 .unwrap()
                                 .get::<Blob<UnknownBlob>, _>(handle)
                             {
@@ -168,9 +172,9 @@ proptest! {
                 ActorOp::Check => {
                     for pile in &mut piles {
                         pile.refresh().unwrap();
-                        let reader = pile.reader().unwrap();
+                        let snapshot = pile.snapshot().unwrap();
                         for (handle, data) in &expected_blobs {
-                            if let Ok(blob) = reader.get::<Blob<UnknownBlob>, _>(*handle) {
+                            if let Ok(blob) = snapshot.get::<Blob<UnknownBlob>, _>(*handle) {
                                 prop_assert_eq!(blob.bytes.as_ref(), data.as_slice());
                             }
                         }
@@ -190,12 +194,12 @@ proptest! {
 
         let mut final_pile = Pile::open(&path).unwrap();
         final_pile.amputate().unwrap();
-        let reader = final_pile.reader().unwrap();
+        let snapshot = final_pile.snapshot().unwrap();
         for (handle, data) in &expected_blobs {
-            let blob = reader.get::<Blob<UnknownBlob>, _>(*handle).unwrap();
+            let blob = snapshot.get::<Blob<UnknownBlob>, _>(*handle).unwrap();
             prop_assert_eq!(blob.bytes.as_ref(), data.as_slice());
         }
-        drop(reader);
+        drop(snapshot);
         assert_known_records(&mut final_pile, &expected_records)?;
         final_pile.close().unwrap();
     }

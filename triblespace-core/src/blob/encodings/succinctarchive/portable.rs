@@ -1519,7 +1519,7 @@ mod tests {
     use super::*;
     use crate::blob::encodings::UnknownBlob;
     use crate::blob::{Blob, Bytes, MemoryBlobStore};
-    use crate::repo::{BlobChildren, BlobStore};
+    use crate::repo::{BlobChildren, SnapshotSource};
 
     const ID_ONE: RawInline =
         hex!("0000000000000000000000000000000000000000000000000000000000000001");
@@ -1812,7 +1812,7 @@ mod tests {
         let mut store = MemoryBlobStore::new();
         store.insert(child);
         store.insert(parent);
-        let reader = store.reader().unwrap();
+        let reader = store.snapshot().unwrap();
         assert!(reader.children(parent_handle).contains(&child_handle));
     }
 

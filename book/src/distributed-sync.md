@@ -86,15 +86,19 @@ cleanup while returning a scope error to an operation that must not continue
 against a physically conflicted store; ordinary scheduler loops may use the
 unit-returning `refresh` surface and observe the warning instead.
 
-The store revision is component-aware local invalidation evidence. An equal
-token performs no inventory work. An unequal token conservatively identifies
-which of PEER, collection-record, capability-proof, and Blob membership may
-have changed; backends without that knowledge report all four. The host carries
-unchanged immutable PATCH components directly into the next snapshot and
-enumerates only changed components. Blob access is a fifth, non-semantic bit:
-a pile append or remap can require a fresh reader lease even when the set of
-Blob handles is identical, so the host refreshes the reader while sharing the
-existing Blob Merkle tree. These tokens and masks never cross the network.
+Each immutable store snapshot is also its own component-aware local
+invalidation token. `StoreSnapshot::changes_since` conservatively identifies
+which of PEER, collection-record, capability-proof, and the observable Blob
+view may have changed; backends without cheap classification report all
+components. The Blob component includes membership, metadata, and
+retrievability. Pile compares persistent PATCH root sharing, so an unrelated
+WANT append is a no-op while same-handle backing replacement still reports a
+Blob change. The host carries unchanged immutable PATCH components directly
+into the next serving snapshot and enumerates only changed components. These
+snapshots and change masks never cross the network. A semantic no-op refresh
+still replaces the host's physical Blob-reader lease while retaining its
+inventory tree, so compaction can retire old mmap and Yard generations without
+inventing a fifth semantic change component.
 
 ## Two independent capabilities
 
@@ -180,11 +184,11 @@ service both require every body to match its intrinsic key.
 The manifest pins immutable **component** snapshots in a server cache bounded
 to eight historical roots per component.
 Unchanged non-blob roots reuse the same component `Arc`. The Blob tree is also
-reused, but its small reader-bearing wrapper is refreshed so an unchanged key
+reused, but its small access-bearing wrapper is refreshed so an unchanged key
 set cannot pin an obsolete mmap or Yard generation indefinitely. Snapshot
 installation refreshes an already-pinned matching Blob root without implicitly
 pinning an unrequested one. Record-only
-churn therefore neither retains old blob readers nor duplicates the other
+churn therefore neither retains old blob-access snapshots nor duplicates the other
 inventory trees.
 Later node and blob-range requests repeat the exact root. If that snapshot has
 expired or been evicted, the server returns `snapshot unavailable`; it never
@@ -218,8 +222,8 @@ after a direct reciprocal capability-authenticated response.
 
 Artifact publication has one production path. `ArtifactOfferStore` records
 grow-only local willingness to serve `c`; `Peer::refresh` observes that policy
-independently of the four-component `StoreRevision`, so an OFFER-only append
-does not rebuild semantic inventory. The host intersects the complete OFFER
+outside the coherent semantic `StoreSnapshot`, so an OFFER-only append does
+not rebuild semantic inventory. The host intersects the complete OFFER
 snapshot with the Blob keys in its current immutable serving snapshot. Only
 that intersection is published, and only under a serving direction.
 

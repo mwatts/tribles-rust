@@ -5,13 +5,13 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
-use triblespace_core::collection::{CollectionRecord, CollectionStore};
+use triblespace_core::collection::{CollectionRead, CollectionRecord};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, INLINE_LEN};
-use triblespace_core::repo::pile::{Pile, PileReader};
+use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{
-    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStore, BlobStoreGet,
-    BlobStoreList,
+    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStoreGet, BlobStoreList,
+    SnapshotSource,
 };
 
 mod branch_to_collection;
@@ -136,25 +136,27 @@ impl ArtifactOfferSeedPlan {
 /// Explicitly recover local OFFER intent for artifacts published before OFFER
 /// was part of the normal publication boundary.
 ///
-/// Records are frozen first. The later reader and offer snapshots are each
-/// taken exactly once, so concurrent appenders can only become work for a
-/// later idempotent invocation. All candidate payloads are content-validated
-/// before the first append; a corrupt resident candidate therefore fails loud
-/// and is never newly offered.
+/// Collection records and resident blobs are frozen together. The operational
+/// offer view is then sampled once, so concurrent appenders can only become
+/// work for a later idempotent invocation. All candidate payloads are
+/// content-validated before the first append; a corrupt resident candidate
+/// therefore fails loud and is never newly offered.
 fn seed_artifact_offers(pile_path: &PathBuf, dry_run: bool) -> Result<()> {
     let mut pile = super::open_refreshed(pile_path)?;
 
     let res = (|| -> Result<(), anyhow::Error> {
-        let records = pile
+        let snapshot = pile
+            .snapshot()
+            .context("freeze native collection and blob view")?;
+        let records = snapshot
             .records()
             .context("freeze native collection records")?
             .collect::<Result<Vec<_>, _>>()
             .context("read frozen native collection records")?;
-        let reader = pile.reader().context("freeze resident blob view")?;
         let offers = pile
             .offers_snapshot()
             .context("freeze artifact offer view")?;
-        let plan = plan_artifact_offers(records, &reader, &offers)?;
+        let plan = plan_artifact_offers(records, &snapshot, &offers)?;
 
         print_artifact_offer_seed_plan(&plan, dry_run);
         if dry_run || plan.novel.is_empty() {
@@ -198,7 +200,7 @@ fn print_artifact_offer_seed_plan(plan: &ArtifactOfferSeedPlan, dry_run: bool) {
 
 fn plan_artifact_offers(
     records: Vec<CollectionRecord>,
-    reader: &PileReader,
+    snapshot: &PileSnapshot,
     offers: &ArtifactOfferSnapshot,
 ) -> Result<ArtifactOfferSeedPlan> {
     let mut plan = ArtifactOfferSeedPlan {
@@ -237,7 +239,7 @@ fn plan_artifact_offers(
     let mut queued = BTreeSet::new();
     let mut queue = VecDeque::new();
     for handle in recursive_roots {
-        if resident(reader, handle)? {
+        if resident(snapshot, handle)? {
             queued.insert(handle);
             queue.push_back(handle);
         } else {
@@ -246,7 +248,7 @@ fn plan_artifact_offers(
     }
 
     while let Some(handle) = queue.pop_front() {
-        let blob = validate_candidate(reader, handle)?;
+        let blob = validate_candidate(snapshot, handle)?;
         plan.candidates.insert(handle);
 
         // This is intentionally the canonical default `BlobChildren`
@@ -258,7 +260,7 @@ fn plan_artifact_offers(
             let mut raw = [0u8; INLINE_LEN];
             raw.copy_from_slice(chunk);
             let child = Inline::<Handle<UnknownBlob>>::new(raw);
-            if !queued.contains(&child) && resident(reader, child)? {
+            if !queued.contains(&child) && resident(snapshot, child)? {
                 queued.insert(child);
                 queue.push_back(child);
             }
@@ -269,11 +271,11 @@ fn plan_artifact_offers(
         if plan.candidates.contains(&handle) {
             continue;
         }
-        if !resident(reader, handle)? {
+        if !resident(snapshot, handle)? {
             plan.missing.insert(handle);
             continue;
         }
-        validate_candidate(reader, handle)?;
+        validate_candidate(snapshot, handle)?;
         plan.candidates.insert(handle);
     }
 
@@ -286,14 +288,17 @@ fn plan_artifact_offers(
     Ok(plan)
 }
 
-fn resident(reader: &PileReader, handle: ArtifactHandle) -> Result<bool> {
-    reader
+fn resident(snapshot: &PileSnapshot, handle: ArtifactHandle) -> Result<bool> {
+    snapshot
         .contains_blob(handle)
         .map_err(|error| anyhow!("inspect artifact {}: {error}", artifact_hex(handle)))
 }
 
-fn validate_candidate(reader: &PileReader, handle: ArtifactHandle) -> Result<Blob<UnknownBlob>> {
-    reader
+fn validate_candidate(
+    snapshot: &PileSnapshot,
+    handle: ArtifactHandle,
+) -> Result<Blob<UnknownBlob>> {
+    snapshot
         .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
         .map_err(|error| {
             anyhow!(
@@ -310,8 +315,8 @@ fn artifact_hex(handle: ArtifactHandle) -> String {
 fn list_migrations(pile_path: &PathBuf) -> Result<()> {
     let mut pile = super::open_refreshed(pile_path)?;
     let res = (|| -> Result<(), anyhow::Error> {
-        let reader = pile.reader().context("pile reader")?;
-        let (present, missing) = record_kind_description_census(&reader)?;
+        let snapshot = pile.snapshot().context("pile snapshot")?;
+        let (present, missing) = record_kind_description_census(&snapshot)?;
         let total = present + missing;
 
         println!("Known migrations:");
@@ -364,9 +369,8 @@ fn migrate_record_kind_descriptions(pile_path: &PathBuf, dry_run: bool) -> Resul
     let mut pile = super::open_refreshed(pile_path)?;
 
     let res = (|| -> Result<(), anyhow::Error> {
-        let reader = pile.reader().context("pile reader")?;
-        let (present, missing) = record_kind_description_census(&reader)?;
-        drop(reader);
+        let snapshot = pile.snapshot().context("pile snapshot")?;
+        let (present, missing) = record_kind_description_census(&snapshot)?;
 
         if missing == 0 {
             println!(
@@ -436,7 +440,11 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
         );
 
         let (mut checked, mut invalid) = (0usize, 0usize);
-        for record in out.records().map_err(|e| anyhow!("read records: {e:?}"))? {
+        let snapshot = out.snapshot().context("snapshot reframed pile")?;
+        for record in snapshot
+            .records()
+            .map_err(|e| anyhow!("read records: {e:?}"))?
+        {
             let record = record.map_err(|e| anyhow!("read record: {e:?}"))?;
             if let triblespace_core::collection::CollectionRecord::Commit(commit) = record {
                 checked += 1;
@@ -469,7 +477,7 @@ mod tests {
     use tempfile::TempDir;
     use triblespace_core::blob::{Blob, Bytes};
     use triblespace_core::collection::{
-        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
+        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
     };
     use triblespace_core::inline::encodings::hash::{Blake3, Hash};
     use triblespace_core::repo::{ArtifactOfferStore, BlobStorePut, WantStore};

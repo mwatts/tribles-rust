@@ -35,13 +35,13 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
-use triblespace_core::collection::store::CollectionStore;
+use triblespace_core::collection::CollectionRead;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace_core::repo::pile::PileSnapshot;
+use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 
 use super::open_refreshed;
@@ -274,9 +274,9 @@ impl Refs {
 /// Walk every collection record in the pile and tally which collections they
 /// name. Merges and derives are included: a collection that only ever appears
 /// as a derive target is still a collection this pile references.
-fn referenced_collections(pile: &mut Pile) -> Result<BTreeMap<CollectionHandle, Refs>> {
+fn referenced_collections(snapshot: &PileSnapshot) -> Result<BTreeMap<CollectionHandle, Refs>> {
     let mut refs: BTreeMap<CollectionHandle, Refs> = BTreeMap::new();
-    let records = pile
+    let records = snapshot
         .records()
         .map_err(|e| anyhow!("enumerate collection records: {e:?}"))?;
     for record in records {
@@ -405,15 +405,14 @@ fn sort_key(row: &Enumerated) -> (u8, String, [u8; 32]) {
 
 /// Every collection the pile references, descriptors decoded, in listing
 /// order.
-fn enumerate(pile: &mut Pile) -> Result<Vec<Enumerated>> {
-    let refs = referenced_collections(pile)?;
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+fn enumerate(snapshot: &PileSnapshot) -> Result<Vec<Enumerated>> {
+    let refs = referenced_collections(snapshot)?;
     let mut rows: Vec<Enumerated> = refs
         .into_iter()
         .map(|(handle, refs)| Enumerated {
             handle,
             refs,
-            fields: Fields::load(&reader, handle),
+            fields: Fields::load(snapshot, handle),
         })
         .collect();
     rows.sort_by_key(sort_key);
@@ -550,13 +549,14 @@ fn format_timestamp(millis: u64) -> String {
 fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Result<()> {
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
-        let rows = enumerate(&mut pile)?;
+        let snapshot = pile
+            .snapshot()
+            .map_err(|e| anyhow!("pile snapshot: {e:?}"))?;
+        let rows = enumerate(&snapshot)?;
         if rows.is_empty() {
             println!("(no collections referenced by pile {})", path.display());
             return Ok(());
         }
-        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-
         // A row's trailing columns are the same question for every section, so
         // they are built once here.
         let tail = |row: &Enumerated| -> Vec<String> {
@@ -587,7 +587,7 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
                 },
             ];
             if metadata {
-                match reader.metadata(row.handle) {
+                match snapshot.metadata(row.handle) {
                     Ok(Some(meta)) => {
                         cells.push(meta.length.to_string());
                         cells.push(format_timestamp(meta.timestamp));
@@ -745,15 +745,17 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
 fn run_show(path: PathBuf, reference: String) -> Result<()> {
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
-        let rows = enumerate(&mut pile)?;
+        let snapshot = pile
+            .snapshot()
+            .map_err(|e| anyhow!("pile snapshot: {e:?}"))?;
+        let rows = enumerate(&snapshot)?;
         let handle = resolve(&rows, &reference)?;
-        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-        let blob: Blob<SimpleArchive> = reader
+        let blob: Blob<SimpleArchive> = snapshot
             .get(handle)
             .map_err(|e| anyhow!("read descriptor blob {}: {e:?}", handle_hex(handle)))?;
 
         println!("collection: blake3:{}", handle_hex(handle));
-        if let Ok(Some(meta)) = reader.metadata(handle) {
+        if let Ok(Some(meta)) = snapshot.metadata(handle) {
             println!(
                 "descriptor blob: {} bytes, stored {}",
                 meta.length,
@@ -766,7 +768,7 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
         let descriptor = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob.clone())
             .map_err(|e| anyhow!("decode collection descriptor: {e:?}"))?;
         println!("entity id:      {:X}", descriptor::entity(&descriptor)?);
-        let fields = Fields::load(&reader, handle);
+        let fields = Fields::load(&snapshot, handle);
         match anchor(&fields) {
             Anchor::Root(Ok(name)) => println!("name:           {name}"),
             Anchor::Root(Err(e)) => println!("name:           <invalid: {e}>"),
@@ -801,7 +803,7 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
             None => println!("mapping algo:   <none>"),
         }
 
-        let facts: TribleSet = reader
+        let facts: TribleSet = snapshot
             .get::<TribleSet, SimpleArchive>(handle)
             .map_err(|e| anyhow!("unarchive descriptor: {e:?}"))?;
         println!("tribles:        {}", facts.len());
@@ -849,7 +851,10 @@ fn names_collection(record: &CollectionRecord, collection: CollectionHandle) -> 
 fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result<()> {
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
-        let rows = enumerate(&mut pile)?;
+        let snapshot = pile
+            .snapshot()
+            .map_err(|e| anyhow!("pile snapshot: {e:?}"))?;
+        let rows = enumerate(&snapshot)?;
         let handle = resolve(&rows, &reference)?;
         let row = rows
             .iter()
@@ -881,7 +886,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
         let short = |bytes: [u8; 32]| abbrev(&hex::encode(bytes), long);
         let mut printed = 0usize;
         let mut skipped = 0usize;
-        let records = pile
+        let records = snapshot
             .records()
             .map_err(|e| anyhow!("enumerate collection records: {e:?}"))?;
         for record in records {
@@ -994,8 +999,8 @@ mod tests {
             "identity is the blob hash, not the intrinsic entity id"
         );
 
-        let reader = store.reader().expect("reader");
-        let blob: Blob<SimpleArchive> = reader.get(handle).expect("read descriptor blob");
+        let snapshot = store.snapshot().expect("snapshot");
+        let blob: Blob<SimpleArchive> = snapshot.get(handle).expect("read descriptor blob");
         assert_eq!(blob.bytes.len(), 256, "four tribles at 64 bytes each");
 
         let decoded = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob)
@@ -1011,7 +1016,7 @@ mod tests {
         assert_eq!(descriptor::entity(&decoded).unwrap(), entity_id);
 
         // The trible dump `show` prints comes from the same bytes.
-        let facts: TribleSet = reader
+        let facts: TribleSet = snapshot
             .get::<TribleSet, SimpleArchive>(handle)
             .expect("unarchive descriptor");
         assert_eq!(facts.len(), 4);
@@ -1023,7 +1028,7 @@ mod tests {
         );
 
         assert!(matches!(
-            anchor(&Fields::load(&reader, handle)),
+            anchor(&Fields::load(&snapshot, handle)),
             Anchor::Root(Ok(name)) if name == "inspected"
         ));
     }

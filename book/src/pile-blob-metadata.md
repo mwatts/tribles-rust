@@ -21,7 +21,7 @@ The current 256-byte generic envelope written ahead of every blob contains:
 | Hash | `96..128` | 32 | Digest used to validate and address the payload. |
 | Reserved | `128..256` | 128 | Required zeros. |
 
-The reader also accepts the legacy envelope and legacy V1/V3 blob headers, and
+The pile snapshot also accepts the legacy envelope and legacy V1/V3 blob headers, and
 projects their timestamp, length, and hash through the same API.
 
 [`BlobMetadata`][blobmetadata] re-exposes the timestamp and length fields so
@@ -31,7 +31,7 @@ callers can read when a blob was appended and how large the payload is.
 
 [`BlobMetadata`][blobmetadata] is a lightweight struct shared by blob-store
 implementations. It mirrors the timestamp/length pair in the header and leaves
-validation to the reader:
+validation to the snapshot:
 
 - `timestamp`: the write time stored in the blob header as a `u64`. A convenient
   way to turn this into a `SystemTime` is shown below. `Pile::put` records this
@@ -39,26 +39,26 @@ validation to the reader:
   forward or backward if the system clock is adjusted.
 - `length`: the size of the blob payload in bytes. Padding that aligns current
   entries to 256-byte boundaries is excluded from this value, so it matches the slice
-  returned by [`PileReader::get`][get].
+  returned by [`PileSnapshot::get`][get].
 
 [blobmetadata]: ../../src/repo.rs
 [get]: ../../src/repo/pile.rs
 
 ## Looking up blob metadata
 
-`PileReader::metadata` accepts the same `Inline<Handle<_, _>>` that other blob
-store APIs use. The reader consults its in-memory index and, on the first
+`PileSnapshot::metadata` accepts the same `Inline<Handle<_, _>>` that other blob
+store APIs use. The snapshot consults its persistent in-memory index and, on the first
 request for a handle, lazily hashes the payload to confirm the bytes match the
 handle. Subsequent metadata lookups for the same handle reuse that cached
 validation result. When the payload passes validation the method returns
 `Some(BlobMetadata)`; otherwise it yields `None`.
 
-Readers operate on the snapshot that was current when they were created. Call
-[`Pile::refresh`][refresh] and request a new reader to observe blobs appended
-afterwards. `PileReader::metadata` never fails for valid snapshots—its error
+`PileSnapshot` is the immutable prefix frozen by [`Pile::snapshot`][snapshot].
+Request another snapshot to refresh the pile and observe blobs appended
+afterwards. `PileSnapshot::metadata` never fails for valid snapshots—its error
 type is [`Infallible`](core::convert::Infallible).
 
-[refresh]: ../../src/repo/pile.rs
+[snapshot]: ../../src/repo/pile.rs
 
 ```rust,ignore
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,6 +67,7 @@ use anybytes::Bytes;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::{BlobStoreMeta, BlobStorePut, SnapshotSource, StorageClose};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pile = Pile::open("/tmp/example.pile")?;
@@ -74,8 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"hello world".to_vec()));
     let handle = pile.put(blob)?;
 
-    let reader = pile.reader()?;
-    if let Some(meta) = reader.metadata(handle).unwrap() {
+    let snapshot = pile.snapshot()?;
+    if let Some(meta) = snapshot.metadata(handle).unwrap() {
         let appended_at = UNIX_EPOCH + Duration::from_millis(meta.timestamp);
         println!(
             "Blob length: {} bytes, appended at {:?}",
@@ -83,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    drop(reader);
+    drop(snapshot);
     pile.close()?;
     Ok(())
 }
@@ -94,8 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `metadata` returns `None` in a few situations:
 
 - the handle does not correspond to any blob stored in the pile;
-- the reader snapshot predates the blob (refresh the pile and create a new
-  reader to see later writes);
+- the snapshot predates the blob (create a new snapshot to refresh and see
+  later writes);
 - validation previously failed because the on-disk bytes did not match the
   recorded hash, for example after the pile file was corrupted before this
   process opened it.

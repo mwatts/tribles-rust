@@ -334,9 +334,10 @@ Callers load the blob once (cheap — mmap-backed
 variables they want:
 
 ```rust
-let bm25: SuccinctBM25Index = reader.get(bm25_handle)?;
-let hnsw: SuccinctHNSWIndex = reader.get(hnsw_handle)?;
-let hnsw_view = hnsw.attach(&reader);
+let snapshot = pile.snapshot()?;
+let bm25: SuccinctBM25Index = snapshot.get(bm25_handle)?;
+let hnsw: SuccinctHNSWIndex = snapshot.get(hnsw_handle)?;
+let hnsw_view = hnsw.attach(&snapshot);
 
 let rows: Vec<(Id,)> = find!(
     (doc: Id),

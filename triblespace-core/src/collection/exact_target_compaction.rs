@@ -13,13 +13,13 @@ use std::fmt;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
-use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta, OfferCapture};
+use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, OfferCapture};
 use crate::trible::Fragment;
 
 use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
 use super::{
     CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
-    CollectionOperationError, CollectionRecord, CollectionStore, Cover, CoverAttachment,
+    CollectionOperationError, CollectionRead, CollectionRecord, CollectionStore, Cover,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -123,10 +123,10 @@ pub fn compact_exact_target<S, Source, Target, H>(
     exact: &ExactDerivedCollection<Source, Target, H>,
     store: &mut S,
     source_cover: &Cover<Source>,
-) -> Result<CoverAttachment<Target>, ExactTargetCompactionError>
+) -> Result<Cover<Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore + ArtifactOfferStore,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: BlobStoreMeta + CollectionRead,
     Source: CollectionEncoding,
     Target: CollectionEncoding,
     Handle<Source>: InlineEncoding,
@@ -141,10 +141,10 @@ pub(crate) fn compact_exact_target_unoffered<S, Source, Target, H>(
     exact: &ExactDerivedCollection<Source, Target, H>,
     store: &mut S,
     source_cover: &Cover<Source>,
-) -> Result<CoverAttachment<Target>, ExactTargetCompactionError>
+) -> Result<Cover<Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: BlobStoreMeta + CollectionRead,
     Source: CollectionEncoding,
     Target: CollectionEncoding,
     Handle<Source>: InlineEncoding,
@@ -156,10 +156,6 @@ where
     seen.insert(cover_identity(&cover));
 
     loop {
-        if !has_tier_collision(&cover) {
-            return Ok(cover);
-        }
-
         match publish_round::<S, Target>(
             exact.target_descriptor().clone(),
             exact.target_collection().handle(),
@@ -181,48 +177,41 @@ fn target_tier<Target: CollectionEncoding>(blob: &Blob<Target>) -> u32 {
     blob.bytes.len().max(1).ilog2()
 }
 
-fn cover_identity<Target: CollectionEncoding>(
-    cover: &CoverAttachment<Target>,
-) -> Vec<CollectionData> {
-    cover
-        .members()
-        .iter()
-        .map(|(data, _)| Handle::<Target>::to_hash(*data))
-        .collect()
-}
-
-fn has_tier_collision<Target: CollectionEncoding>(cover: &CoverAttachment<Target>) -> bool {
-    let mut tiers = BTreeSet::new();
-    cover
-        .members()
-        .iter()
-        .any(|(_, blob)| !tiers.insert(target_tier::<Target>(blob)))
+fn cover_identity<Target: CollectionEncoding>(cover: &Cover<Target>) -> Vec<CollectionData> {
+    cover.members().map(Handle::<Target>::to_hash).collect()
 }
 
 enum RoundOutcome<Target: CollectionEncoding> {
     Published,
-    Stable(CoverAttachment<Target>),
+    Stable(Cover<Target>),
 }
 
 fn publish_round<S, Target>(
     descriptor: Fragment,
     collection: CollectionHandle,
     store: &mut S,
-    cover: CoverAttachment<Target>,
+    cover: Cover<Target>,
 ) -> Result<RoundOutcome<Target>, ExactTargetCompactionError>
 where
     S: BlobStore + CollectionStore,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: BlobStoreMeta + CollectionRead,
     Target: CollectionEncoding,
     Handle<Target>: InlineEncoding,
 {
-    let reader = store.reader().map_err(|source| {
-        ExactTargetCompactionError::storage("open target-compaction reader", source)
+    if cover.len() < 2 {
+        return Ok(RoundOutcome::Stable(cover));
+    }
+
+    let reader = store.snapshot().map_err(|source| {
+        ExactTargetCompactionError::storage("open target-compaction snapshot", source)
     })?;
     let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
     let mut locations = BTreeMap::<CollectionData, u32>::new();
-    for (data, blob) in cover.members().iter().cloned() {
-        let data = Handle::<Target>::to_hash(data);
+    for handle in cover.members() {
+        let data = Handle::<Target>::to_hash(handle);
+        let blob = reader.get(handle).map_err(|source| {
+            ExactTargetCompactionError::storage("load target-compaction member", source)
+        })?;
         let tier = target_tier::<Target>(&blob);
         locations.insert(data, tier);
         tiers.entry(tier).or_default().insert(data, blob);
@@ -322,6 +311,7 @@ mod tests {
     use crate::inline::Inline;
     use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::BlobStorePut;
 
     /// Test-only encoding with no directly materialized join.
     /// Minted with `trible genid` on 2026-08-30.
@@ -373,23 +363,17 @@ mod tests {
         }
     }
 
-    impl BlobStore for NoWriteStore {
-        type Reader = <MemoryRepo as BlobStore>::Reader;
-        type ReaderError = Infallible;
+    impl crate::repo::SnapshotSource for NoWriteStore {
+        type Snapshot = <MemoryRepo as crate::repo::SnapshotSource>::Snapshot;
+        type SnapshotError = Infallible;
 
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.blobs.reader()
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            crate::repo::SnapshotSource::snapshot(&mut self.blobs)
         }
     }
 
     impl CollectionStore for NoWriteStore {
-        type RecordsError = Infallible;
         type InsertError = Infallible;
-        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
-
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            Ok(Vec::new().into_iter())
-        }
 
         fn insert(&mut self, _: CollectionRecord) -> Result<(), Self::InsertError> {
             panic!("stable no-join compaction attempted to publish a MERGE")
@@ -417,27 +401,17 @@ mod tests {
         members.sort_unstable_by_key(|member| member.get_handle().raw);
         let cover =
             Cover::from_members(collection, members.iter().map(|member| member.get_handle()));
-        let original = cover_identity(&CoverAttachment::from_parts(
-            cover.clone(),
-            members
-                .iter()
-                .cloned()
-                .map(|member| (member.get_handle(), member))
-                .collect(),
-        ));
-        let attachment = CoverAttachment::from_parts(
-            cover,
-            members
-                .into_iter()
-                .map(|member| (member.get_handle(), member))
-                .collect(),
-        );
+        let original = cover_identity(&cover);
+        let mut blobs = MemoryRepo::default();
+        for member in members {
+            blobs.put::<NoJoinEncoding, _>(member).unwrap();
+        }
 
         let result = publish_round(
             descriptor,
             collection.handle(),
-            &mut NoWriteStore::default(),
-            attachment,
+            &mut NoWriteStore { blobs },
+            cover,
         )
         .unwrap();
         let RoundOutcome::Stable(result) = result else {

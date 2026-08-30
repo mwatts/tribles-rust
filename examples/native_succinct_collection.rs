@@ -44,9 +44,12 @@ fn main() {
         .expect("publish person");
     }
 
-    // Freeze the exact admitted target frontier. cover() reads collection
-    // records, but not these commits' data or metadata blobs.
-    let cover = pile.cover(collection).expect("discover exact cover");
+    // Freeze one coherent store observation, then discover its exact admitted
+    // target frontier without reading the commits' data or metadata blobs.
+    let snapshot = pile.snapshot().expect("freeze pile snapshot");
+    let cover = collection
+        .admitted(&snapshot)
+        .expect("discover exact cover");
     assert_eq!(cover.len(), 3);
 
     // Build any missing canonical raw Succinct shards and their exact Rank9

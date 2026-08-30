@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use triblespace::core::and;
 use triblespace::core::find;
 use triblespace::core::id::Id;
-use triblespace::core::repo::{BlobStoreGet, BlobStorePut};
+use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 use triblespace::macros::pattern;
 
 use triblespace_search::bm25::BM25Builder;
@@ -102,13 +102,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Query { text } => {
             let handle = load_current_index_handle(&kb)?;
-            let reader = pile.reader()?;
+            let snapshot = pile.snapshot()?;
             // The type annotation on the get line picks the
             // D=GenId, T=WordHash defaults; an index built with
             // different schemas would spell them here too (e.g.
             // `SuccinctBM25Index<ShortString, WordHash>`).
             let idx: SuccinctBM25Index =
-                reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
+                snapshot.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
             // One engine pass: `matches_text` tokenises the query
             // internally (whitespace + lowercase + Blake3 via
             // `hash_tokens`) and binds `doc` to docs that match at
@@ -293,7 +293,7 @@ rotation:
   `TryFromBlob` impl.
 - `Blob<SuccinctBM25Blob>` is the same Rust type.
 - Bytes in the pile under an old handle are the same bytes.
-- `reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(h)`
+- `snapshot.get::<SuccinctBM25Index, SuccinctBM25Blob>(h)`
   returns those bytes and happily tries to parse them. If
   the old-format and new-format byte layouts happen to
   alias cleanly, you'll decode wrong values with no error.

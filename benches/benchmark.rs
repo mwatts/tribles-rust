@@ -992,8 +992,9 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_tribles));
         group.bench_function(BenchmarkId::new("materialize", n_commits), |b| {
             b.iter(|| {
-                storage
-                    .snapshot::<TribleSet, _>(collection)
+                let snapshot = storage.snapshot().expect("freeze store snapshot");
+                collection
+                    .read::<TribleSet, _>(&snapshot)
                     .expect("materialize collection")
             });
         });

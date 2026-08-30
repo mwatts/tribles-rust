@@ -85,10 +85,9 @@ let commit = storage.commit(
     &writer,
     entity! { metadata::name: "first-model" },
 )?;
-let snapshot = storage.snapshot::<TribleSet, _>(models)?;
-assert!(snapshot
-    .cover()
-    .contains(Handle::<SimpleArchive>::from_hash(commit.data())));
+let snapshot = storage.snapshot()?;
+let cover = models.admitted(&snapshot)?;
+assert!(cover.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
 storage.flush()?;
 ```
 
@@ -157,28 +156,38 @@ parameters, and content identities validate. An invalid or unavailable result is
 cannot suppress an explicit cover member.
 
 Local publication remains unconditional. A publisher which needs to predict
-whether an authority-aware reader will admit a signer can call
-`store.writer_is_admitted(collection, signer)`: it checks the descriptor
-authority and resident exact WRITE evidence at one instant without scanning
+whether an authority-aware observation will admit a signer can freeze a store
+snapshot and call `collection.writer_is_admitted(&snapshot, signer)`: it checks
+the descriptor authority and resident exact WRITE evidence without scanning
 collection commits or publishing anything.
 
 ## Known-prefix snapshots and covers
 
-`store.snapshot(collection)` observes one clock instant, discovers resident
-capability proofs rooted at the descriptor authority, and verifies them against
-the exact collection write request before discovering commits by the resulting
-subjects.
-Their distinct data handles form a `Cover<E>`. It opens one target reader and
-constructs a logical view from only that payload set. The returned
-`Snapshot<E, V, R>` keeps the logical view `V`, exact cover, and reader together
-so downstream code cannot accidentally pair one logical frontier with a
-different physical view. Consumers which need the exact strictly verified
-COMMIT roots selected during the same capability-aware admission event use
-`snapshot_with_admission`; later claims over the same payload remain broader
-provenance rather than retroactive roots. Ordinary snapshots do not retain one
-192-byte record per attestation. For a
-`SimpleArchive`, `V = TribleSet`; for a `SuccinctArchiveBlob`, `V` may be
-an mmap-backed `UnionArchive` retaining all selected shards.
+`store.snapshot()` freezes one immutable observation containing blob bytes,
+collection records, capability proofs, and peer evidence from the same known
+prefix. A collection then performs admission against that observation:
+
+```rust,ignore
+let snapshot = store.snapshot()?;
+let admitted = collection.admitted(&snapshot)?;
+let physical = admitted.resolve(&snapshot)?;
+let value = V::try_from_cover(&physical, &snapshot)?;
+```
+
+`admitted` is the semantic COMMIT frontier: it discovers proofs rooted at the
+descriptor authority, verifies the exact collection write request, and forms a
+`Cover<E>` from distinct payload handles signed by the admitted subjects.
+`resolve` may select a resident support-equivalent decomposition using validated
+`MERGE` and `DERIVE` evidence. `TryFromCover<E>` then constructs the logical
+value solely from that selected physical cover and the same frozen store
+snapshot. `collection.read::<V, _>(&snapshot)` is the convenience form of these
+three steps. For a `SimpleArchive`, `V = TribleSet`; for a
+`SuccinctArchiveBlob`, `V` may be an mmap-backed union retaining selected
+shards.
+
+Consumers which need the exact strictly verified COMMIT roots selected during
+admission use `collection.admitted_with_claims(&snapshot)`; later claims over
+the same payload remain broader provenance rather than retroactive roots.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear on this call or a later
@@ -186,23 +195,23 @@ call. Every cover member was nevertheless admitted and its payload validated
 for the returned snapshot, or the call fails instead of returning a partial
 set.
 
-`store.cover(collection)` performs the same admission check and
-record discovery, but does not fetch or materialize member blobs. Freeze a
-cover when another component will select or build a representation:
+Admission does not fetch or materialize member blobs. Keep the returned cover
+when another component will select or build a representation:
 
 ```rust,ignore
-let cover = storage.cover(models)?;
-let facts = storage.materialize(&cover)?;
+let snapshot = storage.snapshot()?;
+let cover = models.admitted(&snapshot)?;
+let physical = cover.resolve(&snapshot)?;
+let facts = TribleSet::try_from_cover(&physical, &snapshot)?;
 ```
 
 Exact replay does not need a publishing key, re-run admission, or retain any
 signed commit or metadata. The opaque cover itself names the exact descriptor
-and payload members to validate. Use `store.claims(&cover)` when currently
+and payload members to validate. Use `cover.claims(&snapshot)` when currently
 resident authorship and metadata provenance matters; zero claims is a valid
 answer and does not invalidate replay. Commits whose data handles are absent
-from the cover remain inert. Call `snapshot` when admission and
-materialization should be one coherent operation; call `materialize(&cover)`
-when replaying an opaque payload frontier.
+from the cover remain inert. Replaying an opaque payload frontier still uses a
+single store snapshot for resolution and member reads.
 
 ## Reuse merge work without changing meaning
 
@@ -238,7 +247,7 @@ Then a resolver may derive a merged source once, derive leaves separately and
 merge their images, or reuse any validated mixture already present. `DERIVE`
 records expose those reusable edges across collection lattices.
 Validation, canonical joins, mappings, and logical cover views all receive one
-frozen blob reader. They may resolve immutable dependencies named by their
+frozen store snapshot. They may resolve immutable dependencies named by their
 input members (for example a text attachment or Merkle child); unrelated
 resident blobs are never ambient semantic input.
 
@@ -280,7 +289,7 @@ bound `CollectionMapping<Source, Target>` determine route freedom. Ordinary raw
 Succinct derivation may choose any cheapest validated route whose support
 equals the source cover. The accelerated stage maps the exact raw cover selected
 upstream. Its cover-aware view reads each embedded raw handle through the
-snapshot reader and validates the exact raw/index pair before constructing the
+store snapshot and validates the exact raw/index pair before constructing the
 query runtime. Exactness is a property of the mapping, not a mode bit or an
 untyped hash convention.
 
@@ -369,7 +378,7 @@ not become members.
 
 With no further options the target descriptor's mandatory authority is the
 migration signing key. The resulting commits are therefore admitted directly
-by ordinary `cover` and `snapshot` calls.
+by ordinary collection admission against a store snapshot.
 
 To register the migrated collection under a different authority, name that
 trust root explicitly:

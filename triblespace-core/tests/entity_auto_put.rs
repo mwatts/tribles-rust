@@ -14,7 +14,7 @@ use triblespace_core::blob::Blob;
 use triblespace_core::id::rngid;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::*;
-use triblespace_core::repo::{BlobStore, BlobStoreGet};
+use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
 mod ns {
     use triblespace_core::prelude::*;
@@ -50,7 +50,7 @@ fn entity_auto_puts_blob_handle_fields() {
 
     // The bytes must resolve against the fragment's own blob store.
     let mut blobs = frag.blobs().clone();
-    let reader = blobs.reader().expect("blob reader");
+    let reader = blobs.snapshot().expect("blob snapshot");
     let bytes: anybytes::View<str> = reader
         .get::<anybytes::View<str>, UTF8String>(resolved)
         .expect("note bytes were absorbed by the macro");
@@ -83,7 +83,7 @@ fn entity_still_accepts_precomputed_value() {
     // empty because `entity!` also carries the declaration blobs referenced by
     // the attribute's metafacts.
     let mut blobs = frag.blobs().clone();
-    let reader = blobs.reader().expect("blob reader");
+    let reader = blobs.snapshot().expect("blob snapshot");
     assert!(reader
         .get::<anybytes::View<str>, UTF8String>(precomputed)
         .is_err());

@@ -86,8 +86,8 @@ all += importer.import_str(doc2)?;
 // all.exports() yields the root ids; all.facts() yields the merged tribles.
 ```
 
-When exporting back to JSON, pass a blob reader (for example from a collection
-snapshot or `MemoryBlobStore`) to `export_to_json` so `UTF8String` blobs can be inlined. If a
+When exporting back to JSON, pass an immutable blob-store snapshot (for example
+from `MemoryBlobStore::snapshot`) to `export_to_json` so `UTF8String` blobs can be inlined. If a
 blob is missing or unreadable the exporter returns an error with the handle hash
 instead of silently emitting a placeholder, keeping roundtrips lossless when
 blobs are present. The exporter uses the same fixed mapping in reverse:

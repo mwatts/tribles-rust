@@ -91,8 +91,8 @@ join. Cover construction is opaque; admission and validated collection algebra
 produce them rather than accepting caller-forged hash sets.
 
 ### Collection Admission
-The read-time signer decision performed by `store.cover` and
-`store.snapshot`. The descriptor authority is admitted directly; each
+The read-time signer decision performed by
+`collection.admitted(&store_snapshot)`. The descriptor authority is admitted directly; each
 resident proof rooted at that authority is considered at one clock instant for
 the exact `ACTION_WRITE`/collection atom. Every valid proof admits its leaf;
 invalid, expired, irrelevant, or incomplete candidates grant nothing without
@@ -118,10 +118,10 @@ covers and logical views remain valid.
 ### Collection Member
 One ordinary typed `Blob<E>` admitted into a `Collection<E>`. A source-bound
 encoding may name another blob in its bytes; validation and cover-aware views
-follow that handle through a reader rather than wrapping the member in another
-runtime artifact. For Rank9-accelerated SuccinctArchive, the root embeds its
-exact raw source handle, has no direct join, and is derived after the raw
-Succinct lattice is compacted.
+follow that handle through the same immutable store snapshot rather than
+wrapping the member in another runtime artifact. For Rank9-accelerated
+SuccinctArchive, the root embeds its exact raw source handle, has no direct
+join, and is derived after the raw Succinct lattice is compacted.
 
 ### Collection Mapping
 A parameterized source-to-target conversion exposed by
@@ -135,13 +135,14 @@ mathematical contract is a join homomorphism over their logical values:
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
 idempotent by intrinsic record ID; combining two stores is set union.
 
-### Collection Snapshot
-One coherent known-prefix observation `Snapshot<E, V, R>` containing a logical
-view `V`, the exact typed payload `Cover<E>` which names it, and the blob reader
-which validated its dependencies. `snapshot_with_admission` additionally
-returns the exact strictly verified COMMIT roots selected during the same
-observation when a consumer needs them. `TryFromCover<E>` controls whether `V`
-eagerly joins member bytes or retains them as a lazy sharded view.
+### Store Snapshot
+One immutable, coherent known-prefix observation produced by
+`SnapshotSource::snapshot`. A snapshot owns all blob, collection-record,
+capability-proof, and peer-evidence reads for that prefix and implements
+`StoreSnapshot::changes_since` for conservative local invalidation. Collection
+admission produces a semantic `Cover<E>` from it; `Cover::resolve` selects a
+resident physical cover; and `TryFromCover<E>` reconstructs either an eager
+value or a lazy sharded view through the same snapshot.
 
 ### CONNECT
 The exact `ACTION_CONNECT` atom used by `triblespace-net` to authenticate a

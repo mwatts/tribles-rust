@@ -15,7 +15,7 @@ use triblespace_core::collection::exact_derived::{
 };
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    CollectionHandle, CollectionStore, Cover, CoverAttachment, TryFromCover, VerifyingKey,
+    CollectionHandle, CollectionRead, CollectionStore, Cover, TryFromCover, VerifyingKey,
 };
 use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreMeta};
 use triblespace_core::trible::Fragment;
@@ -32,8 +32,8 @@ pub enum PathSummaryCollectionError {
     Summary(PathSummaryBlobError),
     /// Closing the joined summary into the accepted endpoint relation failed.
     Index(PathError),
-    /// A reader for the attached cover could not be opened.
-    Reader(String),
+    /// A store snapshot for the cover could not be frozen.
+    Snapshot(String),
 }
 
 impl fmt::Display for PathSummaryCollectionError {
@@ -42,7 +42,7 @@ impl fmt::Display for PathSummaryCollectionError {
             Self::Collection(source) => source.fmt(f),
             Self::Summary(source) => source.fmt(f),
             Self::Index(source) => source.fmt(f),
-            Self::Reader(source) => write!(f, "open path-summary cover reader: {source}"),
+            Self::Snapshot(source) => write!(f, "freeze path-summary cover snapshot: {source}"),
         }
     }
 }
@@ -53,7 +53,7 @@ impl Error for PathSummaryCollectionError {
             Self::Collection(source) => Some(source),
             Self::Summary(source) => Some(source),
             Self::Index(source) => Some(source),
-            Self::Reader(_) => None,
+            Self::Snapshot(_) => None,
         }
     }
 }
@@ -168,13 +168,13 @@ impl PathSummaryCollection {
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.attach_exact(store, source_cover)?;
-        let reader = store
-            .reader()
-            .map_err(|source| PathSummaryCollectionError::Reader(source.to_string()))?;
-        self.index_from_cover(cover, &reader).map(Arc::new)
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
+        self.index_from_cover(&cover, &snapshot).map(Arc::new)
     }
 
     /// Ensure and attach the exact endpoint relation for `source_cover`.
@@ -189,13 +189,13 @@ impl PathSummaryCollection {
     ) -> Result<Arc<PathIndex>, PathSummaryCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;
-        let reader = store
-            .reader()
-            .map_err(|source| PathSummaryCollectionError::Reader(source.to_string()))?;
-        self.index_from_cover(cover, &reader).map(Arc::new)
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
+        self.index_from_cover(&cover, &snapshot).map(Arc::new)
     }
 
     fn kernel(
@@ -209,14 +209,14 @@ impl PathSummaryCollection {
 
     fn index_from_cover<R>(
         &self,
-        cover: CoverAttachment<PathSummaryBlob>,
-        reader: &R,
+        cover: &Cover<PathSummaryBlob>,
+        snapshot: &R,
     ) -> Result<PathIndex, PathSummaryCollectionError>
     where
         R: triblespace_core::repo::BlobStoreGet + BlobStoreMeta,
     {
-        let cover = PathSummaryView::try_from_cover(cover, reader)
-            .expect("constructing a lazy path-summary view is infallible");
+        let cover = PathSummaryView::try_from_cover(cover, snapshot)
+            .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
         let mut joined = PathSummaryBlob::empty(&self.automaton);
         for segment in cover.into_blobs() {
             joined = PathSummaryBlob::join(&joined, &segment, &self.automaton)
@@ -236,7 +236,7 @@ mod tests {
     use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
     use triblespace_core::capability::{
         CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-        CapabilityProofBundle, CapabilityProofId, CapabilityResource,
+        CapabilityProofBundle, CapabilityResource,
     };
     use triblespace_core::collection::{
         CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStoreExt,
@@ -248,7 +248,7 @@ mod tests {
     use triblespace_core::metadata;
     use triblespace_core::prelude::entity;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore};
+    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
     use triblespace_core::trible::TribleSet;
 
     use crate::{Step, Transition};
@@ -272,26 +272,17 @@ mod tests {
         }
     }
 
-    impl BlobStore for CollectionOnly {
-        type Reader = <MemoryRepo as BlobStore>::Reader;
-        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+    impl SnapshotSource for CollectionOnly {
+        type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
+        type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.0.reader()
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            self.0.snapshot()
         }
     }
 
     impl CollectionStore for CollectionOnly {
-        type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
         type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-        type RecordIter<'a>
-            = <MemoryRepo as CollectionStore>::RecordIter<'a>
-        where
-            Self: 'a;
-
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            self.0.records()
-        }
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.0.insert(record)
@@ -299,20 +290,7 @@ mod tests {
     }
 
     impl CapabilityProofStore for CollectionOnly {
-        type ProofsError = <MemoryRepo as CapabilityProofStore>::ProofsError;
         type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
-        type ProofIter<'a> = <MemoryRepo as CapabilityProofStore>::ProofIter<'a>;
-
-        fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-            self.0.proofs()
-        }
-
-        fn proof(
-            &mut self,
-            id: CapabilityProofId,
-        ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-            self.0.proof(id)
-        }
 
         fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
             self.0.insert_proof(proof)
@@ -449,11 +427,18 @@ mod tests {
             }
             store.insert_proof(proof).unwrap();
         }
-        store.cover(collection).unwrap()
+        let snapshot = store.snapshot().unwrap();
+        collection.admitted(&snapshot).unwrap()
     }
 
     fn records(store: &mut CollectionOnly) -> Vec<CollectionRecord> {
-        store.records().unwrap().map(Result::unwrap).collect()
+        store
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 
     fn assert_cross_fragment_path(index: &PathIndex) {
@@ -505,7 +490,7 @@ mod tests {
         bytes.extend_from_slice(&[2; 32]);
         let persisted = Blob::<PathSummaryBlob>::new(bytes.into());
         let mut store = CollectionOnly::default();
-        let reader = store.reader().unwrap();
+        let reader = store.snapshot().unwrap();
         assert!(matches!(
             <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::validate_member(
                 &paths.descriptor(),
@@ -525,7 +510,8 @@ mod tests {
             .unwrap();
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
-        let cover = store.cover(collection).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let cover = collection.admitted(&snapshot).unwrap();
         let index = paths.ensure_exact(&mut store, &cover).unwrap();
         assert_eq!(index.accepted_pair_count(), 0);
         assert_eq!(store.0.blobs.len(), blobs);
@@ -787,7 +773,7 @@ mod tests {
             .attach_exact(&mut store, &source_cover)
             .unwrap();
         assert_eq!(cover.len(), 1);
-        assert_eq!(cover.members()[0].0, joined.get_handle());
+        assert_eq!(cover.members().next().unwrap(), joined.get_handle());
         assert_cross_fragment_path(&paths.attach_exact(&mut store, &source_cover).unwrap());
     }
 

@@ -13,7 +13,8 @@ use crate::trible::{Fragment, TribleSet};
 
 use super::{join_many, validate_descriptor, SimpleArchiveUnionValidationError};
 use crate::collection::{
-    collection_physical_cover, CollectionData, CollectionSemantics, CoverAttachment, TryFromCover,
+    collection_physical_cover, CollectionData, CollectionSemantics, Cover, TryFromCover,
+    TryFromCoverError,
 };
 
 /// Failure to form a logical fact union from an already validated exact cover.
@@ -46,32 +47,42 @@ impl TryFromCover<SimpleArchive> for TribleSet {
     type Error = FactViewError;
 
     fn try_from_cover<R>(
-        attachment: CoverAttachment<SimpleArchive>,
-        _reader: &R,
-    ) -> Result<Self, Self::Error>
+        cover: &Cover<SimpleArchive>,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
-        R: BlobStoreGet + BlobStoreMeta,
+        R: BlobStoreGet,
     {
-        let members = attachment.into_members();
+        let mut members = Vec::with_capacity(cover.len());
+        for handle in cover.members() {
+            let member = Handle::<SimpleArchive>::to_hash(handle);
+            let blob = snapshot
+                .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            members.push((handle, blob));
+        }
         match members.as_slice() {
             [] => Ok(TribleSet::new()),
-            [(handle, blob)] => blob
-                .clone()
-                .try_from_blob()
-                .map_err(|source| FactViewError {
+            [(handle, blob)] => blob.clone().try_from_blob().map_err(|source| {
+                TryFromCoverError::View(FactViewError {
                     member: Handle::<SimpleArchive>::to_hash(*handle),
                     source,
-                }),
+                })
+            }),
             _ => {
                 let union = join_many(members.iter().map(|(_, blob)| blob)).map_err(
-                    |(index, source)| FactViewError {
-                        member: Handle::<SimpleArchive>::to_hash(members[index].0),
-                        source,
+                    |(index, source)| {
+                        TryFromCoverError::View(FactViewError {
+                            member: Handle::<SimpleArchive>::to_hash(members[index].0),
+                            source,
+                        })
                     },
                 )?;
-                union.try_from_blob().map_err(|source| FactViewError {
-                    member: Handle::<SimpleArchive>::to_hash(members[0].0),
-                    source,
+                union.try_from_blob().map_err(|source| {
+                    TryFromCoverError::View(FactViewError {
+                        member: Handle::<SimpleArchive>::to_hash(members[0].0),
+                        source,
+                    })
                 })
             }
         }
@@ -264,7 +275,7 @@ mod tests {
     use crate::inline::Inline;
     use crate::inline::InlineEncoding;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobMetadata, BlobStoreGet, BlobStoreMeta};
+    use crate::repo::{BlobMetadata, BlobStoreGet, BlobStoreMeta, SnapshotSource};
     use crate::trible::{Trible, TRIBLE_LEN};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,7 +437,8 @@ mod tests {
         for merge in merges {
             CollectionStore::insert(&mut records, CollectionRecord::Merge(*merge)).unwrap();
         }
-        let discovered = discover_collection_records(&mut records).unwrap();
+        let snapshot = records.snapshot().unwrap();
+        let discovered = discover_collection_records(&snapshot).unwrap();
         let authorized = commits.iter().map(CollectionCommit::id).collect();
         resolve_collection_semantics(
             &discovered,

@@ -462,13 +462,13 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     let pins = pile
         .snapshot_pin_heads()
         .expect("snapshot legacy branch pins");
-    let reader = pile.reader().expect("pile reader");
+    let snapshot = pile.snapshot().expect("pile snapshot");
 
     let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
     for raw in pins.iter_ordered() {
         let id = Id::new(*raw).expect("legacy pin snapshot contains a nil id");
         let meta_handle = *pins.get(raw).expect("iterated legacy pin has a head");
-        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
+        let Ok(meta): Result<TribleSet, _> = snapshot.get(meta_handle) else {
             continue;
         };
         let handles: Vec<Inline<Handle<UTF8String>>> = find!(
@@ -478,7 +478,7 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         .map(|(n,)| n)
         .collect();
         let [h] = handles[..] else { continue };
-        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else {
+        let Ok(name): Result<anybytes::View<str>, _> = snapshot.get(h) else {
             continue;
         };
         named.push((id, name.as_ref().to_owned(), meta));
@@ -517,7 +517,7 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     let mut chain: Vec<(CommitHandle, TribleSet)> = Vec::new();
     let mut cursor = Some(head);
     while let Some(handle) = cursor {
-        let meta: TribleSet = reader.get(handle).expect("read commit metadata");
+        let meta: TribleSet = snapshot.get(handle).expect("read commit metadata");
         let parents: Vec<CommitHandle> = find!(
             (p: Inline<Handle<SimpleArchive>>),
             pattern!(&meta, [{ repo::parent: ?p }])
@@ -549,7 +549,7 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         .map(|(c,)| c)
         .collect();
         let [content] = contents[..] else { continue };
-        let blob: Blob<SimpleArchive> = reader.get(content).expect("read content blob");
+        let blob: Blob<SimpleArchive> = snapshot.get(content).expect("read content blob");
         total += blob.bytes.len() / 64;
         cum.push(total);
         entries.push(content);
@@ -568,11 +568,11 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         .into_iter()
         .take(k)
         .map(|content| {
-            let set: TribleSet = reader.get(content).expect("read commit content");
+            let set: TribleSet = snapshot.get(content).expect("read commit content");
             Chunk { content: set }
         })
         .collect();
-    // The reader is a snapshot; closing the pile here is safe and keeps the
+    // The snapshot owns its observation; closing the pile here is safe and keeps the
     // "dropped without close()" warning out of sweep logs.
     pile.close().expect("close pile");
     chunks
@@ -774,7 +774,10 @@ fn main() {
                     .commit(source, &signing_key, Fragment::from(chunk.content.clone()))
                     .expect("publish source chunk");
             }
-            let cover = store.cover(source).expect("freeze exact source cover");
+            let snapshot = store.snapshot().expect("freeze source snapshot");
+            let cover = source
+                .admitted(&snapshot)
+                .expect("freeze exact source cover");
 
             let t = Instant::now();
             let union = succinct
@@ -796,14 +799,20 @@ fn main() {
             let raw_cover = exact
                 .attach_exact(&mut store, &cover)
                 .expect("reattach exact raw cover for metrics");
+            let snapshot = store.snapshot().expect("freeze raw target snapshot");
             let shape = BuildShape {
                 source_cover_members: cover.len(),
                 raw_cover_members: raw_cover.len(),
                 query_shards: union.segment_count(),
                 raw_bytes: raw_cover
                     .members()
-                    .iter()
-                    .map(|(_, blob)| blob.bytes.len())
+                    .map(|handle| {
+                        snapshot
+                            .get::<Blob<SuccinctArchiveBlob>, _>(handle)
+                            .expect("load raw target member")
+                            .bytes
+                            .len()
+                    })
                     .sum(),
             };
             drop(raw_cover);

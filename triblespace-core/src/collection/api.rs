@@ -1,4 +1,4 @@
-//! Store-centric publication and snapshots for canonical collections.
+//! Store-centric publication and immutable reads for canonical collections.
 //!
 //! A collection is its descriptor handle. Registering a descriptor through
 //! [`CollectionStoreExt::collection`] stores and offers its complete
@@ -8,7 +8,7 @@
 //!
 //! Local publication is deliberately unconditional: a store may record any
 //! structurally valid, strictly signed commit. Authority is enforced when a
-//! cover or snapshot is constructed. The descriptor authority's own commits
+//! admitted cover or logical value is constructed. The descriptor authority's own commits
 //! are admitted directly; delegated writers are admitted when the store holds
 //! a valid proof for [`ACTION_WRITE`] on that exact descriptor handle.
 
@@ -34,7 +34,7 @@ use crate::inline::Inline;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::{
     ArtifactHandle, ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut,
-    CapabilityProofStore, OfferCapture, OfferCaptureInsertError,
+    CapabilityProofRead, OfferCapture, OfferCaptureInsertError, SnapshotSource,
 };
 // Reach arrives here as a builder argument; only the tests name a
 // particular one.
@@ -48,9 +48,9 @@ use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
     CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
-    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
+    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError, CollectionRead,
     CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
-    CoverAttachment, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, ACTION_WRITE,
+    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_WRITE,
 };
 
 /// Failure to discover the resident capability evidence used for collection
@@ -62,19 +62,14 @@ use super::{
 /// proof-store observation itself, where silently returning a smaller cover
 /// would confuse unavailable evidence with negative authorization.
 #[derive(Debug)]
-pub enum CollectionEvidenceDiscoveryError<ProofsError, ReaderError> {
+pub enum CollectionEvidenceDiscoveryError<ProofsError> {
     /// The store could not enumerate its resident proof snapshot.
     Proofs(ProofsError),
-    /// The blob-reader snapshot used for all candidate claim closures could
-    /// not be created.
-    Reader(ReaderError),
 }
 
-impl<ProofsError, ReaderError> fmt::Display
-    for CollectionEvidenceDiscoveryError<ProofsError, ReaderError>
+impl<ProofsError> fmt::Display for CollectionEvidenceDiscoveryError<ProofsError>
 where
     ProofsError: fmt::Display,
-    ReaderError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -84,25 +79,17 @@ where
                     "failed to enumerate resident capability proofs: {source}"
                 )
             }
-            Self::Reader(source) => {
-                write!(
-                    formatter,
-                    "failed to open capability-claim blob view: {source}"
-                )
-            }
         }
     }
 }
 
-impl<ProofsError, ReaderError> Error for CollectionEvidenceDiscoveryError<ProofsError, ReaderError>
+impl<ProofsError> Error for CollectionEvidenceDiscoveryError<ProofsError>
 where
     ProofsError: Error + 'static,
-    ReaderError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Proofs(source) => Some(source),
-            Self::Reader(source) => Some(source),
         }
     }
 }
@@ -110,9 +97,7 @@ where
 /// Failure while reading and structurally validating a collection descriptor
 /// by its content identity.
 #[derive(Debug)]
-pub enum CollectionDescriptorError<ReaderError, GetError> {
-    /// The blob-reader snapshot could not be created.
-    Reader(ReaderError),
+pub enum CollectionDescriptorError<GetError> {
     /// The descriptor blob could not be fetched.
     Get {
         /// Requested collection identity.
@@ -129,16 +114,12 @@ pub enum CollectionDescriptorError<ReaderError, GetError> {
     },
 }
 
-impl<ReaderError, GetError> fmt::Display for CollectionDescriptorError<ReaderError, GetError>
+impl<GetError> fmt::Display for CollectionDescriptorError<GetError>
 where
-    ReaderError: fmt::Display,
     GetError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Reader(source) => {
-                write!(formatter, "failed to open descriptor blob view: {source}")
-            }
             Self::Get { collection, source } => write!(
                 formatter,
                 "failed to fetch collection descriptor {}: {source}",
@@ -153,14 +134,12 @@ where
     }
 }
 
-impl<ReaderError, GetError> Error for CollectionDescriptorError<ReaderError, GetError>
+impl<GetError> Error for CollectionDescriptorError<GetError>
 where
-    ReaderError: Error + 'static,
     GetError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Reader(source) => Some(source),
             Self::Get { source, .. } => Some(source),
             Self::Invalid { source, .. } => Some(source),
         }
@@ -174,18 +153,16 @@ where
 /// observation itself was unavailable; invalid or irrelevant individual
 /// proofs merely fail to admit their subjects and are not errors.
 #[derive(Debug)]
-pub enum CollectionAdmissionError<ProofsError, ReaderError, GetError> {
+pub enum CollectionAdmissionError<ProofsError, GetError> {
     /// The collection descriptor was unavailable or malformed.
-    Descriptor(CollectionDescriptorError<ReaderError, GetError>),
+    Descriptor(CollectionDescriptorError<GetError>),
     /// The resident capability-proof observation could not be completed.
-    Evidence(CollectionEvidenceDiscoveryError<ProofsError, ReaderError>),
+    Evidence(CollectionEvidenceDiscoveryError<ProofsError>),
 }
 
-impl<ProofsError, ReaderError, GetError> fmt::Display
-    for CollectionAdmissionError<ProofsError, ReaderError, GetError>
+impl<ProofsError, GetError> fmt::Display for CollectionAdmissionError<ProofsError, GetError>
 where
     ProofsError: fmt::Display,
-    ReaderError: fmt::Display,
     GetError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -196,11 +173,9 @@ where
     }
 }
 
-impl<ProofsError, ReaderError, GetError> Error
-    for CollectionAdmissionError<ProofsError, ReaderError, GetError>
+impl<ProofsError, GetError> Error for CollectionAdmissionError<ProofsError, GetError>
 where
     ProofsError: Error + 'static,
-    ReaderError: Error + 'static,
     GetError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -457,79 +432,22 @@ impl fmt::Display for CoverAdvanceError {
 
 impl Error for CoverAdvanceError {}
 
-/// One coherent known-prefix view of a scoped collection.
-///
-/// [`cover`](Self::cover) is the exact payload set reconstructed as
-/// [`value`](Self::value).
-/// [`reader`](Self::reader) is the blob-reader snapshot used to validate and
-/// materialize those facts. The reader may contain physically available blobs
-/// published after record discovery, but those blobs acquire no semantic role
-/// unless their payloads are present in this snapshot's cover.
-pub struct Snapshot<L: CollectionEncoding, V, R> {
-    value: V,
-    cover: Cover<L>,
-    reader: R,
-}
-
-impl<L: CollectionEncoding, V, R> Snapshot<L, V, R> {
-    /// Materialized logical value named by this snapshot's exact cover.
-    pub fn value(&self) -> &V {
-        &self.value
-    }
-
-    /// Exact collection cover from which the value was materialized.
-    pub fn cover(&self) -> &Cover<L> {
-        &self.cover
-    }
-
-    /// Blob-reader snapshot used to validate and reconstruct the logical value.
-    pub fn reader(&self) -> &R {
-        &self.reader
-    }
-
-    /// Consume the snapshot and return its materialized value.
-    pub fn into_value(self) -> V {
-        self.value
-    }
-
-    /// Consume the snapshot into materialized value, exact cover, and reader.
-    pub fn into_parts(self) -> (V, Cover<L>, R) {
-        (self.value, self.cover, self.reader)
-    }
-}
-
-impl<R> Snapshot<SimpleArchive, TribleSet, R> {
-    /// Materialized fact union named by this snapshot's exact payload cover.
-    pub fn facts(&self) -> &TribleSet {
-        self.value()
-    }
-
-    /// Consume the snapshot and return its materialized fact union.
-    pub fn into_facts(self) -> TribleSet {
-        self.into_value()
-    }
-}
-
-/// Snapshot of the canonical SimpleArchive fact-union lattice.
-pub type FactSnapshot<R> = Snapshot<SimpleArchive, TribleSet, R>;
-
 /// Failure to discover one exact admitted payload cover.
 #[derive(Debug)]
-pub enum CollectionCoverError<RecordsError, ProofsError, ReaderError, GetError> {
+pub enum CollectionCoverError<RecordsError, ProofsError, GetError> {
     /// The collection descriptor was unavailable or malformed.
-    Descriptor(CollectionDescriptorError<ReaderError, GetError>),
+    Descriptor(CollectionDescriptorError<GetError>),
     /// The resident capability-proof observation could not be completed.
-    Evidence(CollectionEvidenceDiscoveryError<ProofsError, ReaderError>),
+    Evidence(CollectionEvidenceDiscoveryError<ProofsError>),
     /// Target collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
 }
 
-impl<RecordsError, ProofsError, ReaderError, GetError> fmt::Display
-    for CollectionCoverError<RecordsError, ProofsError, ReaderError, GetError>
+impl<RecordsError, ProofsError, GetError> fmt::Display
+    for CollectionCoverError<RecordsError, ProofsError, GetError>
 where
     RecordsError: fmt::Display,
     ProofsError: fmt::Display,
-    ReaderError: fmt::Display,
     GetError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -541,12 +459,11 @@ where
     }
 }
 
-impl<RecordsError, ProofsError, ReaderError, GetError> Error
-    for CollectionCoverError<RecordsError, ProofsError, ReaderError, GetError>
+impl<RecordsError, ProofsError, GetError> Error
+    for CollectionCoverError<RecordsError, ProofsError, GetError>
 where
     RecordsError: Error + 'static,
     ProofsError: Error + 'static,
-    ReaderError: Error + 'static,
     GetError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -560,9 +477,12 @@ where
 
 /// Failure to publish one collection element into local storage.
 #[derive(Debug)]
-pub enum CollectionCommitError<ReaderError, GetError, PutError, InsertError> {
+pub enum CollectionCommitError<SnapshotError, GetError, PutError, InsertError> {
+    /// A store snapshot needed by the mutable publication convenience could
+    /// not be frozen.
+    Snapshot(SnapshotError),
     /// The named collection descriptor was unavailable or malformed.
-    Descriptor(CollectionDescriptorError<ReaderError, GetError>),
+    Descriptor(CollectionDescriptorError<GetError>),
     /// The encoded member is not a canonical element of the collection lattice.
     InvalidMember(CollectionOperationError),
     /// A described attachment, member, or metadata archive could not be stored.
@@ -571,16 +491,22 @@ pub enum CollectionCommitError<ReaderError, GetError, PutError, InsertError> {
     RecordInsert(InsertError),
 }
 
-impl<ReaderError, GetError, PutError, InsertError> fmt::Display
-    for CollectionCommitError<ReaderError, GetError, PutError, InsertError>
+impl<SnapshotError, GetError, PutError, InsertError> fmt::Display
+    for CollectionCommitError<SnapshotError, GetError, PutError, InsertError>
 where
-    ReaderError: fmt::Display,
+    SnapshotError: fmt::Display,
     GetError: fmt::Display,
     PutError: fmt::Display,
     InsertError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Snapshot(source) => {
+                write!(
+                    formatter,
+                    "failed to freeze collection store snapshot: {source}"
+                )
+            }
             Self::Descriptor(source) => source.fmt(formatter),
             Self::InvalidMember(source) => write!(formatter, "invalid collection member: {source}"),
             Self::DependencyPut(source) => {
@@ -593,16 +519,17 @@ where
     }
 }
 
-impl<ReaderError, GetError, PutError, InsertError> Error
-    for CollectionCommitError<ReaderError, GetError, PutError, InsertError>
+impl<SnapshotError, GetError, PutError, InsertError> Error
+    for CollectionCommitError<SnapshotError, GetError, PutError, InsertError>
 where
-    ReaderError: Error + 'static,
+    SnapshotError: Error + 'static,
     GetError: Error + 'static,
     PutError: Error + 'static,
     InsertError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Snapshot(source) => Some(source),
             Self::Descriptor(source) => Some(source),
             Self::InvalidMember(source) => Some(source),
             Self::DependencyPut(source) => Some(source),
@@ -621,7 +548,6 @@ where
 #[derive(Debug)]
 pub enum CollectionMaterializationError<
     RecordsError,
-    ReaderError,
     GetError,
     ViewError,
     EvidenceError = Infallible,
@@ -647,8 +573,6 @@ pub enum CollectionMaterializationError<
         /// Structural descriptor decoding failure.
         source: RecordDecodeError,
     },
-    /// The blob reader could not be created after record discovery.
-    Reader(ReaderError),
     /// A cover member's data blob could not be fetched.
     MemberGet {
         /// Exact payload identity.
@@ -670,36 +594,29 @@ pub enum CollectionMaterializationError<
         /// Uncovered members of the collection's semantic frontier.
         obligations: BTreeSet<CollectionData>,
     },
-    /// The selected exact attachment could not form the requested logical view.
+    /// The selected physical cover could not form the requested logical view.
     View(ViewError),
 }
 
 /// Materialization failure for the canonical SimpleArchive fact view.
-pub type FactMaterializationError<RecordsError, ReaderError, GetError> =
-    CollectionMaterializationError<RecordsError, ReaderError, GetError, FactViewError>;
+pub type FactMaterializationError<RecordsError, GetError> =
+    CollectionMaterializationError<RecordsError, GetError, FactViewError>;
 
-/// Snapshot failure including typed discovery of resident authorization
-/// evidence.
-pub type CollectionSnapshotError<RecordsError, ProofsError, ReaderError, GetError, ViewError> =
+/// Read failure including typed discovery of resident authorization evidence.
+pub type CollectionReadError<RecordsError, ProofsError, GetError, ViewError> =
     CollectionMaterializationError<
         RecordsError,
-        ReaderError,
         GetError,
         ViewError,
-        CollectionEvidenceDiscoveryError<ProofsError, ReaderError>,
+        CollectionEvidenceDiscoveryError<ProofsError>,
     >;
 
-impl<RecordsError, ProofsError, ReaderError, GetError, ViewError>
-    From<CollectionCoverError<RecordsError, ProofsError, ReaderError, GetError>>
-    for CollectionSnapshotError<RecordsError, ProofsError, ReaderError, GetError, ViewError>
+impl<RecordsError, ProofsError, GetError, ViewError>
+    From<CollectionCoverError<RecordsError, ProofsError, GetError>>
+    for CollectionReadError<RecordsError, ProofsError, GetError, ViewError>
 {
-    fn from(
-        source: CollectionCoverError<RecordsError, ProofsError, ReaderError, GetError>,
-    ) -> Self {
+    fn from(source: CollectionCoverError<RecordsError, ProofsError, GetError>) -> Self {
         match source {
-            CollectionCoverError::Descriptor(CollectionDescriptorError::Reader(source)) => {
-                Self::Reader(source)
-            }
             CollectionCoverError::Descriptor(CollectionDescriptorError::Get {
                 collection,
                 source,
@@ -714,19 +631,11 @@ impl<RecordsError, ProofsError, ReaderError, GetError, ViewError>
     }
 }
 
-impl<RecordsError, ReaderError, GetError, ViewError, EvidenceError>
-    From<CollectionDescriptorError<ReaderError, GetError>>
-    for CollectionMaterializationError<
-        RecordsError,
-        ReaderError,
-        GetError,
-        ViewError,
-        EvidenceError,
-    >
+impl<RecordsError, GetError, ViewError, EvidenceError> From<CollectionDescriptorError<GetError>>
+    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
 {
-    fn from(source: CollectionDescriptorError<ReaderError, GetError>) -> Self {
+    fn from(source: CollectionDescriptorError<GetError>) -> Self {
         match source {
-            CollectionDescriptorError::Reader(source) => Self::Reader(source),
             CollectionDescriptorError::Get { collection, source } => {
                 Self::DescriptorGet { collection, source }
             }
@@ -737,17 +646,21 @@ impl<RecordsError, ReaderError, GetError, ViewError, EvidenceError>
     }
 }
 
-impl<RecordsError, ReaderError, GetError, ViewError, EvidenceError> fmt::Display
-    for CollectionMaterializationError<
-        RecordsError,
-        ReaderError,
-        GetError,
-        ViewError,
-        EvidenceError,
-    >
+impl<RecordsError, GetError, ViewError, EvidenceError> From<TryFromCoverError<GetError, ViewError>>
+    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
+{
+    fn from(source: TryFromCoverError<GetError, ViewError>) -> Self {
+        match source {
+            TryFromCoverError::MemberGet { member, source } => Self::MemberGet { member, source },
+            TryFromCoverError::View(source) => Self::View(source),
+        }
+    }
+}
+
+impl<RecordsError, GetError, ViewError, EvidenceError> fmt::Display
+    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
 where
     RecordsError: fmt::Display,
-    ReaderError: fmt::Display,
     GetError: fmt::Display,
     ViewError: fmt::Display,
     EvidenceError: fmt::Display,
@@ -767,7 +680,6 @@ where
                 "collection descriptor {} is invalid: {source}",
                 hex::encode_upper(collection.raw),
             ),
-            Self::Reader(source) => write!(f, "failed to open collection blob view: {source}"),
             Self::MemberGet { member, source } => write!(
                 f,
                 "failed to fetch cover member {}: {source}",
@@ -789,17 +701,10 @@ where
     }
 }
 
-impl<RecordsError, ReaderError, GetError, ViewError, EvidenceError> Error
-    for CollectionMaterializationError<
-        RecordsError,
-        ReaderError,
-        GetError,
-        ViewError,
-        EvidenceError,
-    >
+impl<RecordsError, GetError, ViewError, EvidenceError> Error
+    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
 where
     RecordsError: Error + 'static,
-    ReaderError: Error + 'static,
     GetError: Error + 'static,
     ViewError: Error + 'static,
     EvidenceError: Error + 'static,
@@ -811,7 +716,6 @@ where
             Self::ExactCover(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
             Self::InvalidDescriptor { source, .. } => Some(source),
-            Self::Reader(source) => Some(source),
             Self::MemberGet { source, .. } => Some(source),
             Self::InvalidMember { source, .. } => Some(source),
             Self::ResolutionConflict(source) => Some(source),
@@ -836,10 +740,10 @@ where
         .expect("typed collection descriptor was structurally validated");
     let (_, facts, _, mut blobs) = descriptor.into_parts();
     if let Some(name) = name {
-        let reader = blobs
-            .reader()
-            .expect("MemoryBlobStore::reader is infallible");
-        let valid = reader
+        let snapshot = blobs
+            .snapshot()
+            .expect("MemoryBlobStore::snapshot is infallible");
+        let valid = snapshot
             .get::<Blob<UTF8String>, UTF8String>(name)
             .ok()
             .and_then(|blob| blob.try_from_blob::<anybytes::View<str>>().ok())
@@ -852,8 +756,8 @@ where
         }
     }
     let mut embedded: Vec<Blob<UnknownBlob>> = blobs
-        .reader()
-        .expect("MemoryBlobStore::reader is infallible")
+        .snapshot()
+        .expect("MemoryBlobStore::snapshot is infallible")
         .into_iter()
         .map(|(_, blob)| blob)
         .collect();
@@ -886,18 +790,14 @@ struct LoadedCollectionDescriptor {
     authority: VerifyingKey,
 }
 
-fn load_collection_descriptor<S>(
-    store: &mut S,
+fn load_collection_descriptor<R>(
+    snapshot: &R,
     collection: CollectionHandle,
-) -> Result<
-    LoadedCollectionDescriptor,
-    CollectionDescriptorError<S::ReaderError, <S::Reader as BlobStoreGet>::GetError<Infallible>>,
->
+) -> Result<LoadedCollectionDescriptor, CollectionDescriptorError<R::GetError<Infallible>>>
 where
-    S: BlobStore,
+    R: BlobStoreGet,
 {
-    let reader = store.reader().map_err(CollectionDescriptorError::Reader)?;
-    let descriptor_blob: Blob<SimpleArchive> = reader
+    let descriptor_blob: Blob<SimpleArchive> = snapshot
         .get(collection)
         .map_err(|source| CollectionDescriptorError::Get { collection, source })?;
     let facts =
@@ -952,57 +852,43 @@ where
 }
 
 fn discover_admitted_subjects_at<S>(
-    store: &mut S,
+    snapshot: &S,
     authority: VerifyingKey,
     collection: CollectionHandle,
     instant: hifitime::Epoch,
-) -> Result<
-    BTreeSet<Inline<ED25519PublicKey>>,
-    CollectionEvidenceDiscoveryError<S::ProofsError, S::ReaderError>,
->
+) -> Result<BTreeSet<Inline<ED25519PublicKey>>, CollectionEvidenceDiscoveryError<S::ProofsError>>
 where
-    S: BlobStore + CapabilityProofStore,
+    S: BlobStoreGet + CapabilityProofRead,
 {
-    // Proof publication stores every claim blob before its proof record.
-    // Freeze proof membership first, then open one reader: every observed
-    // proof's prior claim closure is consequently visible in that reader.
-    let proofs = store
+    let proofs = snapshot
         .proofs()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?;
-    let reader = store
-        .reader()
-        .map_err(CollectionEvidenceDiscoveryError::Reader)?;
     Ok(admitted_subjects_at(
-        &reader, authority, collection, instant, proofs,
+        snapshot, authority, collection, instant, proofs,
     ))
 }
 
 fn discover_admitted_cover_at<S, L>(
-    store: &mut S,
+    snapshot: &S,
     collection: Collection<L>,
     instant: hifitime::Epoch,
 ) -> Result<
     (Fragment, DiscoveredCollectionRecords, Cover<L>),
-    CollectionCoverError<
-        S::RecordsError,
-        S::ProofsError,
-        S::ReaderError,
-        <S::Reader as BlobStoreGet>::GetError<Infallible>,
-    >,
+    CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
 >
 where
-    S: BlobStore + CapabilityProofStore + CollectionStore,
+    S: BlobStoreGet + CapabilityProofRead + CollectionRead,
     L: CollectionEncoding,
 {
-    let loaded = load_collection_descriptor(store, collection.handle())
+    let loaded = load_collection_descriptor(snapshot, collection.handle())
         .map_err(CollectionCoverError::Descriptor)?;
     let admitted =
-        discover_admitted_subjects_at(store, loaded.authority, collection.handle(), instant)
+        discover_admitted_subjects_at(snapshot, loaded.authority, collection.handle(), instant)
             .map_err(CollectionCoverError::Evidence)?;
     let discovered =
-        discover_collection_records_authorized(store, collection.handle(), |subject| {
+        discover_collection_records_authorized(snapshot, collection.handle(), |subject| {
             admitted.contains(subject)
         })
         .map_err(CollectionCoverError::Discovery)?;
@@ -1011,6 +897,198 @@ where
         discovered.commits().iter().map(CollectionCommit::data),
     );
     Ok((loaded.fragment, discovered, cover))
+}
+
+impl<L: CollectionEncoding> Collection<L> {
+    /// Decide whether `subject` is admitted as a writer at `instant`.
+    ///
+    /// The descriptor authority is admitted directly. Other subjects require
+    /// a complete proof for exact [`ACTION_WRITE`] on this collection in the
+    /// same immutable store observation.
+    pub fn writer_is_admitted_at<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+        instant: hifitime::Epoch,
+    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+    where
+        S: BlobStoreGet + CapabilityProofRead,
+    {
+        let loaded = load_collection_descriptor(snapshot, self.handle())
+            .map_err(CollectionAdmissionError::Descriptor)?;
+        if subject == loaded.authority {
+            return Ok(true);
+        }
+        let admitted =
+            discover_admitted_subjects_at(snapshot, loaded.authority, self.handle(), instant)
+                .map_err(CollectionAdmissionError::Evidence)?;
+        Ok(admitted.contains(&Inline::new(subject.to_bytes())))
+    }
+
+    /// Decide whether `subject` is admitted at the current clock instant.
+    pub fn writer_is_admitted<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+    where
+        S: BlobStoreGet + CapabilityProofRead,
+    {
+        self.writer_is_admitted_at(snapshot, subject, clock::epoch_now())
+    }
+
+    /// Discover the exact payload cover admitted at `instant`.
+    ///
+    /// The result is the semantic COMMIT frontier. It deliberately does not
+    /// substitute resident MERGE results; call [`Cover::resolve`] when a
+    /// physical cover is needed.
+    pub fn admitted_at<S>(
+        self,
+        snapshot: &S,
+        instant: hifitime::Epoch,
+    ) -> Result<
+        Cover<L>,
+        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
+    >
+    where
+        S: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    {
+        discover_admitted_cover_at(snapshot, self, instant).map(|(_, _, cover)| cover)
+    }
+
+    /// Discover the exact payload cover admitted at the current clock instant.
+    pub fn admitted<S>(
+        self,
+        snapshot: &S,
+    ) -> Result<
+        Cover<L>,
+        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
+    >
+    where
+        S: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    {
+        self.admitted_at(snapshot, clock::epoch_now())
+    }
+
+    /// Discover an admitted cover and the exact COMMIT roots selected by the
+    /// same authorization decision.
+    pub fn admitted_with_claims_at<S>(
+        self,
+        snapshot: &S,
+        instant: hifitime::Epoch,
+    ) -> Result<
+        (Cover<L>, Vec<CollectionCommit>),
+        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
+    >
+    where
+        S: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    {
+        let (_, discovered, cover) = discover_admitted_cover_at(snapshot, self, instant)?;
+        Ok((cover, discovered.commits().to_vec()))
+    }
+
+    /// Discover an admitted cover and its exact roots at the current instant.
+    pub fn admitted_with_claims<S>(
+        self,
+        snapshot: &S,
+    ) -> Result<
+        (Cover<L>, Vec<CollectionCommit>),
+        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
+    >
+    where
+        S: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    {
+        self.admitted_with_claims_at(snapshot, clock::epoch_now())
+    }
+
+    /// Read one logical value admitted at `instant` through one immutable
+    /// store observation.
+    pub fn read_at<V, S>(
+        self,
+        snapshot: &S,
+        instant: hifitime::Epoch,
+    ) -> Result<
+        V,
+        CollectionReadError<S::RecordsError, S::ProofsError, S::GetError<Infallible>, V::Error>,
+    >
+    where
+        S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
+        V: TryFromCover<L>,
+    {
+        let (descriptor, discovered, admitted) =
+            discover_admitted_cover_at(snapshot, self, instant)
+                .map_err(CollectionMaterializationError::from)?;
+        let resolved = resolve_cover_from_observation::<S, L, V::Error, _>(
+            snapshot,
+            &descriptor,
+            discovered,
+            admitted,
+        )?;
+        V::try_from_cover(&resolved, snapshot).map_err(CollectionMaterializationError::from)
+    }
+
+    /// Read one logical value, sampling the clock exactly once.
+    pub fn read<V, S>(
+        self,
+        snapshot: &S,
+    ) -> Result<
+        V,
+        CollectionReadError<S::RecordsError, S::ProofsError, S::GetError<Infallible>, V::Error>,
+    >
+    where
+        S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
+        V: TryFromCover<L>,
+    {
+        self.read_at(snapshot, clock::epoch_now())
+    }
+}
+
+impl<L: CollectionEncoding> Cover<L> {
+    /// Resolve this exact semantic cover to one resident physical cover.
+    ///
+    /// The returned `Cover` names the members actually selected from the same
+    /// snapshot. Support-equivalent compaction may therefore make it differ
+    /// from `self`; additions-only deltas belong on admitted covers, not on
+    /// these replaceable physical decompositions.
+    pub fn resolve<S>(
+        &self,
+        snapshot: &S,
+    ) -> Result<
+        Cover<L>,
+        CollectionMaterializationError<S::RecordsError, S::GetError<Infallible>, Infallible>,
+    >
+    where
+        S: BlobStoreGet + BlobStoreMeta + CollectionRead,
+    {
+        let descriptor = load_collection_descriptor(snapshot, self.collection().handle())
+            .map_err(CollectionMaterializationError::from)?
+            .fragment;
+        let discovered = if self.is_empty() {
+            DiscoveredCollectionRecords::default()
+        } else {
+            discover_collection_equations_for_cover(snapshot, self)
+                .map_err(CollectionMaterializationError::Discovery)?
+        };
+        resolve_cover_from_observation::<S, L, Infallible, Infallible>(
+            snapshot,
+            &descriptor,
+            discovered,
+            self.clone(),
+        )
+    }
+
+    /// Return every strictly verified provenance claim currently present for
+    /// these payload members in `snapshot`.
+    pub fn claims<S>(
+        &self,
+        snapshot: &S,
+    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<S::RecordsError>>
+    where
+        S: CollectionRead,
+    {
+        let discovered = discover_collection_claims_for_cover(snapshot, self)?;
+        Ok(discovered.commits().to_vec())
+    }
 }
 
 /// Ergonomic collection operations implemented directly by the backing store.
@@ -1048,10 +1126,10 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     /// Publish one signed fragment into an already registered collection.
     ///
     /// This performs no capability check. Local storage is a grow-only claim
-    /// ledger; authority is applied only by [`cover`](Self::cover) and
-    /// [`snapshot`](Self::snapshot). The descriptor is fetched and structurally
-    /// decoded before dependencies are staged, and the signed record is
-    /// inserted last without an implicit durability flush.
+    /// ledger; authority is applied by [`Collection::admitted`] when an
+    /// immutable store snapshot is read. The descriptor is fetched and
+    /// structurally decoded before dependencies are staged, and the signed
+    /// record is inserted last without an implicit durability flush.
     fn commit(
         &mut self,
         collection: Collection<SimpleArchive>,
@@ -1060,8 +1138,8 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
     ) -> Result<
         CollectionCommit,
         CollectionCommitError<
-            <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
+            <Self as SnapshotSource>::SnapshotError,
+            <<Self as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
             <Self as BlobStorePut>::PutError,
             OfferCaptureInsertError<
                 <Self as ArtifactOfferStore>::OfferError,
@@ -1070,10 +1148,12 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         >,
     >
     where
-        Self::Reader: BlobStoreMeta,
+        <Self as SnapshotSource>::Snapshot: BlobStoreMeta,
     {
-        let loaded = load_collection_descriptor(self, collection.handle())
+        let snapshot = self.snapshot().map_err(CollectionCommitError::Snapshot)?;
+        let loaded = load_collection_descriptor(&snapshot, collection.handle())
             .map_err(CollectionCommitError::Descriptor)?;
+        drop(snapshot);
 
         // A signed commit introduces authored graph facts. Other collection
         // encodings are reproducible representations introduced through
@@ -1082,8 +1162,8 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         let data_root: Blob<SimpleArchive> = facts.to_blob();
         let metadata: Blob<SimpleArchive> = metadata_facts.to_blob();
         let mut attachments: Vec<Blob<UnknownBlob>> = fragment_blobs
-            .reader()
-            .expect("MemoryBlobStore::reader is infallible")
+            .snapshot()
+            .expect("MemoryBlobStore::snapshot is infallible")
             .into_iter()
             .map(|(_, blob)| blob)
             .collect();
@@ -1098,12 +1178,10 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
         // Fragment attachments are resident before the authored member is
         // validated, so every handle named by its facts or metafacts already
         // has a published target.
-        let reader = store.reader().map_err(|source| {
-            CollectionCommitError::Descriptor(CollectionDescriptorError::Reader(source))
-        })?;
-        SimpleArchive::validate_member(&loaded.fragment, &data_root, &reader)
+        let snapshot = store.snapshot().map_err(CollectionCommitError::Snapshot)?;
+        SimpleArchive::validate_member(&loaded.fragment, &data_root, &snapshot)
             .map_err(CollectionCommitError::InvalidMember)?;
-        drop(reader);
+        drop(snapshot);
 
         let data_handle = store
             .put::<SimpleArchive, _>(data_root)
@@ -1122,241 +1200,42 @@ pub trait CollectionStoreExt: BlobStore + CollectionStore + ArtifactOfferStore +
             .map_err(CollectionCommitError::RecordInsert)?;
         Ok(commit)
     }
-
-    /// Decide whether `subject` would be admitted as a writer at this instant.
-    ///
-    /// The descriptor authority is admitted directly. Other subjects require
-    /// resident, valid evidence for exact [`ACTION_WRITE`] on this descriptor
-    /// handle. This pre-publication check neither scans collection commits nor
-    /// publishes anything; it applies the same proof rule as ordinary
-    /// capability-aware cover and snapshot discovery.
-    fn writer_is_admitted<L>(
-        &mut self,
-        collection: Collection<L>,
-        subject: VerifyingKey,
-    ) -> Result<
-        bool,
-        CollectionAdmissionError<
-            <Self as CapabilityProofStore>::ProofsError,
-            <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
-        >,
-    >
-    where
-        Self: CapabilityProofStore,
-        L: CollectionEncoding,
-    {
-        let loaded = load_collection_descriptor(self, collection.handle())
-            .map_err(CollectionAdmissionError::Descriptor)?;
-        if subject == loaded.authority {
-            return Ok(true);
-        }
-        let admitted = discover_admitted_subjects_at(
-            self,
-            loaded.authority,
-            collection.handle(),
-            clock::epoch_now(),
-        )
-        .map_err(CollectionAdmissionError::Evidence)?;
-        Ok(admitted.contains(&Inline::new(subject.to_bytes())))
-    }
-
-    /// Discover one canonical admitted payload cover.
-    ///
-    /// The descriptor authority is always admitted directly. Every resident
-    /// proof rooted at that authority is considered for exact [`ACTION_WRITE`]
-    /// on `collection`. Invalid, irrelevant, expired, or incomplete candidate
-    /// evidence grants nothing; failure to observe the proof store remains an
-    /// error.
-    fn cover<L>(
-        &mut self,
-        collection: Collection<L>,
-    ) -> Result<
-        Cover<L>,
-        CollectionCoverError<
-            <Self as CollectionStore>::RecordsError,
-            <Self as CapabilityProofStore>::ProofsError,
-            <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
-        >,
-    >
-    where
-        Self: CapabilityProofStore,
-        L: CollectionEncoding,
-    {
-        let (_, _, cover) = discover_admitted_cover_at(self, collection, clock::epoch_now())?;
-        Ok(cover)
-    }
-
-    /// Capture one coherent known-prefix logical value, cover, and reader snapshot.
-    fn snapshot<V, L>(
-        &mut self,
-        collection: Collection<L>,
-    ) -> Result<
-        Snapshot<L, V, <Self as BlobStore>::Reader>,
-        CollectionSnapshotError<
-            <Self as CollectionStore>::RecordsError,
-            <Self as CapabilityProofStore>::ProofsError,
-            <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
-            V::Error,
-        >,
-    >
-    where
-        Self: CapabilityProofStore,
-        <Self as BlobStore>::Reader: BlobStoreMeta,
-        L: CollectionEncoding,
-        V: TryFromCover<L>,
-    {
-        let (descriptor, discovered, cover) =
-            discover_admitted_cover_at(self, collection, clock::epoch_now())
-                .map_err(CollectionMaterializationError::from)?;
-        snapshot_from_observation(self, &descriptor, discovered, cover)
-    }
-
-    /// Capture one snapshot together with its exact admitted COMMIT roots.
-    ///
-    /// This performs the same single capability-aware discovery and
-    /// materialization as [`snapshot`](Self::snapshot), while additionally
-    /// retaining the strictly verified COMMIT records selected by that
-    /// admission event. It is opt-in because each record is substantially
-    /// larger than its deduplicated payload handle. The returned roots are
-    /// intentionally narrower than a later [`claims`](Self::claims) query:
-    /// unauthorized or newly arrived duplicate claims over an admitted
-    /// payload are not retroactive roots of this observation.
-    fn snapshot_with_admission<V, L>(
-        &mut self,
-        collection: Collection<L>,
-    ) -> Result<
-        (
-            Snapshot<L, V, <Self as BlobStore>::Reader>,
-            Vec<CollectionCommit>,
-        ),
-        CollectionSnapshotError<
-            <Self as CollectionStore>::RecordsError,
-            <Self as CapabilityProofStore>::ProofsError,
-            <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
-            V::Error,
-        >,
-    >
-    where
-        Self: CapabilityProofStore,
-        <Self as BlobStore>::Reader: BlobStoreMeta,
-        L: CollectionEncoding,
-        V: TryFromCover<L>,
-    {
-        let (descriptor, discovered, cover) =
-            discover_admitted_cover_at(self, collection, clock::epoch_now())
-                .map_err(CollectionMaterializationError::from)?;
-        let admitted_commits = discovered.commits().to_vec();
-        let snapshot = snapshot_from_observation(self, &descriptor, discovered, cover)?;
-        Ok((snapshot, admitted_commits))
-    }
-
-    /// Replay one opaque exact cover against this store.
-    ///
-    /// Unlike [`snapshot`](Self::snapshot), this performs no capability or
-    /// provenance discovery. Only the descriptor and payload bytes named by
-    /// `cover` are mandatory; resident commits and metadata are unnecessary.
-    /// Same-descriptor merge records may still accelerate the physical union.
-    fn materialize<V, L>(
-        &mut self,
-        cover: &Cover<L>,
-    ) -> Result<
-        V,
-        CollectionMaterializationError<
-            <Self as CollectionStore>::RecordsError,
-            <Self as BlobStore>::ReaderError,
-            <<Self as BlobStore>::Reader as BlobStoreGet>::GetError<Infallible>,
-            V::Error,
-        >,
-    >
-    where
-        <Self as BlobStore>::Reader: BlobStoreMeta,
-        L: CollectionEncoding,
-        V: TryFromCover<L>,
-    {
-        let collection = cover.collection();
-        let descriptor = load_collection_descriptor(self, collection.handle())
-            .map_err(CollectionMaterializationError::from)?
-            .fragment;
-        let discovered = if cover.is_empty() {
-            DiscoveredCollectionRecords::default()
-        } else {
-            discover_collection_equations_for_cover(self, cover)
-                .map_err(CollectionMaterializationError::Discovery)?
-        };
-        snapshot_from_observation(self, &descriptor, discovered, cover.clone())
-            .map(Snapshot::into_value)
-    }
-
-    /// Return every strictly verified provenance claim currently known for the
-    /// members of an opaque cover.
-    ///
-    /// This query is intentionally broader than the admission event which
-    /// minted the cover: later authorship or metadata claims over the same
-    /// payloads are visible without changing the cover itself.
-    fn claims<L>(
-        &mut self,
-        cover: &Cover<L>,
-    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<Self::RecordsError>>
-    where
-        L: CollectionEncoding,
-    {
-        let discovered = discover_collection_claims_for_cover(self, cover)?;
-        Ok(discovered.commits().to_vec())
-    }
 }
 
 impl<S> CollectionStoreExt for S where S: BlobStore + CollectionStore + ArtifactOfferStore {}
 
-/// Materialize one already-discovered exact payload cover.
+/// Resolve one already-discovered exact payload cover.
 ///
-/// Ordinary admitted snapshots, opaque replay, and exact-derived collection kinds use this
-/// single validator so descriptor, mandatory member, merge-cover, and
-/// reader-snapshot semantics cannot drift apart. Signed claims may have
-/// established a cover originally, but replay does not require them: metadata
-/// and authors remain optional provenance over the same payload member.
-pub(crate) fn snapshot_from_observation<S, L, V, EvidenceError>(
-    storage: &mut S,
+/// Admission and opaque replay use this single validator so descriptor,
+/// mandatory member, and merge-cover semantics cannot drift apart. The result
+/// is the actual resident physical cover selected by the resolver.
+pub(crate) fn resolve_cover_from_observation<S, L, ViewError, EvidenceError>(
+    snapshot: &S,
     descriptor: &Fragment,
     discovered: DiscoveredCollectionRecords,
     cover: Cover<L>,
 ) -> Result<
-    Snapshot<L, V, S::Reader>,
+    Cover<L>,
     CollectionMaterializationError<
         S::RecordsError,
-        S::ReaderError,
-        <S::Reader as BlobStoreGet>::GetError<Infallible>,
-        V::Error,
+        S::GetError<Infallible>,
+        ViewError,
         EvidenceError,
     >,
 >
 where
-    S: BlobStore + CollectionStore,
-    S::Reader: BlobStoreMeta,
+    S: BlobStoreGet + BlobStoreMeta + CollectionRead,
     L: CollectionEncoding,
-    V: TryFromCover<L>,
 {
     let collection = cover.collection().handle();
-    let reader = storage
-        .reader()
-        .map_err(CollectionMaterializationError::Reader)?;
+    let reader = snapshot;
 
     if cover.is_empty() {
-        let snapshot_cover = cover.clone();
-        let value = V::try_from_cover(CoverAttachment::from_parts(cover, Vec::new()), &reader)
-            .map_err(CollectionMaterializationError::View)?;
-        return Ok(Snapshot {
-            value,
-            cover: snapshot_cover,
-            reader,
-        });
+        return Ok(cover);
     }
 
-    // The descriptor was bound to this typed collection before this coherent
-    // reader was opened. Its immutable content address already binds these
+    // The descriptor was fetched and bound to this typed collection through
+    // this same immutable snapshot. Its content address already binds these
     // facts; another fetch cannot strengthen that proof.
 
     // Fetch and validate each cover payload exactly once. Claims, authorship,
@@ -1368,7 +1247,7 @@ where
         let blob = reader
             .get(member_handle)
             .map_err(|source| CollectionMaterializationError::MemberGet { member, source })?;
-        L::validate_member(descriptor, &blob, &reader)
+        L::validate_member(descriptor, &blob, reader)
             .map_err(|source| CollectionMaterializationError::InvalidMember { member, source })?;
         known.insert(member, blob);
     }
@@ -1468,7 +1347,7 @@ where
         } else {
             match (known.get(&low), known.get(&high)) {
                 (Some(low_blob), Some(high_blob)) => {
-                    match L::join_members(descriptor, low_blob, high_blob, &reader) {
+                    match L::join_members(descriptor, low_blob, high_blob, reader) {
                         Ok(Some(value)) => {
                             let expected = Handle::<L>::to_hash(value.get_handle());
                             expected_hashes.insert(pair, expected);
@@ -1497,7 +1376,7 @@ where
                 if joined.is_none() {
                     joined = match (known.get(&low), known.get(&high)) {
                         (Some(low_blob), Some(high_blob)) => {
-                            L::join_members(descriptor, low_blob, high_blob, &reader)
+                            L::join_members(descriptor, low_blob, high_blob, reader)
                                 .ok()
                                 .flatten()
                         }
@@ -1612,7 +1491,7 @@ where
             let handle = Handle::<L>::from_hash(data);
             let root: Result<Blob<L>, _> = reader.get(handle);
             match root {
-                Ok(root) => match L::validate_member(descriptor, &root, &reader) {
+                Ok(root) => match L::validate_member(descriptor, &root, reader) {
                     Ok(()) => {
                         selected.insert(data, root);
                     }
@@ -1630,25 +1509,5 @@ where
         }
     };
 
-    let mut members = Vec::with_capacity(physical_cover.len());
-    for data in physical_cover {
-        let blob = if roots.contains(&data) {
-            known
-                .get(&data)
-                .expect("explicit cover-root bytes stay cached")
-        } else {
-            selected
-                .get(&data)
-                .expect("selected optional cover members stay cached")
-        };
-        members.push((Handle::<L>::from_hash(data), (*blob).clone()));
-    }
-    let snapshot_cover = cover.clone();
-    let value = V::try_from_cover(CoverAttachment::from_parts(cover, members), &reader)
-        .map_err(CollectionMaterializationError::View)?;
-    Ok(Snapshot {
-        value,
-        cover: snapshot_cover,
-        reader,
-    })
+    Ok(Cover::from_data(cover.collection(), physical_cover))
 }

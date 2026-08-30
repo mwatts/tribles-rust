@@ -105,29 +105,29 @@ fn scan_record_evidence(pile_path: &Path) -> Result<RecordEvidence> {
 
 fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace::prelude::blobencodings::{SimpleArchive, UTF8String};
-    use triblespace::prelude::{BlobStore, BlobStoreGet};
+    use triblespace::prelude::BlobStoreGet;
 
     use triblespace_core::id::id_hex;
     use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
     use triblespace_core::inline::Inline;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::repo::pile::{Pile, ReadError};
-    use triblespace_core::repo::{self, BlobStoreMeta, PinSnapshotSource};
+    use triblespace_core::repo::{self, BlobStoreMeta, PinSnapshotSource, SnapshotSource};
     use triblespace_core::trible::TribleSet;
 
     match Pile::open(pile_path) {
         Ok(mut pile) => {
             let res = (|| -> Result<(), anyhow::Error> {
                 let mut any_error = false;
-                let reader = pile
-                    .reader()
+                let snapshot = pile
+                    .snapshot()
                     .map_err(|error| super::pile_read_error(pile_path, error))?;
                 let evidence = scan_record_evidence(pile_path)?;
 
                 // Blob hash validation.
                 let mut invalid = 0usize;
                 let mut total = 0usize;
-                for item in reader.iter() {
+                for item in snapshot.iter() {
                     match item {
                         Ok((handle, blob)) => {
                             total += 1;
@@ -209,7 +209,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                     id_hex!("4DD4DDD05CC31734B03ABB4E43188B1F");
 
                 fn verify_chain(
-                    reader: &triblespace_core::repo::pile::PileReader,
+                    snapshot: &triblespace_core::repo::pile::PileSnapshot,
                     start: Inline<Handle<SimpleArchive>>,
                     repo_parent_attr: triblespace_core::id::Id,
                     repo_content_attr: triblespace_core::id::Id,
@@ -224,7 +224,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                         if !visited.insert(hex.clone()) {
                             continue;
                         }
-                        match reader.metadata(h) {
+                        match snapshot.metadata(h) {
                             Ok(None) => {
                                 return (count, Some(format!("commit blake3:{hex} missing")));
                             }
@@ -236,7 +236,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                 );
                             }
                         }
-                        let meta: TribleSet = match reader.get::<TribleSet, SimpleArchive>(h) {
+                        let meta: TribleSet = match snapshot.get::<TribleSet, SimpleArchive>(h) {
                             Ok(m) => m,
                             Err(e) => {
                                 return (
@@ -257,7 +257,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                         // Some commits (for example merge-only commits) intentionally do not carry
                         // a content blob. Only verify content existence when present.
                         if let Some(c) = content_handle {
-                            match reader.metadata(c) {
+                            match snapshot.metadata(c) {
                                 Ok(Some(_)) => {}
                                 Ok(None) => {
                                     return (
@@ -295,12 +295,12 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                             println!("- {id_hex}: <no branch metadata head set>");
                         }
                         Some(meta_handle) => {
-                            let meta_present = reader.metadata(meta_handle)?.is_some();
+                            let meta_present = snapshot.metadata(meta_handle)?.is_some();
                             let mut name_val: Option<String> = None;
                             let mut head_val: Option<Inline<Handle<SimpleArchive>>> = None;
                             let mut meta_err: Option<String> = None;
                             if meta_present {
-                                match reader.get::<TribleSet, SimpleArchive>(meta_handle) {
+                                match snapshot.get::<TribleSet, SimpleArchive>(meta_handle) {
                                     Ok(meta) => match repo::branch::branch_entity(&meta, bid) {
                                         Ok(branch_entity) => {
                                             let mut names = find!(
@@ -309,7 +309,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                             );
                                             if let (Some(name), None) = (names.next(), names.next())
                                             {
-                                                if let Ok(view) = reader
+                                                if let Ok(view) = snapshot
                                                     .get::<triblespace::prelude::View<str>, _>(name)
                                                 {
                                                     name_val = Some(view.as_ref().to_string());
@@ -378,7 +378,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                             }
                             if let Some(head) = head_val {
                                 let (count, err) = verify_chain(
-                                    &reader,
+                                    &snapshot,
                                     head,
                                     repo_parent_attr,
                                     repo_content_attr,

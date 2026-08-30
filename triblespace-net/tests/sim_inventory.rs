@@ -14,13 +14,16 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::{
     CapabilityClaim, CapabilityMode, CapabilityProofBundle, CapabilityValidity,
 };
-use triblespace_core::collection::{CollectionMerge, CollectionRecord, CollectionStore};
+use triblespace_core::collection::{
+    CollectionMerge, CollectionRead, CollectionRecord, CollectionStore,
+};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::peer::PeerEvidence;
 use triblespace_core::repo::{
-    BlobStorePut, CapabilityProofStore, PeerStore, StorageFlush, WantRequest, WantStore,
+    BlobStorePut, CapabilityProofRead, CapabilityProofStore, PeerRead, PeerStore, SnapshotSource,
+    StorageFlush, WantRequest, WantStore,
 };
 use triblespace_net::inventory::{
     BlobReconcileMode, ReconcileDirection, ReconcileQos, sync_team_capability_atom,
@@ -59,15 +62,21 @@ fn has_blob(peer: &mut TestPeer, hash: [u8; 32]) -> bool {
 }
 
 fn has_record(peer: &TestPeer, expected: CollectionRecord) -> bool {
-    peer.store().record(expected.id()).unwrap() == Some(expected)
+    let mut store = peer.store();
+    let snapshot = store.snapshot().unwrap();
+    snapshot.record(expected.id()).unwrap() == Some(expected)
 }
 
 fn has_proof(peer: &TestPeer, expected: &triblespace_core::capability::CapabilityProof) -> bool {
-    peer.store().proof(expected.id()).unwrap().as_ref() == Some(expected)
+    let mut store = peer.store();
+    let snapshot = store.snapshot().unwrap();
+    snapshot.proof(expected.id()).unwrap().as_ref() == Some(expected)
 }
 
 fn has_peer(peer: &TestPeer, expected: PeerEvidence) -> bool {
-    peer.store()
+    let mut store = peer.store();
+    let snapshot = store.snapshot().unwrap();
+    snapshot
         .peers()
         .unwrap()
         .any(|candidate| candidate.unwrap() == expected)

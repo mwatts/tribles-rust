@@ -26,7 +26,7 @@ use triblespace_core::inline::Inline;
 use triblespace_core::macros::attributes;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::query::temp;
-use triblespace_core::repo::BlobStore;
+use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
 
 use triblespace_search::hnsw::HNSWBuilder;
@@ -112,8 +112,8 @@ fn main() {
 
     // Put the fixed ANN probe into the same content-addressed store.
     let query_handle = put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-    let reader = store.reader().unwrap();
-    let view = idx.attach(&reader);
+    let snapshot = store.snapshot().unwrap();
+    let view = idx.attach(&snapshot);
     println!(
         "HNSW index built: {} handles, dim = {}, max_level = {}",
         idx.doc_count(),

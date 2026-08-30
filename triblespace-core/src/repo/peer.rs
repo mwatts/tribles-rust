@@ -133,24 +133,44 @@ impl Error for PeerEvidenceDecodeError {
     }
 }
 
-/// Storage surface for positive peer-routing evidence.
+/// Immutable read surface for positive peer-routing evidence.
 ///
-/// Insertion is idempotent and enumeration is deterministic. The interface
-/// deliberately has no removal operation and carries no authorization or
-/// availability semantics.
-pub trait PeerStore {
+/// Enumeration is deterministic and observes one coherent store snapshot.
+/// Evidence carries no authorization or availability semantics.
+pub trait PeerRead {
     /// Failure while enumerating peer evidence.
     type PeersError: Error + Debug + Send + Sync + 'static;
-    /// Failure while inserting peer evidence.
-    type InsertError: Error + Debug + Send + Sync + 'static;
-
     /// Borrowing iterator over one deterministic view of known evidence.
     type PeerIter<'a>: Iterator<Item = Result<PeerEvidence, Self::PeersError>>
     where
         Self: 'a;
 
     /// Enumerate currently known evidence in canonical byte order.
-    fn peers<'a>(&'a mut self) -> Result<Self::PeerIter<'a>, Self::PeersError>;
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError>;
+}
+
+impl<R> PeerRead for &R
+where
+    R: PeerRead + ?Sized,
+{
+    type PeersError = R::PeersError;
+    type PeerIter<'a>
+        = R::PeerIter<'a>
+    where
+        Self: 'a;
+
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+        (**self).peers()
+    }
+}
+
+/// Grow-only write surface for positive peer-routing evidence.
+///
+/// Insertion is idempotent. The interface deliberately has no removal
+/// operation; readers obtain evidence from the store's immutable snapshot.
+pub trait PeerStore {
+    /// Failure while inserting peer evidence.
+    type InsertError: Error + Debug + Send + Sync + 'static;
 
     /// Insert one positive routing fact.
     fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError>;
@@ -160,16 +180,7 @@ impl<S> PeerStore for &mut S
 where
     S: PeerStore + ?Sized,
 {
-    type PeersError = S::PeersError;
     type InsertError = S::InsertError;
-    type PeerIter<'a>
-        = S::PeerIter<'a>
-    where
-        Self: 'a;
-
-    fn peers<'a>(&'a mut self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
-        (**self).peers()
-    }
 
     fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
         (**self).insert_peer(evidence)
@@ -182,6 +193,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::SnapshotSource;
 
     fn key(byte: u8) -> VerifyingKey {
         SigningKey::from_bytes(&[byte; 32]).verifying_key()
@@ -231,7 +243,8 @@ mod tests {
         repo.insert_peer(low).unwrap();
         repo.insert_peer(high).unwrap();
 
-        let peers = repo
+        let snapshot = repo.snapshot().unwrap();
+        let peers = snapshot
             .peers()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()

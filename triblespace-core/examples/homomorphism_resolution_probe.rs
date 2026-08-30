@@ -16,7 +16,7 @@ use triblespace_core::collection::{
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::prelude::blobencodings::SimpleArchive;
-use triblespace_core::repo::{memoryrepo::MemoryRepo, BlobStorePut};
+use triblespace_core::repo::{memoryrepo::MemoryRepo, BlobStorePut, SnapshotSource};
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
@@ -183,7 +183,8 @@ fn build(
     for record in &derives {
         CollectionStore::insert(&mut store, CollectionRecord::Derive(*record)).unwrap();
     }
-    let records = discover_collection_records(&mut store).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let records = discover_collection_records(&snapshot).unwrap();
     let authorized = commits.iter().map(CollectionCommit::id).collect();
     (
         records,

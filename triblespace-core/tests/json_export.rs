@@ -5,7 +5,7 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::export::json::export_to_json;
 use triblespace_core::import::json::JsonObjectImporter;
-use triblespace_core::prelude::BlobStore;
+use triblespace_core::prelude::SnapshotSource;
 
 #[test]
 fn exports_json_with_cardinality_hints() {
@@ -31,7 +31,7 @@ fn exports_json_with_cardinality_hints() {
     let mut merged = importer.metadata().into_facts();
     merged += fragment.into_facts();
 
-    let reader = blobs.reader().expect("reader");
+    let reader = blobs.snapshot().expect("snapshot");
 
     let mut export_raw = String::new();
     export_to_json(&merged, root, &reader, &mut export_raw).expect("export");
@@ -89,7 +89,7 @@ fn exports_openai_like_conversation() {
     let mut merged = importer.metadata().into_facts();
     merged += fragment.into_facts();
 
-    let reader = blobs.reader().expect("reader");
+    let reader = blobs.snapshot().expect("snapshot");
 
     let mut exported_raw = String::new();
     export_to_json(&merged, root, &reader, &mut exported_raw).expect("export");

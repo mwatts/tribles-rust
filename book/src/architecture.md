@@ -169,24 +169,25 @@ not what a process may append to its own store.
 
 Reads are exact about what they observed, not magical about global time:
 
-- `store.cover(collection)` loads the descriptor authority, admits its own
-  strictly signed commits directly, discovers and verifies resident delegation
-  proofs, and returns one canonical typed payload `Cover<E>`
-  without fetching member data;
-- `store.snapshot(collection)` performs that same admission and
-  carries a `TryFromCover<E>` logical value, the exact cover, and the blob
-  reader which validated them; and
-- `store.materialize(&cover)` exact-replays an already admitted multi-author
-  frontier without holding a publishing key or repeating capability policy.
+- `store.snapshot()` freezes blob bytes, collection records, capability proofs,
+  and peer evidence from one coherent known prefix;
+- `collection.admitted(&snapshot)` applies the descriptor authority and
+  resident delegation proofs to obtain one semantic `Cover<E>` without
+  fetching member data;
+- `cover.resolve(&snapshot)` selects a resident support-equivalent physical
+  decomposition; and
+- `V::try_from_cover(&physical, &snapshot)` reconstructs the logical value
+  through that same immutable observation. `collection.read(&snapshot)` is the
+  convenience form of the final three steps.
 
 Cover identity is the collection descriptor plus distinct payload handles.
 Signer, signature, and metadata claims currently known to the store remain
 queryable, but no claim is required for replay, and another claim over the same
 payload does not change the cover or repeat data work.
 
-Each call observes one known prefix of an append-only store. A concurrent
-commit may appear now or on the next call, but a snapshot never
-combines facts from one admission frontier with payloads from another. The
+Each store snapshot observes one known prefix of an append-only store. A
+concurrent commit may appear now or on the next call, but one observation never
+combines records from one prefix with payloads from another. The
 descriptor authority and every delegate authorized by a valid resident proof
 participate; unauthorized commits remain inert.
 
@@ -224,7 +225,7 @@ index. Thus raw cover `{a, b}` maps to `{f(a), f(b)}` even when resident
 evidence also proves `a join b = c`; only explicit raw compaction to cover
 `{c}` changes the accelerated cover to `{f(c)}`. Exact derivation stores the
 selected source before the target root and semantic record. A cover-aware view
-follows the embedded handle through its reader, validates the exact raw/index
+follows the embedded handle through its store snapshot, validates the exact raw/index
 pair, and only then builds the transient query runtime. A root whose raw child
 is absent is nonresident; ensuring reconstructs the exact accelerated image
 from that raw source.

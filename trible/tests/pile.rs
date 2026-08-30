@@ -1,8 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
-use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreList;
+use triblespace::prelude::SnapshotSource;
 use triblespace_core::repo::pile::Pile;
 
 fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
@@ -106,9 +106,9 @@ fn put_ingests_file() {
         .stdout(predicate::str::is_match(pattern).unwrap());
 
     let mut pile: Pile = Pile::open(&pile_path).unwrap();
-    let reader = pile.reader().unwrap();
-    assert!(reader.blobs().next().is_some());
-    drop(reader);
+    let snapshot = pile.snapshot().unwrap();
+    assert!(snapshot.blobs().next().is_some());
+    drop(snapshot);
     pile.close().unwrap();
 }
 

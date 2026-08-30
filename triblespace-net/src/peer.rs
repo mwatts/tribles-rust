@@ -15,15 +15,16 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use triblespace_core::collection::CollectionStore;
+use triblespace_core::collection::{CollectionRead, CollectionStore};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     ArtifactOfferSnapshot, ArtifactOfferStore, BlobChildren, BlobStore, BlobStoreGet,
-    BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofStore, PeerStore, StorageFlush,
-    StoreRevision, StoreRevisionChanges, StoreScope, StoreScopeError, WantRequest, WantStore,
+    BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
+    PeerRead, PeerStore, SnapshotSource, StorageFlush, StoreChanges, StoreRead, StoreScope,
+    StoreScopeError, StoreSnapshot as CoreStoreSnapshot, WantRequest, WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
@@ -79,6 +80,55 @@ impl<E: Error + 'static> Error for PeerOpenError<E> {
     }
 }
 
+/// Failure while freezing the local observation behind a [`Peer`].
+#[derive(Debug)]
+pub enum PeerSnapshotError<SnapshotError, ScopeError> {
+    /// The backing store could not freeze its coherent observation.
+    Store(SnapshotError),
+    /// The physical store is no longer valid for this peer's team.
+    Scope(PeerOpenError<ScopeError>),
+}
+
+impl<SnapshotError, ScopeError> fmt::Display for PeerSnapshotError<SnapshotError, ScopeError>
+where
+    SnapshotError: fmt::Display,
+    ScopeError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "cannot freeze peer store snapshot: {error}"),
+            Self::Scope(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<SnapshotError, ScopeError> Error for PeerSnapshotError<SnapshotError, ScopeError>
+where
+    SnapshotError: Error + 'static,
+    ScopeError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Scope(error) => Some(error),
+        }
+    }
+}
+
+fn validate_scope<S>(
+    store: &mut S,
+    requested: VerifyingKey,
+) -> Result<(), PeerOpenError<S::ScopeError>>
+where
+    S: StoreScope,
+{
+    match store.store_scope().map_err(PeerOpenError::Scope)? {
+        None => Err(PeerOpenError::Unbound),
+        Some(bound) if bound == requested => Ok(()),
+        Some(bound) => Err(PeerOpenError::TeamMismatch { bound, requested }),
+    }
+}
+
 /// A store attached to one team-scoped network host.
 pub struct Peer<S>
 where
@@ -89,10 +139,9 @@ where
         + ArtifactOfferStore
         + WantStore
         + StorageFlush
-        + StoreRevision
         + Send
         + 'static,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobStoreMeta,
 {
     store: Arc<Mutex<S>>,
     sender: NetSender,
@@ -106,7 +155,7 @@ where
     /// Last local observation used to build the installed immutable inventory.
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
-    last_store_revision: Option<S::Revision>,
+    last_store_snapshot: Option<S::Snapshot>,
     /// Last durable local publication policy sent to the host. Offers are
     /// deliberately observed independently of the four-component inventory
     /// revision because changing them must not rebuild semantic inventory.
@@ -124,10 +173,9 @@ where
         + StoreScope
         + WantStore
         + StorageFlush
-        + StoreRevision
         + Send
         + 'static,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobStoreMeta,
 {
     /// Spawn a production host and attach `store` to exactly `config.team`.
     pub fn new(
@@ -161,11 +209,7 @@ where
         store: &mut S,
         requested: VerifyingKey,
     ) -> Result<(), PeerOpenError<S::ScopeError>> {
-        match store.store_scope().map_err(PeerOpenError::Scope)? {
-            None => Err(PeerOpenError::Unbound),
-            Some(bound) if bound == requested => Ok(()),
-            Some(bound) => Err(PeerOpenError::TeamMismatch { bound, requested }),
-        }
+        validate_scope(store, requested)
     }
 
     fn assemble(
@@ -199,7 +243,7 @@ where
             team,
             qos,
             pending_network_flush,
-            last_store_revision: None,
+            last_store_snapshot: None,
             last_artifact_offers: None,
             last_event_at: crate::clock::mono_now(),
         };
@@ -273,7 +317,7 @@ where
             // A transient scope-observation failure must not strand the peer
             // with no snapshot merely because the sync-visible revision did
             // not change before the next successful refresh.
-            self.last_store_revision = None;
+            self.last_store_snapshot = None;
         }
         result
     }
@@ -363,12 +407,12 @@ where
             }
         }
         if !self.pending_network_flush {
-            let revision = match store.store_revision() {
-                Ok(revision) => revision,
+            let snapshot = match store.snapshot() {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     tracing::warn!(
                         ?error,
-                        "store revision unavailable; keeping prior inventory"
+                        "store snapshot unavailable; keeping prior inventory"
                     );
                     // Offer observation is an independent local policy lane.
                     // Keep the previous semantic inventory, but do not skip a
@@ -383,33 +427,33 @@ where
                     return Ok(());
                 }
             };
-            // `store_revision` may itself reobserve an external append. Scope
+            // `snapshot` may itself reobserve an external append. Scope
             // is intentionally absent from that sync-visible token, so check
             // it again before an equality fast-path can retain a serving view.
             Self::validate_store_scope(&mut *store, self.team)?;
             let previous_snapshot = self.sender.current_snapshot();
             let changes = if previous_snapshot.is_none() {
-                StoreRevisionChanges::ALL
+                StoreChanges::ALL
             } else {
-                self.last_store_revision
+                self.last_store_snapshot
                     .as_ref()
-                    .map_or(StoreRevisionChanges::ALL, |previous| {
-                        S::revision_changes(previous, &revision)
+                    .map_or(StoreChanges::ALL, |previous| {
+                        snapshot.changes_since(previous)
                     })
             };
-            if changes.is_empty() {
-                // An implementation may conservatively vary its opaque token
-                // for state outside the semantic components. Remember that
-                // observation instead of classifying the same no-op forever.
-                self.last_store_revision = Some(revision);
-            } else if Self::install_validated_snapshot(
+            // Even a semantic no-op installs the fresh read lease. The host
+            // reuses unchanged PATCH inventories while replacing the Blob
+            // reader, so pile remaps and reclaimed generations are not pinned
+            // forever merely because their content sets stayed identical.
+            if Self::install_validated_snapshot(
                 &self.sender,
                 &mut *store,
+                snapshot.clone(),
                 self.team,
                 previous_snapshot.as_deref(),
                 changes,
             )? {
-                self.last_store_revision = Some(revision);
+                self.last_store_snapshot = Some(snapshot);
             }
         }
         Self::observe_artifact_offers(
@@ -456,12 +500,18 @@ where
     fn install_validated_snapshot(
         sender: &NetSender,
         store: &mut S,
+        store_snapshot: S::Snapshot,
         team: VerifyingKey,
         previous: Option<&StoreSnapshot>,
-        changes: StoreRevisionChanges,
+        changes: StoreChanges,
     ) -> Result<bool, PeerOpenError<S::ScopeError>> {
         Self::validate_store_scope(store, team)?;
-        let snapshot = match StoreSnapshot::from_store_changes(store, team, previous, changes) {
+        let snapshot = match StoreSnapshot::from_store_changes(
+            store_snapshot,
+            team,
+            previous,
+            changes,
+        ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(%error, "store inventory snapshot unavailable; clearing serving view");
@@ -485,14 +535,14 @@ where
         let Self { store, .. } = self;
         Arc::try_unwrap(store)
             .unwrap_or_else(|_| {
-                panic!("Peer::into_store: an outstanding PeerReader still shares the store")
+                panic!("Peer::into_store: an outstanding PeerSnapshot still shares the store")
             })
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn try_local(&mut self, hash: RawHash) -> Option<Bytes> {
-        self.reader()
+        self.snapshot()
             .ok()?
             .get::<Bytes, UnknownBlob>(Inline::new(hash))
             .ok()
@@ -538,10 +588,9 @@ where
         + StoreScope
         + WantStore
         + StorageFlush
-        + StoreRevision
         + Send
         + 'static,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobStoreMeta,
 {
     type PutError = S::PutError;
 
@@ -556,7 +605,7 @@ where
     }
 }
 
-impl<S> BlobStore for Peer<S>
+impl<S> SnapshotSource for Peer<S>
 where
     S: BlobStore
         + CollectionStore
@@ -566,27 +615,43 @@ where
         + StoreScope
         + WantStore
         + StorageFlush
-        + StoreRevision
         + Send
         + 'static,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobStoreMeta,
 {
-    type Reader = PeerReader<S::Reader>;
-    type ReaderError = S::ReaderError;
+    type Snapshot = PeerSnapshot<S::Snapshot>;
+    type SnapshotError = PeerSnapshotError<S::SnapshotError, S::ScopeError>;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.refresh();
-        let local = self.store.lock().expect("store mutex").reader()?;
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        // Unlike the scheduler-oriented `refresh`, freezing a caller-visible
+        // snapshot must report a scope conflict rather than merely withdrawing
+        // the serving inventory and continuing.
+        self.try_refresh().map_err(PeerSnapshotError::Scope)?;
+        let mut store = self.store.lock().expect("store mutex");
+        validate_scope(&mut *store, self.team).map_err(PeerSnapshotError::Scope)?;
+        let local = store.snapshot().map_err(PeerSnapshotError::Store)?;
+        // A file-backed snapshot may itself reobserve an externally appended
+        // scope record. Check again before minting the lazy fetch capability.
+        validate_scope(&mut *store, self.team).map_err(PeerSnapshotError::Scope)?;
+        drop(store);
         let fetch = Some(FetchCap {
             sender: self.sender.clone(),
-            sink: Arc::new(SharedStore(self.store.clone())),
+            sink: Arc::new(SharedStore {
+                store: self.store.clone(),
+                team: self.team,
+            }),
         });
-        Ok(PeerReader { local, fetch })
+        Ok(PeerSnapshot { local, fetch })
     }
 }
 
-/// A frozen local reader plus an optional exact-fetch capability.
-pub struct PeerReader<L> {
+/// A frozen local store observation plus an optional live exact-fetch
+/// capability.
+///
+/// Synchronous reads and listings remain fixed at `local`. Async retrieval may
+/// acquire explicitly addressed immutable bytes through the swarm and cache
+/// them operationally, but never extends this snapshot's frozen inventory.
+pub struct PeerSnapshot<L> {
     local: L,
     fetch: Option<FetchCap>,
 }
@@ -602,14 +667,19 @@ trait StoreSink: Send + Sync {
     fn land(&self, bytes: Bytes);
 }
 
-struct SharedStore<S>(Arc<Mutex<S>>);
+struct SharedStore<S> {
+    store: Arc<Mutex<S>>,
+    team: VerifyingKey,
+}
 
 impl<S> StoreSink for SharedStore<S>
 where
-    S: BlobStorePut + WantStore + StorageFlush + Send + 'static,
+    S: BlobStorePut + WantStore + StorageFlush + StoreScope + Send + 'static,
 {
     fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut store = self.0.lock().expect("store mutex");
+        let mut store = self.store.lock().expect("store mutex");
+        validate_scope(&mut *store, self.team)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
         store
             .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
             .map_err(|error| {
@@ -624,7 +694,11 @@ where
     }
 
     fn land(&self, bytes: Bytes) {
-        if let Ok(mut store) = self.0.lock() {
+        if let Ok(mut store) = self.store.lock() {
+            if let Err(error) = validate_scope(&mut *store, self.team) {
+                tracing::warn!(%error, "refusing to land a fetched blob into an invalidly scoped store");
+                return;
+            }
             if let Err(error) = store.put::<UnknownBlob, Bytes>(bytes) {
                 tracing::warn!(?error, "reader fetch landing failed");
             }
@@ -632,7 +706,7 @@ where
     }
 }
 
-impl<L: Clone> Clone for PeerReader<L> {
+impl<L: Clone> Clone for PeerSnapshot<L> {
     fn clone(&self) -> Self {
         Self {
             local: self.local.clone(),
@@ -641,22 +715,31 @@ impl<L: Clone> Clone for PeerReader<L> {
     }
 }
 
-impl<L: PartialEq> PartialEq for PeerReader<L> {
+impl<L: PartialEq> PartialEq for PeerSnapshot<L> {
     fn eq(&self, other: &Self) -> bool {
         self.local == other.local
     }
 }
 
-impl<L: Eq> Eq for PeerReader<L> {}
+impl<L: Eq> Eq for PeerSnapshot<L> {}
+
+impl<L> CoreStoreSnapshot for PeerSnapshot<L>
+where
+    L: CoreStoreSnapshot,
+{
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        self.local.changes_since(&previous.local)
+    }
+}
 
 #[derive(Debug)]
-pub enum PeerReaderGetError<E> {
+pub enum PeerSnapshotGetError<E> {
     Conversion(E),
     Unavailable,
     WantRecord(Box<dyn std::error::Error + Send + Sync>),
 }
 
-impl<E: std::error::Error> std::fmt::Display for PeerReaderGetError<E> {
+impl<E: std::error::Error> std::fmt::Display for PeerSnapshotGetError<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Conversion(error) => write!(formatter, "blob conversion failed: {error}"),
@@ -666,7 +749,7 @@ impl<E: std::error::Error> std::fmt::Display for PeerReaderGetError<E> {
     }
 }
 
-impl<E: std::error::Error + 'static> std::error::Error for PeerReaderGetError<E> {
+impl<E: std::error::Error + 'static> std::error::Error for PeerSnapshotGetError<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Conversion(error) => Some(error),
@@ -676,7 +759,7 @@ impl<E: std::error::Error + 'static> std::error::Error for PeerReaderGetError<E>
     }
 }
 
-impl<L> BlobStoreGet for PeerReader<L>
+impl<L> BlobStoreGet for PeerSnapshot<L>
 where
     L: BlobStoreGet,
 {
@@ -695,7 +778,7 @@ where
     }
 }
 
-impl<L> BlobStoreList for PeerReader<L>
+impl<L> BlobStoreList for PeerSnapshot<L>
 where
     L: BlobStoreList,
 {
@@ -718,13 +801,76 @@ where
     }
 }
 
-impl<L> BlobChildren for PeerReader<L> where L: BlobStoreGet {}
+impl<L> BlobStoreMeta for PeerSnapshot<L>
+where
+    L: BlobStoreMeta,
+{
+    type MetaError = L::MetaError;
 
-impl<L> triblespace_core::repo::async_store::AsyncBlobStoreGet for PeerReader<L>
+    fn metadata<Sch>(
+        &self,
+        handle: Inline<Handle<Sch>>,
+    ) -> Result<Option<triblespace_core::repo::BlobMetadata>, Self::MetaError>
+    where
+        Sch: BlobEncoding + 'static,
+        Handle<Sch>: InlineEncoding,
+    {
+        self.local.metadata(handle)
+    }
+}
+
+impl<L> CollectionRead for PeerSnapshot<L>
+where
+    L: CollectionRead,
+{
+    type RecordsError = L::RecordsError;
+    type RecordIter<'a>
+        = L::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.local.records()
+    }
+}
+
+impl<L> CapabilityProofRead for PeerSnapshot<L>
+where
+    L: CapabilityProofRead,
+{
+    type ProofsError = L::ProofsError;
+    type ProofIter<'a>
+        = L::ProofIter<'a>
+    where
+        Self: 'a;
+
+    fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        self.local.proofs()
+    }
+}
+
+impl<L> PeerRead for PeerSnapshot<L>
+where
+    L: PeerRead,
+{
+    type PeersError = L::PeersError;
+    type PeerIter<'a>
+        = L::PeerIter<'a>
+    where
+        Self: 'a;
+
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+        self.local.peers()
+    }
+}
+
+impl<L> BlobChildren for PeerSnapshot<L> where L: BlobStoreGet {}
+
+impl<L> triblespace_core::repo::async_store::AsyncBlobStoreGet for PeerSnapshot<L>
 where
     L: BlobStoreGet + Clone + Send + 'static,
 {
-    type GetError<E: std::error::Error + Send + Sync + 'static> = PeerReaderGetError<E>;
+    type GetError<E: std::error::Error + Send + Sync + 'static> = PeerSnapshotGetError<E>;
 
     fn get<T, Sch>(
         &self,
@@ -748,23 +894,23 @@ where
                 fetch
                     .sink
                     .record_want(raw)
-                    .map_err(PeerReaderGetError::WantRecord)?;
+                    .map_err(PeerSnapshotGetError::WantRecord)?;
                 let Some(bytes) = fetch
                     .sender
                     .fetch_blob(raw, crate::host::INTERACTIVE_FETCH_DEADLINE)
                     .await
                 else {
-                    return Err(PeerReaderGetError::Unavailable);
+                    return Err(PeerSnapshotGetError::Unavailable);
                 };
                 let bytes = Bytes::from(bytes);
                 fetch.sink.land(bytes.clone());
                 bytes
             } else {
-                return Err(PeerReaderGetError::Unavailable);
+                return Err(PeerSnapshotGetError::Unavailable);
             };
             triblespace_core::blob::Blob::<Sch>::new(bytes)
                 .try_from_blob()
-                .map_err(PeerReaderGetError::Conversion)
+                .map_err(PeerSnapshotGetError::Conversion)
         }
     }
 }
@@ -791,6 +937,27 @@ mod tests {
             Peer::with_wiring(store, team, ReconcileQos::default(), sender, receiver).unwrap();
         assert_eq!(peer.team(), team);
         assert_eq!(peer.id(), endpoint_id);
+    }
+
+    #[test]
+    fn semantic_noop_refresh_still_replaces_the_host_read_lease() {
+        let endpoint = SigningKey::from_bytes(&[17; 32]).verifying_key();
+        let team = SigningKey::from_bytes(&[18; 32]).verifying_key();
+        let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint_id);
+        let snapshot_probe = sender.clone();
+        let mut store = MemoryRepo::default();
+        store.bind_store_scope(team).unwrap();
+        let mut peer =
+            Peer::with_wiring(store, team, ReconcileQos::default(), sender, receiver).unwrap();
+
+        let first = snapshot_probe.current_snapshot().unwrap();
+        peer.try_refresh().unwrap();
+        let second = snapshot_probe.current_snapshot().unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "a fresh backend observation must replace the host reader even when every semantic PATCH is unchanged",
+        );
     }
 
     #[test]
@@ -924,5 +1091,68 @@ mod tests {
             !snapshot_probe.snapshot_available(),
             "a peer must stop serving after reobserving conflicting store scopes"
         );
+    }
+
+    #[test]
+    fn peer_snapshots_fail_closed_after_an_external_scope_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let serving_path = dir.path().join("serving.pile");
+        let conflicting_path = dir.path().join("conflicting.pile");
+        std::fs::File::create(&serving_path).unwrap();
+        std::fs::File::create(&conflicting_path).unwrap();
+        let serving_team = SigningKey::from_bytes(&[14; 32]).verifying_key();
+        let conflicting_team = SigningKey::from_bytes(&[15; 32]).verifying_key();
+
+        let mut serving = Pile::open(&serving_path).unwrap();
+        serving.bind_store_scope(serving_team).unwrap();
+        let mut conflicting = Pile::open(&conflicting_path).unwrap();
+        conflicting.bind_store_scope(conflicting_team).unwrap();
+        conflicting.close().unwrap();
+
+        let endpoint = SigningKey::from_bytes(&[16; 32]).verifying_key();
+        let endpoint_id = EndpointId::from_bytes(endpoint.as_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint_id);
+        let mut peer = Peer::with_wiring(
+            serving,
+            serving_team,
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        )
+        .unwrap();
+        let old_snapshot = peer.snapshot().unwrap();
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&serving_path)
+            .unwrap()
+            .write_all(&std::fs::read(&conflicting_path).unwrap())
+            .unwrap();
+        let conflicted_len = std::fs::metadata(&serving_path).unwrap().len();
+
+        let fetch = old_snapshot
+            .fetch
+            .as_ref()
+            .expect("peer snapshots carry a lazy fetch capability");
+        fetch
+            .sink
+            .record_want([17; 32])
+            .expect_err("an old snapshot must not mutate a newly conflicted store");
+        assert_eq!(
+            std::fs::metadata(&serving_path).unwrap().len(),
+            conflicted_len,
+            "scope rejection must happen before the WANT append",
+        );
+
+        let error = match peer.snapshot() {
+            Ok(_) => panic!("a new snapshot hid the external scope conflict"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            PeerSnapshotError::Scope(PeerOpenError::Scope(StoreScopeError::Conflict { .. }))
+        ));
+        drop(old_snapshot);
+        peer.into_store().close().unwrap();
     }
 }

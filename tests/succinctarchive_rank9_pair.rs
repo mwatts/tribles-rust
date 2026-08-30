@@ -6,7 +6,7 @@ use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, Bytes, MemoryBlobStore};
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
-use triblespace::core::repo::{reachable, BlobStore, BlobStoreGet};
+use triblespace::core::repo::{reachable, BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::{Trible, TribleSet};
 
 type RawTrible = [u8; 64];
@@ -59,14 +59,14 @@ fn rank9_root_discovers_and_retains_its_raw_archive() {
 
     let root: Inline<Handle<UnknownBlob>> = rank9_handle.transmute();
     let raw_unknown: Inline<Handle<UnknownBlob>> = raw_handle.transmute();
-    let reader = store.reader().unwrap();
-    let reachable_from_rank9: Vec<_> = reachable(&reader, [root]).collect();
+    let snapshot = store.snapshot().unwrap();
+    let reachable_from_rank9: Vec<_> = reachable(&snapshot, [root]).collect();
     assert_eq!(reachable_from_rank9[0], root);
     assert!(reachable_from_rank9.contains(&raw_unknown));
     assert_eq!(reachable_from_rank9.len(), 2);
 
-    store.keep(reachable(&reader, [root]));
-    let retained = store.reader().unwrap();
+    store.keep(reachable(&snapshot, [root]));
+    let retained = store.snapshot().unwrap();
     assert_eq!(retained.len(), 2);
     assert!(retained
         .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, Rank9AcceleratedSuccinctArchiveBlob>(

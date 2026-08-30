@@ -17,14 +17,14 @@ use triblespace_core::collection::exact_derived::{
     ExactAttachPlan, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use triblespace_core::collection::{
-    CollectionData, CollectionEncoding, CollectionMapping, CollectionRecord,
-    CollectionRecordSelector, CollectionStore, Cover, CoverAttachment,
+    CollectionData, CollectionEncoding, CollectionMapping, CollectionRead, CollectionRecord,
+    CollectionRecordSelector, CollectionStore, Cover,
 };
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreMeta, CapabilityProofStore, PeerStore, StorageFlush,
-    StoreRevision, StoreScope, WantStore,
+    ArtifactOfferStore, BlobStore, BlobStoreMeta, CapabilityProofStore, PeerStore, SnapshotSource,
+    StorageFlush, StoreRead, StoreScope, WantStore,
 };
 
 use crate::peer::Peer;
@@ -110,7 +110,7 @@ pub async fn ensure_exact_derived<S, Source, Target, Mapping>(
     peer: &mut Peer<S>,
     lifecycle: &ExactDerivedCollection<Source, Target, Mapping>,
     source_cover: &Cover<Source>,
-) -> Result<CoverAttachment<Target>, ExactDerivedSyncError>
+) -> Result<Cover<Target>, ExactDerivedSyncError>
 where
     S: BlobStore
         + CollectionStore
@@ -120,10 +120,9 @@ where
         + StoreScope
         + WantStore
         + StorageFlush
-        + StoreRevision
         + Send
         + 'static,
-    S::Reader: BlobStoreMeta,
+    S::Snapshot: StoreRead + BlobStoreMeta,
     Source: CollectionEncoding,
     Target: CollectionEncoding,
     Mapping: CollectionMapping<Source, Target>,
@@ -142,12 +141,14 @@ where
         ExactDerivedSyncError::storage("refresh exact-derived network store", error)
     })?;
     let mut offered = {
-        let mut store = peer.store();
+        let snapshot = peer.snapshot().map_err(|error| {
+            ExactDerivedSyncError::storage("freeze exact-derived store snapshot", error)
+        })?;
         let selectors = BTreeSet::from([
             CollectionRecordSelector::MergeCollection(lifecycle.target_collection().handle()),
             CollectionRecordSelector::DeriveTarget(lifecycle.target_collection().handle()),
         ]);
-        store
+        snapshot
             .select_records(&selectors)
             .map_err(|error| {
                 ExactDerivedSyncError::storage("enumerate target artifact offers", error)

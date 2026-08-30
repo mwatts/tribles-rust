@@ -23,22 +23,25 @@ use ed25519_dalek::VerifyingKey;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::collection::{
+    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, PATCH};
 
+use super::peer::{PeerEvidence, PeerRead, PeerStore};
 use super::pile::{
-    CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError, Pile, PileReader,
-    PileRevision, PileWriteError, ReadError,
+    CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError, Pile,
+    PileSnapshot, PileWriteError, ReadError,
 };
-use super::proof::CapabilityProofStore;
+use super::proof::{CapabilityProofRead, CapabilityProofStore};
 use super::{
     transfer, ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobChildren, BlobInfo,
-    BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, RetentionRoots, StorageClose,
-    StoreRevision, StoreRevisionChanges, StoreScope, StoreScopeError, TransferError, WantRequest,
-    WantStore, WANT_REQUEST_BYTES_LEN,
+    BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, RetentionRoots, SnapshotSource,
+    StorageClose, StoreChanges, StoreScope, StoreScopeError, StoreSnapshot, TransferError,
+    WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -198,56 +201,6 @@ pub struct Yard {
     want_state: Arc<Mutex<WantState>>,
 }
 
-/// Opaque invalidation token for the sync-visible union of a [`Yard`].
-///
-/// Each Pile revision covers its sync-visible native sets; persistent live sets
-/// additionally capture logical blob movement and eviction that need not append
-/// a record to the source segment. Local wants and artifact offers do not alter
-/// semantic inventory bits, though a segment's changed reader lease is retained
-/// as local invalidation evidence.
-#[derive(Clone, PartialEq, Eq)]
-pub struct YardRevision {
-    segments: Vec<(PileRevision, HandleSet)>,
-}
-
-impl StoreRevision for Yard {
-    type Revision = YardRevision;
-    type Error = ReadError;
-
-    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
-        let mut segments = Vec::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                let boundary = segment.pile_mut().store_revision()?;
-                segments.push((boundary, segment.live.clone()));
-            }
-        }
-        Ok(YardRevision { segments })
-    }
-
-    fn revision_changes(
-        previous: &Self::Revision,
-        current: &Self::Revision,
-    ) -> StoreRevisionChanges {
-        if previous.segments.len() != current.segments.len() {
-            return StoreRevisionChanges::ALL;
-        }
-
-        previous.segments.iter().zip(&current.segments).fold(
-            StoreRevisionChanges::NONE,
-            |mut changes, ((previous_pile, previous_live), (current_pile, current_live))| {
-                changes = changes.union(current_pile.changes_since(previous_pile));
-                if previous_live != current_live {
-                    changes = changes
-                        .union(StoreRevisionChanges::BLOBS)
-                        .union(StoreRevisionChanges::BLOB_READER);
-                }
-                changes
-            },
-        )
-    }
-}
-
 impl Yard {
     fn opaque_record_count(&mut self) -> Result<usize, ReadError> {
         let mut count = 0usize;
@@ -353,7 +306,7 @@ impl Yard {
                 path: path.clone(),
                 err,
             })?;
-            let reader = pile.reader().map_err(|err| YardOpenError::Pile {
+            let reader = pile.snapshot().map_err(|err| YardOpenError::Pile {
                 path: path.clone(),
                 err,
             })?;
@@ -458,23 +411,7 @@ impl Yard {
     /// empty [`RetentionRoots`] explicitly when native evidence supplies the
     /// only desired strong roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
-        let opaque_records = self
-            .opaque_record_count()
-            .map_err(|err| YardCollectError::Reader(YardReaderError::Pile(err)))?;
-        if opaque_records != 0 {
-            return Err(YardCollectError::OpaqueRecords {
-                count: opaque_records,
-            });
-        }
-        let retention = self
-            .retention_with_native_commits(retention)
-            .map_err(YardCollectError::CollectionRecords)?;
-        let retention = self
-            .retention_with_capability_proofs(&retention)
-            .map_err(YardCollectError::CapabilityProofs)?;
-        let reader = self.reader().map_err(YardCollectError::Reader)?;
-        let strong_keep = self.strong_keep_set(&reader, &retention);
-        let present = reader.live_set();
+        let (_snapshot, strong_keep, present) = self.retention_observation(retention)?;
         let want_keep = self
             .want_state
             .lock()
@@ -504,14 +441,7 @@ impl Yard {
         let mut dumped = Vec::new();
 
         {
-            let retention = self
-                .retention_with_native_commits(retention)
-                .map_err(YardCollectError::CollectionRecords)?;
-            let retention = self
-                .retention_with_capability_proofs(&retention)
-                .map_err(YardCollectError::CapabilityProofs)?;
-            let reader = self.reader().map_err(YardCollectError::Reader)?;
-            let strong_keep = self.strong_keep_set(&reader, &retention);
+            let (snapshot, strong_keep, _present) = self.retention_observation(retention)?;
 
             for level in 0..last {
                 let strong_here = self.generations[level].segments[0]
@@ -537,7 +467,7 @@ impl Yard {
                 let mut copied = Vec::new();
                 {
                     let target = self.generations[level + 1].active_mut().pile_mut();
-                    for result in transfer(&reader, target, handles.clone()) {
+                    for result in transfer(&snapshot, target, handles.clone()) {
                         let (source, _target) = result.map_err(YardCollectError::Transfer)?;
                         copied.push(source);
                     }
@@ -590,10 +520,11 @@ impl Yard {
     /// Yard readers, but they do not mutate the underlying append-only pile
     /// files. `reclaim` is the explicit physical step. For each generation it
     /// writes the current live handles, every native collection record, every
-    /// canonical complete proof, and every positive artifact offer to a sibling
-    /// temporary pile, closes both piles, atomically renames the temporary file
-    /// over the original on the same filesystem, and reopens the generation.
-    /// Offers survive as operational intent but do not add handles to `live`.
+    /// canonical complete proof, every positive peer-routing fact, and every
+    /// positive artifact offer to a sibling temporary pile, closes both piles,
+    /// atomically renames the temporary file over the original on the same
+    /// filesystem, and reopens the generation. Offers survive as operational
+    /// intent but do not add handles to `live`.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         let opaque_records = self.opaque_record_count().map_err(YardReclaimError::Pile)?;
         if opaque_records != 0 {
@@ -663,6 +594,31 @@ impl Yard {
         self.config.strong_level_budget.saturating_mul(multiplier)
     }
 
+    /// Freeze the one coherent prefix used by an entire retention-planning
+    /// phase. Unknown-record refusal, native commits, complete proofs, and
+    /// live blob membership must never be sampled from different prefixes.
+    fn retention_observation(
+        &mut self,
+        retention: &RetentionRoots,
+    ) -> Result<(YardSnapshot, HandleSet, HandleSet), YardCollectError> {
+        let snapshot = self.snapshot().map_err(YardCollectError::Snapshot)?;
+        let opaque_records = snapshot.opaque_record_count();
+        if opaque_records != 0 {
+            return Err(YardCollectError::OpaqueRecords {
+                count: opaque_records,
+            });
+        }
+        let present = snapshot.live_set();
+        let retention = self
+            .retention_with_native_commits(&snapshot, &present, retention)
+            .map_err(YardCollectError::CollectionRecords)?;
+        let retention = self
+            .retention_with_capability_proofs(&snapshot, &present, &retention)
+            .map_err(YardCollectError::CapabilityProofs)?;
+        let strong_keep = self.strong_keep_set(&snapshot, &retention);
+        Ok((snapshot, strong_keep, present))
+    }
+
     /// Add the resident ownership edges carried by strictly verified native
     /// commits. Invalid signatures authenticate no fields. A valid commit is
     /// preserved as a native record even when one of its dependencies is not
@@ -670,11 +626,13 @@ impl Yard {
     /// recursive roots; unsigned merge/derive equations are evidence only and
     /// never own their inputs.
     fn retention_with_native_commits(
-        &mut self,
+        &self,
+        snapshot: &YardSnapshot,
+        present: &HandleSet,
         retention: &RetentionRoots,
     ) -> Result<RetentionRoots, YardCollectionRecordsError> {
         let mut combined = retention.clone();
-        let records = self.records()?.collect::<Result<Vec<_>, _>>()?;
+        let records = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
         for record in records {
             let CollectionRecord::Commit(commit) = record else {
                 continue;
@@ -687,13 +645,7 @@ impl Yard {
             let data = Inline::<Handle<UnknownBlob>>::new(commit.data().raw);
             let metadata = commit.metadata().transmute();
             for handle in [descriptor, data, metadata] {
-                let live = self.generations.iter().any(|generation| {
-                    generation
-                        .segments
-                        .iter()
-                        .any(|segment| segment.live.get(&handle.raw).is_some())
-                });
-                if live {
+                if present.get(&handle.raw).is_some() {
                     combined.retain_recursive(handle);
                 }
             }
@@ -705,11 +657,13 @@ impl Yard {
     /// complete proofs. Structurally canonical but invalid proofs remain
     /// replicated evidence and authenticate no lifetime roots.
     fn retention_with_capability_proofs(
-        &mut self,
+        &self,
+        snapshot: &YardSnapshot,
+        present: &HandleSet,
         retention: &RetentionRoots,
     ) -> Result<RetentionRoots, YardCapabilityProofError> {
         let mut combined = retention.clone();
-        let proofs = self
+        let proofs = snapshot
             .proofs()?
             .collect::<Result<Vec<_>, YardCapabilityProofError>>()?;
         for proof in proofs {
@@ -718,13 +672,7 @@ impl Yard {
             }
             for claim in proof.claim_handles() {
                 let claim = Inline::<Handle<UnknownBlob>>::new(claim.raw);
-                let live = self.generations.iter().any(|generation| {
-                    generation
-                        .segments
-                        .iter()
-                        .any(|segment| segment.live.get(&claim.raw).is_some())
-                });
-                if live {
+                if present.get(&claim.raw).is_some() {
                     combined.retain_direct(claim);
                 }
             }
@@ -732,7 +680,7 @@ impl Yard {
         Ok(combined)
     }
 
-    fn strong_keep_set(&self, reader: &YardReader, retention: &RetentionRoots) -> HandleSet {
+    fn strong_keep_set(&self, reader: &YardSnapshot, retention: &RetentionRoots) -> HandleSet {
         let mut keep = HandleSet::new();
         // Explicit policy roots remain strong even if the same handle or an
         // owned descendant also has a stale want marker.
@@ -889,31 +837,69 @@ impl Error for YardCapabilityProofError {
     }
 }
 
-impl CapabilityProofStore for Yard {
+/// Deterministic union of peer-routing evidence across yard segments.
+pub struct YardPeerIter {
+    inner: std::collections::btree_set::IntoIter<PeerEvidence>,
+}
+
+impl Iterator for YardPeerIter {
+    type Item = Result<PeerEvidence, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+}
+
+impl PeerRead for YardSnapshot {
+    type PeersError = ReadError;
+    type PeerIter<'a> = YardPeerIter;
+
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+        let mut peers = BTreeSet::new();
+        for generation in &self.generations {
+            for evidence in generation.snapshot.peers()? {
+                peers.insert(evidence?);
+            }
+        }
+        Ok(YardPeerIter {
+            inner: peers.into_iter(),
+        })
+    }
+}
+
+impl PeerStore for Yard {
+    type InsertError = PileWriteError;
+
+    fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
+        self.generations[0]
+            .active_mut()
+            .pile_mut()
+            .insert_peer(evidence)
+    }
+}
+
+impl CapabilityProofRead for YardSnapshot {
     type ProofsError = YardCapabilityProofError;
-    type InsertError = CapabilityProofInsertError;
     type ProofIter<'a> = YardCapabilityProofIter;
 
-    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+    fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
         let mut proofs = BTreeMap::<[u8; 32], CapabilityProof>::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                for proof in segment
-                    .pile_mut()
-                    .proofs()
-                    .map_err(YardCapabilityProofError::Pile)?
-                {
-                    let proof = proof.map_err(YardCapabilityProofError::Pile)?;
-                    let id = proof.id();
-                    match proofs.entry(id.raw) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(proof);
-                        }
-                        std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get().as_bytes() == proof.as_bytes() => {}
-                        std::collections::btree_map::Entry::Occupied(_) => {
-                            return Err(YardCapabilityProofError::IdCollision { id });
-                        }
+        for generation in &self.generations {
+            for proof in generation
+                .snapshot
+                .proofs()
+                .map_err(YardCapabilityProofError::Pile)?
+            {
+                let proof = proof.map_err(YardCapabilityProofError::Pile)?;
+                let id = proof.id();
+                match proofs.entry(id.raw) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(proof);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().as_bytes() == proof.as_bytes() => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(YardCapabilityProofError::IdCollision { id });
                     }
                 }
             }
@@ -923,29 +909,28 @@ impl CapabilityProofStore for Yard {
         })
     }
 
-    fn proof(
-        &mut self,
-        id: CapabilityProofId,
-    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+    fn proof(&self, id: CapabilityProofId) -> Result<Option<CapabilityProof>, Self::ProofsError> {
         let mut found: Option<CapabilityProof> = None;
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                let Some(candidate) = segment
-                    .pile_mut()
-                    .proof(id)
-                    .map_err(YardCapabilityProofError::Pile)?
-                else {
-                    continue;
-                };
-                match &found {
-                    None => found = Some(candidate),
-                    Some(existing) if existing.as_bytes() == candidate.as_bytes() => {}
-                    Some(_) => return Err(YardCapabilityProofError::IdCollision { id }),
-                }
+        for generation in &self.generations {
+            let Some(candidate) = generation
+                .snapshot
+                .proof(id)
+                .map_err(YardCapabilityProofError::Pile)?
+            else {
+                continue;
+            };
+            match &found {
+                None => found = Some(candidate),
+                Some(existing) if existing.as_bytes() == candidate.as_bytes() => {}
+                Some(_) => return Err(YardCapabilityProofError::IdCollision { id }),
             }
         }
         Ok(found)
     }
+}
+
+impl CapabilityProofStore for Yard {
+    type InsertError = CapabilityProofInsertError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         self.generations[0]
@@ -955,30 +940,27 @@ impl CapabilityProofStore for Yard {
     }
 }
 
-impl CollectionStore for Yard {
+impl CollectionRead for YardSnapshot {
     type RecordsError = YardCollectionRecordsError;
-    type InsertError = CollectionInsertError;
     type RecordIter<'a> = YardCollectionRecordIter;
 
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         let mut records = BTreeMap::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                let replay = segment
-                    .pile_mut()
-                    .records()
-                    .map_err(YardCollectionRecordsError::Pile)?;
-                for result in replay {
-                    let record = result.map_err(YardCollectionRecordsError::Pile)?;
-                    let id = record.id();
-                    match records.get(&id) {
-                        Some(existing) if existing != &record => {
-                            return Err(YardCollectionRecordsError::IdCollision { id });
-                        }
-                        Some(_) => {}
-                        None => {
-                            records.insert(id, record);
-                        }
+        for generation in &self.generations {
+            let replay = generation
+                .snapshot
+                .records()
+                .map_err(YardCollectionRecordsError::Pile)?;
+            for result in replay {
+                let record = result.map_err(YardCollectionRecordsError::Pile)?;
+                let id = record.id();
+                match records.get(&id) {
+                    Some(existing) if existing != &record => {
+                        return Err(YardCollectionRecordsError::IdCollision { id });
+                    }
+                    Some(_) => {}
+                    None => {
+                        records.insert(id, record);
                     }
                 }
             }
@@ -989,35 +971,37 @@ impl CollectionStore for Yard {
     }
 
     fn select_records(
-        &mut self,
+        &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
         let mut records = BTreeMap::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                let selected = segment
-                    .pile_mut()
-                    .select_records(selectors)
-                    .map_err(YardCollectionRecordsError::Pile)?;
-                for record in selected {
-                    let id = record.id();
-                    match records.get(&id) {
-                        Some(existing) if existing != &record => {
-                            return Err(YardCollectionRecordsError::IdCollision { id });
-                        }
-                        Some(_) => {}
-                        None => {
-                            records.insert(id, record);
-                        }
+        for generation in &self.generations {
+            let selected = generation
+                .snapshot
+                .select_records(selectors)
+                .map_err(YardCollectionRecordsError::Pile)?;
+            for record in selected {
+                let id = record.id();
+                match records.get(&id) {
+                    Some(existing) if existing != &record => {
+                        return Err(YardCollectionRecordsError::IdCollision { id });
+                    }
+                    Some(_) => {}
+                    None => {
+                        records.insert(id, record);
                     }
                 }
             }
         }
         Ok(records.into_values().collect())
     }
+}
+
+impl CollectionStore for Yard {
+    type InsertError = CollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.generations[0].active_mut().pile_mut().insert(record)
@@ -1134,21 +1118,21 @@ impl BlobStorePut for Yard {
     }
 }
 
-impl BlobStore for Yard {
-    type Reader = YardReader;
-    type ReaderError = YardReaderError;
+impl SnapshotSource for Yard {
+    type Snapshot = YardSnapshot;
+    type SnapshotError = ReadError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         let mut generations = Vec::new();
         for generation in &mut self.generations {
             for segment in &mut generation.segments {
-                generations.push(YardGenerationReader {
-                    reader: segment.pile_mut().reader().map_err(YardReaderError::Pile)?,
+                generations.push(YardGenerationSnapshot {
+                    snapshot: segment.pile_mut().snapshot()?,
                     live: segment.live.clone(),
                 });
             }
         }
-        Ok(YardReader {
+        Ok(YardSnapshot {
             generations,
             want_state: self.want_state.clone(),
         })
@@ -1189,27 +1173,27 @@ impl StorageClose for Yard {
 }
 
 #[derive(Debug, Clone)]
-struct YardGenerationReader {
-    reader: PileReader,
+struct YardGenerationSnapshot {
+    snapshot: PileSnapshot,
     live: HandleSet,
 }
 
-impl PartialEq for YardGenerationReader {
-    fn eq(&self, other: &Self) -> bool {
-        self.reader == other.reader && self.live == other.live
-    }
-}
-
-impl Eq for YardGenerationReader {}
-
-/// Read-only Yard snapshot.
+/// One immutable observation of a yard's segment union.
 #[derive(Debug, Clone)]
-pub struct YardReader {
-    generations: Vec<YardGenerationReader>,
+pub struct YardSnapshot {
+    generations: Vec<YardGenerationSnapshot>,
     want_state: Arc<Mutex<WantState>>,
 }
 
-impl YardReader {
+impl YardSnapshot {
+    fn opaque_record_count(&self) -> usize {
+        self.generations
+            .iter()
+            .map(|generation| generation.snapshot.opaque_record_count())
+            .try_fold(0usize, usize::checked_add)
+            .expect("yard opaque-record count overflow")
+    }
+
     fn live_set(&self) -> HandleSet {
         let mut live = HandleSet::new();
         for generation in &self.generations {
@@ -1238,7 +1222,7 @@ impl YardReader {
             if generation.live.get(&unknown.raw).is_none() {
                 continue;
             }
-            match generation.reader.get::<T, S>(handle) {
+            match generation.snapshot.get::<T, S>(handle) {
                 Ok(value) => return Some(Ok(value)),
                 Err(GetBlobError::BlobNotFound) => continue,
                 Err(err) => return Some(Err(YardGetError::Pile(err))),
@@ -1248,15 +1232,26 @@ impl YardReader {
     }
 }
 
-impl PartialEq for YardReader {
-    fn eq(&self, other: &Self) -> bool {
-        self.generations == other.generations
+impl StoreSnapshot for YardSnapshot {
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        if previous.generations.len() != self.generations.len() {
+            return StoreChanges::ALL;
+        }
+
+        previous.generations.iter().zip(&self.generations).fold(
+            StoreChanges::NONE,
+            |mut changes, (previous, current)| {
+                changes = changes.union(current.snapshot.changes_since(&previous.snapshot));
+                if previous.live != current.live {
+                    changes = changes.union(StoreChanges::BLOBS);
+                }
+                changes
+            },
+        )
     }
 }
 
-impl Eq for YardReader {}
-
-impl BlobStoreGet for YardReader {
+impl BlobStoreGet for YardSnapshot {
     type GetError<E: Error + Send + Sync + 'static> = YardGetError<E>;
 
     fn get<T, S>(
@@ -1284,7 +1279,7 @@ impl BlobStoreGet for YardReader {
     }
 }
 
-impl BlobChildren for YardReader {
+impl BlobChildren for YardSnapshot {
     fn children(&self, handle: Inline<Handle<UnknownBlob>>) -> Vec<Inline<Handle<UnknownBlob>>> {
         // Structural scan: use the non-minting read so reference
         // discovery never floods the wanted set with speculative wants. Wanted
@@ -1310,7 +1305,7 @@ impl BlobChildren for YardReader {
     }
 }
 
-impl BlobStoreList for YardReader {
+impl BlobStoreList for YardSnapshot {
     type Iter<'a> = YardListIter;
     type Err = Infallible;
 
@@ -1343,14 +1338,38 @@ impl BlobStoreList for YardReader {
             generation
                 .live
                 .get(&handle.raw)
-                .and_then(|_| generation.reader.unvalidated_blob_info(handle))
+                .and_then(|_| generation.snapshot.unvalidated_blob_info(handle))
         }))
+    }
+}
+
+impl BlobStoreMeta for YardSnapshot {
+    type MetaError = Infallible;
+
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<Option<super::BlobMetadata>, Self::MetaError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        let unknown: Inline<Handle<UnknownBlob>> = handle.transmute();
+        for generation in &self.generations {
+            if generation.live.get(&unknown.raw).is_none() {
+                continue;
+            }
+            if let Some(metadata) = generation.snapshot.metadata(handle)? {
+                return Ok(Some(metadata));
+            }
+        }
+        Ok(None)
     }
 }
 
 pub struct YardListIter {
     inner: crate::patch::PATCHIntoIterator<INLINE_LEN, IdentitySchema, ()>,
-    generations: Vec<YardGenerationReader>,
+    generations: Vec<YardGenerationSnapshot>,
 }
 
 impl Iterator for YardListIter {
@@ -1361,7 +1380,7 @@ impl Iterator for YardListIter {
         let info = self
             .generations
             .iter()
-            .find_map(|generation| generation.reader.unvalidated_blob_info(handle))
+            .find_map(|generation| generation.snapshot.unvalidated_blob_info(handle))
             .expect("live Yard handle must resolve in one generation snapshot");
         Some(Ok(info))
     }
@@ -1388,12 +1407,8 @@ fn reclaim_generation(
     live: &HandleSet,
     mut old_pile: Pile,
 ) -> Result<Pile, YardReclaimError> {
-    let store_scope = old_pile
-        .store_scope()
-        .map_err(YardReclaimError::StoreScope)?;
-    let opaque_records = old_pile
-        .opaque_record_count()
-        .map_err(YardReclaimError::Pile)?;
+    let reader = old_pile.snapshot().map_err(YardReclaimError::Pile)?;
+    let opaque_records = reader.opaque_record_count();
     if opaque_records != 0 {
         return Err(YardReclaimError::OpaqueRecords {
             count: opaque_records,
@@ -1406,27 +1421,26 @@ fn reclaim_generation(
         Err(err) => return Err(YardReclaimError::Io(err)),
     }
 
-    let collection_records = old_pile
+    let collection_records = reader
         .records()
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
-    let capability_proofs = old_pile
+    let capability_proofs = reader
         .proofs()
+        .map_err(YardReclaimError::Pile)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(YardReclaimError::Pile)?;
+    let peer_evidence = reader
+        .peers()
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
     let artifact_offers = old_pile
         .offers_snapshot()
         .map_err(YardReclaimError::Offer)?;
-    let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
-    if let Some(team) = store_scope {
-        new_pile
-            .bind_store_scope(team)
-            .map_err(YardReclaimError::StoreScope)?;
-    }
     let handles: Vec<_> = live
         .clone()
         .into_iter()
@@ -1439,6 +1453,29 @@ fn reclaim_generation(
     old_pile
         .preserve_legacy_collection_headers_into(&mut new_pile)
         .map_err(YardReclaimError::CollectionRecord)?;
+    // `preserve_legacy_collection_headers_into` refreshes the source. Observe
+    // scope with the final source refresh, then inspect the opaque count from
+    // that exact replayed prefix. A conflicting scope or opaque addition made
+    // during planning must fail closed rather than be projected away.
+    let store_scope = match old_pile.store_scope() {
+        Ok(scope) => scope,
+        Err(error) => {
+            let _ = new_pile.close();
+            return Err(YardReclaimError::StoreScope(error));
+        }
+    };
+    let opaque_records = old_pile.observed_opaque_record_count();
+    if opaque_records != 0 {
+        let _ = new_pile.close();
+        return Err(YardReclaimError::OpaqueRecords {
+            count: opaque_records,
+        });
+    }
+    if let Some(team) = store_scope {
+        new_pile
+            .bind_store_scope(team)
+            .map_err(YardReclaimError::StoreScope)?;
+    }
     for record in collection_records {
         new_pile
             .insert(record)
@@ -1448,6 +1485,11 @@ fn reclaim_generation(
         new_pile
             .insert_proof(proof)
             .map_err(YardReclaimError::CapabilityProof)?;
+    }
+    for evidence in peer_evidence {
+        new_pile
+            .insert_peer(evidence)
+            .map_err(YardReclaimError::PeerEvidence)?;
     }
     new_pile
         .offer_all(artifact_offers.iter())
@@ -1521,21 +1563,6 @@ impl fmt::Display for YardOpenError {
 impl Error for YardOpenError {}
 
 #[derive(Debug)]
-pub enum YardReaderError {
-    Pile(ReadError),
-}
-
-impl fmt::Display for YardReaderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pile(err) => write!(f, "failed to read yard generation: {err}"),
-        }
-    }
-}
-
-impl Error for YardReaderError {}
-
-#[derive(Debug)]
 pub enum YardGetError<E: Error> {
     NotFound,
     Pile(GetBlobError<E>),
@@ -1555,7 +1582,7 @@ impl<E: Error + 'static> Error for YardGetError<E> {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum YardCollectError {
-    Reader(YardReaderError),
+    Snapshot(ReadError),
     /// At least one generation contains opaque records. Collection cannot know
     /// whether they own otherwise-unrooted blobs, so it refuses before
     /// changing any generation's live set.
@@ -1574,7 +1601,7 @@ pub enum YardCollectError {
 impl fmt::Display for YardCollectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Reader(err) => write!(f, "failed to create yard reader: {err}"),
+            Self::Snapshot(err) => write!(f, "failed to create yard snapshot: {err}"),
             Self::OpaqueRecords { count } => write!(
                 f,
                 "refusing to collect a yard containing {count} opaque record(s)"
@@ -1628,6 +1655,8 @@ pub enum YardReclaimError {
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
     CapabilityProof(CapabilityProofInsertError),
+    /// Positive peer-routing evidence could not be copied.
+    PeerEvidence(PileWriteError),
     /// Positive artifact offers could not be copied.
     Offer(PileWriteError),
     /// The generation's local team scope conflicted or could not be copied.
@@ -1662,6 +1691,9 @@ impl fmt::Display for YardReclaimError {
             }
             Self::CapabilityProof(err) => {
                 write!(f, "failed to copy a yard capability proof: {err}")
+            }
+            Self::PeerEvidence(err) => {
+                write!(f, "failed to copy yard peer-routing evidence: {err}")
             }
             Self::Offer(err) => write!(f, "failed to copy a yard artifact offer: {err}"),
             Self::StoreScope(err) => write!(f, "failed to copy yard store scope: {err}"),
@@ -1719,33 +1751,27 @@ mod tests {
     }
 
     #[test]
-    fn yard_revision_lifts_reader_and_live_set_changes() {
+    fn yard_snapshot_lifts_physical_and_live_set_changes() {
         let (_dir, mut yard) = yard_with(1, YardConfig::default());
-        let empty = yard.store_revision().unwrap();
+        let empty = yard.snapshot().unwrap();
 
         yard.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
             [0x51; INLINE_LEN],
         )))
         .unwrap();
-        let after_want = yard.store_revision().unwrap();
-        assert_eq!(
-            Yard::revision_changes(&empty, &after_want),
-            StoreRevisionChanges::BLOB_READER,
-        );
+        let after_want = yard.snapshot().unwrap();
+        assert_eq!(after_want.changes_since(&empty), StoreChanges::NONE);
 
         yard.put::<RawBytes, _>(raw_blob(b"revision fixture"))
             .unwrap();
-        let after_blob = yard.store_revision().unwrap();
-        assert_eq!(
-            Yard::revision_changes(&after_want, &after_blob),
-            StoreRevisionChanges::BLOBS.union(StoreRevisionChanges::BLOB_READER),
-        );
+        let after_blob = yard.snapshot().unwrap();
+        assert_eq!(after_blob.changes_since(&after_want), StoreChanges::BLOBS,);
 
         yard.collect(&RetentionRoots::new()).unwrap();
-        let after_collect = yard.store_revision().unwrap();
+        let after_collect = yard.snapshot().unwrap();
         assert_eq!(
-            Yard::revision_changes(&after_blob, &after_collect),
-            StoreRevisionChanges::BLOBS.union(StoreRevisionChanges::BLOB_READER),
+            after_collect.changes_since(&after_blob),
+            StoreChanges::BLOBS,
         );
     }
 
@@ -1774,6 +1800,63 @@ mod tests {
     }
 
     #[test]
+    fn peer_evidence_unions_generations_and_survives_reclaim_and_reopen() {
+        let config = YardConfig::default();
+        let (_dir, paths, mut yard) = yard_with_paths(2, config);
+        let team = SigningKey::from_bytes(&[81; 32]).verifying_key();
+        let old_peer = SigningKey::from_bytes(&[82; 32]).verifying_key();
+        let young_peer = SigningKey::from_bytes(&[83; 32]).verifying_key();
+        let old = PeerEvidence::new(team, old_peer);
+        let young = PeerEvidence::new(team, young_peer);
+
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .insert_peer(old)
+            .unwrap();
+        yard.insert_peer(young).unwrap();
+        let mut expected = vec![old, young];
+        expected.sort_unstable();
+
+        let snapshot = yard.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .peers()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+        drop(snapshot);
+
+        yard.reclaim().unwrap();
+        let snapshot = yard.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .peers()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+        drop(snapshot);
+        yard.close().unwrap();
+
+        let mut reopened = Yard::open(paths, config).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .peers()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+        drop(snapshot);
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn yard_unions_offers_and_reclaim_preserves_marker_not_blob() {
         let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
         let offered = yard.put::<RawBytes, _>(raw_blob(b"offered")).unwrap();
@@ -1797,14 +1880,14 @@ mod tests {
 
         yard.collect(&RetentionRoots::new()).unwrap();
         assert!(yard
-            .reader()
+            .snapshot()
             .unwrap()
             .get::<Blob<UnknownBlob>, _>(offered)
             .is_err());
         yard.reclaim().unwrap();
         assert!(yard.offers_snapshot().unwrap().contains(offered));
         assert!(yard
-            .reader()
+            .snapshot()
             .unwrap()
             .get::<Blob<UnknownBlob>, _>(offered)
             .is_err());
@@ -1813,7 +1896,7 @@ mod tests {
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
         assert!(reopened.offers_snapshot().unwrap().contains(offered));
         assert!(reopened
-            .reader()
+            .snapshot()
             .unwrap()
             .get::<Blob<UnknownBlob>, _>(offered)
             .is_err());
@@ -1929,7 +2012,7 @@ mod tests {
     }
 
     fn get_raw(
-        reader: &YardReader,
+        reader: &YardSnapshot,
         handle: Inline<Handle<RawBytes>>,
     ) -> Result<Bytes, YardGetError<Infallible>> {
         reader.get::<Bytes, RawBytes>(handle)
@@ -1938,7 +2021,7 @@ mod tests {
     fn pile_blob_count(path: &Path) -> usize {
         let mut pile = Pile::open(path).unwrap();
         pile.refresh().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let count = reader.blobs().collect::<Result<Vec<_>, _>>().unwrap().len();
         drop(reader);
         pile.close().unwrap();
@@ -1952,7 +2035,7 @@ mod tests {
             .put_in_generation::<RawBytes, _>(1, raw_blob(b"old generation"))
             .unwrap();
 
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
 
         assert_eq!(get_raw(&reader, old).unwrap(), raw_blob(b"old generation"));
         let info = reader
@@ -1992,8 +2075,10 @@ mod tests {
 
         let mut expected = vec![first, second, third];
         expected.sort_by_key(CollectionRecord::id);
+        let snapshot = yard.snapshot().unwrap();
         assert_eq!(
-            yard.records()
+            snapshot
+                .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -2002,6 +2087,8 @@ mod tests {
         let young = yard.generations[0]
             .active_mut()
             .pile_mut()
+            .snapshot()
+            .unwrap()
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -2010,8 +2097,9 @@ mod tests {
 
         yard.close().unwrap();
         let mut reopened = Yard::open(&paths, config).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
         assert_eq!(
-            reopened
+            snapshot
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -2050,10 +2138,12 @@ mod tests {
             .insert_proof(proof.clone())
             .unwrap();
         yard.insert_proof(proof.clone()).unwrap();
-        assert_eq!(yard.proof(proof.id()).unwrap(), Some(proof.clone()));
-        assert_eq!(yard.proof(Inline::new([0; 32])).unwrap(), None);
+        let snapshot = yard.snapshot().unwrap();
+        assert_eq!(snapshot.proof(proof.id()).unwrap(), Some(proof.clone()));
+        assert_eq!(snapshot.proof(Inline::new([0; 32])).unwrap(), None);
         assert_eq!(
-            yard.proofs()
+            snapshot
+                .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -2061,14 +2151,16 @@ mod tests {
         );
 
         yard.collect(&RetentionRoots::new()).unwrap();
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
         assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_err());
         assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
         drop(reader);
 
         yard.reclaim().unwrap();
+        let snapshot = yard.snapshot().unwrap();
         assert_eq!(
-            yard.proofs()
+            snapshot
+                .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -2077,15 +2169,16 @@ mod tests {
         yard.close().unwrap();
 
         let mut reopened = Yard::open(&paths, config).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
         assert_eq!(
-            reopened
+            snapshot
                 .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
             vec![proof]
         );
-        let reader = reopened.reader().unwrap();
+        let reader = reopened.snapshot().unwrap();
         assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_err());
         assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
         drop(reader);
@@ -2135,12 +2228,16 @@ mod tests {
         let mut expected = vec![first, conflicting];
         expected.sort_unstable_by_key(CollectionRecord::id);
 
-        assert_eq!(yard.select_records(&selectors).unwrap(), expected);
+        assert_eq!(
+            yard.snapshot().unwrap().select_records(&selectors).unwrap(),
+            expected
+        );
         yard.close().unwrap();
 
         let mut reopened = Yard::open(&paths, config).unwrap();
-        assert_eq!(reopened.select_records(&selectors).unwrap(), expected);
-        assert!(!reopened
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.select_records(&selectors).unwrap(), expected);
+        assert!(!snapshot
             .select_records(&selectors)
             .unwrap()
             .contains(&unrelated));
@@ -2192,7 +2289,7 @@ mod tests {
         }
 
         yard.collect(&RetentionRoots::new()).unwrap();
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
         assert!(reader.get::<Bytes, RawBytes>(attachment).is_ok());
         assert!(reader.get::<Bytes, RawBytes>(data).is_ok());
         assert!(reader
@@ -2207,6 +2304,8 @@ mod tests {
         yard.reclaim().unwrap();
         assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 4);
         let actual = yard
+            .snapshot()
+            .unwrap()
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -2243,7 +2342,7 @@ mod tests {
         }
 
         yard.collect(&RetentionRoots::new()).unwrap();
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
         assert!(!reader.contains_blob(forged_data).unwrap());
         assert!(!reader.contains_blob(forged_metadata).unwrap());
         drop(reader);
@@ -2251,6 +2350,8 @@ mod tests {
         yard.reclaim().unwrap();
         assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 0);
         let mut actual = yard
+            .snapshot()
+            .unwrap()
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -2288,6 +2389,8 @@ mod tests {
         yard.reclaim().unwrap();
         assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 1);
         let mut actual = yard
+            .snapshot()
+            .unwrap()
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -2318,7 +2421,7 @@ mod tests {
         let mut roots = RetentionRoots::new();
         roots.retain_recursive(strong);
         yard.collect(&roots).unwrap();
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
 
         assert_eq!(get_raw(&reader, strong).unwrap(), raw_blob(b"strong"));
         assert!(matches!(
@@ -2361,7 +2464,7 @@ mod tests {
         roots.retain_recursive(owned_parent);
         roots.retain_direct(ledger_record);
         yard.collect(&roots).unwrap();
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
 
         for retained in [owned_parent, owned_child, ledger_record] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
@@ -2388,7 +2491,7 @@ mod tests {
         yard.want(WantRequest::blob(absent)).unwrap();
 
         yard.collect(&roots).unwrap();
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
 
         assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
         assert!(matches!(
@@ -2454,7 +2557,7 @@ mod tests {
             .unwrap();
         assert_eq!(pile_blob_count(&paths[0]), 2);
         let strong_before = {
-            let reader = yard.reader().unwrap();
+            let reader = yard.snapshot().unwrap();
             get_raw(&reader, strong).unwrap()
         };
 
@@ -2465,7 +2568,7 @@ mod tests {
         // stays readable.
         assert_eq!(pile_blob_count(&paths[0]), 0);
         assert!(yard.contains_in_generation(1, strong));
-        let reader = yard.reader().unwrap();
+        let reader = yard.snapshot().unwrap();
         assert_eq!(get_raw(&reader, strong).unwrap(), strong_before);
     }
 
@@ -2491,7 +2594,7 @@ mod tests {
         yard.collect(&roots).unwrap();
         let before_size = fs::metadata(&paths[0]).unwrap().len();
         let before_count = pile_blob_count(&paths[0]);
-        let before_reader = yard.reader().unwrap();
+        let before_reader = yard.snapshot().unwrap();
         let live_before = get_raw(&before_reader, live).unwrap();
 
         assert!(matches!(
@@ -2504,7 +2607,7 @@ mod tests {
 
         let after_size = fs::metadata(&paths[0]).unwrap().len();
         let after_count = pile_blob_count(&paths[0]);
-        let after_reader = yard.reader().unwrap();
+        let after_reader = yard.snapshot().unwrap();
 
         assert!(after_size < before_size);
         assert_eq!(after_count, 1);
@@ -2516,7 +2619,7 @@ mod tests {
 
         let mut fresh_pile = Pile::open(&paths[0]).unwrap();
         fresh_pile.refresh().unwrap();
-        let fresh_reader = fresh_pile.reader().unwrap();
+        let fresh_reader = fresh_pile.snapshot().unwrap();
         assert_eq!(
             fresh_reader.get::<Bytes, RawBytes>(live).unwrap(),
             live_before
@@ -2578,7 +2681,7 @@ mod tests {
         // The reloaded want still works as a retention marker: the
         // cached blob survives collection under the default budget.
         reopened.collect(&RetentionRoots::new()).unwrap();
-        let reader = reopened.reader().unwrap();
+        let reader = reopened.snapshot().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached"));
     }
 
@@ -2616,7 +2719,7 @@ mod tests {
             wanted.contains(&cached.raw),
             "cache marker lost by reclaim rewrite"
         );
-        let reader = reopened.reader().unwrap();
+        let reader = reopened.snapshot().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached blob"));
     }
 
@@ -2713,7 +2816,7 @@ mod tests {
         // valid prefix stays readable.
         let mut repaired = Yard::amputate(paths.clone(), YardConfig::default()).unwrap();
         assert!(fs::metadata(&paths[0]).unwrap().len() < corrupt_len);
-        let reader = repaired.reader().unwrap();
+        let reader = repaired.snapshot().unwrap();
         assert_eq!(get_raw(&reader, live).unwrap(), raw_blob(b"survivor"));
     }
 }

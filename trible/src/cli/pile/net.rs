@@ -15,7 +15,7 @@ use triblespace_net::peer::{
 use triblespace_net::protocol::PILE_SYNC_ALPN;
 
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{StoreRevision, StoreScope};
+use triblespace_core::repo::{SnapshotSource, StoreChanges, StoreScope, StoreSnapshot};
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
@@ -194,29 +194,22 @@ fn stable_inventory_manifest(
     let scope_before = pile
         .store_scope()?
         .ok_or_else(|| anyhow!("pile has no bound team scope"))?;
-    let revision_before = pile.store_revision()?;
     let snapshot = InventorySnapshot::from_store(pile, scope_before)?;
     let manifest = snapshot.manifest().clone();
-    drop(snapshot);
-    let revision_after = pile.store_revision()?;
+    let after = pile.snapshot()?;
     let scope_after = pile.store_scope()?;
+    let changes = after.changes_since(snapshot.store_snapshot());
 
-    ensure_inventory_sample_unchanged(
-        &revision_before,
-        &revision_after,
-        scope_before,
-        scope_after,
-    )?;
+    ensure_inventory_sample_unchanged(changes, scope_before, scope_after)?;
     Ok((scope_before, manifest))
 }
 
-fn ensure_inventory_sample_unchanged<R: Eq>(
-    revision_before: &R,
-    revision_after: &R,
+fn ensure_inventory_sample_unchanged(
+    changes: StoreChanges,
     scope_before: ed25519_dalek::VerifyingKey,
     scope_after: Option<ed25519_dalek::VerifyingKey>,
 ) -> Result<()> {
-    if revision_before != revision_after || scope_after != Some(scope_before) {
+    if !changes.is_empty() || scope_after != Some(scope_before) {
         return Err(anyhow!(
             "sync-visible inventory changed while it was sampled; retry"
         ));
@@ -609,11 +602,11 @@ mod tests {
         let team = SigningKey::from_bytes(&[0x61; 32]).verifying_key();
         let other = SigningKey::from_bytes(&[0x62; 32]).verifying_key();
 
-        assert!(ensure_inventory_sample_unchanged(&0, &0, team, Some(team)).is_ok());
+        assert!(ensure_inventory_sample_unchanged(StoreChanges::NONE, team, Some(team)).is_ok());
         for error in [
-            ensure_inventory_sample_unchanged(&0, &1, team, Some(team)).unwrap_err(),
-            ensure_inventory_sample_unchanged(&0, &0, team, Some(other)).unwrap_err(),
-            ensure_inventory_sample_unchanged(&0, &0, team, None).unwrap_err(),
+            ensure_inventory_sample_unchanged(StoreChanges::BLOBS, team, Some(team)).unwrap_err(),
+            ensure_inventory_sample_unchanged(StoreChanges::NONE, team, Some(other)).unwrap_err(),
+            ensure_inventory_sample_unchanged(StoreChanges::NONE, team, None).unwrap_err(),
         ] {
             assert!(error.to_string().contains("sync-visible inventory changed"));
         }

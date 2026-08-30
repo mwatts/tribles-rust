@@ -52,6 +52,7 @@
 //! [`StatedOrder::tiebreak_by_id`](crate::query::register::StatedOrder::tiebreak_by_id).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
@@ -63,6 +64,7 @@ use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
 use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata;
@@ -79,7 +81,7 @@ use super::records::{
 };
 use super::{
     simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
-    CollectionStore, CoverAttachment, FactCover, TryFromCover,
+    CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 
 const ID_LEN: usize = 16;
@@ -589,17 +591,22 @@ impl TryFromCover<LwwRegisterBlob> for LwwIndex {
     type Error = LwwRegisterError;
 
     fn try_from_cover<R>(
-        attachment: CoverAttachment<LwwRegisterBlob>,
-        _reader: &R,
-    ) -> Result<Self, Self::Error>
+        cover: &super::Cover<LwwRegisterBlob>,
+        reader: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
-        R: BlobStoreGet + BlobStoreMeta,
+        R: BlobStoreGet,
     {
         let mut combined = Projection::default();
-        for segment in attachment.into_blobs() {
-            combined = combined.union(decode_projection(&segment)?);
+        for handle in cover.members() {
+            let member = Handle::<LwwRegisterBlob>::to_hash(handle);
+            let segment = reader
+                .get(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            combined =
+                combined.union(decode_projection(&segment).map_err(TryFromCoverError::View)?);
         }
-        Self::from_projection(combined)
+        Self::from_projection(combined).map_err(TryFromCoverError::View)
     }
 }
 
@@ -709,13 +716,18 @@ impl LwwRegisterCollection {
     ) -> Result<LwwIndex, LwwRegisterCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.attach_exact(store, source_cover)?;
         let reader = store
-            .reader()
-            .map_err(|source| LwwRegisterCollectionError::Reader(source.to_string()))?;
-        LwwIndex::try_from_cover(cover, &reader).map_err(LwwRegisterCollectionError::Algebra)
+            .snapshot()
+            .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;
+        LwwIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
+            TryFromCoverError::MemberGet { source, .. } => {
+                LwwRegisterCollectionError::Snapshot(source.to_string())
+            }
+            TryFromCoverError::View(source) => LwwRegisterCollectionError::Algebra(source),
+        })
     }
 
     /// Ensure and attach the exact projection for `source_cover`.
@@ -726,13 +738,18 @@ impl LwwRegisterCollection {
     ) -> Result<LwwIndex, LwwRegisterCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;
         let reader = store
-            .reader()
-            .map_err(|source| LwwRegisterCollectionError::Reader(source.to_string()))?;
-        LwwIndex::try_from_cover(cover, &reader).map_err(LwwRegisterCollectionError::Algebra)
+            .snapshot()
+            .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;
+        LwwIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
+            TryFromCoverError::MemberGet { source, .. } => {
+                LwwRegisterCollectionError::Snapshot(source.to_string())
+            }
+            TryFromCoverError::View(source) => LwwRegisterCollectionError::Algebra(source),
+        })
     }
 
     fn kernel(
@@ -752,8 +769,8 @@ pub enum LwwRegisterCollectionError {
     Collection(ExactDerivedCollectionError),
     /// Canonical projection construction or joining failed.
     Algebra(LwwRegisterError),
-    /// A reader for the attached cover could not be opened.
-    Reader(String),
+    /// A store snapshot for the cover could not be frozen.
+    Snapshot(String),
 }
 
 impl fmt::Display for LwwRegisterCollectionError {
@@ -761,7 +778,7 @@ impl fmt::Display for LwwRegisterCollectionError {
         match self {
             Self::Collection(source) => source.fmt(formatter),
             Self::Algebra(source) => source.fmt(formatter),
-            Self::Reader(source) => write!(formatter, "open LWW cover reader: {source}"),
+            Self::Snapshot(source) => write!(formatter, "freeze LWW cover snapshot: {source}"),
         }
     }
 }
@@ -771,7 +788,7 @@ impl Error for LwwRegisterCollectionError {
         match self {
             Self::Collection(source) => Some(source),
             Self::Algebra(source) => Some(source),
-            Self::Reader(_) => None,
+            Self::Snapshot(_) => None,
         }
     }
 }

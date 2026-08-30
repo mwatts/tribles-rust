@@ -206,7 +206,7 @@ refreshing state.
    envelope kinds as opaque records and distinguishes an unknown legacy marker
    as `ReadError::UnsupportedRecord { offset, marker }`. It never mutates the
    file. Callers rarely need to invoke it directly:
-   blob readers and collection/OFFER/WANT/pin-snapshot enumerations refresh internally
+   `Pile::snapshot` and collection/OFFER/WANT/pin-snapshot observations refresh internally
    before observing records, so external writers are visible without a
    standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
@@ -238,14 +238,16 @@ refreshing state.
    append-only, still repairable by an explicit `amputate` if a crash leaves a
    partial tail, but serialised against other writers for the duration of the
    append.
-5. **Read through a snapshot.** `reader` clones the memory map and PATCH
-   indices into a `PileReader`, yielding iterators and metadata lookups that
-   can execute without further locking.
+5. **Read through a snapshot.** `SnapshotSource::snapshot` refreshes the pile,
+   then clones the memory map and persistent PATCH indices into a
+   `PileSnapshot`. Blob bytes, collection records, capability proofs, and peer
+   evidence all come from that one immutable prefix and can be read without
+   further locking.
 
 This lifecycle keeps pile usage predictable: open → operate (operations
-refresh as they run) → hand out read-only readers. If a process wants to scan
+refresh as they run) → freeze immutable snapshots. If a process wants to scan
 for new appends between operations (for example, a background monitor that is
-not issuing a reader or record enumeration), it can explicitly call `refresh` to pick up
+not issuing a snapshot or record enumeration), it can explicitly call `refresh` to pick up
 external writers without blocking them for long. If corruption is ever
 reported, surface it to the operator; truncating is a decision, not a default.
 
@@ -303,19 +305,19 @@ fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     // Insert a blob and obtain a handle pointing at the on-disk bytes.
     let handle = pile.put(Bytes::from_source(bytes.to_vec()))?;
 
-    // Readers operate on a snapshot cloned from the pile's mmap.
-    let reader = pile.reader()?;
-    if let Some(meta) = reader.metadata(handle)? {
+    // One immutable snapshot owns every read capability for this pile prefix.
+    let snapshot = pile.snapshot()?;
+    if let Some(meta) = snapshot.metadata(handle)? {
         println!("stored {} bytes at {}", meta.length, meta.timestamp);
     }
-    drop(reader);
+    drop(snapshot);
     pile.close()?;
     Ok(())
 }
 ```
 
 This pattern illustrates the typical flow: open, load with `refresh`, append
-through the storage traits, then hand a `PileReader` snapshot to read-only
+through the storage traits, then hand a `PileSnapshot` to read-only
 consumers. `refresh` acquires a shared lock so it cannot race with an explicit
 `amputate`, which takes an exclusive lock before truncating a corrupted tail.
 
@@ -335,10 +337,15 @@ readback still observes the live length while looking for the caller's own
 record. This avoids a metadata syscall per record without weakening exact
 torn-tail offsets or amputation's exclusive retry.
 
-`PileReader` receives one persistent PATCH snapshot when it is created. Later
-refreshes can extend the pile's copy without changing existing readers, and
-`blobs_diff` can compare two snapshots through PATCH's structurally shared set
-difference instead of enumerating either complete index.
+`PileSnapshot` receives persistent PATCH roots when it is created. Later
+refreshes can extend the pile without changing existing snapshots.
+`StoreSnapshot::changes_since` compares the Blob, collection-record,
+capability-proof, and peer-evidence PATCH roots directly. For Blobs it compares
+lineage-local root sharing rather than key-only equality, so replacing a
+corrupt same-handle candidate is visible while unrelated appended records are
+not. Classification is therefore constant in the number of semantic
+components rather than a scan of either snapshot; component-specific consumers
+can reuse unchanged derived state.
 
 Tools that need the raw log rather than the collapsed state—reflogs,
 consolidation, forensics—should use
@@ -400,7 +407,7 @@ Each blob record carries:
 
 The payload follows at `record_start + 256` and is post-padded to the next
 256-byte boundary. The [Pile Blob Metadata](./pile-blob-metadata.md) chapter
-explains how to query these fields through the `PileReader` API.
+explains how to query these fields through the `PileSnapshot` API.
 
 ## Native Collection Records
 

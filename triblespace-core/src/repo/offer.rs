@@ -11,13 +11,13 @@ use std::fmt::{self, Debug};
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob};
-use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::capability::CapabilityProof;
+use crate::collection::{CollectionRecord, CollectionStore};
 use crate::id::{id_hex, Id};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
-use crate::repo::{BlobStore, BlobStorePut, CapabilityProofStore};
+use crate::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
 
 /// Stable semantic kind of a positive local artifact offer.
 ///
@@ -266,15 +266,15 @@ where
     }
 }
 
-impl<S> BlobStore for OfferCapture<S>
+impl<S> SnapshotSource for OfferCapture<S>
 where
-    S: BlobStore,
+    S: SnapshotSource,
 {
-    type Reader = S::Reader;
-    type ReaderError = S::ReaderError;
+    type Snapshot = S::Snapshot;
+    type SnapshotError = S::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.inner.reader()
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
     }
 }
 
@@ -282,27 +282,7 @@ impl<S> CollectionStore for OfferCapture<S>
 where
     S: CollectionStore + ArtifactOfferStore,
 {
-    type RecordsError = S::RecordsError;
     type InsertError = OfferCaptureInsertError<S::OfferError, S::InsertError>;
-    type RecordIter<'a>
-        = S::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.inner.records()
-    }
-
-    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.inner.record(id)
-    }
-
-    fn select_records(
-        &mut self,
-        selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-        self.inner.select_records(selectors)
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         if let Err(source) = self.offer_pending() {
@@ -321,23 +301,7 @@ impl<S> CapabilityProofStore for OfferCapture<S>
 where
     S: CapabilityProofStore + ArtifactOfferStore,
 {
-    type ProofsError = S::ProofsError;
     type InsertError = OfferCaptureInsertError<S::OfferError, S::InsertError>;
-    type ProofIter<'a>
-        = S::ProofIter<'a>
-    where
-        Self: 'a;
-
-    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-        self.inner.proofs()
-    }
-
-    fn proof(
-        &mut self,
-        id: CapabilityProofId,
-    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-        self.inner.proof(id)
-    }
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         if let Err(source) = self.offer_pending() {
@@ -362,7 +326,7 @@ mod tests {
     };
     use crate::collection::{CollectionData, CollectionHandle, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::StoreRevision;
+    use crate::repo::{SnapshotSource, StoreSnapshot};
     use ed25519_dalek::SigningKey;
     use std::convert::Infallible;
 
@@ -395,10 +359,10 @@ mod tests {
     #[test]
     fn local_offers_do_not_change_sync_visible_revision() {
         let mut repo = MemoryRepo::default();
-        let before = repo.store_revision().unwrap();
+        let before = repo.snapshot().unwrap();
         repo.offer(handle(9)).unwrap();
-        let after = repo.store_revision().unwrap();
-        assert!(before == after);
+        let after = repo.snapshot().unwrap();
+        assert!(after.changes_since(&before).is_empty());
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,7 +370,7 @@ mod tests {
         Put(ArtifactHandle),
         Offer(Vec<ArtifactHandle>),
         Insert(Id),
-        InsertProof(CapabilityProofId),
+        InsertProof(crate::capability::CapabilityProofId),
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,22 +438,7 @@ mod tests {
     }
 
     impl CollectionStore for ProbeStore {
-        type RecordsError = Infallible;
         type InsertError = ProbeError;
-        type RecordIter<'a>
-            = std::vec::IntoIter<Result<CollectionRecord, Infallible>>
-        where
-            Self: 'a;
-
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            Ok(self
-                .records
-                .clone()
-                .into_iter()
-                .map(Ok)
-                .collect::<Vec<_>>()
-                .into_iter())
-        }
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.events.push(ProbeEvent::Insert(record.id()));
@@ -502,22 +451,7 @@ mod tests {
     }
 
     impl CapabilityProofStore for ProbeStore {
-        type ProofsError = ProbeError;
         type InsertError = ProbeError;
-        type ProofIter<'a>
-            = std::vec::IntoIter<Result<CapabilityProof, ProbeError>>
-        where
-            Self: 'a;
-
-        fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-            Ok(self
-                .proofs
-                .clone()
-                .into_iter()
-                .map(Ok)
-                .collect::<Vec<_>>()
-                .into_iter())
-        }
 
         fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
             self.events.push(ProbeEvent::InsertProof(proof.id()));

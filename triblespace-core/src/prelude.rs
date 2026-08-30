@@ -40,8 +40,8 @@ pub use crate::blob::IntoBlob;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
 pub use crate::collection::{
-    Collection, CollectionEncoding, CollectionStore, CollectionStoreExt, Cover, CoverAttachment,
-    FactCover, FactSnapshot, SimpleArchiveCollection, Snapshot, TryFromCover, VerifyingKey,
+    Collection, CollectionEncoding, CollectionRead, CollectionStore, CollectionStoreExt, Cover,
+    FactCover, SimpleArchiveCollection, TryFromCover, TryFromCoverError, VerifyingKey,
 };
 pub use crate::id::fucid;
 pub use crate::id::genid;
@@ -80,13 +80,20 @@ pub use crate::query::TriblePattern;
 pub use crate::query::Variable;
 pub use crate::repo::lazy::Lazy;
 pub use crate::repo::memoryrepo::MemoryRepo;
-pub use crate::repo::pile::Pile;
+pub use crate::repo::pile::{Pile, PileSnapshot};
 pub use crate::repo::BlobChildren;
 pub use crate::repo::BlobStore;
 pub use crate::repo::BlobStoreGet;
 pub use crate::repo::BlobStorePut;
 pub use crate::repo::CommitHandle;
+pub use crate::repo::SnapshotErrorOf;
+pub use crate::repo::SnapshotOf;
+pub use crate::repo::SnapshotSource;
 pub use crate::repo::StorageFlush;
+pub use crate::repo::Store;
+pub use crate::repo::StoreChanges;
+pub use crate::repo::StoreRead;
+pub use crate::repo::StoreSnapshot;
 pub use crate::repo::WantRequest;
 pub use crate::repo::WantRequestDecodeError;
 pub use crate::repo::WantStore;

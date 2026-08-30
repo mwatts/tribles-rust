@@ -61,8 +61,8 @@ use triblespace::prelude::inlineencodings::Handle;
 
 let mut store = MemoryBlobStore::new();
 let handle: Inline<Handle<UTF8String>> = store.put("Fear is the mind-killer.")?;
-let reader = store.reader()?;
-let value: View<str> = reader.get(handle)?;
+let snapshot = store.snapshot()?;
+let value: View<str> = snapshot.get(handle)?;
 assert_eq!(value.as_ref(), "Fear is the mind-killer.");
 ```
 

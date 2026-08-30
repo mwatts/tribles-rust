@@ -58,7 +58,7 @@ roots have no direct `MERGE`. If policy retains the accelerated root, ordinary
 child traversal also retains its named raw child.
 
 Read-only materialization accepts only a complete resident source-bound member.
-Its cover-aware view loads the embedded raw child through its reader, validates
+Its cover-aware view loads the embedded raw child through its store snapshot, validates
 the exact raw/index pair, and then constructs a transient query runtime. Missing
 root or child bytes make that route nonresident, not semantically false. A later
 `ensure_exact` finds or constructs a usable raw route, stores the selected raw

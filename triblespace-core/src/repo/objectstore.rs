@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -17,10 +18,10 @@ use url::Url;
 use hex::FromHex;
 
 use super::async_store::{
-    AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
-    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionStore,
+    AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStoreMeta,
+    AsyncBlobStorePut, AsyncCollectionRead, AsyncCollectionStore, AsyncSnapshotSource,
 };
-use super::{BlobInfo, BlobMetadata};
+use super::{BlobInfo, BlobMetadata, StoreChanges, StoreSnapshot};
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
@@ -41,7 +42,7 @@ const COLLECTION_RECORD_INFIX: &str = "collection-records";
 /// All data is stored in an external service (e.g. S3, local filesystem)
 /// via the `object_store` crate, which is async at its core — so this
 /// type is **async-native**: it implements the
-/// [`AsyncBlobStore`] family
+/// [`super::async_store::AsyncBlobStore`] family
 /// directly, awaiting each operation, with no owned runtime.
 ///
 /// Synchronous callers wrap it in
@@ -72,29 +73,49 @@ impl fmt::Debug for ObjectStoreRemote {
     }
 }
 
-impl fmt::Debug for ObjectStoreReader {
+impl fmt::Debug for ObjectStoreSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ObjectStoreReader")
+        f.debug_struct("ObjectStoreSnapshot")
             .field("prefix", &self.prefix)
+            .field("blob_count", &self.blobs.len())
+            .field("collection_record_count", &self.collection_records.len())
             .finish()
     }
 }
 
-/// Read-only handle into an [`ObjectStoreRemote`] that can be cloned and
-/// shared.
+/// One immutable observation of an [`ObjectStoreRemote`].
+///
+/// Remote object stores generally cannot provide an atomic cross-prefix read
+/// transaction. Snapshot construction therefore observes both immutable
+/// namespaces once, validates every observed entry, and freezes their
+/// membership together. Reads are gated by this frozen membership: objects
+/// inserted after the observation cannot leak into it through a later GET.
 #[derive(Clone)]
-pub struct ObjectStoreReader {
+pub struct ObjectStoreSnapshot {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
+    blobs: Arc<BTreeMap<RawInline, ObservedBlob>>,
+    collection_records: Arc<Vec<CollectionRecord>>,
 }
 
-impl PartialEq for ObjectStoreReader {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.store, &other.store) && self.prefix == other.prefix
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ObservedBlob {
+    length: u64,
+    timestamp: u64,
+}
+
+impl StoreSnapshot for ObjectStoreSnapshot {
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        let mut changes = StoreChanges::NONE;
+        if self.blobs != previous.blobs {
+            changes = changes.union(StoreChanges::BLOBS);
+        }
+        if self.collection_records != previous.collection_records {
+            changes = changes.union(StoreChanges::COLLECTION_RECORDS);
+        }
+        changes
     }
 }
-
-impl Eq for ObjectStoreReader {}
 
 impl ObjectStoreRemote {
     /// Creates storage pointing at the object store described by
@@ -159,62 +180,60 @@ impl AsyncBlobStorePut for ObjectStoreRemote {
     }
 }
 
-impl AsyncBlobStore for ObjectStoreRemote {
-    type Reader = ObjectStoreReader;
-    type ReaderError = Infallible;
+impl AsyncSnapshotSource for ObjectStoreRemote {
+    type Snapshot = ObjectStoreSnapshot;
+    type SnapshotError = ObjectStoreSnapshotError;
 
-    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
-        let reader = ObjectStoreReader {
-            store: self.store.clone(),
-            prefix: self.prefix.clone(),
-        };
-        async move { Ok(reader) }
+    fn snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
+        async move {
+            // Observe semantic records before blobs. Under the normal
+            // dependency-first, naming-record-last publication order, this
+            // biases a concurrent observation toward harmless extra blobs
+            // rather than a newly observed record whose preceding blob write
+            // was missed by an earlier listing. Explicit forgets can still
+            // make a snapshotted payload unavailable; GET reports that I/O
+            // failure without changing the frozen membership.
+            let record_prefix = self.prefix.child(COLLECTION_RECORD_INFIX);
+            let mut collection_records = BTreeMap::new();
+            let mut listed_records = self.store.list(Some(&record_prefix));
+            while let Some(item) = listed_records.next().await {
+                let meta = item.map_err(ListCollectionRecordsErr::List)?;
+                let record =
+                    read_collection_record(&*self.store, &record_prefix, meta.location).await?;
+                collection_records.insert(record.id(), record);
+            }
+            let collection_records = collection_records.into_values().collect();
+
+            let blob_prefix = self.prefix.child(BLOB_INFIX);
+            let mut blobs = BTreeMap::new();
+            let mut listed_blobs = self.store.list(Some(&blob_prefix));
+            while let Some(item) = listed_blobs.next().await {
+                let meta = item.map_err(ListBlobsErr::List)?;
+                let raw = blob_handle_from_path(&blob_prefix, &meta.location)?;
+                let timestamp = u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0);
+                blobs.insert(
+                    raw,
+                    ObservedBlob {
+                        length: meta.size,
+                        timestamp,
+                    },
+                );
+            }
+
+            Ok(ObjectStoreSnapshot {
+                store: self.store.clone(),
+                prefix: self.prefix.clone(),
+                blobs: Arc::new(blobs),
+                collection_records: Arc::new(collection_records),
+            })
+        }
     }
 }
 
 impl AsyncCollectionStore for ObjectStoreRemote {
-    type RecordsError = ListCollectionRecordsErr;
     type InsertError = InsertCollectionRecordErr;
-
-    fn records(
-        &mut self,
-    ) -> impl Future<
-        Output = Result<Vec<Result<CollectionRecord, Self::RecordsError>>, Self::RecordsError>,
-    > + Send {
-        async move {
-            let prefix = self.prefix.child(COLLECTION_RECORD_INFIX);
-            let mut observed = Vec::new();
-
-            // Object-store LIST is an observed monotone view, not a coherent
-            // snapshot. A concurrent immutable insertion may be visible on
-            // this call or the next one; every object this call does observe
-            // is nevertheless validated before it is returned.
-            let listed = self.store.list(Some(&prefix)).collect::<Vec<_>>().await;
-            for item in listed {
-                let (sort_id, sort_path, result) = match item {
-                    Err(error) => {
-                        let sort_path = error.to_string();
-                        (None, sort_path, Err(ListCollectionRecordsErr::List(error)))
-                    }
-                    Ok(meta) => {
-                        let sort_path = meta.location.to_string();
-                        let path_id = collection_record_id_from_path(&prefix, &meta.location).ok();
-                        let result =
-                            read_collection_record(&*self.store, &prefix, meta.location).await;
-                        let sort_id = result.as_ref().map(CollectionRecord::id).ok().or(path_id);
-                        (sort_id, sort_path, result)
-                    }
-                };
-                observed.push((sort_id, sort_path, result));
-            }
-
-            // Remote LIST order is backend-specific. Normalize successful
-            // records by intrinsic id, and malformed entries by path, so the
-            // observed view is deterministic independent of provider order.
-            observed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-            Ok(observed.into_iter().map(|(_, _, result)| result).collect())
-        }
-    }
 
     fn insert(
         &mut self,
@@ -291,13 +310,13 @@ impl crate::repo::StorageClose for ObjectStoreRemote {
     }
 }
 
-impl ObjectStoreReader {
+impl ObjectStoreSnapshot {
     fn blob_path(&self, handle_hex: String) -> Path {
         self.prefix.child(BLOB_INFIX).child(handle_hex)
     }
 }
 
-impl AsyncBlobStoreGet for ObjectStoreReader {
+impl AsyncBlobStoreGet for ObjectStoreSnapshot {
     type GetError<E: Error + Send + Sync + 'static> = GetBlobErr<E>;
 
     fn get<T, S>(
@@ -311,6 +330,11 @@ impl AsyncBlobStoreGet for ObjectStoreReader {
     {
         let raw = handle.raw;
         async move {
+            if !self.blobs.contains_key(&raw) {
+                return Err(GetBlobErr::NotInSnapshot {
+                    handle: Inline::new(raw),
+                });
+            }
             let path = self.blob_path(hex::encode(raw));
             let object = self.store.get(&path).await?;
             let bytes = object.bytes().await?;
@@ -326,34 +350,26 @@ impl AsyncBlobStoreGet for ObjectStoreReader {
     }
 }
 
-impl AsyncBlobStoreList for ObjectStoreReader {
-    type Err = ListBlobsErr;
+impl AsyncBlobStoreList for ObjectStoreSnapshot {
+    type Err = Infallible;
 
     fn blobs(&self) -> impl Future<Output = Vec<Result<BlobInfo, Self::Err>>> + Send {
-        async move {
-            let prefix = self.prefix.child(BLOB_INFIX);
-            let stream = self.store.list(Some(&prefix)).map(|r| match r {
-                Ok(meta) => {
-                    let blob_name = meta
-                        .location
-                        .filename()
-                        .ok_or(ListBlobsErr::NotAFile("no filename"))?;
-                    let digest =
-                        RawInline::from_hex(blob_name).map_err(ListBlobsErr::BadNameHex)?;
-                    Ok(BlobInfo {
-                        handle: Inline::new(digest),
-                        length: meta.size,
-                    })
-                }
-                Err(e) => Err(ListBlobsErr::List(e)),
-            });
-            stream.collect().await
-        }
+        let blobs = self
+            .blobs
+            .iter()
+            .map(|(raw, observed)| {
+                Ok(BlobInfo {
+                    handle: Inline::new(*raw),
+                    length: observed.length,
+                })
+            })
+            .collect();
+        async move { blobs }
     }
 }
 
-impl AsyncBlobStoreMeta for ObjectStoreReader {
-    type MetaError = object_store::Error;
+impl AsyncBlobStoreMeta for ObjectStoreSnapshot {
+    type MetaError = Infallible;
 
     fn metadata<S>(
         &self,
@@ -364,22 +380,33 @@ impl AsyncBlobStoreMeta for ObjectStoreReader {
         Handle<S>: InlineEncoding,
     {
         let raw = handle.raw;
-        async move {
-            let path = self.prefix.child(BLOB_INFIX).child(hex::encode(raw));
-            match self.store.head(&path).await {
-                Ok(meta) => {
-                    let ts = meta.last_modified.timestamp_millis() as u64;
-                    let len = meta.size;
-                    Ok(Some(BlobMetadata {
-                        timestamp: ts,
-                        length: len,
-                    }))
-                }
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e),
-            }
-        }
+        let metadata = self.blobs.get(&raw).map(|observed| BlobMetadata {
+            timestamp: observed.timestamp,
+            length: observed.length,
+        });
+        async move { Ok(metadata) }
     }
+}
+
+impl AsyncCollectionRead for ObjectStoreSnapshot {
+    type RecordsError = Infallible;
+
+    fn records(
+        &self,
+    ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send {
+        let records = self.collection_records.as_ref().clone();
+        async move { Ok(records) }
+    }
+}
+
+fn blob_handle_from_path(prefix: &Path, location: &Path) -> Result<RawInline, ListBlobsErr> {
+    let name = location
+        .filename()
+        .ok_or(ListBlobsErr::NotAFile("no filename"))?;
+    if location != &prefix.child(name) {
+        return Err(ListBlobsErr::NotDirectChild(location.to_string()));
+    }
+    RawInline::from_hex(name).map_err(ListBlobsErr::BadNameHex)
 }
 
 fn collection_record_id_from_path(
@@ -421,6 +448,51 @@ async fn read_collection_record(
         });
     }
     Ok(record)
+}
+
+/// Failure while freezing one object-store observation.
+///
+/// Snapshot construction is all-or-nothing: a malformed or unavailable
+/// object in either immutable namespace prevents publication of a partial
+/// authority view.
+#[derive(Debug)]
+pub enum ObjectStoreSnapshotError {
+    /// Blob membership could not be observed and validated.
+    Blobs(ListBlobsErr),
+    /// Collection-record membership could not be observed and validated.
+    CollectionRecords(ListCollectionRecordsErr),
+}
+
+impl From<ListBlobsErr> for ObjectStoreSnapshotError {
+    fn from(error: ListBlobsErr) -> Self {
+        Self::Blobs(error)
+    }
+}
+
+impl From<ListCollectionRecordsErr> for ObjectStoreSnapshotError {
+    fn from(error: ListCollectionRecordsErr) -> Self {
+        Self::CollectionRecords(error)
+    }
+}
+
+impl fmt::Display for ObjectStoreSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blobs(error) => write!(formatter, "failed to snapshot blobs: {error}"),
+            Self::CollectionRecords(error) => {
+                write!(formatter, "failed to snapshot collection records: {error}")
+            }
+        }
+    }
+}
+
+impl Error for ObjectStoreSnapshotError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Blobs(error) => Some(error),
+            Self::CollectionRecords(error) => Some(error),
+        }
+    }
 }
 
 /// Error returned while enumerating native collection records.
@@ -556,6 +628,11 @@ impl Error for PutBlobErr {
 /// Error returned when retrieving a blob from the object store.
 #[derive(Debug)]
 pub enum GetBlobErr<E: Error> {
+    /// The requested handle was not a member of this frozen observation.
+    NotInSnapshot {
+        /// Content address rejected by the snapshot membership gate.
+        handle: Inline<Hash<Blake3>>,
+    },
     /// The underlying object store operation failed.
     Store(object_store::Error),
     /// The fetched object's bytes did not hash to the requested content address.
@@ -572,6 +649,11 @@ pub enum GetBlobErr<E: Error> {
 impl<E: Error> fmt::Display for GetBlobErr<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotInSnapshot { handle } => write!(
+                f,
+                "blob {} was not present in this snapshot",
+                Hash::<Blake3>::to_hex(handle)
+            ),
             Self::Store(e) => write!(f, "object store error: {e}"),
             Self::HashMismatch { expected, actual } => write!(
                 f,
@@ -588,7 +670,7 @@ impl<E: Error> Error for GetBlobErr<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(e) => Some(e),
-            Self::HashMismatch { .. } | Self::Conversion(_) => None,
+            Self::NotInSnapshot { .. } | Self::HashMismatch { .. } | Self::Conversion(_) => None,
         }
     }
 }
@@ -606,6 +688,8 @@ pub enum ListBlobsErr {
     List(object_store::Error),
     /// A listed object had no filename component.
     NotAFile(&'static str),
+    /// A listed object was nested below the one-handle-per-object namespace.
+    NotDirectChild(String),
     /// A listed object's filename was not valid hexadecimal.
     BadNameHex(<RawInline as FromHex>::Error),
 }
@@ -615,6 +699,9 @@ impl fmt::Display for ListBlobsErr {
         match self {
             Self::List(e) => write!(f, "list failed: {e}"),
             Self::NotAFile(e) => write!(f, "list failed: {e}"),
+            Self::NotDirectChild(path) => {
+                write!(f, "blob object is not a direct child: {path}")
+            }
             Self::BadNameHex(e) => write!(f, "list failed: {e}"),
         }
     }
@@ -631,11 +718,14 @@ mod tests {
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
-        CollectionMerge, CollectionStore, COLLECTION_MERGE_BYTES_LEN,
+        CollectionMerge, CollectionRead, CollectionStore, COLLECTION_MERGE_BYTES_LEN,
         COLLECTION_RECORD_KIND_MERGE_V1,
     };
-    use crate::repo::async_store::{AsyncBlobStorePut, Blocking};
-    use crate::repo::StorageFlush;
+    use crate::repo::async_store::{
+        AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut, AsyncCollectionRead,
+        AsyncSnapshotSource, Blocking,
+    };
+    use crate::repo::{SnapshotSource, StorageFlush};
 
     fn remote() -> ObjectStoreRemote {
         ObjectStoreRemote {
@@ -663,6 +753,7 @@ mod tests {
             let mut store = remote();
             let first = record(1);
             let second = record(9);
+            let before = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
 
             AsyncCollectionStore::insert(&mut store, second)
                 .await
@@ -689,15 +780,18 @@ mod tests {
             assert_eq!(stored.len(), 1 + COLLECTION_MERGE_BYTES_LEN);
             assert_eq!(stored[0], COLLECTION_RECORD_KIND_MERGE_V1);
 
-            let actual = AsyncCollectionStore::records(&mut store)
+            let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+            assert!(AsyncCollectionRead::records(&before)
                 .await
                 .unwrap()
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+                .is_empty());
+            let actual = AsyncCollectionRead::records(&snapshot).await.unwrap();
             let mut expected = vec![first, second];
             expected.sort_unstable_by_key(CollectionRecord::id);
             assert_eq!(actual, expected);
+            let changes = snapshot.changes_since(&before);
+            assert!(changes.contains(StoreChanges::COLLECTION_RECORDS));
+            assert!(!changes.contains(StoreChanges::BLOBS));
         });
     }
 
@@ -719,13 +813,39 @@ mod tests {
                 Err(InsertCollectionRecordErr::ExistingMismatch { id }) if id == path_record.id()
             ));
 
-            let records = AsyncCollectionStore::records(&mut store).await.unwrap();
-            assert_eq!(records.len(), 1);
             assert!(matches!(
-                &records[0],
-                Err(ListCollectionRecordsErr::IdMismatch { path, record })
-                    if *path == path_record.id() && *record == stored_record.id()
+                AsyncSnapshotSource::snapshot(&mut store).await,
+                Err(ObjectStoreSnapshotError::CollectionRecords(
+                    ListCollectionRecordsErr::IdMismatch { path, record }
+                )) if path == path_record.id() && record == stored_record.id()
             ));
+        });
+    }
+
+    #[test]
+    fn blob_get_is_gated_by_frozen_snapshot_membership() {
+        block_on(async {
+            let mut store = remote();
+            let before = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+            let bytes = Bytes::from_source(b"arrived after snapshot".to_vec());
+            let handle = AsyncBlobStorePut::put::<RawBytes, _>(&mut store, bytes.clone())
+                .await
+                .unwrap();
+
+            assert!(AsyncBlobStoreList::blobs(&before).await.is_empty());
+            assert!(matches!(
+                AsyncBlobStoreGet::get::<Blob<RawBytes>, RawBytes>(&before, handle).await,
+                Err(GetBlobErr::NotInSnapshot { handle: rejected })
+                    if rejected.raw == handle.raw
+            ));
+
+            let after = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+            let fetched: Blob<RawBytes> = AsyncBlobStoreGet::get(&after, handle).await.unwrap();
+            assert_eq!(fetched.bytes, bytes);
+            assert_eq!(AsyncBlobStoreList::blobs(&after).await.len(), 1);
+            let changes = after.changes_since(&before);
+            assert!(changes.contains(StoreChanges::BLOBS));
+            assert!(!changes.contains(StoreChanges::COLLECTION_RECORDS));
         });
     }
 
@@ -777,7 +897,8 @@ mod tests {
 
         CollectionStore::insert(&mut store, record).unwrap();
         StorageFlush::flush(&mut store).unwrap();
-        let actual = CollectionStore::records(&mut store)
+        let snapshot = SnapshotSource::snapshot(&mut store).unwrap();
+        let actual = CollectionRead::records(&snapshot)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

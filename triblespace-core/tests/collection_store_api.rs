@@ -10,7 +10,7 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofBundle, CapabilityProofId, CapabilityResource, CapabilityValidity,
+    CapabilityProofBundle, CapabilityResource, CapabilityValidity,
 };
 use triblespace_core::collection::records::{
     collection_authority, collection_name, collection_representation, KIND_COLLECTION_DESCRIPTOR,
@@ -18,8 +18,8 @@ use triblespace_core::collection::records::{
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace_core::collection::{
-    reach, Collection, CollectionRecord, CollectionRecordSelector, CollectionStore,
-    CollectionStoreExt, ACTION_WRITE,
+    reach, Collection, CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
+    ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -28,8 +28,8 @@ use triblespace_core::prelude::entity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{
-    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStore, BlobStoreGet,
-    BlobStorePut, CapabilityProofStore,
+    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobStoreGet, BlobStorePut,
+    CapabilityProofStore, SnapshotSource,
 };
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -73,37 +73,17 @@ impl BlobStorePut for CountingRepo {
     }
 }
 
-impl BlobStore for CountingRepo {
-    type Reader = <MemoryRepo as BlobStore>::Reader;
-    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+impl SnapshotSource for CountingRepo {
+    type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.inner.reader()
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
     }
 }
 
 impl CollectionStore for CountingRepo {
-    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
     type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-    type RecordIter<'a> = <MemoryRepo as CollectionStore>::RecordIter<'a>;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.inner.records()
-    }
-
-    fn record(
-        &mut self,
-        id: triblespace_core::id::Id,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.inner.record(id)
-    }
-
-    fn select_records(
-        &mut self,
-        selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-        self.inner.select_records(selectors)
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.events.push(StoreEvent::Insert(record.id()));
@@ -112,20 +92,7 @@ impl CollectionStore for CountingRepo {
 }
 
 impl CapabilityProofStore for CountingRepo {
-    type ProofsError = <MemoryRepo as CapabilityProofStore>::ProofsError;
     type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
-    type ProofIter<'a> = <MemoryRepo as CapabilityProofStore>::ProofIter<'a>;
-
-    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-        self.inner.proofs()
-    }
-
-    fn proof(
-        &mut self,
-        id: CapabilityProofId,
-    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-        self.inner.proof(id)
-    }
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         self.inner.insert_proof(proof)
@@ -198,7 +165,7 @@ fn registration_offers_the_complete_descriptor_closure_once() {
         simplearchive_union::descriptor("closure", authority.verifying_key(), reach::private());
     let mut attachments = descriptor.blobs().clone();
     let attachment_handles: Vec<_> = attachments
-        .reader()
+        .snapshot()
         .unwrap()
         .into_iter()
         .map(|(handle, _)| handle)
@@ -239,8 +206,8 @@ fn direct_stage_retains_descriptor_attachments_and_publishes_commit_last() {
 
     let mut staged = prepared.stage(&mut store, &signer).unwrap();
     let commit = *staged.commit();
-    assert!(staged
-        .store_mut()
+    let staged_snapshot = staged.store_mut().snapshot().unwrap();
+    assert!(staged_snapshot
         .records()
         .unwrap()
         .collect::<Result<Vec<_>, Infallible>>()
@@ -265,8 +232,8 @@ fn direct_stage_retains_descriptor_attachments_and_publishes_commit_last() {
         .expect("commit insert");
     assert!(name_put < descriptor_put && descriptor_put < insert);
 
-    let reader = store.reader().unwrap();
-    let stored_name: Blob<UTF8String> = reader.get(name).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let stored_name: Blob<UTF8String> = snapshot.get(name).unwrap();
     assert_eq!(
         std::str::from_utf8(&stored_name.bytes).unwrap(),
         "direct-stage-name"
@@ -346,7 +313,8 @@ fn commit_offers_every_dependency_before_one_idempotent_record() {
     assert_eq!(repeated, first);
     assert_eq!(
         store
-            .inner
+            .snapshot()
+            .unwrap()
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, Infallible>>()
@@ -370,10 +338,12 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
         .unwrap();
 
     let delegated = store.commit(collection, &delegate, fragment(2)).unwrap();
-    assert!(store.cover(collection).unwrap().is_empty());
+    let snapshot = store.snapshot().unwrap();
+    assert!(collection.admitted(&snapshot).unwrap().is_empty());
 
     let root = store.commit(collection, &authority, fragment(1)).unwrap();
-    let authority_cover = store.cover(collection).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let authority_cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(authority_cover.collection(), collection);
     assert_eq!(
         authority_cover.members().collect::<Vec<_>>(),
@@ -381,7 +351,8 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     );
 
     store_write_proof(&mut store, &authority, delegate.verifying_key(), collection);
-    let cover_before_duplicate = store.cover(collection).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let cover_before_duplicate = collection.admitted(&snapshot).unwrap();
     assert_eq!(cover_before_duplicate.len(), 2);
 
     // A second authorized signer may attest the same payload with a distinct
@@ -397,7 +368,8 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     let foreign_duplicate = store.commit(collection, &foreign, fragment(1)).unwrap();
     assert_eq!(foreign_duplicate.data(), root.data());
 
-    let cover = store.cover(collection).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(cover, cover_before_duplicate);
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.len(), 2);
@@ -409,8 +381,8 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
         ]),
     );
     assert_eq!(
-        store
-            .claims(&cover)
+        cover
+            .claims(&snapshot)
             .unwrap()
             .into_iter()
             .map(|claim| claim.id())
@@ -423,7 +395,7 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
         ]),
     );
 
-    let (snapshot, admitted_commits) = store.snapshot_with_admission(collection).unwrap();
+    let (admitted_cover, admitted_commits) = collection.admitted_with_claims(&snapshot).unwrap();
     assert_eq!(
         admitted_commits
             .iter()
@@ -433,9 +405,8 @@ fn authority_is_descriptor_local_and_delegation_activates_resident_commits() {
     );
     let mut expected = fragment(1).into_facts();
     expected += fragment(2).into_facts();
-    assert_eq!(snapshot.facts(), &expected);
-    assert_eq!(snapshot.cover(), &cover);
-    let materialized: TribleSet = store.materialize(&cover).unwrap();
+    assert_eq!(admitted_cover, cover);
+    let materialized: TribleSet = collection.read(&snapshot).unwrap();
     assert_eq!(materialized, expected);
 }
 
@@ -454,19 +425,21 @@ fn writer_admission_uses_authority_and_exact_resident_proofs_without_commits() {
         ))
         .unwrap();
 
-    assert!(store
-        .writer_is_admitted(collection, authority.verifying_key())
+    let snapshot = store.snapshot().unwrap();
+    assert!(collection
+        .writer_is_admitted(&snapshot, authority.verifying_key())
         .unwrap());
-    assert!(!store
-        .writer_is_admitted(collection, delegate.verifying_key())
+    assert!(!collection
+        .writer_is_admitted(&snapshot, delegate.verifying_key())
         .unwrap());
-    assert!(!store
-        .writer_is_admitted(collection, foreign.verifying_key())
+    assert!(!collection
+        .writer_is_admitted(&snapshot, foreign.verifying_key())
         .unwrap());
 
     store_write_proof(&mut store, &authority, delegate.verifying_key(), collection);
-    assert!(store
-        .writer_is_admitted(collection, delegate.verifying_key())
+    let snapshot = store.snapshot().unwrap();
+    assert!(collection
+        .writer_is_admitted(&snapshot, delegate.verifying_key())
         .unwrap());
 
     let atom = CapabilityAtom::new(
@@ -486,14 +459,15 @@ fn writer_admission_uses_authority_and_exact_resident_proofs_without_commits() {
     .unwrap();
     store_proof_bundle(&mut store, bundle);
 
-    assert!(!store
-        .writer_is_admitted(collection, expired.verifying_key())
+    let snapshot = store.snapshot().unwrap();
+    assert!(!collection
+        .writer_is_admitted(&snapshot, expired.verifying_key())
         .unwrap());
-    assert!(!store
-        .writer_is_admitted(collection, foreign.verifying_key())
+    assert!(!collection
+        .writer_is_admitted(&snapshot, foreign.verifying_key())
         .unwrap());
     assert_eq!(
-        store
+        snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, Infallible>>()
@@ -599,7 +573,8 @@ fn invalid_resident_proof_grants_nothing_without_poisoning_valid_evidence() {
     let tampered = CapabilityProof::from_bytes(&proof_bytes).unwrap();
     store_proof_bundle(&mut store, CapabilityProofBundle::new(tampered, claims));
 
-    let cover = store.cover(collection).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(
         cover.members().collect::<Vec<_>>(),
         vec![Handle::<SimpleArchive>::from_hash(valid_commit.data())]
@@ -642,15 +617,14 @@ fn pile_reopen_discovers_resident_delegation_proof_and_claims() {
 
     let mut reopened = Pile::open(&path).unwrap();
     reopened.refresh().unwrap();
-    let cover = reopened.cover(collection).unwrap();
+    let snapshot = reopened.snapshot().unwrap();
+    let cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(
         cover.members().collect::<Vec<_>>(),
         vec![Handle::<SimpleArchive>::from_hash(committed.data())]
     );
-    assert_eq!(
-        reopened.snapshot(collection).unwrap().facts(),
-        &fragment(3).into_facts()
-    );
+    let materialized: TribleSet = collection.read(&snapshot).unwrap();
+    assert_eq!(materialized, fragment(3).into_facts());
     reopened.close().unwrap();
 }
 
@@ -674,7 +648,8 @@ fn pile_reopens_source_first_rank9_derivation() {
         .unwrap();
     pile.commit(source_collection, &authority, fragment(4))
         .unwrap();
-    let source_cover = pile.cover(source_collection).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let source_cover = source_collection.admitted(&snapshot).unwrap();
     assert_eq!(
         facade
             .ensure_exact(&mut pile, &source_cover)
@@ -684,7 +659,8 @@ fn pile_reopens_source_first_rank9_derivation() {
         1
     );
 
-    let records = pile
+    let snapshot = pile.snapshot().unwrap();
+    let records = snapshot
         .records()
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
@@ -711,14 +687,13 @@ fn pile_reopens_source_first_rank9_derivation() {
     pile.close().unwrap();
 
     let mut reopened = Pile::open(&path).unwrap();
-    let reader = reopened.reader().unwrap();
-    reader
+    let snapshot = reopened.snapshot().unwrap();
+    snapshot
         .get::<Blob<SuccinctArchiveBlob>, _>(Handle::from_hash(raw))
         .unwrap();
-    reader
+    snapshot
         .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, _>(Handle::from_hash(root))
         .unwrap();
-    drop(reader);
     assert_eq!(
         facade
             .attach_exact(&mut reopened, &source_cover)

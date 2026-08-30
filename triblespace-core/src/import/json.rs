@@ -641,6 +641,7 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::blob::MemoryBlobStore;
     use crate::prelude::Attribute;
+    use crate::repo::SnapshotSource;
 
     use anybytes::View;
 
@@ -737,7 +738,7 @@ mod tests {
     }
 
     fn read_text(blobs: &mut MemoryBlobStore, handle_raw: RawInline) -> String {
-        let entries: Vec<_> = blobs.reader().unwrap().into_iter().collect();
+        let entries: Vec<_> = blobs.snapshot().unwrap().into_iter().collect();
         let (_, blob) = entries
             .iter()
             .find(|(h, _)| {

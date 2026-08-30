@@ -5,8 +5,11 @@ mod common;
 
 use std::time::Duration;
 
-use triblespace_core::collection::{CollectionMerge, CollectionRecord, CollectionStore};
+use triblespace_core::collection::{
+    CollectionMerge, CollectionRead, CollectionRecord, CollectionStore,
+};
 use triblespace_core::inline::Inline;
+use triblespace_core::repo::SnapshotSource;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_net::inventory::{BlobReconcileMode, ReconcileDirection, ReconcileQos};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
@@ -75,17 +78,24 @@ fn one_store_drain_admits_more_than_the_old_per_leaf_bridge_capacity() {
         for _ in 0..2_000 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
         }
-        assert_eq!(consumer.store().records().unwrap().count(), 0);
+        {
+            let mut store = consumer.store();
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot.records().unwrap().count(), 0);
+        }
 
         // A single drain admits all queued batches and crosses one durability
         // barrier before publishing the replacement local snapshot.
         consumer.refresh();
-        let received = consumer
-            .store()
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let received = {
+            let mut store = consumer.store();
+            let snapshot = store.snapshot().unwrap();
+            snapshot
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
         assert_eq!(received.len(), usize::from(RECORD_COUNT));
         for index in 0..RECORD_COUNT {
             assert!(received.contains(&record(index)));

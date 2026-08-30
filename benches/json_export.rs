@@ -6,13 +6,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::Blob;
-use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::blob::{MemoryBlobStore, MemoryBlobStoreSnapshot};
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
 use triblespace::core::import::json::JsonObjectImporter;
-use triblespace::prelude::{BlobStore, TribleSet};
-
-type Reader = <MemoryBlobStore as BlobStore>::Reader;
+use triblespace::prelude::{SnapshotSource, TribleSet};
 
 struct Fixture {
     name: &'static str,
@@ -24,8 +22,7 @@ struct PreparedFixture {
     payload: String,
     merged: TribleSet,
     root: Id,
-    reader: Reader,
-    _blobs: MemoryBlobStore,
+    snapshot: MemoryBlobStoreSnapshot,
     data_tribles: usize,
     json_bytes: usize,
 }
@@ -72,9 +69,9 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
                 (merged, root, data_tribles)
             };
 
-            let reader = blobs.reader().expect("reader");
+            let snapshot = blobs.snapshot().expect("snapshot");
             let mut json_buf = String::new();
-            export_to_json(&merged, root, &reader, &mut json_buf).expect("export JSON");
+            export_to_json(&merged, root, &snapshot, &mut json_buf).expect("export JSON");
             let json_bytes = json_buf.len();
 
             Some(PreparedFixture {
@@ -82,8 +79,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
                 payload: fixture.payload,
                 merged,
                 root,
-                reader,
-                _blobs: blobs,
+                snapshot,
                 data_tribles,
                 json_bytes,
             })
@@ -100,10 +96,10 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_export", prepared.name),
             prepared,
             |b, prepared| {
-                let reader = prepared.reader.clone();
+                let snapshot = prepared.snapshot.clone();
                 b.iter(|| {
                     let mut buf = String::new();
-                    export_to_json(&prepared.merged, prepared.root, &reader, &mut buf)
+                    export_to_json(&prepared.merged, prepared.root, &snapshot, &mut buf)
                         .expect("export");
                     std::hint::black_box(buf.len());
                 });
@@ -113,10 +109,10 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_export_stream", prepared.name),
             prepared,
             |b, prepared| {
-                let reader = prepared.reader.clone();
+                let snapshot = prepared.snapshot.clone();
                 b.iter(|| {
                     let mut buf = String::new();
-                    export_to_json(&prepared.merged, prepared.root, &reader, &mut buf)
+                    export_to_json(&prepared.merged, prepared.root, &snapshot, &mut buf)
                         .expect("export");
                     std::hint::black_box(buf.len());
                 });
@@ -136,10 +132,10 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_export_to_string", prepared.name),
             prepared,
             |b, prepared| {
-                let reader = prepared.reader.clone();
+                let snapshot = prepared.snapshot.clone();
                 b.iter(|| {
                     let mut buf = String::new();
-                    export_to_json(&prepared.merged, prepared.root, &reader, &mut buf)
+                    export_to_json(&prepared.merged, prepared.root, &snapshot, &mut buf)
                         .expect("export");
                     std::hint::black_box(buf.len());
                 });
@@ -149,10 +145,10 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_export_stream_to_string", prepared.name),
             prepared,
             |b, prepared| {
-                let reader = prepared.reader.clone();
+                let snapshot = prepared.snapshot.clone();
                 b.iter(|| {
                     let mut buf = String::new();
-                    export_to_json(&prepared.merged, prepared.root, &reader, &mut buf)
+                    export_to_json(&prepared.merged, prepared.root, &snapshot, &mut buf)
                         .expect("export");
                     std::hint::black_box(buf.len());
                 });
@@ -245,9 +241,9 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                         merged += fragment.into_facts();
                         (merged, root)
                     };
-                    let reader = blobs.reader().expect("reader");
+                    let snapshot = blobs.snapshot().expect("snapshot");
                     let mut buf = String::new();
-                    export_to_json(&merged, root, &reader, &mut buf).expect("export JSON");
+                    export_to_json(&merged, root, &snapshot, &mut buf).expect("export JSON");
                     std::hint::black_box(buf.len());
                 });
             },
@@ -281,9 +277,9 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                         merged += fragment.into_facts();
                         (merged, root)
                     };
-                    let reader = blobs.reader().expect("reader");
+                    let snapshot = blobs.snapshot().expect("snapshot");
                     let mut buf = String::new();
-                    export_to_json(&merged, root, &reader, &mut buf).expect("export JSON");
+                    export_to_json(&merged, root, &snapshot, &mut buf).expect("export JSON");
                     std::hint::black_box(buf.len());
                 });
             },

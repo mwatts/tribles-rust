@@ -334,7 +334,7 @@ pub fn verify(path: &Path) -> Result<()> {
 
     let collection = results_collection().collection();
     let snapshot = pile
-        .snapshot(collection)
+        .snapshot(collection, &[])
         .map_err(|e| anyhow!("snapshot results collection: {e:?}"))?;
     if snapshot.ticket().is_empty() {
         bail!(
@@ -545,7 +545,7 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         let collection = results_collection().collection();
-        let snapshot = pile.snapshot(collection).unwrap();
+        let snapshot = pile.snapshot(collection, &[]).unwrap();
         // Each run publishes a durable start checkpoint and a final checkpoint.
         assert_eq!(snapshot.ticket().len(), 4);
 
@@ -617,7 +617,7 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         let collection = results_collection().collection();
-        let snapshot = pile.snapshot(collection).unwrap();
+        let snapshot = pile.snapshot(collection, &[]).unwrap();
         assert_eq!(snapshot.ticket().len(), 2);
 
         let facts = snapshot.facts();

@@ -198,7 +198,7 @@ fn find_hnsw_similar_to_on_succinct() {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::{put_embedding, Embedding};
 
@@ -213,8 +213,8 @@ fn find_hnsw_similar_to_on_succinct() {
         handles.push(h);
     }
     let succinct = b.build();
-    let reader = store.reader().unwrap();
-    let succinct_view = succinct.attach(&reader);
+    let snapshot = store.snapshot().unwrap();
+    let succinct_view = succinct.attach(&snapshot);
     let probe = handles[0];
     let floor = 0.4f32;
 

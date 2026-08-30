@@ -700,12 +700,12 @@ const _: () = assert!(
 /// `Inline<Handle<Embedding>>` rows in a
 /// [`View<[[u8; 32]]>`] section of the canonical bytes.
 /// Embeddings live in the pile's blob store, content-addressed
-/// — queries resolve handles through the attached reader at
+/// — queries resolve handles through the attached snapshot at
 /// walk time.
 ///
 /// Built via [`Self::from_naive`]; a direct builder skipping
 /// the naive intermediate is a later optimization. Query the
-/// index by calling [`Self::attach`] with a blob-store reader
+/// index by calling [`Self::attach`] with a blob-store snapshot
 /// and using [`AttachedSuccinctHNSWIndex::similar_to`] /
 /// [`AttachedSuccinctHNSWIndex::cosine_at_least`] inside `find!`.
 ///
@@ -714,7 +714,7 @@ const _: () = assert!(
 /// ```
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
-/// use triblespace_core::repo::BlobStore;
+/// use triblespace_core::repo::SnapshotSource;
 /// use triblespace_core::inline::encodings::hash::{Blake3, Handle};
 /// use triblespace_core::inline::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
@@ -735,8 +735,8 @@ const _: () = assert!(
 /// }
 /// let idx: SuccinctHNSWIndex = b.build();
 ///
-/// let reader = store.reader().unwrap();
-/// let view = idx.attach(&reader);
+/// let snapshot = store.snapshot().unwrap();
+/// let view = idx.attach(&snapshot);
 /// let hits: Vec<_> = find!(
 ///     (n: Inline<Handle<Embedding>>),
 ///     view.similar_to(handles[0], n, 0.8)
@@ -909,12 +909,12 @@ impl SuccinctHNSWIndex {
         self.handles.get(i).map(|raw| Inline::new(*raw))
     }
 
-    /// Attach a blob store to this index, returning a queryable
+    /// Attach a blob-store snapshot to this index, returning a queryable
     /// view. Paired with the typical load flow:
     ///
     /// ```ignore
-    /// let idx: SuccinctHNSWIndex = reader.get(handle)?;
-    /// let view = idx.attach(&reader);
+    /// let idx: SuccinctHNSWIndex = snapshot.get(handle)?;
+    /// let view = idx.attach(&snapshot);
     /// view.candidates_above(from_handle, 0.8)?;
     /// ```
     ///
@@ -1887,7 +1887,7 @@ impl TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
 
     #[test]
     fn empty_roundtrip() {
@@ -2346,7 +2346,6 @@ mod tests {
     fn succinct_hnsw_matches_naive_on_sample() {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
-        use triblespace_core::repo::BlobStore;
 
         // Small deterministic corpus of 4-D vectors. with_seed
         // locks the level sampling so the graph is reproducible.
@@ -2362,7 +2361,7 @@ mod tests {
         }
         let naive = b.build_naive();
         let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
 
         assert_eq!(succinct.doc_count(), naive.doc_count());
         assert_eq!(succinct.dim(), naive.dim());
@@ -2371,8 +2370,8 @@ mod tests {
         // Query from a few probe handles and check the
         // above-threshold set matches exactly between naive and
         // succinct backends.
-        let naive_view = naive.attach(&reader);
-        let succinct_view = succinct.attach(&reader);
+        let naive_view = naive.attach(&snapshot);
+        let succinct_view = succinct.attach(&snapshot);
         let floor = 0.5f32;
         for probe in handles.iter().take(3) {
             let n: std::collections::HashSet<_> = naive_view
@@ -2429,15 +2428,15 @@ mod tests {
 
         // Same probe handle must return identical above-threshold
         // sets on both backends.
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
         let orig_hits: std::collections::HashSet<_> = original
-            .attach(&reader)
+            .attach(&snapshot)
             .candidates_above(handles[0], 0.5)
             .unwrap()
             .into_iter()
             .collect();
         let load_hits: std::collections::HashSet<_> = reloaded
-            .attach(&reader)
+            .attach(&snapshot)
             .candidates_above(handles[0], 0.5)
             .unwrap()
             .into_iter()
@@ -2449,7 +2448,6 @@ mod tests {
     fn succinct_hnsw_empty_round_trip() {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::{Blob, MemoryBlobStore, TryFromBlob};
-        use triblespace_core::repo::BlobStore;
 
         let idx = HNSWBuilder::new(3).build();
         let blob: Blob<SuccinctHNSWBlob> = Blob::new(idx.bytes.clone());
@@ -2459,7 +2457,7 @@ mod tests {
         let mut store: MemoryBlobStore = MemoryBlobStore::new();
         let probe = crate::schemas::put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0]).unwrap();
         assert!(reloaded
-            .attach(&store.reader().unwrap())
+            .attach(&store.snapshot().unwrap())
             .candidates_above(probe, 0.0)
             .unwrap()
             .is_empty());
@@ -2524,14 +2522,13 @@ mod tests {
     fn succinct_hnsw_empty_index() {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
-        use triblespace_core::repo::BlobStore;
 
         let succinct = HNSWBuilder::new(3).build();
         assert_eq!(succinct.doc_count(), 0);
         let mut store: MemoryBlobStore = MemoryBlobStore::new();
         let probe = crate::schemas::put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0]).unwrap();
         assert!(succinct
-            .attach(&store.reader().unwrap())
+            .attach(&store.snapshot().unwrap())
             .candidates_above(probe, 0.0)
             .unwrap()
             .is_empty());

@@ -14,10 +14,12 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use triblespace_core::collection::{
+    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+};
 use triblespace_core::repo::{
     ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, CapabilityProofStore, PeerStore,
-    StorageFlush, StoreRevision, StoreScope, WantRequest, WantStore,
+    SnapshotSource, StorageFlush, StoreRead, StoreScope, WantRequest, WantStore,
 };
 
 use crate::peer::Peer;
@@ -83,10 +85,9 @@ impl Reconciler {
             + StoreScope
             + WantStore
             + StorageFlush
-            + StoreRevision
             + Send
             + 'static,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: StoreRead + BlobStoreMeta,
     {
         let mut stats = ReconcileStats::default();
 
@@ -123,9 +124,20 @@ impl Reconciler {
             .copied()
             .map(CollectionRecordSelector::Operation)
             .collect();
+        let snapshot = match peer.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "store snapshot unavailable; skipping reconcile pass"
+                );
+                stats.missing = operation_wants.len() + blob_wants.len();
+                stats.pending = stats.missing;
+                return stats;
+            }
+        };
         let answered_operations: HashSet<_> = {
-            let mut store = peer.store();
-            match store.select_records(&selectors) {
+            match snapshot.select_records(&selectors) {
                 Ok(records) => records
                     .into_iter()
                     .filter_map(want_request_for_record)
@@ -141,15 +153,6 @@ impl Reconciler {
             .filter(|request| !answered_operations.contains(request))
             .count();
 
-        let reader = match peer.reader() {
-            Ok(reader) => reader,
-            Err(error) => {
-                tracing::warn!(?error, "blob reader unavailable; skipping reconcile pass");
-                stats.missing = missing_operations + blob_wants.len();
-                stats.pending = stats.missing;
-                return stats;
-            }
-        };
         let visible_blobs: HashSet<_> = blob_wants
             .iter()
             .copied()
@@ -157,10 +160,9 @@ impl Reconciler {
                 let WantRequest::Blob { handle } = request else {
                     unreachable!()
                 };
-                reader.get::<Bytes, UnknownBlob>(*handle).is_ok()
+                snapshot.get::<Bytes, UnknownBlob>(*handle).is_ok()
             })
             .collect();
-        drop(reader);
 
         self.durable_blob_answers
             .retain(|request| blob_wants.contains(request) && visible_blobs.contains(request));

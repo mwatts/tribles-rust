@@ -3268,6 +3268,20 @@ where
         self.root.as_ref().map(|root| root.hash())
     }
 
+    /// Whether two snapshots still share the same persistent root allocation.
+    ///
+    /// This is a lineage-local invalidation primitive, not semantic equality
+    /// and not a portable version. Clones share the root; every key or attached
+    /// value mutation copy-on-writes it, even when the key-only fingerprint is
+    /// unchanged by replacing a value.
+    pub(crate) fn shares_root(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.tptr == right.tptr,
+            _ => false,
+        }
+    }
+
     /// Clone the opaque archive-owner receipt without exposing the root Head.
     pub(crate) fn owner_guard(&self) -> PATCHOwnerGuard {
         PATCHOwnerGuard(self.owners.clone())

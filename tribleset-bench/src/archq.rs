@@ -47,20 +47,19 @@ use subject::core::blob::MemoryBlobStore;
 use subject::core::inline::encodings::genid::GenId;
 #[cfg(feature = "protocol-v2")]
 use subject::core::inline::InlineEncoding;
-use subject::core::prelude::BlobStore;
 use subject::core::prelude::TribleSet;
+#[cfg(feature = "frontier")]
+use subject::core::query::Frontier;
+#[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
+use subject::core::query::ProposeCursor;
+use subject::core::query::TriblePattern;
 #[cfg(feature = "protocol-v2")]
 use subject::core::query::{
     Binding, Candidates, Constraint, ProposalBuffer, Term, VariableId, VariableSet,
 };
-#[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
-use subject::core::query::ProposeCursor;
-#[cfg(feature = "frontier")]
-use subject::core::query::Frontier;
-use subject::core::query::TriblePattern;
 
 use crate::queries::{self, Answer};
-use crate::wd_schema::{AnyBlobReader, Dataset};
+use crate::wd_schema::{memory_blob_snapshot, AnyBlobReader, Dataset};
 
 /// The live-candidate count at or above which `triblespace-gpu` routes
 /// a confirm region to the device.
@@ -172,13 +171,13 @@ pub fn answer_count(answer: &Answer) -> usize {
 /// over an empty in-memory store so nothing can silently resolve.
 pub fn shell<B>(facts: B) -> Dataset<B> {
     let mut store = MemoryBlobStore::default();
-    let reader = store.reader().expect("memory blob store reader");
+    let snapshot = memory_blob_snapshot(&mut store);
     Dataset {
         facts,
         paths: TribleSet::new(),
-        reader: AnyBlobReader::Memory(reader.clone()),
+        reader: AnyBlobReader::Memory(snapshot.clone()),
         meta: TribleSet::new(),
-        meta_reader: AnyBlobReader::Memory(reader),
+        meta_reader: AnyBlobReader::Memory(snapshot),
         triples: 0,
         tribles: 0,
     }

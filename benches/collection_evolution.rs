@@ -57,11 +57,11 @@ use triblespace_core::collection::succinctarchive_union::{
 };
 use triblespace_core::collection::{
     simplearchive_union, Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
-    CollectionRecord, CollectionStore, CollectionStoreExt, Cover, CoverAttachment,
+    CollectionRead, CollectionRecord, CollectionStoreExt, Cover,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
-use triblespace_core::repo::{ArtifactOfferStore, BlobStore, BlobStoreList, StoreRevision};
+use triblespace_core::repo::{ArtifactOfferStore, BlobStoreGet, BlobStoreList};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MappingCalls {
@@ -162,7 +162,8 @@ struct Collections {
 
 fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape {
     let mut shape = StoreShape::default();
-    for record in store.records().expect("enumerate collection records") {
+    let snapshot = store.snapshot().expect("freeze MemoryRepo snapshot");
+    for record in snapshot.records().expect("enumerate collection records") {
         match record.expect("MemoryRepo collection records are infallible") {
             CollectionRecord::Commit(commit) if commit.collection() == collections.source => {
                 shape.commits += 1;
@@ -186,8 +187,7 @@ fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape 
         }
     }
 
-    let reader = store.reader().expect("snapshot MemoryRepo blobs");
-    for info in reader.blobs() {
+    for info in snapshot.blobs() {
         let info = info.expect("MemoryRepo blob listing is infallible");
         shape.blobs += 1;
         shape.blob_bytes += info.length;
@@ -227,11 +227,16 @@ struct CoverIdentity {
     hash: [u8; 32],
 }
 
-fn cover_identity(cover: &CoverAttachment<SuccinctArchiveBlob>) -> CoverIdentity {
+fn cover_identity<S>(snapshot: &S, cover: &Cover<SuccinctArchiveBlob>) -> CoverIdentity
+where
+    S: BlobStoreGet,
+{
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0u64;
-    for (data, blob) in cover.members() {
-        hasher.update(&data.raw);
+    for handle in cover.members() {
+        hasher.update(&handle.raw);
+        let blob: Blob<SuccinctArchiveBlob> =
+            snapshot.get(handle).expect("load exact raw cover member");
         bytes += blob.bytes.len() as u64;
     }
     CoverIdentity {
@@ -352,8 +357,8 @@ fn diagnose_raw(
     // by this arm. The public accelerated phase remains represented by timing
     // and its ordinary DERIVE/MERGE/blob delta.
     let diagnostic_before = store
-        .store_revision()
-        .expect("snapshot pre-diagnostic store revision");
+        .snapshot()
+        .expect("freeze pre-diagnostic store snapshot");
     let offers_before = store
         .offers_snapshot()
         .expect("snapshot pre-diagnostic artifact offers");
@@ -362,12 +367,14 @@ fn diagnose_raw(
         .ensure_exact(store, cover)
         .expect("diagnose complete raw exact cover");
     let projection_calls = mapping_calls();
-    let cover = cover_identity(&raw_cover);
     let diagnostic_after = store
-        .store_revision()
-        .expect("snapshot post-diagnostic store revision");
+        .snapshot()
+        .expect("freeze post-diagnostic store snapshot");
+    let cover = cover_identity(&diagnostic_after, &raw_cover);
     assert!(
-        diagnostic_after == diagnostic_before,
+        diagnostic_after
+            .changes_since(&diagnostic_before)
+            .is_empty(),
         "post-operation raw mapping diagnostic wrote sync-visible storage"
     );
     assert_eq!(
@@ -414,9 +421,9 @@ fn run_warm_pair(
         Operation::Compact => (Arm::CompactWarm, Arm::CompactNoop),
     };
     let timed_warm = time_operation(operation, store, context.cover, context.succinct);
-    let revision_after_warm = store
-        .store_revision()
-        .expect("snapshot revision between warm and no-op calls");
+    let snapshot_after_warm = store
+        .snapshot()
+        .expect("freeze snapshot between warm and no-op calls");
     let offers_after_warm = store
         .offers_snapshot()
         .expect("snapshot offers between warm and no-op calls");
@@ -424,14 +431,14 @@ fn run_warm_pair(
     // Keep these public calls adjacent. In particular, do not materialize the
     // first result or replay the exact proof before timing the unchanged call.
     let timed_noop = time_operation(operation, store, context.cover, context.succinct);
-    let revision_after_noop = store
-        .store_revision()
-        .expect("snapshot revision after no-op call");
+    let snapshot_after_noop = store.snapshot().expect("freeze snapshot after no-op call");
     let offers_after_noop = store
         .offers_snapshot()
         .expect("snapshot offers after no-op call");
     assert!(
-        revision_after_noop == revision_after_warm,
+        snapshot_after_noop
+            .changes_since(&snapshot_after_warm)
+            .is_empty(),
         "an unchanged public operation changed sync-visible storage"
     );
     assert_eq!(
@@ -550,9 +557,9 @@ fn run_exact_view_pair(
         context.cover.len(),
         "view support accounting must cover the exact payload set",
     );
-    let revision_after_advance = store
-        .store_revision()
-        .expect("snapshot revision between view advance and no-op");
+    let snapshot_after_advance = store
+        .snapshot()
+        .expect("freeze snapshot between view advance and no-op");
     let offers_after_advance = store
         .offers_snapshot()
         .expect("snapshot offers between view advance and no-op");
@@ -573,9 +580,10 @@ fn run_exact_view_pair(
     );
     assert!(
         store
-            .store_revision()
-            .expect("snapshot revision after view no-op")
-            == revision_after_advance,
+            .snapshot()
+            .expect("freeze snapshot after view no-op")
+            .changes_since(&snapshot_after_advance)
+            .is_empty(),
         "an unchanged exact view changed sync-visible storage",
     );
     assert_eq!(
@@ -737,8 +745,11 @@ fn run_iteration(
         }
         published = checkpoint;
 
-        let cover = source_accounting
-            .cover(source)
+        let source_snapshot = source_accounting
+            .snapshot()
+            .expect("freeze accounting source snapshot");
+        let cover = source
+            .admitted(&source_snapshot)
             .expect("freeze accounting source cover");
         assert_eq!(cover.len(), checkpoint);
         let source_shape = store_shape(&mut source_accounting, &collections);

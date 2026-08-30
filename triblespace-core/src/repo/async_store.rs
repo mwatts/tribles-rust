@@ -1,6 +1,6 @@
 //! Async store traits — the honest contract for *remote* backends.
 //!
-//! The sync [`BlobStore`] family is the right
+//! The sync [`crate::repo::BlobStore`] family is the right
 //! contract for *local* backends: `MemoryBlobStore` and a
 //! `Pile`-over-mmap are genuinely synchronous, and a sync `get` that
 //! returns a `Result` is the truth. But genuinely *remote* backends —
@@ -21,21 +21,21 @@
 //!   zero-await futures — so an async consumer can read a local store
 //!   for free, with no runtime and no blocking (the futures resolve on
 //!   first poll).
-//! - the inverse (an async store behind a single `block_on` boundary)
-//!   is `Blocking`, landing in a later increment so the scattered
-//!   `block_on`s in `ObjectStore` collapse into one place.
+//! - [`Blocking`](crate::repo::async_store::Blocking) lowers an async store
+//!   behind one `block_on` boundary, so remote backends do not carry private
+//!   runtimes or scatter blocking calls through their implementations.
 
 use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
 
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use crate::collection::{CollectionRecord, CollectionStore};
+use crate::collection::{CollectionRead, CollectionRecord, CollectionStore};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
-    BlobInfo, BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
-    BlobStorePut,
+    BlobInfo, BlobMetadata, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
+    BlobStorePut, SnapshotSource, StoreChanges, StoreSnapshot,
 };
 // Only used by the `object-store`-gated `Blocking` impls below.
 #[cfg(feature = "object-store")]
@@ -46,7 +46,11 @@ use crate::repo::{BlobChildren, StorageClose};
 /// `get` returns a `Send` future so it can be driven on a multi-thread
 /// runtime. The output `T` need not be `Send` — it is produced at
 /// completion, not held across an await — so this mirrors the sync
-/// signature's bounds exactly.
+/// signature's bounds exactly. For a remote or lazy snapshot, explicit
+/// handle retrieval may remain a live operational capability: it may fetch or
+/// wait for immutable content-addressed bytes which were absent from the
+/// snapshot's frozen membership. That does not add the handle to the frozen
+/// listing or alter the snapshot's semantic record observation.
 pub trait AsyncBlobStoreGet {
     /// Error type for get operations, parameterised by the
     /// deserialization error (mirrors the sync GAT).
@@ -108,45 +112,55 @@ pub trait AsyncBlobStoreList {
     fn blobs(&self) -> impl Future<Output = Vec<Result<BlobInfo, Self::Err>>> + Send;
 }
 
-/// Async counterpart of [`BlobStore`]: combined
-/// read/write with a shareable reader snapshot.
-pub trait AsyncBlobStore: AsyncBlobStorePut {
-    /// A clonable async reader handle for concurrent blob lookups.
-    /// Mirrors the sync `Reader` bound (so it can round-trip through a
-    /// `Blocking` adapter into a full sync `BlobStore::Reader`).
-    type Reader: AsyncBlobStoreGet
-        + AsyncBlobStoreList
-        + Clone
-        + Send
-        + Sync
-        + PartialEq
-        + Eq
-        + 'static;
-    /// Error type for creating a reader.
-    type ReaderError: Error + Send + Sync + 'static;
+/// Async counterpart of [`SnapshotSource`].
+///
+/// The snapshot value uses the same [`StoreSnapshot`] change contract as a
+/// synchronous backend; only freezing it may require asynchronous I/O. Its
+/// semantic records and listings are immutable even when an
+/// [`AsyncBlobStoreGet`] capability can acquire explicitly addressed bytes.
+pub trait AsyncSnapshotSource {
+    /// Immutable observation returned by this store.
+    type Snapshot: StoreSnapshot;
+    /// Failure while refreshing and freezing an observation.
+    type SnapshotError: Error + Debug + Send + Sync + 'static;
 
-    /// Create a shareable reader snapshot of the current store state.
-    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
+    /// Reobserve external changes and freeze the resulting prefix once.
+    fn snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send;
 }
 
-/// Async counterpart of [`CollectionStore`].
-///
-/// A remote enumeration is an observed monotone view, not a coherent snapshot:
-/// records appended concurrently may appear on this call or a later one. Every
-/// returned vector is nevertheless ordered deterministically by intrinsic
-/// record id by the implementation.
-pub trait AsyncCollectionStore {
+/// Async combined blob storage whose reads come from one shared snapshot.
+pub trait AsyncBlobStore:
+    AsyncBlobStorePut + AsyncSnapshotSource<Snapshot: AsyncBlobStoreGet + AsyncBlobStoreList>
+{
+}
+
+impl<S> AsyncBlobStore for S
+where
+    S: AsyncBlobStorePut + AsyncSnapshotSource,
+    S::Snapshot: AsyncBlobStoreGet + AsyncBlobStoreList,
+{
+}
+
+/// Async immutable read surface for one frozen collection-record observation.
+pub trait AsyncCollectionRead {
     /// Failure while enumerating stored records.
     type RecordsError: Error + Debug + Send + Sync + 'static;
+
+    /// Return every record in deterministic intrinsic-id order.
+    fn records(
+        &self,
+    ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send;
+}
+
+/// Async counterpart of the insert-only [`CollectionStore`].
+///
+/// Read access belongs to the immutable snapshot returned by
+/// [`AsyncSnapshotSource`].
+pub trait AsyncCollectionStore {
     /// Failure while admitting one canonical record.
     type InsertError: Error + Debug + Send + Sync + 'static;
-
-    /// Enumerate the collection records currently observed by the backend.
-    fn records(
-        &mut self,
-    ) -> impl Future<
-        Output = Result<Vec<Result<CollectionRecord, Self::RecordsError>>, Self::RecordsError>,
-    > + Send;
 
     /// Insert one immutable canonical record.
     ///
@@ -209,6 +223,15 @@ impl<S> SyncAsAsync<S> {
     /// Unwrap back to the sync store.
     pub fn into_inner(self) -> S {
         self.0
+    }
+}
+
+impl<S> StoreSnapshot for SyncAsAsync<S>
+where
+    S: StoreSnapshot,
+{
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        self.0.changes_since(&previous.0)
     }
 }
 
@@ -280,16 +303,30 @@ where
     }
 }
 
-impl<S> AsyncBlobStore for SyncAsAsync<S>
+impl<S> AsyncSnapshotSource for SyncAsAsync<S>
 where
-    S: BlobStore + Send + Sync,
-    S::Reader: Sync,
+    S: SnapshotSource + Send,
 {
-    type Reader = SyncAsAsync<S::Reader>;
-    type ReaderError = S::ReaderError;
+    type Snapshot = SyncAsAsync<S::Snapshot>;
+    type SnapshotError = S::SnapshotError;
 
-    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
-        async move { self.0.reader().map(SyncAsAsync) }
+    fn snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
+        async move { self.0.snapshot().map(SyncAsAsync) }
+    }
+}
+
+impl<S> AsyncCollectionRead for SyncAsAsync<S>
+where
+    S: CollectionRead + Sync,
+{
+    type RecordsError = S::RecordsError;
+
+    fn records(
+        &self,
+    ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send {
+        async move { self.0.records()?.collect() }
     }
 }
 
@@ -297,16 +334,7 @@ impl<S> AsyncCollectionStore for SyncAsAsync<S>
 where
     S: CollectionStore + Send,
 {
-    type RecordsError = S::RecordsError;
     type InsertError = S::InsertError;
-
-    fn records(
-        &mut self,
-    ) -> impl Future<
-        Output = Result<Vec<Result<CollectionRecord, Self::RecordsError>>, Self::RecordsError>,
-    > + Send {
-        async move { self.0.records().map(Iterator::collect) }
-    }
 
     fn insert(
         &mut self,
@@ -395,18 +423,15 @@ impl<A: std::fmt::Debug> std::fmt::Debug for Blocking<A> {
     }
 }
 
-// Identity ignores the runtime: two blocking wrappers are equal iff
-// their inner snapshots are. The runtime is a driver, not part of the
-// store's value. (Required so `Blocking<Reader>` satisfies the sync
-// `BlobStore::Reader: PartialEq + Eq` bound.)
 #[cfg(feature = "object-store")]
-impl<A: PartialEq> PartialEq for Blocking<A> {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner
+impl<A> StoreSnapshot for Blocking<A>
+where
+    A: StoreSnapshot,
+{
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        self.inner.changes_since(&previous.inner)
     }
 }
-#[cfg(feature = "object-store")]
-impl<A: Eq> Eq for Blocking<A> {}
 
 #[cfg(feature = "object-store")]
 impl<A> Blocking<A> {
@@ -433,6 +458,23 @@ impl<A> Blocking<A> {
     /// Unwrap back to the async store.
     pub fn into_inner(self) -> A {
         self.inner
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A> SnapshotSource for Blocking<A>
+where
+    A: AsyncSnapshotSource,
+{
+    type Snapshot = Blocking<A::Snapshot>;
+    type SnapshotError = A::SnapshotError;
+
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let snapshot = self.rt.block_on(self.inner.snapshot())?;
+        Ok(Blocking {
+            inner: snapshot,
+            rt: self.rt.clone(),
+        })
     }
 }
 
@@ -481,31 +523,23 @@ impl<A: AsyncBlobStorePut> BlobStorePut for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
-impl<A: AsyncBlobStore> BlobStore for Blocking<A> {
-    type Reader = Blocking<A::Reader>;
-    type ReaderError = A::ReaderError;
-
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        let reader = self.rt.block_on(self.inner.reader())?;
-        Ok(Blocking {
-            inner: reader,
-            rt: self.rt.clone(),
-        })
-    }
-}
-
-#[cfg(feature = "object-store")]
-impl<A: AsyncCollectionStore> CollectionStore for Blocking<A> {
+impl<A: AsyncCollectionRead> CollectionRead for Blocking<A> {
     type RecordsError = A::RecordsError;
-    type InsertError = A::InsertError;
     type RecordIter<'a>
         = std::vec::IntoIter<Result<CollectionRecord, A::RecordsError>>
     where
         A: 'a;
 
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.rt.block_on(self.inner.records()).map(Vec::into_iter)
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.rt
+            .block_on(self.inner.records())
+            .map(|records| records.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
     }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncCollectionStore> CollectionStore for Blocking<A> {
+    type InsertError = A::InsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.rt.block_on(self.inner.insert(record))
@@ -541,9 +575,8 @@ impl<A: AsyncBlobStoreForget> BlobStoreForget for Blocking<A> {
     }
 }
 
-// The conservative reference scan rides the (sync) `BlobStoreGet` that
-// Blocking already provides, so any Blocking reader gets `children` for
-// free via the default scan-and-check.
+// The conservative reference scan rides the sync `BlobStoreGet` delegation,
+// so a blocking snapshot gets `children` via the default scan-and-check.
 #[cfg(feature = "object-store")]
 impl<A: AsyncBlobStoreGet> BlobChildren for Blocking<A> {}
 
@@ -614,17 +647,17 @@ mod tests {
         let b = blob(1);
 
         let handle = block_on(store.put::<SimpleArchive, _>(b.clone())).unwrap();
-        let reader = block_on(store.reader()).unwrap();
-        let got: Blob<SimpleArchive> = block_on(reader.get(handle)).unwrap();
+        let snapshot = block_on(store.snapshot()).unwrap();
+        let got: Blob<SimpleArchive> = block_on(snapshot.get(handle)).unwrap();
         assert_eq!(got.bytes, b.bytes);
     }
 
     #[test]
     fn missing_blob_is_an_error_not_a_hang() {
         let mut store = SyncAsAsync::new(MemoryBlobStore::new());
-        let reader = block_on(store.reader()).unwrap();
+        let snapshot = block_on(store.snapshot()).unwrap();
         let missing = blob(9).get_handle();
-        let got = block_on(reader.get::<Blob<SimpleArchive>, SimpleArchive>(missing));
+        let got = block_on(snapshot.get::<Blob<SimpleArchive>, SimpleArchive>(missing));
         assert!(got.is_err(), "absent blob resolves to Err, immediately");
     }
 
@@ -633,8 +666,8 @@ mod tests {
         let mut store = SyncAsAsync::new(MemoryBlobStore::new());
         let h1 = block_on(store.put::<SimpleArchive, _>(blob(1))).unwrap();
         let h2 = block_on(store.put::<SimpleArchive, _>(blob(2))).unwrap();
-        let reader = block_on(store.reader()).unwrap();
-        let listed: Vec<_> = block_on(reader.blobs())
+        let snapshot = block_on(store.snapshot()).unwrap();
+        let listed: Vec<_> = block_on(snapshot.blobs())
             .into_iter()
             .filter_map(Result::ok)
             .map(|info| info.handle.raw)
@@ -652,11 +685,8 @@ mod tests {
         block_on(AsyncCollectionStore::insert(&mut store, first)).unwrap();
         block_on(AsyncCollectionStore::insert(&mut store, second)).unwrap();
 
-        let actual = block_on(AsyncCollectionStore::records(&mut store))
-            .unwrap()
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let snapshot = block_on(store.snapshot()).unwrap();
+        let actual = block_on(AsyncCollectionRead::records(&snapshot)).unwrap();
         let mut expected = vec![first, second];
         expected.sort_unstable_by_key(CollectionRecord::id);
         assert_eq!(actual, expected);
@@ -669,7 +699,8 @@ mod tests {
         let record = collection_record(13);
 
         CollectionStore::insert(&mut store, record).unwrap();
-        let actual = CollectionStore::records(&mut store)
+        let snapshot = SnapshotSource::snapshot(&mut store).unwrap();
+        let actual = CollectionRead::records(&snapshot)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -683,16 +714,16 @@ mod tests {
     #[cfg(feature = "object-store")]
     #[test]
     fn blocking_over_async_roundtrips_as_a_sync_store() {
-        use crate::repo::{BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut};
+        use crate::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource};
 
         let mut store = Blocking::new(SyncAsAsync::new(MemoryBlobStore::new())).unwrap();
         let b = blob(5);
         // Pure sync calls — no `.await`, no visible runtime.
         let h = store.put::<SimpleArchive, _>(b.clone()).unwrap();
-        let reader = store.reader().unwrap();
-        let got: Blob<SimpleArchive> = reader.get(h).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let got: Blob<SimpleArchive> = snapshot.get(h).unwrap();
         assert_eq!(got.bytes, b.bytes);
-        let listed: Vec<_> = reader
+        let listed: Vec<_> = snapshot
             .blobs()
             .filter_map(Result::ok)
             .map(|info| info.handle.raw)
@@ -707,6 +738,6 @@ mod tests {
     #[allow(dead_code)]
     fn _send_proof(store: &mut SyncAsAsync<MemoryBlobStore>) {
         _assert_send(store.put::<SimpleArchive, _>(blob(2)));
-        _assert_send(store.reader());
+        _assert_send(store.snapshot());
     }
 }

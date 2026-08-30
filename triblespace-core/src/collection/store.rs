@@ -2,9 +2,8 @@
 //!
 //! A collection store is a grow-only set keyed by each record's intrinsic id.
 //! It deliberately exposes no mutable head, deletion, compare-and-swap, or
-//! point-in-time snapshot contract. Backends may discover additional records
-//! between calls; each individual enumeration is required only to be
-//! deterministic for the records it returns.
+//! read-through-writer path. A [`CollectionRead`] implementation belongs to an
+//! immutable store snapshot, while [`CollectionStore`] only admits new records.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -84,33 +83,28 @@ pub(crate) fn selectors_match_record(
     }
 }
 
-/// Storage surface for canonical collection-calculus records.
+/// Immutable read surface for canonical collection-calculus records.
 ///
-/// Inserting the same intrinsic record id more than once is an idempotent
-/// success. Records are never replaced through this interface. Implementations
-/// enumerate their currently known records in deterministic intrinsic-id
-/// order, without promising that the enumeration is a globally coherent
-/// snapshot of a concurrently changing or distributed backend.
-pub trait CollectionStore {
+/// Implementations enumerate one coherent store snapshot in deterministic
+/// intrinsic-id order. Mutation lives on [`CollectionStore`], so admission and
+/// physical-cover resolution cannot accidentally observe different prefixes.
+pub trait CollectionRead {
     /// Failure while enumerating stored records.
     type RecordsError: Error + Debug + Send + Sync + 'static;
-    /// Failure while admitting one canonical record.
-    type InsertError: Error + Debug + Send + Sync + 'static;
-
     /// Borrowing iterator over one deterministic view of known records.
     type RecordIter<'a>: Iterator<Item = Result<CollectionRecord, Self::RecordsError>>
     where
         Self: 'a;
 
     /// Enumerate currently known records in deterministic intrinsic-id order.
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError>;
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError>;
 
     /// Look up one record by its intrinsic content-derived id.
     ///
     /// The default implementation scans the deterministic record view once
     /// and stops as soon as it reaches or passes `id`. Backends with a keyed
     /// primary index should override this method.
-    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
         for record in self.records()? {
             let record = record?;
             match record.id().cmp(&id) {
@@ -130,7 +124,7 @@ pub trait CollectionStore {
     /// records remain deduplicated and sorted by intrinsic id. An empty union
     /// returns immediately without asking the backend for a view.
     fn select_records(
-        &mut self,
+        &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         if selectors.is_empty() {
@@ -146,6 +140,42 @@ pub trait CollectionStore {
         }
         Ok(selected)
     }
+}
+
+impl<R> CollectionRead for &R
+where
+    R: CollectionRead + ?Sized,
+{
+    type RecordsError = R::RecordsError;
+    type RecordIter<'a>
+        = R::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        (**self).records()
+    }
+
+    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        (**self).record(id)
+    }
+
+    fn select_records(
+        &self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        (**self).select_records(selectors)
+    }
+}
+
+/// Grow-only write surface for canonical collection-calculus records.
+///
+/// Inserting the same intrinsic record id more than once is an idempotent
+/// success. Records are never replaced through this interface. Read access is
+/// deliberately obtained from the store's immutable snapshot instead.
+pub trait CollectionStore {
+    /// Failure while admitting one canonical record.
+    type InsertError: Error + Debug + Send + Sync + 'static;
 
     /// Insert one canonical record.
     ///
@@ -158,27 +188,7 @@ impl<S> CollectionStore for &mut S
 where
     S: CollectionStore + ?Sized,
 {
-    type RecordsError = S::RecordsError;
     type InsertError = S::InsertError;
-    type RecordIter<'a>
-        = S::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        (**self).records()
-    }
-
-    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        (**self).record(id)
-    }
-
-    fn select_records(
-        &mut self,
-        selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-        (**self).select_records(selectors)
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         (**self).insert(record)
@@ -187,6 +197,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::convert::Infallible;
 
     use ed25519_dalek::SigningKey;
@@ -231,16 +242,15 @@ mod tests {
     #[derive(Default)]
     struct FallbackStore {
         records: Vec<CollectionRecord>,
-        enumerations: usize,
+        enumerations: Cell<usize>,
     }
 
-    impl CollectionStore for FallbackStore {
+    impl CollectionRead for FallbackStore {
         type RecordsError = Infallible;
-        type InsertError = Infallible;
         type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
 
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            self.enumerations += 1;
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            self.enumerations.set(self.enumerations.get() + 1);
             Ok(self
                 .records
                 .iter()
@@ -249,6 +259,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into_iter())
         }
+    }
+
+    impl CollectionStore for FallbackStore {
+        type InsertError = Infallible;
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.records.push(record);
@@ -287,7 +301,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let mut store = FallbackStore {
+        let store = FallbackStore {
             records: records.clone(),
             ..FallbackStore::default()
         };
@@ -306,7 +320,7 @@ mod tests {
             .collect();
         expected.sort_unstable_by_key(CollectionRecord::id);
         assert_eq!(selected, expected);
-        assert_eq!(store.enumerations, 1);
+        assert_eq!(store.enumerations.get(), 1);
         assert_eq!(
             selected
                 .iter()
@@ -321,15 +335,15 @@ mod tests {
     fn default_point_lookup_scans_one_ordered_view() {
         let records = fixture();
         let expected = records[records.len() / 2];
-        let mut store = FallbackStore {
+        let store = FallbackStore {
             records,
             ..FallbackStore::default()
         };
 
         assert_eq!(store.record(expected.id()).unwrap(), Some(expected));
-        assert_eq!(store.enumerations, 1);
+        assert_eq!(store.enumerations.get(), 1);
         assert_eq!(store.record(Id::new([0xff; 16]).unwrap()).unwrap(), None);
-        assert_eq!(store.enumerations, 2);
+        assert_eq!(store.enumerations.get(), 2);
     }
 
     #[test]
@@ -339,7 +353,7 @@ mod tests {
         let pair = [CollectionRecordSelector::DeriveTarget(target)]
             .into_iter()
             .collect();
-        let mut store = FallbackStore {
+        let store = FallbackStore {
             records,
             ..FallbackStore::default()
         };
@@ -355,38 +369,41 @@ mod tests {
 
     #[test]
     fn empty_selection_returns_without_enumeration() {
-        let mut store = FallbackStore {
+        let store = FallbackStore {
             records: fixture(),
             ..FallbackStore::default()
         };
 
         assert!(store.select_records(&BTreeSet::new()).unwrap().is_empty());
-        assert_eq!(store.enumerations, 0);
+        assert_eq!(store.enumerations.get(), 0);
     }
 
     #[derive(Default)]
     struct OverrideStore {
-        records_calls: usize,
-        selection_calls: usize,
+        records_calls: Cell<usize>,
+        selection_calls: Cell<usize>,
     }
 
-    impl CollectionStore for OverrideStore {
+    impl CollectionRead for OverrideStore {
         type RecordsError = Infallible;
-        type InsertError = Infallible;
         type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
 
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            self.records_calls += 1;
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            self.records_calls.set(self.records_calls.get() + 1);
             Ok(Vec::new().into_iter())
         }
 
         fn select_records(
-            &mut self,
+            &self,
             _selectors: &BTreeSet<CollectionRecordSelector>,
         ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-            self.selection_calls += 1;
+            self.selection_calls.set(self.selection_calls.get() + 1);
             Ok(Vec::new())
         }
+    }
+
+    impl CollectionStore for OverrideStore {
+        type InsertError = Infallible;
 
         fn insert(&mut self, _record: CollectionRecord) -> Result<(), Self::InsertError> {
             Ok(())
@@ -394,14 +411,14 @@ mod tests {
     }
 
     #[test]
-    fn mutable_reference_forwards_selection_override() {
-        let mut store = OverrideStore::default();
-        let mut borrowed = &mut store;
+    fn shared_reference_forwards_selection_override() {
+        let store = OverrideStore::default();
+        let borrowed = &store;
         let selectors = [CollectionRecordSelector::Id(Id::new([1; 16]).unwrap())]
             .into_iter()
             .collect();
-        CollectionStore::select_records(&mut borrowed, &selectors).unwrap();
-        assert_eq!(store.selection_calls, 1);
-        assert_eq!(store.records_calls, 0);
+        CollectionRead::select_records(&borrowed, &selectors).unwrap();
+        assert_eq!(store.selection_calls.get(), 1);
+        assert_eq!(store.records_calls.get(), 0);
     }
 }

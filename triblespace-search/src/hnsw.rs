@@ -15,7 +15,7 @@
 //!
 //! ```
 //! # use triblespace_core::blob::MemoryBlobStore;
-//! # use triblespace_core::repo::BlobStore;
+//! # use triblespace_core::repo::SnapshotSource;
 //! # use triblespace_core::inline::encodings::hash::Blake3;
 //! # use triblespace_search::hnsw::FlatBuilder;
 //! # use triblespace_search::schemas::put_embedding;
@@ -32,8 +32,8 @@
 //!
 //! // Fixed-probe retrieval is explicit; exact pair filtering lives in the
 //! // separate `cosine_at_least(a, b, floor)` predicate.
-//! let reader = store.reader().unwrap();
-//! let view = idx.attach(&reader);
+//! let snapshot = store.snapshot().unwrap();
+//! let view = idx.attach(&snapshot);
 //! let hits = view.candidates_above(h1, 0.8).unwrap();
 //! assert!(hits.contains(&h1));
 //! assert!(hits.contains(&h3));
@@ -1160,7 +1160,7 @@ mod tests {
     use super::*;
 
     use triblespace_core::blob::MemoryBlobStore;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
 
     #[test]
     fn true_cosine_handles_extreme_f32_magnitudes() {
@@ -1192,10 +1192,9 @@ mod tests {
         (b.build(), store, handles)
     }
 
-    /// Stable reader from an existing store — the writer must
-    /// live for the reader to remain valid.
-    fn reader_of(store: &mut MemoryBlobStore) -> <MemoryBlobStore as BlobStore>::Reader {
-        store.reader().unwrap()
+    /// Freeze one stable snapshot of an existing store.
+    fn snapshot_of(store: &mut MemoryBlobStore) -> <MemoryBlobStore as SnapshotSource>::Snapshot {
+        store.snapshot().unwrap()
     }
 
     #[test]
@@ -1209,7 +1208,7 @@ mod tests {
             ],
         );
         let hits = idx
-            .attach(&reader_of(&mut store))
+            .attach(&snapshot_of(&mut store))
             .candidates_above(handles[0], 0.999)
             .unwrap();
         assert_eq!(hits, vec![handles[0]]);
@@ -1220,7 +1219,7 @@ mod tests {
         let (idx, mut store, handles) =
             build_flat(2, &[vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]]);
         let got: std::collections::HashSet<_> = idx
-            .attach(&reader_of(&mut store))
+            .attach(&snapshot_of(&mut store))
             .candidates_above(handles[0], 0.8)
             .unwrap()
             .into_iter()
@@ -1243,9 +1242,9 @@ mod tests {
         let mut store = MemoryBlobStore::new();
         let idx = FlatBuilder::new(4).build();
         let probe = put_emb(&mut store, vec![1.0, 0.0, 0.0, 0.0]);
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
         assert!(idx
-            .attach(&reader)
+            .attach(&snapshot)
             .candidates_above(probe, 0.0)
             .unwrap()
             .is_empty());
@@ -1298,9 +1297,9 @@ mod tests {
         let idx = HNSWBuilder::new(4).build();
         assert_eq!(idx.doc_count(), 0);
         let probe = put_emb(&mut store, vec![1.0, 0.0, 0.0, 0.0]);
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
         assert!(idx
-            .attach(&reader)
+            .attach(&snapshot)
             .candidates_above(probe, 0.0)
             .unwrap()
             .is_empty());
@@ -1310,7 +1309,7 @@ mod tests {
     fn hnsw_single_doc_returns_itself() {
         let (idx, mut store, handles) = build_hnsw(3, 42, &[vec![1.0, 0.0, 0.0]]);
         let hits = idx
-            .attach(&reader_of(&mut store))
+            .attach(&snapshot_of(&mut store))
             .candidates_above(handles[0], 0.999)
             .unwrap();
         assert_eq!(hits, vec![handles[0]]);
@@ -1321,7 +1320,7 @@ mod tests {
         let (idx, mut store, handles) =
             build_hnsw(2, 42, &[vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]]);
         let got: std::collections::HashSet<_> = idx
-            .attach(&reader_of(&mut store))
+            .attach(&snapshot_of(&mut store))
             .candidates_above(handles[0], 0.8)
             .unwrap()
             .into_iter()
@@ -1359,10 +1358,10 @@ mod tests {
         let (hnsw, mut hstore, hhandles) = build_hnsw(dim, 42, &vecs);
         // Handles must agree (same content → same Blake3 hash).
         assert_eq!(fhandles, hhandles);
-        let freader = fstore.reader().unwrap();
-        let hreader = hstore.reader().unwrap();
-        let hnsw_view = hnsw.attach(&hreader).with_ef_search(50);
-        let flat_view = flat.attach(&freader);
+        let fsnapshot = fstore.snapshot().unwrap();
+        let hsnapshot = hstore.snapshot().unwrap();
+        let hnsw_view = hnsw.attach(&hsnapshot).with_ef_search(50);
+        let flat_view = flat.attach(&fsnapshot);
 
         let floor = 0.6;
         let mut total_hits = 0usize;
@@ -1403,11 +1402,11 @@ mod tests {
         assert_eq!(a.max_level(), b.max_level());
         assert_eq!(a_handles, b_handles);
         let ra = a
-            .attach(&a_store.reader().unwrap())
+            .attach(&a_store.snapshot().unwrap())
             .candidates_above(a_handles[0], 0.5)
             .unwrap();
         let rb = b
-            .attach(&b_store.reader().unwrap())
+            .attach(&b_store.snapshot().unwrap())
             .candidates_above(b_handles[0], 0.5)
             .unwrap();
         assert_eq!(ra, rb);

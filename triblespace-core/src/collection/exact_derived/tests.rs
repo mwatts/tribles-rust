@@ -17,13 +17,16 @@ use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
 use crate::collection::simplearchive_union;
-use crate::collection::{CollectionCommit, CollectionStoreExt};
+use crate::collection::{CollectionCommit, CollectionRead, CollectionStoreExt};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::metadata::MetaDescribe;
-use crate::repo::memoryrepo::MemoryRepo;
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut};
+use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
+use crate::repo::{
+    BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, SnapshotSource, StoreChanges,
+    StoreSnapshot,
+};
 use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 macro_rules! inert_test_offers {
@@ -595,15 +598,18 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
 
     let attached = exact.ensure_exact(&mut store, &cover).unwrap();
     assert_eq!(attached.len(), 1);
-    assert_eq!(attached.members()[0].1.bytes.as_ref(), expected.as_bytes());
+    let snapshot = store.snapshot().unwrap();
+    let attached_blob: Blob<AttachedTextBlob> =
+        snapshot.get(attached.members().next().unwrap()).unwrap();
+    assert_eq!(attached_blob.bytes.as_ref(), expected.as_bytes());
 
     // A second read-only pass forward-validates the resident DERIVE through
     // the same attachment lookup rather than trusting its output handle.
     let reattached = exact.attach_exact(&mut store, &cover).unwrap();
-    assert_eq!(
-        reattached.members()[0].1.bytes.as_ref(),
-        expected.as_bytes()
-    );
+    let snapshot = store.snapshot().unwrap();
+    let reattached_blob: Blob<AttachedTextBlob> =
+        snapshot.get(reattached.members().next().unwrap()).unwrap();
+    assert_eq!(reattached_blob.bytes.as_ref(), expected.as_bytes());
 }
 
 fn selective_kernel(
@@ -849,11 +855,14 @@ fn join_test_sources(
     .transmute()
 }
 
+fn collection_records(store: &mut MemoryRepo) -> Vec<CollectionRecord> {
+    let snapshot = store.snapshot().unwrap();
+    snapshot.records().unwrap().map(Result::unwrap).collect()
+}
+
 fn derived_inputs(store: &mut MemoryRepo) -> Vec<CollectionData> {
-    store
-        .records()
-        .unwrap()
-        .map(Result::unwrap)
+    collection_records(store)
+        .into_iter()
         .filter_map(|record| match record {
             CollectionRecord::Derive(claim)
                 if claim.collection() == kernel().target_collection().handle() =>
@@ -880,23 +889,17 @@ impl BlobStorePut for PanicStore {
     }
 }
 
-impl BlobStore for PanicStore {
-    type Reader = <MemoryRepo as BlobStore>::Reader;
-    type ReaderError = Infallible;
+impl SnapshotSource for PanicStore {
+    type Snapshot = MemoryRepoSnapshot;
+    type SnapshotError = Infallible;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        panic!("empty cover opened a reader")
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        panic!("empty cover opened a snapshot")
     }
 }
 
 impl CollectionStore for PanicStore {
-    type RecordsError = Infallible;
     type InsertError = Infallible;
-    type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        panic!("empty cover scanned records")
-    }
 
     fn insert(&mut self, _: CollectionRecord) -> Result<(), Self::InsertError> {
         panic!("empty cover inserted a record")
@@ -962,34 +965,33 @@ impl fmt::Display for InjectedMetadataError {
 
 impl Error for InjectedMetadataError {}
 
-#[derive(Debug)]
-struct DemandGuardReader {
-    inner: <MemoryRepo as BlobStore>::Reader,
+struct DemandGuardSnapshot {
+    inner: MemoryRepoSnapshot,
     missing_gets: Arc<AtomicUsize>,
-    metadata_failures: Arc<Mutex<BTreeSet<[u8; 32]>>>,
+    metadata_failures: BTreeSet<[u8; 32]>,
 }
 
-impl Clone for DemandGuardReader {
+impl Clone for DemandGuardSnapshot {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             missing_gets: Arc::clone(&self.missing_gets),
-            metadata_failures: Arc::clone(&self.metadata_failures),
+            metadata_failures: self.metadata_failures.clone(),
         }
     }
 }
 
-impl PartialEq for DemandGuardReader {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner
-            && Arc::ptr_eq(&self.missing_gets, &other.missing_gets)
-            && Arc::ptr_eq(&self.metadata_failures, &other.metadata_failures)
+impl StoreSnapshot for DemandGuardSnapshot {
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        let mut changes = self.inner.changes_since(&previous.inner);
+        if self.metadata_failures != previous.metadata_failures {
+            changes = changes.union(StoreChanges::BLOBS);
+        }
+        changes
     }
 }
 
-impl Eq for DemandGuardReader {}
-
-impl BlobStoreMeta for DemandGuardReader {
+impl BlobStoreMeta for DemandGuardSnapshot {
     type MetaError = InjectedMetadataError;
 
     fn metadata<S>(
@@ -1000,28 +1002,28 @@ impl BlobStoreMeta for DemandGuardReader {
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        if self.metadata_failures.lock().unwrap().contains(&handle.raw) {
+        if self.metadata_failures.contains(&handle.raw) {
             return Err(InjectedMetadataError);
         }
         self.inner.metadata(handle).map_err(|never| match never {})
     }
 }
 
-impl BlobStoreList for DemandGuardReader {
+impl BlobStoreList for DemandGuardSnapshot {
     type Iter<'a>
-        = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Iter<'a>
+        = <MemoryRepoSnapshot as BlobStoreList>::Iter<'a>
     where
         Self: 'a;
-    type Err = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Err;
+    type Err = <MemoryRepoSnapshot as BlobStoreList>::Err;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.inner.blobs()
     }
 }
 
-impl BlobStoreGet for DemandGuardReader {
+impl BlobStoreGet for DemandGuardSnapshot {
     type GetError<E: Error + Send + Sync + 'static> =
-        <<MemoryRepo as BlobStore>::Reader as BlobStoreGet>::GetError<E>;
+        <MemoryRepoSnapshot as BlobStoreGet>::GetError<E>;
 
     fn get<T, S>(
         &self,
@@ -1039,6 +1041,18 @@ impl BlobStoreGet for DemandGuardReader {
     }
 }
 
+impl CollectionRead for DemandGuardSnapshot {
+    type RecordsError = <MemoryRepoSnapshot as CollectionRead>::RecordsError;
+    type RecordIter<'a>
+        = <MemoryRepoSnapshot as CollectionRead>::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.inner.records()
+    }
+}
+
 impl BlobStorePut for CountingStore {
     type PutError = <MemoryRepo as BlobStorePut>::PutError;
 
@@ -1053,30 +1067,21 @@ impl BlobStorePut for CountingStore {
     }
 }
 
-impl BlobStore for CountingStore {
-    type Reader = DemandGuardReader;
-    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+impl SnapshotSource for CountingStore {
+    type Snapshot = DemandGuardSnapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        Ok(DemandGuardReader {
-            inner: self.inner.reader()?,
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        Ok(DemandGuardSnapshot {
+            inner: self.inner.snapshot()?,
             missing_gets: Arc::clone(&self.missing_gets),
-            metadata_failures: Arc::clone(&self.metadata_failures),
+            metadata_failures: self.metadata_failures.lock().unwrap().clone(),
         })
     }
 }
 
 impl CollectionStore for CountingStore {
-    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
     type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-    type RecordIter<'a>
-        = <MemoryRepo as CollectionStore>::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.inner.records()
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.inserts += 1;
@@ -1112,9 +1117,9 @@ fn ensure_publishes_the_complete_descriptor_attachment_closure() {
 
     exact.ensure_exact(&mut store, &source_cover).unwrap();
 
-    let reader = store.reader().unwrap();
+    let snapshot = store.snapshot().unwrap();
     for descriptor in [exact.source_descriptor(), exact.target_descriptor()] {
-        let stored_descriptor: Blob<SimpleArchive> = reader
+        let stored_descriptor: Blob<SimpleArchive> = snapshot
             .get(
                 crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone())
                     .get_handle(),
@@ -1126,9 +1131,9 @@ fn ensure_publishes_the_complete_descriptor_attachment_closure() {
         );
 
         let mut embedded = descriptor.blobs().clone();
-        let embedded_reader = embedded.reader().unwrap();
-        for (handle, expected) in embedded_reader {
-            let actual: Blob<UnknownBlob> = reader
+        let embedded_snapshot = embedded.snapshot().unwrap();
+        for (handle, expected) in embedded_snapshot {
+            let actual: Blob<UnknownBlob> = snapshot
                 .get(handle)
                 .expect("every descriptor attachment is resident");
             assert_eq!(actual.bytes, expected.bytes);
@@ -1158,7 +1163,7 @@ fn compacted_source_cover_reuses_resident_decomposition_images() {
     })
     .unwrap();
 
-    let mut actual: Vec<_> = target.cover().members().collect();
+    let mut actual: Vec<_> = target.members().collect();
     actual.sort_unstable();
     let mut expected = vec![fa.get_handle(), fb.get_handle()];
     expected.sort_unstable();
@@ -1190,7 +1195,7 @@ fn compacted_source_capacity_falls_back_to_resident_decomposition_inputs() {
     })
     .unwrap();
 
-    let mut actual: Vec<_> = target.cover().members().collect();
+    let mut actual: Vec<_> = target.members().collect();
     actual.sort_unstable();
     let mut expected = vec![
         derive(&a).unwrap().get_handle(),
@@ -1227,10 +1232,7 @@ fn complete_direct_image_does_not_expand_source_decompositions() {
     })
     .unwrap();
 
-    assert_eq!(
-        target.cover().members().collect::<Vec<_>>(),
-        vec![fc.get_handle()]
-    );
+    assert_eq!(target.members().collect::<Vec<_>>(), vec![fc.get_handle()]);
     assert_eq!((store.puts, store.inserts), (0, 0));
     assert!(algebra.source_attempts.lock().unwrap().is_empty());
 }
@@ -1264,7 +1266,7 @@ fn unrelated_optional_result_metadata_failure_is_inert() {
     let attached = kernel().attach_exact(&mut store, &source_cover).unwrap();
 
     assert_eq!(
-        attached.cover().members().collect::<Vec<_>>(),
+        attached.members().collect::<Vec<_>>(),
         vec![target.get_handle()]
     );
     assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
@@ -1298,7 +1300,12 @@ fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
     .unwrap();
 
     assert_eq!(target.len(), 1);
-    assert_eq!(target.members()[0].1.bytes, derive(&c).unwrap().bytes);
+    let actual: Blob<TestTargetBlob> = store
+        .snapshot()
+        .unwrap()
+        .get(target.members().next().unwrap())
+        .unwrap();
+    assert_eq!(actual.bytes, derive(&c).unwrap().bytes);
     assert!(algebra.derive_attempts.lock().unwrap().contains(&data(&c)));
     assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
 }
@@ -1341,7 +1348,12 @@ fn forged_reverse_decomposition_cannot_supply_a_cover() {
     })
     .unwrap();
     assert_eq!(target.len(), 1);
-    assert_eq!(target.members()[0].1.bytes, derive(&c).unwrap().bytes);
+    let actual: Blob<TestTargetBlob> = store
+        .snapshot()
+        .unwrap()
+        .get(target.members().next().unwrap())
+        .unwrap();
+    assert_eq!(actual.bytes, derive(&c).unwrap().bytes);
     assert!(algebra.derive_attempts.lock().unwrap().contains(&data(&c)));
     assert!(store.puts > 0 && store.inserts > 0);
 }
@@ -1354,12 +1366,10 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
     let source_cover = source_cover(&[commit]);
 
     let first = kernel().ensure_exact(&mut store, &source_cover).unwrap();
-    let first_member = first.cover().members().next().unwrap();
+    let first_member = first.members().next().unwrap();
     assert!(
-        !store
-            .records()
-            .unwrap()
-            .map(Result::unwrap)
+        !collection_records(&mut store)
+            .into_iter()
             .any(|record| matches!(
                 record,
                 CollectionRecord::Commit(commit)
@@ -1369,13 +1379,16 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
         "the first algebra result must remain unsigned equation evidence",
     );
 
-    let second = second_kernel()
-        .ensure_exact(&mut store, first.cover())
-        .unwrap();
+    let second = second_kernel().ensure_exact(&mut store, &first).unwrap();
     assert_eq!(second.len(), 1);
     let mut expected = derive(&source).unwrap().bytes.as_ref().to_vec();
     expected.push(0xB6);
-    assert_eq!(second.members()[0].1.bytes.as_ref(), expected.as_slice());
+    let actual: Blob<SecondTestTargetBlob> = store
+        .snapshot()
+        .unwrap()
+        .get(second.members().next().unwrap())
+        .unwrap();
+    assert_eq!(actual.bytes.as_ref(), expected.as_slice());
 }
 
 #[test]
@@ -1568,13 +1581,12 @@ fn fatal_source_construction_is_not_capacity_fallback() {
     assert_eq!((store.puts, store.inserts), (0, 0));
 }
 
-#[derive(Debug)]
-struct GuardReader {
-    inner: <MemoryRepo as BlobStore>::Reader,
+struct GuardSnapshot {
+    inner: MemoryRepoSnapshot,
     live: Arc<AtomicUsize>,
 }
 
-impl Clone for GuardReader {
+impl Clone for GuardSnapshot {
     fn clone(&self) -> Self {
         self.live.fetch_add(1, Ordering::SeqCst);
         Self {
@@ -1584,22 +1596,20 @@ impl Clone for GuardReader {
     }
 }
 
-impl Drop for GuardReader {
+impl Drop for GuardSnapshot {
     fn drop(&mut self) {
         self.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-impl PartialEq for GuardReader {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner && Arc::ptr_eq(&self.live, &other.live)
+impl StoreSnapshot for GuardSnapshot {
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        self.inner.changes_since(&previous.inner)
     }
 }
 
-impl Eq for GuardReader {}
-
-impl BlobStoreMeta for GuardReader {
-    type MetaError = <<MemoryRepo as BlobStore>::Reader as BlobStoreMeta>::MetaError;
+impl BlobStoreMeta for GuardSnapshot {
+    type MetaError = <MemoryRepoSnapshot as BlobStoreMeta>::MetaError;
 
     fn metadata<S>(
         &self,
@@ -1613,9 +1623,9 @@ impl BlobStoreMeta for GuardReader {
     }
 }
 
-impl BlobStoreGet for GuardReader {
+impl BlobStoreGet for GuardSnapshot {
     type GetError<E: Error + Send + Sync + 'static> =
-        <<MemoryRepo as BlobStore>::Reader as BlobStoreGet>::GetError<E>;
+        <MemoryRepoSnapshot as BlobStoreGet>::GetError<E>;
 
     fn get<T, S>(
         &self,
@@ -1630,12 +1640,12 @@ impl BlobStoreGet for GuardReader {
     }
 }
 
-impl BlobStoreList for GuardReader {
+impl BlobStoreList for GuardSnapshot {
     type Iter<'a>
-        = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Iter<'a>
+        = <MemoryRepoSnapshot as BlobStoreList>::Iter<'a>
     where
         Self: 'a;
-    type Err = <<MemoryRepo as BlobStore>::Reader as BlobStoreList>::Err;
+    type Err = <MemoryRepoSnapshot as BlobStoreList>::Err;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.inner.blobs()
@@ -1647,6 +1657,18 @@ impl BlobStoreList for GuardReader {
         Handle<S>: InlineEncoding,
     {
         self.inner.contains_blob(handle)
+    }
+}
+
+impl CollectionRead for GuardSnapshot {
+    type RecordsError = <MemoryRepoSnapshot as CollectionRead>::RecordsError;
+    type RecordIter<'a>
+        = <MemoryRepoSnapshot as CollectionRead>::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.inner.records()
     }
 }
 
@@ -1663,11 +1685,11 @@ struct GuardStore {
 }
 
 impl GuardStore {
-    fn assert_no_reader(&self) {
+    fn assert_no_snapshot(&self) {
         assert_eq!(
             self.live.load(Ordering::SeqCst),
             0,
-            "write while reader is live"
+            "write while snapshot is live"
         );
     }
 }
@@ -1681,7 +1703,7 @@ impl BlobStorePut for GuardStore {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        self.assert_no_reader();
+        self.assert_no_snapshot();
         let blob = item.to_blob();
         self.events
             .push(WriteEvent::Put(Handle::<S>::to_hash(blob.get_handle())));
@@ -1689,14 +1711,14 @@ impl BlobStorePut for GuardStore {
     }
 }
 
-impl BlobStore for GuardStore {
-    type Reader = GuardReader;
-    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+impl SnapshotSource for GuardStore {
+    type Snapshot = GuardSnapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        let inner = self.inner.reader()?;
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let inner = self.inner.snapshot()?;
         self.live.fetch_add(1, Ordering::SeqCst);
-        Ok(GuardReader {
+        Ok(GuardSnapshot {
             inner,
             live: Arc::clone(&self.live),
         })
@@ -1704,26 +1726,17 @@ impl BlobStore for GuardStore {
 }
 
 impl CollectionStore for GuardStore {
-    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
     type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-    type RecordIter<'a>
-        = <MemoryRepo as CollectionStore>::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.inner.records()
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        self.assert_no_reader();
+        self.assert_no_snapshot();
         self.events.push(WriteEvent::Insert(record));
         self.inner.insert(record)
     }
 }
 
 #[test]
-fn reader_is_dropped_before_first_write() {
+fn snapshot_is_dropped_before_first_write() {
     let source = archive([(1, 3)]);
     let mut inner = MemoryRepo::default();
     let commit = source_commit(&mut inner, 1, &source);
@@ -1778,10 +1791,8 @@ fn ensure_stores_source_before_target_and_derive() {
 }
 
 fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
-    store
-        .records()
-        .unwrap()
-        .map(Result::unwrap)
+    collection_records(store)
+        .into_iter()
         .filter_map(|record| match record {
             CollectionRecord::Merge(claim)
                 if claim.collection() == kernel().target_collection().handle() =>
@@ -1793,24 +1804,24 @@ fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
         .collect()
 }
 
-fn joined_cover(cover: &CoverAttachment<TestTargetBlob>) -> Blob<TestTargetBlob> {
-    let mut members = cover.members().iter();
-    let mut joined = members
+fn joined_cover(store: &mut MemoryRepo, cover: &Cover<TestTargetBlob>) -> Blob<TestTargetBlob> {
+    let snapshot = store.snapshot().unwrap();
+    let mut members = cover.members();
+    let mut joined: Blob<TestTargetBlob> = members
         .next()
-        .expect("nonempty cover has a target member")
-        .1
-        .clone();
-    for (_, member) in members {
-        joined = join_test_targets(&joined, member).unwrap();
+        .map(|handle| snapshot.get(handle).unwrap())
+        .expect("nonempty cover has a target member");
+    for handle in members {
+        let member: Blob<TestTargetBlob> = snapshot.get(handle).unwrap();
+        joined = join_test_targets(&joined, &member).unwrap();
     }
     joined
 }
 
-fn cover_ids(cover: &CoverAttachment<TestTargetBlob>) -> Vec<CollectionData> {
+fn cover_ids(cover: &Cover<TestTargetBlob>) -> Vec<CollectionData> {
     cover
         .members()
-        .iter()
-        .map(|(handle, _)| Handle::<TestTargetBlob>::to_hash(*handle))
+        .map(Handle::<TestTargetBlob>::to_hash)
         .collect()
 }
 
@@ -1848,8 +1859,12 @@ fn compaction_collapses_same_tier_and_returns_an_exact_tier_stable_cover() {
 
     let cover = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     let mut tiers = BTreeSet::new();
-    for (_, blob) in cover.members() {
-        assert!(tiers.insert(blob.bytes.len().max(1).ilog2()));
+    {
+        let snapshot = store.snapshot().unwrap();
+        for handle in cover.members() {
+            let blob: Blob<TestTargetBlob> = snapshot.get(handle).unwrap();
+            assert!(tiers.insert(blob.bytes.len().max(1).ilog2()));
+        }
     }
     assert_eq!(cover.len(), 2);
     assert!(!target_merge_records(&mut store).is_empty());
@@ -1861,7 +1876,7 @@ fn compaction_collapses_same_tier_and_returns_an_exact_tier_stable_cover() {
             join_test_sources(&joined, source)
         });
     assert_eq!(
-        joined_cover(&cover).bytes,
+        joined_cover(&mut store, &cover).bytes,
         derive(&expected_source).unwrap().bytes
     );
 }
@@ -2048,12 +2063,16 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof()
     assert_eq!(before.len(), 3);
     let after = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     let mut tiers = BTreeSet::new();
-    assert!(after
-        .members()
-        .iter()
-        .all(|(_, blob)| tiers.insert(blob.bytes.len().max(1).ilog2())));
+    let tier_stable = {
+        let snapshot = store.snapshot().unwrap();
+        after.members().all(|handle| {
+            let blob: Blob<TestTargetBlob> = snapshot.get(handle).unwrap();
+            tiers.insert(blob.bytes.len().max(1).ilog2())
+        })
+    };
+    assert!(tier_stable);
     assert_eq!(after.len(), 2);
-    assert_eq!(joined_cover(&after).bytes, old_upper.bytes);
+    assert_eq!(joined_cover(&mut store, &after).bytes, old_upper.bytes);
     assert!(target_merge_records(&mut store)
         .iter()
         .any(|claim| claim.inputs() == (targets[0].0, targets[1].0)));
@@ -2091,9 +2110,9 @@ fn compaction_is_cover_order_deterministic_and_repeatedly_idempotent() {
         target_merge_records(&mut second_store)
     );
 
-    let records_before: Vec<_> = first_store.records().unwrap().map(Result::unwrap).collect();
+    let records_before = collection_records(&mut first_store);
     let repeated = compact_exact_target(&kernel(), &mut first_store, &first_cover).unwrap();
-    let records_after: Vec<_> = first_store.records().unwrap().map(Result::unwrap).collect();
+    let records_after = collection_records(&mut first_store);
     assert_eq!(cover_ids(&first), cover_ids(&repeated));
     assert_eq!(records_before, records_after);
 }
@@ -2205,26 +2224,17 @@ impl BlobStorePut for DropMergeStore {
     }
 }
 
-impl BlobStore for DropMergeStore {
-    type Reader = <MemoryRepo as BlobStore>::Reader;
-    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+impl SnapshotSource for DropMergeStore {
+    type Snapshot = MemoryRepoSnapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.inner.reader()
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
     }
 }
 
 impl CollectionStore for DropMergeStore {
-    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
     type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-    type RecordIter<'a>
-        = <MemoryRepo as CollectionStore>::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.inner.records()
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         if matches!(record, CollectionRecord::Merge(_)) {
@@ -2235,26 +2245,17 @@ impl CollectionStore for DropMergeStore {
     }
 }
 
-impl BlobStore for RejectPutStore {
-    type Reader = <MemoryRepo as BlobStore>::Reader;
-    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+impl SnapshotSource for RejectPutStore {
+    type Snapshot = MemoryRepoSnapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.inner.reader()
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
     }
 }
 
 impl CollectionStore for RejectPutStore {
-    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
     type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-    type RecordIter<'a>
-        = <MemoryRepo as CollectionStore>::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.inner.records()
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.inner.insert(record)
@@ -2350,26 +2351,17 @@ impl BlobStorePut for LossyStore {
     }
 }
 
-impl BlobStore for LossyStore {
-    type Reader = <MemoryRepo as BlobStore>::Reader;
-    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+impl SnapshotSource for LossyStore {
+    type Snapshot = MemoryRepoSnapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.inner.reader()
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
     }
 }
 
 impl CollectionStore for LossyStore {
-    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
     type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-    type RecordIter<'a>
-        = <MemoryRepo as CollectionStore>::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.inner.records()
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.inner.insert(record)
@@ -2641,11 +2633,14 @@ fn ungrounded_source_superset_cannot_escape_the_cover() {
         .unwrap();
 
     let cover = kernel().ensure_exact(&mut store, &source_cover).unwrap();
-    assert_eq!(cover.members()[0].1.bytes, derive(&a).unwrap().bytes);
-    let derives: Vec<_> = store
-        .records()
+    let actual: Blob<TestTargetBlob> = store
+        .snapshot()
         .unwrap()
-        .map(Result::unwrap)
+        .get(cover.members().next().unwrap())
+        .unwrap();
+    assert_eq!(actual.bytes, derive(&a).unwrap().bytes);
+    let derives: Vec<_> = collection_records(&mut store)
+        .into_iter()
         .filter_map(|record| match record {
             CollectionRecord::Derive(claim) => Some(claim.input()),
             _ => None,

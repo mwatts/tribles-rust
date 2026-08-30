@@ -755,13 +755,13 @@ type CommitHandle = Inline<Handle<SimpleArchive>>;
 /// Walk a linear branch parents-first (oldest-first). Vendored from
 /// sparqloscope-bench; uses only `repo::parent` facts.
 fn commit_chain(
-    reader: &triblespace_core::repo::pile::PileReader,
+    snapshot: &triblespace_core::repo::pile::PileSnapshot,
     head: CommitHandle,
 ) -> Vec<(CommitHandle, TribleSet)> {
     let mut chain = Vec::new();
     let mut cursor = Some(head);
     while let Some(handle) = cursor {
-        let meta: TribleSet = reader.get(handle).expect("read commit metadata");
+        let meta: TribleSet = snapshot.get(handle).expect("read commit metadata");
         let parents: Vec<CommitHandle> = find!(
             (p: Inline<Handle<SimpleArchive>>),
             pattern!(&meta, [{ repo::parent: ?p }])
@@ -796,7 +796,7 @@ fn pile_checkout(
     let pins = pile
         .snapshot_pin_heads()
         .expect("snapshot legacy branch pins");
-    let reader = pile.reader().expect("pile reader");
+    let snapshot = pile.snapshot().expect("pile snapshot");
 
     // Resolve legacy branches by metadata::name. With --branch, exact match; else
     // auto-pick the single branch not named "manifest".
@@ -804,7 +804,7 @@ fn pile_checkout(
     for raw in pins.iter_ordered() {
         let id = Id::new(*raw).expect("legacy pin snapshot contains a nil id");
         let meta_handle = *pins.get(raw).expect("iterated legacy pin has a head");
-        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
+        let Ok(meta): Result<TribleSet, _> = snapshot.get(meta_handle) else {
             continue;
         };
         let handles: Vec<Inline<Handle<UTF8String>>> = find!(
@@ -814,7 +814,7 @@ fn pile_checkout(
         .map(|(n,)| n)
         .collect();
         let [h] = handles[..] else { continue };
-        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else {
+        let Ok(name): Result<anybytes::View<str>, _> = snapshot.get(h) else {
             continue;
         };
         named.push((id, name.as_ref().to_owned(), meta));
@@ -848,7 +848,7 @@ fn pile_checkout(
     let [head] = heads[..] else {
         panic!("branch {branch_name:?} has no unique head commit")
     };
-    let chain = commit_chain(&reader, head);
+    let chain = commit_chain(&snapshot, head);
 
     // Rung -> k: one walk, per-commit tribles = SimpleArchive blob len / 64.
     let mut handles: Vec<CommitHandle> = Vec::new();
@@ -862,7 +862,7 @@ fn pile_checkout(
         .map(|(c,)| c)
         .collect();
         let [content] = contents[..] else { continue }; // skip empty commits
-        let blob: Blob<SimpleArchive> = reader.get(content).expect("read content blob");
+        let blob: Blob<SimpleArchive> = snapshot.get(content).expect("read content blob");
         total += blob.bytes.len() / 64;
         handles.push(*handle);
         cum.push(total);
@@ -912,7 +912,7 @@ fn pile_checkout(
         let t = Instant::now();
         let mut set = TribleSet::new();
         for handle in &handles[..k] {
-            let meta: TribleSet = reader.get(*handle).expect("read legacy commit metadata");
+            let meta: TribleSet = snapshot.get(*handle).expect("read legacy commit metadata");
             let contents: Vec<CommitHandle> = find!(
                 (c: Inline<Handle<SimpleArchive>>),
                 pattern!(&meta, [{ repo::content: ?c }])
@@ -922,7 +922,7 @@ fn pile_checkout(
             let [content] = contents[..] else {
                 continue;
             };
-            let content: TribleSet = reader.get(content).expect("read legacy commit content");
+            let content: TribleSet = snapshot.get(content).expect("read legacy commit content");
             set += content;
         }
         if let Some(n) = carve {

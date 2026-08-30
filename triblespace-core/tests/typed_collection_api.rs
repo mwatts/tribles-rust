@@ -7,10 +7,11 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
-use triblespace_core::collection::{reach, CollectionStoreExt};
+use triblespace_core::collection::{reach, CollectionStoreExt, TryFromCover};
 use triblespace_core::collection::{simplearchive_union, succinctarchive_union};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 fn one_fact(seed: u8) -> TribleSet {
@@ -43,15 +44,12 @@ fn simplearchive_collection_round_trips_typed_views() {
         expected_member
     );
 
-    let cover = store.cover(collection).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![expected_member]);
 
-    let snapshot = store.snapshot::<TribleSet, _>(collection).unwrap();
-    assert_eq!(snapshot.cover(), &cover);
-    assert_eq!(snapshot.facts(), &expected);
-
-    let materialized = store.materialize::<TribleSet, _>(&cover).unwrap();
+    let materialized: TribleSet = collection.read(&snapshot).unwrap();
     assert_eq!(materialized, expected);
 }
 
@@ -84,21 +82,20 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     store
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
-    let source_cover = store.cover(source).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let source_cover = source.admitted(&snapshot).unwrap();
     let derived = ExactDerivedCollection::<
         SimpleArchive,
         SuccinctArchiveBlob,
         SimpleToSuccinctMapping,
     >::new(source_descriptor, target_descriptor)
     .unwrap();
-    let attachment = derived.ensure_exact(&mut store, &source_cover).unwrap();
-    let cover = attachment.cover().clone();
+    let cover = derived.ensure_exact(&mut store, &source_cover).unwrap();
     assert_eq!(cover.collection(), target);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
 
-    let materialized = store
-        .materialize::<UnionArchive<OrderedUniverse>, _>(&cover)
-        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let materialized = UnionArchive::<OrderedUniverse>::try_from_cover(&cover, &snapshot).unwrap();
     assert_eq!(materialized.segment_count(), 1);
     assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
 }

@@ -14,12 +14,10 @@ use ed25519_dalek::VerifyingKey;
 
 use std::convert::Infallible;
 
-use crate::collection::api::{
-    snapshot_from_observation, FactCover, FactMaterializationError, FactSnapshot,
-};
+use crate::collection::api::{resolve_cover_from_observation, FactCover, FactMaterializationError};
 use crate::collection::discovery::discover_collection_equations_for_cover;
-use crate::collection::{Collection, CollectionStore, DiscoveredCollectionRecords};
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::collection::{Collection, CollectionRead, TryFromCover};
+use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::{Fragment, TribleSet};
 
 /// Read-only exact-cover view of one canonical `SimpleArchive` union.
@@ -88,19 +86,11 @@ impl SimpleArchiveCollection {
     /// An empty cover returns the local empty set without touching storage.
     pub fn attach_exact<S>(
         &self,
-        store: &mut S,
+        snapshot: &S,
         cover: &FactCover,
-    ) -> Result<
-        TribleSet,
-        FactMaterializationError<
-            S::RecordsError,
-            S::ReaderError,
-            <S::Reader as BlobStoreGet>::GetError<Infallible>,
-        >,
-    >
+    ) -> Result<TribleSet, FactMaterializationError<S::RecordsError, S::GetError<Infallible>>>
     where
-        S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S: BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
         if cover.collection() != self.collection() {
             return Err(FactMaterializationError::ExactCover(
@@ -113,74 +103,31 @@ impl SimpleArchiveCollection {
         if cover.is_empty() {
             return Ok(TribleSet::new());
         }
-        self.snapshot_canonical(store, cover.clone())
-            .map(FactSnapshot::into_facts)
+        let resolved = self.resolve_canonical(snapshot, cover.clone())?;
+        TribleSet::try_from_cover(&resolved, snapshot).map_err(FactMaterializationError::from)
     }
 
-    /// Capture one coherent exact-cover fact, cover, and reader snapshot.
-    ///
-    /// Record selection happens once before one blob reader is opened. The
-    /// returned payload members are canonical and duplicate-free, and only
-    /// those members can contribute facts even if the reader physically
-    /// contains later or otherwise unselected blobs. An empty cover still
-    /// opens and returns a reader, matching
-    /// [`crate::collection::CollectionStoreExt::snapshot`].
-    pub fn snapshot_exact<S>(
+    fn resolve_canonical<S>(
         &self,
-        store: &mut S,
-        cover: &FactCover,
-    ) -> Result<
-        FactSnapshot<S::Reader>,
-        FactMaterializationError<
-            S::RecordsError,
-            S::ReaderError,
-            <S::Reader as BlobStoreGet>::GetError<Infallible>,
-        >,
-    >
-    where
-        S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
-    {
-        if cover.collection() != self.collection() {
-            return Err(FactMaterializationError::ExactCover(
-                crate::collection::ExactCoverError::WrongCollection {
-                    expected: self.collection().handle(),
-                    actual: cover.collection().handle(),
-                },
-            ));
-        }
-        self.snapshot_canonical(store, cover.clone())
-    }
-
-    fn snapshot_canonical<S>(
-        &self,
-        store: &mut S,
+        snapshot: &S,
         cover: FactCover,
-    ) -> Result<
-        FactSnapshot<S::Reader>,
-        FactMaterializationError<
-            S::RecordsError,
-            S::ReaderError,
-            <S::Reader as BlobStoreGet>::GetError<Infallible>,
-        >,
-    >
+    ) -> Result<FactCover, FactMaterializationError<S::RecordsError, S::GetError<Infallible>>>
     where
-        S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S: BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
         let descriptor = self.descriptor();
         if cover.is_empty() {
-            return snapshot_from_observation(
-                store,
-                &descriptor,
-                DiscoveredCollectionRecords::default(),
-                cover,
-            );
+            return Ok(cover);
         }
 
-        let discovered = discover_collection_equations_for_cover(store, &cover)
+        let discovered = discover_collection_equations_for_cover(snapshot, &cover)
             .map_err(FactMaterializationError::Discovery)?;
-        snapshot_from_observation(store, &descriptor, discovered, cover)
+        resolve_cover_from_observation::<S, super::SimpleArchive, super::FactViewError, Infallible>(
+            snapshot,
+            &descriptor,
+            discovered,
+            cover,
+        )
     }
 }
 
@@ -188,21 +135,24 @@ impl SimpleArchiveCollection {
 mod tests {
     use std::collections::BTreeSet;
     use std::convert::Infallible;
+    use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::SigningKey;
 
     use super::*;
     use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
-    use crate::blob::{Blob, BlobEncoding, Bytes, IntoBlob};
+    use crate::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::{
-        CollectionCommit, CollectionRecord, CollectionRecordSelector, CollectionStoreExt,
-        ExactCoverError,
+        CollectionCommit, CollectionRead, CollectionRecord, CollectionRecordSelector,
+        CollectionStore, ExactCoverError,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
-    use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::BlobStorePut;
+    use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
+    use crate::repo::{BlobMetadata, BlobStoreGet, BlobStoreMeta, SnapshotSource, StoreSnapshot};
     use crate::trible::{Trible, TRIBLE_LEN};
 
     fn test_facade(name: &str) -> SimpleArchiveCollection {
@@ -270,57 +220,78 @@ mod tests {
     #[derive(Default)]
     struct ReadOnlyCountingStore {
         inner: MemoryRepo,
-        selections: usize,
-        readers: usize,
-        last_selectors: Option<BTreeSet<CollectionRecordSelector>>,
+        selections: Arc<AtomicUsize>,
+        last_selectors: Arc<Mutex<Option<BTreeSet<CollectionRecordSelector>>>>,
     }
 
-    impl BlobStorePut for ReadOnlyCountingStore {
-        type PutError = Infallible;
+    #[derive(Clone)]
+    struct ReadOnlyCountingSnapshot {
+        inner: MemoryRepoSnapshot,
+        selections: Arc<AtomicUsize>,
+        last_selectors: Arc<Mutex<Option<BTreeSet<CollectionRecordSelector>>>>,
+    }
 
-        fn put<E, T>(&mut self, _item: T) -> Result<Inline<Handle<E>>, Self::PutError>
+    impl StoreSnapshot for ReadOnlyCountingSnapshot {}
+
+    impl BlobStoreGet for ReadOnlyCountingSnapshot {
+        type GetError<E: Error + Send + Sync + 'static> =
+            <MemoryRepoSnapshot as BlobStoreGet>::GetError<E>;
+
+        fn get<T, E>(
+            &self,
+            handle: Inline<Handle<E>>,
+        ) -> Result<T, Self::GetError<<T as TryFromBlob<E>>::Error>>
+        where
+            E: BlobEncoding,
+            T: TryFromBlob<E>,
+        {
+            self.inner.get(handle)
+        }
+    }
+
+    impl BlobStoreMeta for ReadOnlyCountingSnapshot {
+        type MetaError = <MemoryRepoSnapshot as BlobStoreMeta>::MetaError;
+
+        fn metadata<E>(
+            &self,
+            handle: Inline<Handle<E>>,
+        ) -> Result<Option<BlobMetadata>, Self::MetaError>
         where
             E: BlobEncoding + 'static,
-            T: IntoBlob<E>,
             Handle<E>: InlineEncoding,
         {
-            panic!("read-only exact facade attempted to write a blob")
+            self.inner.metadata(handle)
         }
     }
 
-    impl BlobStore for ReadOnlyCountingStore {
-        type Reader = <MemoryRepo as BlobStore>::Reader;
-        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+    impl CollectionRead for ReadOnlyCountingSnapshot {
+        type RecordsError = <MemoryRepoSnapshot as CollectionRead>::RecordsError;
+        type RecordIter<'a> = <MemoryRepoSnapshot as CollectionRead>::RecordIter<'a>;
 
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.readers += 1;
-            self.inner.reader()
-        }
-    }
-
-    impl CollectionStore for ReadOnlyCountingStore {
-        type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
-        type InsertError = Infallible;
-        type RecordIter<'a>
-            = <MemoryRepo as CollectionStore>::RecordIter<'a>
-        where
-            Self: 'a;
-
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
             panic!("exact facade must use the selector boundary")
         }
 
         fn select_records(
-            &mut self,
+            &self,
             selectors: &BTreeSet<CollectionRecordSelector>,
         ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-            self.selections += 1;
-            self.last_selectors = Some(selectors.clone());
+            self.selections.fetch_add(1, Ordering::SeqCst);
+            *self.last_selectors.lock().expect("selector mutex") = Some(selectors.clone());
             self.inner.select_records(selectors)
         }
+    }
 
-        fn insert(&mut self, _record: CollectionRecord) -> Result<(), Self::InsertError> {
-            panic!("read-only exact facade attempted to insert a record")
+    impl SnapshotSource for ReadOnlyCountingStore {
+        type Snapshot = ReadOnlyCountingSnapshot;
+        type SnapshotError = Infallible;
+
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            Ok(ReadOnlyCountingSnapshot {
+                inner: self.inner.snapshot()?,
+                selections: self.selections.clone(),
+                last_selectors: self.last_selectors.clone(),
+            })
         }
     }
 
@@ -334,19 +305,20 @@ mod tests {
         let (_unselected, _) = publish(&mut store, &descriptor, 9, 3);
 
         let requested = cover(&facade, [second, first, first]);
-        let snapshot = facade.snapshot_exact(&mut store, &requested).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let actual = facade.attach_exact(&snapshot, &requested).unwrap();
         let mut expected = facts(1);
         expected += facts(2);
         let expected_cover = cover(&facade, [first, second]);
 
-        assert_eq!(snapshot.facts(), &expected);
-        assert_eq!(snapshot.cover(), &expected_cover);
-        assert_eq!(snapshot.cover().len(), 2);
+        assert_eq!(actual, expected);
+        assert_eq!(requested, expected_cover);
+        assert_eq!(requested.len(), 2);
         assert_ne!(first.public_key(), second.public_key());
     }
 
     #[test]
-    fn exact_reads_select_records_once_and_open_one_coherent_reader() {
+    fn exact_reads_select_records_once_from_one_coherent_snapshot() {
         let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut inner = MemoryRepo::default();
@@ -357,14 +329,13 @@ mod tests {
         };
 
         let requested = cover(&facade, [commit]);
-        let snapshot = facade.snapshot_exact(&mut store, &requested).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let actual = facade.attach_exact(&snapshot, &requested).unwrap();
 
-        assert_eq!(snapshot.facts(), &facts(1));
-        assert_eq!(snapshot.cover(), &requested);
-        assert_eq!(store.selections, 1);
-        assert_eq!(store.readers, 1);
+        assert_eq!(actual, facts(1));
+        assert_eq!(store.selections.load(Ordering::SeqCst), 1);
         assert_eq!(
-            store.last_selectors,
+            store.last_selectors.lock().expect("selector mutex").clone(),
             Some(BTreeSet::from([CollectionRecordSelector::MergeCollection(
                 identity_for_tests(&descriptor),
             )])),
@@ -412,12 +383,13 @@ mod tests {
             [first, missing_metadata_claim, corrupt_metadata_claim],
         );
         assert_eq!(requested.len(), 1);
+        let snapshot = store.snapshot().unwrap();
         assert_eq!(
-            facade.attach_exact(&mut store, &requested).unwrap(),
+            facade.attach_exact(&snapshot, &requested).unwrap(),
             facts(1)
         );
 
-        let claims = store.claims(&requested).unwrap();
+        let claims = requested.claims(&snapshot).unwrap();
         assert_eq!(claims.len(), 3);
         assert!(claims.contains(&first));
         assert!(claims.contains(&missing_metadata_claim));
@@ -434,8 +406,9 @@ mod tests {
         let requested = cover(&facade, [absent]);
         let mut claimless = MemoryRepo::default();
         claimless.blobs = source.blobs.clone();
+        let snapshot = claimless.snapshot().unwrap();
         assert_eq!(
-            facade.attach_exact(&mut claimless, &requested).unwrap(),
+            facade.attach_exact(&snapshot, &requested).unwrap(),
             facts(1)
         );
 
@@ -452,10 +425,9 @@ mod tests {
         alternate_store
             .insert(CollectionRecord::Commit(alternate_author))
             .unwrap();
+        let snapshot = alternate_store.snapshot().unwrap();
         assert_eq!(
-            facade
-                .attach_exact(&mut alternate_store, &requested)
-                .unwrap(),
+            facade.attach_exact(&snapshot, &requested).unwrap(),
             facts(1)
         );
 
@@ -465,8 +437,9 @@ mod tests {
         invalid_store
             .insert(CollectionRecord::Commit(invalid))
             .unwrap();
+        let snapshot = invalid_store.snapshot().unwrap();
         assert_eq!(
-            facade.attach_exact(&mut invalid_store, &requested).unwrap(),
+            facade.attach_exact(&snapshot, &requested).unwrap(),
             facts(1)
         );
     }
@@ -482,9 +455,10 @@ mod tests {
             inner: source,
             ..ReadOnlyCountingStore::default()
         };
+        let snapshot = store.snapshot().unwrap();
 
         assert!(matches!(
-            facade.attach_exact(&mut store, &requested),
+            facade.attach_exact(&snapshot, &requested),
             Err(FactMaterializationError::ExactCover(
                 ExactCoverError::WrongCollection {
                     expected,
@@ -493,8 +467,7 @@ mod tests {
             )) if expected == facade.collection().handle()
                 && actual == other.collection().handle()
         ));
-        assert_eq!(store.selections, 0);
-        assert_eq!(store.readers, 0);
+        assert_eq!(store.selections.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -510,17 +483,17 @@ mod tests {
         missing_descriptor
             .blobs
             .keep([data_handle.transmute::<Handle<UnknownBlob>>()]);
+        let snapshot = missing_descriptor.snapshot().unwrap();
         assert_eq!(
-            facade
-                .attach_exact(&mut missing_descriptor, &requested)
-                .unwrap(),
+            facade.attach_exact(&snapshot, &requested).unwrap(),
             facts(1),
         );
 
         let mut missing_data = base.clone();
         missing_data.blobs.keep([]);
+        let snapshot = missing_data.snapshot().unwrap();
         assert!(matches!(
-            facade.attach_exact(&mut missing_data, &requested),
+            facade.attach_exact(&snapshot, &requested),
             Err(FactMaterializationError::MemberGet { member, .. })
                 if member == commit.data()
         ));
@@ -550,28 +523,24 @@ mod tests {
         .unwrap();
 
         let requested = cover(&facade, [second, first]);
-        let attached = facade.attach_exact(&mut store, &requested).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let attached = facade.attach_exact(&snapshot, &requested).unwrap();
         let mut expected = facts(1);
         expected += facts(2);
         assert_eq!(attached, expected);
     }
 
     #[test]
-    fn empty_attach_is_store_free_while_empty_snapshot_returns_one_reader() {
+    fn empty_attach_does_not_query_the_snapshot() {
         let facade = test_facade("first");
         let mut store = ReadOnlyCountingStore::default();
         let empty = FactCover::from_data(facade.collection(), std::iter::empty());
+        let snapshot = store.snapshot().unwrap();
 
         assert_eq!(
-            facade.attach_exact(&mut store, &empty).unwrap(),
+            facade.attach_exact(&snapshot, &empty).unwrap(),
             TribleSet::new()
         );
-        assert_eq!((store.selections, store.readers), (0, 0));
-
-        let snapshot = facade.snapshot_exact(&mut store, &empty).unwrap();
-        assert_eq!(snapshot.facts(), &TribleSet::new());
-        assert!(snapshot.cover().is_empty());
-        assert_eq!(snapshot.cover(), &empty);
-        assert_eq!((store.selections, store.readers), (0, 1));
+        assert_eq!(store.selections.load(Ordering::SeqCst), 0);
     }
 }

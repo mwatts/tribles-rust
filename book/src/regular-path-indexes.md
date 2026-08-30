@@ -197,7 +197,7 @@ resident canonical source data.
 
 Distinct signed claims that name identical data collapse to one cover member
 and one unit of derivation work. Their authorship, signatures, and metadata are
-queryable, possibly absent provenance through `store.claims(&cover)` and are
+queryable, possibly absent provenance through `cover.claims(&snapshot)` and are
 intentionally unnecessary for replay or path semantics.
 
 `attach_exact` never writes. It admits existing canonical source `MERGE`,
@@ -216,7 +216,7 @@ at least one still-unsupported payload member. A resident source merge can
 therefore replace several leaf derivations, even when it overlaps a member that
 already has a target image. It publishes descriptor and output blobs before the
 unsigned `DERIVE` records and performs no implicit durability flush. It drops
-the old reader before those writes and calls `attach_exact` afterwards, so
+the old store snapshot before those writes and calls `attach_exact` afterwards, so
 local construction never substitutes for fresh admission. Concurrent and
 repeated ensures are content-addressed and record-idempotent.
 

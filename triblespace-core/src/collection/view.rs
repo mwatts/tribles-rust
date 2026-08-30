@@ -1,69 +1,59 @@
 //! Logical values over exact typed collection covers.
 //!
 //! A [`Cover`](super::Cover) names the physical members of one exact lattice
-//! point.  [`CoverAttachment`] pairs those typed identities with freshly
-//! validated bytes, and [`TryFromCover`] decides whether a consumer eagerly
-//! joins them or retains the shards as one lazy logical value.
+//! point. [`TryFromCover`] reconstructs a logical value from those identities
+//! through the same immutable store snapshot which resolved the cover.
 
+use std::convert::Infallible;
 use std::error::Error;
+use std::fmt;
 
-use crate::blob::Blob;
-use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
-use crate::repo::{BlobStoreGet, BlobStoreMeta};
+use crate::repo::BlobStoreGet;
 
-use super::{Collection, CollectionEncoding, Cover};
+use super::{CollectionData, CollectionEncoding, Cover};
 
-/// Freshly validated bytes attached to one exact semantic cover.
-///
-/// This is transient materialization state, not another durable record or a
-/// second kind of cover.  The cover remains the identity passed between
-/// collection stages; attached blobs merely avoid rereading selected members.
-pub struct CoverAttachment<L: CollectionEncoding> {
-    cover: Cover<L>,
-    members: Vec<(Inline<Handle<L>>, Blob<L>)>,
+/// Failure at the generic boundary between a physical cover and its logical
+/// interpretation.
+#[derive(Debug)]
+pub enum TryFromCoverError<GetError, ViewError> {
+    /// One exact physical member could not be fetched from the snapshot.
+    MemberGet {
+        /// Selected physical member.
+        member: CollectionData,
+        /// Backend fetch failure.
+        source: GetError,
+    },
+    /// Resident member bytes could not form the requested logical value.
+    View(ViewError),
 }
 
-impl<L: CollectionEncoding> CoverAttachment<L> {
-    pub(crate) fn empty(collection: Collection<L>) -> Self {
-        Self {
-            cover: Cover::from_members(collection, []),
-            members: Vec::new(),
+impl<GetError, ViewError> fmt::Display for TryFromCoverError<GetError, ViewError>
+where
+    GetError: fmt::Display,
+    ViewError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MemberGet { member, source } => write!(
+                formatter,
+                "failed to fetch cover member {}: {source}",
+                hex::encode_upper(member.raw),
+            ),
+            Self::View(source) => source.fmt(formatter),
         }
     }
+}
 
-    pub(crate) fn from_parts(cover: Cover<L>, members: Vec<(Inline<Handle<L>>, Blob<L>)>) -> Self {
-        Self { cover, members }
-    }
-
-    /// Exact semantic cover whose bytes are attached.
-    pub fn cover(&self) -> &Cover<L> {
-        &self.cover
-    }
-
-    /// Number of selected physical members.
-    pub fn len(&self) -> usize {
-        self.members.len()
-    }
-
-    /// Whether the attachment is the store-free empty-cover bottom.
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-
-    /// Borrow the ordered physical members.
-    pub fn members(&self) -> &[(Inline<Handle<L>>, Blob<L>)] {
-        &self.members
-    }
-
-    /// Consume the ordered physical members.
-    pub fn into_members(self) -> Vec<(Inline<Handle<L>>, Blob<L>)> {
-        self.members
-    }
-
-    /// Consume just the ordered attached blobs.
-    pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<L>> {
-        self.members.into_iter().map(|(_, blob)| blob)
+impl<GetError, ViewError> Error for TryFromCoverError<GetError, ViewError>
+where
+    GetError: Error + 'static,
+    ViewError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MemberGet { source, .. } => Some(source),
+            Self::View(source) => Some(source),
+        }
     }
 }
 
@@ -73,11 +63,18 @@ impl<L: CollectionEncoding> CoverAttachment<L> {
 /// some values eagerly join members, while others retain mmap-backed shards
 /// and answer queries over the union without constructing one monolith.
 pub trait TryFromCover<L: CollectionEncoding>: Sized {
-    /// Failure to construct the logical view from already validated members.
+    /// Failure to construct the logical view from the resolved cover.
     type Error: Error + Send + Sync + 'static;
 
-    /// Consume the exact attachment into its logical value.
-    fn try_from_cover<R>(attachment: CoverAttachment<L>, reader: &R) -> Result<Self, Self::Error>
+    /// Reconstruct the logical value named by `cover` through `snapshot`.
+    ///
+    /// `cover` is the actual physical cover selected by
+    /// [`Cover::resolve`](super::Cover::resolve), never an admitted semantic
+    /// cover paired with bytes from another support-equivalent decomposition.
+    fn try_from_cover<R>(
+        cover: &Cover<L>,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
-        R: BlobStoreGet + BlobStoreMeta;
+        R: BlobStoreGet;
 }

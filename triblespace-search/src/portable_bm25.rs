@@ -812,7 +812,7 @@ mod tests {
     use triblespace_core::inline::encodings::UnknownInline;
     use triblespace_core::query::{Constraint, Frontier, ProposalBuffer, VariableContext};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
 
     type TestIndex = PortableBM25Index<UnknownInline, UnknownInline>;
 
@@ -1057,16 +1057,16 @@ mod tests {
         let low: Blob<PortableBM25Blob> = (&left).to_blob();
         let high: Blob<PortableBM25Blob> = (&right).to_blob();
         let mut store = MemoryRepo::default();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
 
-        PortableBM25Blob::validate_member(&Fragment::empty(), &low, &reader).unwrap();
-        PortableBM25Blob::validate_member(&Fragment::empty(), &high, &reader).unwrap();
-        let joined = PortableBM25Blob::join_members(&Fragment::empty(), &low, &high, &reader)
+        PortableBM25Blob::validate_member(&Fragment::empty(), &low, &snapshot).unwrap();
+        PortableBM25Blob::validate_member(&Fragment::empty(), &high, &snapshot).unwrap();
+        let joined = PortableBM25Blob::join_members(&Fragment::empty(), &low, &high, &snapshot)
             .unwrap()
             .expect("portable BM25 has a direct canonical join");
 
         assert_eq!(joined.bytes.as_ref(), expected.bytes().as_ref());
-        PortableBM25Blob::validate_member(&Fragment::empty(), &joined, &reader).unwrap();
+        PortableBM25Blob::validate_member(&Fragment::empty(), &joined, &snapshot).unwrap();
     }
 
     #[cfg(feature = "succinct")]

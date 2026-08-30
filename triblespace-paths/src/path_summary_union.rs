@@ -34,7 +34,7 @@ use triblespace_core::collection::records::{
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     CollectionEncoding, CollectionHandle, CollectionMapping, CollectionOperationError, Cover,
-    CoverAttachment, TryFromCover, VerifyingKey,
+    TryFromCover, TryFromCoverError, VerifyingKey,
 };
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
@@ -206,7 +206,7 @@ impl CollectionEncoding for PathSummaryBlob {
         _reader: &R,
     ) -> Result<(), CollectionOperationError>
     where
-        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+        R: triblespace_core::repo::BlobStoreGet,
     {
         let automaton = automaton_from_descriptor(descriptor)?;
         PathSummaryBlob::decode(member.clone(), &automaton)
@@ -221,7 +221,7 @@ impl CollectionEncoding for PathSummaryBlob {
         _reader: &R,
     ) -> Result<Option<Blob<Self>>, CollectionOperationError>
     where
-        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+        R: triblespace_core::repo::BlobStoreGet,
     {
         let automaton = automaton_from_descriptor(descriptor)?;
         PathSummaryBlob::join(low, high, &automaton)
@@ -250,7 +250,7 @@ impl CollectionMapping<SimpleArchive, PathSummaryBlob> for RegularPathMapping {
         _reader: &R,
     ) -> Result<Blob<PathSummaryBlob>, CollectionOperationError>
     where
-        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+        R: triblespace_core::repo::BlobStoreGet,
     {
         derive_element(source, &self.automaton).map_err(|source| match source {
             RegularPathMappingError::Summary(PathSummaryBlobError::CapacityOverflow) => {
@@ -277,38 +277,39 @@ fn summary_operation_error(source: PathSummaryBlobError) -> CollectionOperationE
 /// Closure is intentionally not part of the collection law. Callers may keep
 /// this cheap view until they actually need to construct a [`PathIndex`].
 pub struct PathSummaryView {
-    attachment: CoverAttachment<PathSummaryBlob>,
+    cover: Cover<PathSummaryBlob>,
+    segments: Vec<(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)>,
 }
 
 impl PathSummaryView {
     /// Exact typed physical cover represented by this view.
     pub fn cover(&self) -> &Cover<PathSummaryBlob> {
-        self.attachment.cover()
+        &self.cover
     }
 
     /// Number of physical path-summary members retained by this view.
     pub fn len(&self) -> usize {
-        self.attachment.len()
+        self.segments.len()
     }
 
     /// Whether this view is the empty-cover bottom.
     pub fn is_empty(&self) -> bool {
-        self.attachment.is_empty()
+        self.segments.is_empty()
     }
 
     /// Borrow the ordered, already validated physical summary members.
     pub fn segments(&self) -> &[(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)] {
-        self.attachment.members()
+        &self.segments
     }
 
     /// Consume the view into its ordered, already validated physical members.
     pub fn into_segments(self) -> Vec<(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)> {
-        self.attachment.into_members()
+        self.segments
     }
 
     /// Consume just the physical summary blobs without forcing their union.
     pub fn into_blobs(self) -> impl ExactSizeIterator<Item = Blob<PathSummaryBlob>> {
-        self.attachment.into_blobs()
+        self.segments.into_iter().map(|(_, blob)| blob)
     }
 }
 
@@ -316,13 +317,24 @@ impl TryFromCover<PathSummaryBlob> for PathSummaryView {
     type Error = Infallible;
 
     fn try_from_cover<R>(
-        attachment: CoverAttachment<PathSummaryBlob>,
-        _reader: &R,
-    ) -> Result<Self, Self::Error>
+        cover: &Cover<PathSummaryBlob>,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
-        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+        R: triblespace_core::repo::BlobStoreGet,
     {
-        Ok(Self { attachment })
+        let mut segments = Vec::with_capacity(cover.len());
+        for handle in cover.members() {
+            let member = Handle::<PathSummaryBlob>::to_hash(handle);
+            let blob = snapshot
+                .get(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            segments.push((handle, blob));
+        }
+        Ok(Self {
+            cover: cover.clone(),
+            segments,
+        })
     }
 }
 

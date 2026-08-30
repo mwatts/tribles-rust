@@ -179,7 +179,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
     use triblespace_search::schemas::{put_embedding, Embedding};
 
     let mut rng = Rng(0xBAD_F00D + n_docs as u64);
@@ -196,7 +196,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
     }
     let naive = builder.build_naive();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
-    let reader = store.reader().unwrap();
+    let snapshot = store.snapshot().unwrap();
 
     // 100 probe handles sampled from the corpus. Probing from a
     // handle rather than a raw vector is the new API; callers
@@ -206,8 +206,8 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         .map(|i| handles[(i * 37 + 1) % handles.len()])
         .collect();
 
-    let naive_view = naive.attach(&reader).with_ef_search(50);
-    let succinct_view = succinct.attach(&reader).with_ef_search(50);
+    let naive_view = naive.attach(&snapshot).with_ef_search(50);
+    let succinct_view = succinct.attach(&snapshot).with_ef_search(50);
     for p in &probes {
         let _ = naive_view.candidates_above(*p, 0.5);
         let _ = succinct_view.candidates_above(*p, 0.5);

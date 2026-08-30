@@ -136,8 +136,8 @@ mod readme_example {
 
         storage.commit(library, &key, initial)?;
 
-        let snapshot = storage.snapshot(library)?;
-        let catalog = snapshot.facts();
+        let snapshot = storage.snapshot()?;
+        let catalog: TribleSet = library.read(&snapshot)?;
         let title = "Dune";
 
         for (f, l, quote) in find!(
@@ -154,7 +154,7 @@ mod readme_example {
                 }
             ])
         ) {
-            let quote: View<str> = snapshot.reader().get(quote)?;
+            let quote: View<str> = snapshot.get(quote)?;
             let quote = quote.as_ref();
             println!("'{quote}'\n - from {title} by {f} {l}.");
         }
@@ -178,7 +178,8 @@ mod readme_example {
             },
         )?;
 
-        let catalog = storage.snapshot(library)?.into_facts();
+        let snapshot = storage.snapshot()?;
+        let catalog: TribleSet = library.read(&snapshot)?;
         let mut names: Vec<String> = find!(
             first: String,
             pattern!(&catalog, [{ _?author @ literature::firstname: ?first }])

@@ -8,8 +8,8 @@ use triblespace::core::blob::Blob;
 use triblespace::core::blob::Bytes;
 use triblespace::core::repo::pile::GetBlobError;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::BlobStore;
 use triblespace::core::repo::BlobStorePut;
+use triblespace::core::repo::SnapshotSource;
 
 // New writes use the generic envelope format: a fixed 256-byte header with the
 // blob payload starting immediately after it. Corrupting the first payload byte
@@ -43,13 +43,13 @@ fn iterator_errors_on_corrupt_blob() {
 
     let mut pile: Pile = Pile::open(&path).unwrap();
     pile.amputate().unwrap();
-    let reader = pile.reader().unwrap();
-    let mut iter = reader.iter();
+    let snapshot = pile.snapshot().unwrap();
+    let mut iter = snapshot.iter();
     match iter.next() {
         Some(Err(GetBlobError::ValidationError(_))) => {}
         other => panic!("expected validation error, got {:?}", other),
     }
     drop(iter);
-    drop(reader);
+    drop(snapshot);
     pile.close().unwrap();
 }

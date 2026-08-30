@@ -257,8 +257,8 @@ mod tests {
     use crate::metadata;
     use crate::metadata::MetaDescribe;
     use crate::query::find;
-    use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;
+    use crate::repo::SnapshotSource;
     use crate::trible::TribleSet;
 
     use crate::inline::encodings::hash::Handle;
@@ -300,7 +300,7 @@ mod tests {
 
         let mut store: crate::blob::MemoryBlobStore = crate::blob::MemoryBlobStore::new();
         let handle = store.put(wasm).expect("put wasm module");
-        let reader = store.reader().expect("blob reader");
+        let snapshot = store.snapshot().expect("blob snapshot");
 
         let schema_id = crate::inline::encodings::shortstring::ShortString::id();
         let schema_entity = crate::id::ExclusiveId::force_ref(&schema_id);
@@ -308,7 +308,7 @@ mod tests {
             metadata::value_formatter: handle,
         };
 
-        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> = BlobCache::new(reader);
+        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> = BlobCache::new(snapshot);
         let formatter = formatter_cache
             .get(formatter_handle(&space, schema_id).expect("formatter handle"))
             .expect("formatter loaded");
@@ -378,8 +378,8 @@ mod tests {
         bundle += <Handle<UTF8String> as MetaDescribe>::describe();
 
         let (space, mut store) = bundle.into_facts_and_blobs();
-        let reader = store.reader().expect("blob reader");
-        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> = BlobCache::new(reader);
+        let snapshot = store.snapshot().expect("blob snapshot");
+        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> = BlobCache::new(snapshot);
         let limits = WasmLimits::default();
         let formatter_for = |schema| {
             formatter_cache

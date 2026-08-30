@@ -9,8 +9,8 @@ use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::BlobStoreMeta;
-use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStorePut;
+use triblespace::prelude::SnapshotSource;
 
 #[test]
 fn metadata_detects_corrupted_blob() {
@@ -23,7 +23,7 @@ fn metadata_detects_corrupted_blob() {
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
     let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
     pile.flush().unwrap();
-    assert!(pile.reader().unwrap().metadata(handle).unwrap().is_some());
+    assert!(pile.snapshot().unwrap().metadata(handle).unwrap().is_some());
     pile.close().unwrap();
 
     {
@@ -45,8 +45,8 @@ fn metadata_detects_corrupted_blob() {
 
     let mut reopened: Pile = Pile::open(&path).unwrap();
     reopened.amputate().unwrap();
-    let reader = reopened.reader().unwrap();
-    assert!(reader.metadata(handle).unwrap().is_none());
-    drop(reader);
+    let snapshot = reopened.snapshot().unwrap();
+    assert!(snapshot.metadata(handle).unwrap().is_none());
+    drop(snapshot);
     reopened.close().unwrap();
 }

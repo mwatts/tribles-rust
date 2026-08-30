@@ -228,8 +228,8 @@ fn entity_spread_propagates_blobs() {
     use triblespace_core::inline::Inline;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
-    use triblespace_core::repo::BlobStore;
     use triblespace_core::repo::BlobStoreGet;
+    use triblespace_core::repo::SnapshotSource;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
 
@@ -246,7 +246,7 @@ fn entity_spread_propagates_blobs() {
     // into Array<F32>'s describe-fragment blob store. If it didn't,
     // the handle would be unresolvable here.
     let mut blobs = frag.blobs().clone();
-    let reader = blobs.reader().expect("blob reader");
+    let reader = blobs.snapshot().expect("blob snapshot");
     let bytes: anybytes::View<str> = reader
         .get::<anybytes::View<str>, UTF8String>(f32_name_handle)
         .expect("F32 name blob is present in the fragment's blob store");

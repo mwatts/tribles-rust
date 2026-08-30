@@ -79,8 +79,9 @@ SYNC_TEAM reconciliation includes every resident collection record.
 Local publication is unconditional: any process may append a structurally
 valid self-signed commit to its own store. Reading applies authority. Commits by
 the descriptor authority are admitted automatically; delegated authors become
-visible only when the caller presents a root-to-leaf proof for exact
-`ACTION_WRITE` on this descriptor. Invalid explicit evidence fails loud.
+visible only when the same store snapshot contains a root-to-leaf proof for
+exact `ACTION_WRITE` on this descriptor. Invalid resident evidence grants
+nothing.
 
 ## 4. Build a self-contained fragment
 
@@ -137,12 +138,15 @@ append order is never an implicit winner.
 ## 6. Read one coherent snapshot
 
 ```rust,ignore
-let snapshot = storage.snapshot(library)?;
+let snapshot = storage.snapshot()?;
+let admitted = library.admitted(&snapshot)?;
+let physical = admitted.resolve(&snapshot)?;
+let facts = TribleSet::try_from_cover(&physical, &snapshot)?;
 let title = "Dune";
 
 for (first, last, quote) in find!(
     (first: String, last: String, quote),
-    pattern!(snapshot.facts(), [
+    pattern!(&facts, [
         { _?author @
             literature::firstname: ?first,
             literature::lastname: ?last
@@ -154,30 +158,25 @@ for (first, last, quote) in find!(
         }
     ])
 ) {
-    let quote: View<str> = snapshot.reader().get(quote)?;
+    let quote: View<str> = snapshot.get(quote)?;
     println!("'{}'\n - from {title} by {first} {last}.", quote.as_ref());
 }
 ```
 
-`snapshot()` admits the descriptor authority plus writers authorized by
-resident delegation proofs at one clock instant. It opens one target blob-reader
-view and materializes facts solely from the resulting exact payload cover. The
-returned `Snapshot<SimpleArchive, TribleSet, R>` keeps the logical fact view,
-its typed `Cover<SimpleArchive>`, and reader together. Consumers which also
-need the exact strictly verified COMMIT roots can opt into
-`storage.snapshot_with_admission(library)`; those roots are intentionally
-narrower than a later `storage.claims(&cover)` provenance query. A concurrent
-commit may appear on this call or a later call, but physically visible blobs
-from an unobserved commit cannot leak into the snapshot's admitted set.
+`storage.snapshot()` freezes blobs, collection records, capability proofs, and
+peer evidence at one coherent known prefix. `library.admitted(&snapshot)` then
+admits the descriptor authority plus writers authorized by proofs in that same
+observation and returns the exact semantic payload cover. `resolve` may replace
+that cover with any resident physical decomposition proven to have equal
+support, and `TryFromCover` constructs the logical value from exactly those
+members through the same immutable snapshot. `library.read(&snapshot)` is the
+convenience form of admission, resolution, and logical reconstruction.
 
-Use `storage.cover(library)` when only the exact payload frontier is needed. It
-discovers and verifies resident proofs, then scans native collection
-records, but it does not fetch or materialize member blobs. Duplicate signed
-claims for one payload collapse to one cover member; authorship, signatures,
-and metadata currently known to the store are reported separately by
-`storage.claims(&cover)`, which may validly return no claims after construction.
-The cover is the continuation passed to derived representations such as
-SuccinctArchive or path-index collections.
+Consumers which need the exact strictly verified COMMIT roots selected by the
+admission decision can call `library.admitted_with_claims(&snapshot)`. Later
+provenance for an exact cover is available through `cover.claims(&snapshot)`.
+Duplicate signed claims for one payload collapse to one cover member; authors,
+signatures, and metadata remain provenance rather than payload identity.
 
 ## 7. Choose durability explicitly
 
@@ -204,8 +203,8 @@ the chosen backend rather than collection policy.
   physical join; the store owns all I/O.
 - `store.commit` publishes one signed, independent member without conflating
   local storage with network authorization.
-- `store.snapshot` returns one coherent known-prefix view admitted by the
-  descriptor authority and valid resident delegation proofs.
+- `store.snapshot` freezes one coherent known-prefix store observation;
+  collection admission and materialization are pure reads over it.
 - Replicas converge by unioning records; they never elect a branch head.
 - Derived indexes are reproducible collection images, not alternate authority.
 

@@ -63,9 +63,11 @@ echo "bench.sh : subject -> $target" >&2
 SUBJECT="$(cd subjects/current && pwd -P)"
 FEATURES=""
 # legacy-repository: old subjects expose only mutable pin/Repository access to
-# their dataset ladder. Current subjects use the immutable PinSnapshotSource
-# path, so the compatibility adapter is selected only for history.
-if ! grep -q 'trait PinSnapshotSource' "$SUBJECT/triblespace-core/src/repo.rs" 2>/dev/null; then
+# their dataset ladder. Current subjects use both immutable pin snapshots and
+# one coherent store snapshot, so the compatibility adapter is selected when
+# either half of that observation surface is absent.
+if ! grep -q 'trait PinSnapshotSource' "$SUBJECT/triblespace-core/src/repo.rs" 2>/dev/null \
+  || ! grep -q 'trait SnapshotSource' "$SUBJECT/triblespace-core/src/repo.rs" 2>/dev/null; then
   FEATURES="$FEATURES legacy-repository"
 fi
 # gpu: the subject must actually ship the triblespace-gpu crate (F10 reads
@@ -75,7 +77,7 @@ if [ -d "$SUBJECT/triblespace-gpu" ] && grep -q '^gpu = ' "$SUBJECT/Cargo.toml" 
 fi
 # protocol-v2: F11 implements Constraint by hand, so it needs the
 # post-Candidates protocol (engine/owned-mask onward).
-if grep -q 'pub struct Candidates' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
+if grep -q '^pub .*Candidates' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
   FEATURES="$FEATURES protocol-v2"
 fi
 # frontier: propose/confirm take a batch of parent bindings rather than

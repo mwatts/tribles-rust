@@ -277,9 +277,9 @@ reloaded from a blob). Typical flow:
 ```rust
 let handle: Inline<Handle<SuccinctBM25Blob>> =
     load_current_index_handle(&kb)?;
-let reader = pile.reader()?;
+let snapshot = pile.snapshot()?;
 let idx: SuccinctBM25Index =
-    reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
+    snapshot.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
 let c = idx.matches(doc, &terms, 0.0);
 ```
 

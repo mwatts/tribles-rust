@@ -14,7 +14,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -55,8 +55,8 @@ fn succinct_bm25_survives_pile_round_trip() {
     // Reopen — exercises the actual on-disk load path.
     let mut pile = Pile::open(&pile_path).expect("reopen pile");
     pile.refresh().expect("refresh");
-    let reader = pile.reader().expect("reader");
-    let reloaded: SuccinctBM25Index = reader
+    let snapshot = pile.snapshot().expect("snapshot");
+    let reloaded: SuccinctBM25Index = snapshot
         .get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)
         .expect("get");
 
@@ -108,8 +108,8 @@ fn succinct_hnsw_survives_pile_round_trip() {
 
     let mut pile = Pile::open(&pile_path).expect("reopen pile");
     pile.refresh().expect("refresh");
-    let reader = pile.reader().expect("reader");
-    let reloaded: SuccinctHNSWIndex = reader
+    let snapshot = pile.snapshot().expect("snapshot");
+    let reloaded: SuccinctHNSWIndex = snapshot
         .get::<SuccinctHNSWIndex, SuccinctHNSWBlob>(handle)
         .expect("get");
 
@@ -121,8 +121,8 @@ fn succinct_hnsw_survives_pile_round_trip() {
     // full pipeline (constraint construction → engine eval →
     // result enumeration) survives the on-disk round-trip, not
     // just the leaf walk.
-    let original_view = original.attach(&reader);
-    let reloaded_view = reloaded.attach(&reader);
+    let original_view = original.attach(&snapshot);
+    let reloaded_view = reloaded.attach(&snapshot);
     let a: HashSet<Inline<Handle<Embedding>>> = find!(
         (n: Inline<Handle<Embedding>>),
         original_view.similar_to(probe, n, 0.4)

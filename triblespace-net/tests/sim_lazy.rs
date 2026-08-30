@@ -1,7 +1,7 @@
 //! Lazy-replication read path — deterministic simulation.
 //!
 //! Exercises the swarm-addressed on-demand fetch (`Peer::fetch_blob`,
-//! run inline via `host::NetCapability`) plus the `PeerReader`
+//! run inline via `host::NetCapability`) plus the `PeerSnapshot`
 //! fall-through and the transparent async read. The property under
 //! test: a node which does NOT hold a content blob can still obtain it
 //! from whoever in the swarm does — without every node eagerly
@@ -29,7 +29,7 @@ use triblespace_core::capability::{
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::{
     ACTION_WRITE, CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding,
-    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError,
+    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRead,
     CollectionRecord, CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR,
     KIND_COLLECTION_MAPPING, collection_authority, collection_mapping, collection_reach,
     collection_representation, collection_source, mapping_algorithm, simplearchive_union,
@@ -42,12 +42,11 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata;
 use triblespace_core::metadata::MetaDescribe;
-use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
     BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofStore,
-    WantRequest, WantStore,
+    SnapshotSource, WantRequest, WantStore,
 };
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
@@ -265,10 +264,16 @@ where
 }
 
 fn holds_locally(peer: &mut triblespace_net::peer::Peer<MemoryRepo>, hash: [u8; 32]) -> bool {
-    let reader = peer.reader().unwrap();
-    // Disambiguate: the sync, local-only `BlobStoreGet::get` (PeerReader
+    let snapshot = peer.snapshot().unwrap();
+    // Disambiguate: the sync, local-only `BlobStoreGet::get` (PeerSnapshot
     // also impls the async fetching `AsyncBlobStoreGet::get`).
-    BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash)).is_ok()
+    BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&snapshot, Inline::new(hash)).is_ok()
+}
+
+fn has_collection_record(peer: &triblespace_net::peer::Peer<MemoryRepo>, id: Id) -> bool {
+    let mut store = peer.store();
+    let snapshot = store.snapshot().unwrap();
+    snapshot.record(id).unwrap().is_some()
 }
 
 /// Count of wanted handles in the peer's store — the retention
@@ -326,7 +331,7 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             server.refresh();
             client.refresh();
-            if client.store().record(receipt.id()).unwrap().is_some() {
+            if has_collection_record(&client, receipt.id()) {
                 converged = true;
                 break;
             }
@@ -340,15 +345,16 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
         assert_eq!(stats.attempted, 0);
         assert_eq!(stats.fulfilled, 0);
         assert_eq!(stats.pending, 0);
-        assert_eq!(
-            client
-                .store()
+        let received = {
+            let mut store = client.store();
+            let snapshot = store.snapshot().unwrap();
+            snapshot
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![receipt]
-        );
+                .unwrap()
+        };
+        assert_eq!(received, vec![receipt]);
         assert_eq!(
             client
                 .store()
@@ -463,7 +469,9 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
         let source_collection = client_store
             .collection(lifecycle.source_descriptor().clone())
             .unwrap();
-        let source_cover = client_store.cover(source_collection).unwrap();
+        let source_cover = source_collection
+            .admitted(&client_store.snapshot().unwrap())
+            .unwrap();
 
         let lower_a = Blob::<NetworkTestBlob>::new(vec![0x31].into());
         let lower_b = Blob::<NetworkTestBlob>::new(vec![0x32].into());
@@ -502,7 +510,7 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
             server.refresh();
         }
         assert!(
-            client.store().record(marker.id()).unwrap().is_none(),
+            !has_collection_record(&client, marker.id()),
             "precondition: the client has not admitted the pending marker",
         );
 
@@ -511,7 +519,7 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
             .expect("the exact empty bottom is infallible");
         assert!(cover.is_empty());
         assert!(
-            client.store().record(marker.id()).unwrap().is_none(),
+            !has_collection_record(&client, marker.id()),
             "empty attachment must not refresh or scan network inventory",
         );
 
@@ -519,7 +527,7 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
         // path admits the record that was already waiting at the boundary.
         client.refresh();
         assert!(
-            client.store().record(marker.id()).unwrap().is_some(),
+            has_collection_record(&client, marker.id()),
             "the marker was genuinely pending before the empty attachment",
         );
     });
@@ -586,7 +594,9 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
             key(0xE4).verifying_key(),
             source_collection.handle(),
         );
-        let source_cover = serving.cover(source_collection).unwrap();
+        let source_cover = source_collection
+            .admitted(&serving.snapshot().unwrap())
+            .unwrap();
 
         let mut conflicting = Pile::open(&conflicting_path).unwrap();
         conflicting.bind_store_scope(conflicting_team).unwrap();
@@ -655,7 +665,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             derive_test_target(&sources[1]),
         ];
         let mut client_store = empty_store();
-        let reader = client_store.reader().unwrap();
+        let reader = client_store.snapshot().unwrap();
         let upper =
             NetworkTestBlob::join_members(&target_descriptor, &targets[0], &targets[1], &reader)
                 .unwrap()
@@ -696,7 +706,9 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
                 source_collection.handle(),
             );
         }
-        let source_cover = client_store.cover(source_collection).unwrap();
+        let source_cover = source_collection
+            .admitted(&client_store.snapshot().unwrap())
+            .unwrap();
         assert_eq!(source_cover.len(), commits.len());
 
         let mut server_store = empty_store();
@@ -750,10 +762,10 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             server.refresh();
             client.refresh();
-            if client.store().record(merge.id()).unwrap().is_some()
+            if has_collection_record(&client, merge.id())
                 && derives
                     .iter()
-                    .all(|derive| client.store().record(derive.id()).unwrap().is_some())
+                    .all(|derive| has_collection_record(&client, derive.id()))
             {
                 records_converged = true;
                 break;
@@ -785,14 +797,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        assert_eq!(
-            cover
-                .members()
-                .iter()
-                .map(|(data, _)| *data)
-                .collect::<Vec<_>>(),
-            expected,
-        );
+        assert_eq!(cover.members().collect::<Vec<_>>(), expected,);
         assert!(
             !holds_locally(&mut client, upper.get_handle().raw),
             "stale upper offer is not manufactured locally",
@@ -818,7 +823,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
 /// The full lazy-read invariant: a node B that does not hold a content
 /// blob fetches it from the swarm and lands it in its store under a
 /// **want** — the demand-born retention marker — after which the
-/// `PeerReader` serves it locally. This is "lazy replication" in one
+/// `PeerSnapshot` serves it locally. This is "lazy replication" in one
 /// test: B reads content it never eagerly replicated and retains it as
 /// a wanted resident.
 #[test]
@@ -972,9 +977,8 @@ fn lazy_store_eviction_is_safe_and_refetches() {
                     blobs[0].1,
                 )))
                 .unwrap();
-            let retained: Vec<Inline<Handle<UnknownBlob>>> = store
-                .reader()
-                .unwrap()
+            let snapshot = store.snapshot().unwrap();
+            let retained: Vec<Inline<Handle<UnknownBlob>>> = snapshot
                 .blobs()
                 .filter_map(Result::ok)
                 .map(|info| info.handle)
@@ -1084,7 +1088,7 @@ fn async_lazy_read_awaits_swarm_and_lands_wanted() {
 
 /// Transparent async read through the trait surface: a *generic*
 /// `AsyncBlobStoreGet` consumer calls `reader.get(handle).await` on a
-/// blob B doesn't hold, and the `PeerReader` fetches it from the swarm
+/// blob B doesn't hold, and the `PeerSnapshot` fetches it from the swarm
 /// and lands it wanted in the shared store — no knowledge that
 /// it's a `Peer`. This is the "lazy replication for free" payoff of
 /// increment 5b.
@@ -1127,7 +1131,7 @@ fn transparent_async_get_fetches_through_reader() {
 
         // A generic async reader: it only knows `AsyncBlobStoreGet`.
         let got: anybytes::Bytes = {
-            let reader = peer_b.reader().unwrap();
+            let reader = peer_b.snapshot().unwrap();
             let mut fut = Box::pin(AsyncBlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(
                 &reader,
                 Inline::new(hash),
@@ -1718,11 +1722,11 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
             "precondition: B lacks the blob"
         );
 
-        // Two independent readers off the same Peer — each owns a clone
+        // Two independent snapshots off the same Peer — each owns a clone
         // of the store snapshot and a fetch capability into the *same*
-        // shared store. (reader() borrows &mut only transiently.)
-        let reader1 = peer_b.reader().unwrap();
-        let reader2 = peer_b.reader().unwrap();
+        // shared store. (`snapshot()` borrows `&mut` only transiently.)
+        let reader1 = peer_b.snapshot().unwrap();
+        let reader2 = peer_b.snapshot().unwrap();
 
         let (got1, got2) = {
             let mut f1 = Box::pin(AsyncBlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(

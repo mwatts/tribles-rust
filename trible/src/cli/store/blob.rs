@@ -11,11 +11,11 @@ use triblespace_core::inline::encodings::hash::Blake3;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::async_store::Blocking;
 use triblespace_core::repo::objectstore::ObjectStoreRemote;
-use triblespace_core::repo::BlobStore;
 use triblespace_core::repo::BlobStoreForget;
 use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::repo::BlobStoreList;
 use triblespace_core::repo::BlobStoreMeta;
+use triblespace_core::repo::SnapshotSource;
 use url::Url;
 
 #[derive(Parser)]
@@ -65,11 +65,11 @@ pub fn run(cmd: Command) -> Result<()> {
             // Prefer the repo-managed blob listing. Do not fall back to raw
             // listing automatically — bare files were a bug, not a feature.
             let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
-            let reader = remote
-                .reader()
-                .map_err(|e| anyhow::anyhow!("remote reader error: {e:?}"))?;
+            let snapshot = remote
+                .snapshot()
+                .map_err(|e| anyhow::anyhow!("remote snapshot error: {e:?}"))?;
 
-            for item_res in reader.blobs() {
+            for item_res in snapshot.blobs() {
                 match item_res {
                     Ok(info) => {
                         let hash: triblespace_core::inline::Inline<
@@ -110,17 +110,16 @@ pub fn run(cmd: Command) -> Result<()> {
         } => {
             use std::io::Write;
 
-            use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreGet;
 
             let url = Url::parse(&url)?;
             let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let hash_val = parse_blob_handle(&handle)?;
             let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> = hash_val.into();
-            let reader = remote
-                .reader()
-                .map_err(|e| anyhow::anyhow!("remote reader error: {e:?}"))?;
-            let bytes: Bytes = reader.get(handle_val)?;
+            let snapshot = remote
+                .snapshot()
+                .map_err(|e| anyhow::anyhow!("remote snapshot error: {e:?}"))?;
+            let bytes: Bytes = snapshot.get(handle_val)?;
             let mut file = File::create(&output)?;
             file.write_all(&bytes)?;
             Ok(())
@@ -136,10 +135,10 @@ pub fn run(cmd: Command) -> Result<()> {
             let hash_val = parse_blob_handle(&handle)?;
             let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> = hash_val.into();
             let handle_str: String = hash_val.clone().from_inline();
-            let reader = remote
-                .reader()
-                .map_err(|e| anyhow::anyhow!("remote reader error: {e:?}"))?;
-            let blob: Blob<UnknownBlob> = reader.get(handle_val)?;
+            let snapshot = remote
+                .snapshot()
+                .map_err(|e| anyhow::anyhow!("remote snapshot error: {e:?}"))?;
+            let blob: Blob<UnknownBlob> = snapshot.get(handle_val)?;
 
             let (_store, base) = parse_url(&url)?;
             let handle_hex = handle_str
@@ -147,7 +146,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 .next_back()
                 .ok_or_else(|| anyhow::anyhow!("invalid handle"))?;
             let _path = base.join("blobs").join(handle_hex);
-            let meta = reader.metadata(handle_val.clone())?;
+            let meta = snapshot.metadata(handle_val.clone())?;
             let length = meta.as_ref().map(|m| m.length).unwrap_or_default();
             let time_str = if let Some(m) = meta {
                 let secs = (m.timestamp / 1000) as i64;

@@ -120,7 +120,7 @@ where
 pub fn plan_collection_retention<D, R>(
     records: &DiscoveredCollectionRecords,
     resolution: &CollectionResolution<D>,
-    reader: &R,
+    snapshot: &R,
 ) -> Result<RetentionRoots, CollectionRetentionError<<R as BlobStoreMeta>::MetaError>>
 where
     R: BlobStoreMeta + ?Sized,
@@ -133,7 +133,7 @@ where
             continue;
         }
 
-        if !require_resident(reader, claim.collection())? {
+        if !require_resident(snapshot, claim.collection())? {
             return Err(CollectionRetentionError::MissingDescriptor {
                 collection: claim.collection(),
             });
@@ -141,7 +141,7 @@ where
         roots.retain_recursive(claim.collection());
 
         let data_handle = Handle::<UnknownBlob>::from_hash(claim.data());
-        if !require_resident(reader, data_handle)? {
+        if !require_resident(snapshot, data_handle)? {
             return Err(CollectionRetentionError::MissingCommitData {
                 commit: claim.id(),
                 data: claim.data(),
@@ -149,7 +149,7 @@ where
         }
         roots.retain_recursive(data_handle);
 
-        if !require_resident(reader, claim.metadata())? {
+        if !require_resident(snapshot, claim.metadata())? {
             return Err(CollectionRetentionError::MissingCommitMetadata {
                 commit: claim.id(),
                 metadata: claim.metadata(),
@@ -162,7 +162,7 @@ where
 }
 
 fn require_resident<R, S>(
-    reader: &R,
+    snapshot: &R,
     handle: Inline<Handle<S>>,
 ) -> Result<bool, CollectionRetentionError<<R as BlobStoreMeta>::MetaError>>
 where
@@ -170,7 +170,7 @@ where
     S: BlobEncoding + 'static,
     Handle<S>: InlineEncoding,
 {
-    reader
+    snapshot
         .metadata(handle)
         .map(|entry| entry.is_some())
         .map_err(|source| CollectionRetentionError::Metadata {
@@ -213,7 +213,7 @@ mod tests {
     use crate::inline::encodings::hash::{Blake3, Hash};
     use crate::macros::entity;
     use crate::metadata;
-    use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet, BlobStoreKeep};
+    use crate::repo::{memoryrepo::MemoryRepo, BlobStoreGet, BlobStoreKeep, SnapshotSource};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     /// One named root under a fixed team of one.
@@ -369,17 +369,17 @@ mod tests {
         let metadata_handle = metadata.get_handle();
         let commit = insert_record_fixture(&mut store, &descriptor, content, metadata, &key);
 
-        let records = discover_collection_records(&mut store).unwrap();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
         let authorized = BTreeSet::from([commit.id()]);
         let resolution = resolve_collection_semantics(
             &records,
             &lineage_from_derives(&records),
             &authorized,
-            |request| validate_union(&reader, &BTreeSet::new(), request),
+            |request| validate_union(&snapshot, &BTreeSet::new(), request),
         )
         .unwrap();
-        let roots = plan_collection_retention(&records, &resolution, &reader).unwrap();
+        let roots = plan_collection_retention(&records, &resolution, &snapshot).unwrap();
         assert_eq!(roots.direct().len(), 0);
         let recursive: BTreeSet<_> = roots.recursive().collect();
         assert_eq!(
@@ -390,14 +390,14 @@ mod tests {
                 metadata_handle.transmute(),
             ])
         );
-        let keep = roots.expanded(&reader);
+        let keep = roots.expanded(&snapshot);
 
         store.keep(keep);
-        let retained_records = discover_collection_records(&mut store).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let retained_records = discover_collection_records(&snapshot).unwrap();
         assert_eq!(retained_records.commits(), &[commit]);
-        let reader = store.reader().unwrap();
         let retained_descriptor: Blob<SimpleArchive> =
-            reader.get(identity_for_tests(&descriptor)).unwrap();
+            snapshot.get(identity_for_tests(&descriptor)).unwrap();
         assert_eq!(
             <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
                 retained_descriptor
@@ -405,19 +405,19 @@ mod tests {
             .unwrap(),
             *descriptor.facts()
         );
-        assert!(reader
+        assert!(snapshot
             .get::<Blob<SimpleArchive>, _>(Handle::from_hash(commit.data()))
             .is_ok());
-        assert!(reader
+        assert!(snapshot
             .get::<Blob<SimpleArchive>, _>(commit.metadata())
             .is_ok());
-        assert!(reader
+        assert!(snapshot
             .get::<Blob<UTF8String>, _>(content_text_handle)
             .is_ok());
-        assert!(reader
+        assert!(snapshot
             .get::<Blob<UTF8String>, _>(metadata_text_handle)
             .is_ok());
-        assert!(reader.get::<Blob<UTF8String>, _>(orphan_handle).is_err());
+        assert!(snapshot.get::<Blob<UTF8String>, _>(orphan_handle).is_err());
     }
 
     #[test]
@@ -495,19 +495,19 @@ mod tests {
             CollectionStore::insert(&mut store, CollectionRecord::Derive(*record)).unwrap();
         }
 
-        let records = discover_collection_records(&mut store).unwrap();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
 
         let unauthorized = resolve_collection_semantics(
             &records,
             &lineage_from_derives(&records),
             &BTreeSet::new(),
-            |request| validate_union_and_derives(&reader, request),
+            |request| validate_union_and_derives(&snapshot, request),
         )
         .unwrap();
         assert!(unauthorized.admitted_claims().contains(&active_merge.id()));
         assert!(unauthorized.admitted_claims().contains(&active_derive.id()));
-        let empty = plan_collection_retention(&records, &unauthorized, &reader).unwrap();
+        let empty = plan_collection_retention(&records, &unauthorized, &snapshot).unwrap();
         assert_eq!(empty.direct().len(), 0);
         assert_eq!(empty.recursive().len(), 0);
 
@@ -516,7 +516,7 @@ mod tests {
             &records,
             &lineage_from_derives(&records),
             &authorized,
-            |request| validate_union_and_derives(&reader, request),
+            |request| validate_union_and_derives(&snapshot, request),
         )
         .unwrap();
         for active in [active_merge.id(), active_derive.id()] {
@@ -528,7 +528,7 @@ mod tests {
             assert!(resolution.activation_pending().contains(&orphan));
         }
 
-        let roots = plan_collection_retention(&records, &resolution, &reader).unwrap();
+        let roots = plan_collection_retention(&records, &resolution, &snapshot).unwrap();
         assert_eq!(roots.direct().len(), 0);
         let recursive: BTreeSet<_> = roots.recursive().collect();
         assert_eq!(
@@ -541,7 +541,7 @@ mod tests {
             ])
         );
 
-        let keep = roots.expanded(&reader);
+        let keep = roots.expanded(&snapshot);
         for cache_blob in [
             &active_merge_result,
             &active_derive_output,
@@ -574,23 +574,23 @@ mod tests {
         ));
         complete.blobs.insert(content.clone());
         complete.blobs.insert(metadata.clone());
-        let records = discover_collection_records(&mut complete).unwrap();
-        let complete_reader = complete.reader().unwrap();
+        let complete_snapshot = complete.snapshot().unwrap();
+        let records = discover_collection_records(&complete_snapshot).unwrap();
         let resolution = resolve_collection_semantics(
             &records,
             &lineage_from_derives(&records),
             &BTreeSet::from([commit.id()]),
-            |request| validate_union(&complete_reader, &BTreeSet::new(), request),
+            |request| validate_union(&complete_snapshot, &BTreeSet::new(), request),
         )
         .unwrap();
-        plan_collection_retention(&records, &resolution, &complete_reader).unwrap();
+        plan_collection_retention(&records, &resolution, &complete_snapshot).unwrap();
 
         let mut missing_descriptor = MemoryBlobStore::new();
         missing_descriptor.insert(content.clone());
         missing_descriptor.insert(metadata.clone());
-        let reader = missing_descriptor.reader().unwrap();
+        let snapshot = missing_descriptor.snapshot().unwrap();
         assert!(matches!(
-            plan_collection_retention(&records, &resolution, &reader),
+            plan_collection_retention(&records, &resolution, &snapshot),
             Err(CollectionRetentionError::MissingDescriptor { collection })
                 if collection == identity_for_tests(&descriptor)
         ));
@@ -600,9 +600,9 @@ mod tests {
             descriptor.facts().clone(),
         ));
         missing_data.insert(metadata.clone());
-        let reader = missing_data.reader().unwrap();
+        let snapshot = missing_data.snapshot().unwrap();
         assert!(matches!(
-            plan_collection_retention(&records, &resolution, &reader),
+            plan_collection_retention(&records, &resolution, &snapshot),
             Err(CollectionRetentionError::MissingCommitData { commit: id, data: missing })
                 if id == commit.id() && missing == data(&content)
         ));
@@ -612,9 +612,9 @@ mod tests {
             descriptor.facts().clone(),
         ));
         missing_metadata.insert(content);
-        let reader = missing_metadata.reader().unwrap();
+        let snapshot = missing_metadata.snapshot().unwrap();
         assert!(matches!(
-            plan_collection_retention(&records, &resolution, &reader),
+            plan_collection_retention(&records, &resolution, &snapshot),
             Err(CollectionRetentionError::MissingCommitMetadata {
                 commit: id,
                 metadata: missing,

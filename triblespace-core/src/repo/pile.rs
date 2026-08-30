@@ -49,7 +49,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::store::selectors_match_record;
+use crate::collection::store::{selectors_match_record, CollectionRead};
 use crate::collection::{
     CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
     CollectionRecordSelector, CollectionStore,
@@ -67,9 +67,11 @@ use crate::patch::{IdentitySchema, XorSip128, PATCH};
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
 use crate::repo::offer::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
-use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
-use crate::repo::proof::CapabilityProofStore;
-use crate::repo::{StoreScope, StoreScopeError, WantRequest, WANT_REQUEST_BYTES_LEN};
+use crate::repo::peer::{PeerEvidence, PeerRead, PeerStore, PEER_EVIDENCE_BYTES_LEN};
+use crate::repo::proof::{CapabilityProofRead, CapabilityProofStore};
+use crate::repo::{
+    SnapshotSource, StoreScope, StoreScopeError, WantRequest, WANT_REQUEST_BYTES_LEN,
+};
 
 mod record_kind;
 pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
@@ -294,7 +296,7 @@ fn compute_validation_state(
     classify_validation(Hash::<Blake3>::digest(bytes), expected)
 }
 
-/// Sparse validation state shared by a pile and all reader snapshots derived
+/// Sparse validation state shared by a pile and all store snapshots derived
 /// from it. Replay itself leaves this empty; entries appear only when a blob is
 /// read or an on-disk duplicate challenges an earlier candidate.
 ///
@@ -2373,7 +2375,7 @@ pub struct Pile {
     /// Positive peer-routing evidence keyed by its complete canonical body.
     peers: PeerEvidenceIndex,
     /// Grow-only local willingness to serve artifacts. Offers are deliberately
-    /// absent from [`super::StoreRevision`] and never retain their blobs.
+    /// absent from [`PileSnapshot`] and never retain their blobs.
     artifact_offers: ArtifactOfferSnapshot,
     /// Every monotone physical-store team-scope assertion observed on disk.
     /// More than one distinct key is retained as a semantic conflict rather
@@ -2406,37 +2408,43 @@ fn padding_for_blob(blob_size: usize) -> usize {
 }
 
 #[derive(Debug, Clone)]
-/// Read-only handle referencing a [`Pile`].
+/// One immutable, coherent observation of a [`Pile`].
 ///
-/// Multiple `PileReader` instances can coexist and provide concurrent access to
-/// the same underlying pile data.
-pub struct PileReader {
+/// Blob bytes, collection records, capability proofs, and peer evidence all
+/// come from the same validated pile prefix. Persistent PATCH roots make both
+/// cloning and [`StoreSnapshot::changes_since`](super::StoreSnapshot::changes_since)
+/// constant-time in the number of semantic components.
+pub struct PileSnapshot {
     mmap: Arc<MmapRaw>,
     covered_len: usize,
+    opaque_records: usize,
     blobs: PileBlobIndex,
     validations: ValidationCache,
+    collection_records: CollectionRecordIndex,
+    capability_proofs: CapabilityProofIndex,
+    peers: PeerEvidenceIndex,
 }
 
-impl PartialEq for PileReader {
-    fn eq(&self, other: &Self) -> bool {
-        self.blobs == other.blobs
-    }
-}
-
-impl Eq for PileReader {}
-
-impl PileReader {
+impl PileSnapshot {
     fn new(
         mmap: Arc<MmapRaw>,
         covered_len: usize,
+        opaque_records: usize,
         blobs: PileBlobIndex,
         validations: ValidationCache,
+        collection_records: CollectionRecordIndex,
+        capability_proofs: CapabilityProofIndex,
+        peers: PeerEvidenceIndex,
     ) -> Self {
         Self {
             mmap,
             covered_len,
+            opaque_records,
             blobs,
             validations,
+            collection_records,
+            capability_proofs,
+            peers,
         }
     }
 
@@ -2459,6 +2467,11 @@ impl PileReader {
         }
     }
 
+    /// Number of unknown generic-envelope records in this exact observation.
+    pub(crate) const fn opaque_record_count(&self) -> usize {
+        self.opaque_records
+    }
+
     /// Returns unvalidated listing metadata for a resident blob.
     ///
     /// This reads only the already-accepted pile record header. Callers that
@@ -2479,7 +2492,7 @@ impl PileReader {
     // metadata moved into BlobStoreMeta impl below
 }
 
-impl BlobStoreGet for PileReader {
+impl BlobStoreGet for PileSnapshot {
     type GetError<E: Error + Send + Sync + 'static> = GetBlobError<E>;
 
     fn get<T, S>(
@@ -2518,97 +2531,46 @@ impl BlobStoreGet for PileReader {
     }
 }
 
-impl super::BlobChildren for PileReader {}
+impl super::BlobChildren for PileSnapshot {}
 
-impl BlobStore for Pile {
-    type Reader = PileReader;
-    type ReaderError = ReadError;
-
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.refresh()?;
-        Ok(PileReader::new(
-            self.mmap.clone(),
-            self.applied_length,
-            self.blobs.clone(),
-            self.validations.clone(),
-        ))
-    }
-}
-
-/// O(1)-clone invalidation token for the sync-visible sets in a [`Pile`].
-///
-/// Operational WANTs, artifact offers, legacy branches, and opaque records do
-/// not alter semantic inventory bits. Their physical append boundary still
-/// participates in the local reader token so a replaced mmap/access lease is
-/// not pinned indefinitely behind otherwise identical blob membership.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PileRevision {
-    blobs: PileBlobIndex,
-    reader: PileReaderRevision,
-    collection_records: CollectionRecordIndex,
-    capability_proofs: CapabilityProofIndex,
-    peers: PeerEvidenceIndex,
-}
-
-#[derive(Clone)]
-struct PileReaderRevision {
-    mmap: Arc<MmapRaw>,
-    covered_len: usize,
-}
-
-impl PartialEq for PileReaderRevision {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.mmap, &other.mmap) && self.covered_len == other.covered_len
-    }
-}
-
-impl Eq for PileReaderRevision {}
-
-impl PileRevision {
-    pub(crate) fn changes_since(&self, previous: &Self) -> super::StoreRevisionChanges {
-        let mut changes = super::StoreRevisionChanges::NONE;
-        if previous.blobs != self.blobs {
-            changes = changes.union(super::StoreRevisionChanges::BLOBS);
-        }
-        if previous.reader != self.reader {
-            changes = changes.union(super::StoreRevisionChanges::BLOB_READER);
+impl super::StoreSnapshot for PileSnapshot {
+    fn changes_since(&self, previous: &Self) -> super::StoreChanges {
+        let mut changes = super::StoreChanges::NONE;
+        // PATCH equality intentionally ignores attached values. Root sharing
+        // additionally notices same-handle candidate healing, where a corrupt
+        // record offset is replaced without changing blob membership.
+        if !previous.blobs.shares_root(&self.blobs) {
+            changes = changes.union(super::StoreChanges::BLOBS);
         }
         if previous.collection_records != self.collection_records {
-            changes = changes.union(super::StoreRevisionChanges::COLLECTION_RECORDS);
+            changes = changes.union(super::StoreChanges::COLLECTION_RECORDS);
         }
         if previous.capability_proofs != self.capability_proofs {
-            changes = changes.union(super::StoreRevisionChanges::CAPABILITY_PROOFS);
+            changes = changes.union(super::StoreChanges::CAPABILITY_PROOFS);
         }
         if previous.peers != self.peers {
-            changes = changes.union(super::StoreRevisionChanges::PEERS);
+            changes = changes.union(super::StoreChanges::PEERS);
         }
         changes
     }
 }
 
-impl super::StoreRevision for Pile {
-    type Revision = PileRevision;
-    type Error = ReadError;
+impl super::SnapshotSource for Pile {
+    type Snapshot = PileSnapshot;
+    type SnapshotError = ReadError;
 
-    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.refresh()?;
-        Ok(PileRevision {
-            blobs: self.blobs.clone(),
-            reader: PileReaderRevision {
-                mmap: self.mmap.clone(),
-                covered_len: self.applied_length,
-            },
-            collection_records: self.collection_records.clone(),
-            capability_proofs: self.capability_proofs.clone(),
-            peers: self.peers.clone(),
-        })
-    }
-
-    fn revision_changes(
-        previous: &Self::Revision,
-        current: &Self::Revision,
-    ) -> super::StoreRevisionChanges {
-        current.changes_since(previous)
+        Ok(PileSnapshot::new(
+            self.mmap.clone(),
+            self.applied_length,
+            self.opaque_records,
+            self.blobs.clone(),
+            self.validations.clone(),
+            self.collection_records.clone(),
+            self.capability_proofs.clone(),
+            self.peers.clone(),
+        ))
     }
 }
 
@@ -3373,13 +3335,12 @@ impl crate::repo::StorageFlush for Pile {
 }
 
 use super::BlobInfo;
-use super::BlobStore;
 use super::BlobStoreGet;
 use super::BlobStoreList;
 use super::BlobStorePut;
 use super::WantStore;
 
-/// Iterator returned by [`PileReader::iter`].
+/// Iterator returned by [`PileSnapshot::iter`].
 ///
 /// Iterates over all `(Handle, Blob)` pairs currently stored in the pile.
 /// Owned iterator over all blobs currently stored in the pile. This collects
@@ -3422,7 +3383,7 @@ impl Iterator for PileBlobStoreIter {
 
 /// Adapter that yields blob information from an owned PATCH snapshot.
 pub struct PileBlobStoreListIter {
-    reader: PileReader,
+    snapshot: PileSnapshot,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry, XorSip128>,
 }
 
@@ -3433,19 +3394,19 @@ impl Iterator for PileBlobStoreListIter {
         let key = self.inner.next()?;
         let hash = Inline::<Hash<Blake3>>::new(key);
         let handle = hash.into();
-        Some(Ok(self.reader.unvalidated_blob_info(handle).expect(
+        Some(Ok(self.snapshot.unvalidated_blob_info(handle).expect(
             "key from PATCH iterator must resolve in the same snapshot",
         )))
     }
 }
 
-impl BlobStoreList for PileReader {
+impl BlobStoreList for PileSnapshot {
     type Err = GetBlobError<Infallible>;
     type Iter<'a> = PileBlobStoreListIter;
 
     fn blobs(&self) -> Self::Iter<'_> {
         PileBlobStoreListIter {
-            reader: self.clone(),
+            snapshot: self.clone(),
             inner: self.blobs.clone().into_iter(),
         }
     }
@@ -3466,10 +3427,10 @@ impl BlobStoreList for PileReader {
         Ok(self.unvalidated_blob_info(*handle.as_transmute()))
     }
 
-    /// Cheap PATCH-level set difference between two immutable reader snapshots.
+    /// Cheap PATCH-level set difference between two immutable store snapshots.
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
         PileBlobStoreListIter {
-            reader: self.clone(),
+            snapshot: self.clone(),
             inner: self.blobs.difference(&old.blobs).into_iter(),
         }
     }
@@ -3584,6 +3545,16 @@ impl Pile {
         Ok(self.opaque_records)
     }
 
+    /// Number of opaque records in the prefix most recently replayed into
+    /// this `Pile`, without performing another refresh.
+    ///
+    /// Physical rewrite guards use this immediately after another operation
+    /// refreshed and validated related state (notably [`StoreScope::store_scope`])
+    /// so both decisions come from one exact replayed prefix.
+    pub(crate) const fn observed_opaque_record_count(&self) -> usize {
+        self.opaque_records
+    }
+
     /// Copy every byte-distinct inert legacy V3 collection header into
     /// `destination`.
     ///
@@ -3647,13 +3618,11 @@ impl Pile {
     }
 }
 
-impl CollectionStore for Pile {
+impl CollectionRead for PileSnapshot {
     type RecordsError = ReadError;
-    type InsertError = CollectionInsertError;
     type RecordIter<'a> = PileCollectionRecordIter;
 
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.refresh()?;
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         let keys = self.collection_records.clone().into_iter_ordered();
         Ok(PileCollectionRecordIter {
             keys,
@@ -3661,19 +3630,17 @@ impl CollectionStore for Pile {
         })
     }
 
-    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.refresh()?;
+    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
         Ok(self.collection_records.get(&id.raw()).copied())
     }
 
     fn select_records(
-        &mut self,
+        &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
-        self.refresh()?;
         Ok(self
             .collection_records
             .iter_ordered()
@@ -3686,6 +3653,10 @@ impl CollectionStore for Pile {
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
     }
+}
+
+impl CollectionStore for Pile {
+    type InsertError = CollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         let id = record.id();
@@ -3724,13 +3695,11 @@ impl CollectionStore for Pile {
     }
 }
 
-impl CapabilityProofStore for Pile {
+impl CapabilityProofRead for PileSnapshot {
     type ProofsError = ReadError;
-    type InsertError = CapabilityProofInsertError;
     type ProofIter<'a> = PileCapabilityProofIter;
 
-    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-        self.refresh()?;
+    fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
         let keys = self.capability_proofs.clone().into_iter_ordered();
         Ok(PileCapabilityProofIter {
             mmap: self.mmap.clone(),
@@ -3739,11 +3708,7 @@ impl CapabilityProofStore for Pile {
         })
     }
 
-    fn proof(
-        &mut self,
-        id: CapabilityProofId,
-    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-        self.refresh()?;
+    fn proof(&self, id: CapabilityProofId) -> Result<Option<CapabilityProof>, Self::ProofsError> {
         let Some(entry) = self.capability_proofs.get(&id.raw) else {
             return Ok(None);
         };
@@ -3760,6 +3725,10 @@ impl CapabilityProofStore for Pile {
                     .saturating_sub(std::mem::size_of::<CapabilityProofRecordPrefix>()),
             })
     }
+}
+
+impl CapabilityProofStore for Pile {
+    type InsertError = CapabilityProofInsertError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         let bytes = proof.as_bytes();
@@ -3828,17 +3797,19 @@ impl CapabilityProofStore for Pile {
     }
 }
 
-impl PeerStore for Pile {
+impl PeerRead for PileSnapshot {
     type PeersError = ReadError;
-    type InsertError = PileWriteError;
     type PeerIter<'a> = PilePeerIter;
 
-    fn peers<'a>(&'a mut self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
-        self.refresh()?;
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
         Ok(PilePeerIter {
             inner: self.peers.clone().into_iter_ordered(),
         })
     }
+}
+
+impl PeerStore for Pile {
+    type InsertError = PileWriteError;
 
     fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
         self.file.lock()?;
@@ -4393,7 +4364,7 @@ impl WantStore for Pile {
     }
 }
 
-impl crate::repo::BlobStoreMeta for PileReader {
+impl crate::repo::BlobStoreMeta for PileSnapshot {
     type MetaError = Infallible;
 
     fn metadata<S>(
@@ -4739,7 +4710,7 @@ pub struct PileRewriteStats {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PileRewriteError {
-    /// The source could not produce a coherent reader snapshot.
+    /// The source could not produce a coherent store snapshot.
     Source(ReadError),
     /// The source contains opaque records, so a semantic rewrite could not
     /// prove that it would preserve their bytes and retention laws.
@@ -4858,8 +4829,12 @@ impl Pile {
         explicit: &super::RetentionRoots,
         wants: WantRewritePolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
+        let reader = self.snapshot().map_err(PileRewriteError::Source)?;
+        // Scope is checked after the source observation. `store_scope`
+        // refreshes once more and fails closed if a conflicting assertion was
+        // appended while the snapshot was being frozen; checking it first
+        // could otherwise launder a conflicted source into a valid rewrite.
         let store_scope = self.store_scope().map_err(PileRewriteError::StoreScope)?;
-        let reader = self.reader().map_err(PileRewriteError::Source)?;
         if self.opaque_records != 0 {
             return Err(PileRewriteError::OpaqueRecords {
                 count: self.opaque_records,
@@ -4871,30 +4846,15 @@ impl Pile {
                 .map_err(PileRewriteError::StoreScope)?;
         }
         let strong_pins = self.branches.clone();
-        let collection_records = self.collection_records.clone();
-        let mut capability_proofs =
-            Vec::with_capacity(self.capability_proofs.len().min(usize::MAX as u64) as usize);
-        for key in self.capability_proofs.iter_ordered() {
-            let entry = self
-                .capability_proofs
-                .get(key)
-                .expect("proof key from PATCH must retain its value");
-            let body = unsafe {
-                slice_from_raw_parts(self.mmap.as_ptr().add(entry.data_offset), entry.data_len)
-                    .as_ref()
-                    .unwrap()
-            };
-            capability_proofs.push(CapabilityProof::from_bytes(body).map_err(|_| {
-                PileRewriteError::Source(ReadError::CorruptPile {
-                    valid_length: entry
-                        .data_offset
-                        .saturating_sub(std::mem::size_of::<CapabilityProofRecordPrefix>()),
-                })
-            })?);
-        }
+        let collection_records = reader.collection_records.clone();
+        let capability_proofs = reader
+            .proofs()
+            .map_err(PileRewriteError::Source)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PileRewriteError::Source)?;
         let legacy_collection_headers = self.legacy_collection_headers.clone();
         let source_wants = self.wants.clone();
-        let peer_evidence = self.peers.clone();
+        let peer_evidence = reader.peers.clone();
         let artifact_offers = self.artifact_offers.clone();
 
         let mut roots = explicit.clone();
@@ -4921,7 +4881,7 @@ impl Pile {
 
             // Unlike explicit policy roots, native COMMIT dependencies may be
             // absent on a partially synchronized node. Observe only this
-            // coherent reader snapshot; do not issue a demand read, and do not
+            // coherent store snapshot; do not issue a demand read, and do not
             // turn absence into a root which would make every later rewrite
             // fail. `reachable` already applies the same resident-only rule to
             // recursive descendants.
@@ -4931,7 +4891,7 @@ impl Pile {
             for handle in [descriptor, data, metadata] {
                 if reader
                     .contains_blob(handle)
-                    .expect("PileReader residency lookup is infallible")
+                    .expect("PileSnapshot residency lookup is infallible")
                 {
                     roots.retain_recursive(handle);
                 }
@@ -4945,7 +4905,7 @@ impl Pile {
                 let claim = Inline::<Handle<UnknownBlob>>::new(claim.raw);
                 if reader
                     .contains_blob(claim)
-                    .expect("PileReader residency lookup is infallible")
+                    .expect("PileSnapshot residency lookup is infallible")
                 {
                     roots.retain_direct(claim);
                 }
@@ -5067,7 +5027,9 @@ mod tests {
     use crate::macros::entity;
     use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
-    use crate::repo::{BlobStoreMeta, RetentionRoots, StorageClose, StoreRevision};
+    use crate::repo::{
+        BlobStoreMeta, RetentionRoots, SnapshotSource, StorageClose, StoreChanges, StoreSnapshot,
+    };
     use crate::trible::TribleSet;
 
     fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
@@ -5285,10 +5247,12 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
         pile.insert_proof(proof.clone()).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
-        assert_eq!(pile.proof(proof.id()).unwrap(), Some(proof.clone()));
-        assert_eq!(pile.proof(Inline::new([0; 32])).unwrap(), None);
+        let snapshot = pile.snapshot().unwrap();
+        assert_eq!(snapshot.proof(proof.id()).unwrap(), Some(proof.clone()));
+        assert_eq!(snapshot.proof(Inline::new([0; 32])).unwrap(), None);
         assert_eq!(
-            pile.proofs()
+            snapshot
+                .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -5316,8 +5280,9 @@ mod tests {
         assert!(records.next().is_none());
 
         let mut reopened = Pile::open(&path).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
         assert_eq!(
-            reopened
+            snapshot
                 .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -5360,7 +5325,8 @@ mod tests {
         expected.sort_unstable_by_key(|proof| proof.id().raw);
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
-            let actual = pile
+            let snapshot = pile.snapshot().unwrap();
+            let actual = snapshot
                 .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -5424,8 +5390,9 @@ mod tests {
         let stats = reframe_into(&source_path, &mut destination).unwrap();
         assert_eq!(stats.capability_proofs, 1);
         assert_eq!(stats.dropped_inert, 0);
+        let snapshot = destination.snapshot().unwrap();
         assert_eq!(
-            destination
+            snapshot
                 .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -5469,7 +5436,7 @@ mod tests {
         assert_eq!(stats.retained_blobs, 1);
         assert_eq!(stats.capability_proofs, 2);
 
-        let reader = destination.reader().unwrap();
+        let reader = destination.snapshot().unwrap();
         assert!(reader
             .get::<Blob<SimpleArchive>, _>(valid_claim_handle)
             .is_ok());
@@ -5485,6 +5452,8 @@ mod tests {
         drop(reader);
 
         let stored = destination
+            .snapshot()
+            .unwrap()
             .proofs()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -5739,12 +5708,14 @@ mod tests {
         assert_eq!(&blob_raw[72..80], &(blob_data.len() as u64).to_le_bytes());
 
         let mut reopened = Pile::open(&path).unwrap();
-        let fetched: Blob<UnknownBlob> = reopened.reader().unwrap().get(blob).unwrap();
+        let fetched: Blob<UnknownBlob> = reopened.snapshot().unwrap().get(blob).unwrap();
         assert_eq!(fetched.bytes.as_ref(), blob_data);
         assert_eq!(reopened.legacy_pin_head_for_test(branch_id).unwrap(), None);
         assert!(reopened.wants().unwrap().next().is_none());
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -5819,7 +5790,7 @@ mod tests {
             source.insert(*record).unwrap();
         }
         let source_timestamps: Vec<u64> = {
-            let reader = source.reader().unwrap();
+            let reader = source.snapshot().unwrap();
             handles
                 .iter()
                 .map(|handle| reader.metadata(*handle).unwrap().unwrap().timestamp)
@@ -5864,6 +5835,8 @@ mod tests {
         );
         assert_eq!(
             result
+                .snapshot()
+                .unwrap()
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -5874,7 +5847,7 @@ mod tests {
         // Payload bytes and handles survive. Insertion timestamps do not, and
         // must not be expected to: they are a local fact about a particular
         // file, never synced, and a rewrite is a fresh append.
-        let reader = result.reader().unwrap();
+        let reader = result.snapshot().unwrap();
         let newest_source = source_timestamps.iter().copied().max().unwrap();
         for (handle, payload) in handles.iter().zip(&payloads) {
             let blob: Blob<UnknownBlob> = reader.get(*handle).unwrap();
@@ -5914,7 +5887,8 @@ mod tests {
 
         let mut result = Pile::open(&dest_path).unwrap();
         let mut verified = 0usize;
-        for record in result.records().unwrap() {
+        let snapshot = result.snapshot().unwrap();
+        for record in snapshot.records().unwrap() {
             let CollectionRecord::Commit(commit) = record.unwrap() else {
                 continue;
             };
@@ -5956,7 +5930,7 @@ mod tests {
         pile.insert_peer(peer_evidence(6, 7)).unwrap();
         pile.bind_store_scope(team_key(8)).unwrap();
         pile.offer(artifact_handle(9)).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
 
         let mut records = PileRecords::open(&path).unwrap();
         let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
@@ -6147,7 +6121,7 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         reopened.refresh().unwrap();
         assert_eq!(reopened.opaque_records, 2);
-        let fetched: Blob<UnknownBlob> = reopened.reader().unwrap().get(known).unwrap();
+        let fetched: Blob<UnknownBlob> = reopened.snapshot().unwrap().get(known).unwrap();
         assert_eq!(fetched.bytes.as_ref(), known_payload);
         assert_eq!(
             reopened.legacy_pin_head_for_test(branch_id).unwrap(),
@@ -6222,7 +6196,13 @@ mod tests {
 
         let mut source = Pile::open(&source_path).unwrap();
         assert_eq!(source.opaque_record_count().unwrap(), 0);
-        assert!(source.records().unwrap().next().is_none());
+        assert!(source
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .next()
+            .is_none());
         let mut destination = Pile::open(&destination_path).unwrap();
         source
             .rewrite_retained_into(
@@ -6348,7 +6328,7 @@ mod tests {
 
         let mut pile = Pile::open(&merged_path).unwrap();
         pile.refresh().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let legacy: Blob<UnknownBlob> = reader.get(legacy_handle).unwrap();
         let current: Blob<UnknownBlob> = reader.get(current_handle).unwrap();
         assert_eq!(legacy.bytes.as_ref(), legacy_payload);
@@ -6387,7 +6367,7 @@ mod tests {
         seed.close().unwrap();
 
         let mut lazy: Lazy<Pile> = Lazy::new(Pile::open(&path).unwrap());
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let first_read: Blob<UnknownBlob> = reader.get(first).unwrap();
         assert_eq!(first_read.bytes.as_ref(), first_payload);
         drop(reader);
@@ -6411,7 +6391,7 @@ mod tests {
         lazy.into_store().close().unwrap();
 
         let mut reopened: Lazy<Pile> = Lazy::new(Pile::open(&path).unwrap());
-        let reader = BlobStore::reader(&mut reopened).unwrap();
+        let reader = SnapshotSource::snapshot(&mut reopened).unwrap();
         let first_read: Blob<UnknownBlob> = reader.get(first).unwrap();
         let second_read: Blob<UnknownBlob> = reader.get(second).unwrap();
         assert_eq!(first_read.bytes.as_ref(), first_payload);
@@ -6556,7 +6536,7 @@ mod tests {
             std::fs::read(&destination_path).unwrap(),
             destination_before
         );
-        let fetched: Blob<UnknownBlob> = source.reader().unwrap().get(retained).unwrap();
+        let fetched: Blob<UnknownBlob> = source.snapshot().unwrap().get(retained).unwrap();
         assert_eq!(fetched.bytes.as_ref(), b"possibly owned");
         destination.close().unwrap();
         source.close().unwrap();
@@ -6588,9 +6568,9 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&source_path).unwrap(), young_before);
         assert_eq!(std::fs::read(&old_path).unwrap(), old_before);
-        let fetched: Blob<UnknownBlob> = yard.reader().unwrap().get(retained).unwrap();
+        let fetched: Blob<UnknownBlob> = yard.snapshot().unwrap().get(retained).unwrap();
         assert_eq!(fetched.bytes.as_ref(), b"possibly owned");
-        let fetched: Blob<UnknownBlob> = yard.reader().unwrap().get(cross_generation).unwrap();
+        let fetched: Blob<UnknownBlob> = yard.snapshot().unwrap().get(cross_generation).unwrap();
         assert_eq!(fetched.bytes.as_ref(), b"possibly owned across generations");
         yard.close().unwrap();
     }
@@ -6625,7 +6605,7 @@ mod tests {
 
         let mut source = Pile::open(&source_path).unwrap();
         let mut destination = Pile::open(&destination_path).unwrap();
-        assert_eq!(source.records().unwrap().count(), 0);
+        assert_eq!(source.snapshot().unwrap().records().unwrap().count(), 0);
 
         let stats = source
             .rewrite_retained_into(
@@ -6635,7 +6615,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stats.retained_blobs, 0);
-        assert_eq!(destination.records().unwrap().count(), 0);
+        assert_eq!(
+            destination.snapshot().unwrap().records().unwrap().count(),
+            0
+        );
 
         let rewritten = legacy_collection_headers_at(&destination_path);
         assert_eq!(
@@ -6696,17 +6679,18 @@ mod tests {
         pile.close().unwrap();
 
         let mut reopened = Pile::open(&path).unwrap();
-        let actual = reopened
+        let snapshot = reopened.snapshot().unwrap();
+        let actual = snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
         assert_eq!(
-            reopened.record(expected[1].id()).unwrap(),
+            snapshot.record(expected[1].id()).unwrap(),
             Some(expected[1])
         );
-        assert_eq!(reopened.record(collection_test_id(0xff)).unwrap(), None);
+        assert_eq!(snapshot.record(collection_test_id(0xff)).unwrap(), None);
         reopened.close().unwrap();
     }
 
@@ -6724,7 +6708,7 @@ mod tests {
 
         assert_eq!(once, ENVELOPE_HEADER_LEN as u64);
         assert_eq!(twice, once);
-        assert_eq!(pile.records().unwrap().count(), 1);
+        assert_eq!(pile.snapshot().unwrap().records().unwrap().count(), 1);
         pile.close().unwrap();
     }
 
@@ -6759,6 +6743,8 @@ mod tests {
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
             let actual = pile
+                .snapshot()
+                .unwrap()
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -6799,11 +6785,17 @@ mod tests {
         for record in [records[0], records[1], first, unrelated] {
             a.insert(record).unwrap();
         }
-        assert_eq!(a.select_records(&exact).unwrap(), vec![first]);
+        assert_eq!(
+            a.snapshot().unwrap().select_records(&exact).unwrap(),
+            vec![first]
+        );
         a.close().unwrap();
 
         let mut reopened = Pile::open(&path_a).unwrap();
-        assert_eq!(reopened.select_records(&exact).unwrap(), vec![first]);
+        assert_eq!(
+            reopened.snapshot().unwrap().select_records(&exact).unwrap(),
+            vec![first]
+        );
         reopened.close().unwrap();
 
         let mut b = Pile::open(&path_b).unwrap();
@@ -6825,8 +6817,12 @@ mod tests {
         expected.sort_unstable_by_key(CollectionRecord::id);
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
-            assert_eq!(pile.select_records(&exact).unwrap(), expected);
-            assert!(!pile.select_records(&exact).unwrap().contains(&unrelated));
+            let snapshot = pile.snapshot().unwrap();
+            assert_eq!(snapshot.select_records(&exact).unwrap(), expected);
+            assert!(!snapshot
+                .select_records(&exact)
+                .unwrap()
+                .contains(&unrelated));
             pile.close().unwrap();
         }
     }
@@ -6920,7 +6916,7 @@ mod tests {
             }
         );
 
-        let reader = destination.reader().unwrap();
+        let reader = destination.snapshot().unwrap();
         for retained in [
             legacy_attachment,
             legacy_head.transmute(),
@@ -6997,6 +6993,8 @@ mod tests {
         assert_eq!(stats.retained_blobs, 0);
         assert_eq!(
             destination
+                .snapshot()
+                .unwrap()
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -7004,7 +7002,7 @@ mod tests {
             sorted_collection_records(records),
         );
 
-        let reader = destination.reader().unwrap();
+        let reader = destination.snapshot().unwrap();
         assert!(matches!(
             reader.get::<Blob<UnknownBlob>, _>(forged_data),
             Err(GetBlobError::BlobNotFound)
@@ -7057,6 +7055,8 @@ mod tests {
         assert_eq!(stats.retained_blobs, 0);
         assert_eq!(
             destination
+                .snapshot()
+                .unwrap()
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -7064,7 +7064,7 @@ mod tests {
             sorted_collection_records(records),
         );
 
-        let reader = destination.reader().unwrap();
+        let reader = destination.snapshot().unwrap();
         assert!(!reader
             .contains_blob(Handle::<UnknownBlob>::from_hash(missing_data))
             .unwrap());
@@ -7166,12 +7166,14 @@ mod tests {
         assert_eq!(stats.retained_blobs, 4);
 
         let actual_records = destination
+            .snapshot()
+            .unwrap()
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual_records, sorted_collection_records(records));
-        let reader = destination.reader().unwrap();
+        let reader = destination.snapshot().unwrap();
         for retained in [
             attachment,
             data,
@@ -7285,7 +7287,7 @@ mod tests {
         replay.refresh().unwrap();
         assert!(replay.validations.states.lock().unwrap().is_empty());
 
-        let reader = replay.reader().unwrap();
+        let reader = replay.snapshot().unwrap();
         let cloned = reader.clone();
         assert!(Arc::ptr_eq(
             &reader.validations.states,
@@ -7331,7 +7333,7 @@ mod tests {
         assert_eq!(states.len(), 2);
         drop(states);
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let blob: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(blob.bytes.as_ref(), payload);
         drop(reader);
@@ -7362,7 +7364,7 @@ mod tests {
         assert!(!states.contains_key(&third));
         drop(states);
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         assert!(matches!(
             reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
             Err(GetBlobError::ValidationError(_))
@@ -7431,7 +7433,7 @@ mod tests {
             .unwrap();
 
         let mut replayed = Pile::open(&path).unwrap();
-        let reader = replayed.reader().unwrap();
+        let reader = replayed.snapshot().unwrap();
         pool.install(|| {
             let blob = reader
                 .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
@@ -7626,7 +7628,7 @@ mod tests {
         }
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(
             fetched.bytes.as_ref(),
@@ -7891,7 +7893,7 @@ mod tests {
         let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
 
         {
-            let reader = pile.reader().unwrap();
+            let reader = pile.snapshot().unwrap();
             let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
             assert_eq!(fetched.bytes.as_ref(), data.as_slice());
         }
@@ -7900,7 +7902,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
         pile.close().unwrap();
@@ -7921,7 +7923,7 @@ mod tests {
         }
         pile.flush().unwrap();
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         for item in reader.iter() {
             let (handle, blob) = item.expect("infallible iteration");
             let data = expected.remove(&handle).unwrap();
@@ -7947,7 +7949,7 @@ mod tests {
             let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
             baseline_handles.insert(handle);
         }
-        let baseline = pile.reader().unwrap();
+        let baseline = pile.snapshot().unwrap();
 
         // Stage two more blobs after taking the baseline snapshot.
         let mut new_handles: HashSet<Inline<Handle<UnknownBlob>>> = HashSet::new();
@@ -7958,7 +7960,7 @@ mod tests {
         }
 
         // Diff the current reader against the baseline.
-        let current = pile.reader().unwrap();
+        let current = pile.snapshot().unwrap();
         let diffed: HashSet<Inline<Handle<UnknownBlob>>> = current
             .blobs_diff(&baseline)
             .map(|r| r.expect("infallible diff iter").handle)
@@ -7990,7 +7992,7 @@ mod tests {
         let handle = pile
             .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(Bytes::from_source(vec![7u8; 13])))
             .unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
 
         let info = BlobStoreList::blob_info(&reader, handle)
             .unwrap()
@@ -8018,7 +8020,7 @@ mod tests {
         let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let metadata = reader.metadata(handle).unwrap().expect("metadata");
         assert_eq!(metadata.length, data.len() as u64);
         let after = SystemTime::now()
@@ -8041,7 +8043,7 @@ mod tests {
         let second = pile
             .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(vec![2u8; 17])))
             .unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let listed: HashMap<_, _> = reader
             .blobs()
             .map(|result| {
@@ -8061,7 +8063,7 @@ mod tests {
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
 
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 4]));
         let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
@@ -8069,7 +8071,7 @@ mod tests {
         assert!(reader.metadata(handle).unwrap().is_none());
 
         pile.flush().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         assert!(reader.metadata(handle).unwrap().is_some());
         pile.close().unwrap();
     }
@@ -8091,7 +8093,7 @@ mod tests {
         let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
-        let stored: Blob<UnknownBlob> = pile.reader().unwrap().get(handle).unwrap();
+        let stored: Blob<UnknownBlob> = pile.snapshot().unwrap().get(handle).unwrap();
         assert_eq!(stored.bytes.as_ref(), &data[..]);
         pile.close().unwrap();
     }
@@ -8193,7 +8195,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let meta = reader.metadata(handle).unwrap().expect("metadata");
         assert_eq!(meta.length, 32);
         assert!(meta.timestamp > 0);
@@ -8212,7 +8214,7 @@ mod tests {
         let h2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.flush().unwrap();
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let handles: Vec<_> = reader
             .iter()
             .map(|res| res.expect("infallible iteration").0)
@@ -8276,7 +8278,7 @@ mod tests {
             (super::ENVELOPE_HEADER_LEN + data.len() + super::block_post_pad(data.len())) as u64;
         assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len);
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
         pile.close().unwrap();
@@ -8295,7 +8297,7 @@ mod tests {
         let handle = pile1.put(blob).unwrap();
         pile1.flush().unwrap();
         pile1.refresh().unwrap();
-        let before_replacement = pile1.store_revision().unwrap();
+        let before_replacement = pile1.snapshot().unwrap();
 
         // Corrupt the first enveloped blob's payload (the fixed header is 256 bytes).
         use std::io::Seek;
@@ -8313,13 +8315,13 @@ mod tests {
         pile2.flush().unwrap();
 
         // Refresh the first pile; it should replace the corrupted blob with the new one.
-        let after_replacement = pile1.store_revision().unwrap();
+        let after_replacement = pile1.snapshot().unwrap();
         assert_eq!(
-            Pile::revision_changes(&before_replacement, &after_replacement),
-            crate::repo::StoreRevisionChanges::BLOB_READER,
-            "same-handle backing replacement keeps membership but refreshes access",
+            after_replacement.changes_since(&before_replacement),
+            StoreChanges::BLOBS,
+            "same-handle backing replacement changes observable blob access",
         );
-        let reader = pile1.reader().unwrap();
+        let reader = pile1.snapshot().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
         pile1.close().unwrap();
@@ -8327,64 +8329,58 @@ mod tests {
     }
 
     #[test]
-    fn store_revision_separates_external_wants_from_inventory_membership() {
+    fn snapshot_changes_separate_external_wants_from_inventory_membership() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "revision.pile");
         let mut observer = Pile::open(&path).unwrap();
         let mut writer = Pile::open(&path).unwrap();
 
-        let empty = observer.store_revision().unwrap();
+        let empty = observer.snapshot().unwrap();
         writer
             .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
                 [0xA1; 32],
             )))
             .unwrap();
         writer.flush().unwrap();
-        let after_external_want = observer.store_revision().unwrap();
-        assert!(empty != after_external_want);
+        let after_external_want = observer.snapshot().unwrap();
         assert_eq!(
-            Pile::revision_changes(&empty, &after_external_want),
-            crate::repo::StoreRevisionChanges::BLOB_READER,
+            after_external_want.changes_since(&empty),
+            StoreChanges::NONE
         );
 
         writer
             .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(vec![0xB2; 17])))
             .unwrap();
         writer.flush().unwrap();
-        let after_external_blob = observer.store_revision().unwrap();
-        assert!(after_external_want != after_external_blob);
+        let after_external_blob = observer.snapshot().unwrap();
         assert_eq!(
-            Pile::revision_changes(&after_external_want, &after_external_blob),
-            crate::repo::StoreRevisionChanges::BLOBS
-                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+            after_external_blob.changes_since(&after_external_want),
+            StoreChanges::BLOBS,
         );
 
         writer.insert(collection_test_records()[0]).unwrap();
         writer.flush().unwrap();
-        let after_external_record = observer.store_revision().unwrap();
+        let after_external_record = observer.snapshot().unwrap();
         assert_eq!(
-            Pile::revision_changes(&after_external_blob, &after_external_record),
-            crate::repo::StoreRevisionChanges::COLLECTION_RECORDS
-                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+            after_external_record.changes_since(&after_external_blob),
+            StoreChanges::COLLECTION_RECORDS,
         );
 
         let (proof, _) = capability_fixture(81, [82; 32]);
         writer.insert_proof(proof).unwrap();
         writer.flush().unwrap();
-        let after_external_proof = observer.store_revision().unwrap();
+        let after_external_proof = observer.snapshot().unwrap();
         assert_eq!(
-            Pile::revision_changes(&after_external_record, &after_external_proof),
-            crate::repo::StoreRevisionChanges::CAPABILITY_PROOFS
-                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+            after_external_proof.changes_since(&after_external_record),
+            StoreChanges::CAPABILITY_PROOFS,
         );
 
         writer.insert_peer(peer_evidence(83, 84)).unwrap();
         writer.flush().unwrap();
-        let after_external_peer = observer.store_revision().unwrap();
+        let after_external_peer = observer.snapshot().unwrap();
         assert_eq!(
-            Pile::revision_changes(&after_external_proof, &after_external_peer),
-            crate::repo::StoreRevisionChanges::PEERS
-                .union(crate::repo::StoreRevisionChanges::BLOB_READER),
+            after_external_peer.changes_since(&after_external_proof),
+            StoreChanges::PEERS,
         );
 
         observer.close().unwrap();
@@ -8425,7 +8421,7 @@ mod tests {
         let handle2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.flush().unwrap();
 
-        let mut reader = pile.reader().unwrap();
+        let mut reader = pile.snapshot().unwrap();
         let _full_patch = reader.blobs.clone();
         let hash1: Inline<Hash<Blake3>> = handle1.into();
         reader.blobs.remove(&hash1.raw);
@@ -8453,7 +8449,7 @@ mod tests {
         let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let meta = reader.metadata(handle).unwrap().expect("metadata");
         assert_eq!(meta.length, data.len() as u64);
         pile.close().unwrap();
@@ -8739,7 +8735,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let got_v1: Blob<UnknownBlob> = reader.get(v1_handle).unwrap();
         assert_eq!(got_v1.bytes.as_ref(), v1_data.as_slice());
         let got1: Blob<UnknownBlob> = reader.get(h1).unwrap();
@@ -8939,6 +8935,8 @@ mod tests {
 
         let mut merged = Pile::open(&left_path).unwrap();
         let actual = merged
+            .snapshot()
+            .unwrap()
             .peers()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -9134,6 +9132,8 @@ mod tests {
         assert_eq!(stats.dropped_inert, 0);
         assert_eq!(
             destination
+                .snapshot()
+                .unwrap()
                 .peers()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -9170,6 +9170,8 @@ mod tests {
         assert_eq!(stats.peer_evidence, 1);
         assert_eq!(
             destination
+                .snapshot()
+                .unwrap()
                 .peers()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -9197,7 +9199,7 @@ mod tests {
         assert_eq!(stats.blobs, 0);
         assert!(destination.offers_snapshot().unwrap().contains(offered));
         assert!(destination
-            .reader()
+            .snapshot()
             .unwrap()
             .get::<Blob<UnknownBlob>, _>(offered)
             .is_err());
@@ -9230,7 +9232,7 @@ mod tests {
         assert_eq!(stats.artifact_offers, 1);
         assert!(destination.offers_snapshot().unwrap().contains(offered));
         assert!(destination
-            .reader()
+            .snapshot()
             .unwrap()
             .get::<Blob<UnknownBlob>, _>(offered)
             .is_err());
@@ -9264,7 +9266,7 @@ mod tests {
         let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
 
         {
-            let reader = pile.reader().unwrap();
+            let reader = pile.snapshot().unwrap();
             let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
             assert_eq!(fetched.bytes.len(), size);
             assert_eq!(fetched.bytes.as_ref(), data.as_slice());
@@ -9276,7 +9278,7 @@ mod tests {
         // is fully self-describing and recoverable.
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
         pile.close().unwrap();

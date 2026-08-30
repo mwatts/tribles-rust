@@ -117,7 +117,7 @@ fn hnsw_1k_vectors_recall_against_flat() {
     const DIM: usize = 32;
 
     use triblespace_core::blob::MemoryBlobStore;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
 
     use triblespace_search::schemas::put_embedding;
 
@@ -137,9 +137,9 @@ fn hnsw_1k_vectors_recall_against_flat() {
     }
     let flat = flat_b.build();
     let hnsw = hnsw_b.build();
-    let reader = store.reader().unwrap();
-    let flat_view = flat.attach(&reader);
-    let hnsw_view = hnsw.attach(&reader).with_ef_search(100);
+    let snapshot = store.snapshot().unwrap();
+    let flat_view = flat.attach(&snapshot);
+    let hnsw_view = hnsw.attach(&snapshot).with_ef_search(100);
 
     let floor = 0.4f32;
     let mut total_truth = 0usize;
@@ -243,7 +243,7 @@ fn succinct_hnsw_1k_docs_matches_naive() {
     use std::collections::HashSet;
 
     use triblespace_core::blob::MemoryBlobStore;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
 
     use triblespace_search::schemas::put_embedding;
 
@@ -261,9 +261,9 @@ fn succinct_hnsw_1k_docs_matches_naive() {
     }
     let naive = builder.build_naive();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
-    let reader = store.reader().unwrap();
-    let naive_view = naive.attach(&reader).with_ef_search(50);
-    let succinct_view = succinct.attach(&reader).with_ef_search(50);
+    let snapshot = store.snapshot().unwrap();
+    let naive_view = naive.attach(&snapshot).with_ef_search(50);
+    let succinct_view = succinct.attach(&snapshot).with_ef_search(50);
 
     let floor = 0.4f32;
     for probe in handles.iter().take(5) {
@@ -311,7 +311,7 @@ fn flat_1k_vectors_threshold_finds_self() {
     const DIM: usize = 32;
 
     use triblespace_core::blob::MemoryBlobStore;
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::SnapshotSource;
 
     use triblespace_search::schemas::put_embedding;
 
@@ -334,12 +334,12 @@ fn flat_1k_vectors_threshold_finds_self() {
         builder.insert(h);
     }
     let idx = builder.build();
-    let reader = store.reader().unwrap();
+    let snapshot = store.snapshot().unwrap();
 
     // Probing from the target handle at a very tight threshold
     // finds it (cos=1.0 against itself).
     let hits = idx
-        .attach(&reader)
+        .attach(&snapshot)
         .candidates_above(h_target, 0.999)
         .unwrap();
     assert!(hits.contains(&h_target));

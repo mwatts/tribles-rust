@@ -289,13 +289,13 @@ mod tests {
     #[test]
     fn put_embedding_roundtrips_through_memory_store() {
         use triblespace_core::blob::MemoryBlobStore;
-        use triblespace_core::repo::{BlobStore, BlobStoreGet};
+        use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
         let mut store = MemoryBlobStore::new();
         let vec = vec![1.0_f32, 0.0, 0.0];
         let handle = put_embedding::<_>(&mut store, vec.clone()).unwrap();
-        let reader = store.reader().unwrap();
-        let view: View<[f32]> = reader.get::<View<[f32]>, Embedding>(handle).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let view: View<[f32]> = snapshot.get::<View<[f32]>, Embedding>(handle).unwrap();
         // After normalize, [1,0,0] stays [1,0,0].
         assert_eq!(view.as_ref(), &[1.0_f32, 0.0, 0.0]);
     }

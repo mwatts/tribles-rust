@@ -21,16 +21,12 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::{
     CapabilityMode, CapabilityProofBundle, CapabilityProofId, CapabilityRequest, CapabilityValidity,
 };
-use triblespace_core::collection::CollectionStore;
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
-use triblespace_core::repo::{
-    ArtifactOfferSnapshot, BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, PeerStore,
-    StoreRevisionChanges,
-};
+use triblespace_core::repo::{ArtifactOfferSnapshot, BlobStoreGet, StoreChanges, StoreRead};
 
 use crate::channel::{
     MAX_ADMISSION_BRIDGE_BATCHES, NetCommand, NetEvent, NetEventBatch, SnapshotNotice,
@@ -336,34 +332,31 @@ impl StoreSnapshot {
     #[cfg(test)]
     pub(crate) fn from_store<S>(store: &mut S, team: VerifyingKey) -> anyhow::Result<Self>
     where
-        S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
+        S: triblespace_core::repo::SnapshotSource,
+        S::Snapshot: StoreRead + triblespace_core::repo::BlobStoreMeta,
     {
-        Self::from_store_changes(store, team, None, StoreRevisionChanges::ALL)
+        let snapshot = store.snapshot().map_err(anyhow::Error::new)?;
+        Self::from_store_changes(snapshot, team, None, StoreChanges::ALL)
     }
 
-    pub(crate) fn from_store_changes<S>(
-        store: &mut S,
+    pub(crate) fn from_store_changes<R>(
+        snapshot: R,
         team: VerifyingKey,
         previous: Option<&Self>,
-        changes: StoreRevisionChanges,
+        changes: StoreChanges,
     ) -> anyhow::Result<Self>
     where
-        S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
+        R: StoreRead + triblespace_core::repo::BlobStoreMeta,
     {
         let previous = previous.filter(|snapshot| snapshot.team == team);
         let changes = if previous.is_some() {
             changes
         } else {
-            StoreRevisionChanges::ALL
+            StoreChanges::ALL
         };
 
-        // Pile::reader performs external-append reobservation. Always obtain a
-        // fresh reader even when blob membership is unchanged: the same root
-        // can acquire a newer backend lease or newly readable payload bytes.
-        let reader = store.reader().map_err(anyhow::Error::new)?;
-
-        let (peer_component, routing_peers) = if changes.contains(StoreRevisionChanges::PEERS) {
-            let peers = store
+        let (peer_component, routing_peers) = if changes.contains(StoreChanges::PEERS) {
+            let peers = snapshot
                 .peers()
                 .map_err(anyhow::Error::new)?
                 .collect::<Result<Vec<_>, _>>()
@@ -398,8 +391,8 @@ impl StoreSnapshot {
             )
         };
 
-        let record_component = if changes.contains(StoreRevisionChanges::COLLECTION_RECORDS) {
-            let records = store
+        let record_component = if changes.contains(StoreChanges::COLLECTION_RECORDS) {
+            let records = snapshot
                 .records()
                 .map_err(anyhow::Error::new)?
                 .collect::<Result<Vec<_>, _>>()
@@ -421,8 +414,8 @@ impl StoreSnapshot {
                 .clone()
         };
 
-        let proof_component = if changes.contains(StoreRevisionChanges::CAPABILITY_PROOFS) {
-            let proofs = store
+        let proof_component = if changes.contains(StoreChanges::CAPABILITY_PROOFS) {
+            let proofs = snapshot
                 .proofs()
                 .map_err(anyhow::Error::new)?
                 .collect::<Result<Vec<_>, _>>()
@@ -444,8 +437,8 @@ impl StoreSnapshot {
                 .clone()
         };
 
-        let (blob_inventory, blob_manifest) = if changes.contains(StoreRevisionChanges::BLOBS) {
-            let blob_keys = reader
+        let (blob_inventory, blob_manifest) = if changes.contains(StoreChanges::BLOBS) {
+            let blob_keys = snapshot
                 .blobs()
                 .map(|info| info.map(|info| info.handle.raw))
                 .collect::<Result<Vec<_>, _>>()
@@ -471,7 +464,7 @@ impl StoreSnapshot {
             manifest: blob_manifest,
             data: InventoryComponentData::Blob {
                 inventory: blob_inventory,
-                reader: Arc::new(CloneableBlobSnapshotReader(Mutex::new(reader))),
+                reader: Arc::new(CloneableBlobSnapshotReader(Mutex::new(snapshot))),
             },
         });
 
@@ -3182,7 +3175,10 @@ mod tests {
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{ArtifactHandle, ArtifactOfferStore, BlobStorePut, StoreRevision};
+    use triblespace_core::repo::{
+        ArtifactHandle, ArtifactOfferStore, BlobStorePut, PeerStore, SnapshotSource,
+        StoreSnapshot as CoreStoreSnapshot,
+    };
 
     use super::*;
 
@@ -4156,8 +4152,14 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(vec![7; 1024]))
             .unwrap();
 
-        let first_revision = store.store_revision().unwrap();
-        let first = StoreSnapshot::from_store(&mut store, team).unwrap();
+        let first_store_snapshot = store.snapshot().unwrap();
+        let first = StoreSnapshot::from_store_changes(
+            first_store_snapshot.clone(),
+            team,
+            None,
+            StoreChanges::ALL,
+        )
+        .unwrap();
         let first_blob = first.component(InventoryComponent::Blob).clone();
         let InventoryComponentData::Blob {
             inventory: first_blob_tree,
@@ -4174,15 +4176,20 @@ mod tests {
         let first_proofs = first.component(InventoryComponent::CapabilityProof).clone();
 
         CollectionStore::insert(&mut store, commit(&author, 1)).unwrap();
-        let second_revision = store.store_revision().unwrap();
-        let changes = MemoryRepo::revision_changes(&first_revision, &second_revision);
+        let second_store_snapshot = store.snapshot().unwrap();
+        let changes = second_store_snapshot.changes_since(&first_store_snapshot);
         let second =
-            StoreSnapshot::from_store_changes(&mut store, team, Some(&first), changes).unwrap();
+            StoreSnapshot::from_store_changes(second_store_snapshot, team, Some(&first), changes)
+                .unwrap();
         let full = StoreSnapshot::from_store(&mut store, team).unwrap();
         assert_eq!(second.manifest(), full.manifest());
-        let forced =
-            StoreSnapshot::from_store_changes(&mut store, team, None, StoreRevisionChanges::NONE)
-                .unwrap();
+        let forced = StoreSnapshot::from_store_changes(
+            store.snapshot().unwrap(),
+            team,
+            None,
+            StoreChanges::NONE,
+        )
+        .unwrap();
         assert_eq!(forced.manifest(), full.manifest());
 
         assert!(!Arc::ptr_eq(
@@ -4224,10 +4231,10 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(vec![2; 64]))
             .unwrap();
         let raced = StoreSnapshot::from_store_changes(
-            &mut store,
+            store.snapshot().unwrap(),
             team,
             Some(&first),
-            StoreRevisionChanges::BLOB_READER,
+            StoreChanges::NONE,
         )
         .unwrap();
 

@@ -39,7 +39,7 @@ use triblespace_core::inline::Inline;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::prelude::blobencodings;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 
 use triblespace_search::bm25::BM25Builder;
@@ -138,10 +138,10 @@ fn refresh(
     )
     .collect();
 
-    let reader = pile.reader()?;
+    let snapshot = pile.snapshot()?;
     let mut builder: BM25Builder = BM25Builder::new();
     for (id, handle) in &body_handles {
-        let body: View<str> = reader.get::<View<str>, blobencodings::UTF8String>(*handle)?;
+        let body: View<str> = snapshot.get::<View<str>, blobencodings::UTF8String>(*handle)?;
         builder.insert(*id, hash_tokens(body.as_ref()));
     }
     let idx: SuccinctBM25Index = builder.build();
@@ -177,8 +177,8 @@ fn query(
         .ok_or("no wiki::index trible under the anchor — run refresh first")?
         .0;
 
-    let reader = pile.reader()?;
-    let idx: SuccinctBM25Index = reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
+    let snapshot = pile.snapshot()?;
+    let idx: SuccinctBM25Index = snapshot.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
 
     // One engine pass: `matches` filters by score floor 0.0, the
     // trible pattern joins on the shared `?doc` to pick the

@@ -15,6 +15,7 @@
 //! runtime without a sidecar record family or wrapper artifact.
 
 use std::cell::Cell;
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
@@ -25,7 +26,7 @@ use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
     SuccinctArchiveError, UnionArchive,
 };
-use crate::blob::TryFromBlob;
+use crate::blob::{Blob, TryFromBlob};
 use crate::collection::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
@@ -33,7 +34,7 @@ use crate::collection::exact_target_compaction::{
 use crate::collection::simplearchive_union;
 use crate::collection::{
     CollectionData, CollectionHandle, CollectionMapping, CollectionOperationError, CollectionStore,
-    CoverAdvanceError, CoverAttachment, FactCover, TryFromCover,
+    Cover, CoverAdvanceError, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -45,18 +46,26 @@ impl TryFromCover<SuccinctArchiveBlob> for UnionArchive<OrderedUniverse> {
     type Error = SuccinctArchiveError;
 
     fn try_from_cover<R>(
-        attachment: CoverAttachment<SuccinctArchiveBlob>,
-        _reader: &R,
-    ) -> Result<Self, Self::Error>
+        cover: &Cover<SuccinctArchiveBlob>,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
-        R: BlobStoreGet + BlobStoreMeta,
+        R: BlobStoreGet,
     {
-        let mut segments = attachment
-            .into_blobs()
-            .map(SuccinctArchive::try_from_blob)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut segments = Vec::with_capacity(cover.len());
+        for handle in cover.members() {
+            let member = Handle::<SuccinctArchiveBlob>::to_hash(handle);
+            let root = snapshot
+                .get::<Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            segments.push(SuccinctArchive::try_from_blob(root).map_err(TryFromCoverError::View)?);
+        }
         if segments.is_empty() {
-            segments.push(super::empty().try_from_blob()?);
+            segments.push(
+                super::empty()
+                    .try_from_blob()
+                    .map_err(TryFromCoverError::View)?,
+            );
         }
         Ok(UnionArchive::new(segments))
     }
@@ -102,33 +111,41 @@ impl TryFromCover<Rank9AcceleratedSuccinctArchiveBlob> for UnionArchive<OrderedU
     type Error = Rank9AcceleratedViewError;
 
     fn try_from_cover<R>(
-        attachment: CoverAttachment<Rank9AcceleratedSuccinctArchiveBlob>,
-        reader: &R,
-    ) -> Result<Self, Self::Error>
+        cover: &Cover<Rank9AcceleratedSuccinctArchiveBlob>,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
-        R: BlobStoreGet + BlobStoreMeta,
+        R: BlobStoreGet,
     {
-        let mut segments = Vec::with_capacity(attachment.len());
-        for root in attachment.into_blobs() {
-            let member = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(root.get_handle());
+        let mut segments = Vec::with_capacity(cover.len());
+        for handle in cover.members() {
+            let member = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(handle);
+            let root = snapshot
+                .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, _>(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
             let source = Rank9AcceleratedSuccinctArchiveBlob::source_handle(&root)
-                .map_err(Rank9AcceleratedViewError::Invalid)?;
-            let raw = reader
+                .map_err(Rank9AcceleratedViewError::Invalid)
+                .map_err(TryFromCoverError::View)?;
+            let raw = snapshot
                 .get::<crate::blob::Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(source)
-                .map_err(|source| Rank9AcceleratedViewError::MissingRaw {
-                    member,
-                    reason: source.to_string(),
+                .map_err(|source| {
+                    TryFromCoverError::View(Rank9AcceleratedViewError::MissingRaw {
+                        member,
+                        reason: source.to_string(),
+                    })
                 })?;
             segments.push(
                 SuccinctArchive::from_accelerated_parts(raw, root)
-                    .map_err(Rank9AcceleratedViewError::Invalid)?,
+                    .map_err(Rank9AcceleratedViewError::Invalid)
+                    .map_err(TryFromCoverError::View)?,
             );
         }
         if segments.is_empty() {
             segments.push(
                 super::empty()
                     .try_from_blob()
-                    .map_err(Rank9AcceleratedViewError::Invalid)?,
+                    .map_err(Rank9AcceleratedViewError::Invalid)
+                    .map_err(TryFromCoverError::View)?,
             );
         }
         Ok(UnionArchive::new(segments))
@@ -144,8 +161,15 @@ pub enum SuccinctArchiveCollectionError {
     Compaction(ExactTargetCompactionError),
     /// A freshly attached accelerated cover could not become a query view.
     View(Rank9AcceleratedViewError),
-    /// A fresh reader for the just-attached cover could not be opened.
-    Reader(String),
+    /// A selected accelerated member could not be fetched.
+    MemberGet {
+        /// Selected physical member.
+        member: CollectionData,
+        /// Backend diagnostic.
+        reason: String,
+    },
+    /// A fresh immutable store observation could not be frozen after writes.
+    Snapshot(String),
 }
 
 impl fmt::Display for SuccinctArchiveCollectionError {
@@ -154,7 +178,14 @@ impl fmt::Display for SuccinctArchiveCollectionError {
             Self::Exact(source) => source.fmt(formatter),
             Self::Compaction(source) => source.fmt(formatter),
             Self::View(source) => source.fmt(formatter),
-            Self::Reader(source) => write!(formatter, "open accelerated cover reader: {source}"),
+            Self::MemberGet { member, reason } => write!(
+                formatter,
+                "accelerated SuccinctArchive member {} could not be fetched: {reason}",
+                hex::encode_upper(member.raw),
+            ),
+            Self::Snapshot(source) => {
+                write!(formatter, "freeze accelerated-cover snapshot: {source}")
+            }
         }
     }
 }
@@ -165,7 +196,8 @@ impl Error for SuccinctArchiveCollectionError {
             Self::Exact(source) => Some(source),
             Self::Compaction(source) => Some(source),
             Self::View(source) => Some(source),
-            Self::Reader(_) => None,
+            Self::MemberGet { .. } => None,
+            Self::Snapshot(_) => None,
         }
     }
 }
@@ -188,18 +220,23 @@ impl From<Rank9AcceleratedViewError> for SuccinctArchiveCollectionError {
     }
 }
 
-fn accelerated_view<S>(
-    store: &mut S,
-    attachment: CoverAttachment<Rank9AcceleratedSuccinctArchiveBlob>,
+fn accelerated_view<R>(
+    snapshot: &R,
+    cover: &Cover<Rank9AcceleratedSuccinctArchiveBlob>,
 ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
 where
-    S: BlobStore,
-    S::Reader: BlobStoreMeta,
+    R: BlobStoreGet,
 {
-    let reader = store
-        .reader()
-        .map_err(|source| SuccinctArchiveCollectionError::Reader(source.to_string()))?;
-    UnionArchive::try_from_cover(attachment, &reader).map_err(Into::into)
+    match UnionArchive::try_from_cover(cover, snapshot) {
+        Ok(archive) => Ok(archive),
+        Err(TryFromCoverError::MemberGet { member, source }) => {
+            Err(SuccinctArchiveCollectionError::MemberGet {
+                member,
+                reason: source.to_string(),
+            })
+        }
+        Err(TryFromCoverError::View(source)) => Err(source.into()),
+    }
 }
 
 /// Canonical accelerated SuccinctArchive projection of one SimpleArchive union.
@@ -318,7 +355,7 @@ impl SuccinctArchiveView {
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         if self.cover.as_ref() == Some(current) {
             if let Some(previous) = &self.archive {
@@ -386,7 +423,7 @@ impl SuccinctArchiveView {
     >
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let source = self.collection.source_descriptor();
         let raw = self.collection.raw_descriptor();
@@ -394,14 +431,16 @@ impl SuccinctArchiveView {
             .map_err(|error| ExactDerivedCollectionError::Resolution(error.to_string()))?;
         let measured = MeasuredSuccinctHomomorphism::new(inner, work);
         let raw_kernel = ExactDerivedCollection::with_mapping(source, raw, measured)?;
-        let raw_attachment = raw_kernel.ensure_exact(store, cover)?;
+        let raw_cover = raw_kernel.ensure_exact(store, cover)?;
         let work = raw_kernel.mapping().work.get();
-        let raw_cover = raw_attachment.cover().clone();
         let accelerated = self
             .collection
             .rank9_derivation()?
             .ensure_member_images(store, &raw_cover)?;
-        Ok((accelerated_view(store, accelerated)?, work))
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
+        Ok((accelerated_view(&snapshot, &accelerated)?, work))
     }
 }
 
@@ -497,14 +536,16 @@ impl SuccinctArchiveCollection {
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
-        let raw_attachment = self.raw_kernel()?.attach_exact(store, source_cover)?;
-        let raw_cover = raw_attachment.cover().clone();
+        let raw_cover = self.raw_kernel()?.attach_exact(store, source_cover)?;
         let accelerated = self
             .rank9_derivation()?
             .attach_member_images(store, &raw_cover)?;
-        accelerated_view(store, accelerated)
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
+        accelerated_view(&snapshot, &accelerated)
     }
 
     /// Ensure both ordinary derivation stages and attach the exact view.
@@ -515,14 +556,16 @@ impl SuccinctArchiveCollection {
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
-        let raw_attachment = self.raw_kernel()?.ensure_exact(store, source_cover)?;
-        let raw_cover = raw_attachment.cover().clone();
+        let raw_cover = self.raw_kernel()?.ensure_exact(store, source_cover)?;
         let accelerated = self
             .rank9_derivation()?
             .ensure_member_images(store, &raw_cover)?;
-        accelerated_view(store, accelerated)
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
+        accelerated_view(&snapshot, &accelerated)
     }
 
     /// Compact the raw target, then ensure the matching accelerated cover.
@@ -533,14 +576,14 @@ impl SuccinctArchiveCollection {
     ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let raw = compact_exact_target(&self.raw_kernel()?, store, source_cover)?;
-        let raw_cover = raw.cover().clone();
-        let accelerated = self
-            .rank9_derivation()?
-            .ensure_member_images(store, &raw_cover)?;
-        accelerated_view(store, accelerated)
+        let accelerated = self.rank9_derivation()?.ensure_member_images(store, &raw)?;
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
+        accelerated_view(&snapshot, &accelerated)
     }
 
     fn raw_kernel(
@@ -580,12 +623,12 @@ mod tests {
     use crate::collection::reach;
     use crate::collection::{
         Collection, CollectionDerive, CollectionEncoding, CollectionMapping, CollectionMerge,
-        CollectionRecord, CollectionStore, Cover, FactCover,
+        CollectionRead, CollectionRecord, CollectionStore, Cover, FactCover,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobStore, BlobStorePut};
+    use crate::repo::{BlobStorePut, SnapshotSource};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     use super::super::RawToRank9AcceleratedMapping;
@@ -613,8 +656,8 @@ mod tests {
 
     fn accelerated(raw: &Blob<SuccinctArchiveBlob>) -> Blob<Rank9AcceleratedSuccinctArchiveBlob> {
         let mut store = MemoryRepo::default();
-        let reader = store.reader().unwrap();
-        RawToRank9AcceleratedMapping.map(raw, &reader).unwrap()
+        let snapshot = store.snapshot().unwrap();
+        RawToRank9AcceleratedMapping.map(raw, &snapshot).unwrap()
     }
 
     #[test]
@@ -671,7 +714,8 @@ mod tests {
         let archive = facade.ensure_exact(&mut store, &cover).unwrap();
         assert_eq!(archive.iter().count(), 2);
 
-        let records = store
+        let snapshot = store.snapshot().unwrap();
+        let records = snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -734,13 +778,14 @@ mod tests {
         facade
             .rank9_derivation()
             .unwrap()
-            .ensure_member_images(&mut store, raw.cover())
+            .ensure_member_images(&mut store, &raw)
             .unwrap();
 
         let archive = facade.compact_exact(&mut store, &cover).unwrap();
         assert_eq!(archive.iter().count(), 2);
 
-        let records = store
+        let snapshot = store.snapshot().unwrap();
+        let records = snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -816,7 +861,7 @@ mod tests {
             .ensure_member_images(&mut store, &raw_cover)
             .unwrap();
 
-        let mut actual = attached.cover().data_members().collect::<Vec<_>>();
+        let mut actual = attached.data_members().collect::<Vec<_>>();
         let mut expected = [a, b]
             .iter()
             .map(|raw| {
@@ -829,7 +874,8 @@ mod tests {
         assert_eq!(actual, expected);
         assert!(!actual.contains(&fc_data));
 
-        let records = store
+        let snapshot = store.snapshot().unwrap();
+        let records = snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -851,11 +897,11 @@ mod tests {
         store
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(root.clone())
             .unwrap();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
 
         assert!(matches!(
             Rank9AcceleratedSuccinctArchiveBlob::validate_member(
-                &Fragment::empty(), &root, &reader,
+                &Fragment::empty(), &root, &snapshot,
             ),
             Err(CollectionOperationError::Fatal(reason))
                 if reason.contains("raw child is not resident")
@@ -872,13 +918,13 @@ mod tests {
         let corrupted = Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(Bytes::from_source(bytes));
         let mut store = MemoryRepo::default();
         store.put::<SuccinctArchiveBlob, _>(raw).unwrap();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
 
         assert!(matches!(
             Rank9AcceleratedSuccinctArchiveBlob::validate_member(
                 &Fragment::empty(),
                 &corrupted,
-                &reader,
+                &snapshot,
             ),
             Err(CollectionOperationError::Fatal(_))
         ));

@@ -14,10 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writers require resident, valid evidence for exact `ACTION_WRITE` on the
   descriptor handle, without scanning collection commits.
 
-- Add opt-in `snapshot_with_admission` for consumers which need the exact
-  strictly verified COMMIT roots used by one capability-aware snapshot. The
-  ordinary snapshot stays lean, while the returned roots stay narrower than
-  later provenance queries over the same cover.
+- Add `Collection::admitted_with_claims` for consumers which need the exact
+  strictly verified COMMIT roots selected by one admission decision. The
+  returned roots stay narrower than later provenance queries over the same
+  cover and immutable store snapshot.
 
 - Add `discover_collection_cover_authorized` as a narrow low-level bridge from
   a caller-supplied signer policy to a typed, strictly verified payload cover,
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proofs.
 
 - Give collection validation, canonical joins, mappings, and cover views one
-  frozen blob-reader boundary. Encodings and mappings may resolve immutable
+  frozen store-snapshot boundary. Encodings and mappings may resolve immutable
   content-addressed dependencies named by their source members without making
   ambient resident content a semantic input.
 
@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Cover<E>` carries only `Handle<E>` members, and `TryFromCover<E>`
   reconstructs either eager values or lazy mmap-backed unions. Signed
   `store.commit` introduces authored `Fragment` leaves into `SimpleArchive`
-  source collections; typed covers, snapshots, and materialization work across
+  source collections; typed covers and logical materialization work across
   encodings. Each `CollectionEncoding` owns canonical validation and may expose
   one direct physical join, while exact derivations bind one parameterized
   `CollectionMapping<Source, Target>` whose ordinary trible fragment is
@@ -130,10 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Drive DHT provider publication exclusively from durable OFFER intent
   intersected with the current resident Blob serving snapshot. `Peer` observes
-  offers independently of `StoreRevision`; serving hosts announce additions
-  immediately and renew successful receiver-local leases at half-life through
-  a bounded fair due-time scheduler. Absent blobs, cleared snapshots, and
-  read-only peers remain dormant, while failed or capacity-rejected attempts
+  offers outside the coherent semantic `StoreSnapshot`; serving hosts announce
+  additions immediately and renew successful receiver-local leases at
+  half-life through a bounded fair due-time scheduler. Absent blobs, cleared
+  snapshots, and read-only peers remain dormant, while failed or
+  capacity-rejected attempts
   use bounded backoff. When any configured, synchronized, or learned remote
   route exists, local self-insertion alone no longer masks failed DHT
   replication; true singleton nodes still renew their self lease normally.
@@ -247,13 +248,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace split reader/revision APIs with one coherent immutable store
+  observation. `SnapshotSource::snapshot` freezes Blob access, collection
+  records, capability proofs, and PEER evidence together; the resulting
+  `StoreSnapshot` classifies local invalidation through `changes_since`.
+  `PileSnapshot` compares persistent PATCH roots per component, including
+  value-only root replacement, while unrelated append-only records remain a
+  no-op. Collection reads now follow
+  `collection.admitted(&snapshot) -> cover.resolve(&snapshot) ->
+  TryFromCover::try_from_cover(&physical, &snapshot)`, with
+  `collection.read(&snapshot)` as the convenience path.
+
 - Replace the unpublished commit-bearing `CollectionTicket`, `store.ticket`,
   and `exact_ticket_additions` surfaces with one opaque PATCH-backed `Cover`
   value. A cover is identified by its collection descriptor and distinct payload
   handles; duplicate signatures or metadata claims over the same payload are
-  optional provenance reported by `store.claims(&cover)`, not new members or
+  optional provenance reported by `cover.claims(&snapshot)`, not new members or
   data work. Replay and derivation require no resident commit or metadata.
-  `store.cover`, snapshots, exact derivations, maintained Succinct views,
+  collection admission, exact derivations, maintained Succinct views,
   paths, and network reuse now share this continuation type. Distinct covers
   may have equal support through validated merges; route freedom or exact
   immediate-input requirements belong to the input collection and mapping,
@@ -275,16 +287,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   descriptor authority. The tribleset benchmark results ledger now uses one
   fixed deliberately public authority key, preserving its prior pile-local
   open trust boundary while giving every run one canonical authority-bearing
-  descriptor and ordinary `snapshot` admission.
+  descriptor and ordinary collection admission against one store snapshot.
 
 - Replace the stateful `Collection<S>`/`CollectionAdmission` facade with
   store-centric collection operations. `store.collection(fragment)` validates,
   stores, and durably offers a descriptor's complete attachment closure;
   `store.commit(handle, key, fragment)` publishes locally without conflating
-  storage with authorization; and `cover`/`snapshot` admit the descriptor
-  authority plus delegated writers authorized by resident proofs. `Cover`
-  carries one
-  canonical exact payload set for replay through `store.materialize(&cover)`.
+  storage with authorization; and `collection.admitted(&store_snapshot)` admits
+  the descriptor authority plus delegated writers authorized by resident
+  proofs. `Cover` carries one canonical exact payload set for resolution and
+  replay through the same immutable store snapshot.
   Descriptor handles are the collection values,
   publication never flushes implicitly, and repeated commits remain
   idempotent native records.
@@ -308,12 +320,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection leases, and late failures can evict only their exact session
   generation rather than a newer redial.
 
-- Make store revision invalidation component-aware. `MemoryRepo`, `Pile`, and
-  `Yard` now distinguish Blob membership, collection records, capability
-  proofs, PEER evidence, and the local Blob reader lease. Network refreshes
+- Make immutable store-snapshot invalidation component-aware. `MemoryRepo`,
+  `Pile`, and `Yard` now distinguish the observable Blob view, collection
+  records, capability proofs, and PEER evidence through
+  `StoreSnapshot::changes_since`. Network refreshes
   enumerate and rebuild only changed BLAKE3 inventory PATCHes, carry unchanged
-  component snapshots forward directly, and still replace an obsolete reader
-  when physical pile backing changes under identical Blob membership.
+  component snapshots forward directly, and rebuild the Blob component when
+  physical pile backing changes under identical membership.
 
 - Make provider-cover directory admission purely aggregate and work-conserving.
   Receivers now bound only live shard count and total live memberships; one
@@ -387,8 +400,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Pin inventory history per component rather than retaining whole store
   snapshots for every changed root. Unchanged roots reuse their immutable
-  trees; Blob reader wrappers still refresh so obsolete backend generations
-  can retire. Record and proof PATCHes carry their key-validated bodies
+  trees; each semantic snapshot installation carries fresh Blob access so
+  obsolete backend generations can retire. Record and proof PATCHes carry their key-validated bodies
   as values while preserving key-only Merkle identities; and concurrent node
   or exact-blob reads no longer serialize through a global snapshot mutex.
 
@@ -474,10 +487,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Decode of that archive: **4.29 s -> 2.42 s** (interleaved medians, sixteen
   cores under other load; the union phase goes from 1.6 s to 40 µs). Warm
-  `Collection::snapshot` on the same collection: **4.50 s -> 2.81 s**. The
+  admitted-cover read on the same collection: **4.50 s -> 2.81 s**. The
   decoded set is byte-identical — all six orders match an independent
   online-insert build root-hash-for-root-hash, key-for-key and
-  fanout-for-fanout at full scale, and the snapshot's re-encoded facts still
+  fanout-for-fanout at full scale, and the result's re-encoded facts still
   hash to the same 32 bytes as an independent `sort_unstable` + `dedup` of
   every one of the 404 commits' rows.
 
@@ -487,12 +500,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported ahead of anything a worker finds inside a run, which is what makes a
   duplicate straddling two runs report as a duplicate.
 
-- **A collection snapshot merges in parallel, and stops naming a value it
-  immediately consumes.** On a 404-commit, 26.26 M-fact collection
-  (`bultmann.pile`, 1.98 GB) `Collection::snapshot` spent 6.38 s, and the
+- **SimpleArchive cover materialization merges in parallel, and stops naming a
+  value it immediately consumes.** On a 404-commit, 26.26 M-fact collection
+  (`bultmann.pile`, 1.98 GB) the admitted-cover read spent 6.38 s, and the
   collection calculus was 78 ms of it — discovery, 404 signature checks,
   canonical validation of 1.86 GB of committed archives, and physical-cover
-  planning together are 1.2% of a snapshot. The rest was two byte-level steps
+  planning together are 1.2% of the read. The rest was two byte-level steps
   under the calculus: a **serial** binary-heap merge of the cover into one
   canonical 1.68 GB archive (1.44 s), a BLAKE3 pass to name that archive
   (0.72 s), and the `TribleSet` decode of it (4.16 s).
@@ -500,15 +513,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The merge is now partitioned by key range — regular sampling picks the cuts,
   each worker merges one interval, and concatenating the runs in range order
   reproduces the serial answer byte for byte, because disjoint key intervals
-  cannot share a duplicate. And `snapshot` no longer builds a `Blob` for the
-  union: it decodes the bytes through the new
+  cannot share a duplicate. And materialization no longer builds a `Blob` for
+  the union: it decodes the bytes through the new
   `simplearchive::try_from_archive_bytes`. The handle it used to compute was
   dropped one expression later; hashing 1.68 GB to name a value on its way into
   a decoder is a fifth of the merge that produced it, spent on nothing.
 
-  Warm snapshot of that collection: **6.38 s -> 4.38 s**, with byte-identical
-  union bytes (verified against an independent sort/dedup of every commit's
-  rows) and an identical decoded set. What remains is the decode: ~2.3 s
+  Warm admitted read of that collection: **6.38 s -> 4.38 s**, with
+  byte-identical union bytes (verified against an independent sort/dedup of
+  every commit's rows) and an identical decoded set. What remains is the decode: ~2.3 s
   building six PATCH orders over 16 chunks and ~1.75 s unioning those chunks,
   which no equation record can avoid — see `INVENTORY.md`.
 
@@ -681,11 +694,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allowing a temporary `Repository` view without transferring backend
   ownership or reimplementing the pin trait in downstream crates.
 - **Direct `SimpleArchive` collections now have a keyless exact-cover read
-  facade.** `SimpleArchiveCollection::{attach_exact,snapshot_exact}` accepts an
-  opaque `Cover` and requires only its descriptor and payload bytes; no signed
-  commit or metadata needs to remain resident. It shares ordinary descriptor,
-  member, merge-cover, and coherent-reader validation, exposes no write
-  operation, and keeps provenance independently queryable.
+  facade.** `SimpleArchiveCollection::attach_exact` accepts an opaque `Cover`
+  against one immutable store snapshot and requires only its descriptor and
+  payload bytes; no signed commit or metadata needs to remain resident. It
+  shares ordinary descriptor, member, and merge-cover validation, exposes no
+  write operation, and keeps provenance independently queryable.
 - **The unpublished branch-index persistence stack is gone.** Core no longer
   exposes commit-range manifests, `IndexKind`, repository on-commit hooks, or
   their branch-head maintenance path. Search no longer exposes the
@@ -743,11 +756,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SuccinctArchiveBlob` members own the joinable lattice; Rank9 roots have no
   direct `MERGE`, so maintenance compacts raw members first and then derives
   the matching accelerated member. A cover-aware view reads the embedded raw
-  handle through its reader and validates the exact raw/index pair before
-  constructing the query runtime. Exact derivation stores the selected raw
-  source before its accelerated root and semantic record. Incomplete roots are
-  nonresident and `ensure_exact` reconstructs them from a usable source route
-  rather than admitting partial state.
+  handle through its immutable store snapshot and validates the exact
+  raw/index pair before constructing the query runtime. Exact derivation stores
+  the selected raw source before its accelerated root and semantic record.
+  Incomplete roots are nonresident and `ensure_exact` reconstructs them from a
+  usable source route rather than admitting partial state.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
   garbage collection. Descriptor-typed lattice methods validate fixed
@@ -797,8 +810,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merges, and derives, and closes the exact resident summary cover once into a
   `PathIndex`. Ensuring lowers only unsupported distinct source elements,
   publishes blobs before unsigned records without an implicit flush, and
-  reattaches through a fresh reader. The empty cover is a no-write local
-  bottom. `PathRollup`, its range attribute, range-manifest attachment,
+  reattaches through a fresh store snapshot. The empty cover is a no-write
+  local bottom. `PathRollup`, its range attribute, range-manifest attachment,
   repository hooks, commit ranges, and manifest-specific path tests are
   removed; the new API requires only `BlobStore + CollectionStore` and works
   without `PinStore`.
@@ -828,15 +841,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   singleton remained 24 us. Initializing a fresh Rayon pool cost the first
   plural scope roughly 0.23--0.26 ms; a first singleton does not initialize it.
 - **Plural authorized collection reads validate commit data in parallel.** Data
-  fetches and metadata validation remain sequential; no reader handle or
-  backend error crosses into Rayon. Only successfully fetched bytes enter the
+  fetches and metadata validation remain sequential; no backend error crosses
+  into Rayon. Only successfully fetched bytes enter the
   parallel identity and canonical `SimpleArchive` checks. Results replay in
   intrinsic commit order, preserving data-before-metadata and deterministic
-  fail-loud attribution. Single-commit snapshots and builds without the
+  fail-loud attribution. Single-commit reads and builds without the
   `parallel` feature retain the direct serial path.
 - **Authorized collection reads validate each distinct data handle and each
-  distinct metadata handle once per snapshot.** Every observed commit still
-  undergoes strict Ed25519 verification and remains in the snapshot's
+  distinct metadata handle once per admission.** Every observed commit still
+  undergoes strict Ed25519 verification and remains available as claim
   provenance, but commits that name identical content share one fetch,
   identity check, and canonical `SimpleArchive` validation. This preserves
   fail-loud mandatory roots while avoiding work proportional to repeated
@@ -965,12 +978,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   candidate.
 
 - **Ordinary collections expose authority-resolved exact covers.**
-  `store.cover(collection)` admits the descriptor authority directly and
+  `collection.admitted(&store_snapshot)` admits the descriptor authority
+  directly and
   verifies every resident delegation proof for exact WRITE access to that
   descriptor, then returns the distinct payload handles named by admitted
   strict claims. Invalid, expired, irrelevant, and incomplete proof candidates
   grant nothing. It reads proof-claim blobs, but no collection-member data or
-  commit-metadata blobs. Cover, snapshot, and materialization therefore share
+  commit-metadata blobs. Cover resolution and materialization therefore share
   one multi-author known-prefix payload frontier rather than treating a
   publishing key as ambient authority.
 
@@ -1075,14 +1089,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or torn known records mention the opt-in destructive repair. `diagnose check`
   also reports the count and boundary offsets of inert legacy V3 collection
   evidence and opaque records.
-- **Ordinary collections now expose coherent authority-aware known-prefix
-  snapshots.** `store.snapshot(collection)` admits the descriptor authority
-  and valid resident delegations, discovers admitted payloads,
-  and returns the materialized facts, exact cover, and target blob reader as
-  one value. Later physically visible blobs cannot alter that authority
-  frontier, preventing derived indexes from mixing an old fact view with a
-  newer source cover. `store.materialize(&cover)` shares the same validation
-  and materialization path without repeating admission.
+- **Ordinary collections now consume coherent store snapshots.**
+  `store.snapshot()` freezes every read surface at one prefix;
+  `collection.admitted(&snapshot)` discovers the authority-approved semantic
+  cover, `cover.resolve(&snapshot)` selects a resident physical cover, and
+  `TryFromCover` constructs the logical value without crossing observations.
+  Later physically visible blobs cannot alter that authority frontier.
 - **New pile writes use a generic, length-delimited record envelope.** The
   envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` was minted with
   `trible genid` on 2026-08-11; the next 16 bytes reuse each current V3/V4
@@ -2769,7 +2781,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 1.123 GB to 674 MB (40%) while preserving first-valid duplicate choice,
   lazy payload hashing, pin LWW, and bounded append replay.
 - **Large pile payload validation now uses BLAKE3's Rayon join strategy.**
-  With the existing `parallel` feature enabled, lock-free `PileReader` blob and
+  With the existing `parallel` feature enabled, lock-free `PileSnapshot` blob and
   metadata reads validate a contiguous payload of at least 1 MiB with
   `update_rayon` when the current Rayon pool has more than one worker. The
   parallel digest is computed outside the sparse validation-cache mutex before

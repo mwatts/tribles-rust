@@ -53,7 +53,7 @@ fn refresh_during_amputate_truncation_is_safe() {
     let mut pile: Pile = Pile::open(&path).unwrap();
     pile.refresh().unwrap();
     let blob = pile
-        .reader()
+        .snapshot()
         .unwrap()
         .get::<Blob<UnknownBlob>, _>(handle)
         .unwrap();

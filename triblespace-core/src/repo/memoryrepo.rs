@@ -9,19 +9,22 @@ use ed25519_dalek::VerifyingKey;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::blob::MemoryBlobStore;
+use crate::blob::{MemoryBlobStore, MemoryBlobStoreSnapshot, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::selectors_match_record;
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::collection::{
+    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+};
 use crate::id::ID_LEN;
 use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::prelude::*;
 use crate::repo::offer::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
-use crate::repo::peer::{PeerEvidence, PeerStore, PEER_EVIDENCE_BYTES_LEN};
-use crate::repo::proof::CapabilityProofStore;
+use crate::repo::peer::{PeerEvidence, PeerRead, PeerStore, PEER_EVIDENCE_BYTES_LEN};
+use crate::repo::proof::{CapabilityProofRead, CapabilityProofStore};
 use crate::repo::{
-    StoreRevision, StoreRevisionChanges, StoreScope, StoreScopeError, WantRequest, WantStore,
+    BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, SnapshotSource,
+    StoreChanges, StoreScope, StoreScopeError, StoreSnapshot, WantRequest, WantStore,
 };
 
 use crate::inline::encodings::hash::Handle;
@@ -51,7 +54,7 @@ pub struct MemoryRepo {
     /// Positive peer-routing evidence keyed by its complete canonical body.
     peer_evidence: PeerEvidenceIndex,
     /// Positive local willingness to serve artifacts. This operational state
-    /// deliberately does not participate in [`MemoryRepoRevision`].
+    /// deliberately does not participate in [`MemoryRepoSnapshot`].
     artifact_offers: ArtifactOfferSnapshot,
     /// Monotone local safety assertion binding this store to one team.
     store_scope: Option<VerifyingKey>,
@@ -97,52 +100,50 @@ impl StoreScope for MemoryRepo {
     }
 }
 
-/// O(1)-clone invalidation token for a [`MemoryRepo`]'s sync-visible sets.
+/// One O(1)-clone immutable observation of a [`MemoryRepo`].
 ///
-/// Each field is a persistent PATCH snapshot (or a blob store backed by one),
-/// so cloning and equality compare cached roots rather than walking entries.
-/// Local wants, artifact offers, and store scope are intentionally excluded.
+/// The blob snapshot and all semantic indexes are frozen together, so
+/// collection admission, capability verification, peer discovery, and payload
+/// decoding cannot observe different prefixes. Local wants, artifact offers,
+/// and store scope are operational state and intentionally excluded.
 #[derive(Clone, PartialEq, Eq)]
-pub struct MemoryRepoRevision {
-    blobs: MemoryBlobStore,
+pub struct MemoryRepoSnapshot {
+    blobs: MemoryBlobStoreSnapshot,
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
     peer_evidence: PeerEvidenceIndex,
 }
 
-impl StoreRevision for MemoryRepo {
-    type Revision = MemoryRepoRevision;
-    type Error = Infallible;
+impl StoreSnapshot for MemoryRepoSnapshot {
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        let mut changes = StoreChanges::NONE;
+        if previous.blobs != self.blobs {
+            changes = changes.union(StoreChanges::BLOBS);
+        }
+        if previous.collection_records != self.collection_records {
+            changes = changes.union(StoreChanges::COLLECTION_RECORDS);
+        }
+        if previous.capability_proofs != self.capability_proofs {
+            changes = changes.union(StoreChanges::CAPABILITY_PROOFS);
+        }
+        if previous.peer_evidence != self.peer_evidence {
+            changes = changes.union(StoreChanges::PEERS);
+        }
+        changes
+    }
+}
 
-    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
-        Ok(MemoryRepoRevision {
-            blobs: self.blobs.clone(),
+impl SnapshotSource for MemoryRepo {
+    type Snapshot = MemoryRepoSnapshot;
+    type SnapshotError = Infallible;
+
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        Ok(MemoryRepoSnapshot {
+            blobs: self.blobs.snapshot()?,
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             peer_evidence: self.peer_evidence.clone(),
         })
-    }
-
-    fn revision_changes(
-        previous: &Self::Revision,
-        current: &Self::Revision,
-    ) -> StoreRevisionChanges {
-        let mut changes = StoreRevisionChanges::NONE;
-        if previous.blobs != current.blobs {
-            changes = changes
-                .union(StoreRevisionChanges::BLOBS)
-                .union(StoreRevisionChanges::BLOB_READER);
-        }
-        if previous.collection_records != current.collection_records {
-            changes = changes.union(StoreRevisionChanges::COLLECTION_RECORDS);
-        }
-        if previous.capability_proofs != current.capability_proofs {
-            changes = changes.union(StoreRevisionChanges::CAPABILITY_PROOFS);
-        }
-        if previous.peer_evidence != current.peer_evidence {
-            changes = changes.union(StoreRevisionChanges::PEERS);
-        }
-        changes
     }
 }
 
@@ -167,16 +168,19 @@ impl Iterator for MemoryPeerIter {
     }
 }
 
-impl PeerStore for MemoryRepo {
+impl PeerRead for MemoryRepoSnapshot {
     type PeersError = Infallible;
-    type InsertError = Infallible;
     type PeerIter<'a> = MemoryPeerIter;
 
-    fn peers<'a>(&'a mut self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
         Ok(MemoryPeerIter {
             inner: self.peer_evidence.clone().into_iter_ordered(),
         })
     }
+}
+
+impl PeerStore for MemoryRepo {
+    type InsertError = Infallible;
 
     fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
         self.peer_evidence.insert(&Entry::new(evidence.as_bytes()));
@@ -268,12 +272,11 @@ impl fmt::Display for MemoryCollectionInsertError {
 
 impl Error for MemoryCollectionInsertError {}
 
-impl CapabilityProofStore for MemoryRepo {
+impl CapabilityProofRead for MemoryRepoSnapshot {
     type ProofsError = Infallible;
-    type InsertError = MemoryProofInsertError;
     type ProofIter<'a> = MemoryCapabilityProofIter;
 
-    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+    fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
         let keys = self.capability_proofs.clone().into_iter_ordered();
         Ok(MemoryCapabilityProofIter {
             keys,
@@ -281,12 +284,13 @@ impl CapabilityProofStore for MemoryRepo {
         })
     }
 
-    fn proof(
-        &mut self,
-        id: CapabilityProofId,
-    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+    fn proof(&self, id: CapabilityProofId) -> Result<Option<CapabilityProof>, Self::ProofsError> {
         Ok(self.capability_proofs.get(&id.raw).cloned())
     }
+}
+
+impl CapabilityProofStore for MemoryRepo {
+    type InsertError = MemoryProofInsertError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         let id = proof.id();
@@ -303,13 +307,11 @@ impl CapabilityProofStore for MemoryRepo {
     }
 }
 
-impl CollectionStore for MemoryRepo {
+impl CollectionRead for MemoryRepoSnapshot {
     type RecordsError = Infallible;
-    type InsertError = MemoryCollectionInsertError;
-
     type RecordIter<'a> = MemoryCollectionRecordIter;
 
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         let keys = self.collection_records.clone().into_iter_ordered();
         Ok(MemoryCollectionRecordIter {
             keys,
@@ -317,12 +319,12 @@ impl CollectionStore for MemoryRepo {
         })
     }
 
-    fn record(&mut self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
         Ok(self.collection_records.get(&id.raw()).copied())
     }
 
     fn select_records(
-        &mut self,
+        &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         if selectors.is_empty() {
@@ -340,6 +342,10 @@ impl CollectionStore for MemoryRepo {
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
     }
+}
+
+impl CollectionStore for MemoryRepo {
+    type InsertError = MemoryCollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         let id = record.id();
@@ -368,20 +374,81 @@ impl crate::repo::BlobStorePut for MemoryRepo {
     }
 }
 
-impl crate::repo::BlobStore for MemoryRepo {
-    type Reader = <MemoryBlobStore as crate::repo::BlobStore>::Reader;
-    type ReaderError = <MemoryBlobStore as crate::repo::BlobStore>::ReaderError;
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.blobs.reader()
+impl BlobStoreList for MemoryRepoSnapshot {
+    type Iter<'a>
+        = <MemoryBlobStoreSnapshot as BlobStoreList>::Iter<'a>
+    where
+        Self: 'a;
+    type Err = <MemoryBlobStoreSnapshot as BlobStoreList>::Err;
+
+    fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+        self.blobs.blobs()
+    }
+
+    fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.contains_blob(handle)
+    }
+
+    fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<BlobInfo>, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.blob_info(handle)
+    }
+
+    fn blobs_diff<'a>(&'a self, old: &Self) -> Self::Iter<'a> {
+        self.blobs.blobs_diff(&old.blobs)
     }
 }
+
+impl BlobStoreMeta for MemoryRepoSnapshot {
+    type MetaError = <MemoryBlobStoreSnapshot as BlobStoreMeta>::MetaError;
+
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<Option<BlobMetadata>, Self::MetaError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.metadata(handle)
+    }
+}
+
+impl BlobStoreGet for MemoryRepoSnapshot {
+    type GetError<E: Error + Send + Sync + 'static> =
+        <MemoryBlobStoreSnapshot as BlobStoreGet>::GetError<E>;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.get(handle)
+    }
+}
+
+impl crate::repo::BlobChildren for MemoryRepoSnapshot {}
 
 impl crate::repo::BlobStoreKeep for MemoryRepo {
     fn keep<I>(&mut self, handles: I)
     where
         I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
     {
-        let reader = self.blobs.reader().expect("memory reader is infallible");
+        let reader = self
+            .blobs
+            .snapshot()
+            .expect("memory snapshot is infallible");
         let mut roots = crate::repo::RetentionRoots::new();
         for key in self.collection_records.iter() {
             let record = self
@@ -489,7 +556,7 @@ mod tests {
 
     #[test]
     fn capability_proofs_are_an_idempotent_set_and_root_verified_claims() {
-        use crate::repo::{BlobStore, BlobStoreGet, BlobStoreKeep};
+        use crate::repo::{BlobStoreGet, BlobStoreKeep};
 
         let mut repo = MemoryRepo::default();
         let root = SigningKey::from_bytes(&[61; 32]);
@@ -510,10 +577,12 @@ mod tests {
 
         repo.insert_proof(proof.clone()).unwrap();
         repo.insert_proof(proof.clone()).unwrap();
-        assert_eq!(repo.proof(proof.id()).unwrap(), Some(proof.clone()));
-        assert_eq!(repo.proof(Inline::new([0; 32])).unwrap(), None);
+        let snapshot = repo.snapshot().unwrap();
+        assert_eq!(snapshot.proof(proof.id()).unwrap(), Some(proof.clone()));
+        assert_eq!(snapshot.proof(Inline::new([0; 32])).unwrap(), None);
         assert_eq!(
-            repo.proofs()
+            snapshot
+                .proofs()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -521,15 +590,15 @@ mod tests {
         );
 
         repo.keep(std::iter::empty());
-        let reader = repo.reader().unwrap();
-        assert!(reader
+        let snapshot = repo.snapshot().unwrap();
+        assert!(snapshot
             .get::<Blob<crate::blob::encodings::simplearchive::SimpleArchive>, _>(claim_handle)
             .is_ok());
     }
 
     #[test]
     fn capability_proof_claim_roots_do_not_follow_coincident_resource_handles() {
-        use crate::repo::{BlobStore, BlobStoreGet, BlobStoreKeep};
+        use crate::repo::{BlobStoreGet, BlobStoreKeep};
 
         let mut repo = MemoryRepo::default();
         let coincident_resource = repo
@@ -554,11 +623,11 @@ mod tests {
         repo.insert_proof(bundle.proof().clone()).unwrap();
 
         repo.keep(std::iter::empty());
-        let reader = repo.reader().unwrap();
-        assert!(reader
+        let snapshot = repo.snapshot().unwrap();
+        assert!(snapshot
             .get::<Blob<crate::blob::encodings::simplearchive::SimpleArchive>, _>(claim_handle)
             .is_ok());
-        assert!(reader
+        assert!(snapshot
             .get::<Blob<UnknownBlob>, _>(coincident_resource)
             .is_err());
     }
@@ -612,14 +681,15 @@ mod tests {
         CollectionStore::insert(&mut repo, derive).unwrap();
         CollectionStore::insert(&mut repo, merge).unwrap();
 
-        let actual = repo
+        let snapshot = repo.snapshot().unwrap();
+        let actual = snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
-        assert_eq!(repo.record(merge.id()).unwrap(), Some(merge));
-        assert_eq!(repo.record(Id::new([0xff; 16]).unwrap()).unwrap(), None);
+        assert_eq!(snapshot.record(merge.id()).unwrap(), Some(merge));
+        assert_eq!(snapshot.record(Id::new([0xff; 16]).unwrap()).unwrap(), None);
     }
 
     #[test]
@@ -683,7 +753,8 @@ mod tests {
         .collect();
         let mut expected = vec![first, conflicting];
         expected.sort_unstable_by_key(CollectionRecord::id);
-        assert_eq!(repo.select_records(&exact).unwrap(), expected);
+        let snapshot = repo.snapshot().unwrap();
+        assert_eq!(snapshot.select_records(&exact).unwrap(), expected);
 
         let grouped = [
             CollectionRecordSelector::MergeCollection(source),
@@ -693,8 +764,11 @@ mod tests {
         .collect();
         let mut expected = vec![merge, first, conflicting, sibling];
         expected.sort_unstable_by_key(CollectionRecord::id);
-        assert_eq!(repo.select_records(&grouped).unwrap(), expected);
-        assert!(!repo.select_records(&grouped).unwrap().contains(&unrelated));
+        assert_eq!(snapshot.select_records(&grouped).unwrap(), expected);
+        assert!(!snapshot
+            .select_records(&grouped)
+            .unwrap()
+            .contains(&unrelated));
     }
 
     #[test]
@@ -721,7 +795,7 @@ mod tests {
 
         repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
 
-        let reader = repo.reader().unwrap();
+        let reader = repo.snapshot().unwrap();
         for retained in [
             collection.handle().transmute(),
             Inline::<Handle<UnknownBlob>>::new(commit.data().raw),
@@ -736,29 +810,23 @@ mod tests {
     }
 
     #[test]
-    fn store_revision_tracks_exactly_the_sync_visible_sets() {
+    fn snapshot_changes_track_exactly_the_semantic_sets() {
         use crate::blob::encodings::utf8string::UTF8String;
 
         let mut repo = MemoryRepo::default();
-        let empty = repo.store_revision().unwrap();
+        let empty = repo.snapshot().unwrap();
 
         // WANT is local operational policy, not advertised inventory.
         repo.want(WantRequest::blob(handle(1))).unwrap();
-        let after_want = repo.store_revision().unwrap();
+        let after_want = repo.snapshot().unwrap();
         assert!(empty == after_want);
-        assert_eq!(
-            MemoryRepo::revision_changes(&empty, &after_want),
-            StoreRevisionChanges::NONE,
-        );
+        assert_eq!(after_want.changes_since(&empty), StoreChanges::NONE,);
 
         repo.put::<UTF8String, _>("revision fixture".to_owned())
             .unwrap();
-        let after_blob = repo.store_revision().unwrap();
+        let after_blob = repo.snapshot().unwrap();
         assert!(after_want != after_blob);
-        assert_eq!(
-            MemoryRepo::revision_changes(&after_want, &after_blob),
-            StoreRevisionChanges::BLOBS.union(StoreRevisionChanges::BLOB_READER),
-        );
+        assert_eq!(after_blob.changes_since(&after_want), StoreChanges::BLOBS,);
 
         let target = identity_for_tests(&named_for_tests(
             "revision-target",
@@ -770,11 +838,11 @@ mod tests {
             handle(74).into(),
         )))
         .unwrap();
-        let after_record = repo.store_revision().unwrap();
+        let after_record = repo.snapshot().unwrap();
         assert!(after_blob != after_record);
         assert_eq!(
-            MemoryRepo::revision_changes(&after_blob, &after_record),
-            StoreRevisionChanges::COLLECTION_RECORDS,
+            after_record.changes_since(&after_blob),
+            StoreChanges::COLLECTION_RECORDS,
         );
 
         let root = SigningKey::from_bytes(&[75; 32]);
@@ -792,11 +860,11 @@ mod tests {
             .proof()
             .clone();
         repo.insert_proof(proof).unwrap();
-        let after_proof = repo.store_revision().unwrap();
+        let after_proof = repo.snapshot().unwrap();
         assert!(after_record != after_proof);
         assert_eq!(
-            MemoryRepo::revision_changes(&after_record, &after_proof),
-            StoreRevisionChanges::CAPABILITY_PROOFS,
+            after_proof.changes_since(&after_record),
+            StoreChanges::CAPABILITY_PROOFS,
         );
 
         repo.insert_peer(PeerEvidence::new(
@@ -804,11 +872,50 @@ mod tests {
             leaf.verifying_key(),
         ))
         .unwrap();
-        let after_peer = repo.store_revision().unwrap();
+        let after_peer = repo.snapshot().unwrap();
         assert!(after_proof != after_peer);
+        assert_eq!(after_peer.changes_since(&after_proof), StoreChanges::PEERS,);
+    }
+
+    #[test]
+    fn snapshot_freezes_blob_collection_and_peer_reads_together() {
+        use crate::blob::encodings::utf8string::UTF8String;
+
+        let mut repo = MemoryRepo::default();
+        let before = repo.snapshot().unwrap();
+        let blob = repo
+            .put::<UTF8String, _>("after snapshot".to_owned())
+            .unwrap();
+        let target = identity_for_tests(&named_for_tests(
+            "snapshot-target",
+            Id::new([81; 16]).unwrap(),
+        ));
+        let record = CollectionRecord::Derive(CollectionDerive::new(
+            target,
+            handle(82).into(),
+            handle(83).into(),
+        ));
+        repo.insert(record).unwrap();
+        let evidence = PeerEvidence::new(
+            SigningKey::from_bytes(&[84; 32]).verifying_key(),
+            SigningKey::from_bytes(&[85; 32]).verifying_key(),
+        );
+        repo.insert_peer(evidence).unwrap();
+        let after = repo.snapshot().unwrap();
+
+        assert!(!before.contains_blob(blob).unwrap());
+        assert_eq!(before.record(record.id()).unwrap(), None);
+        assert!(before.peers().unwrap().next().is_none());
+
+        assert!(after.contains_blob(blob).unwrap());
+        assert_eq!(after.record(record.id()).unwrap(), Some(record));
         assert_eq!(
-            MemoryRepo::revision_changes(&after_proof, &after_peer),
-            StoreRevisionChanges::PEERS,
+            after
+                .peers()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![evidence],
         );
     }
 }

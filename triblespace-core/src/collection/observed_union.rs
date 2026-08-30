@@ -55,6 +55,7 @@
 use ed25519_dalek::VerifyingKey;
 
 use anybytes::Bytes;
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
@@ -63,6 +64,7 @@ use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
 use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::macros::entity;
 // Reach arrives here as a builder argument; only the tests name a
@@ -82,7 +84,7 @@ use super::records::{
 };
 use super::{
     simplearchive_union, CollectionEncoding, CollectionMapping, CollectionOperationError,
-    CollectionStore, CoverAttachment, FactCover, TryFromCover,
+    CollectionRead, CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::repo::{ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta};
 
@@ -418,17 +420,21 @@ impl TryFromCover<ObservedSetBlob> for ObservedIndex {
     type Error = ObservedSetError;
 
     fn try_from_cover<R>(
-        attachment: CoverAttachment<ObservedSetBlob>,
-        _reader: &R,
-    ) -> Result<Self, Self::Error>
+        cover: &super::Cover<ObservedSetBlob>,
+        reader: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
-        R: BlobStoreGet + BlobStoreMeta,
+        R: BlobStoreGet,
     {
         let mut joined = empty();
-        for segment in attachment.into_blobs() {
-            joined = join(&joined, &segment)?;
+        for handle in cover.members() {
+            let member = Handle::<ObservedSetBlob>::to_hash(handle);
+            let segment = reader
+                .get(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            joined = join(&joined, &segment).map_err(TryFromCoverError::View)?;
         }
-        Self::decode(&joined)
+        Self::decode(&joined).map_err(TryFromCoverError::View)
     }
 }
 
@@ -533,13 +539,18 @@ impl ObservedSetCollection {
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.attach_exact(store, source_cover)?;
         let reader = store
-            .reader()
-            .map_err(|source| ObservedSetCollectionError::Reader(source.to_string()))?;
-        ObservedIndex::try_from_cover(cover, &reader).map_err(ObservedSetCollectionError::Algebra)
+            .snapshot()
+            .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;
+        ObservedIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
+            TryFromCoverError::MemberGet { source, .. } => {
+                ObservedSetCollectionError::Snapshot(source.to_string())
+            }
+            TryFromCoverError::View(source) => ObservedSetCollectionError::Algebra(source),
+        })
     }
 
     /// Ensure and attach the observed set for `source_cover`.
@@ -550,13 +561,18 @@ impl ObservedSetCollection {
     ) -> Result<ObservedIndex, ObservedSetCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let cover = self.kernel()?.ensure_exact(store, source_cover)?;
         let reader = store
-            .reader()
-            .map_err(|source| ObservedSetCollectionError::Reader(source.to_string()))?;
-        ObservedIndex::try_from_cover(cover, &reader).map_err(ObservedSetCollectionError::Algebra)
+            .snapshot()
+            .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;
+        ObservedIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
+            TryFromCoverError::MemberGet { source, .. } => {
+                ObservedSetCollectionError::Snapshot(source.to_string())
+            }
+            TryFromCoverError::View(source) => ObservedSetCollectionError::Algebra(source),
+        })
     }
 
     fn kernel(
@@ -576,8 +592,8 @@ pub enum ObservedSetCollectionError {
     Collection(ExactDerivedCollectionError),
     /// Canonical observed-set construction failed.
     Algebra(ObservedSetError),
-    /// A reader for the attached cover could not be opened.
-    Reader(String),
+    /// A store snapshot for the cover could not be frozen.
+    Snapshot(String),
 }
 
 impl fmt::Display for ObservedSetCollectionError {
@@ -585,7 +601,9 @@ impl fmt::Display for ObservedSetCollectionError {
         match self {
             Self::Collection(source) => source.fmt(formatter),
             Self::Algebra(source) => source.fmt(formatter),
-            Self::Reader(source) => write!(formatter, "open observed-set cover reader: {source}"),
+            Self::Snapshot(source) => {
+                write!(formatter, "freeze observed-set cover snapshot: {source}")
+            }
         }
     }
 }
@@ -595,7 +613,7 @@ impl Error for ObservedSetCollectionError {
         match self {
             Self::Collection(source) => Some(source),
             Self::Algebra(source) => Some(source),
-            Self::Reader(_) => None,
+            Self::Snapshot(_) => None,
         }
     }
 }

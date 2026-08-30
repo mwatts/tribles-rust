@@ -1,17 +1,29 @@
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::blob::TryFromBlob;
+use crate::capability::CapabilityProof;
+use crate::collection::{CollectionRead, CollectionRecord, CollectionStore};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
-use crate::repo::BlobStore;
+use crate::repo::BlobChildren;
+use crate::repo::BlobInfo;
+use crate::repo::BlobMetadata;
+use crate::repo::BlobStoreGet;
+use crate::repo::BlobStoreList;
+use crate::repo::BlobStoreMeta;
 use crate::repo::BlobStorePut;
+use crate::repo::CapabilityProofRead;
 use crate::repo::CapabilityProofStore;
+use crate::repo::PeerRead;
+use crate::repo::PeerStore;
+use crate::repo::SnapshotSource;
 use crate::repo::StorageFlush;
+use crate::repo::StoreChanges;
+use crate::repo::StoreSnapshot;
 use crate::repo::{ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore};
 use crate::repo::{WantRequest, WantStore};
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -26,6 +38,87 @@ pub struct HybridStore<B, R> {
     pub blobs: B,
     /// Storage for native collection records.
     pub records: R,
+}
+
+/// One immutable, dependency-consistent observation of both halves of a
+/// [`HybridStore`].
+///
+/// Blob capabilities come exclusively from `blobs`; collection, proof, and
+/// peer capabilities come exclusively from `records`. Offers and wants remain
+/// mutable local operational state and are intentionally absent. The record
+/// half is sampled first and the blob half second, mirroring dependency-first
+/// publication: every semantic record observed by a conforming writer can
+/// therefore see the blobs published before it.
+#[derive(Clone, Debug)]
+pub struct HybridSnapshot<B, R> {
+    /// Frozen blob-side observation.
+    blobs: B,
+    /// Frozen semantic-record-side observation.
+    records: R,
+}
+
+impl<B, R> StoreSnapshot for HybridSnapshot<B, R>
+where
+    B: StoreSnapshot,
+    R: StoreSnapshot,
+{
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        let blob_changes = self.blobs.changes_since(&previous.blobs);
+        let record_changes = self.records.changes_since(&previous.records);
+        let mut changes = StoreChanges::NONE;
+        if blob_changes.contains(StoreChanges::BLOBS) {
+            changes = changes.union(StoreChanges::BLOBS);
+        }
+        for component in [
+            StoreChanges::COLLECTION_RECORDS,
+            StoreChanges::CAPABILITY_PROOFS,
+            StoreChanges::PEERS,
+        ] {
+            if record_changes.contains(component) {
+                changes = changes.union(component);
+            }
+        }
+        changes
+    }
+}
+
+/// Failure while freezing one side of a [`HybridStore`].
+#[derive(Debug)]
+pub enum HybridSnapshotError<BlobError, RecordError> {
+    /// The blob-side snapshot could not be frozen.
+    Blobs(BlobError),
+    /// The semantic-record-side snapshot could not be frozen.
+    Records(RecordError),
+}
+
+impl<BlobError, RecordError> fmt::Display for HybridSnapshotError<BlobError, RecordError>
+where
+    BlobError: fmt::Display,
+    RecordError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blobs(error) => {
+                write!(formatter, "failed to snapshot hybrid blob store: {error}")
+            }
+            Self::Records(error) => {
+                write!(formatter, "failed to snapshot hybrid record store: {error}")
+            }
+        }
+    }
+}
+
+impl<BlobError, RecordError> Error for HybridSnapshotError<BlobError, RecordError>
+where
+    BlobError: Error + 'static,
+    RecordError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Blobs(error) => Some(error),
+            Self::Records(error) => Some(error),
+        }
+    }
 }
 
 impl<B, R> ArtifactOfferStore for HybridStore<B, R>
@@ -122,15 +215,169 @@ where
     }
 }
 
-impl<B, R> BlobStore for HybridStore<B, R>
+impl<B, R> SnapshotSource for HybridStore<B, R>
 where
-    B: BlobStore,
+    B: SnapshotSource,
+    R: SnapshotSource,
 {
-    type Reader = B::Reader;
-    type ReaderError = B::ReaderError;
+    type Snapshot = HybridSnapshot<B::Snapshot, R::Snapshot>;
+    type SnapshotError = HybridSnapshotError<B::SnapshotError, R::SnapshotError>;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.blobs.reader()
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        // Publication stores dependencies before the records which name them.
+        // Reading in the opposite order makes the non-atomic split safe: a
+        // record observed here cannot name a dependency published only after
+        // the later blob observation.
+        let records = self
+            .records
+            .snapshot()
+            .map_err(HybridSnapshotError::Records)?;
+        let blobs = self.blobs.snapshot().map_err(HybridSnapshotError::Blobs)?;
+        Ok(HybridSnapshot { blobs, records })
+    }
+}
+
+impl<B, R> BlobStoreGet for HybridSnapshot<B, R>
+where
+    B: BlobStoreGet,
+{
+    type GetError<E: Error + Send + Sync + 'static> = B::GetError<E>;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.get(handle)
+    }
+}
+
+impl<B, R> BlobStoreList for HybridSnapshot<B, R>
+where
+    B: BlobStoreList,
+{
+    type Iter<'a>
+        = B::Iter<'a>
+    where
+        Self: 'a;
+    type Err = B::Err;
+
+    fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+        self.blobs.blobs()
+    }
+
+    fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.contains_blob(handle)
+    }
+
+    fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<BlobInfo>, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.blob_info(handle)
+    }
+
+    fn blobs_diff<'a>(&'a self, old: &Self) -> Self::Iter<'a> {
+        self.blobs.blobs_diff(&old.blobs)
+    }
+}
+
+impl<B, R> BlobStoreMeta for HybridSnapshot<B, R>
+where
+    B: BlobStoreMeta,
+{
+    type MetaError = B::MetaError;
+
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<Option<BlobMetadata>, Self::MetaError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.metadata(handle)
+    }
+}
+
+impl<B, R> BlobChildren for HybridSnapshot<B, R>
+where
+    B: BlobChildren,
+{
+    fn children(&self, handle: Inline<Handle<UnknownBlob>>) -> Vec<Inline<Handle<UnknownBlob>>> {
+        self.blobs.children(handle)
+    }
+}
+
+impl<B, R> CollectionRead for HybridSnapshot<B, R>
+where
+    R: CollectionRead,
+{
+    type RecordsError = R::RecordsError;
+    type RecordIter<'a>
+        = R::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.records.records()
+    }
+
+    fn record(&self, id: crate::id::Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        self.records.record(id)
+    }
+
+    fn select_records(
+        &self,
+        selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        self.records.select_records(selectors)
+    }
+}
+
+impl<B, R> CapabilityProofRead for HybridSnapshot<B, R>
+where
+    R: CapabilityProofRead,
+{
+    type ProofsError = R::ProofsError;
+    type ProofIter<'a>
+        = R::ProofIter<'a>
+    where
+        Self: 'a;
+
+    fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        self.records.proofs()
+    }
+
+    fn proof(
+        &self,
+        id: crate::capability::CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        self.records.proof(id)
+    }
+}
+
+impl<B, R> PeerRead for HybridSnapshot<B, R>
+where
+    R: PeerRead,
+{
+    type PeersError = R::PeersError;
+    type PeerIter<'a>
+        = R::PeerIter<'a>
+    where
+        Self: 'a;
+
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+        self.records.peers()
     }
 }
 
@@ -138,25 +385,7 @@ impl<B, R> CollectionStore for HybridStore<B, R>
 where
     R: CollectionStore,
 {
-    type RecordsError = R::RecordsError;
     type InsertError = R::InsertError;
-
-    type RecordIter<'a>
-        = R::RecordIter<'a>
-    where
-        B: 'a,
-        R: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.records.records()
-    }
-
-    fn select_records(
-        &mut self,
-        selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-        self.records.select_records(selectors)
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.records.insert(record)
@@ -167,27 +396,24 @@ impl<B, R> CapabilityProofStore for HybridStore<B, R>
 where
     R: CapabilityProofStore,
 {
-    type ProofsError = R::ProofsError;
     type InsertError = R::InsertError;
-    type ProofIter<'a>
-        = R::ProofIter<'a>
-    where
-        B: 'a,
-        R: 'a;
-
-    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-        self.records.proofs()
-    }
-
-    fn proof(
-        &mut self,
-        id: CapabilityProofId,
-    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-        self.records.proof(id)
-    }
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         self.records.insert_proof(proof)
+    }
+}
+
+impl<B, R> PeerStore for HybridStore<B, R>
+where
+    R: PeerStore,
+{
+    type InsertError = R::InsertError;
+
+    fn insert_peer(
+        &mut self,
+        evidence: crate::repo::peer::PeerEvidence,
+    ) -> Result<(), Self::InsertError> {
+        self.records.insert_peer(evidence)
     }
 }
 
@@ -226,10 +452,13 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
     use crate::collection::{
-        simplearchive_union, CollectionHandle, CollectionMerge, CollectionStoreExt,
+        simplearchive_union, CollectionHandle, CollectionMerge, CollectionRead,
+        CollectionRecordSelector, CollectionStoreExt,
     };
     use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::SnapshotSource;
     use crate::trible::Fragment;
+    use crate::trible::TribleSet;
     use ed25519_dalek::SigningKey;
 
     fn id(byte: u8) -> Id {
@@ -251,8 +480,10 @@ mod tests {
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
 
         CollectionStore::insert(&mut hybrid, record).unwrap();
+        let snapshot = hybrid.snapshot().unwrap();
         assert_eq!(
-            CollectionStore::records(&mut hybrid)
+            snapshot
+                .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -261,20 +492,11 @@ mod tests {
         let selectors = [CollectionRecordSelector::MergeCollection(collection)]
             .into_iter()
             .collect();
-        assert_eq!(
-            CollectionStore::select_records(&mut hybrid, &selectors).unwrap(),
-            vec![record]
-        );
-        assert_eq!(
-            CollectionStore::records(&mut hybrid.records)
-                .unwrap()
-                .count(),
-            1
-        );
-        assert_eq!(
-            CollectionStore::records(&mut hybrid.blobs).unwrap().count(),
-            0
-        );
+        assert_eq!(snapshot.select_records(&selectors).unwrap(), vec![record]);
+        let record_snapshot = hybrid.records.snapshot().unwrap();
+        assert_eq!(record_snapshot.records().unwrap().count(), 1);
+        let blob_snapshot = hybrid.blobs.snapshot().unwrap();
+        assert_eq!(blob_snapshot.records().unwrap().count(), 0);
     }
 
     #[test]
@@ -305,12 +527,14 @@ mod tests {
         let commit = hybrid
             .commit(target, &signing_key, Fragment::empty())
             .unwrap();
-        assert_eq!(hybrid.snapshot(target).unwrap().facts().len(), 0);
+        let snapshot = hybrid.snapshot().unwrap();
+        let facts: TribleSet = target.read(&snapshot).unwrap();
+        assert_eq!(facts.len(), 0);
         assert_eq!(commit.collection(), target.handle());
         assert!(hybrid.blobs.blobs.len() >= 2);
+        let record_snapshot = hybrid.records.snapshot().unwrap();
         assert_eq!(
-            hybrid
-                .records
+            record_snapshot
                 .records()
                 .unwrap()
                 .filter_map(Result::ok)
@@ -320,7 +544,8 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(hybrid.blobs.records().unwrap().count(), 0);
+        let blob_snapshot = hybrid.blobs.snapshot().unwrap();
+        assert_eq!(blob_snapshot.records().unwrap().count(), 0);
     }
 
     #[test]

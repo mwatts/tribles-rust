@@ -23,39 +23,71 @@ use subject::core::blob::TryFromBlob;
 use subject::core::id::Id;
 #[cfg(feature = "rpq")]
 use subject::core::import::ntriples::uri_to_id_pure;
+use subject::core::inline::encodings::hash::Handle;
 use subject::core::inline::Inline;
 use subject::core::inline::InlineEncoding;
-use subject::core::inline::encodings::hash::Handle;
 use subject::core::macros::entity;
 use subject::core::metadata::{self, MetaDescribe};
+#[cfg(feature = "legacy-repository")]
 use subject::core::prelude::BlobStore;
 use subject::core::prelude::BlobStoreGet;
 use subject::core::prelude::IntoBlob;
+#[cfg(not(feature = "legacy-repository"))]
+use subject::core::prelude::SnapshotSource;
+#[cfg(feature = "legacy-repository")]
 use subject::core::repo::pile::PileReader;
+#[cfg(not(feature = "legacy-repository"))]
+use subject::core::repo::pile::PileSnapshot;
 use subject::core::trible::TribleSet;
+
+/// Immutable observation of an importer [`MemoryBlobStore`].
+#[cfg(feature = "legacy-repository")]
+pub type MemoryBlobSnapshot = <MemoryBlobStore as BlobStore>::Reader;
+/// Immutable observation of an importer [`MemoryBlobStore`].
+#[cfg(not(feature = "legacy-repository"))]
+pub type MemoryBlobSnapshot = <MemoryBlobStore as SnapshotSource>::Snapshot;
+
+/// Immutable observation of a pile-backed dataset.
+#[cfg(feature = "legacy-repository")]
+pub type PileBlobSnapshot = PileReader;
+/// Immutable observation of a pile-backed dataset.
+#[cfg(not(feature = "legacy-repository"))]
+pub type PileBlobSnapshot = PileSnapshot;
+
+/// Freeze the in-memory importer store once, outside measured query work.
+pub fn memory_blob_snapshot(store: &mut MemoryBlobStore) -> MemoryBlobSnapshot {
+    #[cfg(feature = "legacy-repository")]
+    {
+        store.reader().expect("memory blob store reader")
+    }
+    #[cfg(not(feature = "legacy-repository"))]
+    {
+        store.snapshot().expect("memory blob store snapshot")
+    }
+}
 
 /// Blob reader over either backing store the harness supports: the
 /// importer's in-memory store (a fresh `.nt` import) or a pile's mmap
 /// (literal lookups then resolve straight from the pile file). One
 /// enum dispatch per `get`; blob resolution itself (hashing, PATCH
 /// lookup) dwarfs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 // The stub runner never builds a `Dataset`, so no variant is
 // constructed yet; the real runner constructs both.
 #[allow(dead_code)]
 pub enum AnyBlobReader {
     /// Snapshot of an importer [`MemoryBlobStore`].
-    Memory(<MemoryBlobStore as BlobStore>::Reader),
-    /// Mmap-backed reader over a pile file.
-    Pile(PileReader),
+    Memory(MemoryBlobSnapshot),
+    /// Mmap-backed snapshot of a pile file.
+    Pile(PileBlobSnapshot),
 }
 
 /// [`AnyBlobReader::get`] failure: the underlying store's error,
 /// tagged by which store it was.
 #[derive(Debug)]
 pub enum AnyGetError<E: std::error::Error + Send + Sync + 'static> {
-    Memory(<<MemoryBlobStore as BlobStore>::Reader as BlobStoreGet>::GetError<E>),
-    Pile(subject::core::repo::pile::GetBlobError<E>),
+    Memory(<MemoryBlobSnapshot as BlobStoreGet>::GetError<E>),
+    Pile(<PileBlobSnapshot as BlobStoreGet>::GetError<E>),
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> std::fmt::Display for AnyGetError<E> {

@@ -48,9 +48,9 @@ use subject::core::prelude::*;
 // Raw engine protocol surface — needed only by the R2 fixtures: F11's
 // hand-written `Constraint` wrapper, F12's programmatic chain, and F13's
 // hand-rolled variable context.
-use subject::core::query::{Constraint, VariableContext};
 #[cfg(feature = "protocol-v2")]
 use subject::core::query::{Binding, ProposalBuffer, VariableId, VariableSet};
+use subject::core::query::{Constraint, VariableContext};
 // `ProposeCursor` is the resumable-narrowing cursor; it exists only on
 // subjects between the chunked-propose era and engine/batched-frontier.
 #[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
@@ -63,12 +63,12 @@ use subject::core::query::Candidates;
 // engine/batched-frontier onward.
 #[cfg(feature = "frontier")]
 use subject::core::query::Frontier;
-use subject::core::repo::pile::Pile;
 use subject::core::repo;
-#[cfg(feature = "legacy-repository")]
-use subject::core::repo::{PinStore, Repository};
+use subject::core::repo::pile::Pile;
 #[cfg(not(feature = "legacy-repository"))]
 use subject::core::repo::PinSnapshotSource;
+#[cfg(feature = "legacy-repository")]
+use subject::core::repo::{PinStore, Repository};
 
 // ---------------------------------------------------------------------------
 // Crash isolation
@@ -349,13 +349,13 @@ type CommitHandle = Inline<Handle<SimpleArchive>>;
 /// Walk a linear branch parents-first (oldest-first). Uses only
 /// `repo::parent` facts.
 fn commit_chain(
-    reader: &subject::core::repo::pile::PileReader,
+    snapshot: &impl BlobStoreGet,
     head: CommitHandle,
 ) -> Vec<(CommitHandle, TribleSet)> {
     let mut chain = Vec::new();
     let mut cursor = Some(head);
     while let Some(handle) = cursor {
-        let meta: TribleSet = reader.get(handle).expect("read commit metadata");
+        let meta: TribleSet = snapshot.get(handle).expect("read commit metadata");
         let parents: Vec<CommitHandle> = find!(
             (p: Inline<Handle<SimpleArchive>>),
             pattern!(&meta, [{ repo::parent: ?p }])
@@ -430,7 +430,10 @@ pub fn pile_checkout(
     let pins = pile
         .snapshot_pin_heads()
         .expect("snapshot legacy branch pins");
-    let reader = pile.reader().expect("pile reader");
+    #[cfg(feature = "legacy-repository")]
+    let snapshot = pile.reader().expect("pile reader");
+    #[cfg(not(feature = "legacy-repository"))]
+    let snapshot = pile.snapshot().expect("pile snapshot");
 
     // Resolve branches by metadata::name. With `branch`, exact match;
     // else auto-pick the single branch not named "manifest".
@@ -454,7 +457,9 @@ pub fn pile_checkout(
         })
         .collect();
     for (id, meta_handle) in legacy_heads {
-        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue };
+        let Ok(meta): Result<TribleSet, _> = snapshot.get(meta_handle) else {
+            continue;
+        };
         let handles: Vec<Inline<Handle<UTF8String>>> = find!(
             (n: Inline<Handle<UTF8String>>),
             pattern!(&meta, [{ metadata::name: ?n }])
@@ -462,7 +467,9 @@ pub fn pile_checkout(
         .map(|(n,)| n)
         .collect();
         let [h] = handles[..] else { continue };
-        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else { continue };
+        let Ok(name): Result<anybytes::View<str>, _> = snapshot.get(h) else {
+            continue;
+        };
         named.push((id, name.as_ref().to_owned(), meta));
     }
     let (_branch_id, branch_name, branch_meta) = match branch {
@@ -471,7 +478,10 @@ pub fn pile_checkout(
             .find(|(_, n, _)| n == want)
             .unwrap_or_else(|| panic!("no branch named {want:?} in pile")),
         None => {
-            let mut data: Vec<_> = named.into_iter().filter(|(_, n, _)| n != "manifest").collect();
+            let mut data: Vec<_> = named
+                .into_iter()
+                .filter(|(_, n, _)| n != "manifest")
+                .collect();
             match data.len() {
                 1 => data.remove(0),
                 n => panic!(
@@ -488,8 +498,10 @@ pub fn pile_checkout(
     )
     .map(|(c,)| c)
     .collect();
-    let [head] = heads[..] else { panic!("branch {branch_name:?} has no unique head commit") };
-    let chain = commit_chain(&reader, head);
+    let [head] = heads[..] else {
+        panic!("branch {branch_name:?} has no unique head commit")
+    };
+    let chain = commit_chain(&snapshot, head);
 
     // Rung -> k: one walk, per-commit tribles = SimpleArchive blob
     // length / 64.
@@ -504,12 +516,15 @@ pub fn pile_checkout(
         .map(|(c,)| c)
         .collect();
         let [content] = contents[..] else { continue }; // skip empty commits
-        let blob: Blob<SimpleArchive> = reader.get(content).expect("read content blob");
+        let blob: Blob<SimpleArchive> = snapshot.get(content).expect("read content blob");
         total += blob.bytes.len() / 64;
         handles.push(*handle);
         cum.push(total);
     }
-    assert!(!handles.is_empty(), "branch {branch_name:?} has no content commits");
+    assert!(
+        !handles.is_empty(),
+        "branch {branch_name:?} has no content commits"
+    );
     let (k, carve) = if rung < cum[0] {
         (1, Some(rung))
     } else {
@@ -560,9 +575,7 @@ pub fn pile_checkout(
         let mut set = {
             let mut set = TribleSet::new();
             for handle in &handles[..k] {
-                let meta: TribleSet = reader
-                    .get(*handle)
-                    .expect("read legacy commit metadata");
+                let meta: TribleSet = snapshot.get(*handle).expect("read legacy commit metadata");
                 let contents: Vec<CommitHandle> = find!(
                     (c: Inline<Handle<SimpleArchive>>),
                     pattern!(&meta, [{ repo::content: ?c }])
@@ -570,9 +583,7 @@ pub fn pile_checkout(
                 .map(|(c,)| c)
                 .collect();
                 let [content] = contents[..] else { continue };
-                let content: TribleSet = reader
-                    .get(content)
-                    .expect("read legacy commit content");
+                let content: TribleSet = snapshot.get(content).expect("read legacy commit content");
                 set += content;
             }
             set

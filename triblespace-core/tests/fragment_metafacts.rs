@@ -91,7 +91,7 @@ fn fragment_merge_deduplicates_descriptions_and_unions_the_shared_store() {
     assert_eq!(handles.len(), 2);
 
     let mut store = left.blobs().clone();
-    let reader = store.reader().expect("shared blob-store reader");
+    let reader = store.snapshot().expect("shared blob-store snapshot");
     let mut values: Vec<String> = handles
         .into_iter()
         .map(|handle| {
@@ -124,7 +124,7 @@ fn spreading_a_fragment_preserves_the_child_metafacts() {
     assert_eq!(nested.len(), 1);
 
     let mut store = parent.blobs().clone();
-    let reader = store.reader().expect("parent blob-store reader");
+    let reader = store.snapshot().expect("parent blob-store snapshot");
     let value: View<str> = reader
         .get::<View<str>, UTF8String>(nested[0])
         .expect("the spread child blob resolves from the parent store");
@@ -180,7 +180,7 @@ fn derived_attribute_identity_fragment_carries_its_name_blob() {
     .expect("the derived attribute identity has a name");
 
     let mut store = fragment.blobs().clone();
-    let reader = store.reader().expect("attribute blob-store reader");
+    let reader = store.snapshot().expect("attribute blob-store snapshot");
     let name: View<str> = reader
         .get::<View<str>, UTF8String>(name_handle)
         .expect("the identity fragment carries its own name bytes");
@@ -215,7 +215,7 @@ fn data_and_metadata_handles_resolve_from_the_same_blob_store() {
     .expect("declaration documentation handle is present in metafacts");
 
     let mut store = fragment.blobs().clone();
-    let reader = store.reader().expect("shared blob-store reader");
+    let reader = store.snapshot().expect("shared blob-store snapshot");
     let data: View<str> = reader
         .get::<View<str>, UTF8String>(data_handle)
         .expect("data handle resolves from the fragment store");

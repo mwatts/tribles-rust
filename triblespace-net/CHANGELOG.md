@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup as ordinary refresh. All speculative cover-member fetches now share
   one absolute interactive deadline instead of renewing it per member.
 
+- Fail closed when freezing a peer snapshot after a physical store-scope
+  conflict, and revalidate the scope before an older snapshot records a WANT
+  or lands fetched bytes. An externally concatenated conflicting scope can no
+  longer be hidden by the scheduler's lossy refresh surface.
+
 - Reobserve externally appended pile bytes before enumerating any inventory
   component, and expose a replacement serving snapshot only after one batched
   admission flush succeeds. A bounded event queue applies backpressure between
@@ -63,10 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canceled second exchange cannot remain cached as a live half-authorized
   connection.
 
-- Build replacement serving snapshots from `StoreRevisionChanges`: changed
-  components alone are enumerated, unchanged immutable inventory PATCHes are
-  retained before construction, and every installed snapshot still carries a
-  fresh Blob reader. A missing prior snapshot forces a conservative full build.
+- Build replacement serving snapshots from
+  `StoreSnapshot::changes_since`: changed components alone are enumerated,
+  unchanged immutable inventory PATCHes are retained before construction, and
+  every installed snapshot still carries fresh Blob access. A missing prior
+  snapshot forces a conservative full build.
 
 - Make provider-cover directory admission purely aggregate and work-conserving.
   Receivers now bound only live shard count and total live memberships; one
@@ -112,14 +118,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned-root/count checks.
 - Cache pinned inventory roots as independent component snapshots and reuse
   unchanged non-blob component `Arc`s plus the Blob component's BLAKE tree.
-  Its reader-bearing wrapper is refreshed even when the root is unchanged, so
+  Its access-bearing wrapper is refreshed even when the root is unchanged, so
   compacted mmap/Yard generations can retire immediately on snapshot install,
   without waiting for another manifest request. Partial churn no longer retains
-  up to 32 whole store snapshots or duplicate blob readers. History is bounded
+  up to 32 whole store snapshots or duplicate Blob access snapshots. History
+  is bounded
   independently to eight roots per component, so one hot inventory cannot
   consume nearly the entire cache. Immutable reads no longer cross a global
   snapshot mutex; exact blob service returns `Bytes`, cloning a
-  generic non-`Sync` reader only under a narrow component-local lock before
+  generic non-`Sync` snapshot only under a narrow component-local lock before
   payload lookup and validation. Superseded trees and backend leases are also
   carried outside pointer/cache locks before their potentially recursive drop.
 

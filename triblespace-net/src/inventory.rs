@@ -22,14 +22,14 @@ use triblespace_core::capability::{
     CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityRequest,
     CapabilityResource, CapabilityValidity,
 };
-use triblespace_core::collection::{CollectionRecord, CollectionStore};
+use triblespace_core::collection::{CollectionRead, CollectionRecord};
 use triblespace_core::id::{Id, id_hex};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::peer::PeerEvidence;
 use triblespace_core::repo::{
-    BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, PeerStore,
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, PeerRead, SnapshotSource,
 };
 
 /// Permission to synchronize one server-selected team inventory.
@@ -568,12 +568,12 @@ pub(crate) fn build_proof_inventory(
 
 /// Immutable authorized observation of all four inventory components.
 ///
-/// Components are pinned independently by their Merkle roots. No atomicity
-/// across store traits is implied or required: a later blob observation does
-/// not invalidate an already-pinned record walk.
+/// [`InventorySnapshot::from_store`] freezes one coherent store snapshot before
+/// deriving any component. Components remain independently addressable by
+/// their Merkle roots without reopening the store or crossing that boundary.
 pub struct InventorySnapshot<R> {
     team: ed25519_dalek::VerifyingKey,
-    reader: R,
+    store_snapshot: R,
     blobs: BlobInventory,
     manifest: InventoryManifest,
 }
@@ -587,40 +587,43 @@ impl InventorySnapshot<()> {
     pub fn from_store<S>(
         store: &mut S,
         team: ed25519_dalek::VerifyingKey,
-    ) -> Result<InventorySnapshot<S::Reader>>
+    ) -> Result<InventorySnapshot<S::Snapshot>>
     where
-        S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore,
+        S: SnapshotSource,
+        S::Snapshot: BlobStoreGet + BlobStoreList + CollectionRead + CapabilityProofRead + PeerRead,
     {
-        // Pile::reader performs external-append reobservation. Refresh before
-        // enumerating every native component so this is one coherent store
-        // observation rather than three stale indexes plus fresh blobs.
-        let reader = store.reader().map_err(anyhow::Error::new)?;
+        let store_snapshot = store.snapshot().map_err(anyhow::Error::new)?;
         let peer_keys = {
-            let iterator = store.peers().map_err(anyhow::Error::new)?;
+            let iterator = store_snapshot.peers().map_err(anyhow::Error::new)?;
             iterator
                 .map(|evidence| evidence.map(|evidence| *evidence.as_bytes()))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
         let records = {
-            let iterator = store.records().map_err(anyhow::Error::new)?;
+            let iterator = store_snapshot.records().map_err(anyhow::Error::new)?;
             iterator
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
         let proofs = {
-            let iterator = store.proofs().map_err(anyhow::Error::new)?;
+            let iterator = store_snapshot.proofs().map_err(anyhow::Error::new)?;
             iterator
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::new)?
         };
-        let blob_keys = reader
+        let blob_keys = store_snapshot
             .blobs()
             .map(|info| info.map(|info| info.handle.raw))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(anyhow::Error::new)?;
         InventorySnapshot::from_observation_parts(
-            team, reader, peer_keys, records, proofs, blob_keys,
+            team,
+            store_snapshot,
+            peer_keys,
+            records,
+            proofs,
+            blob_keys,
         )
     }
 }
@@ -634,27 +637,27 @@ where
     /// Backend ordering is ignored and duplicate identities collapse. Merkle
     /// digests authenticate keys only; record/proof bodies are frozen as
     /// associated PATCH values and checked against those keys, while blob
-    /// bytes are retrieved from the pinned reader only when requested.
+    /// bytes are retrieved from the pinned store snapshot only when requested.
     pub fn from_observation(
         team: ed25519_dalek::VerifyingKey,
-        reader: R,
+        store_snapshot: R,
         peers: impl IntoIterator<Item = PeerEvidence>,
         records: impl IntoIterator<Item = CollectionRecord>,
         proofs: impl IntoIterator<Item = CapabilityProof>,
     ) -> Result<Self> {
         let peer_keys = peers.into_iter().map(|evidence| *evidence.as_bytes());
-        let blob_keys = reader
+        let blob_keys = store_snapshot
             .blobs()
             .map(|info| info.map(|info| info.handle.raw))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(anyhow::Error::new)?;
 
-        Self::from_observation_parts(team, reader, peer_keys, records, proofs, blob_keys)
+        Self::from_observation_parts(team, store_snapshot, peer_keys, records, proofs, blob_keys)
     }
 
     fn from_observation_parts(
         team: ed25519_dalek::VerifyingKey,
-        reader: R,
+        store_snapshot: R,
         peer_keys: impl IntoIterator<Item = [u8; 64]>,
         records: impl IntoIterator<Item = CollectionRecord>,
         proofs: impl IntoIterator<Item = CapabilityProof>,
@@ -693,7 +696,7 @@ where
 
         Ok(Self {
             team,
-            reader,
+            store_snapshot,
             blobs: blob_inventory,
             manifest,
         })
@@ -709,9 +712,9 @@ where
         &self.manifest
     }
 
-    /// Frozen reader used to serve a blob named by this inventory.
-    pub const fn reader(&self) -> &R {
-        &self.reader
+    /// Frozen store snapshot used to serve a blob named by this inventory.
+    pub const fn store_snapshot(&self) -> &R {
+        &self.store_snapshot
     }
 }
 
@@ -724,7 +727,7 @@ where
         if self.blobs.get(&hash).is_none() {
             return None;
         }
-        self.reader
+        self.store_snapshot
             .get::<anybytes::Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(hash))
             .ok()
     }
@@ -736,7 +739,9 @@ mod tests {
     use hifitime::Epoch;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::capability::{CapabilityClaim, CapabilityMode};
-    use triblespace_core::collection::{CollectionCommit, CollectionData, CollectionRecord};
+    use triblespace_core::collection::{
+        CollectionCommit, CollectionData, CollectionRecord, CollectionStore,
+    };
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{BlobStorePut, PeerStore};

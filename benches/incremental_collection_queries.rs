@@ -88,7 +88,8 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     store
         .commit(collection, &signing_key, author)
         .expect("publish seed author");
-    let seed_cover = store.cover(collection).expect("freeze seed cover");
+    let snapshot = store.snapshot().expect("freeze seed snapshot");
+    let seed_cover = collection.admitted(&snapshot).expect("freeze seed cover");
     assert_eq!(seed_cover.len(), 1);
 
     let mut covers = Vec::with_capacity(commits);
@@ -117,7 +118,8 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         store
             .commit(collection, &signing_key, fragment)
             .expect("publish book commit");
-        covers.push(store.cover(collection).expect("freeze exact cover"));
+        let snapshot = store.snapshot().expect("freeze collection snapshot");
+        covers.push(collection.admitted(&snapshot).expect("freeze exact cover"));
         expected_batches.push(expected);
     }
 
@@ -223,9 +225,10 @@ impl IncrementalState {
             .view
             .ensure(&mut self.store, cover)
             .expect("advance incremental full view");
+        let snapshot = self.store.snapshot().expect("freeze delta snapshot");
         let changed = fixture
             .simple
-            .attach_exact(&mut self.store, &added)
+            .attach_exact(&snapshot, &added)
             .expect("attach exact support delta");
 
         let mut raw_rows = 0usize;

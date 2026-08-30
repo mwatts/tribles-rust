@@ -523,7 +523,7 @@ pub trait CosineSimilarity {
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
 /// use triblespace_core::query::{temp, ContainsConstraint};
-/// use triblespace_core::repo::BlobStore;
+/// use triblespace_core::repo::SnapshotSource;
 /// use triblespace_core::inline::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
@@ -541,8 +541,8 @@ pub trait CosineSimilarity {
 ///     handles.push(h);
 /// }
 /// let idx = b.build();
-/// let reader = store.reader().unwrap();
-/// let view = idx.attach(&reader);
+/// let snapshot = store.snapshot().unwrap();
+/// let view = idx.attach(&snapshot);
 ///
 /// let probe = handles[0];
 /// let candidates: HashSet<_> = handles.iter().copied().collect();
@@ -688,7 +688,7 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
 /// use std::collections::HashSet;
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
-/// use triblespace_core::repo::BlobStore;
+/// use triblespace_core::repo::SnapshotSource;
 /// use triblespace_core::inline::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
@@ -706,8 +706,8 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
 ///     handles.push(h);
 /// }
 /// let idx = b.build();
-/// let reader = store.reader().unwrap();
-/// let view = idx.attach(&reader);
+/// let snapshot = store.snapshot().unwrap();
+/// let view = idx.attach(&snapshot);
 ///
 /// // No temp!, no `.is()` — the probe is pinned on the call.
 /// let rows: Vec<(Inline<EmbHandle>,)> = find!(
@@ -821,7 +821,7 @@ mod tests {
     use triblespace_core::inline::{InlineEncoding, IntoInline, TryFromInline};
     use triblespace_core::query::BindingStore;
     use triblespace_core::query::Query;
-    use triblespace_core::repo::{BlobStore, BlobStorePut};
+    use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -1207,8 +1207,8 @@ mod tests {
     #[test]
     fn flat_cosine_filters_candidates_exactly_in_both_binding_orders() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = flat.attach(&snapshot);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
@@ -1248,8 +1248,8 @@ mod tests {
     #[test]
     fn cosine_confirm_keeps_candidates_while_peer_is_unbound() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = flat.attach(&snapshot);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
@@ -1267,8 +1267,8 @@ mod tests {
     #[test]
     fn flat_cosine_satisfied_checks_the_same_exact_predicate() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = flat.attach(&snapshot);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
@@ -1293,8 +1293,8 @@ mod tests {
         let (_flat, hnsw, mut store, handles) = sample_sim();
         let outside =
             crate::schemas::put_embedding::<_>(&mut store, vec![0.999, 0.001, 0.0]).unwrap();
-        let reader = store.reader().unwrap();
-        let view = hnsw.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = hnsw.attach(&snapshot);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
@@ -1314,8 +1314,8 @@ mod tests {
         let (flat, _hnsw, mut store, _handles) = sample_sim();
         let a_handle = store.put::<Embedding, _>(vec![2.0f32, 0.0, 0.0]).unwrap();
         let b_handle = store.put::<Embedding, _>(vec![3.0f32, 0.0, 0.0]).unwrap();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = flat.attach(&snapshot);
         let a = Variable::<Handle<Embedding>>::new(0);
         let b = Variable::<Handle<Embedding>>::new(1);
 
@@ -1338,8 +1338,8 @@ mod tests {
     #[test]
     fn cosine_estimate_saturates_even_when_the_peer_is_bound() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = flat.attach(&snapshot);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
@@ -1360,8 +1360,8 @@ mod tests {
     #[test]
     fn repeated_cosine_variable_is_checked_during_confirmation() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = flat.attach(&snapshot);
         let x = Variable::<Handle<Embedding>>::new(0);
 
         let mut accepted = ProposalBuffer::new();
@@ -1389,8 +1389,8 @@ mod tests {
     #[test]
     fn exact_cosine_filters_in_production_queries() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let view = flat.attach(&snapshot);
         let a = Variable::<Handle<Embedding>>::new(0);
         let b = Variable::<Handle<Embedding>>::new(1);
 
@@ -1468,12 +1468,14 @@ mod tests {
     }
 
     #[test]
-    fn similar_to_snapshot_outlives_attached_index_and_blob_reader() {
+    fn similar_to_snapshot_outlives_attached_index_and_blob_snapshot() {
         let neighbour = Variable::<Handle<Embedding>>::new(0);
         let (constraint, mut expected) = {
             let (flat, _hnsw, mut store, handles) = sample_sim();
-            let reader = store.reader().unwrap();
-            let constraint = flat.attach(&reader).similar_to(handles[0], neighbour, 0.8);
+            let snapshot = store.snapshot().unwrap();
+            let constraint = flat
+                .attach(&snapshot)
+                .similar_to(handles[0], neighbour, 0.8);
             (constraint, vec![handles[0].raw, handles[2].raw])
         };
 
@@ -1598,9 +1600,9 @@ mod tests {
         hnsw_b.insert(far_h, far).unwrap();
         let hnsw = hnsw_b.build_naive();
 
-        let reader = store.reader().unwrap();
-        let flat_view = flat.attach(&reader);
-        let hnsw_view = hnsw.attach(&reader);
+        let snapshot = store.snapshot().unwrap();
+        let flat_view = flat.attach(&snapshot);
+        let hnsw_view = hnsw.attach(&snapshot);
 
         // Both leaf walks repeat the shared handle.
         assert_eq!(flat_view.candidates_above(near_h, 0.8).unwrap().len(), 2);
@@ -1627,7 +1629,7 @@ mod tests {
             // `from_naive` copies the handle table verbatim — no universe, no
             // sort, no dedup — so the succinct walk repeats it too.
             let succinct = crate::succinct::SuccinctHNSWIndex::from_naive(&hnsw).unwrap();
-            let succinct_view = succinct.attach(&reader);
+            let succinct_view = succinct.attach(&snapshot);
             assert_eq!(
                 succinct_view.candidates_above(near_h, 0.8).unwrap().len(),
                 2

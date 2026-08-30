@@ -32,7 +32,7 @@ use crate::inline::{Inline, InlineEncoding, IntoInline, RawInline};
 use crate::metadata;
 use crate::prelude::{entity, find, pattern};
 use crate::query::TriblePattern;
-use crate::repo::{BlobStore, BlobStorePut};
+use crate::repo::{BlobStorePut, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
 
 // Reach arrives here as a builder argument; only the tests name a
@@ -68,8 +68,8 @@ where
 {
     let mut blobs = descriptor.blobs().clone();
     let mut embedded: Vec<Blob<UnknownBlob>> = blobs
-        .reader()
-        .expect("MemoryBlobStore::reader is infallible")
+        .snapshot()
+        .expect("MemoryBlobStore::snapshot is infallible")
         .into_iter()
         .map(|(_, blob)| blob)
         .collect();
@@ -434,7 +434,7 @@ mod tests {
     use crate::collection::records::{collection_authority, collection_source};
     use crate::inline::encodings::ed25519::ED25519PublicKey;
     use crate::metadata;
-    use crate::repo::{BlobStore, BlobStoreGet};
+    use crate::repo::BlobStoreGet;
     use crate::trible::Trible;
 
     use anybytes::View;
@@ -520,7 +520,7 @@ mod tests {
             .expect("root descriptor has a name");
 
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().expect("memory blob reader");
+        let reader = blobs.snapshot().expect("memory blob snapshot");
         let actual: View<str> = reader
             .get::<View<str>, UTF8String>(handle)
             .expect("the name bytes travel with the descriptor fragment");

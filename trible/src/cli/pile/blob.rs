@@ -6,7 +6,7 @@ use std::path::PathBuf;
 // DEFAULT_MAX_PILE_SIZE removed; the new Pile API no longer uses a size const generic
 
 use crate::cli::util::parse_blob_handle;
-use triblespace_core::repo::BlobStoreMeta;
+use triblespace_core::repo::{BlobStoreMeta, SnapshotSource};
 
 #[derive(Parser)]
 pub enum Command {
@@ -51,7 +51,6 @@ pub fn run(cmd: Command) -> Result<()> {
             use std::time::Duration;
             use std::time::UNIX_EPOCH;
 
-            use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreList;
             use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::inline::encodings::hash::Blake3;
@@ -61,17 +60,17 @@ pub fn run(cmd: Command) -> Result<()> {
 
             let mut pile: Pile = Pile::open(&path)?;
             let res = (|| -> Result<(), anyhow::Error> {
-                let reader = pile
-                    .reader()
-                    .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-                for info in reader.blobs() {
+                let snapshot = pile
+                    .snapshot()
+                    .map_err(|e| anyhow::anyhow!("pile snapshot error: {e:?}"))?;
+                for info in snapshot.blobs() {
                     let handle: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                         info?.handle;
                     let hash: triblespace_core::inline::Inline<Hash<Blake3>> =
                         Handle::to_hash(handle);
                     let string: String = hash.from_inline();
                     if metadata {
-                        let meta_opt = reader.metadata(handle)?;
+                        let meta_opt = snapshot.metadata(handle)?;
                         if let Some(meta) = meta_opt {
                             let dt = UNIX_EPOCH + Duration::from_millis(meta.timestamp);
                             let time: DateTime<Utc> = DateTime::<Utc>::from(dt);
@@ -117,7 +116,6 @@ pub fn run(cmd: Command) -> Result<()> {
         } => {
             use std::io::Write;
 
-            use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreGet;
             use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::blob::Bytes;
@@ -130,10 +128,10 @@ pub fn run(cmd: Command) -> Result<()> {
                 let hash_val = parse_blob_handle(&handle)?;
                 let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                     hash_val.into();
-                let reader = pile
-                    .reader()
-                    .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-                let bytes: Bytes = reader.get(handle_val)?;
+                let snapshot = pile
+                    .snapshot()
+                    .map_err(|e| anyhow::anyhow!("pile snapshot error: {e:?}"))?;
+                let bytes: Bytes = snapshot.get(handle_val)?;
                 let mut file = File::create(&output)?;
                 file.write_all(&bytes)?;
                 Ok(())
@@ -148,7 +146,6 @@ pub fn run(cmd: Command) -> Result<()> {
             use std::time::Duration;
             use std::time::UNIX_EPOCH;
 
-            use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreGet;
             use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::blob::Blob;
@@ -162,11 +159,11 @@ pub fn run(cmd: Command) -> Result<()> {
                 let hash_val = parse_blob_handle(&handle)?;
                 let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                     hash_val.into();
-                let reader = pile
-                    .reader()
-                    .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-                let blob: Blob<UnknownBlob> = reader.get(handle_val)?;
-                let metadata: BlobMetadata = reader
+                let snapshot = pile
+                    .snapshot()
+                    .map_err(|e| anyhow::anyhow!("pile snapshot error: {e:?}"))?;
+                let blob: Blob<UnknownBlob> = snapshot.get(handle_val)?;
+                let metadata: BlobMetadata = snapshot
                     .metadata(handle_val)?
                     .ok_or_else(|| anyhow::anyhow!("blob not found"))?;
 

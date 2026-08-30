@@ -50,7 +50,7 @@ use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 use crate::repo::{
     ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStorePut, OfferCapture,
-    OfferCaptureInsertError,
+    OfferCaptureInsertError, SnapshotSource,
 };
 use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
@@ -318,8 +318,8 @@ impl PreparedCollectionCommit {
         let mut store = OfferCapture::new(store);
         if put_descriptor {
             let mut attachments: Vec<Blob<UnknownBlob>> = descriptor_blobs
-                .reader()
-                .expect("MemoryBlobStore::reader is infallible")
+                .snapshot()
+                .expect("MemoryBlobStore::snapshot is infallible")
                 .into_iter()
                 .map(|(_, blob)| blob)
                 .collect();
@@ -799,8 +799,8 @@ pub fn prepare_fragment_commit(
     // The sort key is the identity `put` will file each blob under, so the
     // staged order is the documented handle order.
     let mut embedded: Vec<Blob<UnknownBlob>> = blobs
-        .reader()
-        .expect("MemoryBlobStore::reader is infallible")
+        .snapshot()
+        .expect("MemoryBlobStore::snapshot is infallible")
         .into_iter()
         .map(|(_, blob)| blob)
         .collect();
@@ -920,14 +920,14 @@ where
 /// construction -- and if it is not, the merge is over something that was
 /// never committed and must fail here rather than be published.
 fn fetch_merge_input<S>(
-    reader: &S::Reader,
+    snapshot: &S::Snapshot,
     role: ElementRole,
     data: CollectionData,
 ) -> Result<Blob<SimpleArchive>, PublicationError<S::PutError, S::InsertError>>
 where
     S: BlobStore + CollectionStore,
 {
-    reader
+    snapshot
         .get::<Blob<SimpleArchive>, _>(Handle::<SimpleArchive>::from_hash(data))
         .map_err(|_| PublicationError::MergeInputAbsent { role, data })
 }
@@ -981,7 +981,7 @@ where
     // them a second time, and re-normalized bytes that were normalized on the
     // way in.
     let reader = store
-        .reader()
+        .snapshot()
         .map_err(|_| PublicationError::MergeInputAbsent {
             role: ElementRole::MergeLow,
             data: low,
@@ -1217,7 +1217,7 @@ mod tests {
     use crate::macros::entity;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
-    use crate::repo::{BlobStore, BlobStoreGet};
+    use crate::repo::{BlobStoreGet, SnapshotSource};
     use crate::trible::TribleSet;
 
     /// The one team every collection in these tests belongs to.
@@ -1281,7 +1281,7 @@ mod tests {
         // handle now, so a store that cannot be read cannot be merged into --
         // which is the point of that change, and this is the probe catching up
         // with it rather than a convenience.
-        blobs: crate::blob::MemoryBlobStore,
+        repo: MemoryRepo,
     }
 
     impl ProbeStore {
@@ -1296,7 +1296,7 @@ mod tests {
         /// what the merge itself writes.
         fn seed(&mut self, blob: &Blob<SimpleArchive>) {
             self.known.insert(blob.get_handle().raw);
-            self.blobs.insert(blob.clone());
+            self.repo.blobs.insert(blob.clone());
         }
 
         fn failing_before_effect_at(operation: usize) -> Self {
@@ -1343,12 +1343,12 @@ mod tests {
         }
     }
 
-    impl crate::repo::BlobStore for ProbeStore {
-        type Reader = <crate::blob::MemoryBlobStore as crate::repo::BlobStore>::Reader;
-        type ReaderError = <crate::blob::MemoryBlobStore as crate::repo::BlobStore>::ReaderError;
+    impl crate::repo::SnapshotSource for ProbeStore {
+        type Snapshot = <MemoryRepo as crate::repo::SnapshotSource>::Snapshot;
+        type SnapshotError = Infallible;
 
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.blobs.reader()
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            crate::repo::SnapshotSource::snapshot(&mut self.repo)
         }
     }
 
@@ -1365,29 +1365,19 @@ mod tests {
             let handle = blob.get_handle();
             self.attempt(ProbeEvent::Put(handle.raw))?;
             self.known.insert(handle.raw);
-            self.blobs.insert(blob.clone());
+            self.repo.blobs.insert(blob.clone());
             Ok(handle)
         }
     }
 
     impl CollectionStore for ProbeStore {
-        type RecordsError = Infallible;
         type InsertError = ProbeFailure;
-        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
-
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            Ok(self
-                .records
-                .values()
-                .copied()
-                .map(Ok)
-                .collect::<Vec<_>>()
-                .into_iter())
-        }
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.attempt(ProbeEvent::Insert(record.id()))?;
             self.records.entry(record.id()).or_insert(record);
+            CollectionStore::insert(&mut self.repo, record)
+                .expect("MemoryRepo insertion is infallible");
             Ok(())
         }
     }
@@ -1475,8 +1465,8 @@ mod tests {
     fn embedded_put_events(fragment: &Fragment) -> Vec<ProbeEvent> {
         let mut blobs = fragment.blobs().clone();
         let mut handles: Vec<_> = blobs
-            .reader()
-            .expect("memory store reader is infallible")
+            .snapshot()
+            .expect("memory store snapshot is infallible")
             .iter()
             .map(|(handle, _)| handle.raw)
             .collect();
@@ -1580,8 +1570,8 @@ mod tests {
         let mut staged = prepared.stage(&mut pile, &signing_key).unwrap();
         let withheld = *staged.commit();
         {
-            let discovered = discover_collection_records(staged.store_mut()).unwrap();
-            let reader = staged.store_mut().reader().unwrap();
+            let reader = staged.store_mut().snapshot().unwrap();
+            let discovered = discover_collection_records(&reader).unwrap();
             assert!(discovered.commits().is_empty());
             assert!(discovered.merges().is_empty());
             assert!(discovered.derives().is_empty());
@@ -1629,8 +1619,8 @@ mod tests {
         pile.close().unwrap();
 
         let mut reopened = Pile::open(&path).unwrap();
-        let discovered = discover_collection_records(&mut reopened).unwrap();
-        let reader = reopened.reader().unwrap();
+        let reader = reopened.snapshot().unwrap();
+        let discovered = discover_collection_records(&reader).unwrap();
         assert!(discovered.commits().is_empty());
         assert!(!discovered
             .commits()
@@ -1661,21 +1651,24 @@ mod tests {
         let mut staged = prepared.stage(&mut store, &signing_key).unwrap();
         let commit = *staged.commit();
         {
-            let reader = staged.store_mut().reader().unwrap();
+            let reader = staged.store_mut().snapshot().unwrap();
             let name: View<str> = reader.get(name_handle).unwrap();
             assert_eq!(&*name, "attached descriptor name");
         }
-        assert!(discover_collection_records(staged.store_mut())
+        let snapshot = staged.store_mut().snapshot().unwrap();
+        assert!(discover_collection_records(&snapshot)
             .unwrap()
             .commits()
             .is_empty());
+        drop(snapshot);
         assert!(staged.store_mut().offers_snapshot().unwrap().is_empty());
 
         staged.finalize().unwrap();
 
         let offers = store.offers_snapshot().unwrap();
         assert!(offers.contains(name_handle.transmute()));
-        let discovered = discover_collection_records(&mut store).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let discovered = discover_collection_records(&snapshot).unwrap();
         assert_eq!(discovered.commits(), &[commit]);
     }
 
@@ -2192,8 +2185,8 @@ mod tests {
         };
 
         let mut reopened = Pile::open(&path).unwrap();
-        let discovered = discover_collection_records(&mut reopened).unwrap();
-        let reader = reopened.reader().unwrap();
+        let reader = reopened.snapshot().unwrap();
+        let discovered = discover_collection_records(&reader).unwrap();
         // Both sides are commits now: a merge is an equation between states,
         // and each side became a state by being committed.
         let mut expected_commits = vec![commit.clone(), right_commit.clone()];
@@ -2249,8 +2242,8 @@ mod tests {
         };
 
         let mut reopened = Pile::open(&path).unwrap();
-        let discovered = discover_collection_records(&mut reopened).unwrap();
-        let reader = reopened.reader().unwrap();
+        let reader = reopened.snapshot().unwrap();
+        let discovered = discover_collection_records(&reader).unwrap();
         assert_eq!(discovered.commits(), &[commit.clone()]);
         assert!(discovered.merges().is_empty());
         assert!(discovered.derives().is_empty());
@@ -2296,7 +2289,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut blobs = descriptor.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let name: View<str> = reader.get(name).unwrap();
         assert_eq!(&*name, "first");
         assert_eq!(

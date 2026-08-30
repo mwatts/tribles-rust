@@ -35,11 +35,10 @@ use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{CapabilityClaim, CapabilityMode, CapabilityProofBundle};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{
-    ArtifactHandle, ArtifactOfferStore, BlobStoreGet, BlobStorePut, StoreScope, WantRequest,
-    WantStore,
+    ArtifactHandle, ArtifactOfferStore, BlobStoreGet, BlobStorePut, SnapshotSource, StoreScope,
+    WantRequest, WantStore,
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
@@ -243,7 +242,7 @@ async fn want_fetches_from_holder_over_iroh() {
 
     // Precondition: B does not hold the payload.
     {
-        let reader = peer_b.reader().expect("b reader");
+        let reader = peer_b.snapshot().expect("b snapshot");
         let held: Result<anybytes::Bytes, _> =
             BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash));
         assert!(
@@ -287,7 +286,7 @@ async fn want_fetches_from_holder_over_iroh() {
 
     // The payload landed in pile B…
     {
-        let reader = peer_b.reader().expect("b reader");
+        let reader = peer_b.snapshot().expect("b snapshot");
         let got: anybytes::Bytes =
             BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash))
                 .expect("B holds the payload after reconcile");

@@ -160,7 +160,7 @@ The crate also ships with these blob encodings:
   epoch. A change that can alter canonical bytes requires a newly minted id.
   This is a complete source-bound accelerated encoding, not a sidecar. Member
   validation follows the embedded handle and requires the raw child to be
-  resident. A cover-aware query view then loads that child through its reader,
+  resident. A cover-aware query view then loads that child through its store snapshot,
   validates the exact raw/index pair, and reconstructs the runtime. The raw
   `SuccinctArchiveBlob` lattice owns canonical union; accelerated roots have no
   direct join. Maintenance therefore compacts raw members first and maps the
@@ -178,7 +178,7 @@ one directly materializable join. Returning no direct join means that physical
 compaction belongs in another lattice; multi-member covers and logical views
 remain valid. `SimpleArchive` and `SuccinctArchiveBlob` are directly joinable,
 while `Rank9AcceleratedSuccinctArchiveBlob` is derived after raw compaction.
-Validation and joining share the snapshot's blob reader, so Merkle-shaped
+Validation and joining share one immutable store snapshot, so Merkle-shaped
 encodings can resolve children named by their members without consulting
 ambient mutable state.
 The maintained collection encodings implement the same contract directly;

@@ -3,9 +3,9 @@ use tempfile::tempdir;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::repo::pile::Pile;
-use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStorePut;
+use triblespace::prelude::SnapshotSource;
 
 #[test]
 fn put_and_get_empty_blob() {
@@ -24,7 +24,7 @@ fn put_and_get_empty_blob() {
 
     let mut reopened: Pile = Pile::open(&path).unwrap();
     let blob = reopened
-        .reader()
+        .snapshot()
         .unwrap()
         .get::<Blob<UnknownBlob>, _>(handle)
         .unwrap();

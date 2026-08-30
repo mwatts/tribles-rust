@@ -15,7 +15,7 @@ use triblespace_core::macros::entity;
 use triblespace_core::metadata;
 use triblespace_core::query::{Binding, Query, Variable};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::BlobStorePut;
+use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 use triblespace_paths::{
     automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathSummaryCollection, Step,
@@ -123,7 +123,8 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     );
     store.insert(CollectionRecord::Commit(commit)).unwrap();
 
-    let cover = store.cover(source).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let cover = source.admitted(&snapshot).unwrap();
     let index = paths.ensure_exact(&mut store, &cover).unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));

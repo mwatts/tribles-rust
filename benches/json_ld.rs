@@ -8,11 +8,11 @@ use std::{fs, hint};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::Blob;
-use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::blob::{MemoryBlobStore, MemoryBlobStoreSnapshot};
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
 use triblespace::core::import::json::JsonObjectImporter;
-use triblespace::prelude::{BlobEncoding, BlobStore, TribleSet};
+use triblespace::prelude::{BlobEncoding, SnapshotSource, TribleSet};
 
 const FIXTURE_NAME: &str = "mapping-authorities-gnd-agrovoc_lds.jsonld";
 
@@ -59,9 +59,8 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     struct ExportFixture {
         merged: TribleSet,
         roots: Vec<Id>,
-        reader: <MemoryBlobStore as BlobStore>::Reader,
+        snapshot: MemoryBlobStoreSnapshot,
         payload_len: usize,
-        _blobs: MemoryBlobStore,
     }
 
     let export_fixture = {
@@ -73,15 +72,14 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         let roots = fragment.exports().collect::<Vec<_>>();
         let mut merged = importer.metadata().into_facts();
         merged += fragment.into_facts();
-        let reader = blobs.reader().expect("reader");
+        let snapshot = blobs.snapshot().expect("snapshot");
         let payload_len = import_payload.len();
 
         ExportFixture {
             merged,
             roots,
-            reader,
+            snapshot,
             payload_len,
-            _blobs: blobs,
         }
     };
 
@@ -122,10 +120,10 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             let roots = fragment.exports().collect::<Vec<_>>();
             let mut merged = importer.metadata().into_facts();
             merged += fragment.into_facts();
-            let reader = blobs.reader().expect("reader");
+            let snapshot = blobs.snapshot().expect("snapshot");
             let exported = if roots.len() == 1 {
                 let mut out = String::new();
-                export_to_json(&merged, roots[0], &reader, &mut out).expect("export JSON");
+                export_to_json(&merged, roots[0], &snapshot, &mut out).expect("export JSON");
                 out
             } else {
                 let mut out = String::new();
@@ -136,7 +134,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
                         let _ = out.write_char(',');
                     }
                     first = false;
-                    export_to_json(&merged, *root, &reader, &mut out).expect("export JSON");
+                    export_to_json(&merged, *root, &snapshot, &mut out).expect("export JSON");
                 }
                 let _ = out.write_char(']');
                 out
@@ -155,13 +153,13 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         BenchmarkId::new("export_only_json", FIXTURE_NAME),
         move |b| {
             b.iter(|| {
-                let reader = export_fixture.reader.clone();
+                let snapshot = export_fixture.snapshot.clone();
                 let mut exported = String::new();
                 if export_fixture.roots.len() == 1 {
                     export_to_json(
                         &export_fixture.merged,
                         export_fixture.roots[0],
-                        &reader,
+                        &snapshot,
                         &mut exported,
                     )
                     .expect("export JSON");
@@ -173,7 +171,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
                             let _ = exported.write_char(',');
                         }
                         first = false;
-                        export_to_json(&export_fixture.merged, *root, &reader, &mut exported)
+                        export_to_json(&export_fixture.merged, *root, &snapshot, &mut exported)
                             .expect("export JSON");
                     }
                     let _ = exported.write_char(']');

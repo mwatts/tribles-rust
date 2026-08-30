@@ -26,7 +26,7 @@ use anybytes::area::ByteArea;
 use triblespace_core::blob::{BlobCache, MemoryBlobStore};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::BlobStore;
+use triblespace_core::repo::SnapshotSource;
 
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::ring::RingGraph;
@@ -302,7 +302,7 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
         ring_size as f64 / csr_size as f64,
     );
 
-    let reader = store.reader().unwrap();
+    let snapshot = store.snapshot().unwrap();
 
     let mut rng = Rng(seed ^ 0xFACE_FEED);
     let queries: Vec<Vec<f32>> = (0..100)
@@ -310,7 +310,7 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
         .collect();
 
     // ─ CSR run ─
-    let cache_csr = BlobCache::new(reader.clone());
+    let cache_csr = BlobCache::new(snapshot.clone());
     let neigh_csr =
         |v: u32, l: u8| -> Vec<u32> { csr.neighbours(v as usize, l as usize).collect() };
     // Warm the cache (one query) before timing.
@@ -340,7 +340,7 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
     let csr_avg = samples_csr.iter().sum::<u128>() / samples_csr.len() as u128;
 
     // ─ Ring run ─
-    let cache_ring = BlobCache::new(reader.clone());
+    let cache_ring = BlobCache::new(snapshot.clone());
     let neigh_ring =
         |v: u32, l: u8| -> Vec<u32> { rings[l as usize].neighbours(v as usize).collect() };
     {

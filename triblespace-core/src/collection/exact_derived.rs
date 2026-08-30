@@ -34,8 +34,8 @@ use super::{
     collection_physical_cover, collection_physical_cover_for, descriptor,
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation, CollectionData,
     CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
-    CollectionOperationError, CollectionRecord, CollectionSemantics, CollectionStore, Cover,
-    CoverAttachment, DiscoveredCollectionRecords,
+    CollectionOperationError, CollectionRead, CollectionRecord, CollectionSemantics,
+    CollectionStore, Cover, DiscoveredCollectionRecords,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -135,7 +135,7 @@ impl Candidate {
 /// selection then chooses another valid cover or reports incompleteness.
 pub enum ExactAttachPlan<Target: CollectionEncoding> {
     /// Every selected physical member is resident and freshly validated.
-    Ready(CoverAttachment<Target>),
+    Ready(Cover<Target>),
     /// Exact target members selected from the offered set but not resident.
     ///
     /// Handles are returned in ascending content-identity order. Fetching them
@@ -391,10 +391,10 @@ where
         &self,
         store: &mut S,
         source_cover: &Cover<Source>,
-    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         self.attach_with_route(store, source_cover, SourceRoute::SupportEquivalent)
     }
@@ -408,10 +408,10 @@ where
         &self,
         store: &mut S,
         source_cover: &Cover<Source>,
-    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         self.attach_with_route(store, source_cover, SourceRoute::ExactMembers)
     }
@@ -438,12 +438,13 @@ where
     ) -> Result<ExactAttachPlan<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
-            return Ok(ExactAttachPlan::Ready(CoverAttachment::empty(
+            return Ok(ExactAttachPlan::Ready(Cover::from_members(
                 self.target_collection,
+                [],
             )));
         }
         let offered_target = offered_target
@@ -483,10 +484,10 @@ where
         &self,
         store: &mut S,
         source_cover: &Cover<Source>,
-    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let mut capture = OfferCapture::new(store);
         self.ensure_exact_unoffered(&mut capture, source_cover)
@@ -496,10 +497,10 @@ where
         &self,
         store: &mut S,
         source_cover: &Cover<Source>,
-    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         self.ensure_with_route(store, source_cover, SourceRoute::SupportEquivalent)
     }
@@ -509,10 +510,10 @@ where
         &self,
         store: &mut S,
         source_cover: &Cover<Source>,
-    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore + ArtifactOfferStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         let mut capture = OfferCapture::new(store);
         self.ensure_with_route(&mut capture, source_cover, SourceRoute::ExactMembers)
@@ -523,14 +524,14 @@ where
         store: &mut S,
         source_cover: &Cover<Source>,
         route: SourceRoute,
-    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
-            return Ok(CoverAttachment::empty(self.target_collection));
+            return Ok(Cover::from_members(self.target_collection, []));
         }
 
         let probe = match route {
@@ -611,7 +612,7 @@ where
                 .collect::<Vec<_>>();
         };
 
-        // Never retain an observed reader snapshot across publication.
+        // Never retain an observed store snapshot across publication.
         drop(probe);
         self.publish_descriptors(store)?;
         for prepared in &prepared {
@@ -642,14 +643,14 @@ where
         store: &mut S,
         source_cover: &Cover<Source>,
         route: SourceRoute,
-    ) -> Result<CoverAttachment<Target>, ExactDerivedCollectionError>
+    ) -> Result<Cover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
-            return Ok(CoverAttachment::empty(self.target_collection));
+            return Ok(Cover::from_members(self.target_collection, []));
         }
         let probe = match route {
             SourceRoute::SupportEquivalent => {
@@ -686,10 +687,10 @@ where
         source_cover: &Cover<Source>,
         plan_source_residual: bool,
         offered_target: &BTreeSet<CollectionData>,
-    ) -> Result<ExactProbe<S::Reader, Source, Target>, ExactDerivedCollectionError>
+    ) -> Result<ExactProbe<S::Snapshot, Source, Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         // Preserve the low-latency direct path. Reverse decomposition may fan
         // out over many unsigned MERGE observations, so consult it only when
@@ -722,21 +723,21 @@ where
         plan_source_residual: bool,
         offered_target: &BTreeSet<CollectionData>,
         scope: ProbeScope,
-    ) -> Result<ExactProbe<S::Reader, Source, Target>, ExactDerivedCollectionError>
+    ) -> Result<ExactProbe<S::Snapshot, Source, Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
-        S::Reader: BlobStoreMeta,
+        S::Snapshot: BlobStoreMeta + CollectionRead,
     {
         self.require_source_cover(source_cover)?;
+        let reader = store.snapshot().map_err(|error| {
+            ExactDerivedCollectionError::storage("open exact-cover snapshot", error)
+        })?;
         let discovered = discover_collection_records_for_derived_cover(
-            store,
+            &reader,
             source_cover,
             self.target_collection.handle(),
         )
         .map_err(|error| ExactDerivedCollectionError::storage("discover exact cover", error))?;
-        let reader = store.reader().map_err(|error| {
-            ExactDerivedCollectionError::storage("open exact-cover reader", error)
-        })?;
 
         let mut known = BTreeMap::<TypedData, ScratchValue<Source, Target>>::new();
         let mut roots = BTreeSet::new();
@@ -1072,25 +1073,9 @@ where
         Ok(ExactProbe {
             reader,
             target_cover: target_physical.fetch.is_empty().then(|| {
-                CoverAttachment::from_parts(
-                    Cover::from_data(
-                        self.target_collection,
-                        target_physical.cover.iter().copied(),
-                    ),
-                    target_physical
-                        .cover
-                        .iter()
-                        .map(|data| {
-                            (
-                                Handle::<Target>::from_hash(*data),
-                                target_physical
-                                    .blobs
-                                    .get(data)
-                                    .expect("resident target cover retains selected bytes")
-                                    .clone(),
-                            )
-                        })
-                        .collect(),
+                Cover::from_data(
+                    self.target_collection,
+                    target_physical.cover.iter().copied(),
                 )
             }),
             target_fetch: target_physical.fetch,
@@ -1163,7 +1148,7 @@ struct SourcePlan<Source: CollectionEncoding> {
 
 struct ExactProbe<R, Source: CollectionEncoding, Target: CollectionEncoding> {
     reader: R,
-    target_cover: Option<CoverAttachment<Target>>,
+    target_cover: Option<Cover<Target>>,
     target_fetch: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,
     unsupported_members: BTreeSet<CollectionData>,
@@ -1185,7 +1170,7 @@ impl<R, Source: CollectionEncoding, Target: CollectionEncoding> ExactProbe<R, So
         }
     }
 
-    fn into_target_cover(self) -> CoverAttachment<Target> {
+    fn into_target_cover(self) -> Cover<Target> {
         self.target_cover
             .expect("complete exact probe has a resident target cover")
     }

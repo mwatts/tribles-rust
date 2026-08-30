@@ -24,8 +24,8 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::{Inline, InlineEncoding, TryFromInline};
 use triblespace_core::metadata;
-use triblespace_core::repo::pile::{Pile, PileReader};
-use triblespace_core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinSnapshotSource};
+use triblespace_core::repo::pile::{Pile, PileSnapshot};
+use triblespace_core::repo::{self, BlobStoreGet, CommitHandle, PinSnapshotSource, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 
 use super::super::signing::load_signing_key;
@@ -93,16 +93,16 @@ fn migrate(
     let pins = pile
         .snapshot_pin_heads()
         .context("snapshot active legacy branch pins")?;
-    let reader = pile.reader().context("snapshot legacy pile blobs")?;
-    let (branch, branch_meta) = resolve_branch(&reader, &pins, branch_reference)?;
-    let head = validate_branch_head(&reader, branch, &branch_meta)?;
+    let snapshot = pile.snapshot().context("snapshot legacy pile")?;
+    let (branch, branch_meta) = resolve_branch(&snapshot, &pins, branch_reference)?;
+    let head = validate_branch_head(&snapshot, branch, &branch_meta)?;
     // Migrated history stays put. A legacy branch carried no notion of reach,
     // so declaring one here would be inventing a decision on the user's behalf
     // about data they wrote before the question existed. Publishing migrated
     // material stays a deliberate re-commit into a private named collection.
     let descriptor = simplearchive_union::descriptor(name, authority, reach::private());
     let (reachable, contentless_merges, prepared) = match head {
-        Some(head) => prepare_reachable(&reader, head, &descriptor)?,
+        Some(head) => prepare_reachable(&snapshot, head, &descriptor)?,
         None => (0, 0, Vec::new()),
     };
     let authored = prepared.len();
@@ -142,14 +142,14 @@ fn migrate(
 }
 
 fn resolve_branch(
-    reader: &PileReader,
+    snapshot: &PileSnapshot,
     pins: &repo::PinSnapshot,
     reference: &str,
 ) -> Result<(Id, TribleSet)> {
     if let Ok(id) = parse_branch_id(reference) {
         let raw: [u8; 16] = id.into();
         if let Some(handle) = pins.get(&raw).copied() {
-            let facts = read_archive(reader, handle, "legacy branch metadata")?.1;
+            let facts = read_archive(snapshot, handle, "legacy branch metadata")?.1;
             repo::branch::branch_entity(&facts, id)
                 .map_err(|_| anyhow!("pin {id:X} does not contain one branch metadata subject"))?;
             return Ok((id, facts));
@@ -161,7 +161,7 @@ fn resolve_branch(
     for raw in pins.iter_ordered() {
         let id = Id::new(*raw).expect("pin snapshot contains a nil id");
         let handle = *pins.get(raw).expect("iterated pin has a value");
-        let (_, facts) = read_archive(reader, handle, "legacy branch metadata")?;
+        let (_, facts) = read_archive(snapshot, handle, "legacy branch metadata")?;
 
         let Ok(subject) = repo::branch::branch_entity(&facts, id) else {
             continue;
@@ -226,7 +226,7 @@ fn parse_branch_id(text: &str) -> Result<Id> {
 }
 
 fn validate_branch_head(
-    reader: &PileReader,
+    snapshot: &PileSnapshot,
     branch: Id,
     facts: &TribleSet,
 ) -> Result<Option<CommitHandle>> {
@@ -234,7 +234,7 @@ fn validate_branch_head(
         .map_err(|_| anyhow!("legacy branch {branch:X} has no unique metadata subject"))?;
     let head = one_value(facts, subject, &repo::head, "branch head")?;
     if let Some(head) = head {
-        let (blob, _) = read_archive(reader, head, "legacy branch head commit")?;
+        let (blob, _) = read_archive(snapshot, head, "legacy branch head commit")?;
         repo::branch::verify(branch, blob, facts.clone())
             .map_err(|_| anyhow!("legacy branch {branch:X} head signature is invalid"))?;
     }
@@ -242,7 +242,7 @@ fn validate_branch_head(
 }
 
 fn prepare_reachable(
-    reader: &PileReader,
+    snapshot: &PileSnapshot,
     head: CommitHandle,
     descriptor: &triblespace_core::trible::Fragment,
 ) -> Result<(usize, usize, Vec<(CommitHandle, PreparedCollectionCommit)>)> {
@@ -260,7 +260,7 @@ fn prepare_reachable(
             continue;
         }
 
-        let (_, facts) = read_archive(reader, handle, "legacy commit wrapper")?;
+        let (_, facts) = read_archive(snapshot, handle, "legacy commit wrapper")?;
         let Some(first) = facts.iter().next() else {
             bail!("legacy commit {} has an empty wrapper", handle_hex(handle));
         };
@@ -282,7 +282,7 @@ fn prepare_reachable(
         stack.extend(parents.iter().copied());
 
         if let Some(content) = content {
-            let data = read_blob(reader, content, "legacy commit content")?;
+            let data = read_blob(snapshot, content, "legacy commit content")?;
             repo::commit::verify(data.clone(), facts).map_err(|_| {
                 anyhow!(
                     "legacy authored commit {} has an invalid content signature",
@@ -290,7 +290,7 @@ fn prepare_reachable(
                 )
             })?;
             let metadata = match metadata {
-                Some(handle) => read_blob(reader, handle, "legacy commit metadata archive")?,
+                Some(handle) => read_blob(snapshot, handle, "legacy commit metadata archive")?,
                 None => empty_metadata.clone(),
             };
             let commit = simplearchive_union::prepare_commit(descriptor, &data, &metadata)
@@ -332,11 +332,11 @@ fn validate_contentless_merge(
 }
 
 fn read_archive(
-    reader: &PileReader,
+    snapshot: &PileSnapshot,
     handle: ArchiveHandle,
     what: &str,
 ) -> Result<(Blob<SimpleArchive>, TribleSet)> {
-    let blob: Blob<SimpleArchive> = reader
+    let blob: Blob<SimpleArchive> = snapshot
         .get(handle)
         .with_context(|| format!("read {what} {}", handle_hex(handle)))?;
     let facts = blob
@@ -347,11 +347,11 @@ fn read_archive(
 }
 
 fn read_blob(
-    reader: &PileReader,
+    snapshot: &PileSnapshot,
     handle: ArchiveHandle,
     what: &str,
 ) -> Result<Blob<SimpleArchive>> {
-    reader
+    snapshot
         .get(handle)
         .with_context(|| format!("read {what} {}", handle_hex(handle)))
 }
@@ -424,7 +424,7 @@ mod tests {
 
     use ed25519_dalek::Signer;
     use tempfile::NamedTempFile;
-    use triblespace_core::collection::{CollectionRecord, CollectionStore};
+    use triblespace_core::collection::{CollectionRead, CollectionRecord};
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::patch::Entry;
     use triblespace_core::repo::BlobStorePut;
@@ -538,10 +538,11 @@ mod tests {
         let mut expected_union = fact(1);
         expected_union += fact(2);
         expected_union += fact(3);
-        let materialized = pile
-            .snapshot(collection)
+        let snapshot = pile.snapshot()?;
+        let materialized: TribleSet = collection
+            .read(&snapshot)
             .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
-        assert_eq!(materialized.facts(), &expected_union);
+        assert_eq!(materialized, expected_union);
 
         pile.flush()?;
         let first_len = fs::metadata(&path)?.len();
@@ -562,8 +563,10 @@ mod tests {
         );
         assert_eq!(fs::metadata(&path)?.len(), first_len);
         let target = target_handle(name, authority);
+        let snapshot = pile.snapshot()?;
         assert_eq!(
-            pile.records()?
+            snapshot
+                .records()?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .filter(|record| {
@@ -588,11 +591,12 @@ mod tests {
             migrate(&mut pile, "legacy", "delegated-events", authority, &signer)?;
 
         assert!(!mappings.is_empty(), "migration still publishes locally");
-        assert!(pile
-            .cover(collection)
+        let snapshot = pile.snapshot()?;
+        assert!(collection
+            .admitted(&snapshot)
             .map_err(|error| anyhow!("read unauthorized cover: {error}"))?
             .is_empty());
-        assert!(pile
+        assert!(snapshot
             .records()?
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -628,10 +632,9 @@ mod tests {
         let collection_name = "empty-preserved";
         let signer = key(11);
         let descriptor = target_descriptor(collection_name, signer.verifying_key());
-        let reader = pile.reader()?;
+        let snapshot = pile.snapshot()?;
         let (reachable, contentless_merges, prepared) =
-            prepare_reachable(&reader, merge_commit, &descriptor)?;
-        drop(reader);
+            prepare_reachable(&snapshot, merge_commit, &descriptor)?;
 
         assert_eq!(reachable, 3);
         assert_eq!(contentless_merges, 1);
@@ -663,10 +666,11 @@ mod tests {
         assert_eq!(data_target.data().raw, data.get_handle().raw);
         assert_eq!(data_target.metadata(), empty_metadata);
 
-        let materialized = pile
-            .snapshot(collection)
+        let snapshot = pile.snapshot()?;
+        let materialized: TribleSet = collection
+            .read(&snapshot)
             .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
-        assert_eq!(materialized.facts(), &fact(9));
+        assert_eq!(materialized, fact(9));
         pile.close()?;
         Ok(())
     }
@@ -696,8 +700,8 @@ mod tests {
         let mut pins = repo::PinSnapshot::new();
         let raw: [u8; 16] = branch.into();
         pins.insert(&Entry::with_value(&raw, legacy_meta));
-        let reader = pile.reader()?;
-        let (resolved, _) = resolve_branch(&reader, &pins, hex_name)?;
+        let snapshot = pile.snapshot()?;
+        let (resolved, _) = resolve_branch(&snapshot, &pins, hex_name)?;
         assert_eq!(resolved, branch);
         pile.close()?;
         Ok(())
@@ -721,9 +725,9 @@ mod tests {
         }
         .into_facts();
         let handle = pile.put::<SimpleArchive, _>(wrapper)?;
-        let reader = pile.reader()?;
+        let snapshot = pile.snapshot()?;
 
-        let (_, wrapper) = read_archive(&reader, handle, "random-subject wrapper")?;
+        let (_, wrapper) = read_archive(&snapshot, handle, "random-subject wrapper")?;
         assert_eq!(
             one_value(&wrapper, subject, &repo::content, "content")?,
             Some(content_handle)
@@ -733,7 +737,7 @@ mod tests {
             key(14).verifying_key(),
             reach::private(),
         );
-        let (reachable, merges, prepared) = prepare_reachable(&reader, handle, &descriptor)?;
+        let (reachable, merges, prepared) = prepare_reachable(&snapshot, handle, &descriptor)?;
         assert_eq!((reachable, merges, prepared.len()), (1, 0, 1));
         pile.close()?;
         Ok(())
@@ -767,12 +771,14 @@ mod tests {
 
         let descriptor =
             simplearchive_union::descriptor("target", key(6).verifying_key(), reach::private());
-        let reader = pile.reader()?;
-        let error = prepare_reachable(&reader, wrapper, &descriptor)
+        let snapshot = pile.snapshot()?;
+        let error = prepare_reachable(&snapshot, wrapper, &descriptor)
             .expect_err("bad authored signature must reject the whole migration");
         assert!(error.to_string().contains("invalid content signature"));
-        drop(reader);
-        assert!(pile.records()?.collect::<Result<Vec<_>, _>>()?.is_empty());
+        assert!(snapshot
+            .records()?
+            .collect::<Result<Vec<_>, _>>()?
+            .is_empty());
         pile.close()?;
         Ok(())
     }

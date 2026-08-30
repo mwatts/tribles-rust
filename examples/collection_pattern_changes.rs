@@ -28,7 +28,8 @@ fn observe(
     checkpoint: &mut Option<Cover<SimpleArchive>>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    let current = store.cover(collection)?;
+    let snapshot = store.snapshot()?;
+    let current = collection.admitted(&snapshot)?;
     let added = match checkpoint.as_ref() {
         Some(previous) => current.additions_since(previous)?,
         None => current.clone(),
@@ -38,7 +39,7 @@ fn observe(
     // admits only new support. The small SimpleArchive delta stays independent
     // because it drives the change query and advances only after consumption.
     let full = full_view.ensure(store, &current)?;
-    let changed = simple.attach_exact(store, &added)?;
+    let changed = simple.attach_exact(&snapshot, &added)?;
 
     let mut titles = Vec::new();
     for title in find!(

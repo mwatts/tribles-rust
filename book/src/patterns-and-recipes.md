@@ -139,8 +139,8 @@ returned fragment:
 // attachment store and puts the resulting handle in the trible.
 change += entity! { &doc @ article::body: "A very long string..." };
 
-// A collection snapshot carries the reader which validated its facts.
-let body: View<str> = snapshot.reader().get(some_body_handle)?;
+// Use the same immutable store snapshot that admitted and materialized the facts.
+let body: View<str> = snapshot.get(some_body_handle)?;
 println!("{}", body.as_ref());
 
 // Low-level producers may put explicitly when they need the handle first.

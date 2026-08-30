@@ -511,9 +511,9 @@ mod instrumentation_tests {
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::blob::Blob;
-    use triblespace_core::collection::{self, CollectionRecord, CollectionStore};
+    use triblespace_core::collection::{self, CollectionRead, CollectionRecord};
     use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageClose};
+    use triblespace_core::repo::{BlobStoreGet, SnapshotSource, StorageClose};
     use triblespace_core::trible::TribleSet;
 
     #[test]
@@ -561,9 +561,9 @@ mod instrumentation_tests {
         assert_eq!(handles.len(), 4);
 
         let mut blobs = context.fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let snapshot = blobs.snapshot().unwrap();
         for handle in handles {
-            let _: Blob<UTF8String> = reader.get(handle).unwrap();
+            let _: Blob<UTF8String> = snapshot.get(handle).unwrap();
         }
     }
 
@@ -589,7 +589,9 @@ mod instrumentation_tests {
         publish_metadata(&path, name, signing_key, fragment);
 
         let mut pile = Pile::open(&path).unwrap();
-        let records = CollectionStore::records(&mut pile)
+        let snapshot = pile.snapshot().unwrap();
+        let records = snapshot
+            .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -605,16 +607,15 @@ mod instrumentation_tests {
             triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(expected_descriptor.clone())
                 .get_handle();
         let commit = records
-            .iter()
+            .into_iter()
             .find_map(|record| match record {
-                CollectionRecord::Commit(commit) if commit.collection() == target => Some(*commit),
+                CollectionRecord::Commit(commit) if commit.collection() == target => Some(commit),
                 _ => None,
             })
             .expect("single target collection commit");
         commit.verify_strict().unwrap();
 
-        let reader = pile.reader().unwrap();
-        let descriptor_blob: Blob<SimpleArchive> = reader.get(commit.collection()).unwrap();
+        let descriptor_blob: Blob<SimpleArchive> = snapshot.get(commit.collection()).unwrap();
         let descriptor =
             <TribleSet as triblespace_core::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
                 descriptor_blob,
@@ -625,7 +626,8 @@ mod instrumentation_tests {
             "the commit names the descriptor the facade published"
         );
 
-        let _: Blob<UTF8String> = reader.get(attachment).unwrap();
+        let _: Blob<UTF8String> = snapshot.get(attachment).unwrap();
+        drop(snapshot);
         StorageClose::close(pile).unwrap();
     }
 }

@@ -19,14 +19,14 @@
 //! *delivered by another party* (a sync daemon, another writer) — it
 //! may never arrive, and the want persists durably either way.
 //!
-//! Like `PeerReader`, existence-vs-retrieval is split by *which trait
+//! Like `PeerSnapshot`, existence-vs-retrieval is split by *which trait
 //! you call*, not by a bespoke method:
 //!
-//! - the **sync** [`BlobStoreGet`] on [`LazyReader`] is the instant
+//! - the **sync** [`BlobStoreGet`] on [`LazySnapshot`] is the instant
 //!   probe: a hit serves from the snapshot; a miss durably records the
 //!   want and returns [`WantGetError::NotYet`] immediately — it never
 //!   waits.
-//! - the **async** [`AsyncBlobStoreGet`] on [`LazyReader`] is the
+//! - the **async** [`AsyncBlobStoreGet`] on [`LazySnapshot`] is the
 //!   waiting read: a hit resolves immediately; a miss durably records
 //!   the SAME want and then suspends until the blob appears in the
 //!   store — landed by a sync daemon servicing the want, or by any
@@ -70,7 +70,7 @@
 //!
 //! [`AsyncBlobStoreGet`]: crate::repo::async_store::AsyncBlobStoreGet
 //! [`BlobStoreGet`]: crate::repo::BlobStoreGet
-//! [`LazyReader`]: crate::repo::lazy::LazyReader
+//! [`LazySnapshot`]: crate::repo::lazy::LazySnapshot
 //! [`Lazy`]: crate::repo::lazy::Lazy
 //! [`WantStore`]: crate::repo::WantStore
 //! [`WantGetError::NotYet`]: crate::repo::lazy::WantGetError::NotYet
@@ -78,7 +78,6 @@
 //! [`WantWaitError::Store`]: crate::repo::lazy::WantWaitError::Store
 //! [`WantWaitError::WantRecord`]: crate::repo::lazy::WantWaitError::WantRecord
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,18 +89,20 @@ use anybytes::Bytes;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
-use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use crate::capability::CapabilityProof;
+use crate::collection::{CollectionRead, CollectionRecord, CollectionStore};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
-use crate::repo::CapabilityProofStore;
+use crate::repo::peer::PeerEvidence;
+use crate::repo::{CapabilityProofRead, CapabilityProofStore, PeerRead, PeerStore};
 
 use super::async_store::{
-    AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
+    AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut, AsyncSnapshotSource,
 };
 use super::{
-    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobInfo, BlobStore, BlobStoreGet,
-    BlobStoreList, BlobStorePut, StorageFlush, WantRequest, WantStore,
+    ArtifactHandle, ArtifactOfferSnapshot, ArtifactOfferStore, BlobInfo, BlobMetadata, BlobStore,
+    BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, SnapshotSource, StorageFlush,
+    StoreChanges, StoreSnapshot, WantRequest, WantStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -149,7 +150,7 @@ where
     }
 }
 
-/// Error from a [`LazyReader`]'s **sync probe** ([`BlobStoreGet`]).
+/// Error from a [`LazySnapshot`]'s **sync probe** ([`BlobStoreGet`]).
 #[derive(Debug)]
 pub enum WantGetError<E, W> {
     /// The bytes were present locally but didn't convert to the
@@ -195,7 +196,7 @@ where
     }
 }
 
-/// Error from a [`LazyReader`]'s **async waiting read**
+/// Error from a [`LazySnapshot`]'s **async waiting read**
 /// ([`AsyncBlobStoreGet`]).
 ///
 /// There is deliberately no "not yet" variant: the async read *resolves*
@@ -328,7 +329,7 @@ impl WantSignal {
 /// docs](self) for the full mental model.
 ///
 /// Mirrors the shared-store shape of `triblespace-net`'s `Peer`
-/// (`Arc<Mutex<S>>`) so a `&self` read on a [`LazyReader`] can record
+/// (`Arc<Mutex<S>>`) so a `&self` read on a [`LazySnapshot`] can record
 /// the durable want — the one piece of state a read must mutate.
 pub struct Lazy<S> {
     store: Arc<Mutex<S>>,
@@ -361,7 +362,7 @@ impl<S> Lazy<S> {
     ///
     /// # Panics
     ///
-    /// Panics if an outstanding [`LazyReader`] still shares the store
+    /// Panics if an outstanding [`LazySnapshot`] still shares the store
     /// — drop all readers first.
     pub fn into_store(self) -> S {
         match Arc::try_unwrap(self.store) {
@@ -369,7 +370,7 @@ impl<S> Lazy<S> {
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             Err(_) => panic!(
-                "Lazy::into_store: an outstanding LazyReader still shares the store; drop readers first"
+                "Lazy::into_store: an outstanding LazySnapshot still shares the store; drop snapshots first"
             ),
         }
     }
@@ -397,16 +398,16 @@ where
     }
 }
 
-impl<S> BlobStore for Lazy<S>
+impl<S> SnapshotSource for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
 {
-    type Reader = LazyReader<S>;
-    type ReaderError = S::ReaderError;
+    type Snapshot = LazySnapshot<S>;
+    type SnapshotError = S::SnapshotError;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        let local = self.store.lock().expect("store mutex").reader()?;
-        Ok(LazyReader {
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let local = self.store.lock().expect("store mutex").snapshot()?;
+        Ok(LazySnapshot {
             local,
             store: self.store.clone(),
             signal: self.signal.clone(),
@@ -416,32 +417,9 @@ where
 
 impl<S> CollectionStore for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
+    S: CollectionStore,
 {
-    type RecordsError = S::RecordsError;
     type InsertError = S::InsertError;
-    // Collected eagerly: the inner iterator borrows the mutex guard, which
-    // cannot escape this call.
-    type RecordIter<'a>
-        = std::vec::IntoIter<Result<CollectionRecord, S::RecordsError>>
-    where
-        S: 'a;
-
-    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        let mut store = self.store.lock().expect("store mutex");
-        let records: Vec<Result<CollectionRecord, S::RecordsError>> = store.records()?.collect();
-        Ok(records.into_iter())
-    }
-
-    fn select_records(
-        &mut self,
-        selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-        self.store
-            .lock()
-            .expect("store mutex")
-            .select_records(selectors)
-    }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.store.lock().expect("store mutex").insert(record)
@@ -450,30 +428,26 @@ where
 
 impl<S> CapabilityProofStore for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + CapabilityProofStore + WantStore + StorageFlush + Send + 'static,
+    S: CapabilityProofStore,
 {
-    type ProofsError = S::ProofsError;
     type InsertError = S::InsertError;
-    type ProofIter<'a>
-        = std::vec::IntoIter<Result<CapabilityProof, S::ProofsError>>
-    where
-        S: 'a;
-
-    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-        let mut store = self.store.lock().expect("store mutex");
-        let proofs: Vec<Result<CapabilityProof, S::ProofsError>> = store.proofs()?.collect();
-        Ok(proofs.into_iter())
-    }
-
-    fn proof(
-        &mut self,
-        id: CapabilityProofId,
-    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-        self.store.lock().expect("store mutex").proof(id)
-    }
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         self.store.lock().expect("store mutex").insert_proof(proof)
+    }
+}
+
+impl<S> PeerStore for Lazy<S>
+where
+    S: PeerStore,
+{
+    type InsertError = S::InsertError;
+
+    fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
+        self.store
+            .lock()
+            .expect("store mutex")
+            .insert_peer(evidence)
     }
 }
 
@@ -583,23 +557,25 @@ where
     }
 }
 
-/// Async reader creation: resolves on first poll (taking a reader is a
-/// local operation). The reader carries both read surfaces — the sync
-/// probe and the async waiting read.
-impl<S> AsyncBlobStore for Lazy<S>
+/// Async snapshot creation: resolves on first poll. The snapshot carries both
+/// read surfaces — the synchronous probe and the asynchronous waiting read —
+/// over one frozen local observation.
+impl<S> AsyncSnapshotSource for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
-    S::Reader: Sync,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: Sync,
 {
-    type Reader = LazyReader<S>;
-    type ReaderError = S::ReaderError;
+    type Snapshot = LazySnapshot<S>;
+    type SnapshotError = S::SnapshotError;
 
-    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
+    fn snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
         let store = self.store.clone();
         let signal = self.signal.clone();
         async move {
-            let local = store.lock().expect("store mutex").reader()?;
-            Ok(LazyReader {
+            let local = store.lock().expect("store mutex").snapshot()?;
+            Ok(LazySnapshot {
                 local,
                 store,
                 signal,
@@ -619,7 +595,8 @@ where
 /// durable want remains recorded.
 struct WaitForBlob<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: BlobStoreGet,
 {
     store: Arc<Mutex<S>>,
     signal: Arc<WantSignal>,
@@ -629,26 +606,27 @@ where
 
 impl<S> Future for WaitForBlob<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: BlobStoreGet,
 {
     type Output = Result<
         Bytes,
-        WantWaitError<std::convert::Infallible, S::ReaderError, WantRecordErrorOf<S>>,
+        WantWaitError<std::convert::Infallible, S::SnapshotError, WantRecordErrorOf<S>>,
     >;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let handle = Inline::<Handle<UnknownBlob>>::new(this.raw);
 
-        // Fresh reader = store refresh; a refresh failure (corrupt pile
+        // Fresh snapshot = store refresh; a refresh failure (corrupt pile
         // tail) is loud and immediate, never spun on.
         let mut store = this.store.lock().expect("store mutex");
-        let reader = match store.reader() {
-            Ok(reader) => reader,
+        let snapshot = match store.snapshot() {
+            Ok(snapshot) => snapshot,
             Err(e) => return Poll::Ready(Err(WantWaitError::Store(e))),
         };
         // Universal byte read: any store-level failure is a miss.
-        if let Ok(bytes) = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle) {
+        if let Ok(bytes) = BlobStoreGet::get::<Bytes, UnknownBlob>(&snapshot, handle) {
             return Poll::Ready(Ok(bytes));
         }
 
@@ -683,12 +661,13 @@ where
 /// The async **waiting read**: present resolves immediately; missing
 /// records the durable want and suspends until the blob lands in the
 /// store. See the [module-level docs](self) for the probe/wait split.
-impl<S> AsyncBlobStoreGet for LazyReader<S>
+impl<S> AsyncBlobStoreGet for LazySnapshot<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: BlobStoreGet,
 {
     type GetError<E: std::error::Error + Send + Sync + 'static> =
-        WantWaitError<E, S::ReaderError, WantRecordErrorOf<S>>;
+        WantWaitError<E, S::SnapshotError, WantRecordErrorOf<S>>;
 
     fn get<T, Sch>(
         &self,
@@ -701,7 +680,7 @@ where
     {
         // Capture only `Send` values — the raw 32 bytes and the shared
         // store/signal handles, never the phantom-typed handle (mirrors
-        // `SyncAsAsync` / `PeerReader`). The typed conversion happens at
+        // `SyncAsAsync` / `PeerSnapshot`). The typed conversion happens at
         // completion, after the final await, so `T`/`Sch` are never part
         // of the future's held state.
         let wait = WaitForBlob {
@@ -726,12 +705,12 @@ where
 
 /// Async listing over the local snapshot — zero-await, resolves on
 /// first poll (enumeration is local; it never records wants).
-impl<S> AsyncBlobStoreList for LazyReader<S>
+impl<S> AsyncBlobStoreList for LazySnapshot<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
-    S::Reader: Sync,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: BlobStoreList + Sync,
 {
-    type Err = <S::Reader as BlobStoreList>::Err;
+    type Err = <S::Snapshot as BlobStoreList>::Err;
 
     // Not an `async fn`: the desugared form would drop the explicit
     // `Send` bound the trait contract requires.
@@ -741,7 +720,7 @@ where
     }
 }
 
-/// The read view of a [`Lazy`]: the store's own reader snapshot plus
+/// The read view of a [`Lazy`]: the store's own immutable snapshot plus
 /// a want-recording handle into the shared store.
 ///
 /// Two read surfaces with deliberately different semantics (see the
@@ -759,11 +738,11 @@ where
 /// probes. Don't drive conservative reference scans ([`super::BlobChildren`])
 /// through this reader; that's why it deliberately doesn't implement the
 /// trait.
-pub struct LazyReader<S>
+pub struct LazySnapshot<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
 {
-    local: S::Reader,
+    local: S::Snapshot,
     /// Want-recording handle into the shared store: a `&self` read must
     /// be able to record the missed handle and flush the want.
     store: Arc<Mutex<S>>,
@@ -774,10 +753,10 @@ where
 
 // Identity ignores the store handle: two readers are equal iff their
 // local snapshots are — the handle is a capability, not part of the
-// snapshot's value. (Mirrors `PeerReader` in triblespace-net.)
-impl<S> Clone for LazyReader<S>
+// snapshot's value. (Mirrors `PeerSnapshot` in triblespace-net.)
+impl<S> Clone for LazySnapshot<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -787,19 +766,35 @@ where
         }
     }
 }
-impl<S> PartialEq for LazyReader<S>
+impl<S> PartialEq for LazySnapshot<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.local == other.local
     }
 }
-impl<S> Eq for LazyReader<S> where S: BlobStore + WantStore + StorageFlush + Send + 'static {}
-
-impl<S> BlobStoreGet for LazyReader<S>
+impl<S> Eq for LazySnapshot<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: Eq,
+{
+}
+
+impl<S> StoreSnapshot for LazySnapshot<S>
+where
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+{
+    fn changes_since(&self, previous: &Self) -> StoreChanges {
+        self.local.changes_since(&previous.local)
+    }
+}
+
+impl<S> BlobStoreGet for LazySnapshot<S>
+where
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: BlobStoreGet,
 {
     type GetError<E: std::error::Error + Send + Sync + 'static> =
         WantGetError<E, WantRecordErrorOf<S>>;
@@ -842,15 +837,16 @@ where
     }
 }
 
-impl<S> BlobStoreList for LazyReader<S>
+impl<S> BlobStoreList for LazySnapshot<S>
 where
-    S: BlobStore + WantStore + StorageFlush + Send + 'static,
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: BlobStoreList,
 {
     type Iter<'a>
-        = <S::Reader as BlobStoreList>::Iter<'a>
+        = <S::Snapshot as BlobStoreList>::Iter<'a>
     where
         Self: 'a;
-    type Err = <S::Reader as BlobStoreList>::Err;
+    type Err = <S::Snapshot as BlobStoreList>::Err;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.local.blobs()
@@ -865,6 +861,73 @@ where
     }
 }
 
+impl<S> BlobStoreMeta for LazySnapshot<S>
+where
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: BlobStoreMeta,
+{
+    type MetaError = <S::Snapshot as BlobStoreMeta>::MetaError;
+
+    fn metadata<Sch>(
+        &self,
+        handle: Inline<Handle<Sch>>,
+    ) -> Result<Option<BlobMetadata>, Self::MetaError>
+    where
+        Sch: BlobEncoding + 'static,
+        Handle<Sch>: InlineEncoding,
+    {
+        self.local.metadata(handle)
+    }
+}
+
+impl<S> CollectionRead for LazySnapshot<S>
+where
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: CollectionRead,
+{
+    type RecordsError = <S::Snapshot as CollectionRead>::RecordsError;
+    type RecordIter<'a>
+        = <S::Snapshot as CollectionRead>::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.local.records()
+    }
+}
+
+impl<S> CapabilityProofRead for LazySnapshot<S>
+where
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: CapabilityProofRead,
+{
+    type ProofsError = <S::Snapshot as CapabilityProofRead>::ProofsError;
+    type ProofIter<'a>
+        = <S::Snapshot as CapabilityProofRead>::ProofIter<'a>
+    where
+        Self: 'a;
+
+    fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        self.local.proofs()
+    }
+}
+
+impl<S> PeerRead for LazySnapshot<S>
+where
+    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
+    S::Snapshot: PeerRead,
+{
+    type PeersError = <S::Snapshot as PeerRead>::PeersError;
+    type PeerIter<'a>
+        = <S::Snapshot as PeerRead>::PeerIter<'a>
+    where
+        Self: 'a;
+
+    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
+        self.local.peers()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,7 +935,7 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::collection::descriptor;
     use crate::collection::reach;
-    use crate::collection::{CollectionHandle, CollectionMerge};
+    use crate::collection::{CollectionHandle, CollectionMerge, CollectionRecordSelector};
     use crate::id::Id;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
@@ -909,8 +972,9 @@ mod tests {
         let mut lazy = Lazy::new(MemoryRepo::default());
 
         CollectionStore::insert(&mut lazy, record).unwrap();
+        let snapshot = SnapshotSource::snapshot(&mut lazy).unwrap();
         assert_eq!(
-            CollectionStore::records(&mut lazy)
+            CollectionRead::records(&snapshot)
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -920,7 +984,7 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(
-            CollectionStore::select_records(&mut lazy, &selectors).unwrap(),
+            CollectionRead::select_records(&snapshot, &selectors).unwrap(),
             vec![record]
         );
     }
@@ -949,7 +1013,7 @@ mod tests {
         let (blob, handle) = blob_of(b"resident");
         BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let bytes: Bytes =
             BlobStoreGet::get(&reader, handle).expect("resident blob serves locally");
         assert_eq!(&bytes[..], b"resident");
@@ -967,7 +1031,7 @@ mod tests {
         let mut lazy: Lazy<Pile> = Lazy::new(fresh_pile(&path));
         let (_, handle) = blob_of(b"wanted but absent");
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let err = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle)
             .expect_err("absent blob must not serve");
         assert!(
@@ -1026,11 +1090,12 @@ mod tests {
         }
     }
 
-    impl BlobStore for FailingWants {
-        type Reader = <MemoryRepo as BlobStore>::Reader;
-        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.0.reader()
+    impl SnapshotSource for FailingWants {
+        type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
+        type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
+
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            self.0.snapshot()
         }
     }
 
@@ -1066,7 +1131,7 @@ mod tests {
         let mut lazy = Lazy::new(FailingWants::default());
         let (_, handle) = blob_of(b"unrecordable");
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let err = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle)
             .expect_err("miss on a want-refusing store must error");
         assert!(
@@ -1086,7 +1151,7 @@ mod tests {
         let mut lazy = Lazy::new(FailingWants::default());
         let (_, handle) = blob_of(b"unrecordable");
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
             &reader, handle,
         ))
@@ -1119,7 +1184,7 @@ mod tests {
         let (blob, handle) = blob_of(b"already here");
         BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let bytes: Bytes =
             block_on(AsyncBlobStoreGet::get(&reader, handle)).expect("present blob resolves");
         assert_eq!(&bytes[..], b"already here");
@@ -1134,7 +1199,7 @@ mod tests {
         let mut lazy = Lazy::new(MemoryRepo::default());
         let (blob, handle) = blob_of(b"lands in process");
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let mut fut = Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
             &reader, handle,
         ));
@@ -1178,7 +1243,7 @@ mod tests {
         let mut lazy = Lazy::new(MemoryRepo::default());
         let (_, handle) = blob_of(b"nobody lands this");
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         {
             let mut fut = Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
                 &reader, handle,
@@ -1217,7 +1282,7 @@ mod tests {
             pile.close().unwrap();
         });
 
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
         let bytes: Bytes = block_on(AsyncBlobStoreGet::get(&reader, handle))
             .expect("blob appears and the wait resolves");
         assert_eq!(&bytes[..], b"landed later");
@@ -1238,7 +1303,7 @@ mod tests {
         let path = dir.path().join("corrupt.pile");
         let mut lazy: Lazy<Pile> = Lazy::new(fresh_pile(&path));
         let (_, handle) = blob_of(b"unreachable");
-        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
 
         // Tear the tail out-of-band before a complete record marker lands.
         let mut file = std::fs::OpenOptions::new()
@@ -1270,7 +1335,7 @@ mod tests {
         let (blob, _) = blob_of(b"through the async surface");
 
         let handle = block_on(AsyncBlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob)).unwrap();
-        let reader = block_on(AsyncBlobStore::reader(&mut lazy)).unwrap();
+        let reader = block_on(AsyncSnapshotSource::snapshot(&mut lazy)).unwrap();
         let bytes: Bytes = block_on(AsyncBlobStoreGet::get(&reader, handle)).unwrap();
         assert_eq!(&bytes[..], b"through the async surface");
 
@@ -1289,13 +1354,13 @@ mod tests {
 
     // Statically assert the futures are `Send` — required by the RPITIT
     // contract of the async traits. If the waiting future ever captured
-    // something non-Send (the phantom-typed handle, a reader snapshot),
+    // something non-Send (the phantom-typed handle, a store snapshot),
     // this would stop compiling.
     fn _assert_send<F: Send>(_: F) {}
     #[allow(dead_code)]
     fn _send_proof(
         lazy: &mut Lazy<MemoryRepo>,
-        reader: &LazyReader<MemoryRepo>,
+        reader: &LazySnapshot<MemoryRepo>,
         handle: Inline<Handle<UnknownBlob>>,
     ) {
         _assert_send(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(reader, handle));
@@ -1304,6 +1369,6 @@ mod tests {
             lazy,
             Blob::<UnknownBlob>::new(Bytes::from_source(&b"x"[..])),
         ));
-        _assert_send(AsyncBlobStore::reader(lazy));
+        _assert_send(AsyncSnapshotSource::snapshot(lazy));
     }
 }

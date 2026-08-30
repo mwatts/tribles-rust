@@ -28,7 +28,7 @@ use std::marker::PhantomData;
 /// Re-export of the blob cache wrapper.
 pub use cache::BlobCache;
 /// Re-export of the in-memory blob store.
-pub use memoryblobstore::MemoryBlobStore;
+pub use memoryblobstore::{MemoryBlobStore, MemoryBlobStoreSnapshot};
 
 /// Re-export of `anybytes::Bytes` for blob payloads.
 pub use anybytes::Bytes;
@@ -103,7 +103,7 @@ where
     /// Constructs a blob from bytes *and* a precomputed handle,
     /// skipping the hash step.
     ///
-    /// Used by blob-store readers (`MemoryBlobStoreReader::get` and
+    /// Used by blob-store snapshots (`MemoryBlobStoreSnapshot::get` and
     /// friends) and pile-format decoders that already know the
     /// handle the blob is stored under — they read the bytes out of
     /// their backing storage already keyed by hash, so recomputing

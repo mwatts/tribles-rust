@@ -11,8 +11,8 @@ use triblespace_core::capability::{
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::proof::CapabilityProofStore;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::proof::{CapabilityProofRead, CapabilityProofStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 
 struct CreatedTeam {
     root: String,
@@ -102,24 +102,28 @@ fn stored_bundle(
     id: CapabilityProofId,
 ) -> (usize, Option<CapabilityProofBundle>) {
     let mut pile = Pile::open(path).expect("open pile");
-    let proof_count = pile
+    let snapshot = pile.snapshot().expect("freeze proof snapshot");
+    let proof_count = snapshot
         .proofs()
         .expect("enumerate native proofs")
         .collect::<Result<Vec<_>, _>>()
         .expect("read native proofs")
         .len();
-    let bundle = pile.proof(id).expect("look up native proof").map(|proof| {
-        let reader = pile.reader().expect("open claim snapshot");
-        let claims = proof
-            .claim_handles()
-            .map(|handle| {
-                let claim: Blob<SimpleArchive> =
-                    reader.get(handle).expect("signed claim is resident");
-                claim
-            })
-            .collect();
-        CapabilityProofBundle::new(proof, claims)
-    });
+    let bundle = snapshot
+        .proof(id)
+        .expect("look up native proof")
+        .map(|proof| {
+            let claims = proof
+                .claim_handles()
+                .map(|handle| {
+                    let claim: Blob<SimpleArchive> =
+                        snapshot.get(handle).expect("signed claim is resident");
+                    claim
+                })
+                .collect();
+            CapabilityProofBundle::new(proof, claims)
+        });
+    drop(snapshot);
     pile.close().expect("close pile");
     (proof_count, bundle)
 }

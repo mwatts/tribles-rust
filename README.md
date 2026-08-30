@@ -46,10 +46,10 @@ Add the crate to a project:
 cargo add triblespace ed25519-dalek rand
 ```
 
-The example below publishes one self-contained `Fragment`, reads one coherent
-collection snapshot, and queries its facts. `entity!` derives the author and
-book identifiers from their contents and carries the quoted string blob with
-the facts that reference it.
+The example below publishes one self-contained `Fragment`, freezes one coherent
+store snapshot, and queries an admitted collection cover. `entity!` derives the
+author and book identifiers from their contents and carries the quoted string
+blob with the facts that reference it.
 
 ```rust
 use ed25519_dalek::SigningKey;
@@ -101,11 +101,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     import += book;
     storage.commit(library, &key, import)?;
 
-    let snapshot = storage.snapshot(library)?;
+    let snapshot = storage.snapshot()?;
+    let admitted = library.admitted(&snapshot)?;
+    let physical = admitted.resolve(&snapshot)?;
+    let facts = TribleSet::try_from_cover(&physical, &snapshot)?;
     let title = "Dune";
     for (first, last, quote) in find!(
         (first: String, last: String, quote),
-        pattern!(snapshot.facts(), [
+        pattern!(&facts, [
             { _?author @
                 literature::firstname: ?first,
                 literature::lastname: ?last
@@ -117,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         ])
     ) {
-        let quote: View<str> = snapshot.reader().get(quote)?;
+        let quote: View<str> = snapshot.get(quote)?;
         println!("'{}'\n - from {title} by {first} {last}.", quote.as_ref());
     }
 
@@ -127,10 +130,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The descriptor's mandatory authority participates in the collection identity
 and is admitted directly. Other strictly verified signers become visible only
-when `snapshot` receives explicit root-to-leaf proofs for exact `ACTION_WRITE`
-on this descriptor handle; it never scans storage for ambient grants.
-Identical retries deduplicate by intrinsic record identity, distinct commits
-coexist, and a snapshot materializes every admitted author's union. Call the
+when `library.admitted(&snapshot)` observes root-to-leaf proofs for exact
+`ACTION_WRITE` on this descriptor handle in the same immutable store snapshot;
+it never scans storage for ambient grants. Identical retries deduplicate by
+intrinsic record identity, distinct commits coexist, and `TryFromCover`
+materializes every admitted author's union. Call the
 store's `flush` operation when an application needs an explicit durability
 barrier.
 

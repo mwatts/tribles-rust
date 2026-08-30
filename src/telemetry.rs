@@ -795,7 +795,8 @@ mod tests {
     use super::*;
     use crate::core::blob::encodings::simplearchive::SimpleArchive;
     use crate::core::blob::encodings::UnknownBlob;
-    use crate::core::collection::CollectionStore;
+    use crate::core::collection::CollectionRead;
+    use crate::core::repo::SnapshotSource;
 
     static TELEMETRY_ENV: Mutex<()> = Mutex::new(());
 
@@ -808,15 +809,15 @@ mod tests {
     fn cold_read_facts(path: &Path) -> TribleSet {
         let mut pile = Pile::open(path).expect("reopen the telemetry pile");
         pile.refresh().expect("refresh the reopened pile");
-        let reader = pile.reader().expect("read the reopened pile");
+        let snapshot = pile.snapshot().expect("read the reopened pile");
 
-        let handles: Vec<_> = reader
+        let handles: Vec<_> = snapshot
             .blobs()
             .map(|info| info.expect("list a blob").handle)
             .collect();
         let mut facts = TribleSet::new();
         for handle in handles {
-            let Ok(blob) = reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
+            let Ok(blob) = snapshot.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
                 continue;
             };
             if let Ok(archived) = blob
@@ -827,7 +828,7 @@ mod tests {
             }
         }
 
-        drop(reader);
+        drop(snapshot);
         pile.close().expect("close the reopened pile");
         facts
     }
@@ -850,11 +851,13 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         pile.refresh().unwrap();
-        let records = pile
+        let snapshot = pile.snapshot().unwrap();
+        let records = snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        drop(snapshot);
         assert_eq!(
             records.len(),
             2,

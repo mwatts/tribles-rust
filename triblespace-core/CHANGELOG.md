@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maps blobs to blobs, and exact derivation stores a selected source member
   before its target image and ordinary `DERIVE` record.
 
-- Add direct typed collection encodings, covers, snapshots, and logical cover
+- Add direct typed collection encodings, covers, and logical cover
   views. `CollectionEncoding` attaches canonical validation and an optional
   directly materializable join to the member encoding; `Collection<E>` and
   `Cover<E>` retain that encoding through the public API; signed commits accept
@@ -51,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through ordinary `DERIVE` records. Raw Succinct members remain directly
   joinable; accelerated roots have no direct `MERGE`, so exact maintenance
   compacts raw first and derives the matching query-ready encoding. Cover-aware
-  views pull the named child through their reader and validate the complete
-  raw/index pair. The former `Rank9MappingV1`/`RANK9_MAPPING_V1`,
+  views pull the named child through the immutable store snapshot and validate
+  the complete raw/index pair. The former `Rank9MappingV1`/`RANK9_MAPPING_V1`,
   intermediate `Rank9SidecarMappingV1*`, old blob names, and their obsolete id
   family have no compatibility aliases. The separate mapping-evidence record
   kind and store surface were removed after a scan found no live records in
@@ -63,12 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semantic validation at real ingress boundaries while deleting duplicate
   rehashes and post-write rereads of values produced or loaded in-process.
 
-- Add conservative `StoreRevisionChanges` classification to `StoreRevision`.
-  The default treats every unequal opaque token as a full change, while
-  `MemoryRepo`, `Pile`, and `Yard` compare their persistent component indexes
-  directly. A separate local Blob-reader bit catches remaps and same-handle
-  backing replacement even though PATCH equality intentionally hashes keys,
-  not attached storage offsets.
+- Replace split Reader and revision APIs with `SnapshotSource` and one coherent
+  immutable `StoreSnapshot`. Blob access, collection records, capability
+  proofs, and PEER evidence are frozen together. `changes_since` defaults to
+  conservative full invalidation, while `MemoryRepo`, `Pile`, and `Yard`
+  compare persistent component PATCHes directly. `BLOBS` covers membership,
+  metadata, and retrievability; Pile's lineage-local root-sharing comparison
+  catches same-handle backing replacement while ignoring unrelated appended
+  records, even though semantic PATCH equality intentionally hashes keys, not
+  attached storage offsets. Yard retention planning now uses one snapshot for
+  opaque-record refusal, live membership, commits, and proofs, and physical
+  rewrites preserve peer evidence alongside collections, proofs, and offers.
 
 ## [0.41.4] - 2026-05-17
 

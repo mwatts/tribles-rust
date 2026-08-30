@@ -7,11 +7,11 @@ use crate::inline::Inline;
 use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::repo::BlobInfo;
-use crate::repo::BlobStore;
 use crate::repo::BlobStoreGet;
 use crate::repo::BlobStoreKeep;
 use crate::repo::BlobStoreList;
 use crate::repo::BlobStorePut;
+use crate::repo::{SnapshotSource, StoreSnapshot};
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -27,13 +27,13 @@ type BlobIndex = PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>, XorSip128>
 ///
 /// Internally a [`PATCH`] mapping the 32-byte raw handle to a
 /// [`Blob<UnknownBlob>`]. Writes go through `&mut self` (the
-/// type system enforces single-writer); [`reader`] hands out
-/// owned snapshots that are independent of the original
+/// type system enforces single-writer);
+/// [`snapshot`](SnapshotSource::snapshot) hands out owned snapshots that are
+/// independent of the original
 /// store. PATCH's structural sharing makes those snapshots
 /// O(1) clones — the writer keeps mutating the canonical
-/// PATCH, readers each hold a pinned Arc-clone.
+/// PATCH; snapshots each hold a pinned Arc-clone.
 ///
-/// [`reader`]: BlobStore::reader
 pub struct MemoryBlobStore {
     blobs: BlobIndex,
 }
@@ -47,37 +47,37 @@ impl Debug for MemoryBlobStore {
 #[derive(Debug)]
 /// Snapshot view into a [`MemoryBlobStore`]. Independent from
 /// the source store — subsequent writes to the store are not
-/// visible to a reader produced earlier; call [`reader`] again
+/// visible to a snapshot produced earlier; call
+/// [`snapshot`](SnapshotSource::snapshot) again
 /// to pick them up.
 ///
-/// `Clone` is O(1) (PATCH structural sharing). The reader is
+/// `Clone` is O(1) (PATCH structural sharing). The snapshot is
 /// `Send + Sync` and freely composes through `find!` /
 /// `pattern!` / `and!` / `or!`.
 ///
-/// [`reader`]: BlobStore::reader
-pub struct MemoryBlobStoreReader {
+pub struct MemoryBlobStoreSnapshot {
     blobs: BlobIndex,
 }
 
-impl Clone for MemoryBlobStoreReader {
+impl Clone for MemoryBlobStoreSnapshot {
     fn clone(&self) -> Self {
-        MemoryBlobStoreReader {
+        MemoryBlobStoreSnapshot {
             blobs: self.blobs.clone(),
         }
     }
 }
 
-impl PartialEq for MemoryBlobStoreReader {
+impl PartialEq for MemoryBlobStoreSnapshot {
     fn eq(&self, other: &Self) -> bool {
         self.blobs == other.blobs
     }
 }
 
-impl Eq for MemoryBlobStoreReader {}
+impl Eq for MemoryBlobStoreSnapshot {}
 
-impl MemoryBlobStoreReader {
+impl MemoryBlobStoreSnapshot {
     fn new(blobs: BlobIndex) -> Self {
-        MemoryBlobStoreReader { blobs }
+        MemoryBlobStoreSnapshot { blobs }
     }
 
     /// Number of blobs in this snapshot.
@@ -211,7 +211,7 @@ impl FromIterator<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>)> for MemoryBl
     }
 }
 
-impl IntoIterator for MemoryBlobStoreReader {
+impl IntoIterator for MemoryBlobStoreSnapshot {
     type Item = (Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>);
     type IntoIter = MemoryBlobStoreIter;
     fn into_iter(self) -> Self::IntoIter {
@@ -238,10 +238,10 @@ impl<E: Error> fmt::Display for MemoryStoreGetError<E> {
 
 impl<E: Error> Error for MemoryStoreGetError<E> {}
 
-/// Iterator returned by [`MemoryBlobStoreReader::iter`].
+/// Iterator returned by [`MemoryBlobStoreSnapshot::iter`].
 ///
 /// Yields `(Handle, Blob)` pairs. Owned snapshot via PATCH
-/// clones — does not borrow from the source reader.
+/// clones — does not borrow from the source snapshot.
 pub struct MemoryBlobStoreIter {
     keys: crate::patch::PATCHIntoIterator<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>, XorSip128>,
     lookup: BlobIndex,
@@ -285,7 +285,7 @@ impl Iterator for MemoryBlobStoreListIter {
     }
 }
 
-impl BlobStoreList for MemoryBlobStoreReader {
+impl BlobStoreList for MemoryBlobStoreSnapshot {
     type Iter<'a> = MemoryBlobStoreListIter;
     type Err = Infallible;
 
@@ -302,7 +302,7 @@ impl BlobStoreList for MemoryBlobStoreReader {
     }
 }
 
-impl crate::repo::BlobStoreMeta for MemoryBlobStoreReader {
+impl crate::repo::BlobStoreMeta for MemoryBlobStoreSnapshot {
     type MetaError = Infallible;
 
     fn metadata<S>(
@@ -323,7 +323,7 @@ impl crate::repo::BlobStoreMeta for MemoryBlobStoreReader {
     }
 }
 
-impl BlobStoreGet for MemoryBlobStoreReader {
+impl BlobStoreGet for MemoryBlobStoreSnapshot {
     type GetError<E: Error + Send + Sync + 'static> = MemoryStoreGetError<E>;
 
     fn get<T, S>(
@@ -346,7 +346,7 @@ impl BlobStoreGet for MemoryBlobStoreReader {
     }
 }
 
-impl crate::repo::BlobChildren for MemoryBlobStoreReader {}
+impl crate::repo::BlobChildren for MemoryBlobStoreSnapshot {}
 
 impl BlobStorePut for MemoryBlobStore {
     type PutError = Infallible;
@@ -363,12 +363,22 @@ impl BlobStorePut for MemoryBlobStore {
     }
 }
 
-impl BlobStore for MemoryBlobStore {
-    type Reader = MemoryBlobStoreReader;
-    type ReaderError = Infallible;
+impl StoreSnapshot for MemoryBlobStoreSnapshot {
+    fn changes_since(&self, previous: &Self) -> crate::repo::StoreChanges {
+        if self == previous {
+            crate::repo::StoreChanges::NONE
+        } else {
+            crate::repo::StoreChanges::BLOBS
+        }
+    }
+}
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        Ok(MemoryBlobStoreReader::new(self.blobs.clone()))
+impl SnapshotSource for MemoryBlobStore {
+    type Snapshot = MemoryBlobStoreSnapshot;
+    type SnapshotError = Infallible;
+
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        Ok(MemoryBlobStoreSnapshot::new(self.blobs.clone()))
     }
 }
 
@@ -405,28 +415,28 @@ mod tests {
         assert_eq!(candidates, vec![retained.transmute()]);
 
         blobs.keep(candidates);
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         assert!(reader.get::<View<str>, UTF8String>(retained).is_ok());
         assert!(reader.get::<View<str>, UTF8String>(discarded).is_err());
     }
 
-    /// `MemoryBlobStoreReader` must be `Send + Sync` so it composes
+    /// `MemoryBlobStoreSnapshot` must be `Send + Sync` so it composes
     /// through the parallel-iter ready `and!` / `or!` macros.
     #[test]
-    fn reader_is_send_sync() {
+    fn snapshot_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<MemoryBlobStoreReader>();
+        assert_send_sync::<MemoryBlobStoreSnapshot>();
     }
 
-    /// `reader()` returns an independent snapshot — writes after
-    /// the reader is produced are not visible to that reader.
+    /// `snapshot()` returns an independent observation — writes after
+    /// it is produced are not visible to that snapshot.
     #[test]
-    fn reader_is_a_pinned_snapshot() {
+    fn snapshot_is_pinned() {
         let mut store = MemoryBlobStore::new();
         let blob_a: Inline<Handle<UTF8String>> = store
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
-        let snapshot = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.len(), 1);
 
         let _blob_b: Inline<Handle<UTF8String>> = store
@@ -438,9 +448,29 @@ mod tests {
         let recovered: View<str> = snapshot.get::<View<str>, UTF8String>(blob_a).unwrap();
         assert_eq!(&*recovered, "hello");
 
-        // A fresh reader sees both.
-        let fresh = store.reader().unwrap();
+        // A fresh snapshot sees both.
+        let fresh = store.snapshot().unwrap();
         assert_eq!(fresh.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_change_classification_uses_patch_identity() {
+        let mut store = MemoryBlobStore::new();
+        let before = store.snapshot().unwrap();
+        let unchanged = store.snapshot().unwrap();
+        assert_eq!(
+            unchanged.changes_since(&before),
+            crate::repo::StoreChanges::NONE
+        );
+
+        store
+            .put::<UTF8String, _>(Bytes::from_source("new".to_string()).view().unwrap())
+            .unwrap();
+        let after = store.snapshot().unwrap();
+        assert_eq!(
+            after.changes_since(&before),
+            crate::repo::StoreChanges::BLOBS,
+        );
     }
 
     #[test]
@@ -451,7 +481,7 @@ mod tests {
             .unwrap();
 
         let listed: Vec<_> = store
-            .reader()
+            .snapshot()
             .unwrap()
             .blobs()
             .collect::<Result<_, _>>()
@@ -484,20 +514,20 @@ mod tests {
 
         a.union(b);
         assert_eq!(
-            a.reader().unwrap().len(),
+            a.snapshot().unwrap().len(),
             2,
             "duplicates collapse via union"
         );
 
         use anybytes::View;
         let recovered_hello: View<str> = a
-            .reader()
+            .snapshot()
             .unwrap()
             .get::<View<str>, UTF8String>(h_hello)
             .unwrap();
         assert_eq!(&*recovered_hello, "hello");
         let recovered_world: View<str> = a
-            .reader()
+            .snapshot()
             .unwrap()
             .get::<View<str>, UTF8String>(h_world)
             .unwrap();

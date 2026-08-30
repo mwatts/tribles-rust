@@ -30,10 +30,10 @@ pub mod objectstore;
 pub mod peer;
 /// Local file-based pile storage backend.
 pub mod pile;
-pub use peer::PeerStore;
+pub use peer::{PeerRead, PeerStore};
 /// Grow-only native storage for complete capability proofs.
 pub mod proof;
-pub use proof::CapabilityProofStore;
+pub use proof::{CapabilityProofRead, CapabilityProofStore};
 /// Monotone local binding between one physical store and one network team.
 pub mod scope;
 pub use scope::{StoreScope, StoreScopeError};
@@ -71,7 +71,7 @@ pub trait StorageFlush {
     fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
-/// Component mask for a changed sync-visible store observation.
+/// Component mask for a changed store snapshot.
 ///
 /// This is deliberately local invalidation evidence, not a portable revision
 /// or a promise that a component changed by only one element. It lets a
@@ -79,12 +79,13 @@ pub trait StorageFlush {
 /// change while conservatively rebuilding everything for stores that cannot
 /// distinguish them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StoreRevisionChanges(u8);
+pub struct StoreChanges(u8);
 
-impl StoreRevisionChanges {
+impl StoreChanges {
     /// No sync-visible component changed.
     pub const NONE: Self = Self(0);
-    /// Resident blob membership may have changed.
+    /// The observable blob view (membership, metadata, or retrievability) may
+    /// have changed.
     pub const BLOBS: Self = Self(1 << 0);
     /// Native collection records may have changed.
     pub const COLLECTION_RECORDS: Self = Self(1 << 1);
@@ -92,16 +93,9 @@ impl StoreRevisionChanges {
     pub const CAPABILITY_PROOFS: Self = Self(1 << 2);
     /// Peer-routing evidence may have changed.
     pub const PEERS: Self = Self(1 << 3);
-    /// The local blob reader/access lease changed without necessarily changing
-    /// resident blob membership.
-    pub const BLOB_READER: Self = Self(1 << 4);
-    /// Every sync-visible component and the blob access lease may have changed.
+    /// Every sync-visible component may have changed.
     pub const ALL: Self = Self(
-        Self::BLOBS.0
-            | Self::COLLECTION_RECORDS.0
-            | Self::CAPABILITY_PROOFS.0
-            | Self::PEERS.0
-            | Self::BLOB_READER.0,
+        Self::BLOBS.0 | Self::COLLECTION_RECORDS.0 | Self::CAPABILITY_PROOFS.0 | Self::PEERS.0,
     );
 
     /// Whether every bit in `change` is present.
@@ -109,7 +103,7 @@ impl StoreRevisionChanges {
         self.0 & change.0 == change.0
     }
 
-    /// Whether neither a sync-visible component nor the blob access lease changed.
+    /// Whether no sync-visible component changed.
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -120,98 +114,56 @@ impl StoreRevisionChanges {
     }
 }
 
-/// Cheap invalidation token for one repository's sync-visible observation.
+/// One immutable observation of a storage backend.
 ///
-/// The token is deliberately local and opaque: it is neither a content
-/// identity nor an ordered version and must never cross a process boundary.
-/// Equality only answers whether rebuilding a derived inventory can be
-/// skipped. Implementations may conservatively change the token when
-/// unrelated local state changes, but must change it whenever resident blobs,
-/// collection records, capability proofs, or peer evidence may have changed.
-///
-/// File-backed implementations reobserve external appends before returning.
-/// This keeps an unchanged poll proportional to the storage boundary (for a
-/// [`pile::Pile`], one file-length observation) instead of to the number of
-/// indexed objects. Local wants, artifact offers, and store-scope assertions
-/// do not mark semantic component bits. A file-backed implementation may still
-/// vary its opaque token and report [`StoreRevisionChanges::BLOB_READER`] when
-/// such an append replaces or extends the local reader lease.
-pub trait StoreRevision {
-    /// Opaque equality token retained by the caller between observations.
-    type Revision: Clone + Eq + Send + 'static;
-    /// Failure while refreshing or observing the local store.
-    type Error: Error + Debug + Send + Sync + 'static;
-
-    /// Reobserve external changes and return the current invalidation token.
-    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error>;
-
-    /// Conservatively classify the difference between two local tokens.
+/// A snapshot is its own local revision token. It owns every read capability
+/// needed to interpret the prefix it observed, and compares directly with an
+/// earlier snapshot from the same store lineage. The default is deliberately
+/// conservative for backends that cannot classify changes cheaply.
+pub trait StoreSnapshot: Clone + Send + Sync + 'static {
+    /// Conservatively classify changes since `previous`.
     ///
-    /// Backends with component-separated persistent indexes should override
-    /// this. The default preserves correctness for every existing backend by
-    /// rebuilding all components whenever the opaque aggregate token differs.
-    /// Implementations must overapproximate: false positives cost work, while
-    /// a false negative can strand derived state after the caller remembers
-    /// `current` as its installed revision. Both tokens must come from the same
-    /// store lineage.
-    fn revision_changes(
-        previous: &Self::Revision,
-        current: &Self::Revision,
-    ) -> StoreRevisionChanges {
-        if previous == current {
-            StoreRevisionChanges::NONE
-        } else {
-            StoreRevisionChanges::ALL
-        }
+    /// False positives only repeat derived work. A false negative can strand
+    /// derived state, so implementations must report every component which may
+    /// have changed. Snapshots are local observations, not portable versions.
+    fn changes_since(&self, _previous: &Self) -> StoreChanges {
+        StoreChanges::ALL
     }
 }
 
-impl<S> StoreRevision for &mut S
+/// A mutable store which can freeze one immutable read observation.
+///
+/// Every semantic read capability implemented by a store shares this one
+/// associated snapshot. This prevents blob bytes, collection records,
+/// capability proofs, and peer evidence from being sampled at subtly
+/// different prefixes. A snapshot may additionally carry a live operational
+/// acquisition capability; fetched bytes join only a later observation and
+/// remain outside `changes_since` until then.
+pub trait SnapshotSource {
+    /// Immutable observation returned by this store.
+    type Snapshot: StoreSnapshot;
+    /// Failure while refreshing and freezing an observation.
+    type SnapshotError: Error + Debug + Send + Sync + 'static;
+
+    /// Reobserve external changes and freeze the resulting prefix once.
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError>;
+}
+
+/// Immutable snapshot type produced by `S`.
+pub type SnapshotOf<S> = <S as SnapshotSource>::Snapshot;
+
+/// Failure while freezing a snapshot of `S`.
+pub type SnapshotErrorOf<S> = <S as SnapshotSource>::SnapshotError;
+
+impl<S> SnapshotSource for &mut S
 where
-    S: StoreRevision + ?Sized,
+    S: SnapshotSource + ?Sized,
 {
-    type Revision = S::Revision;
-    type Error = S::Error;
+    type Snapshot = S::Snapshot;
+    type SnapshotError = S::SnapshotError;
 
-    fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
-        (**self).store_revision()
-    }
-
-    fn revision_changes(
-        previous: &Self::Revision,
-        current: &Self::Revision,
-    ) -> StoreRevisionChanges {
-        S::revision_changes(previous, current)
-    }
-}
-
-#[cfg(test)]
-mod store_revision_tests {
-    use std::convert::Infallible;
-
-    use super::{StoreRevision, StoreRevisionChanges};
-
-    struct CoarseRevision(u8);
-
-    impl StoreRevision for CoarseRevision {
-        type Revision = u8;
-        type Error = Infallible;
-
-        fn store_revision(&mut self) -> Result<Self::Revision, Self::Error> {
-            Ok(self.0)
-        }
-    }
-
-    #[test]
-    fn default_change_classification_is_conservative() {
-        assert_eq!(
-            CoarseRevision::revision_changes(&1, &1),
-            StoreRevisionChanges::NONE,
-        );
-        assert_eq!(
-            CoarseRevision::revision_changes(&1, &2),
-            StoreRevisionChanges::ALL,
-        );
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        (**self).snapshot()
     }
 }
 
@@ -236,7 +188,7 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::collection::{CollectionData, CollectionHandle};
+use crate::collection::{CollectionData, CollectionHandle, CollectionRead, CollectionStore};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
@@ -294,7 +246,7 @@ pub trait BlobStoreList {
     /// Lists all blobs in the repository.
     fn blobs<'a>(&'a self) -> Self::Iter<'a>;
 
-    /// Test whether one blob is present in this reader snapshot without
+    /// Test whether one blob is present in this store snapshot without
     /// turning absence into demand.
     ///
     /// The default derives membership from [`blobs`](Self::blobs). Indexed
@@ -338,17 +290,14 @@ pub trait BlobStoreList {
 
     /// Lists blobs in `self` that are not in `old`.
     ///
-    /// Backends with true snapshot semantics (e.g. [`Pile`],
-    /// where each [`Reader`](BlobStore::Reader) holds a frozen clone of the
-    /// in-memory blob index) compute the difference cheaply via the index's
-    /// own set-difference operation. Backends without snapshot semantics
-    /// (e.g. an object store, where the Reader is just a handle to the live
-    /// remote) fall back to the default implementation, which lists all
-    /// current blobs — over-eager but always correct.
+    /// Backends with persistent indexes compute the difference cheaply via
+    /// their index's own set-difference operation. Backends without such an
+    /// index fall back to the default implementation, which lists all current
+    /// blobs — over-eager but always correct.
     ///
     /// Use this for "what blobs are new since I last looked" patterns
     /// (e.g. announcing newly-imported blobs to a DHT) where holding the
-    /// previous Reader as a baseline gives you the delta.
+    /// previous snapshot as a baseline gives you the delta.
     fn blobs_diff<'a>(&'a self, _old: &Self) -> Self::Iter<'a> {
         self.blobs()
     }
@@ -453,29 +402,55 @@ where
     }
 }
 
-/// Combined read/write blob storage.
+/// Combined blob storage whose reads come from the store's one shared
+/// immutable snapshot.
 ///
-/// Extends [`BlobStorePut`] with the ability to create a shareable
-/// [`Reader`](BlobStore::Reader) snapshot for concurrent reads.
-pub trait BlobStore: BlobStorePut {
-    /// A clonable reader handle for concurrent blob lookups.
-    type Reader: BlobStoreGet + BlobStoreList + Clone + Send + PartialEq + Eq + 'static;
-    /// Error type for creating a reader.
-    type ReaderError: Error + Debug + Send + Sync + 'static;
-    /// Creates a shareable reader snapshot of the current store state.
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError>;
+/// Blob writes remain a property of the mutable store. Blob reads and listings
+/// are properties of [`SnapshotSource::Snapshot`], so collection admission,
+/// capability verification, and payload decoding can all observe one prefix.
+pub trait BlobStore: BlobStorePut + SnapshotSource<Snapshot: BlobStoreGet + BlobStoreList> {}
+
+impl<B> BlobStore for B
+where
+    B: BlobStorePut + SnapshotSource + ?Sized,
+    B::Snapshot: BlobStoreGet + BlobStoreList,
+{
 }
 
-impl<B> BlobStore for &mut B
-where
-    B: BlobStore + ?Sized,
+/// Immutable read surface of a complete repository snapshot.
+pub trait StoreRead:
+    StoreSnapshot
+    + BlobStoreGet
+    + BlobStoreList
+    + BlobStoreMeta
+    + CollectionRead
+    + CapabilityProofRead
+    + PeerRead
 {
-    type Reader = B::Reader;
-    type ReaderError = B::ReaderError;
+}
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        (**self).reader()
-    }
+impl<R> StoreRead for R where
+    R: StoreSnapshot
+        + BlobStoreGet
+        + BlobStoreList
+        + BlobStoreMeta
+        + CollectionRead
+        + CapabilityProofRead
+        + PeerRead
+{
+}
+
+/// Mutable repository whose semantic reads all share one snapshot.
+pub trait Store:
+    BlobStore + CollectionStore + CapabilityProofStore + PeerStore + SnapshotSource<Snapshot: StoreRead>
+{
+}
+
+impl<S> Store for S
+where
+    S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore + SnapshotSource,
+    S::Snapshot: StoreRead,
+{
 }
 
 /// Trait for blob stores that can retain a supplied set of handles.

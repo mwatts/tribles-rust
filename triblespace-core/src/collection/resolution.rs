@@ -1227,10 +1227,10 @@ mod tests {
     use crate::blob::{Blob, IntoBlob};
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
-    use crate::collection::{CollectionRecord, CollectionStore};
+    use crate::collection::{CollectionRead, CollectionRecord, CollectionStore};
     use crate::inline::encodings::hash::{Blake3, Handle, Hash};
     use crate::inline::Inline;
-    use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet};
+    use crate::repo::{memoryrepo::MemoryRepo, BlobStoreGet, SnapshotSource};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     #[derive(Default)]
@@ -1238,14 +1238,17 @@ mod tests {
         records: Vec<Result<CollectionRecord, Infallible>>,
     }
 
-    impl CollectionStore for ProbeStore {
+    impl CollectionRead for ProbeStore {
         type RecordsError = Infallible;
-        type InsertError = Infallible;
         type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Self::RecordsError>>;
 
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
             Ok(self.records.clone().into_iter())
         }
+    }
+
+    impl CollectionStore for ProbeStore {
+        type InsertError = Infallible;
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.records.push(Ok(record));
@@ -1291,7 +1294,7 @@ mod tests {
         for record in records {
             CollectionStore::insert(&mut store, record).unwrap();
         }
-        super::super::discover_collection_records(&mut store).unwrap()
+        super::super::discover_collection_records(&store).unwrap()
     }
 
     fn accepted(
@@ -2594,10 +2597,10 @@ mod tests {
         store.blobs.insert(left);
         store.blobs.insert(right);
 
-        let records = super::super::discover_collection_records(&mut store).unwrap();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let records = super::super::discover_collection_records(&snapshot).unwrap();
         let pending = resolve_with_derive_lineage(&records, &[], &authorized, |request| {
-            validate_union(&reader, request)
+            validate_union(&snapshot, request)
         })
         .unwrap();
         assert_eq!(pending.validation_pending(), &BTreeSet::from([merge.id()]));
@@ -2606,10 +2609,10 @@ mod tests {
             .contains(identity_for_tests(&definition), merge.result()));
 
         store.blobs.insert(result);
-        let records = super::super::discover_collection_records(&mut store).unwrap();
-        let reader = store.reader().unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let records = super::super::discover_collection_records(&snapshot).unwrap();
         let resolved = resolve_with_derive_lineage(&records, &[], &authorized, |request| {
-            validate_union(&reader, request)
+            validate_union(&snapshot, request)
         })
         .unwrap();
         assert!(resolved.validation_pending().is_empty());

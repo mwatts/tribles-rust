@@ -4,8 +4,7 @@ use std::collections::HashSet;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, MemoryBlobStore};
 use triblespace::core::inline::INLINE_LEN;
-use triblespace::core::repo::BlobStore;
-use triblespace::core::repo::{reachable, transfer, BlobStoreGet};
+use triblespace::core::repo::{reachable, transfer, BlobStoreGet, SnapshotSource};
 
 #[test]
 fn reachable_keep_and_transfer() {
@@ -27,10 +26,10 @@ fn reachable_keep_and_transfer() {
     let root_handle = source.insert(root_blob);
 
     // Retain only blobs reachable from the root handle.
-    let reader = source.reader().expect("reader");
-    source.keep(reachable(&reader, [root_handle]));
+    let snapshot = source.snapshot().expect("snapshot");
+    source.keep(reachable(&snapshot, [root_handle]));
 
-    let refreshed = source.reader().expect("refreshed reader");
+    let refreshed = source.snapshot().expect("refreshed snapshot");
     assert!(refreshed
         .get::<Blob<UnknownBlob>, UnknownBlob>(root_handle)
         .is_ok());
@@ -42,9 +41,9 @@ fn reachable_keep_and_transfer() {
         .is_err());
 
     // Copy only the handles reported by the reachable walker into a fresh store.
-    let reader = source.reader().expect("post-keep reader");
+    let snapshot = source.snapshot().expect("post-keep snapshot");
     let mut target = MemoryBlobStore::new();
-    let copied = transfer(&reader, &mut target, reachable(&reader, [root_handle]))
+    let copied = transfer(&snapshot, &mut target, reachable(&snapshot, [root_handle]))
         .collect::<Result<Vec<_>, _>>()
         .expect("transfer handles");
 
@@ -53,12 +52,12 @@ fn reachable_keep_and_transfer() {
     assert!(copied_handles.contains(&root_handle));
     assert!(copied_handles.contains(&child_handle));
 
-    let target_reader = target.reader().expect("target reader");
-    assert_eq!(target_reader.len(), 2);
-    assert!(target_reader
+    let target_snapshot = target.snapshot().expect("target snapshot");
+    assert_eq!(target_snapshot.len(), 2);
+    assert!(target_snapshot
         .get::<Blob<UnknownBlob>, UnknownBlob>(root_handle)
         .is_ok());
-    assert!(target_reader
+    assert!(target_snapshot
         .get::<Blob<UnknownBlob>, UnknownBlob>(child_handle)
         .is_ok());
 }

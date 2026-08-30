@@ -15,7 +15,7 @@ use triblespace_core::find;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -45,9 +45,8 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
         .expect("put should succeed");
 
     // Get → reloaded view.
-    let reader =
-        <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store).expect("reader");
-    let reloaded: SuccinctBM25Index = reader
+    let snapshot = store.snapshot().expect("snapshot");
+    let reloaded: SuccinctBM25Index = snapshot
         .get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)
         .expect("get should succeed");
 
@@ -94,10 +93,9 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         .put::<SuccinctHNSWBlob, _>(&original)
         .expect("put should succeed");
 
-    // Get → reloaded view, then attach the reader for queries.
-    let reader =
-        <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store).expect("reader");
-    let reloaded: SuccinctHNSWIndex = reader
+    // Get → reloaded view, then attach the snapshot for queries.
+    let snapshot = store.snapshot().expect("snapshot");
+    let reloaded: SuccinctHNSWIndex = snapshot
         .get::<SuccinctHNSWIndex, SuccinctHNSWBlob>(handle)
         .expect("get should succeed");
 
@@ -111,8 +109,8 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     // pipeline a real consumer runs after loading an index from
     // a pile, and it's the shape we want tests to demonstrate.
     let probe = handles[0];
-    let original_view = original.attach(&reader);
-    let reloaded_view = reloaded.attach(&reader);
+    let original_view = original.attach(&snapshot);
+    let reloaded_view = reloaded.attach(&snapshot);
     let a: HashSet<Inline<Handle<Embedding>>> = find!(
         (n: Inline<Handle<Embedding>>),
         original_view.similar_to(probe, n, 0.4)
@@ -134,8 +132,6 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
 /// Explicitly test that load-bearing property.
 #[test]
 fn hnsw_indexes_share_embedding_blobs() {
-    use triblespace_core::repo::BlobStore;
-
     use triblespace_search::schemas::put_embedding;
 
     let vecs = [
@@ -180,22 +176,22 @@ fn hnsw_indexes_share_embedding_blobs() {
 
     // Store size check: we did 6 `put_embedding` calls but
     // only 3 distinct vectors were supplied, so only 3 blobs
-    // survive in the reader's view.
-    let reader = store.reader().unwrap();
+    // survive in the snapshot's view.
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(
-        reader.len(),
+        snapshot.len(),
         3,
         "expected 3 unique embedding blobs, found {}",
-        reader.len()
+        snapshot.len()
     );
 
-    // Both indexes, attached to the same reader, find the shared
+    // Both indexes, attached to the same snapshot, find the shared
     // handle when probed from it — the exact match is always
     // above any finite threshold. Engine path through `find!`,
     // matching what a consumer actually runs.
     let probe = idx_a.handles()[0];
-    let view_a = idx_a.attach(&reader);
-    let view_b = idx_b.attach(&reader);
+    let view_a = idx_a.attach(&snapshot);
+    let view_b = idx_b.attach(&snapshot);
     let hits_a: Vec<_> = find!(
         (n: Inline<Handle<Embedding>>),
         view_a.similar_to(probe, n, 0.99)

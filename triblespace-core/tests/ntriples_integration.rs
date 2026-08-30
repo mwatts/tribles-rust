@@ -16,8 +16,8 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{self, Handle};
-use triblespace_core::prelude::BlobStore as _;
 use triblespace_core::prelude::BlobStoreGet as _;
+use triblespace_core::prelude::SnapshotSource as _;
 use triblespace_core::trible::{Fragment, TribleSet};
 
 const NT_SAMPLE: &[u8] = br#"
@@ -730,8 +730,8 @@ fn predicate_uris_recoverable_from_metafacts() {
 
     let mut blobs = import.facts.blobs().clone();
     let uri: View<str> = blobs
-        .reader()
-        .expect("fragment blob reader")
+        .snapshot()
+        .expect("fragment blob snapshot")
         .get(h)
         .expect("IRI blob resolvable from the shared fragment store");
     assert_eq!(uri.as_ref(), "http://example.org/firstname");

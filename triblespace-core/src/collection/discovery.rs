@@ -1,7 +1,8 @@
 //! Discovery over native collection-record storage.
 //!
-//! A [`CollectionStore`](super::CollectionStore) is responsible for decoding
-//! its physical representation into structurally canonical typed records.
+//! A [`CollectionRead`](super::CollectionRead) snapshot is responsible for
+//! decoding its physical representation into structurally canonical typed
+//! records.
 //! Discovery therefore performs no blob-store scan and has no malformed-record
 //! recovery path: a structural storage failure is fatal. It verifies signed
 //! commits, classifies records, and canonicalizes the resulting semantic view.
@@ -18,7 +19,7 @@ use crate::inline::Inline;
 
 use super::{
     CollectionCommit, CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMerge,
-    CollectionRecord, CollectionRecordSelector, CollectionStore, CommitVerificationError, Cover,
+    CollectionRead, CollectionRecord, CollectionRecordSelector, CommitVerificationError, Cover,
 };
 
 /// Failure to use one opaque payload cover with its exact collection.
@@ -169,13 +170,15 @@ where
 /// membership roots. Encoding-specific `MERGE` validation and mapping-specific
 /// `DERIVE` validation likewise remain the resolver callback's responsibility.
 pub fn discover_collection_records<S>(
-    store: &mut S,
+    snapshot: &S,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
-    let records = store.records().map_err(CollectionDiscoveryError::Records)?;
+    let records = snapshot
+        .records()
+        .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
         let record = record.map_err(CollectionDiscoveryError::Records)?;
@@ -203,12 +206,12 @@ where
 /// when it was constructed. Replaying it therefore needs equations, not
 /// another signature scan over provenance claims for the same payloads.
 pub(crate) fn discover_collection_records_for_derived_cover<S, L>(
-    store: &mut S,
+    snapshot: &S,
     cover: &Cover<L>,
     target: CollectionHandle,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
     L: CollectionEncoding,
 {
     let source = cover.collection().handle();
@@ -216,7 +219,7 @@ where
     selectors.insert(CollectionRecordSelector::MergeCollection(source));
     selectors.insert(CollectionRecordSelector::MergeCollection(target));
     selectors.insert(CollectionRecordSelector::DeriveTarget(target));
-    discover_collection_records_for_cover_selectors(store, cover, &selectors)
+    discover_collection_records_for_cover_selectors(snapshot, cover, &selectors)
 }
 
 /// Discover same-lattice equations that may physically realize one cover.
@@ -224,48 +227,48 @@ where
 /// The cover is already an opaque constructed value, so this
 /// path deliberately does not select or verify provenance commits.
 pub(crate) fn discover_collection_equations_for_cover<S, L>(
-    store: &mut S,
+    snapshot: &S,
     cover: &Cover<L>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
     L: CollectionEncoding,
 {
     let selectors = BTreeSet::from([CollectionRecordSelector::MergeCollection(
         cover.collection().handle(),
     )]);
-    discover_collection_records_for_cover_selectors(store, cover, &selectors)
+    discover_collection_records_for_cover_selectors(snapshot, cover, &selectors)
 }
 
 /// Discover every strictly signed provenance claim currently known for one
 /// exact payload cover.
 pub(crate) fn discover_collection_claims_for_cover<S, L>(
-    store: &mut S,
+    snapshot: &S,
     cover: &Cover<L>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
     L: CollectionEncoding,
 {
     let selectors: BTreeSet<_> = cover
         .data_members()
         .map(|member| CollectionRecordSelector::CommitMember(cover.collection().handle(), member))
         .collect();
-    discover_collection_records_for_cover_selectors(store, cover, &selectors)
+    discover_collection_records_for_cover_selectors(snapshot, cover, &selectors)
 }
 
 fn discover_collection_records_for_cover_selectors<S, L>(
-    store: &mut S,
+    snapshot: &S,
     cover: &Cover<L>,
     selectors: &BTreeSet<CollectionRecordSelector>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
     L: CollectionEncoding,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
-    let records = store
+    let records = snapshot
         .select_records(selectors)
         .map_err(CollectionDiscoveryError::Records)?;
 
@@ -324,16 +327,18 @@ where
 /// or iteration failure is fatal even when it appears outside the requested
 /// commit scope.
 pub fn discover_collection_records_scoped<S>(
-    store: &mut S,
+    snapshot: &S,
     collection: CollectionHandle,
     signer: Inline<ED25519PublicKey>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
-    let records = store.records().map_err(CollectionDiscoveryError::Records)?;
+    let records = snapshot
+        .records()
+        .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
         let record = record.map_err(CollectionDiscoveryError::Records)?;
@@ -404,17 +409,19 @@ where
 /// [`discover_collection_records_scoped`] retains them: they are unsigned
 /// equations whose relevance can span collection boundaries.
 pub fn discover_collection_records_authorized<S, F>(
-    store: &mut S,
+    snapshot: &S,
     collection: CollectionHandle,
     is_member: F,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
     F: Fn(&Inline<ED25519PublicKey>) -> bool,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
-    let records = store.records().map_err(CollectionDiscoveryError::Records)?;
+    let records = snapshot
+        .records()
+        .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
         let record = record.map_err(CollectionDiscoveryError::Records)?;
@@ -465,21 +472,21 @@ where
 /// collapse through the cover's set semantics.
 ///
 /// This is a deliberately low-level admission seam. Unlike
-/// [`crate::collection::CollectionStoreExt::cover`], it does not discover or
+/// [`crate::collection::Collection::admitted`], it does not discover or
 /// verify capability proofs and does not load the descriptor authority. A
 /// caller using this helper is responsible for supplying an authorization
 /// predicate appropriate to its own already-verified boundary.
 pub fn discover_collection_cover_authorized<S, L, F>(
-    store: &mut S,
+    snapshot: &S,
     collection: super::Collection<L>,
     is_member: F,
 ) -> Result<Cover<L>, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
     L: CollectionEncoding,
     F: Fn(&Inline<ED25519PublicKey>) -> bool,
 {
-    discover_collection_cover_authorized_with_admission(store, collection, is_member)
+    discover_collection_cover_authorized_with_admission(snapshot, collection, is_member)
         .map(|(cover, _)| cover)
 }
 
@@ -492,16 +499,17 @@ where
 /// query: unauthorized or newly arrived duplicate claims cannot become roots
 /// of an earlier cover observation.
 pub fn discover_collection_cover_authorized_with_admission<S, L, F>(
-    store: &mut S,
+    snapshot: &S,
     collection: super::Collection<L>,
     is_member: F,
 ) -> Result<(Cover<L>, Vec<CollectionCommit>), CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionStore,
+    S: CollectionRead,
     L: CollectionEncoding,
     F: Fn(&Inline<ED25519PublicKey>) -> bool,
 {
-    let discovered = discover_collection_records_authorized(store, collection.handle(), is_member)?;
+    let discovered =
+        discover_collection_records_authorized(snapshot, collection.handle(), is_member)?;
     let cover = Cover::from_data(
         collection,
         discovered.commits().iter().map(CollectionCommit::data),
@@ -547,8 +555,6 @@ where
 mod tests {
     use super::*;
 
-    use std::convert::Infallible;
-
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -573,21 +579,15 @@ mod tests {
         records: Vec<Result<CollectionRecord, ProbeRecordsError>>,
     }
 
-    impl CollectionStore for ProbeStore {
+    impl CollectionRead for ProbeStore {
         type RecordsError = ProbeRecordsError;
-        type InsertError = Infallible;
         type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Self::RecordsError>>;
 
-        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
             if let Some(error) = self.start_error {
                 return Err(error);
             }
             Ok(self.records.clone().into_iter())
-        }
-
-        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-            self.records.push(Ok(record));
-            Ok(())
         }
     }
 
@@ -705,7 +705,7 @@ mod tests {
             CollectionRecord::Merge(source_merge),
         ];
         physical.sort_unstable_by_key(CollectionRecord::id);
-        let mut store = ProbeStore {
+        let store = ProbeStore {
             records: physical.into_iter().map(Ok).collect(),
             ..ProbeStore::default()
         };
@@ -713,8 +713,7 @@ mod tests {
         let cover =
             FactCover::from_members(source, [Handle::<SimpleArchive>::from_hash(commit.data())]);
         let discovered =
-            discover_collection_records_for_derived_cover(&mut store, &cover, target.handle())
-                .unwrap();
+            discover_collection_records_for_derived_cover(&store, &cover, target.handle()).unwrap();
 
         let mut expected_merges = vec![source_merge, target_merge];
         expected_merges.sort_unstable_by_key(CollectionMerge::id);
@@ -727,17 +726,17 @@ mod tests {
     #[test]
     fn native_records_are_verified_classified_and_order_independent() {
         let (records, invalid_commit) = fixture_records();
-        let mut forward = ProbeStore {
+        let forward = ProbeStore {
             records: records.iter().copied().map(Ok).collect(),
             ..ProbeStore::default()
         };
-        let mut reverse = ProbeStore {
+        let reverse = ProbeStore {
             records: records.iter().rev().copied().map(Ok).collect(),
             ..ProbeStore::default()
         };
 
-        let forward_records = discover_collection_records(&mut forward).unwrap();
-        let reverse_records = discover_collection_records(&mut reverse).unwrap();
+        let forward_records = discover_collection_records(&forward).unwrap();
+        let reverse_records = discover_collection_records(&reverse).unwrap();
 
         assert_eq!(forward_records, reverse_records);
         assert_eq!(forward_records.commits().len(), 1);
@@ -788,7 +787,7 @@ mod tests {
         let other_merge = CollectionMerge::new(other.handle(), data(3), data(4), data(6));
         let crossing_derive = CollectionDerive::new(other.handle(), data(5), data(6));
 
-        let mut store = ProbeStore {
+        let store = ProbeStore {
             records: [
                 CollectionRecord::Commit(wrong_signer),
                 CollectionRecord::Merge(other_merge),
@@ -804,12 +803,9 @@ mod tests {
             ..ProbeStore::default()
         };
 
-        let discovered = discover_collection_records_scoped(
-            &mut store,
-            target.handle(),
-            signer(&authorized_key),
-        )
-        .unwrap();
+        let discovered =
+            discover_collection_records_scoped(&store, target.handle(), signer(&authorized_key))
+                .unwrap();
 
         assert_eq!(discovered.commits(), &[valid]);
         assert_eq!(
@@ -856,7 +852,7 @@ mod tests {
             data(3),
             empty_metadata_handle(),
         ));
-        let mut store = ProbeStore {
+        let store = ProbeStore {
             records: [
                 CollectionRecord::Commit(unauthorized),
                 CollectionRecord::Commit(invalid),
@@ -870,7 +866,7 @@ mod tests {
         };
 
         let (cover, roots) =
-            discover_collection_cover_authorized_with_admission(&mut store, target, |subject| {
+            discover_collection_cover_authorized_with_admission(&store, target, |subject| {
                 *subject == signer(&authorized_key)
             })
             .unwrap();
@@ -885,7 +881,7 @@ mod tests {
         assert!(!roots.contains(&unauthorized));
         assert!(!roots.contains(&invalid));
 
-        let projected = discover_collection_cover_authorized(&mut store, target, |subject| {
+        let projected = discover_collection_cover_authorized(&store, target, |subject| {
             *subject == signer(&authorized_key)
         })
         .unwrap();
@@ -915,14 +911,13 @@ mod tests {
             r,
             s,
         );
-        let mut store = ProbeStore {
+        let store = ProbeStore {
             records: vec![Ok(CollectionRecord::Commit(invalid_key_commit))],
             ..ProbeStore::default()
         };
 
         let discovered =
-            discover_collection_records_scoped(&mut store, target.handle(), invalid_signer)
-                .unwrap();
+            discover_collection_records_scoped(&store, target.handle(), invalid_signer).unwrap();
         assert!(discovered.commits().is_empty());
         assert_eq!(
             discovered.diagnostics(),
@@ -984,18 +979,18 @@ mod tests {
                 data(6),
             )),
         ];
-        let mut full_store = ProbeStore {
+        let full_store = ProbeStore {
             records: records.iter().copied().map(Ok).collect(),
             ..ProbeStore::default()
         };
-        let mut scoped_store = ProbeStore {
+        let scoped_store = ProbeStore {
             records: records.into_iter().map(Ok).collect(),
             ..ProbeStore::default()
         };
 
-        let full = discover_collection_records(&mut full_store).unwrap();
+        let full = discover_collection_records(&full_store).unwrap();
         let scoped = discover_collection_records_scoped(
-            &mut scoped_store,
+            &scoped_store,
             target.handle(),
             signer(&authorized_key),
         )
@@ -1048,16 +1043,12 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                let mut store = ProbeStore {
+                let store = ProbeStore {
                     records: records.iter().copied().map(Ok).collect(),
                     ..ProbeStore::default()
                 };
-                discover_collection_records_scoped(
-                    &mut store,
-                    target.handle(),
-                    signer(&authorized_key),
-                )
-                .unwrap()
+                discover_collection_records_scoped(&store, target.handle(), signer(&authorized_key))
+                    .unwrap()
             })
         };
 
@@ -1084,36 +1075,36 @@ mod tests {
 
     #[test]
     fn start_and_iteration_failures_are_fatal() {
-        let mut start_failure = ProbeStore {
+        let start_failure = ProbeStore {
             start_error: Some(ProbeRecordsError("start")),
             ..ProbeStore::default()
         };
         assert!(matches!(
-            discover_collection_records(&mut start_failure),
+            discover_collection_records(&start_failure),
             Err(CollectionDiscoveryError::Records(ProbeRecordsError(
                 "start"
             )))
         ));
 
         let (records, _) = fixture_records();
-        let mut iteration_failure = ProbeStore {
+        let iteration_failure = ProbeStore {
             records: vec![Ok(records[0]), Err(ProbeRecordsError("iteration"))],
             ..ProbeStore::default()
         };
         assert!(matches!(
-            discover_collection_records(&mut iteration_failure),
+            discover_collection_records(&iteration_failure),
             Err(CollectionDiscoveryError::Records(ProbeRecordsError(
                 "iteration"
             )))
         ));
 
-        let mut scoped_failure = ProbeStore {
+        let scoped_failure = ProbeStore {
             records: vec![Ok(records[0]), Err(ProbeRecordsError("scoped iteration"))],
             ..ProbeStore::default()
         };
         assert!(matches!(
             discover_collection_records_scoped(
-                &mut scoped_failure,
+                &scoped_failure,
                 collection(99).handle(),
                 signer(&SigningKey::from_bytes(&[9; 32])),
             ),

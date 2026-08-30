@@ -31,7 +31,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, RawInline};
 use crate::metadata::{self, MetaDescribe};
 use crate::prelude::entity;
-use crate::repo::BlobStore;
+use crate::repo::SnapshotSource;
 use crate::trible::{Fragment, TribleSet};
 
 /// Tag identifying an entity that describes one pile record kind.
@@ -210,8 +210,8 @@ pub fn description_blobs() -> Vec<Blob<UnknownBlob>> {
         let reader = fragment
             .blobs()
             .clone()
-            .reader()
-            .expect("MemoryBlobStore reader is infallible");
+            .snapshot()
+            .expect("MemoryBlobStore snapshot is infallible");
         for (_, blob) in reader.iter() {
             push(blob);
         }

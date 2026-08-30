@@ -28,7 +28,7 @@ use triblespace_core::inline::Inline;
 use triblespace_core::macros::attributes;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::query::temp;
-use triblespace_core::repo::BlobStore;
+use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
 
 use triblespace_search::bm25::BM25Builder;
@@ -120,8 +120,8 @@ fn main() {
 
     // Put the query vector into the store as the fixed ANN probe.
     let query_handle = put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-    let reader = store.reader().unwrap();
-    let hnsw_view = hnsw.attach(&reader);
+    let snapshot = store.snapshot().unwrap();
+    let hnsw_view = hnsw.attach(&snapshot);
 
     // The headline query: title contains "graph" AND embedding
     // close to [1,0,0,0] (cos ≥ 0.8). One `find!`, three

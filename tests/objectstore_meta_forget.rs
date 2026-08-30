@@ -11,7 +11,7 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     use triblespace::core::blob::Bytes;
     use triblespace::core::repo::async_store::Blocking;
     use triblespace::core::repo::objectstore::ObjectStoreRemote;
-    use triblespace::core::repo::{BlobStoreForget, BlobStoreList, BlobStoreMeta};
+    use triblespace::core::repo::{BlobStoreForget, BlobStoreList, BlobStoreMeta, SnapshotSource};
 
     use triblespace::prelude::BlobStorePut;
 
@@ -24,23 +24,22 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
 
     let handle = remote.put::<UnknownBlob, _>(blob)?;
 
-    // metadata should be present and report the correct length
-    use triblespace::prelude::BlobStore;
-
-    let reader = remote.reader()?;
-    let meta = reader.metadata(handle)?;
+    // Metadata should be present and report the correct length.
+    let snapshot = remote.snapshot()?;
+    let meta = snapshot.metadata(handle)?;
     assert!(meta.is_some());
     let meta = meta.unwrap();
     assert_eq!(meta.length, contents.len() as u64);
-    let listed: Vec<_> = reader.blobs().collect::<Result<_, _>>()?;
+    let listed: Vec<_> = snapshot.blobs().collect::<Result<_, _>>()?;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].handle, handle);
     assert_eq!(listed[0].length, contents.len() as u64);
 
     // forget removes the blob and is idempotent
     remote.forget(handle)?;
-    let meta2 = reader.metadata(handle)?;
-    assert!(meta2.is_none());
+    assert!(snapshot.metadata(handle)?.is_some());
+    let refreshed = remote.snapshot()?;
+    assert!(refreshed.metadata(handle)?.is_none());
     // second call should succeed as well
     remote.forget(handle)?;
 
@@ -58,7 +57,7 @@ fn objectstore_get_rejects_bytes_that_do_not_match_the_path_hash(
     use triblespace::core::inline::Inline;
     use triblespace::core::repo::async_store::Blocking;
     use triblespace::core::repo::objectstore::{GetBlobErr, ObjectStoreRemote};
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 
     let dir = tempdir()?;
     let expected_blob = Blob::<UnknownBlob>::new(Bytes::from(b"expected".to_vec()));
@@ -73,8 +72,8 @@ fn objectstore_get_rejects_bytes_that_do_not_match_the_path_hash(
 
     let url = Url::parse(&format!("file://{}", dir.path().display()))?;
     let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
-    let reader = remote.reader()?;
-    let err = reader
+    let snapshot = remote.snapshot()?;
+    let err = snapshot
         .get::<Bytes, UnknownBlob>(expected_handle)
         .expect_err("wrong bytes at a content-addressed path must be rejected");
 

@@ -25,8 +25,8 @@ use triblespace_core::capability::{
 };
 use triblespace_core::id::{id_hex, Id};
 use triblespace_core::repo::pile::{GetBlobError, Pile};
-use triblespace_core::repo::proof::CapabilityProofStore;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::proof::{CapabilityProofRead, CapabilityProofStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 
 use triblespace_net::inventory::{sync_team_capability_atom, ACTION_SYNC_TEAM};
 use triblespace_net::protocol::{connect_capability_atom, ACTION_CONNECT};
@@ -277,7 +277,10 @@ pub(crate) fn load_capability_bundle(
     pile: &mut Pile,
     proof_id: CapabilityProofId,
 ) -> Result<CapabilityProofBundle> {
-    let proof = pile
+    let snapshot = pile
+        .snapshot()
+        .context("open capability proof and claim snapshot")?;
+    let proof = snapshot
         .proof(proof_id)
         .map_err(|error| anyhow!("read capability proof store: {error}"))?
         .with_context(|| {
@@ -286,10 +289,9 @@ pub(crate) fn load_capability_bundle(
                 format_proof_id(proof_id)
             )
         })?;
-    let reader = pile.reader().context("open capability claim snapshot")?;
     let mut claims = Vec::with_capacity(proof.step_count());
     for (step, handle) in proof.claim_handles().enumerate() {
-        let claim: Blob<SimpleArchive> = match reader.get(handle) {
+        let claim: Blob<SimpleArchive> = match snapshot.get(handle) {
             Ok(claim) => claim,
             Err(GetBlobError::BlobNotFound) => {
                 bail!(

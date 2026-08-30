@@ -506,7 +506,7 @@ mod tests {
     use crate::inline::encodings::hash::Handle;
     use crate::inline::Inline;
     use crate::macros::{find, pattern};
-    use crate::repo::{BlobStore, BlobStoreGet};
+    use crate::repo::{BlobStoreGet, SnapshotSource};
 
     #[test]
     fn lossless_ids_are_content_based() {
@@ -583,7 +583,7 @@ mod tests {
         .expect("the field entry has a name handle");
 
         let mut local = fragment.blobs().clone();
-        let reader = local.reader().expect("fragment blob-store reader");
+        let reader = local.snapshot().expect("fragment blob-store snapshot");
         let value: View<str> = reader
             .get(string_handle)
             .expect("string bytes resolve from the returned fragment");
