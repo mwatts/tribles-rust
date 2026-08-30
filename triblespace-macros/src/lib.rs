@@ -514,7 +514,8 @@ mod instrumentation_tests {
         descriptor, CollectionRead, CollectionRecord, CollectionStoreExt,
     };
     use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::repo::{BlobStoreGet, MemoryRepo, SnapshotSource, StorageClose};
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{BlobStoreGet, SnapshotSource, StorageClose};
     use triblespace_core::trible::TribleSet;
 
     #[test]
