@@ -1018,7 +1018,7 @@ mod tests {
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1;
     use triblespace_core::collection::{CollectionPolicy, CollectionStoreExt};
-    use triblespace_core::repo::MemoryRepo;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
 
     fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
         CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
