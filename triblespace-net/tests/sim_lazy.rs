@@ -16,8 +16,6 @@
 mod common;
 
 use std::time::Duration;
-use triblespace_core::collection::reach;
-
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -28,11 +26,10 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::{
-    ACTION_WRITE, CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding,
-    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRead,
-    CollectionRecord, CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR,
-    KIND_COLLECTION_MAPPING, collection_authority, collection_mapping, collection_reach,
-    collection_representation, collection_source, mapping_algorithm, simplearchive_union,
+    ACTION_WRITE, AdmissionPolicy, CollectionCommit, CollectionData, CollectionDerive,
+    CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
+    CollectionOperationError, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
+    CollectionStoreExt, KIND_COLLECTION_MAPPING, mapping_algorithm, simplearchive_union,
 };
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
@@ -198,7 +195,14 @@ fn network_test_mapping_fragment() -> Fragment {
 
 struct NetworkTestMapping;
 
-impl CollectionMapping<SimpleArchive, NetworkTestBlob> for NetworkTestMapping {
+impl CollectionMapping for NetworkTestMapping {
+    type Source = SimpleArchive;
+    type Target = NetworkTestBlob;
+
+    fn fragment(&self) -> Fragment {
+        network_test_mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         let actual = triblespace_core::collection::descriptor::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
@@ -223,23 +227,11 @@ impl CollectionMapping<SimpleArchive, NetworkTestBlob> for NetworkTestMapping {
     }
 }
 
-fn descriptor_handle(descriptor: &Fragment) -> CollectionHandle {
-    let blob: Blob<SimpleArchive> = descriptor.clone().into_facts().to_blob();
-    blob.get_handle()
-}
-
-fn network_target_descriptor(
-    source: CollectionHandle,
-    authority: ed25519_dalek::VerifyingKey,
-) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_source: source,
-        collection_authority: authority,
-        collection_representation*: <NetworkTestBlob as MetaDescribe>::describe(),
-        collection_mapping*: network_test_mapping_fragment(),
-        collection_reach*: reach::private(),
-    }
+fn private_collection_policy(authority: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
+    CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    )
 }
 
 /// Drive `fut` to completion, stepping the sim between polls so the
@@ -296,12 +288,11 @@ fn inventory_satisfies_operation_want_without_a_second_record_rpc() {
         let mut server_store = empty_store();
         let mut client_store = empty_store();
 
-        // Only the identity matters here; the descriptor is never stored.
-        let descriptor =
-            simplearchive_union::descriptor("lazy", key(0xF1).verifying_key(), reach::private())
-                .into_facts()
-                .to_blob()
-                .get_handle();
+        // Only the identity matters here; no collection read is attempted.
+        let descriptor = server_store
+            .collection("lazy", private_collection_policy(key(0xF1).verifying_key()))
+            .unwrap()
+            .handle();
         let a = Inline::new([1; 32]);
         let b = Inline::new([2; 32]);
         let result = Inline::new([3; 32]);
@@ -455,20 +446,20 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
         let namespace = key(0xD3).verifying_key();
         let team_root = root.verifying_key();
 
-        let source_descriptor =
-            simplearchive_union::descriptor("network-empty-source", namespace, reach::private());
-        let target_descriptor =
-            network_target_descriptor(descriptor_handle(&source_descriptor), namespace);
-        let lifecycle =
-            ExactDerivedCollection::<SimpleArchive, NetworkTestBlob, NetworkTestMapping>::new(
-                source_descriptor.clone(),
-                target_descriptor.clone(),
-            )
-            .unwrap();
         let mut client_store = empty_store();
         let source_collection = client_store
-            .collection(lifecycle.source_descriptor().clone())
+            .collection("network-empty-source", private_collection_policy(namespace))
             .unwrap();
+        let target_collection = client_store
+            .derive(
+                source_collection,
+                NetworkTestMapping,
+                private_collection_policy(namespace),
+            )
+            .unwrap();
+        let lifecycle =
+            ExactDerivedCollection::<NetworkTestMapping>::new(source_collection, target_collection)
+                .unwrap();
         let source_cover = source_collection
             .admitted(&client_store.snapshot().unwrap())
             .unwrap();
@@ -477,7 +468,7 @@ fn empty_exact_cover_does_not_admit_pending_inventory() {
         let lower_b = Blob::<NetworkTestBlob>::new(vec![0x32].into());
         let upper = Blob::<NetworkTestBlob>::new(vec![0x33].into());
         let marker = CollectionMerge::new(
-            lifecycle.target_collection().handle(),
+            target_collection.handle(),
             collection_data(&lower_a),
             collection_data(&lower_b),
             collection_data(&upper),
@@ -559,23 +550,24 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
         let serving_team = key(0xE1).verifying_key();
         let conflicting_team = key(0xE2).verifying_key();
         let namespace = key(0xE3).verifying_key();
-        let source_descriptor =
-            simplearchive_union::descriptor("scope-conflict-source", namespace, reach::private());
-        let target_descriptor =
-            network_target_descriptor(descriptor_handle(&source_descriptor), namespace);
-        let lifecycle =
-            ExactDerivedCollection::<SimpleArchive, NetworkTestBlob, NetworkTestMapping>::new(
-                source_descriptor.clone(),
-                target_descriptor.clone(),
-            )
-            .unwrap();
-
         let mut serving = Pile::open(&serving_path).unwrap();
         serving.bind_store_scope(serving_team).unwrap();
         let source_collection = serving
-            .collection(lifecycle.source_descriptor().clone())
+            .collection(
+                "scope-conflict-source",
+                private_collection_policy(namespace),
+            )
             .unwrap();
-        assert_eq!(source_collection, lifecycle.source_collection());
+        let target_collection = serving
+            .derive(
+                source_collection,
+                NetworkTestMapping,
+                private_collection_policy(namespace),
+            )
+            .unwrap();
+        let lifecycle =
+            ExactDerivedCollection::<NetworkTestMapping>::new(source_collection, target_collection)
+                .unwrap();
         let source = content_blob(0xA1).0;
         serving.put::<SimpleArchive, _>(source.clone()).unwrap();
         let metadata = serving
@@ -583,7 +575,7 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
             .unwrap();
         let commit = CollectionCommit::sign(
             &key(0xE4),
-            lifecycle.source_collection().handle(),
+            source_collection.handle(),
             collection_data(&source),
             metadata,
         );
@@ -636,7 +628,7 @@ fn nonempty_exact_attachment_reports_external_scope_conflict() {
 /// remain demand-only. The resolver first chooses a stale one-member upper
 /// offer, removes it after the exact GET misses, replans to the two available
 /// lower members, and introduces neither a durable WANT nor descriptor
-/// publication.
+/// mutation.
 #[test]
 fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
     let _g = sim_guard();
@@ -648,33 +640,29 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
         let namespace = key(0xD4).verifying_key();
         let team_root = root.verifying_key();
 
-        let source_descriptor =
-            simplearchive_union::descriptor("network-cover-source", namespace, reach::private());
-        let target_descriptor =
-            network_target_descriptor(descriptor_handle(&source_descriptor), namespace);
-        let lifecycle =
-            ExactDerivedCollection::<SimpleArchive, NetworkTestBlob, NetworkTestMapping>::new(
-                source_descriptor.clone(),
-                target_descriptor.clone(),
+        let mut client_store = empty_store();
+        let source_collection = client_store
+            .collection("network-cover-source", private_collection_policy(namespace))
+            .unwrap();
+        let target_collection = client_store
+            .derive(
+                source_collection,
+                NetworkTestMapping,
+                private_collection_policy(namespace),
             )
             .unwrap();
-
+        let lifecycle =
+            ExactDerivedCollection::<NetworkTestMapping>::new(source_collection, target_collection)
+                .unwrap();
         let sources = [content_blob(0x71).0, content_blob(0x81).0];
         let targets = [
             derive_test_target(&sources[0]),
             derive_test_target(&sources[1]),
         ];
-        let mut client_store = empty_store();
-        let reader = client_store.snapshot().unwrap();
-        let upper =
-            NetworkTestBlob::join_members(&target_descriptor, &targets[0], &targets[1], &reader)
-                .unwrap()
-                .expect("network test encoding has a direct join");
-        drop(reader);
-        let source_collection = client_store
-            .collection(lifecycle.source_descriptor().clone())
-            .unwrap();
-        assert_eq!(source_collection, lifecycle.source_collection());
+        let upper = derive_test_target(
+            &simplearchive_union::join(&sources[0], &sources[1])
+                .expect("network test encoding has a direct source join"),
+        );
         let metadata = client_store
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
@@ -687,7 +675,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
                     .unwrap();
                 let commit = CollectionCommit::sign(
                     &key(0x91 + index as u8),
-                    lifecycle.source_collection().handle(),
+                    source_collection.handle(),
                     collection_data(source),
                     metadata,
                 );
@@ -722,7 +710,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             .zip(&targets)
             .map(|(source, target)| {
                 CollectionDerive::new(
-                    lifecycle.target_collection().handle(),
+                    target_collection.handle(),
                     collection_data(source),
                     collection_data(target),
                 )
@@ -734,7 +722,7 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
                 .unwrap();
         }
         let merge = CollectionMerge::new(
-            lifecycle.target_collection().handle(),
+            target_collection.handle(),
             collection_data(&targets[0]),
             collection_data(&targets[1]),
             collection_data(&upper),
@@ -777,10 +765,10 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
         }
         assert_eq!(want_count(&client), 0, "precondition: no durable wants");
         assert!(!holds_locally(&mut client, upper.get_handle().raw));
-        assert!(!holds_locally(
-            &mut client,
-            lifecycle.target_collection().handle().raw,
-        ));
+        assert!(
+            holds_locally(&mut client, target_collection.handle().raw,),
+            "the store-owned lifecycle has already registered its descriptor"
+        );
 
         let cover = drive_future(
             ensure_exact_derived(&mut client, &lifecycle, &source_cover),
@@ -809,8 +797,8 @@ fn remote_cover_fetch_replans_stale_upper_without_durable_want() {
             );
         }
         assert!(
-            !holds_locally(&mut client, lifecycle.target_collection().handle().raw),
-            "remote reuse did not fall through to local descriptor publication",
+            holds_locally(&mut client, target_collection.handle().raw),
+            "exact reuse leaves the registered descriptor resident",
         );
         assert_eq!(
             want_count(&client),

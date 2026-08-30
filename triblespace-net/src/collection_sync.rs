@@ -17,8 +17,8 @@ use triblespace_core::collection::exact_derived::{
     ExactAttachPlan, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use triblespace_core::collection::{
-    CollectionData, CollectionEncoding, CollectionMapping, CollectionRead, CollectionRecord,
-    CollectionRecordSelector, CollectionStore, Cover,
+    CollectionData, CollectionMapping, CollectionRead, CollectionRecord, CollectionRecordSelector,
+    CollectionStore, Cover,
 };
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -106,11 +106,11 @@ impl From<ExactDerivedCollectionError> for ExactDerivedSyncError {
 /// residency, and shrink after every attempted fetch. The operation therefore
 /// terminates even when every offer is stale. Exact fetches neither create
 /// durable [`WantStore`] entries nor change collection authority.
-pub async fn ensure_exact_derived<S, Source, Target, Mapping>(
+pub async fn ensure_exact_derived<S, Mapping>(
     peer: &mut Peer<S>,
-    lifecycle: &ExactDerivedCollection<Source, Target, Mapping>,
-    source_cover: &Cover<Source>,
-) -> Result<Cover<Target>, ExactDerivedSyncError>
+    lifecycle: &ExactDerivedCollection<Mapping>,
+    source_cover: &Cover<Mapping::Source>,
+) -> Result<Cover<Mapping::Target>, ExactDerivedSyncError>
 where
     S: BlobStore
         + CollectionStore
@@ -123,11 +123,9 @@ where
         + Send
         + 'static,
     S::Snapshot: StoreRead + BlobStoreMeta,
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-    Mapping: CollectionMapping<Source, Target>,
-    Handle<Source>: InlineEncoding,
-    Handle<Target>: InlineEncoding,
+    Mapping: CollectionMapping,
+    Handle<Mapping::Source>: InlineEncoding,
+    Handle<Mapping::Target>: InlineEncoding,
 {
     if source_cover.is_empty() {
         return lifecycle
@@ -159,7 +157,7 @@ where
                 CollectionRecord::Merge(merge) => Some(merge.result()),
                 CollectionRecord::Derive(derive) => Some(derive.output()),
             })
-            .map(Handle::<Target>::from_hash)
+            .map(Handle::<Mapping::Target>::from_hash)
             .collect::<BTreeSet<_>>()
     };
 
@@ -189,7 +187,7 @@ where
                         offered.remove(&expected);
                         continue 'replan;
                     };
-                    let blob = Blob::<Target>::new(Bytes::from(raw));
+                    let blob = Blob::<Mapping::Target>::new(Bytes::from(raw));
                     let actual = blob.get_handle();
                     if actual != expected {
                         // `fetch_blob` already checks this. Keep the boundary
@@ -197,13 +195,16 @@ where
                         offered.remove(&expected);
                         continue 'replan;
                     }
-                    let landed = peer.store().put::<Target, _>(blob).map_err(|error| {
-                        ExactDerivedSyncError::storage("land fetched target artifact", error)
-                    })?;
+                    let landed = peer
+                        .store()
+                        .put::<Mapping::Target, _>(blob)
+                        .map_err(|error| {
+                            ExactDerivedSyncError::storage("land fetched target artifact", error)
+                        })?;
                     if landed != expected {
                         return Err(ExactDerivedSyncError::LandingIdentity {
-                            expected: Handle::<Target>::to_hash(expected),
-                            actual: Handle::<Target>::to_hash(landed),
+                            expected: Handle::<Mapping::Target>::to_hash(expected),
+                            actual: Handle::<Mapping::Target>::to_hash(landed),
                         });
                     }
                     // Local residency, freshly re-read by the next probe, now
