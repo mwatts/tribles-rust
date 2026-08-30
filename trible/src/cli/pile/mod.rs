@@ -21,11 +21,12 @@ pub enum PileCommand {
     },
     /// Collection-aware views of a pile.
     ///
-    /// A collection is a grow-only set of signed records, named within a team
-    /// and identified by the blake3 handle of its descriptor blob. These
-    /// subcommands decode that descriptor — so a collection lists under the
-    /// name it was given, rather than as the opaque bytes `pile blob inspect`
-    /// would report. Every one of them takes either the name or the handle.
+    /// A collection is a grow-only set of signed records identified by the
+    /// blake3 handle of its descriptor blob. These subcommands decode that
+    /// descriptor — including its independent READ and WRITE policies — so a
+    /// root collection lists under the name it was given, rather than as the
+    /// opaque bytes `pile blob inspect` would report. Every one of them takes
+    /// either the name or the handle.
     Collection {
         #[command(subcommand)]
         cmd: collection::Command,

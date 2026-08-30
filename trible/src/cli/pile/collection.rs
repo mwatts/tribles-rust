@@ -2,11 +2,12 @@
 //!
 //! A collection is identified by the blake3 handle of its *descriptor blob*,
 //! not by the entity id inside that blob. The descriptor is an ordinary
-//! canonical `SimpleArchive` of one intrinsic entity: the
+//! canonical `SimpleArchive` whose distinguished intrinsic entity carries the
 //! `KIND_COLLECTION_DESCRIPTOR` tag, an anchor — `name` for a root, `source`
-//! for a derivation — plus its mandatory capability authority, the blob
-//! `representation`, and — for a derivation — its content-derived `mapping`,
-//! the mapping algorithm, and whatever parameters that mapping carries.
+//! for a derivation — plus independent READ and WRITE admission policies, the
+//! blob `representation`, and — for a derivation — its content-derived
+//! `mapping`. Policy, encoding, mapping algorithm, and concrete mapping
+//! parameters are embedded as ordinary associated entities.
 //!
 //! Without this module the only way to look at one was
 //! `pile blob inspect <PILE> blake3:<HEX>`, which reports "256 bytes, Binary"
@@ -15,11 +16,11 @@
 //! and retention use, so the CLI view can never drift from the semantics.
 //!
 //! Names are what the listing leads with. A root carries the name it is known
-//! by under its authority, and that name — not the 64 hex characters of its
-//! descriptor handle — is what an operator came to read. Every subcommand that
-//! takes a collection therefore accepts either spelling. `blake3:` and `name:`
-//! prefixes disambiguate the unusual case where an arbitrary UTF-8 name itself
-//! looks like a bare handle.
+//! by, while its complete policy remains part of its immutable identity. That
+//! name — not the 64 hex characters of its descriptor handle — is what an
+//! operator came to read. Every subcommand that takes a collection therefore
+//! accepts either spelling. `blake3:` and `name:` prefixes disambiguate the
+//! unusual case where an arbitrary UTF-8 name itself looks like a bare handle.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -33,9 +34,9 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob;
-use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::CollectionRead;
+use triblespace_core::collection::{descriptor, AdmissionPolicy};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
 use triblespace_core::inline::Inline;
@@ -71,7 +72,7 @@ pub enum Command {
         /// Also show the descriptor blob's size and storage timestamp.
         #[arg(long)]
         metadata: bool,
-        /// Print handles and authority keys in full.
+        /// Print handles and policy roots in full.
         #[arg(long)]
         long: bool,
     },
@@ -254,6 +255,44 @@ fn short_optional_named_id(
     }
 }
 
+/// Compact rendering of one action's immutable admission law.
+fn policy_text(policy: &AdmissionPolicy, long: bool) -> String {
+    match policy {
+        AdmissionPolicy::Open => "open".to_owned(),
+        AdmissionPolicy::Quorum(quorum) => {
+            let roots = quorum
+                .roots()
+                .iter()
+                .map(|root| abbrev(&hex::encode_upper(root.to_bytes()), long))
+                .collect::<Vec<_>>()
+                .join(",");
+            let delegate = quorum
+                .delegate_threshold()
+                .map(|threshold| format!(" delegate={threshold}"))
+                .unwrap_or_default();
+            format!(
+                "{}/{} [{}]{delegate}",
+                quorum.invoke_threshold(),
+                quorum.roots().len(),
+                roots,
+            )
+        }
+    }
+}
+
+fn descriptor_policy_columns(facts: &TribleSet, long: bool) -> [String; 2] {
+    match descriptor::policy(facts) {
+        Ok(policy) => [
+            policy_text(policy.read(), long),
+            policy_text(policy.write(), long),
+        ],
+        Err(error) => {
+            let invalid = format!("<invalid: {error}>");
+            [invalid.clone(), invalid]
+        }
+    }
+}
+
 /// How many records of each kind name one collection.
 #[derive(Default, Clone, Copy)]
 struct Refs {
@@ -354,8 +393,8 @@ struct Enumerated {
     fields: Fields,
 }
 
-/// What a descriptor is anchored to. A root is named under its authority and
-/// a derivation is anchored by the collection it derives from.
+/// What a descriptor is anchored to. A root is named directly and a
+/// derivation is anchored by the collection it derives from.
 enum Anchor {
     Root(Result<String, String>),
     Derived(CollectionHandle),
@@ -478,7 +517,7 @@ fn resolve(rows: &[Enumerated], reference: &str) -> Result<CollectionHandle> {
             }
         }
         many => Err(anyhow!(
-            "{} collections in this pile are named {name:?} under different authorities. Pass one \
+            "{} collections in this pile are named {name:?} under different policies. Pass one \
              of the handles instead:\n{}",
             many.len(),
             many.iter()
@@ -560,14 +599,16 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         // A row's trailing columns are the same question for every section, so
         // they are built once here.
         let tail = |row: &Enumerated| -> Vec<String> {
+            let policies = row
+                .fields
+                .facts()
+                .map(|facts| descriptor_policy_columns(facts, long))
+                .unwrap_or_else(|| ["-".to_owned(), "-".to_owned()]);
             let mut cells = vec![
                 row.refs.total().to_string(),
                 abbrev(&handle_hex(row.handle), long),
-                match row.fields.facts().map(descriptor::authority) {
-                    Some(Ok(authority)) => abbrev(&hex::encode_upper(authority.to_bytes()), long),
-                    Some(Err(error)) => format!("<invalid: {error}>"),
-                    None => "-".to_owned(),
-                },
+                policies[0].clone(),
+                policies[1].clone(),
                 match row.fields.facts() {
                     Some(facts) => {
                         short_named_id(descriptor::representation(facts), representation_name)
@@ -650,13 +691,15 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         let mut tail_headers: Vec<&str> = vec![
             "RECORDS",
             "COLLECTION",
-            "AUTHORITY",
+            "READ",
+            "WRITE",
             "REPRESENTATION",
             "MAPPING",
             "ALGORITHM",
         ];
         let mut tail_aligns = vec![
             Align::Right,
+            Align::Left,
             Align::Left,
             Align::Left,
             Align::Left,
@@ -777,12 +820,15 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
             }
             Anchor::Unreadable(why) => println!("anchor:         <{why}>"),
         }
-        match descriptor::authority(&descriptor) {
-            Ok(authority) => println!(
-                "authority:      {}",
-                hex::encode_upper(authority.to_bytes())
-            ),
-            Err(error) => println!("authority:      <invalid: {error}>"),
+        match descriptor::policy(&descriptor) {
+            Ok(policy) => {
+                println!("read policy:    {}", policy_text(policy.read(), true));
+                println!("write policy:   {}", policy_text(policy.write(), true));
+            }
+            Err(error) => {
+                println!("read policy:    <invalid: {error}>");
+                println!("write policy:   <invalid: {error}>");
+            }
         }
         println!(
             "representation: {}",
@@ -969,10 +1015,14 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
-    use triblespace_core::blob::{IntoBlob, MemoryBlobStore};
-    use triblespace_core::collection::reach;
+    use triblespace_core::blob::IntoBlob;
     use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1;
-    use triblespace_core::repo::BlobStorePut;
+    use triblespace_core::collection::{CollectionPolicy, CollectionStoreExt};
+    use triblespace_core::repo::MemoryRepo;
+
+    fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
+        CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
+    }
 
     /// A descriptor built in-process must round-trip through exactly the path
     /// `show` uses: store the blob, address it by its own handle, read it back
@@ -983,30 +1033,27 @@ mod tests {
     fn show_decodes_a_descriptor_addressed_by_its_blob_handle() {
         let authority = SigningKey::from_bytes(&[8; 32]).verifying_key();
         let representation = <SimpleArchive as MetaDescribe>::id();
-        let fragment = descriptor::naming("inspected", authority, representation, reach::private());
-        let entity_id = fragment.root().expect("the descriptor has one root");
-
-        let mut store = MemoryBlobStore::new();
-        let expected_name = store
-            .put::<UTF8String, _>("inspected".to_owned())
-            .expect("store descriptor name");
-        let handle: CollectionHandle = store
-            .put::<SimpleArchive, _>(fragment.into_facts().to_blob())
-            .expect("store descriptor");
+        let policy = direct_policy(authority);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection("inspected", policy.clone())
+            .expect("register collection");
+        let handle = collection.handle();
+        let snapshot = store.snapshot().expect("snapshot");
+        let blob: Blob<SimpleArchive> = snapshot.get(handle).expect("read descriptor blob");
+        let decoded = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob.clone())
+            .expect("decode descriptor");
+        let entity_id = descriptor::entity(&decoded).expect("descriptor entity");
         assert_ne!(
             handle.raw[..16],
             <[u8; 16]>::from(entity_id)[..],
             "identity is the blob hash, not the intrinsic entity id"
         );
 
-        let snapshot = store.snapshot().expect("snapshot");
-        let blob: Blob<SimpleArchive> = snapshot.get(handle).expect("read descriptor blob");
-        assert_eq!(blob.bytes.len(), 256, "four tribles at 64 bytes each");
-
-        let decoded = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob)
-            .expect("decode descriptor");
+        let expected_name: Inline<triblespace_core::inline::encodings::hash::Handle<UTF8String>> =
+            "inspected".to_owned().to_blob().get_handle();
         assert_eq!(descriptor::name(&decoded).unwrap().unwrap(), expected_name);
-        assert_eq!(descriptor::authority(&decoded).unwrap(), authority);
+        assert_eq!(descriptor::policy(&decoded).unwrap(), policy);
         assert_eq!(
             descriptor::representation(&decoded).unwrap(),
             representation
@@ -1019,13 +1066,13 @@ mod tests {
         let facts: TribleSet = snapshot
             .get::<TribleSet, SimpleArchive>(handle)
             .expect("unarchive descriptor");
-        assert_eq!(facts.len(), 4);
+        assert_eq!(blob.bytes.len(), facts.len() * 64);
         let entities: BTreeSet<Id> = facts.iter().map(|t| *t.e()).collect();
-        assert_eq!(
-            entities,
-            BTreeSet::from([entity_id]),
-            "all descriptor tribles hang off one intrinsic entity"
+        assert!(
+            entities.contains(&entity_id),
+            "descriptor entity remains directly queryable among embedded policy descriptions"
         );
+        assert!(entities.len() > 1, "policy entities are self-contained");
 
         assert!(matches!(
             anchor(&Fields::load(&snapshot, handle)),
@@ -1103,16 +1150,12 @@ mod tests {
     /// Build one descriptor's decoded fields the way `list` sees them.
     fn root(name: &str, authority_seed: u8) -> Fields {
         let authority = SigningKey::from_bytes(&[authority_seed; 32]).verifying_key();
-        Fields::Decoded {
-            facts: descriptor::naming(
-                name,
-                authority,
-                <SimpleArchive as MetaDescribe>::id(),
-                reach::private(),
-            )
-            .into_facts(),
-            name: Ok(Some(name.to_owned())),
-        }
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(name, direct_policy(authority))
+            .expect("register fixture collection");
+        let snapshot = store.snapshot().expect("snapshot fixture store");
+        Fields::load(&snapshot, collection.handle())
     }
 
     fn anchorless(facts: TribleSet) -> Fields {
@@ -1164,10 +1207,10 @@ mod tests {
         assert_eq!(resolve(&rows, "wiki").unwrap(), rows[1].handle);
     }
 
-    /// A name is scoped by descriptor authority, so two authorities may both
-    /// have a `wiki`. Lookup must not paper that over with a first match.
+    /// Policy participates in descriptor identity, so two collections may
+    /// both have a `wiki`. Lookup must not paper that over with a first match.
     #[test]
-    fn a_name_shared_by_two_authorities_refuses_to_resolve() {
+    fn a_name_shared_by_two_policies_refuses_to_resolve() {
         let rows = vec![row(3, root("wiki", 7)), row(5, root("wiki", 9))];
         let err = resolve(&rows, "wiki").expect_err("ambiguous");
         let text = err.to_string();

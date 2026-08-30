@@ -31,10 +31,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   order; and `team join` verifies both completely before its first append-only
   store write. The artifact marker was minted with `trible genid` as
   `888807EA9891D3187A83408578CDD21B`.
-- Split legacy branch migration naming from admission: `--namespace` now only
-  names the target, omission of `--authority` selects explicit open admission,
-  and controlled targets consume one exact native WRITE proof plus its named
-  claims. An authority-root signer may bootstrap and store its own root proof.
+- Port legacy branch migration and collection inspection to immutable,
+  independent READ and WRITE policies. `--authority` is the direct root of
+  both policies (defaulting to the signer); migration validates before target
+  registration and preserves the exact legacy data, metadata, and entity ids.
 - Use direct proof IDs throughout `team create`, `invite`, `join`, and `show`.
   Keyless claims hold semantic restrictions, native `K0 (S C K)+` proofs hold
   principal delegation, and invites carry the complete bounded proof bundle.

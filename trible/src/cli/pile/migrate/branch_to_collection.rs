@@ -16,9 +16,9 @@ use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::collection::reach;
-use triblespace_core::collection::simplearchive_union::{self, PreparedCollectionCommit};
-use triblespace_core::collection::{Collection, CollectionCommit, CollectionStoreExt};
+use triblespace_core::collection::{
+    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionStoreExt,
+};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::shortstring::ShortString;
@@ -26,12 +26,16 @@ use triblespace_core::inline::{Inline, InlineEncoding, TryFromInline};
 use triblespace_core::metadata;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{self, BlobStoreGet, CommitHandle, PinSnapshotSource, SnapshotSource};
-use triblespace_core::trible::TribleSet;
+use triblespace_core::trible::{Fragment, TribleSet};
 
 use super::super::signing::load_signing_key;
 
 type ArchiveHandle = Inline<Handle<SimpleArchive>>;
 type NameHandle = Inline<Handle<UTF8String>>;
+
+fn private_policy(root: VerifyingKey) -> CollectionPolicy {
+    CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MigrationReport {
@@ -96,31 +100,23 @@ fn migrate(
     let snapshot = pile.snapshot().context("snapshot legacy pile")?;
     let (branch, branch_meta) = resolve_branch(&snapshot, &pins, branch_reference)?;
     let head = validate_branch_head(&snapshot, branch, &branch_meta)?;
-    // Migrated history stays put. A legacy branch carried no notion of reach,
-    // so declaring one here would be inventing a decision on the user's behalf
-    // about data they wrote before the question existed. Publishing migrated
-    // material stays a deliberate re-commit into a private named collection.
-    let descriptor = simplearchive_union::descriptor(name, authority, reach::private());
     let (reachable, contentless_merges, prepared) = match head {
-        Some(head) => prepare_reachable(&snapshot, head, &descriptor)?,
+        Some(head) => prepare_reachable(&snapshot, head)?,
         None => (0, 0, Vec::new()),
     };
     let authored = prepared.len();
 
-    // Preparation above performs no I/O. Register the complete descriptor
-    // closure only after every reachable legacy node has passed validation;
-    // local publication deliberately performs no admission check.
+    // Preparation above performs no I/O. Register the target only after every
+    // reachable legacy node has passed validation. The legacy branch had no
+    // READ/WRITE split, so the selected trust root controls both actions.
     let collection = pile
-        .collection(descriptor)
+        .collection(name, private_policy(authority))
         .map_err(|error| anyhow!("register target collection: {error}"))?;
     let mut mappings = Vec::with_capacity(authored);
-    for (source, prepared) in prepared {
-        let staged = prepared
-            .stage_for(pile, collection.handle(), signer)
-            .map_err(|error| anyhow!("stage native collection commit: {error}"))?;
-        let commit = staged
-            .finalize()
-            .map_err(|error| anyhow!("finalize native collection commit: {error}"))?;
+    for (source, fragment) in prepared {
+        let commit = pile
+            .commit(collection, signer, fragment)
+            .map_err(|error| anyhow!("publish native collection commit: {error}"))?;
         mappings.push((source, commit));
     }
     mappings.sort_unstable_by_key(|(source, _)| source.raw);
@@ -244,8 +240,7 @@ fn validate_branch_head(
 fn prepare_reachable(
     snapshot: &PileSnapshot,
     head: CommitHandle,
-    descriptor: &triblespace_core::trible::Fragment,
-) -> Result<(usize, usize, Vec<(CommitHandle, PreparedCollectionCommit)>)> {
+) -> Result<(usize, usize, Vec<(CommitHandle, Fragment)>)> {
     let empty_metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
     // Pile reads verify each content address. A reference cycle would require
     // a BLAKE3 fixed point or collision, so set reachability needs no separate
@@ -293,9 +288,21 @@ fn prepare_reachable(
                 Some(handle) => read_blob(snapshot, handle, "legacy commit metadata archive")?,
                 None => empty_metadata.clone(),
             };
-            let commit = simplearchive_union::prepare_commit(descriptor, &data, &metadata)
-                .map_err(|error| anyhow!("prepare native collection commit: {error}"))?;
-            prepared.push((handle, commit));
+            let facts = data
+                .clone()
+                .try_from_blob()
+                .with_context(|| format!("decode legacy commit content {}", handle_hex(handle)))?;
+            let metafacts = metadata
+                .clone()
+                .try_from_blob()
+                .with_context(|| format!("decode legacy commit metadata {}", handle_hex(handle)))?;
+            // Re-wrapping canonical fact sets does not mint or substitute any
+            // entity id. `commit` serializes these exact sets back to the same
+            // data and metadata handles while signing the native record.
+            prepared.push((
+                handle,
+                Fragment::from_parts(facts, metafacts, Default::default()),
+            ));
         } else {
             validate_contentless_merge(&facts, subject, handle, &parents)?;
             contentless_merges += 1;
@@ -464,20 +471,6 @@ mod tests {
         Inline::new(raw)
     }
 
-    fn target_descriptor(
-        name: &str,
-        authority: VerifyingKey,
-    ) -> triblespace_core::trible::Fragment {
-        simplearchive_union::descriptor(name, authority, reach::private())
-    }
-
-    fn target_handle(name: &str, authority: VerifyingKey) -> ArchiveHandle {
-        target_descriptor(name, authority)
-            .into_facts()
-            .to_blob()
-            .get_handle()
-    }
-
     fn authored_wrapper(
         author: &SigningKey,
         parents: impl IntoIterator<Item = CommitHandle>,
@@ -562,7 +555,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(fs::metadata(&path)?.len(), first_len);
-        let target = target_handle(name, authority);
+        let target = collection.handle();
         let snapshot = pile.snapshot()?;
         assert_eq!(
             snapshot
@@ -631,22 +624,19 @@ mod tests {
 
         let collection_name = "empty-preserved";
         let signer = key(11);
-        let descriptor = target_descriptor(collection_name, signer.verifying_key());
         let snapshot = pile.snapshot()?;
-        let (reachable, contentless_merges, prepared) =
-            prepare_reachable(&snapshot, merge_commit, &descriptor)?;
+        let (reachable, contentless_merges, prepared) = prepare_reachable(&snapshot, merge_commit)?;
 
         assert_eq!(reachable, 3);
         assert_eq!(contentless_merges, 1);
         assert_eq!(prepared.len(), 2);
-        let collection = pile.collection(descriptor)?;
+        let collection =
+            pile.collection(collection_name, private_policy(signer.verifying_key()))?;
         let mut mappings = Vec::new();
-        for (source, prepared) in prepared {
-            let target = prepared
-                .stage_for(&mut pile, collection.handle(), &signer)
-                .map_err(|error| anyhow!("stage test migration: {error}"))?
-                .finalize()
-                .map_err(|error| anyhow!("finalize test migration: {error}"))?;
+        for (source, fragment) in prepared {
+            let target = pile
+                .commit(collection, &signer, fragment)
+                .map_err(|error| anyhow!("publish test migration: {error}"))?;
             mappings.push((source, target));
         }
 
@@ -732,12 +722,7 @@ mod tests {
             one_value(&wrapper, subject, &repo::content, "content")?,
             Some(content_handle)
         );
-        let descriptor = simplearchive_union::descriptor(
-            "random-subject",
-            key(14).verifying_key(),
-            reach::private(),
-        );
-        let (reachable, merges, prepared) = prepare_reachable(&snapshot, handle, &descriptor)?;
+        let (reachable, merges, prepared) = prepare_reachable(&snapshot, handle)?;
         assert_eq!((reachable, merges, prepared.len()), (1, 0, 1));
         pile.close()?;
         Ok(())
@@ -769,10 +754,8 @@ mod tests {
         .into_facts();
         let wrapper = pile.put::<SimpleArchive, _>(wrapper)?;
 
-        let descriptor =
-            simplearchive_union::descriptor("target", key(6).verifying_key(), reach::private());
         let snapshot = pile.snapshot()?;
-        let error = prepare_reachable(&snapshot, wrapper, &descriptor)
+        let error = prepare_reachable(&snapshot, wrapper)
             .expect_err("bad authored signature must reject the whole migration");
         assert!(error.to_string().contains("invalid content signature"));
         assert!(snapshot

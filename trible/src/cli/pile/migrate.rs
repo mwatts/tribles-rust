@@ -42,9 +42,9 @@ pub enum Command {
     /// This is deliberately a same-pile migration: one frozen pin observation
     /// selects the head, a later append-only blob snapshot validates everything
     /// it reaches, and only then are native records appended to that pile. The
-    /// target authority defaults to the migration signer. Choosing a different
-    /// authority is allowed, but admission of the resulting commits then needs
-    /// a resident proof granting the signer exact WRITE access to the
+    /// target policy root defaults to the migration signer. Choosing a
+    /// different root is allowed, but admission of the resulting commits then
+    /// needs a resident proof granting the signer exact WRITE access to the
     /// collection.
     BranchToCollection {
         /// Legacy branch to migrate, by exact name or 32-hex-character id.
@@ -53,7 +53,7 @@ pub enum Command {
         /// Immutable name of the target root collection.
         #[arg(long)]
         collection_name: String,
-        /// Capability trust root. Defaults to the migration signer.
+        /// Root for both target READ and WRITE policies. Defaults to the signer.
         #[arg(long)]
         authority: Option<String>,
         /// Durable target signing-key file (64-hex-character seed).

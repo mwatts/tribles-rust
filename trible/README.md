@@ -76,19 +76,18 @@ Legacy piles can be migrated directly into native collections:
 trible pile migrate <PILE> branch-to-collection \
   --branch <LEGACY_BRANCH> \
   --collection-name <NAME> \
-  --namespace <PUBLIC_KEY> \
+  [--authority <TRUST_ROOT>] \
   --signing-key <KEY_PATH>
 ```
 
 This is an explicit compatibility operation over an immutable legacy pin
-snapshot. `--namespace` names the target but grants no authority; omission of
-authorization flags selects explicitly open admission. For controlled
-admission, pass `--authority <TRUST_ROOT> --proof <PROOF_ID>`. The exact native
-proof and its named claim blobs must prove WRITE/Invoke for the signing key and
-target before target bytes are staged. The proof may be omitted only when the
-signing key is the authority root, in which case the command mints, stores, and
-prints the exact root proof. The current CLI does not create, advance, merge,
-or delete branches.
+snapshot. `--authority` selects the direct trust root for both the target's
+READ and WRITE policies and defaults to the migration signer. Choosing another
+root does not block local publication, but the resulting commits remain
+inadmissible until the pile contains an exact WRITE proof for their signer.
+The command validates the full frozen legacy closure before registering the
+target, preserves every existing fact and metadata entity id, and does not
+create, advance, merge, or delete branches.
 
 `seed-artifact-offers` is deliberately outside the schema-migration `run`
 sequence. It is an operator policy choice, not a format repair: strictly
@@ -111,15 +110,14 @@ garbage-collection root.
 #### Collections
 
 A collection is identified by the blake3 handle of its canonical descriptor
-blob — a `SimpleArchive` naming its root (`name` + public-key namespace) or
-derived source, mandatory local capability authority, representation, concrete
-mapping, and reach law, together with the encoding and mapping-algorithm
-descriptions.
+blob — a `SimpleArchive` naming its root or derived source, independent READ
+and WRITE admission policies, representation, and concrete mapping, together
+with the encoding and mapping-algorithm descriptions.
 `pile blob inspect` sees only the encoded blob; these subcommands decode it.
 
-- `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded namespace/source anchor, local authority, representation, and mapping algorithm (known representation and algorithm ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
+- `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded name/source anchor, READ and WRITE policies, representation, and mapping algorithm (known representation and algorithm ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
 - `pile collection show <PILE> <HANDLE>` — decode one descriptor, its anchor,
-  local authority, representation, mapping, reach law, and referencing record
+  READ and WRITE policies, representation, mapping, and referencing record
   counts. The handle is accepted with or without the `blake3:` prefix.
 
 ### Distributed pile sync
