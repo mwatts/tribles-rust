@@ -273,10 +273,11 @@ therefore first-arrival: one authorized provider may occupy the whole bounded
 directory until its leases expire. Principal fairness is intentionally outside
 this soft discovery primitive.
 
-A reader that already knows `c` performs iterative `FIND_NODE`, asks those
-replicas for the corresponding team-and-prefix directory, and sends the raw
-artifact handle in `PROVIDER_GET`. Each replica derives `r` itself and returns
-only providers whose live sorted prefix shard contains that exact key. Both the
+A reader that already knows `c` derives `r`, performs iterative `FIND_NODE`, and
+asks those replicas for the corresponding team-and-prefix directory by sending
+only `r` in `PROVIDER_GET`. The raw artifact handle is reserved for the final
+provider-facing `GET_BLOB`. Each replica returns only providers whose live
+sorted prefix shard contains that exact key. Both the
 candidate scan and result fan-out are bounded and rotate across calls without
 capping stored memberships. Because this is a soft directory, one lookup may
 return fewer hints (including none) under adversarially dense occupancy; it
@@ -366,7 +367,7 @@ compute reuse without weakening this boundary.
 ## Wire surface
 
 All direct operations use
-`PILE_SYNC_ALPN = "/triblespace/pile-sync/14"`. One QUIC stream carries one
+`PILE_SYNC_ALPN = "/triblespace/pile-sync/15"`. One QUIC stream carries one
 strictly framed operation:
 
 | Operation | Byte | Purpose |

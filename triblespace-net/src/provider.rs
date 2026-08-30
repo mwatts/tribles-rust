@@ -566,6 +566,30 @@ mod tests {
     }
 
     #[test]
+    fn directory_membership_is_addressed_by_provider_key_not_raw_artifact() {
+        let team = SigningKey::from_bytes(&[5; 32]).verifying_key();
+        let artifact = [6; 32];
+        let key = provider_key(team, artifact);
+        assert_ne!(key, artifact);
+        let build = ProviderCover::from_artifacts(team, [artifact]);
+        let shard = build.cover.iter().next().unwrap().1;
+        let candidate = ProviderShardCandidate::validate(
+            shard.prefix(),
+            shard.digest(),
+            shard.count(),
+            shard.keys().to_vec(),
+        )
+        .unwrap();
+        let provider = [7; 32];
+        let now = crate::clock::mono_now();
+        let mut directory = ProviderDirectory::default();
+        assert!(install(&mut directory, candidate, provider, now));
+
+        assert!(directory.get(artifact, now).is_empty());
+        assert_eq!(directory.get(key, now), vec![provider]);
+    }
+
+    #[test]
     fn a_large_offer_set_collapses_to_at_most_256_publication_units() {
         let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
         let build = ProviderCover::from_artifacts(

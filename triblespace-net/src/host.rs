@@ -2503,24 +2503,16 @@ impl<T: Transport> ProviderClient<T> {
         let targets = self
             .lookup_replicas(provider_prefix_key(self.team, key[0]))
             .await;
-        self.find(key, artifact, targets).await
+        self.find(key, targets).await
     }
 
-    async fn find(
-        &self,
-        key: ProviderKey,
-        artifact: ArtifactId,
-        targets: Vec<PeerId>,
-    ) -> Vec<PeerId> {
+    async fn find(&self, key: ProviderKey, targets: Vec<PeerId>) -> Vec<PeerId> {
         let mut replies = futures::stream::iter(targets)
             .map(|target| async move {
                 (
                     target,
-                    tokio::time::timeout(
-                        PROVIDER_CONTROL_RPC_DEADLINE,
-                        self.get(target, key, artifact),
-                    )
-                    .await,
+                    tokio::time::timeout(PROVIDER_CONTROL_RPC_DEADLINE, self.get(target, key))
+                        .await,
                 )
             })
             .buffer_unordered(ALPHA);
@@ -2539,7 +2531,7 @@ impl<T: Transport> ProviderClient<T> {
         interleave_provider_replies(replies_by_replica)
     }
 
-    async fn get(&self, target: PeerId, key: ProviderKey, artifact: ArtifactId) -> Vec<PeerId> {
+    async fn get(&self, target: PeerId, key: ProviderKey) -> Vec<PeerId> {
         if target == self.my_id {
             return self
                 .providers
@@ -2568,8 +2560,7 @@ impl<T: Transport> ProviderClient<T> {
             .lock()
             .unwrap()
             .promote_authenticated(target);
-        match tokio::time::timeout(OP_DEADLINE, op_provider_get(connection.conn(), &artifact)).await
-        {
+        match tokio::time::timeout(OP_DEADLINE, op_provider_get(connection.conn(), &key)).await {
             Ok(Ok(providers)) => providers,
             Ok(Err(error)) => {
                 debug!(peer = %hex::encode(&target[..4]), %error, "provider GET failed");
@@ -2825,9 +2816,8 @@ impl SnapshotHandler {
                 .await?;
             }
             OP_PROVIDER_GET => {
-                let session = current_inventory_session(&authorization)?;
-                let artifact = recv_provider_artifact(recv).await?;
-                let key = provider_key(session.team(), artifact);
+                let _session = current_inventory_session(&authorization)?;
+                let key = recv_provider_key(recv).await?;
                 let providers = self
                     .providers
                     .lock()
@@ -3054,12 +3044,12 @@ async fn require_stream_eof<R: tokio::io::AsyncRead + Unpin>(recv: &mut R) -> an
     Ok(())
 }
 
-async fn recv_provider_artifact<R: tokio::io::AsyncRead + Unpin>(
+async fn recv_provider_key<R: tokio::io::AsyncRead + Unpin>(
     recv: &mut R,
-) -> anyhow::Result<ArtifactId> {
-    let artifact = recv_hash(recv).await?;
+) -> anyhow::Result<ProviderKey> {
+    let key = recv_hash(recv).await?;
     require_stream_eof(recv).await?;
-    Ok(artifact)
+    Ok(key)
 }
 
 async fn recv_provider_probe<R: tokio::io::AsyncRead + Unpin>(
@@ -3987,19 +3977,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_request_has_no_forgeable_provider_field() {
+    async fn provider_request_is_one_exact_derived_key_without_a_provider_field() {
+        let team = SigningKey::from_bytes(&[6; 32]).verifying_key();
         let artifact = [7; 32];
+        let key = provider_key(team, artifact);
+        assert_ne!(key, artifact);
         let (mut send, mut recv) = tokio::io::duplex(64);
-        send.write_all(&artifact).await.unwrap();
+        send.write_all(&key).await.unwrap();
         send.shutdown().await.unwrap();
-        assert_eq!(recv_provider_artifact(&mut recv).await.unwrap(), artifact);
+        assert_eq!(recv_provider_key(&mut recv).await.unwrap(), key);
 
         let (mut send, mut recv) = tokio::io::duplex(64);
-        send.write_all(&artifact).await.unwrap();
+        send.write_all(&key).await.unwrap();
         send.write_all(&[8; 32]).await.unwrap();
         send.shutdown().await.unwrap();
         assert!(
-            recv_provider_artifact(&mut recv).await.is_err(),
+            recv_provider_key(&mut recv).await.is_err(),
             "an appended claimed provider identity must invalidate the request"
         );
     }

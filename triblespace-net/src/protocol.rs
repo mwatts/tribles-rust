@@ -15,7 +15,7 @@
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   PROVIDER_PROBE prefix:u8 digest:32 count:u32 → KNOWN/NEED/FULL
 //!   PROVIDER_BODY prefix:u8 digest:32 count:u32 keys:[32; count] → OK/FULL
-//!   PROVIDER_GET artifact:32 → count:u8 provider:[32; count]
+//!   PROVIDER_GET key:32 → count:u8 provider:[32; count]
 //!   FIND_NODE target:32 → count:u8 peer:[32; count]
 //!   INVENTORY_AUTH, MANIFEST, NODE, and BLOB_RANGE are defined by
 //!   `inventory_wire`; they form the bounded SYNC_TEAM-authorized Merkle walk.
@@ -33,7 +33,7 @@
 //! Provider-cover writes bind the TLS-authenticated caller to receiver-local
 //! prefix-shard leases and never accept a claimed provider identity.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/14";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/15";
 
 use ed25519_dalek::VerifyingKey;
 use hifitime::Epoch;
@@ -346,11 +346,14 @@ pub(crate) async fn op_provider_body<C: Conn>(
     Ok(stored)
 }
 
-/// PROVIDER_GET: return the receiver's bounded live provider hints.
-pub async fn op_provider_get<C: Conn>(conn: &C, artifact: &RawHash) -> Result<Vec<[u8; 32]>> {
+/// PROVIDER_GET: return bounded live hints for one derived provider key.
+///
+/// The raw artifact handle is deliberately absent from this directory request.
+/// It is disclosed only to an actual provider in [`op_get_blob`].
+pub async fn op_provider_get<C: Conn>(conn: &C, key: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_PROVIDER_GET).await?;
-    send_hash(&mut send, artifact).await?;
+    send_hash(&mut send, key).await?;
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let count = recv_u8(&mut recv).await? as usize;
@@ -435,6 +438,8 @@ async fn recv_blob_response<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option
 
 #[cfg(test)]
 mod bounds_tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
@@ -480,6 +485,40 @@ mod bounds_tests {
             .unwrap();
 
         (root, peer, leaf_bundle)
+    }
+
+    #[derive(Clone)]
+    struct CapturingProviderGetConn {
+        request: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl Conn for CapturingProviderGetConn {
+        type SendHalf = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+        type RecvHalf = tokio::io::ReadHalf<tokio::io::DuplexStream>;
+
+        fn remote_id(&self) -> crate::transport::PeerId {
+            [0; 32]
+        }
+
+        async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
+            let (client, mut server) = tokio::io::duplex(128);
+            let request = self.request.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                server.read_to_end(&mut bytes).await.unwrap();
+                *request.lock().unwrap() = Some(bytes);
+                server.write_all(&[0]).await.unwrap();
+                server.shutdown().await.unwrap();
+            });
+            let (recv, send) = tokio::io::split(client);
+            Ok((send, recv))
+        }
+
+        async fn accept_bi(&self) -> Option<(Self::SendHalf, Self::RecvHalf)> {
+            None
+        }
+
+        fn close(&self, _code: u32, _reason: &[u8]) {}
     }
 
     fn one_step_bundle(
@@ -709,6 +748,25 @@ mod bounds_tests {
         bytes.extend_from_slice(&payload);
         let mut input = bytes.as_slice();
         assert_eq!(recv_blob_response(&mut input).await.unwrap(), Some(payload));
+    }
+
+    #[tokio::test]
+    async fn provider_get_wire_carries_the_derived_key_not_the_bearer_handle() {
+        let team = SigningKey::from_bytes(&[0xE1; 32]).verifying_key();
+        let artifact = [0xE2; 32];
+        let key = crate::provider::provider_key(team, artifact);
+        assert_ne!(key, artifact);
+        let request = Arc::new(Mutex::new(None));
+        let conn = CapturingProviderGetConn {
+            request: request.clone(),
+        };
+
+        assert!(op_provider_get(&conn, &key).await.unwrap().is_empty());
+        let request = request.lock().unwrap().take().unwrap();
+        assert_eq!(request.len(), 1 + key.len());
+        assert_eq!(request[0], OP_PROVIDER_GET);
+        assert_eq!(&request[1..], &key);
+        assert_ne!(&request[1..], &artifact);
     }
 
     #[tokio::test]
