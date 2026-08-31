@@ -342,15 +342,15 @@ impl SuccinctArchiveBlob {
     }
 }
 
-/// Persisted Rank9/select accelerator for one exact [`SuccinctArchiveBlob`].
+/// Complete Rank9-accelerated Merkle encoding of one [`SuccinctArchiveBlob`].
 ///
 /// The first 32 bytes are the source archive's content handle. Keeping that
 /// dependency at aligned offset zero makes ordinary blob reachability follow
 /// the accelerator to its raw archive without format-specific traversal code.
 /// The remaining bytes are native-ABI Rank9 payloads and their relative
-/// section table; unlike [`SuccinctArchiveBlob`], this representation is an
-/// explicitly replaceable accelerator rather than part of the archive's
-/// content identity.
+/// section table. The root's identity covers both parts through the child
+/// handle; a different ABI may reproducibly derive its own complete root for
+/// the same logical set.
 pub struct Rank9AcceleratedSuccinctArchiveBlob;
 
 impl BlobEncoding for Rank9AcceleratedSuccinctArchiveBlob {}

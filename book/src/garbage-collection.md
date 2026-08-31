@@ -57,11 +57,11 @@ roots have no direct `MERGE`. If policy retains the accelerated root, ordinary
 child traversal also retains its named raw child.
 
 Read-only materialization accepts only a complete resident source-bound member.
-Its cover-aware view loads the embedded raw child through its store snapshot, validates
-the exact raw/index pair, and then constructs a transient query runtime. Missing
-root or child bytes make that route nonresident, not semantically false. A later
-`ensure` finds or constructs a usable raw route, stores the selected raw
-source before its accelerated target, and inserts the ordinary `DERIVE` record
+Its cover-aware view loads the embedded raw child through its store snapshot,
+validates the exact raw/index pair, and then constructs a transient query
+runtime. A missing root is not a resident route; a selected root with a missing
+child is rejected by the typed view. Normal `ensure` publication stores the raw
+source before its accelerated target and inserts the ordinary `DERIVE` record
 last. No accelerator-specific retention relation or hidden root is involved.
 
 The resulting roots compose with both storage paths. Yard's `collect` and

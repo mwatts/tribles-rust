@@ -7,12 +7,14 @@
 //!                --DERIVE--> Rank9AcceleratedSuccinctArchiveBlob
 //! ```
 //!
-//! Both stages use the same exact-cover resolver and ordinary `DERIVE`
-//! records. Raw SuccinctArchive members own the directly materialized `MERGE`;
-//! every accelerated member is instead the exact image of one raw member. The
-//! accelerated encoding is an ordinary blob whose header names its portable
-//! raw source. Attaching it resolves that source and constructs the query
-//! runtime without a sidecar record family or wrapper artifact.
+//! Both stages use the same cover resolver and ordinary collection equations.
+//! Raw SuccinctArchive members own the directly materialized `MERGE`; the
+//! accelerated lattice obtains the corresponding union by deriving the merged
+//! raw member. This is deliberately two ordinary operations rather than one
+//! multi-output construction. The accelerated encoding is an ordinary blob
+//! whose header names its portable raw source. Attaching it resolves that
+//! source and constructs the query runtime without a sidecar record family or
+//! wrapper artifact.
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -429,7 +431,7 @@ impl SuccinctArchiveView {
         let accelerated = self
             .collection
             .rank9_derivation()?
-            .ensure_member_images(store, &raw_cover)?;
+            .ensure(store, &raw_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
@@ -482,9 +484,7 @@ impl SuccinctArchiveCollection {
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let raw_cover = self.raw_kernel()?.attach(store, source_cover)?;
-        let accelerated = self
-            .rank9_derivation()?
-            .attach_member_images(store, &raw_cover)?;
+        let accelerated = self.rank9_derivation()?.attach(store, &raw_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
@@ -502,9 +502,7 @@ impl SuccinctArchiveCollection {
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let raw_cover = self.raw_kernel()?.ensure(store, source_cover)?;
-        let accelerated = self
-            .rank9_derivation()?
-            .ensure_member_images(store, &raw_cover)?;
+        let accelerated = self.rank9_derivation()?.ensure(store, &raw_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
@@ -543,7 +541,7 @@ mod tests {
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobStorePut, SnapshotSource};
+    use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     use super::super::RawToRank9AcceleratedMapping;
@@ -678,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn ensuring_raw_constructs_the_exact_accelerated_image() {
+    fn ensuring_raw_derives_the_accelerated_union_image() {
         let mut store = MemoryRepo::default();
         let facade = facade(&mut store);
         let a: Blob<SimpleArchive> = [row(1, 2, 3)].into_iter().collect::<TribleSet>().to_blob();
@@ -701,7 +699,7 @@ mod tests {
         facade
             .rank9_derivation()
             .unwrap()
-            .ensure_member_images(&mut store, &raw)
+            .ensure(&mut store, &raw)
             .unwrap();
 
         let archive = facade.ensure(&mut store, &cover).unwrap();
@@ -724,12 +722,31 @@ mod tests {
                 _ => None,
             })
             .expect("raw compaction published a MERGE");
-        assert!(records.iter().any(|record| matches!(
-            record,
-            CollectionRecord::Derive(derive)
-                if derive.collection() == facade.collection().handle()
-                    && derive.input() == compacted_raw
-        )));
+        let accelerated = records
+            .iter()
+            .find_map(|record| match record {
+                CollectionRecord::Derive(derive)
+                    if derive.collection() == facade.collection().handle()
+                        && derive.input() == compacted_raw =>
+                {
+                    Some(derive.output())
+                }
+                _ => None,
+            })
+            .expect("accelerated derivation consumed the raw union");
+        let raw_handle = Handle::<SuccinctArchiveBlob>::from_hash(compacted_raw);
+        snapshot
+            .get::<Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(raw_handle)
+            .expect("raw union remains resident");
+        let accelerated_handle =
+            Handle::<Rank9AcceleratedSuccinctArchiveBlob>::from_hash(accelerated);
+        let accelerated_root = snapshot
+            .get::<Blob<Rank9AcceleratedSuccinctArchiveBlob>, _>(accelerated_handle)
+            .expect("accelerated union remains resident");
+        assert_eq!(
+            Rank9AcceleratedSuccinctArchiveBlob::source_handle(&accelerated_root).unwrap(),
+            raw_handle,
+        );
         assert!(!records.iter().any(|record| matches!(
             record,
             CollectionRecord::Merge(merge)
@@ -738,7 +755,85 @@ mod tests {
     }
 
     #[test]
-    fn exact_acceleration_does_not_replace_named_raw_members_with_their_union() {
+    fn rank9_ensure_derives_a_resident_raw_union_without_an_accelerated_merge() {
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
+        let a = raw([row(1, 2, 3)]);
+        let b = raw([row(4, 5, 6)]);
+        let c = super::super::join(&a, &b).unwrap();
+        let a_data = Handle::<SuccinctArchiveBlob>::to_hash(a.get_handle());
+        let b_data = Handle::<SuccinctArchiveBlob>::to_hash(b.get_handle());
+        let c_data = Handle::<SuccinctArchiveBlob>::to_hash(c.get_handle());
+        let fa = accelerated(&a);
+        let fb = accelerated(&b);
+        let fa_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fa.get_handle());
+        let fb_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fb.get_handle());
+
+        for member in [a, b, c] {
+            store.put::<SuccinctArchiveBlob, _>(member).unwrap();
+        }
+        for member in [fa, fb] {
+            store
+                .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(member)
+                .unwrap();
+        }
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                facade.raw_collection().handle(),
+                a_data,
+                b_data,
+                c_data,
+            )))
+            .unwrap();
+        for (input, output) in [(a_data, fa_data), (b_data, fb_data)] {
+            store
+                .insert(CollectionRecord::Derive(CollectionDerive::new(
+                    facade.collection().handle(),
+                    input,
+                    output,
+                )))
+                .unwrap();
+        }
+
+        let raw_cover = Cover::from_data(facade.raw_collection(), [c_data]);
+        let accelerated_cover = facade
+            .rank9_derivation()
+            .unwrap()
+            .ensure(&mut store, &raw_cover)
+            .unwrap();
+
+        assert_eq!(accelerated_cover.len(), 1);
+        let snapshot = store.snapshot().unwrap();
+        let records = snapshot
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let derived_c = records
+            .iter()
+            .find_map(|record| match record {
+                CollectionRecord::Derive(derive)
+                    if derive.collection() == facade.collection().handle()
+                        && derive.input() == c_data =>
+                {
+                    Some(derive.output())
+                }
+                _ => None,
+            })
+            .expect("resident raw union was derived");
+        assert_eq!(
+            accelerated_cover.data_members().collect::<Vec<_>>(),
+            vec![derived_c],
+        );
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            CollectionRecord::Merge(merge)
+                if merge.collection() == facade.collection().handle()
+        )));
+    }
+
+    #[test]
+    fn rank9_attach_accepts_a_support_equivalent_union_image() {
         let mut store = MemoryRepo::default();
         let facade = facade(&mut store);
         let a = raw([row(1, 2, 3)]);
@@ -776,40 +871,14 @@ mod tests {
         let attached = facade
             .rank9_derivation()
             .unwrap()
-            .ensure_member_images(&mut store, &raw_cover)
+            .attach(&mut store, &raw_cover)
             .unwrap();
 
-        let mut actual = attached.data_members().collect::<Vec<_>>();
-        let mut expected = [a, b]
-            .iter()
-            .map(|raw| {
-                let root = accelerated(raw);
-                Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(root.get_handle())
-            })
-            .collect::<Vec<_>>();
-        actual.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(actual, expected);
-        assert!(!actual.contains(&fc_data));
-
-        let snapshot = store.snapshot().unwrap();
-        let records = snapshot
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        for input in [a_data, b_data] {
-            assert!(records.iter().any(|record| matches!(
-                record,
-                CollectionRecord::Derive(derive)
-                    if derive.collection() == facade.collection().handle()
-                        && derive.input() == input
-            )));
-        }
+        assert_eq!(attached.data_members().collect::<Vec<_>>(), vec![fc_data]);
     }
 
     #[test]
-    fn accelerated_root_without_raw_child_is_not_resident() {
+    fn accelerated_member_validation_rejects_a_missing_raw_child() {
         let raw = raw([row(1, 2, 3)]);
         let root = accelerated(&raw);
         let mut store = MemoryRepo::default();

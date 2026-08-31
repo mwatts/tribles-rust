@@ -30,17 +30,10 @@ type BoxError = Box<dyn Error + Send + Sync + 'static>;
 type MappingSource<M> = <M as CollectionMapping>::Source;
 type MappingTarget<M> = <M as CollectionMapping>::Target;
 
-#[derive(Clone, Copy)]
-enum SourceRoute {
-    SupportEquivalent,
-    ExactMembers,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ProbeScope {
     Direct,
     SupportEquivalent,
-    ExactMembers,
 }
 
 pub(super) type TargetMergePair = (CollectionData, CollectionData);
@@ -318,24 +311,23 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        self.attach_with_route(store, source_cover, SourceRoute::SupportEquivalent)
-    }
-
-    /// Attach only images of the exact physical source members.
-    ///
-    /// This is crate-private because it is a mapping law, not a caller tuning
-    /// knob. Source-bound encodings such as Rank9 acceleration use it when an
-    /// equal-support decomposition is not the same physical input cover.
-    pub(crate) fn attach_member_images<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        self.attach_with_route(store, source_cover, SourceRoute::ExactMembers)
+        self.require_source_cover(source_cover)?;
+        if source_cover.is_empty() {
+            return Ok(Cover::from_members(self.target_collection, []));
+        }
+        let blocked_target_merges = BTreeMap::new();
+        let blocked_sources = BTreeMap::new();
+        let probe = self.probe(
+            store,
+            source_cover,
+            false,
+            &blocked_sources,
+            &blocked_target_merges,
+        )?;
+        if !probe.is_complete() {
+            return Err(probe.incomplete_error());
+        }
+        Ok(probe.into_target_cover())
     }
 
     /// Ensure the deterministic maintained target cover.
@@ -373,28 +365,13 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        self.ensure_with_route(store, source_cover, SourceRoute::SupportEquivalent, blocks)
+        self.ensure_with_blocks(store, source_cover, blocks)
     }
 
-    /// Ensure one target image for every exact physical source member.
-    pub(crate) fn ensure_member_images<S>(
+    fn ensure_with_blocks<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let mut blocks = ExactPlannerBlocks::default();
-        self.ensure_with_route(store, source_cover, SourceRoute::ExactMembers, &mut blocks)
-    }
-
-    fn ensure_with_route<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        route: SourceRoute,
         blocks: &mut ExactPlannerBlocks,
     ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
@@ -410,23 +387,13 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         let mut published_source_derives = BTreeSet::<CollectionData>::new();
 
         loop {
-            let probe = match route {
-                SourceRoute::SupportEquivalent => self.probe(
-                    store,
-                    source_cover,
-                    true,
-                    &blocks.sources,
-                    &blocks.target_merges,
-                )?,
-                SourceRoute::ExactMembers => self.probe_once(
-                    store,
-                    source_cover,
-                    true,
-                    ProbeScope::ExactMembers,
-                    &blocks.sources,
-                    &blocks.target_merges,
-                )?,
-            };
+            let probe = self.probe(
+                store,
+                source_cover,
+                true,
+                &blocks.sources,
+                &blocks.target_merges,
+            )?;
             if probe.is_complete() {
                 return Ok(probe.into_target_cover());
             }
@@ -682,7 +649,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
 
             match plan {
                 Ok(()) if published => continue,
-                Ok(()) => return self.attach_with_route(store, source_cover, route),
+                Ok(()) => return self.attach(store, source_cover),
                 Err(
                     ExactDerivedCollectionError::UnrepresentableCover { .. }
                     | ExactDerivedCollectionError::IncompleteCover { .. },
@@ -690,45 +657,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                 Err(error) => return Err(error),
             }
         }
-    }
-
-    fn attach_with_route<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        route: SourceRoute,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        self.require_source_cover(source_cover)?;
-        if source_cover.is_empty() {
-            return Ok(Cover::from_members(self.target_collection, []));
-        }
-        let blocked_target_merges = BTreeMap::new();
-        let blocked_sources = BTreeMap::new();
-        let probe = match route {
-            SourceRoute::SupportEquivalent => self.probe(
-                store,
-                source_cover,
-                false,
-                &blocked_sources,
-                &blocked_target_merges,
-            )?,
-            SourceRoute::ExactMembers => self.probe_once(
-                store,
-                source_cover,
-                false,
-                ProbeScope::ExactMembers,
-                &blocked_sources,
-                &blocked_target_merges,
-            )?,
-        };
-        if !probe.is_complete() {
-            return Err(probe.incomplete_error());
-        }
-        Ok(probe.into_target_cover())
     }
 
     fn probe<S>(
@@ -849,16 +777,13 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             |request| {
                 let verdict = match request {
                     CollectionValidationRequest::Merge { claim }
-                        if scope != ProbeScope::ExactMembers
-                            && (claim.collection() == self.source_collection.handle()
-                                || claim.collection() == self.target_collection.handle()) =>
+                        if claim.collection() == self.source_collection.handle()
+                            || claim.collection() == self.target_collection.handle() =>
                     {
                         CollectionClaimValidation::Accepted
                     }
                     CollectionValidationRequest::Derive { claim }
-                        if claim.collection() == self.target_collection.handle()
-                            && (scope != ProbeScope::ExactMembers
-                                || roots.contains(&claim.input())) =>
+                        if claim.collection() == self.target_collection.handle() =>
                     {
                         CollectionClaimValidation::Accepted
                     }
@@ -938,9 +863,8 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
 
         let semantically_complete =
             target_physical.missing.is_empty() && unsupported_members.is_empty();
-        let plan_preferences = plan_source_residual
-            && scope != ProbeScope::ExactMembers
-            && !(semantically_complete && target_physical.cover.len() <= 1);
+        let plan_preferences =
+            plan_source_residual && !(semantically_complete && target_physical.cover.len() <= 1);
         let source_resident =
             if plan_source_residual && (!semantically_complete || plan_preferences) {
                 let mut source_resident = BTreeSet::new();

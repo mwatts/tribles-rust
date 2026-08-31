@@ -210,7 +210,7 @@ impl MetaDescribe for RawToRank9AcceleratedMappingV1 {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "raw-to-rank9-accelerated-succinctarchive-v1",
-                metadata::description: "Canonical mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Compaction joins portable inputs first and then derives the exact source-bound accelerator, so no independent accelerated-side join is required.",
+                metadata::description: "Canonical join-homomorphic mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Construction first joins in the portable lattice and then derives the accelerated member as a separate ordinary operation.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }

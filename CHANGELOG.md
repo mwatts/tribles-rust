@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make Rank9 acceleration an ordinary second collection derivation. Raw
+  Succinct members are merged first and the resulting member is then derived
+  into one complete accelerated encoding; the exact-member side path is gone,
+  support-equivalent covers use the normal resolver, and no construction emits
+  raw and accelerated blobs together.
+
 - Rebuild every active Full-replica disclosure forest whenever resident blobs
   change. Exact H-only arrivals carry no collection provenance, so this
   conservative invalidation lets a newly resident Merkle child advance every
@@ -352,20 +358,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data work. Replay and derivation require no resident commit or metadata.
   collection admission, exact derivations, maintained Succinct views,
   paths, and network reuse now share this continuation type. Distinct covers
-  may have equal support through validated merges; route freedom or exact
-  immediate-input requirements belong to the input collection and mapping,
-  including Rank9's exact raw-Succinct input. For mappings with route freedom,
-  exact derivation can reverse-ground a compacted source member through freshly
-  validated `MERGE` inputs, so `{c}` may reuse resident `{f(a), f(b)}` when
-  `a join b = c`, while forged equations remain inert and fall back to direct
-  construction. Source-bound mappings use the same resolver in exact-member
-  mode: Rank9 acceleration always constructs `f(c)` for the precise raw member
-  `c`. The generic equivalence route also lets capacity replanning replace a
-  blocked compacted member with its resident lower shards. Resolution tries
-  the explicit Cover path first and widens into reverse decompositions only
-  when allowed and needed; unreadable optional inputs and incomplete Merkle
-  closures cannot poison an otherwise valid replay or turn speculative misses
-  into durable demand.
+  may have equal support through validated merges. Exact derivation can
+  reverse-ground a compacted source member through freshly validated `MERGE`
+  inputs, so `{c}` may reuse resident `{f(a), f(b)}` when `a join b = c`, while
+  forged equations remain inert and fall back to direct construction. Rank9
+  uses that same ordinary equivalence route: its facade first maintains the raw
+  Succinct cover and then derives the accelerated cover as a separate step.
+  The equivalence route also lets capacity replanning replace a blocked
+  compacted member with its resident lower shards. Resolution tries the
+  explicit Cover path first and widens into reverse decompositions only when
+  needed; unreadable optional inputs and incomplete Merkle closures cannot
+  poison an otherwise valid replay or turn speculative misses into durable
+  demand.
 
 - Port the remaining benchmark, path/network test, macro-instrumentation, and
   benchmark-ledger callers to the store-centric collection API with mandatory
@@ -844,8 +848,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle through its immutable store snapshot and validates the exact
   raw/index pair before constructing the query runtime. Exact derivation stores
   the selected raw source before its accelerated root and semantic record.
-  Incomplete roots are nonresident and `ensure` reconstructs them from a
-  usable source route rather than admitting partial state.
+  The typed view rejects an accelerated root whose named raw child is absent;
+  normal construction prevents that state by publishing source before target.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
   garbage collection. Descriptor-typed lattice methods validate fixed

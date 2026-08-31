@@ -312,8 +312,8 @@ let same_archive = succinct.attach(&mut storage, &cover)?;
 - `attach` is read-only, performs no collection algebra, and requires a
   complete resident physical cover.
 - `ensure` is the singular construction and maintenance path. It completes the
-  raw exact projection, deterministically carries colliding raw target members
-  by serialized-size tier, then ensures the matching accelerated cover and
+  raw projection, deterministically carries colliding raw target members by
+  serialized-size tier, then ensures a support-equivalent accelerated cover and
   returns its query view.
 
 At each target lattice node, `ensure` reuses the resident result first. If the
@@ -337,25 +337,26 @@ Every position uses the same `Cover<E>` shape, but its typed handles cannot be
 mixed across representations. `Cover<SimpleArchive>` contains only
 `Handle<SimpleArchive>`; `Cover<SuccinctArchiveBlob>` contains only
 `Handle<SuccinctArchiveBlob>`; the second stage uses
-`Handle<Rank9AcceleratedSuccinctArchiveBlob>`. The target descriptor and its
-bound `CollectionMapping` determine route freedom. Ordinary raw
+`Handle<Rank9AcceleratedSuccinctArchiveBlob>`. Stored `MERGE` equations define
+support-equivalent routes; `Cover` carries no route-mode bit. Ordinary raw
 Succinct derivation follows the resident-node priority above while preserving
-support equal to the source cover. The accelerated stage maps the exact raw
-cover selected upstream. Its cover-aware view reads each embedded raw handle
-through the store snapshot and validates the exact raw/index pair before
-constructing the query runtime. Exactness is a property of the mapping, not a
-mode bit or an untyped hash convention.
+support equal to the source cover. The accelerated stage resolves the ordinary
+derived lattice over the raw cover selected upstream. Its cover-aware view
+reads each embedded raw handle through the store snapshot and validates the
+exact raw/index pair before constructing the query runtime. There is no
+separate member-image mode.
 
 None of them signs a replacement root, advances a head, flushes implicitly, or
 adds a special manifest. [Regular-path summaries](regular-path-indexes.md) and
 Rank9 acceleration both use the same collection algebra. The accelerated
 encoding is a Merkle root whose first 32 bytes name its exact portable raw
-child, but it does not define a direct Rank9 join. Raw Succinct members are
-joinable, so `ensure` maintains that upstream target lattice first and then
-derives the exact accelerated image of the selected raw cover. Derivation
+child, but it does not define a second physical Rank9 join. Raw Succinct members
+are joinable, and the raw-to-accelerated mapping is a join homomorphism, so
+`ensure` maintains that upstream lattice first and then derives an accelerated
+cover with the same support. Derivation
 stores the selected raw source before the accelerated root and ordinary
-`DERIVE` record. An incomplete source-bound member is merely a nonresident
-route which `ensure` can reconstruct.
+`DERIVE` record. The typed view rejects an accelerated member whose named raw
+child is unavailable.
 
 ## WANT missing content or computation
 

@@ -480,8 +480,9 @@ ordinary `DERIVE`. The raw Succinct collection owns the direct join; there is no
 Rank9 `MERGE`. The accelerated root's first 32 bytes name the raw child, so
 generic blob traversal can follow the dependency without a special pile index.
 Exact derivation stores the selected raw source before its accelerated root and
-then the semantic record. Collection resolution treats a missing root or child
-as nonresident and later construction may rebuild it.
+then the semantic record. Collection resolution requires the root to be
+resident; typed materialization additionally requires and validates its named
+raw child.
 The unpublished mapping-evidence record kind was clean-cutover removed after a
 scan found no live records requiring migration.
 

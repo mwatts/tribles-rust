@@ -3002,7 +3002,7 @@ fn discarded_merge_insert_stalls_instead_of_looping() {
 }
 
 #[test]
-fn discarded_batched_derive_insert_stalls_instead_of_looping() {
+fn discarded_derive_insert_stalls_after_the_first_unobserved_publication() {
     let sources = [archive([(1, 3)]), archive([(2, 4)])];
     let mut inner = MemoryRepo::default();
     let commits: Vec<_> = sources
@@ -3017,10 +3017,10 @@ fn discarded_batched_derive_insert_stalls_instead_of_looping() {
     };
 
     assert!(matches!(
-        kernel().ensure_member_images(&mut store, &source_cover),
+        kernel().ensure(&mut store, &source_cover),
         Err(ExactDerivedCollectionError::Stalled { cover }) if cover.is_empty()
     ));
-    assert_eq!(store.dropped_derives, 2);
+    assert_eq!(store.dropped_derives, 1);
 }
 
 #[test]

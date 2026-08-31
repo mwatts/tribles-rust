@@ -162,13 +162,16 @@ The crate also ships with these blob encodings:
   validation follows the embedded handle and requires the raw child to be
   resident. A cover-aware query view then loads that child through its store snapshot,
   validates the exact raw/index pair, and reconstructs the runtime. The raw
-  `SuccinctArchiveBlob` lattice owns canonical union; accelerated roots have no
-  direct join. `SuccinctArchiveCollection::ensure` therefore performs
-  deterministic size-tiered maintenance in the raw target lattice first and
-  maps the resulting exact cover through ordinary `DERIVE` records. Exact
-  derivation stores each selected raw source before its accelerated root and
-  semantic record. If a raw child is absent, the member is nonresident and can
-  be reconstructed from its source rather than treated as usable partial state.
+  `SuccinctArchiveBlob` encoding owns the directly materialized union.
+  `SuccinctArchiveCollection::ensure` therefore performs deterministic
+  size-tiered maintenance in the raw lattice first and maps that result through
+  ordinary `DERIVE` records. The accelerated collection has the same logical
+  join because the mapping is a join homomorphism: its physical construction is
+  `MERGE` in the raw lattice followed by `DERIVE`, not one operation that emits
+  both blobs. Ordinary support-equivalent cover resolution may reuse any
+  already-derived accelerated cover with the same foundation. Normal
+  construction stores the raw source before its accelerated image, and the
+  typed view rejects an image whose named raw child is unavailable.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 
@@ -178,8 +181,8 @@ typed `Blob`, the encoding owns canonical member validation, and it may expose
 one directly materializable join. Returning no direct join means that physical
 compaction belongs in another lattice; multi-member covers and logical views
 remain valid. `SimpleArchive` and `SuccinctArchiveBlob` are directly joinable,
-while `Rank9AcceleratedSuccinctArchiveBlob` is derived after raw-target
-maintenance.
+while `Rank9AcceleratedSuccinctArchiveBlob` realizes union by deriving after
+raw-target maintenance.
 Validation and joining share one immutable store snapshot, so Merkle-shaped
 encodings can resolve children named by their members without consulting
 ambient mutable state.

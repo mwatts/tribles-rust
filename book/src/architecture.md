@@ -213,10 +213,10 @@ Different target covers may denote the same join, and every lattice position
 uses the same `Cover<E>` shape while retaining its own typed member handles.
 Missing derived artifacts are cache misses, not missing facts.
 
-Route freedom belongs to the input collection expected by the mapping rather
-than to a flag on `Cover`: ordinary Succinct construction may reuse any
-resident equal-support route. Rank9 acceleration is another ordinary derived
-collection. Its members are ordinary
+`Cover` carries no route mode. The resolver checks its explicit members first
+and, only when needed, widens through stored `MERGE` equations to a resident
+equal-support route. Rank9 acceleration is another ordinary derived collection.
+Its members are ordinary
 `Blob<Rank9AcceleratedSuccinctArchiveBlob>` values whose first 32 bytes name the
 exact portable `SuccinctArchiveBlob` child carrying their source rows. The root
 and named child together are a complete source-bound accelerated encoding, not
@@ -232,8 +232,8 @@ source children rather than synthesized with a source `MERGE`. Every computed
 raw `MERGE` and cross-lattice `DERIVE` is persisted. A cover-aware view follows
 each embedded handle through its store snapshot, validates the exact raw/index
 pair, and only then builds the transient query runtime. A root whose raw child
-is absent is nonresident; ensuring reconstructs the exact accelerated image
-from that raw source.
+is absent is not a usable query value. Normal construction prevents that state
+by storing the raw source before its accelerated image and `DERIVE` record.
 
 ## WANT is operational, not semantic
 
