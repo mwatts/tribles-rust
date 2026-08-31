@@ -27,6 +27,7 @@ use crate::capability::{
     CapabilityProof, CapabilityProofBundle, CapabilityRequest, CapabilityResource,
 };
 use crate::clock;
+use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
@@ -178,24 +179,29 @@ where
     }
 }
 
-/// Failure to persist one root-issued, unbounded READ grant for a collection.
+/// Failure to persist one root-issued, unbounded collection grant.
 ///
-/// The operation validates the descriptor and its READ roots before writing
-/// anything. Claim blobs are then stored before the native proof record, so a
-/// failed or interrupted publication can only leave inert content behind.
+/// The operation validates the descriptor and the exact action roots before
+/// writing anything. Claim blobs are then stored before the native proof
+/// record, so a failed or interrupted publication can only leave inert content
+/// behind.
 #[derive(Debug)]
-pub enum CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError> {
+pub enum CollectionGrantError<SnapshotError, GetError, PutError, InsertError> {
     /// The store could not freeze the read boundary used to validate policy.
     Snapshot(SnapshotError),
     /// The collection descriptor was unavailable or malformed.
     Descriptor(CollectionDescriptorError<GetError>),
-    /// The collection is already readable without proof.
+    /// The collection action is already open and therefore needs no proof.
     OpenPolicy {
-        /// Exact collection whose READ policy is open.
+        /// Exact action whose policy is open.
+        action: Id,
+        /// Exact collection whose action policy is open.
         collection: CollectionHandle,
     },
-    /// The supplied signing key is not one of this collection's READ roots.
+    /// The supplied signing key is not one of this collection action's roots.
     RootNotAuthorized {
+        /// Exact action whose policy rejected the signer.
+        action: Id,
         /// Exact collection whose policy rejected the signer.
         collection: CollectionHandle,
         /// Public half of the supplied root signing key.
@@ -208,7 +214,7 @@ pub enum CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError
 }
 
 impl<SnapshotError, GetError, PutError, InsertError> fmt::Display
-    for CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError>
+    for CollectionGrantError<SnapshotError, GetError, PutError, InsertError>
 where
     SnapshotError: fmt::Display,
     GetError: fmt::Display,
@@ -221,15 +227,21 @@ where
                 write!(formatter, "failed to freeze store snapshot: {source}")
             }
             Self::Descriptor(source) => source.fmt(formatter),
-            Self::OpenPolicy { collection } => write!(
+            Self::OpenPolicy { action, collection } => write!(
                 formatter,
-                "collection {} has an open READ policy; no proof is required",
+                "collection {} has an open {} policy; no proof is required",
                 hex::encode_upper(collection.raw),
+                collection_action_label(*action),
             ),
-            Self::RootNotAuthorized { collection, root } => write!(
+            Self::RootNotAuthorized {
+                action,
+                collection,
+                root,
+            } => write!(
                 formatter,
-                "key {} is not a READ root of collection {}",
+                "key {} is not a {} root of collection {}",
                 hex::encode_upper(root.to_bytes()),
+                collection_action_label(*action),
                 hex::encode_upper(collection.raw),
             ),
             Self::ClaimPut(source) => {
@@ -247,7 +259,7 @@ where
 }
 
 impl<SnapshotError, GetError, PutError, InsertError> Error
-    for CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError>
+    for CollectionGrantError<SnapshotError, GetError, PutError, InsertError>
 where
     SnapshotError: Error + 'static,
     GetError: Error + 'static,
@@ -262,6 +274,22 @@ where
             Self::ClaimPut(source) => Some(source),
             Self::ProofInsert(source) => Some(source),
         }
+    }
+}
+
+/// Error returned by [`grant_collection_read`].
+pub type CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError> =
+    CollectionGrantError<SnapshotError, GetError, PutError, InsertError>;
+
+/// Error returned by [`grant_collection_write`].
+pub type CollectionWriteGrantError<SnapshotError, GetError, PutError, InsertError> =
+    CollectionGrantError<SnapshotError, GetError, PutError, InsertError>;
+
+fn collection_action_label(action: Id) -> &'static str {
+    match action {
+        ACTION_READ => "READ",
+        ACTION_WRITE => "WRITE",
+        _ => "unknown collection action",
     }
 }
 
@@ -1025,19 +1053,72 @@ where
     S: SnapshotSource + BlobStorePut + CapabilityProofStore,
     <S as SnapshotSource>::Snapshot: BlobStoreGet,
 {
-    let snapshot = store
-        .snapshot()
-        .map_err(CollectionReadGrantError::Snapshot)?;
+    grant_collection_action(store, collection, root, recipient, ACTION_READ)
+}
+
+/// Persist one deterministic root-issued WRITE/Invoke proof for `recipient`.
+///
+/// This is the WRITE counterpart of [`grant_collection_read`]. The descriptor
+/// is validated from one coherent snapshot, `root` must be named by its WRITE
+/// quorum, and the canonical claim closure is stored before the proof record.
+/// The proof activates matching COMMITs by `recipient` when a later collection
+/// snapshot performs WRITE admission; local publication itself remains
+/// unconditional.
+pub fn grant_collection_write<S>(
+    store: &mut S,
+    collection: CollectionHandle,
+    root: &SigningKey,
+    recipient: VerifyingKey,
+) -> Result<
+    CapabilityProofBundle,
+    CollectionWriteGrantError<
+        <S as SnapshotSource>::SnapshotError,
+        <<S as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
+        <S as BlobStorePut>::PutError,
+        <S as CapabilityProofStore>::InsertError,
+    >,
+>
+where
+    S: SnapshotSource + BlobStorePut + CapabilityProofStore,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+{
+    grant_collection_action(store, collection, root, recipient, ACTION_WRITE)
+}
+
+fn grant_collection_action<S>(
+    store: &mut S,
+    collection: CollectionHandle,
+    root: &SigningKey,
+    recipient: VerifyingKey,
+    action: Id,
+) -> Result<
+    CapabilityProofBundle,
+    CollectionGrantError<
+        <S as SnapshotSource>::SnapshotError,
+        <<S as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
+        <S as BlobStorePut>::PutError,
+        <S as CapabilityProofStore>::InsertError,
+    >,
+>
+where
+    S: SnapshotSource + BlobStorePut + CapabilityProofStore,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+{
+    let snapshot = store.snapshot().map_err(CollectionGrantError::Snapshot)?;
     let descriptor = load_collection_descriptor(&snapshot, collection)
-        .map_err(CollectionReadGrantError::Descriptor)?;
-    let roots = descriptor
-        .policy
-        .read()
+        .map_err(CollectionGrantError::Descriptor)?;
+    let policy = match action {
+        ACTION_READ => descriptor.policy.read(),
+        ACTION_WRITE => descriptor.policy.write(),
+        _ => unreachable!("grant wrappers only supply collection actions"),
+    };
+    let roots = policy
         .roots()
-        .ok_or(CollectionReadGrantError::OpenPolicy { collection })?;
+        .ok_or(CollectionGrantError::OpenPolicy { action, collection })?;
     let root_key = root.verifying_key();
     if !roots.contains(&root_key) {
-        return Err(CollectionReadGrantError::RootNotAuthorized {
+        return Err(CollectionGrantError::RootNotAuthorized {
+            action,
             collection,
             root: root_key,
         });
@@ -1045,7 +1126,7 @@ where
     drop(snapshot);
 
     let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_READ),
+        CapabilityAction::new(action),
         CapabilityResource::from(collection),
     );
     let claim = crate::capability::CapabilityClaim::root(atom, CapabilityMode::Invoke, None);
@@ -1055,11 +1136,11 @@ where
     for claim in bundle.claims().iter().cloned() {
         store
             .put::<SimpleArchive, _>(claim)
-            .map_err(CollectionReadGrantError::ClaimPut)?;
+            .map_err(CollectionGrantError::ClaimPut)?;
     }
     store
         .insert_proof(bundle.proof().clone())
-        .map_err(CollectionReadGrantError::ProofInsert)?;
+        .map_err(CollectionGrantError::ProofInsert)?;
     Ok(bundle)
 }
 

@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `grant_collection_read` and `pile collection grant-read` for an exact
-  existing collection and recipient endpoint. The root-only operation validates
-  the descriptor's READ policy before mutation, issues an unbounded Invoke
-  claim, persists claim closure before proof, and is deterministic and
+- Add symmetric `grant_collection_read` / `grant_collection_write` APIs and
+  `pile collection grant-read` / `grant-write` commands for an exact existing
+  collection and recipient key. Each root-only operation validates the
+  descriptor's matching action policy before mutation, issues an unbounded
+  Invoke claim, persists claim closure before proof, and is deterministic and
   replay-idempotent.
 
 - Add a read-only `Collection::<E>::open` boundary for validating an existing

@@ -107,8 +107,11 @@ with the encoding and mapping-algorithm descriptions.
   counts. The handle is accepted with or without the `blake3:` prefix.
 - `pile collection grant-read <PILE> <COLLECTION> <RECIPIENT> [--key PATH]` —
   issue one deterministic, unbounded READ/Invoke proof from a configured READ
-  root to an iroh endpoint id. Claims are persisted before the proof; replaying
-  the exact command is idempotent.
+  root to an Ed25519 public key. Claims are persisted before the proof;
+  replaying the exact command is idempotent.
+- `pile collection grant-write <PILE> <COLLECTION> <RECIPIENT> [--key PATH]` —
+  issue the symmetric deterministic WRITE/Invoke proof from a configured WRITE
+  root to an author key.
 
 ### Distributed pile sync
 

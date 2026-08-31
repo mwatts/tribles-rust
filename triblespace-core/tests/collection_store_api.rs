@@ -13,10 +13,10 @@ use triblespace_core::capability::{
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
 use triblespace_core::collection::{
-    grant_collection_read, AdmissionPolicy, Collection, CollectionDescriptorError,
-    CollectionOpenError, CollectionPolicy, CollectionReadGrantError, CollectionRecord,
-    CollectionStore, CollectionStoreExt, CollectionTypeError, PreparedCollectionCommit,
-    ACTION_READ, ACTION_WRITE,
+    grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
+    CollectionDescriptorError, CollectionOpenError, CollectionPolicy, CollectionReadGrantError,
+    CollectionRecord, CollectionStore, CollectionStoreExt, CollectionTypeError,
+    CollectionWriteGrantError, PreparedCollectionCommit, ACTION_READ, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -272,6 +272,62 @@ fn read_grant_is_root_checked_commit_last_and_replay_deterministic() {
 }
 
 #[test]
+fn write_grant_is_root_checked_commit_last_and_activates_recipient_commits() {
+    let root = key(34);
+    let writer = key(35);
+    let mut store = CountingRepo::default();
+    let collection = store
+        .collection(
+            "root-granted-write",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(root.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let commit = store.commit(collection, &writer, fragment(36)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(collection.admitted(&snapshot).unwrap().is_empty());
+    drop(snapshot);
+    store.events.clear();
+
+    let bundle = grant_collection_write(
+        &mut store,
+        collection.handle(),
+        &root,
+        writer.verifying_key(),
+    )
+    .unwrap();
+    let claim_handle = bundle.proof().leaf_claim();
+    assert_eq!(
+        store.events,
+        vec![
+            StoreEvent::Put(claim_handle.raw),
+            StoreEvent::Proof(bundle.proof().id().raw),
+        ]
+    );
+
+    let claim = CapabilityClaim::from_blob(bundle.claims()[0].clone()).unwrap();
+    assert_eq!(claim.parent(), None);
+    assert_eq!(claim.mode(), CapabilityMode::Invoke);
+    assert_eq!(claim.validity(), None);
+    assert_eq!(claim.atom(), atom(ACTION_WRITE, collection));
+    assert_eq!(bundle.proof().leaf_key(), writer.verifying_key());
+
+    let snapshot = store.snapshot().unwrap();
+    assert!(collection
+        .writer_is_admitted_at(
+            &snapshot,
+            writer.verifying_key(),
+            Epoch::from_tai_seconds(0.0),
+        )
+        .unwrap());
+    let admitted = collection.admitted(&snapshot).unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert!(admitted.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
+}
+
+#[test]
 fn read_grant_rejects_non_root_without_writing() {
     let root = key(27);
     let stranger = key(28);
@@ -293,6 +349,7 @@ fn read_grant_rejects_non_root_without_writing() {
     assert!(matches!(
         error,
         CollectionReadGrantError::RootNotAuthorized {
+            action: ACTION_READ,
             collection: rejected,
             root: rejected_root,
         } if rejected == collection.handle() && rejected_root == stranger.verifying_key()
@@ -347,8 +404,47 @@ fn read_grant_rejects_redundant_open_policy_without_writing() {
 
     assert!(matches!(
         error,
-        CollectionReadGrantError::OpenPolicy { collection: rejected }
+        CollectionReadGrantError::OpenPolicy {
+            action: ACTION_READ,
+            collection: rejected,
+        }
             if rejected == collection.handle()
+    ));
+    assert!(store.events.is_empty());
+}
+
+#[test]
+fn write_grant_checks_write_roots_not_read_roots() {
+    let read_root = key(37);
+    let write_root = key(38);
+    let writer = key(39);
+    let mut store = CountingRepo::default();
+    let collection = store
+        .collection(
+            "distinct-write-root",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(read_root.verifying_key()),
+                AdmissionPolicy::direct(write_root.verifying_key()),
+            ),
+        )
+        .unwrap();
+    store.events.clear();
+
+    let error = grant_collection_write(
+        &mut store,
+        collection.handle(),
+        &read_root,
+        writer.verifying_key(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CollectionWriteGrantError::RootNotAuthorized {
+            action: ACTION_WRITE,
+            collection: rejected,
+            root: rejected_root,
+        } if rejected == collection.handle() && rejected_root == read_root.verifying_key()
     ));
     assert!(store.events.is_empty());
 }

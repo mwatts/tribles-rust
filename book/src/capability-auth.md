@@ -202,20 +202,22 @@ cannot nominate its own authority, collection, or subject. There is no global
 roster to enumerate and no requirement that two collections share roots or
 delegation geometry.
 
-`grant_collection_read(&mut store, collection, &root, recipient)` is the
-root-only persistence seam for the common direct case. It validates the exact
-descriptor and READ root against one snapshot, creates an unbounded
-READ/Invoke bundle, stores its claim closure, and only then inserts the native
-proof record. Repeating the same inputs reproduces the same identities. The
-equivalent pile operation is:
+`grant_collection_read(&mut store, collection, &root, recipient)` and
+`grant_collection_write(&mut store, collection, &root, recipient)` are the
+root-only persistence seams for the common direct cases. Each validates the
+exact descriptor and matching action root against one snapshot, creates an
+unbounded Invoke bundle, stores its claim closure, and only then inserts the
+native proof record. Repeating the same inputs reproduces the same identities.
+The equivalent pile operations are:
 
 ```text
 trible pile collection grant-read PILE COLLECTION RECIPIENT [--key PATH]
+trible pile collection grant-write PILE COLLECTION RECIPIENT [--key PATH]
 ```
 
-`RECIPIENT` is the authenticated iroh endpoint id. The command refuses open
-READ policies (which need no proof) and keys absent from the descriptor's READ
-root set.
+`RECIPIENT` is an Ed25519 public key in the same hex or z-base-32 spelling as
+an iroh endpoint id. Each command refuses an open policy (which needs no
+proof) and keys absent from the descriptor's roots for that action.
 
 Validity bounds are optional monotone restrictions, not mutable revocation.
 Ending an unexpired grant requires changing the served trust root or another

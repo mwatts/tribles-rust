@@ -163,6 +163,79 @@ fn collection_grant_read_is_replay_idempotent_and_admits_the_endpoint() {
 }
 
 #[test]
+fn collection_grant_write_is_replay_idempotent_and_admits_the_author() {
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("grant-write.pile");
+    let key_path = dir.path().join("self.key");
+    std::fs::File::create(&pile_path).unwrap();
+    let root = triblespace_core::signing_key_file::init(&key_path).unwrap();
+    let writer = SigningKey::from_bytes(&[78; 32]);
+    let recipient = iroh_base::PublicKey::from_bytes(&writer.verifying_key().to_bytes())
+        .unwrap()
+        .to_string();
+
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let collection = pile
+        .collection(
+            "cli-write-grant",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(root.verifying_key()),
+            ),
+        )
+        .unwrap();
+    pile.close().unwrap();
+
+    let handle = format!("blake3:{}", hex::encode(collection.handle().raw));
+    let invoke = || {
+        Command::cargo_bin("trible")
+            .unwrap()
+            .args(["pile", "collection", "grant-write"])
+            .arg(&pile_path)
+            .arg(&handle)
+            .arg(&recipient)
+            .output()
+            .unwrap()
+    };
+
+    let first = invoke();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_len = std::fs::metadata(&pile_path).unwrap().len();
+    let second = invoke();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), first_len);
+
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let opened = Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap();
+    assert!(opened
+        .writer_is_admitted_at(
+            &snapshot,
+            writer.verifying_key(),
+            Epoch::from_tai_seconds(0.0),
+        )
+        .unwrap());
+    let proofs = snapshot
+        .proofs()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(proofs.len(), 1);
+    let _: Blob<SimpleArchive> = snapshot.get(proofs[0].leaf_claim()).unwrap();
+    drop(snapshot);
+    pile.close().unwrap();
+}
+
+#[test]
 fn put_ingests_file() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("put_test.pile");
