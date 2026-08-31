@@ -526,7 +526,7 @@ fn mapping_entity_id_substitution_preserves_binding_semantics() {
     store.put::<TestSourceBlob, _>(input.clone()).unwrap();
     let cover = Cover::from_members(source, [input.get_handle()]);
     exact
-        .ensure_exact(&mut store, &cover)
+        .ensure(&mut store, &cover)
         .expect("binding depends on mapping facts, not intrinsic-id minting history");
 }
 
@@ -558,7 +558,7 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
     let commit = store.commit(source_collection, &authority, source).unwrap();
     let cover = Cover::from_data(source_collection, [commit.data()]);
 
-    let attached = exact.ensure_exact(&mut store, &cover).unwrap();
+    let attached = exact.ensure(&mut store, &cover).unwrap();
     assert_eq!(attached.len(), 1);
     let snapshot = store.snapshot().unwrap();
     let attached_blob: Blob<AttachedTextBlob> =
@@ -567,7 +567,7 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
 
     // A second read-only pass forward-validates the resident DERIVE through
     // the same attachment lookup rather than trusting its output handle.
-    let reattached = exact.attach_exact(&mut store, &cover).unwrap();
+    let reattached = exact.attach(&mut store, &cover).unwrap();
     let snapshot = store.snapshot().unwrap();
     let reattached_blob: Blob<AttachedTextBlob> =
         snapshot.get(reattached.members().next().unwrap()).unwrap();
@@ -910,14 +910,8 @@ impl CollectionStore for PanicStore {
 fn empty_cover_performs_no_store_operation() {
     let mut store = PanicStore;
     let cover = source_cover(&[]);
-    assert!(kernel()
-        .attach_exact(&mut store, &cover)
-        .unwrap()
-        .is_empty());
-    assert!(kernel()
-        .ensure_exact(&mut store, &cover)
-        .unwrap()
-        .is_empty());
+    assert!(kernel().attach(&mut store, &cover).unwrap().is_empty());
+    assert!(kernel().ensure(&mut store, &cover).unwrap().is_empty());
     assert!(compact_exact_target(&kernel(), &mut store, &cover)
         .unwrap()
         .is_empty());
@@ -931,8 +925,8 @@ fn empty_cover_still_belongs_to_one_exact_collection() {
         .unwrap();
     let foreign = Cover::from_members(foreign_collection, []);
     for result in [
-        kernel().attach_exact(&mut store, &foreign),
-        kernel().ensure_exact(&mut store, &foreign),
+        kernel().attach(&mut store, &foreign),
+        kernel().ensure(&mut store, &foreign),
     ] {
         assert!(matches!(
             result,
@@ -1101,7 +1095,7 @@ fn complete_probe_ensure_performs_zero_writes() {
     };
     let source_cover = source_cover(&[commit]);
 
-    let cover = kernel().ensure_exact(&mut store, &source_cover).unwrap();
+    let cover = kernel().ensure(&mut store, &source_cover).unwrap();
     assert_eq!(cover.len(), 1);
     assert_eq!(store.puts, 0);
     assert_eq!(store.inserts, 0);
@@ -1159,10 +1153,8 @@ fn compacted_source_cover_reuses_resident_decomposition_images() {
     };
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = with_selective(&algebra, |kernel| {
-        kernel.ensure_exact(&mut store, &source_cover)
-    })
-    .unwrap();
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
 
     let mut actual: Vec<_> = target.members().collect();
     actual.sort_unstable();
@@ -1191,10 +1183,8 @@ fn compacted_source_capacity_falls_back_to_resident_decomposition_inputs() {
     };
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = with_selective(&algebra, |kernel| {
-        kernel.ensure_exact(&mut store, &source_cover)
-    })
-    .unwrap();
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
 
     let mut actual: Vec<_> = target.members().collect();
     actual.sort_unstable();
@@ -1228,10 +1218,8 @@ fn complete_direct_image_does_not_expand_source_decompositions() {
     };
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = with_selective(&algebra, |kernel| {
-        kernel.ensure_exact(&mut store, &source_cover)
-    })
-    .unwrap();
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
 
     assert_eq!(target.members().collect::<Vec<_>>(), vec![fc.get_handle()]);
     assert_eq!((store.puts, store.inserts), (0, 0));
@@ -1264,7 +1252,7 @@ fn unrelated_optional_result_metadata_failure_is_inert() {
         .insert(unrelated.raw);
     let source_cover = Cover::from_members(kernel().source_collection(), [source.get_handle()]);
 
-    let attached = kernel().attach_exact(&mut store, &source_cover).unwrap();
+    let attached = kernel().attach(&mut store, &source_cover).unwrap();
 
     assert_eq!(
         attached.members().collect::<Vec<_>>(),
@@ -1296,10 +1284,8 @@ fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
     };
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target = with_selective(&algebra, |kernel| {
-        kernel.ensure_exact(&mut store, &source_cover)
-    })
-    .unwrap();
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
 
     assert_eq!(target.len(), 1);
     let actual: Blob<TestTargetBlob> = store
@@ -1339,16 +1325,13 @@ fn forged_reverse_decomposition_cannot_supply_a_cover() {
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
     assert!(matches!(
-        with_selective(&algebra, |kernel| kernel
-            .attach_exact(&mut store, &source_cover)),
+        with_selective(&algebra, |kernel| kernel.attach(&mut store, &source_cover)),
         Err(ExactDerivedCollectionError::IncompleteCover { .. })
     ));
     assert_eq!((store.puts, store.inserts), (0, 0));
 
-    let target = with_selective(&algebra, |kernel| {
-        kernel.ensure_exact(&mut store, &source_cover)
-    })
-    .unwrap();
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
     assert_eq!(target.len(), 1);
     let actual: Blob<TestTargetBlob> = store
         .snapshot()
@@ -1367,7 +1350,7 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
     let commit = source_commit(&mut store, 1, &source);
     let source_cover = source_cover(&[commit]);
 
-    let first = kernel().ensure_exact(&mut store, &source_cover).unwrap();
+    let first = kernel().ensure(&mut store, &source_cover).unwrap();
     let first_member = first.members().next().unwrap();
     assert!(
         !collection_records(&mut store)
@@ -1382,7 +1365,7 @@ fn algebra_produced_cover_composes_without_an_intermediate_commit() {
     );
 
     let second_exact = register_second_kernel(&mut store);
-    let second = second_exact.ensure_exact(&mut store, &first).unwrap();
+    let second = second_exact.ensure(&mut store, &first).unwrap();
     assert_eq!(second.len(), 1);
     let mut expected = derive(&source).unwrap().bytes.as_ref().to_vec();
     expected.push(0xB6);
@@ -1432,10 +1415,8 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
     };
     let source_cover = source_cover(&commits);
 
-    let cover = with_selective(&algebra, |kernel| {
-        kernel.ensure_exact(&mut store, &source_cover)
-    })
-    .unwrap();
+    let cover =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
     assert_eq!(cover.len(), 2);
     let mut actual = derived_inputs(&mut store.inner);
     actual.sort_unstable();
@@ -1477,10 +1458,7 @@ fn capacity_source_replan_is_global_across_overlapping_uppers() {
     };
     let source_cover = source_cover(&commits);
 
-    with_selective(&algebra, |kernel| {
-        kernel.ensure_exact(&mut store, &source_cover)
-    })
-    .unwrap();
+    with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
     let mut actual = derived_inputs(&mut store.inner);
     actual.sort_unstable();
     let mut expected = vec![data(successful_upper), data(final_leaf)];
@@ -1516,7 +1494,7 @@ fn terminal_source_capacity_is_repeatable_and_zero_write() {
 
     for _ in 0..2 {
         assert!(matches!(
-            with_selective(&algebra, |kernel| kernel.ensure_exact(&mut store, &source_cover)),
+            with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)),
             Err(ExactDerivedCollectionError::UnrepresentableCover { ref blocked, ref missing })
                 if blocked.len() == 1 && missing.len() == 1
         ));
@@ -1549,8 +1527,7 @@ fn mixed_terminal_capacity_publishes_no_prepared_sibling() {
     let source_cover = source_cover(&commits);
 
     assert!(matches!(
-        with_selective(&algebra, |kernel| kernel
-            .ensure_exact(&mut store, &source_cover)),
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)),
         Err(ExactDerivedCollectionError::UnrepresentableCover { .. })
     ));
     assert_eq!((store.puts, store.inserts), (0, 0));
@@ -1578,7 +1555,7 @@ fn fatal_source_construction_is_not_capacity_fallback() {
     let source_cover = source_cover(&[commit]);
 
     assert!(matches!(
-        with_selective(&algebra, |kernel| kernel.ensure_exact(&mut store, &source_cover)),
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)),
         Err(ExactDerivedCollectionError::Derive { input, .. }) if input == data(&source)
     ));
     assert_eq!((store.puts, store.inserts), (0, 0));
@@ -1750,7 +1727,7 @@ fn snapshot_is_dropped_before_first_write() {
         events: Vec::new(),
     };
     let source_cover = source_cover(&[commit]);
-    kernel().ensure_exact(&mut store, &source_cover).unwrap();
+    kernel().ensure(&mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
 }
 
@@ -1766,7 +1743,7 @@ fn ensure_stores_source_before_target_and_derive() {
     };
 
     kernel()
-        .ensure_exact(&mut store, &source_cover(&[commit]))
+        .ensure(&mut store, &source_cover(&[commit]))
         .unwrap();
 
     let (insert, claim) = store
@@ -2062,7 +2039,7 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof()
     ] {
         store.insert(CollectionRecord::Merge(claim)).unwrap();
     }
-    let before = kernel().attach_exact(&mut store, &source_cover).unwrap();
+    let before = kernel().attach(&mut store, &source_cover).unwrap();
     assert_eq!(before.len(), 3);
     let after = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     let mut tiers = BTreeSet::new();
@@ -2383,7 +2360,7 @@ fn fresh_reprobe_rejects_a_lossy_output_put() {
         discard: data(&output),
     };
     let source_cover = source_cover(&[commit]);
-    match kernel().ensure_exact(&mut store, &source_cover) {
+    match kernel().ensure(&mut store, &source_cover) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected fresh-reprobe error: {error:?}"),
         Ok(_) => panic!("lossy output was incorrectly admitted"),
@@ -2404,18 +2381,12 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
         )))
         .unwrap();
     let source_cover = source_cover(&[commit]);
-    match kernel().attach_exact(&mut store, &source_cover) {
+    match kernel().attach(&mut store, &source_cover) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected missing-output error: {error:?}"),
         Ok(_) => panic!("missing output was incorrectly admitted"),
     }
-    assert_eq!(
-        kernel()
-            .ensure_exact(&mut store, &source_cover)
-            .unwrap()
-            .len(),
-        1,
-    );
+    assert_eq!(kernel().ensure(&mut store, &source_cover).unwrap().len(), 1,);
 }
 
 #[test]
@@ -2636,7 +2607,7 @@ fn ungrounded_source_superset_cannot_escape_the_cover() {
         )))
         .unwrap();
 
-    let cover = kernel().ensure_exact(&mut store, &source_cover).unwrap();
+    let cover = kernel().ensure(&mut store, &source_cover).unwrap();
     let actual: Blob<TestTargetBlob> = store
         .snapshot()
         .unwrap()

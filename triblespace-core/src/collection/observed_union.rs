@@ -465,7 +465,7 @@ impl ObservedSetCollection {
     }
 
     /// Attach the observed set already resident for `source_cover`.
-    pub fn attach_exact<S>(
+    pub fn attach<S>(
         &self,
         store: &mut S,
         source_cover: &FactCover,
@@ -474,7 +474,7 @@ impl ObservedSetCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.attach_exact(store, source_cover)?;
+        let cover = self.kernel()?.attach(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;
@@ -487,7 +487,7 @@ impl ObservedSetCollection {
     }
 
     /// Ensure and attach the observed set for `source_cover`.
-    pub fn ensure_exact<S>(
+    pub fn ensure<S>(
         &self,
         store: &mut S,
         source_cover: &FactCover,
@@ -496,7 +496,7 @@ impl ObservedSetCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.ensure_exact(store, source_cover)?;
+        let cover = self.kernel()?.ensure(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;

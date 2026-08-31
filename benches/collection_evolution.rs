@@ -3,8 +3,8 @@
 //! This benchmark compares the three real public maintenance operations on
 //! geometrically growing exact covers:
 //!
-//! - `ensure_exact`: canonical raw and Rank9-accelerated derivations.
-//! - `exact_view().ensure`: retain already-admitted immutable shards and run
+//! - `ensure`: canonical raw and Rank9-accelerated derivations.
+//! - `exact_view().advance`: retain already-admitted immutable shards and run
 //!   ordinary exact admission only over newly signed support.
 //! - `compact_exact`: the same exact completion plus deterministic dyadic
 //!   raw-target compaction and the matching accelerated collection cover.
@@ -260,7 +260,7 @@ impl Operation {
     ) -> UnionArchive<OrderedUniverse> {
         match self {
             Self::Ensure => succinct
-                .ensure_exact(store, cover)
+                .ensure(store, cover)
                 .expect("ensure exact Succinct collection"),
             Self::Compact => succinct
                 .compact_exact(store, cover)
@@ -360,7 +360,7 @@ fn diagnose_raw(
         .expect("freeze pre-diagnostic store snapshot");
     reset_mapping_calls();
     let raw_cover = exact
-        .ensure_exact(store, cover)
+        .ensure(store, cover)
         .expect("diagnose complete raw exact cover");
     let projection_calls = mapping_calls();
     let diagnostic_after = store
@@ -513,7 +513,7 @@ fn time_exact_view(
 ) -> TimedOperation {
     let start = Instant::now();
     let union = view
-        .ensure(store, cover)
+        .advance(store, cover)
         .expect("advance maintained exact Succinct view");
     let elapsed = start.elapsed();
     black_box(union.segment_count());

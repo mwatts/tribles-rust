@@ -388,7 +388,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
     /// Missing unsigned intermediates are reconstructed in use-counted scratch
     /// from explicit source-cover roots. Scratch validation never publishes a
     /// blob or equation.
-    pub fn attach_exact<S>(
+    pub fn attach<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
@@ -481,7 +481,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
     /// returns before any write. For a final feasible plan, the reader is
     /// dropped before descriptors and all output blobs are written ahead of
     /// unsigned `DERIVE` records. No flush or signed record is emitted.
-    pub fn ensure_exact<S>(
+    pub fn ensure<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,

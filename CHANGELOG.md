@@ -779,7 +779,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allowing a temporary `Repository` view without transferring backend
   ownership or reimplementing the pin trait in downstream crates.
 - **Direct `SimpleArchive` collections now have a keyless exact-cover read
-  facade.** `SimpleArchiveCollection::attach_exact` accepts an opaque `Cover`
+  facade.** `SimpleArchiveCollection::attach` accepts an opaque `Cover`
   against one immutable store snapshot and requires only its descriptor and
   payload bytes; no signed commit or metadata needs to remain resident. It
   shares ordinary descriptor, member, and merge-cover validation, exposes no
@@ -844,7 +844,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle through its immutable store snapshot and validates the exact
   raw/index pair before constructing the query runtime. Exact derivation stores
   the selected raw source before its accelerated root and semantic record.
-  Incomplete roots are nonresident and `ensure_exact` reconstructs them from a
+  Incomplete roots are nonresident and `ensure` reconstructs them from a
   usable source route rather than admitting partial state.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
@@ -855,8 +855,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intermediates have use-counted scratch lifetimes and are never persisted.
   Invalid or incomplete cache paths are ignored and the deterministic physical
   cover is recomputed. This adds neither receipts nor authority/retention
-  records, and `attach_exact` remains write-free even after a retained Pile
-  rewrite collects intermediate cache blobs; `ensure_exact` repairs only the
+  records, and `attach` remains write-free even after a retained Pile
+  rewrite collects intermediate cache blobs; `ensure` repairs only the
   missing canonical closure and is write-free again once it is resident.
 
   Lattice operations return
@@ -890,7 +890,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cover, never for compacted-away leaves; each raw shard retains the explicit
   `u32::MAX` row/domain boundary.
 - **Regular paths now use one exact native collection path.**
-  `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen
+  `PathSummaryCollection::{attach, ensure}` validates a frozen
   source `Cover`, reuses canonical source merges, target
   merges, and derives, and closes the exact resident summary cover once into a
   `PathIndex`. Ensuring lowers only unsupported distinct source elements,

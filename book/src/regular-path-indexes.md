@@ -183,10 +183,10 @@ let path_collection = PathSummaryCollection::create(
 )?;
 
 // `cover` is the admitted PATCH set of distinct source payload handles.
-let paths = path_collection.ensure_exact(&mut store, &cover)?;
+let paths = path_collection.ensure(&mut store, &cover)?;
 
 // Read-only consumers can require an already resident exact cover.
-let same_paths = path_collection.attach_exact(&mut store, &cover)?;
+let same_paths = path_collection.attach(&mut store, &cover)?;
 ```
 
 Both methods require only `BlobStore + CollectionStore`. The exact source
@@ -207,7 +207,7 @@ and one unit of derivation work. Their authorship, signatures, and metadata are
 queryable, possibly absent provenance through `cover.commits(&snapshot)` and are
 intentionally unnecessary for replay or path semantics.
 
-`attach_exact` never writes. It admits existing canonical source `MERGE`,
+`attach` never writes. It admits existing canonical source `MERGE`,
 path-summary `MERGE`, and source-to-target `DERIVE` equations, then requires
 both:
 
@@ -217,13 +217,13 @@ both:
 
 Only then are selected summaries joined and closed once into `PathIndex`.
 
-`ensure_exact` performs the same probe, selects a deterministic resident source
+`ensure` performs the same probe, selects a deterministic resident source
 `Cover`, and lowers only cover members supporting
 at least one still-unsupported payload member. A resident source merge can
 therefore replace several leaf derivations, even when it overlaps a member that
 already has a target image. It publishes descriptor and output blobs before the
 unsigned `DERIVE` records and performs no implicit durability flush. It drops
-the old store snapshot before those writes and calls `attach_exact` afterwards, so
+the old store snapshot before those writes and calls `attach` afterwards, so
 local construction never substitutes for fresh admission. Concurrent and
 repeated ensures are content-addressed and record-idempotent.
 

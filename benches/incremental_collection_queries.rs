@@ -151,7 +151,7 @@ impl FullState {
         let mut store = fixture.store.clone();
         let mut view = fixture.succinct.exact_view();
         let seed = view
-            .ensure(&mut store, &fixture.seed_cover)
+            .advance(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
         assert_eq!(seed.iter().count(), 2, "seed contains the author facts");
         Self {
@@ -165,7 +165,7 @@ impl FullState {
         let start = Instant::now();
         let full = self
             .view
-            .ensure(&mut self.store, cover)
+            .advance(&mut self.store, cover)
             .expect("advance full-query view");
         let mut raw_rows = 0usize;
         let mut next = BTreeSet::new();
@@ -202,7 +202,7 @@ impl IncrementalState {
         let mut store = fixture.store.clone();
         let mut view = fixture.succinct.exact_view();
         let seed = view
-            .ensure(&mut store, &fixture.seed_cover)
+            .advance(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
         assert_eq!(seed.iter().count(), 2, "seed contains the author facts");
         Self {
@@ -221,7 +221,7 @@ impl IncrementalState {
         assert_eq!(added.len(), 1, "one payload is observed per step");
         let full = self
             .view
-            .ensure(&mut self.store, cover)
+            .advance(&mut self.store, cover)
             .expect("advance incremental full view");
         let snapshot = self.store.snapshot().expect("freeze delta snapshot");
         let changed =

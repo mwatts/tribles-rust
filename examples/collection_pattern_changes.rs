@@ -38,7 +38,7 @@ fn observe(
     // The full view retains its already-admitted immutable Succinct shards and
     // admits only new support. The small SimpleArchive delta stays independent
     // because it drives the change query and advances only after consumption.
-    let full = full_view.ensure(store, &current)?;
+    let full = full_view.advance(store, &current)?;
     let changed = TribleSet::try_from_cover(&added, &snapshot)?;
 
     let mut titles = Vec::new();

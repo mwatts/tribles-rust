@@ -646,7 +646,7 @@ impl LwwRegisterCollection {
     }
 
     /// Attach an already resident exact projection for `source_cover`.
-    pub fn attach_exact<S>(
+    pub fn attach<S>(
         &self,
         store: &mut S,
         source_cover: &FactCover,
@@ -655,7 +655,7 @@ impl LwwRegisterCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.attach_exact(store, source_cover)?;
+        let cover = self.kernel()?.attach(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;
@@ -668,7 +668,7 @@ impl LwwRegisterCollection {
     }
 
     /// Ensure and attach the exact projection for `source_cover`.
-    pub fn ensure_exact<S>(
+    pub fn ensure<S>(
         &self,
         store: &mut S,
         source_cover: &FactCover,
@@ -677,7 +677,7 @@ impl LwwRegisterCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.ensure_exact(store, source_cover)?;
+        let cover = self.kernel()?.ensure(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;
@@ -1120,11 +1120,11 @@ mod tests {
             [identity_commit.data(), order_commit.data()],
         );
 
-        let ensured = collection.ensure_exact(&mut store, &source_cover).unwrap();
+        let ensured = collection.ensure(&mut store, &source_cover).unwrap();
         assert_eq!(ensured.winner(*register), Some(*state));
         assert_eq!(
             collection
-                .attach_exact(&mut store, &source_cover)
+                .attach(&mut store, &source_cover)
                 .unwrap()
                 .winner(*register),
             Some(*state)

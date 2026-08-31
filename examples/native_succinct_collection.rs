@@ -62,7 +62,7 @@ fn main() {
         .expect("register Rank9-accelerated projection");
     let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
     let archive = succinct
-        .ensure_exact(&mut pile, &cover)
+        .ensure(&mut pile, &cover)
         .expect("ensure exact Succinct projection");
     let mut names: Vec<String> = find!(
         name: Inline<_>,

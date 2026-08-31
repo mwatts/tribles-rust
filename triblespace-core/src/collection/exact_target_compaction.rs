@@ -131,7 +131,7 @@ where
     Handle<H::Source>: InlineEncoding,
     Handle<H::Target>: InlineEncoding,
 {
-    let mut cover = exact.ensure_exact(store, source_cover)?;
+    let mut cover = exact.ensure(store, source_cover)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 
@@ -140,7 +140,7 @@ where
             RoundOutcome::Published => {}
             RoundOutcome::Stable(cover) => return Ok(cover),
         }
-        cover = exact.attach_exact(store, source_cover)?;
+        cover = exact.attach(store, source_cover)?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
             return Err(ExactTargetCompactionError::Stalled { cover: identity });

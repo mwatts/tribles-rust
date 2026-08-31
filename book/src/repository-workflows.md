@@ -299,13 +299,13 @@ let raw = storage.derive(source, SimpleToSuccinctMapping, raw_policy)?;
 let accelerated = storage.derive(raw, RawToRank9AcceleratedMapping, accelerated_policy)?;
 let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
 
-let archive = succinct.ensure_exact(&mut storage, &cover)?;
-let same_archive = succinct.attach_exact(&mut storage, &cover)?;
+let archive = succinct.ensure(&mut storage, &cover)?;
+let same_archive = succinct.attach(&mut storage, &cover)?;
 let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 ```
 
-- `attach_exact` is read-only and requires a complete valid resident cover.
-- `ensure_exact` reuses valid equations, computes missing canonical images, and
+- `attach` is read-only and requires a complete valid resident cover.
+- `ensure` reuses valid equations, computes missing canonical images, and
   stores each selected source before its target image and new record.
 - `compact_exact` deterministically compacts the raw target cover, then ensures
   the matching accelerated cover and returns its query view.
@@ -332,7 +332,7 @@ joinable, so `compact_exact` and other maintenance compact that upstream
 lattice first and then derive the corresponding accelerated root. Derivation
 stores the selected raw source before the accelerated root and ordinary
 `DERIVE` record. An incomplete source-bound member is merely a nonresident
-route which `ensure_exact` can reconstruct.
+route which `ensure` can reconstruct.
 
 ## WANT missing content or computation
 

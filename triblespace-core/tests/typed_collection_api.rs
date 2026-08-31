@@ -78,7 +78,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
     let derived = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, target).unwrap();
-    let cover = derived.ensure_exact(&mut store, &source_cover).unwrap();
+    let cover = derived.ensure(&mut store, &source_cover).unwrap();
     assert_eq!(cover.collection(), target);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
 

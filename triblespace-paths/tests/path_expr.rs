@@ -113,7 +113,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
 
     let snapshot = store.snapshot().unwrap();
     let cover = paths.source_collection().admitted(&snapshot).unwrap();
-    let index = paths.ensure_exact(&mut store, &cover).unwrap();
+    let index = paths.ensure(&mut store, &cover).unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));
     let reachable = Query::new(index.constraint(start, end), |binding: &Binding| {

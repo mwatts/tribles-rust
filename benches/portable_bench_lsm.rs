@@ -792,7 +792,7 @@ fn main() {
             let exact = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw)
                 .expect("bind exact raw Succinct projection");
             let raw_cover = exact
-                .attach_exact(&mut store, &cover)
+                .attach(&mut store, &cover)
                 .expect("reattach exact raw cover for metrics");
             let snapshot = store.snapshot().expect("freeze raw target snapshot");
             let shape = BuildShape {

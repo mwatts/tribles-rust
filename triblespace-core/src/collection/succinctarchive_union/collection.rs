@@ -244,7 +244,7 @@ pub struct SuccinctArchiveCollection {
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
 }
 
-/// Exact work performed by one successful [`SuccinctArchiveView::ensure`].
+/// Exact work performed by one successful [`SuccinctArchiveView::advance`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SuccinctArchiveViewWork {
     /// Distinct payload members represented after the call.
@@ -349,8 +349,8 @@ impl SuccinctArchiveView {
         self.last_work
     }
 
-    /// Ensure and retain the exact view for the current source cover.
-    pub fn ensure<S>(
+    /// Advance and retain the view for the current source cover.
+    pub fn advance<S>(
         &mut self,
         store: &mut S,
         current: &FactCover,
@@ -433,7 +433,7 @@ impl SuccinctArchiveView {
             self.collection.raw,
             measured,
         )?;
-        let raw_cover = raw_kernel.ensure_exact(store, cover)?;
+        let raw_cover = raw_kernel.ensure(store, cover)?;
         let work = raw_kernel
             .mapping_override()
             .expect("measured kernel retains its explicit mapping")
@@ -485,7 +485,7 @@ impl SuccinctArchiveCollection {
     }
 
     /// Attach the exact accelerated cover without writing.
-    pub fn attach_exact<S>(
+    pub fn attach<S>(
         &self,
         store: &mut S,
         source_cover: &FactCover,
@@ -494,7 +494,7 @@ impl SuccinctArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
-        let raw_cover = self.raw_kernel()?.attach_exact(store, source_cover)?;
+        let raw_cover = self.raw_kernel()?.attach(store, source_cover)?;
         let accelerated = self
             .rank9_derivation()?
             .attach_member_images(store, &raw_cover)?;
@@ -505,7 +505,7 @@ impl SuccinctArchiveCollection {
     }
 
     /// Ensure both ordinary derivation stages and attach the exact view.
-    pub fn ensure_exact<S>(
+    pub fn ensure<S>(
         &self,
         store: &mut S,
         source_cover: &FactCover,
@@ -514,7 +514,7 @@ impl SuccinctArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
-        let raw_cover = self.raw_kernel()?.ensure_exact(store, source_cover)?;
+        let raw_cover = self.raw_kernel()?.ensure(store, source_cover)?;
         let accelerated = self
             .rank9_derivation()?
             .ensure_member_images(store, &raw_cover)?;
@@ -673,7 +673,7 @@ mod tests {
             [Handle::<SimpleArchive>::to_hash(source.get_handle())],
         );
 
-        let archive = facade.ensure_exact(&mut store, &cover).unwrap();
+        let archive = facade.ensure(&mut store, &cover).unwrap();
         assert_eq!(archive.iter().count(), 2);
 
         let snapshot = store.snapshot().unwrap();
@@ -727,7 +727,7 @@ mod tests {
         let raw = facade
             .raw_kernel()
             .unwrap()
-            .ensure_exact(&mut store, &cover)
+            .ensure(&mut store, &cover)
             .unwrap();
         facade
             .rank9_derivation()

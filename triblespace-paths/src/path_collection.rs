@@ -116,7 +116,7 @@ impl PathSummaryCollection {
     }
 
     /// Attach the exact endpoint relation already resident for `source_cover`.
-    pub fn attach_exact<S>(
+    pub fn attach<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<SimpleArchive>,
@@ -125,7 +125,7 @@ impl PathSummaryCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.attach_exact(store, source_cover)?;
+        let cover = self.kernel()?.attach(store, source_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
@@ -137,7 +137,7 @@ impl PathSummaryCollection {
     /// Existing source merges, target merges, and derivations are reused. New
     /// target blobs precede unsigned records, no flush is implied, and a fresh
     /// pass proves the frozen cover before path closure runs once.
-    pub fn ensure_exact<S>(
+    pub fn ensure<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<SimpleArchive>,
@@ -146,7 +146,7 @@ impl PathSummaryCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.ensure_exact(store, source_cover)?;
+        let cover = self.kernel()?.ensure(store, source_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
@@ -454,7 +454,7 @@ mod tests {
         let record_count = records(&mut store).len();
         let snapshot = store.snapshot().unwrap();
         let cover = collection.admitted(&snapshot).unwrap();
-        let index = paths.ensure_exact(&mut store, &cover).unwrap();
+        let index = paths.ensure(&mut store, &cover).unwrap();
         assert_eq!(index.accepted_pair_count(), 0);
         assert_eq!(store.0.blobs.len(), blobs);
         assert_eq!(records(&mut store).len(), record_count);
@@ -473,14 +473,14 @@ mod tests {
         publish(&mut store, second);
         let cover = source_cover(&mut store, &paths, [first, second]);
         assert!(matches!(
-            paths.attach_exact(&mut store, &cover),
+            paths.attach(&mut store, &cover),
             Err(PathSummaryCollectionError::Collection(
                 ExactDerivedCollectionError::IncompleteCover { unsupported_members, .. }
             ))
                 if unsupported_members.len() == 2
         ));
-        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &cover).unwrap());
-        assert_cross_fragment_path(&paths.attach_exact(&mut store, &cover).unwrap());
+        assert_cross_fragment_path(&paths.ensure(&mut store, &cover).unwrap());
+        assert_cross_fragment_path(&paths.attach(&mut store, &cover).unwrap());
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
         publish(&mut store, first);
         publish(&mut store, second);
         let old_cover = source_cover(&mut store, &paths, [first, second]);
-        paths.ensure_exact(&mut store, &old_cover).unwrap();
+        paths.ensure(&mut store, &old_cover).unwrap();
 
         let later = put_data(&mut store, &edge(3, 4));
         let third = signed_commit(&mut store, paths.source_collection(), 3, &later);
@@ -512,7 +512,7 @@ mod tests {
             )))
             .unwrap();
 
-        let old = paths.attach_exact(&mut store, &old_cover).unwrap();
+        let old = paths.attach(&mut store, &old_cover).unwrap();
         assert!(!old.contains(&RawInline::from(id(1)), &RawInline::from(id(4))));
     }
 
@@ -527,7 +527,7 @@ mod tests {
         publish(&mut store, first);
         publish(&mut store, second);
         let cover = source_cover(&mut store, &paths, [first, first, second]);
-        paths.ensure_exact(&mut store, &cover).unwrap();
+        paths.ensure(&mut store, &cover).unwrap();
         let derives = records(&mut store)
             .into_iter()
             .filter(|record| {
@@ -536,7 +536,7 @@ mod tests {
             })
             .count();
         assert_eq!(derives, 1);
-        paths.attach_exact(&mut store, &cover).unwrap();
+        paths.attach(&mut store, &cover).unwrap();
     }
 
     #[test]
@@ -559,7 +559,7 @@ mod tests {
         assert!(empty_cover.is_empty());
         assert_eq!(
             paths
-                .attach_exact(&mut store, &empty_cover)
+                .attach(&mut store, &empty_cover)
                 .unwrap()
                 .accepted_pair_count(),
             0,
@@ -571,7 +571,7 @@ mod tests {
         publish(&mut store, other_commit);
         let wrong_cover = source_cover(&mut store, &other_paths, [other_commit]);
         assert!(matches!(
-            paths.attach_exact(&mut store, &wrong_cover),
+            paths.attach(&mut store, &wrong_cover),
             Err(PathSummaryCollectionError::Collection(
                 ExactDerivedCollectionError::InvalidCover(_)
             ))
@@ -579,7 +579,7 @@ mod tests {
 
         publish(&mut store, commit);
         let cover = source_cover(&mut store, &paths, [commit]);
-        let attached = paths.attach_exact(&mut store, &cover).unwrap();
+        let attached = paths.attach(&mut store, &cover).unwrap();
         assert!(attached.contains(&RawInline::from(id(1)), &RawInline::from(id(2))));
     }
 
@@ -606,7 +606,7 @@ mod tests {
             )))
             .unwrap();
         let cover = source_cover(&mut store, &paths, [first, second]);
-        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &cover).unwrap());
+        assert_cross_fragment_path(&paths.ensure(&mut store, &cover).unwrap());
         let inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
@@ -657,7 +657,7 @@ mod tests {
             .unwrap();
 
         let cover = source_cover(&mut store, &paths, [first, second]);
-        assert_cross_fragment_path(&paths.ensure_exact(&mut store, &cover).unwrap());
+        assert_cross_fragment_path(&paths.ensure(&mut store, &cover).unwrap());
         let mut inputs: Vec<_> = records(&mut store)
             .into_iter()
             .filter_map(|record| match record {
@@ -716,11 +716,11 @@ mod tests {
         let cover = paths
             .kernel()
             .unwrap()
-            .attach_exact(&mut store, &source_cover)
+            .attach(&mut store, &source_cover)
             .unwrap();
         assert_eq!(cover.len(), 1);
         assert_eq!(cover.members().next().unwrap(), joined.get_handle());
-        assert_cross_fragment_path(&paths.attach_exact(&mut store, &source_cover).unwrap());
+        assert_cross_fragment_path(&paths.attach(&mut store, &source_cover).unwrap());
     }
 
     #[test]
@@ -741,7 +741,7 @@ mod tests {
         publish(&mut store, commit);
         let cover = source_cover(&mut store, &paths, [commit]);
         assert!(matches!(
-            paths.attach_exact(&mut store, &cover),
+            paths.attach(&mut store, &cover),
             Err(PathSummaryCollectionError::Collection(
                 ExactDerivedCollectionError::IncompleteMember(found)
             )) if found == commit.data()
