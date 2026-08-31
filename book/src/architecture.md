@@ -200,10 +200,15 @@ summary is connected to its source by a mapping which is a join homomorphism:
 f(a ⊔ b) = f(a) ⊔ f(b)
 ```
 
-That law permits either route through the evidence graph: merge source shards
-and derive once, derive individual shards and merge their images, or reuse any
-stored mixture already present. An opaque source cover fixes the logical
-value while a resolver chooses a target cover with equal support.
+That law makes equations on either side of the mapping reusable evidence. The
+public `ExactDerivedCollection::ensure` owns one deterministic maintenance
+policy: reuse a resident target node; otherwise join both resident target
+children before crossing the mapping; otherwise derive the corresponding
+resident source node; and only then descend when that source node is missing
+or capacity-terminal. A capacity-terminal or unsupported target join likewise
+falls through to the corresponding source node. It never constructs a missing
+source merge merely to derive its image. An opaque source cover fixes the logical
+value while the resolver chooses a target cover with equal support.
 Different target covers may denote the same join, and every lattice position
 uses the same `Cover<E>` shape while retaining its own typed member handles.
 Missing derived artifacts are cache misses, not missing facts.
@@ -218,13 +223,14 @@ and named child together are a complete source-bound accelerated encoding, not
 a separate sidecar or runtime artifact.
 
 Raw Succinct members own the directly materializable join. Rank9 roots do not
-define another physical join: maintenance compacts raw members first, then the
-ordinary raw-to-accelerated `DERIVE` maps that exact source blob to its query
-index. Thus raw cover `{a, b}` maps to `{f(a), f(b)}` even when resident
-evidence also proves `a join b = c`; only explicit raw compaction to cover
-`{c}` changes the accelerated cover to `{f(c)}`. Exact derivation stores the
-selected source before the target root and semantic record. A cover-aware view
-follows the embedded handle through its store snapshot, validates the exact raw/index
+define another physical join: `ensure` deterministically carries the raw target
+lattice by dyadic serialized-size tier, then the ordinary raw-to-accelerated
+`DERIVE` maps the exact final raw cover to its query indexes. Target carries do
+not compact the source collection. If the corresponding source node already
+exists it can be mapped, but a missing source node is decomposed into its
+source children rather than synthesized with a source `MERGE`. Every computed
+raw `MERGE` and cross-lattice `DERIVE` is persisted. A cover-aware view follows
+each embedded handle through its store snapshot, validates the exact raw/index
 pair, and only then builds the transient query runtime. A root whose raw child
 is absent is nonresident; ensuring reconstructs the exact accelerated image
 from that raw source.

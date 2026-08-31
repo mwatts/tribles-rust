@@ -1,102 +1,27 @@
-//! Explicit size-tiered maintenance for exact derived target collections.
+//! Deterministic size-tiered maintenance for derived target collections.
 //!
-//! Compaction remains separate from cover construction. It starts from an
-//! opaque exact cover and publishes every canonical target blob it computes
-//! together with its `MERGE` equation. A later failed or unsupported join does
+//! This is the horizontal half of [`ExactDerivedCollection::ensure`]. It starts
+//! from a completed cover and publishes one canonical target carry before
+//! re-entering the per-point planner. A later failed or unsupported join does
 //! not erase earlier useful work. The source cover remains the value boundary,
 //! and yard/GC policy alone decides the lifetime of materialized nodes.
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
-use std::fmt;
 
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::exact_derived::{data_identity, ExactDerivedCollection, ExactDerivedCollectionError};
+use super::exact_derived::{
+    data_identity, ExactDerivedCollection, ExactDerivedCollectionError, ExactPlannerBlocks,
+    TargetMergeBlock, TargetMergePair,
+};
 use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMapping, CollectionMerge,
     CollectionOperationError, CollectionRead, CollectionRecord, CollectionStore, Cover,
 };
 
-type BoxError = Box<dyn Error + Send + Sync + 'static>;
-
-/// Failure while explicitly compacting one exact target cover.
-#[derive(Debug)]
-pub enum ExactTargetCompactionError {
-    /// Exact-cover completion or fresh attachment failed.
-    Exact(ExactDerivedCollectionError),
-    /// The target encoding could not join one deterministic pair.
-    Merge {
-        /// Canonically lower input content identity.
-        low: CollectionData,
-        /// Canonically higher input content identity.
-        high: CollectionData,
-        /// Concrete construction failure.
-        reason: String,
-    },
-    /// A storage operation failed.
-    Storage {
-        /// Operation that failed.
-        operation: &'static str,
-        /// Backend failure.
-        source: BoxError,
-    },
-    /// Fresh attachment repeated an unstable physical cover.
-    Stalled {
-        /// Repeated cover in canonical content-handle order.
-        cover: Vec<CollectionData>,
-    },
-}
-
-impl ExactTargetCompactionError {
-    fn storage(operation: &'static str, source: impl Error + Send + Sync + 'static) -> Self {
-        Self::Storage {
-            operation,
-            source: Box::new(source),
-        }
-    }
-}
-
-impl fmt::Display for ExactTargetCompactionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Exact(source) => source.fmt(f),
-            Self::Merge { low, high, reason } => write!(
-                f,
-                "merge exact target elements {} and {}: {reason}",
-                hex::encode_upper(low.raw),
-                hex::encode_upper(high.raw),
-            ),
-            Self::Storage { operation, source } => write!(f, "{operation}: {source}"),
-            Self::Stalled { cover } => write!(
-                f,
-                "exact target compaction repeated an unstable {}-member cover",
-                cover.len(),
-            ),
-        }
-    }
-}
-
-impl Error for ExactTargetCompactionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Exact(source) => Some(source),
-            Self::Storage { source, .. } => Some(source.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
-    fn from(source: ExactDerivedCollectionError) -> Self {
-        Self::Exact(source)
-    }
-}
-
-/// Ensure and explicitly compact one exact canonical target cover.
+/// Complete and maintain one canonical target cover.
 ///
 /// The fixed policy assigns each canonical target blob to
 /// `floor(log2(max(1, serialized_len)))`, then repeatedly joins the two lowest
@@ -110,19 +35,18 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// round attempts at most `n - 1` pairs. No policy knobs, manifest, receipt,
 /// signed record, retention record, or implicit flush are involved.
 ///
-/// Each maintenance round stages its deterministic carry under one immutable
-/// reader. After that reader has been dropped, every successfully computed
-/// result is stored before its topologically ordered `MERGE` record—even when
-/// a later pair failed or had no directly materialized join. A fresh read pass
-/// then selects the resulting physical cover without replaying the equations.
-/// Freshly selected covers are compacted again when concurrent or older
-/// evidence exposes another collision. Repetition of any non-stable canonical
-/// cover returns [`ExactTargetCompactionError::Stalled`].
-pub fn compact_exact_target<S, H>(
+/// Each maintenance round finds at most one successful deterministic carry
+/// under one immutable reader. After that reader has been dropped, the result
+/// is stored before its `MERGE` record. The per-point planner then observes the
+/// fresh equation before another arbitrary dyadic pair can be chosen. Freshly
+/// selected covers are carried again when concurrent or older evidence exposes
+/// another collision. Repetition of any non-stable canonical cover returns
+/// [`ExactDerivedCollectionError::Stalled`].
+pub(super) fn ensure_target<S, H>(
     exact: &ExactDerivedCollection<H>,
     store: &mut S,
     source_cover: &Cover<H::Source>,
-) -> Result<Cover<H::Target>, ExactTargetCompactionError>
+) -> Result<Cover<H::Target>, ExactDerivedCollectionError>
 where
     S: BlobStore + CollectionStore,
     S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -130,19 +54,28 @@ where
     Handle<H::Source>: InlineEncoding,
     Handle<H::Target>: InlineEncoding,
 {
-    let mut cover = exact.ensure(store, source_cover)?;
+    let mut blocks = ExactPlannerBlocks::default();
+    let mut cover = exact.complete(store, source_cover, &mut blocks)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 
     loop {
-        match publish_round::<S, H::Target>(exact.target_collection(), store, cover)? {
+        match publish_round::<S, H::Target>(
+            exact.target_collection(),
+            store,
+            cover,
+            &blocks.target_merges,
+        )? {
             RoundOutcome::Published => {}
             RoundOutcome::Stable(cover) => return Ok(cover),
         }
-        cover = exact.attach(store, source_cover)?;
+        // Every successful carry can create an exact child image for a known
+        // source-lattice point. Re-enter vertical planning before choosing the
+        // next global size-tiered pair.
+        cover = exact.complete(store, source_cover, &mut blocks)?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
-            return Err(ExactTargetCompactionError::Stalled { cover: identity });
+            return Err(ExactDerivedCollectionError::Stalled { cover: identity });
         }
     }
 }
@@ -164,7 +97,8 @@ fn publish_round<S, Target>(
     collection: Collection<Target>,
     store: &mut S,
     cover: Cover<Target>,
-) -> Result<RoundOutcome<Target>, ExactTargetCompactionError>
+    blocked_target_merges: &BTreeMap<TargetMergePair, TargetMergeBlock>,
+) -> Result<RoundOutcome<Target>, ExactDerivedCollectionError>
 where
     S: BlobStore + CollectionStore,
     S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -176,41 +110,32 @@ where
     }
 
     let reader = store.snapshot().map_err(|source| {
-        ExactTargetCompactionError::storage("open target-compaction snapshot", source)
+        ExactDerivedCollectionError::storage("open target-maintenance snapshot", source)
     })?;
     let descriptor = super::api::load_collection_descriptor(&reader, collection.handle())
         .map_err(|error| {
-            ExactTargetCompactionError::Exact(ExactDerivedCollectionError::Resolution(format!(
-                "load exact target descriptor: {error}"
-            )))
+            ExactDerivedCollectionError::Resolution(format!("load target descriptor: {error}"))
         })?
         .fragment;
     super::encoding::validate_descriptor_type::<Target>(&descriptor).map_err(|error| {
-        ExactTargetCompactionError::Exact(ExactDerivedCollectionError::Resolution(format!(
-            "invalid exact target descriptor: {error}"
-        )))
+        ExactDerivedCollectionError::Resolution(format!("invalid target descriptor: {error}"))
     })?;
     let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
-    let mut locations = BTreeMap::<CollectionData, u32>::new();
     for handle in cover.members() {
         let data = Handle::<Target>::to_hash(handle);
         let blob = reader.get(handle).map_err(|source| {
-            ExactTargetCompactionError::storage("load target-compaction member", source)
+            ExactDerivedCollectionError::storage("load target-maintenance member", source)
         })?;
         let tier = target_tier::<Target>(&blob);
-        locations.insert(data, tier);
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
-    let mut outputs = BTreeMap::<CollectionData, Blob<Target>>::new();
-    let mut claims = Vec::<CollectionMerge>::new();
-    let mut deferred_error = None;
     loop {
         let Some(tier) = tiers
             .iter()
             .find_map(|(tier, bin)| (bin.len() >= 2).then_some(*tier))
         else {
-            break;
+            return Ok(RoundOutcome::Stable(cover));
         };
         let mut bin = tiers.remove(&tier).expect("selected tier exists");
         let (low_data, low) = bin.pop_first().expect("colliding tier has a low input");
@@ -218,78 +143,47 @@ where
         if !bin.is_empty() {
             tiers.insert(tier, bin);
         }
-        locations.remove(&low_data);
-        locations.remove(&high_data);
+        match blocked_target_merges.get(&(low_data, high_data)) {
+            Some(TargetMergeBlock::Unsupported) => {
+                return Ok(RoundOutcome::Stable(cover));
+            }
+            Some(TargetMergeBlock::Capacity) => {
+                tiers.entry(tier).or_default().insert(high_data, high);
+                continue;
+            }
+            None => {}
+        }
 
         let constructed = match Target::join_members(&descriptor, &low, &high, &reader) {
             Ok(Some(constructed)) => constructed,
-            Ok(None) => break,
+            Ok(None) => return Ok(RoundOutcome::Stable(cover)),
             Err(CollectionOperationError::Fatal(reason)) => {
-                deferred_error = Some(ExactTargetCompactionError::Merge {
+                return Err(ExactDerivedCollectionError::Merge {
                     low: low_data,
                     high: high_data,
                     reason,
                 });
-                break;
             }
             Err(CollectionOperationError::Capacity(_)) => {
-                locations.insert(high_data, tier);
                 tiers.entry(tier).or_default().insert(high_data, high);
                 continue;
             }
         };
         let result_data = data_identity::<Target>(&constructed);
-        let result = constructed;
         let claim = CollectionMerge::new(collection.handle(), low_data, high_data, result_data);
 
-        if let Some(existing_tier) = locations.remove(&result_data) {
-            let existing_bin = tiers
-                .get_mut(&existing_tier)
-                .expect("located result tier exists");
-            existing_bin.remove(&result_data);
-            if existing_bin.is_empty() {
-                tiers.remove(&existing_tier);
-            }
-        }
-        let result_tier = target_tier::<Target>(&result);
-        locations.insert(result_data, result_tier);
-        tiers
-            .entry(result_tier)
-            .or_default()
-            .insert(result_data, result.clone());
-        outputs.insert(result_data, result);
-        claims.push(claim);
-    }
-
-    if claims.is_empty() {
-        if let Some(error) = deferred_error {
-            return Err(error);
-        }
-        return Ok(RoundOutcome::Stable(cover));
-    }
-
-    // Closure-dependent joins observe one immutable reader boundary. Do not
-    // retain it across publication.
-    drop(reader);
-
-    for claim in claims {
-        if let Some(result) = outputs.remove(&claim.result()) {
-            store.put::<Target, _>(result).map_err(|error| {
-                ExactTargetCompactionError::storage("store compacted target", error)
-            })?;
-        }
+        // Closure-dependent joins observe one immutable reader boundary. Do
+        // not retain it across publication. Publish exactly this carry, then
+        // let the caller re-enter per-point planning against a fresh snapshot.
+        drop(reader);
+        store
+            .put::<Target, _>(constructed)
+            .map_err(|error| ExactDerivedCollectionError::storage("store merged target", error))?;
         store
             .insert(CollectionRecord::Merge(claim))
-            .map_err(|error| ExactTargetCompactionError::storage("publish target MERGE", error))?;
+            .map_err(|error| ExactDerivedCollectionError::storage("publish target MERGE", error))?;
+        return Ok(RoundOutcome::Published);
     }
-    debug_assert!(
-        outputs.is_empty(),
-        "every computed result has a MERGE claim"
-    );
-    if let Some(error) = deferred_error {
-        return Err(error);
-    }
-    Ok(RoundOutcome::Published)
 }
 
 #[cfg(test)]
@@ -409,7 +303,13 @@ mod tests {
             blobs.put::<NoJoinEncoding, _>(member).unwrap();
         }
 
-        let result = publish_round(collection, &mut NoWriteStore { blobs }, cover).unwrap();
+        let result = publish_round(
+            collection,
+            &mut NoWriteStore { blobs },
+            cover,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let RoundOutcome::Stable(result) = result else {
             panic!("a no-join encoding published a compaction round");
         };

@@ -26,9 +26,6 @@ use crate::blob::encodings::succinctarchive::{
 };
 use crate::blob::{Blob, TryFromBlob};
 use crate::collection::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
-use crate::collection::exact_target_compaction::{
-    compact_exact_target, ExactTargetCompactionError,
-};
 use crate::collection::{
     Collection, CollectionData, CollectionMapping, CollectionOperationError, CollectionStore,
     Cover, CoverAdvanceError, FactCover, TryFromCover, TryFromCoverError,
@@ -149,13 +146,11 @@ impl TryFromCover<Rank9AcceleratedSuccinctArchiveBlob> for UnionArchive<OrderedU
     }
 }
 
-/// Failure to complete or attach one exact accelerated Succinct cover.
+/// Failure to maintain or attach one exact accelerated Succinct cover.
 #[derive(Debug)]
 pub enum SuccinctArchiveCollectionError {
     /// Exact-cover resolution, construction, or storage failed.
     Exact(ExactDerivedCollectionError),
-    /// Explicit raw target compaction failed.
-    Compaction(ExactTargetCompactionError),
     /// A freshly attached accelerated cover could not become a query view.
     View(Rank9AcceleratedViewError),
     /// A selected accelerated member could not be fetched.
@@ -173,7 +168,6 @@ impl fmt::Display for SuccinctArchiveCollectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Exact(source) => source.fmt(formatter),
-            Self::Compaction(source) => source.fmt(formatter),
             Self::View(source) => source.fmt(formatter),
             Self::MemberGet { member, reason } => write!(
                 formatter,
@@ -191,7 +185,6 @@ impl Error for SuccinctArchiveCollectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Exact(source) => Some(source),
-            Self::Compaction(source) => Some(source),
             Self::View(source) => Some(source),
             Self::MemberGet { .. } => None,
             Self::Snapshot(_) => None,
@@ -202,12 +195,6 @@ impl Error for SuccinctArchiveCollectionError {
 impl From<ExactDerivedCollectionError> for SuccinctArchiveCollectionError {
     fn from(source: ExactDerivedCollectionError) -> Self {
         Self::Exact(source)
-    }
-}
-
-impl From<ExactTargetCompactionError> for SuccinctArchiveCollectionError {
-    fn from(source: ExactTargetCompactionError) -> Self {
-        Self::Compaction(source)
     }
 }
 
@@ -504,7 +491,7 @@ impl SuccinctArchiveCollection {
         accelerated_view(&snapshot, &accelerated)
     }
 
-    /// Ensure both ordinary derivation stages and attach the exact view.
+    /// Maintain both ordinary derivation stages and attach the exact view.
     pub fn ensure<S>(
         &self,
         store: &mut S,
@@ -518,24 +505,6 @@ impl SuccinctArchiveCollection {
         let accelerated = self
             .rank9_derivation()?
             .ensure_member_images(store, &raw_cover)?;
-        let snapshot = store
-            .snapshot()
-            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
-        accelerated_view(&snapshot, &accelerated)
-    }
-
-    /// Compact the raw target, then ensure the matching accelerated cover.
-    pub fn compact_exact<S>(
-        &self,
-        store: &mut S,
-        source_cover: &FactCover,
-    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
-    {
-        let raw = compact_exact_target(&self.raw_kernel()?, store, source_cover)?;
-        let accelerated = self.rank9_derivation()?.ensure_member_images(store, &raw)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
@@ -709,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn compacting_raw_constructs_the_exact_accelerated_image() {
+    fn ensuring_raw_constructs_the_exact_accelerated_image() {
         let mut store = MemoryRepo::default();
         let facade = facade(&mut store);
         let a: Blob<SimpleArchive> = [row(1, 2, 3)].into_iter().collect::<TribleSet>().to_blob();
@@ -735,7 +704,7 @@ mod tests {
             .ensure_member_images(&mut store, &raw)
             .unwrap();
 
-        let archive = facade.compact_exact(&mut store, &cover).unwrap();
+        let archive = facade.ensure(&mut store, &cover).unwrap();
         assert_eq!(archive.iter().count(), 2);
 
         let snapshot = store.snapshot().unwrap();

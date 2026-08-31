@@ -307,16 +307,31 @@ let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
 
 let archive = succinct.ensure(&mut storage, &cover)?;
 let same_archive = succinct.attach(&mut storage, &cover)?;
-let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 ```
 
 - `attach` is read-only, performs no collection algebra, and requires a
   complete resident physical cover.
-- `ensure` reuses stored equations, computes missing canonical images, and
-  publishes every computed source/image/equation triple before beginning the
-  next one.
-- `compact_exact` deterministically compacts the raw target cover, then ensures
-  the matching accelerated cover and returns its query view.
+- `ensure` is the singular construction and maintenance path. It completes the
+  raw exact projection, deterministically carries colliding raw target members
+  by serialized-size tier, then ensures the matching accelerated cover and
+  returns its query view.
+
+At each target lattice node, `ensure` reuses the resident result first. If the
+result is absent, it joins the two corresponding target children when both are
+resident. A capacity-terminal or unsupported target join falls through to the
+corresponding resident source node. If that source node is absent, or its
+mapping reports a capacity boundary, planning reuses any already complete lower
+target cover and otherwise descends to the source children. It never creates a
+missing source merge as a shortcut. Every target `MERGE` or cross-lattice
+`DERIVE` it actually computes is stored with its equation, including useful
+work completed before a later capacity or fatal result.
+
+The maintenance policy has no knob: a raw target member belongs to
+`floor(log2(max(1, serialized_len)))`, and the lowest two content handles in
+the lowest colliding tier are carried first. A capacity-limited or non-joinable
+encoding may leave a collision stable; otherwise the resulting cover has at
+most one member per tier. Each successful global carry re-enters the exact
+per-point planner before another dyadic pair is selected.
 
 Every position uses the same `Cover<E>` shape, but its typed handles cannot be
 mixed across representations. `Cover<SimpleArchive>` contains only
@@ -324,20 +339,20 @@ mixed across representations. `Cover<SimpleArchive>` contains only
 `Handle<SuccinctArchiveBlob>`; the second stage uses
 `Handle<Rank9AcceleratedSuccinctArchiveBlob>`. The target descriptor and its
 bound `CollectionMapping` determine route freedom. Ordinary raw
-Succinct derivation may choose any cheapest resident route whose support
-equals the source cover. The accelerated stage maps the exact raw cover selected
-upstream. Its cover-aware view reads each embedded raw handle through the
-store snapshot and validates the exact raw/index pair before constructing the
-query runtime. Exactness is a property of the mapping, not a mode bit or an
-untyped hash convention.
+Succinct derivation follows the resident-node priority above while preserving
+support equal to the source cover. The accelerated stage maps the exact raw
+cover selected upstream. Its cover-aware view reads each embedded raw handle
+through the store snapshot and validates the exact raw/index pair before
+constructing the query runtime. Exactness is a property of the mapping, not a
+mode bit or an untyped hash convention.
 
 None of them signs a replacement root, advances a head, flushes implicitly, or
 adds a special manifest. [Regular-path summaries](regular-path-indexes.md) and
 Rank9 acceleration both use the same collection algebra. The accelerated
 encoding is a Merkle root whose first 32 bytes name its exact portable raw
 child, but it does not define a direct Rank9 join. Raw Succinct members are
-joinable, so `compact_exact` and other maintenance compact that upstream
-lattice first and then derive the corresponding accelerated root. Derivation
+joinable, so `ensure` maintains that upstream target lattice first and then
+derives the exact accelerated image of the selected raw cover. Derivation
 stores the selected raw source before the accelerated root and ordinary
 `DERIVE` record. An incomplete source-bound member is merely a nonresident
 route which `ensure` can reconstruct.

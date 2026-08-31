@@ -12,9 +12,6 @@ use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::descriptor;
-use crate::collection::exact_target_compaction::{
-    compact_exact_target, ExactTargetCompactionError,
-};
 use crate::collection::simplearchive_union;
 use crate::collection::{AdmissionPolicy, CollectionPolicy};
 use crate::collection::{CollectionCommit, CollectionRead, CollectionStoreExt};
@@ -913,9 +910,6 @@ fn empty_cover_performs_no_store_operation() {
     let cover = source_cover(&[]);
     assert!(kernel().attach(&mut store, &cover).unwrap().is_empty());
     assert!(kernel().ensure(&mut store, &cover).unwrap().is_empty());
-    assert!(compact_exact_target(&kernel(), &mut store, &cover)
-        .unwrap()
-        .is_empty());
 }
 
 #[test]
@@ -1239,16 +1233,525 @@ fn compacted_source_cover_reuses_resident_decomposition_images() {
     };
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
+    let target = with_selective(&algebra, |kernel| {
+        kernel.complete(
+            &mut store,
+            &source_cover,
+            &mut ExactPlannerBlocks::default(),
+        )
+    })
+    .unwrap();
+
+    assert_eq!(
+        cover_ids(&target),
+        vec![data(&join_test_targets(&fa, &fb).unwrap())]
+    );
+    assert_eq!((store.puts, store.inserts), (1, 1));
+    assert!(!algebra.derive_attempts.lock().unwrap().contains(&data(&c)));
+}
+
+#[test]
+fn ensure_joins_resident_target_children_before_crossing_the_mapping() {
+    let a = archive([(1, 3)]);
+    let b = archive((2u8..=9).map(|entity| (entity, entity + 20)));
+    let mut inner = MemoryRepo::default();
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
+    let c = publish_source_merge(&mut inner, &a, &b);
+    let fa = publish_derive(&mut inner, &a);
+    let fb = publish_derive(&mut inner, &b);
+    let expected = join_test_targets(&fa, &fb).unwrap();
+    let pair = SelectiveMapping::pair(&fa, &fb);
+    assert_ne!(
+        fa.bytes.len().max(1).ilog2(),
+        fb.bytes.len().max(1).ilog2(),
+        "the local target-child rule must not depend on the global LSM tier",
+    );
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
+
     let target =
         with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
 
-    let mut actual: Vec<_> = target.members().collect();
-    actual.sort_unstable();
-    let mut expected = vec![fa.get_handle(), fb.get_handle()];
-    expected.sort_unstable();
-    assert_eq!(actual, expected);
-    assert_eq!((store.puts, store.inserts), (0, 0));
-    assert!(!algebra.derive_attempts.lock().unwrap().contains(&data(&c)));
+    assert_eq!(cover_ids(&target), vec![data(&expected)]);
+    assert!(algebra.derive_attempts.lock().unwrap().is_empty());
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert_eq!(algebra.target_attempts.lock().unwrap().as_slice(), &[pair]);
+    assert_eq!((store.puts, store.inserts), (1, 1));
+}
+
+#[test]
+fn target_child_capacity_falls_back_to_the_corresponding_source_node() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let mut inner = MemoryRepo::default();
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
+    let c = publish_source_merge(&mut inner, &a, &b);
+    let fa = publish_derive(&mut inner, &a);
+    let fb = publish_derive(&mut inner, &b);
+    let pair = SelectiveMapping::pair(&fa, &fb);
+    let algebra = SelectiveMapping {
+        capacity_target_pairs: BTreeSet::from([pair]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
+
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+
+    assert_eq!(cover_ids(&target), vec![data(&derive(&c).unwrap())]);
+    assert_eq!(algebra.target_attempts.lock().unwrap().as_slice(), &[pair]);
+    assert_eq!(
+        algebra.derive_attempts.lock().unwrap().as_slice(),
+        &[data(&c)]
+    );
+}
+
+#[test]
+fn ensure_uses_a_resident_corresponding_source_node_before_target_children() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let c = join_test_sources(&a, &b);
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    inner.put::<TestSourceBlob, _>(c.clone()).unwrap();
+    inner
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().source_collection().handle(),
+            data(&a),
+            data(&b),
+            data(&c),
+        )))
+        .unwrap();
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(
+        kernel().source_collection(),
+        [a.get_handle(), b.get_handle()],
+    );
+
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+
+    assert_eq!(cover_ids(&target), vec![data(&derive(&c).unwrap())]);
+    assert_eq!(
+        algebra.derive_attempts.lock().unwrap().as_slice(),
+        &[data(&c)]
+    );
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert!(algebra.target_attempts.lock().unwrap().is_empty());
+    assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ensure_uses_resident_corresponding_source_node_before_target_grandchildren() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let e = archive([(5, 6)]);
+    let d = join_test_sources(&a, &b);
+    let c = join_test_sources(&d, &e);
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    inner.put::<TestSourceBlob, _>(c.clone()).unwrap();
+    for (low, high, result) in [(&a, &b, &d), (&d, &e, &c)] {
+        inner
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                kernel().source_collection().handle(),
+                data(low),
+                data(high),
+                data(result),
+            )))
+            .unwrap();
+    }
+    publish_derive(&mut inner, &a);
+    publish_derive(&mut inner, &b);
+    publish_derive(&mut inner, &e);
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
+
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+
+    let derive_attempts = algebra.derive_attempts.lock().unwrap().clone();
+    let target_attempts = algebra.target_attempts.lock().unwrap().clone();
+    assert_eq!(
+        (derive_attempts, target_attempts),
+        (vec![data(&c)], Vec::new())
+    );
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert_eq!(cover_ids(&target), vec![data(&derive(&c).unwrap())]);
+}
+
+#[test]
+fn recursive_preferences_follow_the_first_fully_actionable_source_producer() {
+    let p1_low_a = archive([(1, 11)]);
+    let p1_low_b = archive([(2, 12), (3, 13)]);
+    let p1_low = join_test_sources(&p1_low_a, &p1_low_b);
+    let p1_high = archive([(4, 14), (5, 15), (6, 16)]);
+
+    let p2_low_a = archive([(1, 11), (4, 14)]);
+    let p2_low_b = archive([(5, 15)]);
+    let p2_low = join_test_sources(&p2_low_a, &p2_low_b);
+    let p2_high = archive([(2, 12), (3, 13), (6, 16)]);
+
+    let c1 = join_test_sources(&p1_low, &p1_high);
+    let c2 = join_test_sources(&p2_low, &p2_high);
+    assert_eq!(c1.bytes, c2.bytes);
+
+    let mut alternatives = [
+        (
+            SelectiveMapping::pair(&p1_low, &p1_high),
+            (&p1_low, &p1_high, &p1_low_a, &p1_low_b),
+        ),
+        (
+            SelectiveMapping::pair(&p2_low, &p2_high),
+            (&p2_low, &p2_high, &p2_low_a, &p2_low_b),
+        ),
+    ];
+    alternatives.sort_unstable_by_key(|(pair, _)| *pair);
+    let (_, unavailable) = alternatives[0];
+    let (_, available) = alternatives[1];
+
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    for (low, high, result) in [
+        (
+            p1_low_a.get_handle(),
+            p1_low_b.get_handle(),
+            p1_low.get_handle(),
+        ),
+        (
+            p2_low_a.get_handle(),
+            p2_low_b.get_handle(),
+            p2_low.get_handle(),
+        ),
+        (p1_low.get_handle(), p1_high.get_handle(), c1.get_handle()),
+        (p2_low.get_handle(), p2_high.get_handle(), c2.get_handle()),
+    ] {
+        inner
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                kernel().source_collection().handle(),
+                Handle::<TestSourceBlob>::to_hash(low),
+                Handle::<TestSourceBlob>::to_hash(high),
+                Handle::<TestSourceBlob>::to_hash(result),
+            )))
+            .unwrap();
+    }
+
+    let (available_low, available_high, available_low_a, available_low_b) = available;
+    for source in [available_low_a, available_low_b, available_high] {
+        publish_derive(&mut inner, source);
+    }
+    let nested_pair = SelectiveMapping::pair(
+        &derive(available_low_a).unwrap(),
+        &derive(available_low_b).unwrap(),
+    );
+    let available_low_target = derive(available_low).unwrap();
+    let root_pair = SelectiveMapping::pair(&available_low_target, &derive(available_high).unwrap());
+    let expected = derive(&c1).unwrap();
+
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c1.get_handle()]);
+
+    let target = with_selective(&algebra, |kernel| {
+        kernel.complete(
+            &mut store,
+            &source_cover,
+            &mut ExactPlannerBlocks::default(),
+        )
+    })
+    .unwrap();
+
+    assert_eq!(cover_ids(&target), vec![data(&expected)]);
+    assert_eq!(
+        algebra.target_attempts.lock().unwrap().as_slice(),
+        &[nested_pair, root_pair]
+    );
+    assert!(algebra.derive_attempts.lock().unwrap().is_empty());
+    assert_ne!(
+        SelectiveMapping::pair(unavailable.0, unavailable.1),
+        SelectiveMapping::pair(available_low, available_high),
+    );
+}
+
+#[test]
+fn capacity_source_node_falls_back_to_an_existing_lower_target_cover() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let e = archive([(5, 6)]);
+    let d = join_test_sources(&a, &b);
+    let c = join_test_sources(&d, &e);
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    inner.put::<TestSourceBlob, _>(c.clone()).unwrap();
+    for (low, high, result) in [(&a, &b, &d), (&d, &e, &c)] {
+        inner
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                kernel().source_collection().handle(),
+                data(low),
+                data(high),
+                data(result),
+            )))
+            .unwrap();
+    }
+    for source in [&a, &b, &e] {
+        publish_derive(&mut inner, source);
+    }
+    let algebra = SelectiveMapping {
+        capacity_derives: BTreeSet::from([data(&c)]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
+
+    let target = with_selective(&algebra, |kernel| {
+        kernel.complete(
+            &mut store,
+            &source_cover,
+            &mut ExactPlannerBlocks::default(),
+        )
+    })
+    .unwrap();
+
+    assert_eq!(
+        algebra.derive_attempts.lock().unwrap().as_slice(),
+        &[data(&c)]
+    );
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert!(algebra.target_attempts.lock().unwrap().is_empty());
+    assert_eq!(
+        joined_cover(&mut store.inner, &target).bytes,
+        derive(&c).unwrap().bytes
+    );
+    assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn capacity_on_one_corresponding_source_node_does_not_skip_another() {
+    let a = archive([(1, 11)]);
+    let b = archive([(2, 12)]);
+    let e = archive([(3, 13)]);
+    let d = join_test_sources(&a, &b);
+    let c = join_test_sources(&d, &e);
+
+    let f = archive([(4, 14)]);
+    let g = archive([(5, 15)]);
+    let h = archive([(6, 16)]);
+    let i = join_test_sources(&f, &g);
+    let j = join_test_sources(&i, &h);
+
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    for root in [&c, &j] {
+        inner.put::<TestSourceBlob, _>(root.clone()).unwrap();
+    }
+    for (low, high, result) in [(&a, &b, &d), (&d, &e, &c), (&f, &g, &i), (&i, &h, &j)] {
+        inner
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                kernel().source_collection().handle(),
+                data(low),
+                data(high),
+                data(result),
+            )))
+            .unwrap();
+    }
+    for source in [&a, &b, &e, &f, &g, &h] {
+        publish_derive(&mut inner, source);
+    }
+
+    let mut roots = [c, j];
+    roots.sort_unstable_by_key(data);
+    let blocked = data(&roots[0]);
+    let successful = data(&roots[1]);
+    let algebra = SelectiveMapping {
+        capacity_derives: BTreeSet::from([blocked]),
+        ..SelectiveMapping::default()
+    };
+    let source_cover = Cover::from_members(
+        kernel().source_collection(),
+        roots.iter().map(Blob::get_handle),
+    );
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+
+    with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+
+    assert_eq!(
+        algebra.derive_attempts.lock().unwrap().as_slice(),
+        &[blocked, successful]
+    );
+    assert!(derived_inputs(&mut store.inner).contains(&successful));
+    assert!(!derived_inputs(&mut store.inner).contains(&blocked));
+}
+
+#[test]
+fn successful_corresponding_source_node_is_visible_before_later_capacity_fallback() {
+    let a = archive([(1, 21)]);
+    let b = archive([(2, 22)]);
+    let e = archive([(3, 23)]);
+    let d = join_test_sources(&a, &b);
+    let c = join_test_sources(&d, &e);
+
+    let f = archive([(4, 24)]);
+    let g = archive([(5, 25)]);
+    let h = archive([(6, 26)]);
+    let i = join_test_sources(&f, &g);
+    let j = join_test_sources(&i, &h);
+
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    for root in [&c, &j] {
+        inner.put::<TestSourceBlob, _>(root.clone()).unwrap();
+    }
+    for (low, high, result) in [(&a, &b, &d), (&d, &e, &c), (&f, &g, &i), (&i, &h, &j)] {
+        inner
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                kernel().source_collection().handle(),
+                data(low),
+                data(high),
+                data(result),
+            )))
+            .unwrap();
+    }
+
+    let (successful, blocked, blocked_leaves) = if data(&c) < data(&j) {
+        (&c, &j, [&f, &g, &h])
+    } else {
+        (&j, &c, [&a, &b, &e])
+    };
+    for source in blocked_leaves {
+        publish_derive(&mut inner, source);
+    }
+    let successful = data(successful);
+    let blocked = data(blocked);
+    let algebra = SelectiveMapping {
+        capacity_derives: BTreeSet::from([blocked]),
+        ..SelectiveMapping::default()
+    };
+    let source_cover = Cover::from_data(kernel().source_collection(), [successful, blocked]);
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+
+    with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+
+    assert_eq!(
+        algebra.derive_attempts.lock().unwrap().as_slice(),
+        &[successful, blocked]
+    );
+    let stored = derived_inputs(&mut store.inner);
+    assert!(stored.contains(&successful));
+    assert!(!stored.contains(&blocked));
+}
+
+#[test]
+fn ensure_derives_source_children_without_constructing_the_corresponding_source_node() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let c = join_test_sources(&a, &b);
+    let fa = derive(&a).unwrap();
+    let fb = derive(&b).unwrap();
+    let expected = join_test_targets(&fa, &fb).unwrap();
+    let pair = SelectiveMapping::pair(&fa, &fb);
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
+    inner
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().source_collection().handle(),
+            data(&a),
+            data(&b),
+            data(&c),
+        )))
+        .unwrap();
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
+
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+
+    assert_eq!(cover_ids(&target), vec![data(&expected)]);
+    let mut actual_derives = algebra.derive_attempts.lock().unwrap().clone();
+    actual_derives.sort_unstable();
+    let mut expected_derives = vec![data(&a), data(&b)];
+    expected_derives.sort_unstable();
+    assert_eq!(actual_derives, expected_derives);
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert_eq!(algebra.target_attempts.lock().unwrap().as_slice(), &[pair]);
+    assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ensure_derives_only_the_target_child_not_already_represented() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let c = join_test_sources(&a, &b);
+    let fa = derive(&a).unwrap();
+    let fb = derive(&b).unwrap();
+    let expected = join_test_targets(&fa, &fb).unwrap();
+    let pair = SelectiveMapping::pair(&fa, &fb);
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
+    inner
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().source_collection().handle(),
+            data(&a),
+            data(&b),
+            data(&c),
+        )))
+        .unwrap();
+    publish_derive(&mut inner, &a);
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
+
+    let target =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+
+    assert_eq!(cover_ids(&target), vec![data(&expected)]);
+    assert_eq!(
+        algebra.derive_attempts.lock().unwrap().as_slice(),
+        &[data(&b)]
+    );
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert_eq!(algebra.target_attempts.lock().unwrap().as_slice(), &[pair]);
+    assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1269,17 +1772,21 @@ fn compacted_source_capacity_falls_back_to_resident_decomposition_inputs() {
     };
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    let target =
-        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
+    let target = with_selective(&algebra, |kernel| {
+        kernel.complete(
+            &mut store,
+            &source_cover,
+            &mut ExactPlannerBlocks::default(),
+        )
+    })
+    .unwrap();
 
-    let mut actual: Vec<_> = target.members().collect();
-    actual.sort_unstable();
-    let mut expected = vec![
-        derive(&a).unwrap().get_handle(),
-        derive(&b).unwrap().get_handle(),
-    ];
-    expected.sort_unstable();
-    assert_eq!(actual, expected);
+    assert_eq!(
+        cover_ids(&target),
+        vec![data(
+            &join_test_targets(&derive(&a).unwrap(), &derive(&b).unwrap()).unwrap()
+        )]
+    );
     assert!(store.puts > 0 && store.inserts > 0);
     assert_eq!(store.missing_gets.load(Ordering::SeqCst), 0);
     let attempts = algebra.derive_attempts.lock().unwrap();
@@ -1496,7 +2003,7 @@ fn stable_exact_cover_compaction_performs_zero_additional_writes() {
     };
     let source_cover = source_cover(&[commit]);
 
-    let cover = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
+    let cover = kernel().ensure(&mut store, &source_cover).unwrap();
     assert_eq!(cover.len(), 1);
     assert_eq!(store.puts, 0);
     assert_eq!(store.inserts, 0);
@@ -1524,7 +2031,7 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
 
     let cover =
         with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
-    assert_eq!(cover.len(), 2);
+    assert_eq!(cover.len(), 1);
     let mut actual = derived_inputs(&mut store.inner);
     actual.sort_unstable();
     let mut expected = vec![data(&a), data(&b)];
@@ -1535,6 +2042,7 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
         .lock()
         .unwrap()
         .contains(&data(&upper)));
+    assert_eq!(algebra.target_attempts.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -1953,7 +2461,7 @@ fn compaction_collapses_same_tier_and_returns_an_exact_tier_stable_cover() {
         .collect();
     let source_cover = source_cover(&commits);
 
-    let cover = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
+    let cover = kernel().ensure(&mut store, &source_cover).unwrap();
     let mut tiers = BTreeSet::new();
     {
         let snapshot = store.snapshot().unwrap();
@@ -2007,10 +2515,8 @@ fn target_capacity_retires_only_low() {
         ..CountingStore::default()
     };
 
-    let cover = with_selective(&algebra, |kernel| {
-        compact_exact_target(kernel, &mut store, &source_cover)
-    })
-    .unwrap();
+    let cover =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
     assert_eq!(cover.len(), 2);
     assert_eq!(
         algebra.target_attempts.lock().unwrap().as_slice(),
@@ -2059,9 +2565,9 @@ fn fatal_late_target_join_preserves_the_successful_prefix() {
 
     assert!(matches!(
         with_selective(&algebra, |kernel| {
-            compact_exact_target(kernel, &mut store, &source_cover)
+            kernel.ensure(&mut store, &source_cover)
         }),
-        Err(ExactTargetCompactionError::Merge { low, high, .. })
+        Err(ExactDerivedCollectionError::Merge { low, high, .. })
             if (low, high) == fatal_pair
     ));
     assert_eq!(
@@ -2102,16 +2608,12 @@ fn capacity_stable_target_collision_is_repeatable_and_zero_write() {
         ..CountingStore::default()
     };
 
-    let first = with_selective(&algebra, |kernel| {
-        compact_exact_target(kernel, &mut store, &source_cover)
-    })
-    .unwrap();
+    let first =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
     assert_eq!(first.len(), 2);
     assert_eq!((store.puts, store.inserts), (0, 0));
-    let second = with_selective(&algebra, |kernel| {
-        compact_exact_target(kernel, &mut store, &source_cover)
-    })
-    .unwrap();
+    let second =
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
     assert_eq!(cover_ids(&first), cover_ids(&second));
     assert_eq!((store.puts, store.inserts), (0, 0));
     assert!(target_merge_records(&mut store.inner).is_empty());
@@ -2159,7 +2661,7 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_stored_equation() {
     }
     let before = kernel().attach(&mut store, &source_cover).unwrap();
     assert_eq!(before.len(), 3);
-    let after = compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
+    let after = kernel().ensure(&mut store, &source_cover).unwrap();
     let mut tiers = BTreeSet::new();
     let tier_stable = {
         let snapshot = store.snapshot().unwrap();
@@ -2200,8 +2702,8 @@ fn compaction_is_cover_order_deterministic_and_repeatedly_idempotent() {
     let first_cover = source_cover(&first_commits);
     let second_cover = source_cover(&second_commits);
 
-    let first = compact_exact_target(&kernel(), &mut first_store, &first_cover).unwrap();
-    let second = compact_exact_target(&kernel(), &mut second_store, &second_cover).unwrap();
+    let first = kernel().ensure(&mut first_store, &first_cover).unwrap();
+    let second = kernel().ensure(&mut second_store, &second_cover).unwrap();
     assert_eq!(cover_ids(&first), cover_ids(&second));
     assert_eq!(
         target_merge_records(&mut first_store),
@@ -2209,7 +2711,7 @@ fn compaction_is_cover_order_deterministic_and_repeatedly_idempotent() {
     );
 
     let records_before = collection_records(&mut first_store);
-    let repeated = compact_exact_target(&kernel(), &mut first_store, &first_cover).unwrap();
+    let repeated = kernel().ensure(&mut first_store, &first_cover).unwrap();
     let records_after = collection_records(&mut first_store);
     assert_eq!(cover_ids(&first), cover_ids(&repeated));
     assert_eq!(records_before, records_after);
@@ -2241,7 +2743,7 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
         events: Vec::new(),
     };
 
-    compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
+    kernel().ensure(&mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
     let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection().handle());
     assert!(!store
@@ -2376,9 +2878,9 @@ fn join_and_put_failures_publish_no_target_merge() {
     };
     assert!(matches!(
         with_selective(&algebra, |kernel| {
-            compact_exact_target(kernel, &mut join_store, &join_cover)
+            kernel.ensure(&mut join_store, &join_cover)
         }),
-        Err(ExactTargetCompactionError::Merge { .. })
+        Err(ExactDerivedCollectionError::Merge { .. })
     ));
     assert!(target_merge_records(&mut join_store).is_empty());
 
@@ -2399,8 +2901,8 @@ fn join_and_put_failures_publish_no_target_merge() {
         reject_at: 1,
     };
     assert!(matches!(
-        compact_exact_target(&kernel(), &mut put_store, &put_cover),
-        Err(ExactTargetCompactionError::Storage { .. })
+        kernel().ensure(&mut put_store, &put_cover),
+        Err(ExactDerivedCollectionError::Storage { .. })
     ));
     assert!(target_merge_records(&mut put_store.inner).is_empty());
 }
@@ -2430,8 +2932,8 @@ fn later_target_put_failure_preserves_the_complete_published_prefix() {
     };
 
     assert!(matches!(
-        compact_exact_target(&kernel(), &mut store, &source_cover(&commits)),
-        Err(ExactTargetCompactionError::Storage { .. })
+        kernel().ensure(&mut store, &source_cover(&commits)),
+        Err(ExactDerivedCollectionError::Storage { .. })
     ));
     assert_eq!(target_merge_records(&mut store.inner).len(), 1);
 }
@@ -2453,8 +2955,8 @@ fn discarded_merge_insert_stalls_instead_of_looping() {
     let mut store = DropMergeStore { inner };
 
     assert!(matches!(
-        compact_exact_target(&kernel(), &mut store, &source_cover),
-        Err(ExactTargetCompactionError::Stalled { cover }) if cover.len() == 2
+        kernel().ensure(&mut store, &source_cover),
+        Err(ExactDerivedCollectionError::Stalled { cover }) if cover.len() == 2
     ));
     assert!(target_merge_records(&mut store.inner).is_empty());
 }

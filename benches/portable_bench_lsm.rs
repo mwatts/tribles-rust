@@ -10,16 +10,17 @@
 //!   build_exact — one end-to-end query-ready exact-Succinct build. Every
 //!                 iteration first publishes the input chunks as independent
 //!                 native `SimpleArchive` collection commits and freezes that
-//!                 collection's exact payload cover OUTSIDE the timer. The timer then
-//!                 covers `SuccinctArchiveCollection::compact_exact`: exact
+//!                 collection's exact payload cover OUTSIDE the timer. The
+//!                 timer then covers `SuccinctArchiveCollection::ensure`:
+//!                 exact
 //!                 source validation/derivation, canonical raw blob puts,
-//!                 deterministic dyadic target compaction, ordinary raw-to-Rank9
-//!                 derivation, equation publication, and final attachment. Source
-//!                 serialization, signing, and publication are deliberately
-//!                 excluded. There is one fixed maintenance policy and no
-//!                 fanout, level, or planner tuning knob. An input pile is
-//!                 opened read-only; each iteration writes only its fresh
-//!                 scratch `MemoryRepo`.
+//!                 deterministic dyadic target maintenance, ordinary
+//!                 raw-to-Rank9 derivation, equation publication, and final
+//!                 attachment. Source serialization, signing, and publication
+//!                 are deliberately excluded. There is one fixed maintenance
+//!                 policy and no fanout, level, or planner tuning knob. An
+//!                 input pile is opened read-only; each iteration writes only
+//!                 its fresh scratch `MemoryRepo`.
 //!   q<N>_union — the same wired query matrix as the main bench (q3 = q3b
 //!                union-under-join, q5 = q5b witness semijoin — keep
 //!                `measure_queries` + the q3b/q5b fns byte-identical with
@@ -780,8 +781,8 @@ fn main() {
 
             let t = Instant::now();
             let union = succinct
-                .compact_exact(&mut store, &cover)
-                .expect("build compact exact Succinct cover");
+                .ensure(&mut store, &cover)
+                .expect("ensure exact Succinct cover");
             if recording {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }

@@ -1,15 +1,14 @@
 //! Evolving-cover maintenance benchmark for canonical Succinct collections.
 //!
-//! This benchmark compares the three real public maintenance operations on
+//! This benchmark compares the two public maintenance paths on
 //! geometrically growing exact covers:
 //!
-//! - `ensure`: canonical raw and Rank9-accelerated derivations.
+//! - `ensure`: deterministic size-tiered raw-target maintenance followed by
+//!   the exact Rank9-accelerated derivation.
 //! - `exact_view().advance`: retain already-admitted immutable shards and run
 //!   ordinary exact admission only over newly signed support.
-//! - `compact_exact`: the same exact completion plus deterministic dyadic
-//!   raw-target compaction and the matching accelerated collection cover.
 //!
-//! Stateless operations get an independent warm store, a source-identical cold
+//! Stateless `ensure` gets an independent warm store, a source-identical cold
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
@@ -244,30 +243,6 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Operation {
-    Ensure,
-    Compact,
-}
-
-impl Operation {
-    fn execute(
-        self,
-        succinct: &SuccinctArchiveCollection,
-        store: &mut MemoryRepo,
-        cover: &Cover<SimpleArchive>,
-    ) -> UnionArchive<OrderedUniverse> {
-        match self {
-            Self::Ensure => succinct
-                .ensure(store, cover)
-                .expect("ensure exact Succinct collection"),
-            Self::Compact => succinct
-                .compact_exact(store, cover)
-                .expect("compact exact Succinct collection"),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Arm {
     EnsureWarm,
@@ -275,9 +250,6 @@ enum Arm {
     EnsureNoop,
     ViewAdvance,
     ViewNoop,
-    CompactWarm,
-    CompactCold,
-    CompactNoop,
 }
 
 impl Arm {
@@ -288,9 +260,6 @@ impl Arm {
             Self::EnsureNoop => "ensure-noop",
             Self::ViewAdvance => "view-advance",
             Self::ViewNoop => "view-noop",
-            Self::CompactWarm => "compact-warm",
-            Self::CompactCold => "compact-cold",
-            Self::CompactNoop => "compact-noop",
         }
     }
 }
@@ -333,15 +302,16 @@ struct RunContext<'a> {
     collections: &'a Collections,
 }
 
-fn time_operation(
-    operation: Operation,
+fn time_ensure(
     store: &mut MemoryRepo,
     cover: &Cover<SimpleArchive>,
     succinct: &SuccinctArchiveCollection,
 ) -> TimedOperation {
     reset_mapping_calls();
     let start = Instant::now();
-    let union = operation.execute(succinct, store, cover);
+    let union = succinct
+        .ensure(store, cover)
+        .expect("ensure exact Succinct collection");
     let elapsed = start.elapsed();
     let calls = mapping_calls();
     black_box(union.segment_count());
@@ -409,24 +379,19 @@ fn finish_sample(
     }
 }
 
-fn run_warm_pair(
-    operation: Operation,
+fn run_ensure_warm_pair(
     store: &mut MemoryRepo,
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
-    let (warm_arm, noop_arm) = match operation {
-        Operation::Ensure => (Arm::EnsureWarm, Arm::EnsureNoop),
-        Operation::Compact => (Arm::CompactWarm, Arm::CompactNoop),
-    };
-    let timed_warm = time_operation(operation, store, context.cover, context.succinct);
+    let timed_warm = time_ensure(store, context.cover, context.succinct);
     let snapshot_after_warm = store
         .snapshot()
         .expect("freeze snapshot between warm and no-op calls");
 
     // Keep these public calls adjacent. In particular, do not materialize the
     // first result or inspect its raw cover before timing the unchanged call.
-    let timed_noop = time_operation(operation, store, context.cover, context.succinct);
+    let timed_noop = time_ensure(store, context.cover, context.succinct);
     let snapshot_after_noop = store.snapshot().expect("freeze snapshot after no-op call");
     assert!(
         snapshot_after_noop
@@ -440,7 +405,7 @@ fn run_warm_pair(
     let raw_cover = observe_raw_cover(store, context.cover, context.exact);
     let warm_calls = timed_warm.calls;
     let warm = finish_sample(
-        warm_arm,
+        Arm::EnsureWarm,
         context,
         context.newly_supported_rows,
         timed_warm,
@@ -454,7 +419,7 @@ fn run_warm_pair(
 
     let noop_calls = timed_noop.calls;
     let noop = finish_sample(
-        noop_arm,
+        Arm::EnsureNoop,
         context,
         context.total_rows,
         timed_noop,
@@ -468,19 +433,13 @@ fn run_warm_pair(
     ([warm, noop], after)
 }
 
-fn run_cold(
-    operation: Operation,
-    arm: Arm,
-    store: &mut MemoryRepo,
-    context: &RunContext<'_>,
-    before: StoreShape,
-) -> Sample {
-    let timed = time_operation(operation, store, context.cover, context.succinct);
+fn run_ensure_cold(store: &mut MemoryRepo, context: &RunContext<'_>, before: StoreShape) -> Sample {
+    let timed = time_ensure(store, context.cover, context.succinct);
     let after = store_shape(store, context.collections);
     let raw_cover = observe_raw_cover(store, context.cover, context.exact);
     let calls = timed.calls;
     let cold = finish_sample(
-        arm,
+        Arm::EnsureCold,
         context,
         context.total_rows,
         timed,
@@ -494,26 +453,21 @@ fn run_cold(
     cold
 }
 
-fn run_operation_family(
+fn run_ensure_family(
     iteration: usize,
-    operation: Operation,
     warm_store: &mut MemoryRepo,
     cold_store: &mut MemoryRepo,
     context: &RunContext<'_>,
     baselines: [StoreShape; 2],
 ) -> (Vec<Sample>, StoreShape) {
     let [warm_before, cold_before] = baselines;
-    let cold_arm = match operation {
-        Operation::Ensure => Arm::EnsureCold,
-        Operation::Compact => Arm::CompactCold,
-    };
     let (warm_pair, warm_after, cold) = if iteration.is_multiple_of(2) {
-        let (warm_pair, warm_after) = run_warm_pair(operation, warm_store, context, warm_before);
-        let cold = run_cold(operation, cold_arm, cold_store, context, cold_before);
+        let (warm_pair, warm_after) = run_ensure_warm_pair(warm_store, context, warm_before);
+        let cold = run_ensure_cold(cold_store, context, cold_before);
         (warm_pair, warm_after, cold)
     } else {
-        let cold = run_cold(operation, cold_arm, cold_store, context, cold_before);
-        let (warm_pair, warm_after) = run_warm_pair(operation, warm_store, context, warm_before);
+        let cold = run_ensure_cold(cold_store, context, cold_before);
+        let (warm_pair, warm_after) = run_ensure_warm_pair(warm_store, context, warm_before);
         (warm_pair, warm_after, cold)
     };
     (vec![warm_pair[0], cold, warm_pair[1]], warm_after)
@@ -713,18 +667,15 @@ fn run_iteration(
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
     let mut source_accounting = new_source_store(succinct);
     let mut cold_ensure_source = new_source_store(succinct);
-    let mut cold_compact_source = new_source_store(succinct);
     let mut warm_ensure = new_source_store(succinct);
     let mut exact_view_source = new_source_store(succinct);
-    let mut warm_compact = new_source_store(succinct);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;
     let mut expected = TribleSet::new();
-    let mut samples = Vec::with_capacity(checkpoints.len() * 8);
+    let mut samples = Vec::with_capacity(checkpoints.len() * 5);
     let mut ensure_derived_shape = StoreShape::default();
     let mut view_derived_shape = StoreShape::default();
-    let mut compact_derived_shape = StoreShape::default();
     for &checkpoint in checkpoints {
         for chunk in &chunks[published..checkpoint] {
             expected.union(chunk.clone());
@@ -735,10 +686,8 @@ fn run_iteration(
                 &mut [
                     &mut source_accounting,
                     &mut cold_ensure_source,
-                    &mut cold_compact_source,
                     &mut warm_ensure,
                     &mut exact_view_source,
-                    &mut warm_compact,
                 ],
             );
         }
@@ -768,14 +717,11 @@ fn run_iteration(
         };
 
         let mut cold_ensure = cold_ensure_source.clone();
-        let mut cold_compact = cold_compact_source.clone();
         let ensure_before = source_shape.plus(ensure_derived_shape);
         let view_before = source_shape.plus(view_derived_shape);
-        let compact_before = source_shape.plus(compact_derived_shape);
         if iteration.is_multiple_of(2) {
-            let (family, warm_after) = run_operation_family(
+            let (family, warm_after) = run_ensure_family(
                 iteration,
-                Operation::Ensure,
                 &mut warm_ensure,
                 &mut cold_ensure,
                 &context,
@@ -792,29 +738,7 @@ fn run_iteration(
             );
             samples.extend(pair);
             view_derived_shape = after.difference(source_shape);
-
-            let (family, warm_after) = run_operation_family(
-                iteration,
-                Operation::Compact,
-                &mut warm_compact,
-                &mut cold_compact,
-                &context,
-                [compact_before, source_shape],
-            );
-            samples.extend(family);
-            compact_derived_shape = warm_after.difference(source_shape);
         } else {
-            let (family, warm_after) = run_operation_family(
-                iteration,
-                Operation::Compact,
-                &mut warm_compact,
-                &mut cold_compact,
-                &context,
-                [compact_before, source_shape],
-            );
-            samples.extend(family);
-            compact_derived_shape = warm_after.difference(source_shape);
-
             let (pair, after) = run_exact_view_pair(
                 &mut exact_view,
                 &mut exact_view_source,
@@ -824,9 +748,8 @@ fn run_iteration(
             samples.extend(pair);
             view_derived_shape = after.difference(source_shape);
 
-            let (family, warm_after) = run_operation_family(
+            let (family, warm_after) = run_ensure_family(
                 iteration,
-                Operation::Ensure,
                 &mut warm_ensure,
                 &mut cold_ensure,
                 &context,
@@ -972,9 +895,6 @@ fn main() {
         Arm::EnsureNoop,
         Arm::ViewAdvance,
         Arm::ViewNoop,
-        Arm::CompactWarm,
-        Arm::CompactCold,
-        Arm::CompactNoop,
     ];
     println!(
         "\n{:>7} {:>13} {:>11} {:>14} {:>10} {:>8}",
@@ -1036,7 +956,7 @@ fn main() {
             assert_eq!(work.commits, 0, "measured operation wrote a COMMIT");
             assert_eq!(
                 work.source_merges, 0,
-                "measured operation compacted the source collection",
+                "measured operation published a source MERGE",
             );
             assert_eq!(work.other_records, 0, "unclassified record write");
         }
@@ -1052,11 +972,9 @@ fn main() {
         }
         let ensure_warm = raw_cover(&aggregates[&(checkpoint, Arm::EnsureWarm)]);
         let ensure_cold = raw_cover(&aggregates[&(checkpoint, Arm::EnsureCold)]);
-        let compact_warm = raw_cover(&aggregates[&(checkpoint, Arm::CompactWarm)]);
-        let compact_cold = raw_cover(&aggregates[&(checkpoint, Arm::CompactCold)]);
         let view_members = aggregates[&(checkpoint, Arm::ViewAdvance)].cover_members;
         println!(
-            "  commits={checkpoint:<7} rows={:<9} logical={} ensure-physical={} ({}/{}) view-members={} compact-physical={} ({}/{})",
+            "  commits={checkpoint:<7} rows={:<9} logical={} ensure-physical={} ({}/{}) view-members={}",
             relation.rows,
             short_hash(&relation.hash),
             if ensure_warm.hash == ensure_cold.hash {
@@ -1067,13 +985,6 @@ fn main() {
             ensure_warm.members,
             ensure_cold.members,
             view_members,
-            if compact_warm.hash == compact_cold.hash {
-                "same"
-            } else {
-                "different"
-            },
-            compact_warm.members,
-            compact_cold.members,
         );
     }
 }

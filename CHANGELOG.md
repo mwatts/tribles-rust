@@ -795,8 +795,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the unpublished API.
 - **Succinct archives now have one two-stage native exact-collection
   lifecycle.** Its former branch-index recipe and branch-bound read wrappers
-  are removed. `SuccinctArchiveCollection` first derives and optionally
-  compacts portable `SuccinctArchiveBlob` members, then derives ordinary
+  are removed. `SuccinctArchiveCollection` first derives and maintains
+  portable `SuccinctArchiveBlob` members, then derives ordinary
   `Rank9AcceleratedSuccinctArchiveBlob` members and exposes their sharded
   `UnionArchive` query view.
 - **The SuccinctArchive example now follows the native collection lifecycle.**
@@ -873,13 +873,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finer cover cannot make an oversized result representable. `Capacity` is
   reserved there until fragmented closure/materialization exists.
 
-  Explicit native target compaction is now available through the generic
-  `collection::exact_target_compaction::compact_exact_target` producer and the
-  thin `SuccinctArchiveCollection::compact_exact` facade. Its fixed policy
-  repeatedly joins the two lowest content handles in the lowest colliding
-  dyadic serialized-byte tier, publishes the target descriptor and canonical
-  result artifacts before topologically ordered unsigned `MERGE` records, and
-  returns the resulting cover for the same source support. A
+  Exact derived collections now expose one constructive `ensure` operation,
+  rather than separate completion and compaction strategies. It reuses
+  an exact target image first, then joins the exact resident target-child pair,
+  then crosses the mapping through the corresponding resident source node, and
+  only then descends through source children. A capacity-terminal target pair
+  or corresponding source node falls through to the next route; the planner
+  never constructs a source merge merely to derive its image. After reaching a local
+  fixpoint, it carries one lowest-handle pair in the lowest colliding dyadic
+  serialized-byte tier and re-enters exact planning before choosing another.
+  Every computed target artifact is stored before its unsigned `MERGE` or
+  `DERIVE` record. A
   capacity failure retires only the lower input for that planning round, so the
   higher input remains eligible for another deterministic pair and every
   attempt shrinks the active set. A no-claim round returns a capacity-stable

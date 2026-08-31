@@ -30,8 +30,8 @@ pub mod discovery;
 pub mod encoding;
 /// Shared exact-cover lifecycle for canonical derived collections.
 pub mod exact_derived;
-/// Explicit size-tiered maintenance for exact canonical target covers.
-pub mod exact_target_compaction;
+/// Deterministic size-tiered maintenance behind exact derived collections.
+mod exact_target_compaction;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
 /// Maintained observed-set projection — the monotone half of register
