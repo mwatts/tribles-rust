@@ -116,6 +116,9 @@ where
     qos: ReconcileQos,
     active: ActiveCollections,
     active_dirty: bool,
+    /// Active collections whose resident closure gained explicitly routed
+    /// bytes after the last published serving snapshot.
+    full_dirty: ActiveCollections,
     /// Network admissions stay outside the advertised snapshot until their
     /// shared durability barrier succeeds. A failed flush is retried on every
     /// refresh without requiring the remote to redeliver the event first.
@@ -186,6 +189,7 @@ where
             qos,
             active: PATCH::new(),
             active_dirty: true,
+            full_dirty: PATCH::new(),
             pending_network_flush: false,
             last_store_snapshot: None,
             last_authorization_change: None,
@@ -243,6 +247,21 @@ where
             self.active.insert(&PatchEntry::new(&collection.raw));
         }
         self.refresh();
+    }
+
+    /// Schedule one active Full-replica forest for reconstruction after a
+    /// collection-routed blob became durable.
+    ///
+    /// Bare blob possession carries no collection relation. Callers use this
+    /// seam only when the acquisition itself named `collection`.
+    pub(crate) fn mark_collection_blobs_dirty(&mut self, collection: CollectionHandle) -> bool {
+        if !matches!(self.qos.blobs, crate::inventory::BlobReplication::Full)
+            || self.active.get(&collection.raw).is_none()
+        {
+            return false;
+        }
+        self.full_dirty.insert(&PatchEntry::new(&collection.raw));
+        true
     }
 
     /// Bare WANT(H) is local retention intent and carries no discovery route.
@@ -339,7 +358,6 @@ where
         let received_batches = incoming.len();
         let received = incoming.iter().map(|batch| batch.len()).sum::<usize>();
         let mut store = self.store.lock().expect("store mutex");
-        let mut admitted = false;
         let mut full_page_acks = Vec::new();
         let mut full_checkpoint = false;
         for batch in incoming {
@@ -347,11 +365,13 @@ where
                 match event {
                     NetEvent::Blob { expected, bytes } => {
                         match store.put::<UnknownBlob, _>(bytes) {
-                            Ok(handle) if handle.raw == expected => admitted = true,
-                            Ok(_) => {
-                                return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                    "network blob hash changed while landing"
-                                )));
+                            Ok(handle) => {
+                                self.pending_network_flush = true;
+                                if handle.raw != expected {
+                                    return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                        "network blob hash changed while landing"
+                                    )));
+                                }
                             }
                             Err(error) => {
                                 return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
@@ -361,7 +381,7 @@ where
                         }
                     }
                     NetEvent::CollectionRecord(record) => match store.insert(record) {
-                        Ok(()) => admitted = true,
+                        Ok(()) => self.pending_network_flush = true,
                         Err(error) => {
                             tracing::warn!(?error, "admitting collection repair record failed")
                         }
@@ -378,9 +398,10 @@ where
                                     "landing collection WRITE claim blob failed: {error:?}"
                                 )));
                             }
+                            self.pending_network_flush = true;
                         }
                         match store.insert_proof(proof) {
-                            Ok(()) => admitted = true,
+                            Ok(()) => self.pending_network_flush = true,
                             Err(error) => {
                                 tracing::warn!(?error, "admitting collection WRITE proof failed");
                                 return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
@@ -390,17 +411,23 @@ where
                         }
                     }
                     NetEvent::FullPage {
+                        collection,
                         blobs,
                         final_page,
                         ack,
                     } => {
+                        if !blobs.is_empty() {
+                            self.full_dirty.insert(&PatchEntry::new(&collection.raw));
+                        }
                         for (expected, bytes) in blobs {
                             match store.put::<UnknownBlob, _>(bytes) {
-                                Ok(handle) if handle.raw == expected => admitted = true,
-                                Ok(_) => {
-                                    return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                        "Full page blob hash changed while landing"
-                                    )));
+                                Ok(handle) => {
+                                    self.pending_network_flush = true;
+                                    if handle.raw != expected {
+                                        return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                            "Full page blob hash changed while landing"
+                                        )));
+                                    }
                                 }
                                 Err(error) => {
                                     return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
@@ -415,7 +442,6 @@ where
                 }
             }
         }
-        self.pending_network_flush |= admitted;
         if self.pending_network_flush {
             match store.flush() {
                 Ok(()) => {
@@ -477,6 +503,7 @@ where
                 && changes == StoreChanges::NONE
                 && !authorization_changed
                 && !self.active_dirty
+                && self.full_dirty.is_empty()
                 && !full_checkpoint
                 && previous_snapshot.is_some()
             {
@@ -497,6 +524,7 @@ where
             let serving = StoreSnapshot::from_store_changes(
                 snapshot.clone(),
                 &self.active,
+                &self.full_dirty,
                 VerifyingKey::from_bytes(self.sender.id().as_bytes())
                     .expect("endpoint id is an Ed25519 key"),
                 previous_snapshot.as_deref(),
@@ -520,6 +548,11 @@ where
                 self.serving_snapshot_rebuilds += 1;
             }
             self.active_dirty = false;
+            // `refresh_checked` owns `&mut self` from event drain through
+            // publication, so no routed mark can race this clear. Events
+            // queued concurrently have not mutated `full_dirty` yet and will
+            // be marked by the next drain.
+            self.full_dirty = PATCH::new();
             self.last_store_snapshot = Some(snapshot);
             self.last_authorization_change = next_authorization_change;
             self.last_observed_at = Some(now);
@@ -905,6 +938,8 @@ mod tests {
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
+    use crate::channel::NetEventBatch;
+
     use super::*;
 
     #[test]
@@ -958,5 +993,40 @@ mod tests {
             .map(|collection| collection.collection())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(active, collections.into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn failed_full_page_keeps_its_collection_dirty() {
+        let key = SigningKey::from_bytes(&[93; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = MemoryRepo::default();
+        let collection = store.collection("failed-full-page", policy).unwrap();
+        let (sender, receiver, wiring) = host::wire(id);
+        let mut peer = Peer::with_wiring(
+            store,
+            ReconcileQos {
+                direction: ReconcileDirection::Bidirectional,
+                blobs: crate::inventory::BlobReplication::Full,
+            },
+            sender,
+            receiver,
+        );
+        peer.activate_collection(collection.handle());
+
+        let (ack, _acked) = tokio::sync::oneshot::channel();
+        let mut page = NetEventBatch::default();
+        page.try_push(NetEvent::FullPage {
+            collection: collection.handle(),
+            blobs: vec![([0xFF; 32], Bytes::from_source(b"hash mismatch".to_vec()))],
+            final_page: true,
+            ack,
+        })
+        .unwrap();
+        wiring.send_admission(page).await;
+
+        assert!(peer.try_refresh().is_err());
+        assert!(peer.pending_network_flush);
+        assert!(peer.full_dirty.get(&collection.handle().raw).is_some());
     }
 }

@@ -203,6 +203,7 @@ impl StoreSnapshot {
     pub(crate) fn from_store_changes<R>(
         snapshot: R,
         active: &ActiveCollections,
+        full_dirty: &ActiveCollections,
         local: VerifyingKey,
         previous: Option<&Self>,
         changes: StoreChanges,
@@ -284,17 +285,16 @@ impl StoreSnapshot {
                     Err(error) => return Err(anyhow::Error::new(error)),
                 }
             };
-            let full_inputs_changed = changes.contains(StoreChanges::BLOBS)
-                || changes.contains(StoreChanges::COLLECTION_RECORDS)
-                || changes.contains(StoreChanges::CAPABILITY_PROOFS)
-                || authorization_changed;
             let full = if !full_replication {
                 Arc::new(FullReplicaState {
                     forest: DisclosureForestPatch::new(),
                     direct_roots: HashSet::new(),
                 })
-            } else if !full_inputs_changed && prior.is_some() {
-                prior.as_ref().unwrap().full.clone()
+            } else if let Some(prior) = prior.as_ref().filter(|prior| {
+                Arc::ptr_eq(&activation, &prior.activation)
+                    && full_dirty.get(&collection.raw).is_none()
+            }) {
+                prior.full.clone()
             } else {
                 Arc::new(build_full_replica_state(&snapshot, &activation))
             };
@@ -700,6 +700,13 @@ pub struct HostWiring {
     snapshot: SnapshotSlot,
     operational_blobs: OperationalBlobSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
+}
+
+#[cfg(test)]
+impl HostWiring {
+    pub(crate) async fn send_admission(&self, batch: NetEventBatch) {
+        self.evt_tx.send(batch).await.unwrap();
+    }
 }
 
 pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
@@ -1377,6 +1384,7 @@ async fn reconcile_collection_peer<T: Transport>(
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         admissions
             .push(NetEvent::FullPage {
+                collection: target.collection,
                 blobs: delta.blobs,
                 final_page: !delta.more,
                 ack: ack_tx,
@@ -1864,11 +1872,367 @@ fn op_name(op: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use anybytes::Bytes;
+    use ed25519_dalek::SigningKey;
+    use iroh_base::EndpointId;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::blob::encodings::UnknownBlob;
+    use triblespace_core::collection::{
+        AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+    };
+    use triblespace_core::id::{ExclusiveId, Id};
+    use triblespace_core::inline::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::patch::{Entry as PatchEntry, PATCH};
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{
+        BlobStorePut, SnapshotSource, StorageFlush, StoreChanges,
+        StoreSnapshot as CoreStoreSnapshot, WantRequest, WantStore,
+    };
+    use triblespace_core::trible::{Fragment, Trible, TribleSet};
+
+    use crate::channel::{NetEvent, NetEventBatch};
+    use crate::inventory::{BlobReplication, ReconcileQos};
+    use crate::peer::Peer;
+    use crate::reconcile::Reconciler;
 
     use super::{
-        MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, RepairTarget, enqueue_repair,
-        live_participants, observe_participant,
+        ActiveCollections, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
+        RepairTarget, StoreSnapshot, enqueue_repair, live_participants, observe_participant,
     };
+
+    fn fragment(seed: u8, value: Inline<Handle<UnknownBlob>>) -> Fragment {
+        let entity = Id::new([seed; 16]).unwrap();
+        let attribute = Id::new([seed.wrapping_add(1); 16]).unwrap();
+        let mut facts = TribleSet::new();
+        facts.insert(&Trible::new(
+            ExclusiveId::force_ref(&entity),
+            &attribute,
+            &value,
+        ));
+        Fragment::from_parts(facts, TribleSet::new(), MemoryBlobStore::new())
+    }
+
+    fn active(
+        collections: impl IntoIterator<
+            Item = Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive>,
+        >,
+    ) -> ActiveCollections {
+        let mut active = PATCH::new();
+        for collection in collections {
+            active.insert(&PatchEntry::new(&collection.handle().raw));
+        }
+        active
+    }
+
+    fn full(
+        snapshot: &StoreSnapshot,
+        collection: Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive>,
+    ) -> Arc<FullReplicaState> {
+        snapshot
+            .collection(collection.handle())
+            .unwrap()
+            .full
+            .clone()
+    }
+
+    fn observed_at() -> hifitime::Epoch {
+        hifitime::Epoch::from_gregorian_utc_at_midnight(2026, 1, 1)
+    }
+
+    #[test]
+    fn full_forests_rebuild_only_for_changed_activation_or_explicit_route() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = MemoryRepo::default();
+        let first = store
+            .collection("selective-full-first", policy.clone())
+            .unwrap();
+        let second = store.collection("selective-full-second", policy).unwrap();
+        store
+            .commit(first, &key, fragment(1, Inline::new([0xA1; 32])))
+            .unwrap();
+        store
+            .commit(second, &key, fragment(2, Inline::new([0xA2; 32])))
+            .unwrap();
+        let active = active([first, second]);
+        let clean = ActiveCollections::new();
+        let first_store = store.snapshot().unwrap();
+        let first_serving = StoreSnapshot::from_store_changes(
+            first_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            None,
+            StoreChanges::ALL,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        let first_before = full(&first_serving, first);
+        let second_before = full(&first_serving, second);
+
+        store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"unrelated cache bytes".to_vec()))
+            .unwrap();
+        store
+            .commit(first, &key, fragment(3, Inline::new([0xA3; 32])))
+            .unwrap();
+        let second_store = store.snapshot().unwrap();
+        let second_serving = StoreSnapshot::from_store_changes(
+            second_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            Some(&first_serving),
+            second_store.changes_since(&first_store),
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        let first_changed = full(&second_serving, first);
+        let second_unchanged = full(&second_serving, second);
+        assert!(!Arc::ptr_eq(&first_before, &first_changed));
+        assert!(Arc::ptr_eq(&second_before, &second_unchanged));
+
+        store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"another unrelated cache blob".to_vec()))
+            .unwrap();
+        let third_store = store.snapshot().unwrap();
+        let third_serving = StoreSnapshot::from_store_changes(
+            third_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            Some(&second_serving),
+            third_store.changes_since(&second_store),
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first_changed, &full(&third_serving, first)));
+        assert!(Arc::ptr_eq(
+            &second_unchanged,
+            &full(&third_serving, second)
+        ));
+
+        let mut routed = ActiveCollections::new();
+        routed.insert(&PatchEntry::new(&second.handle().raw));
+        let routed_serving = StoreSnapshot::from_store_changes(
+            third_store,
+            &active,
+            &routed,
+            key.verifying_key(),
+            Some(&third_serving),
+            StoreChanges::NONE,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &full(&third_serving, first),
+            &full(&routed_serving, first)
+        ));
+        assert!(!Arc::ptr_eq(
+            &full(&third_serving, second),
+            &full(&routed_serving, second)
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonfinal_full_page_retains_collection_route_until_checkpoint() {
+        let key = SigningKey::from_bytes(&[0x32; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let child_bytes = Bytes::from_source(b"late collection child".to_vec());
+        let child = Blob::<UnknownBlob>::new(child_bytes.clone());
+        let child_handle = child.get_handle();
+        let mut store = MemoryRepo::default();
+        let collection = store.collection("full-page-route", policy.clone()).unwrap();
+        let untouched = store.collection("full-page-untouched", policy).unwrap();
+        store
+            .commit(collection, &key, fragment(4, child_handle))
+            .unwrap();
+        store
+            .commit(untouched, &key, fragment(5, Inline::new([0xA5; 32])))
+            .unwrap();
+        let (sender, receiver, wiring) = super::wire(id);
+        let observer = sender.clone();
+        let mut peer = Peer::with_wiring(
+            store,
+            ReconcileQos {
+                direction: crate::inventory::ReconcileDirection::Bidirectional,
+                blobs: BlobReplication::Full,
+            },
+            sender,
+            receiver,
+        );
+        peer.activate_collections([collection.handle(), untouched.handle()]);
+        let before = observer.current_snapshot().unwrap();
+        let untouched_before = full(&before, untouched);
+
+        let (first_ack, mut first_acked) = tokio::sync::oneshot::channel();
+        let mut first_page = NetEventBatch::default();
+        first_page
+            .try_push(NetEvent::FullPage {
+                collection: collection.handle(),
+                blobs: vec![(child_handle.raw, child_bytes)],
+                final_page: false,
+                ack: first_ack,
+            })
+            .unwrap();
+        wiring.evt_tx.send(first_page).await.unwrap();
+        peer.refresh();
+        assert!(first_acked.try_recv().is_ok());
+        assert!(Arc::ptr_eq(&before, &observer.current_snapshot().unwrap()));
+
+        let (final_ack, mut final_acked) = tokio::sync::oneshot::channel();
+        let mut final_page = NetEventBatch::default();
+        final_page
+            .try_push(NetEvent::FullPage {
+                collection: collection.handle(),
+                blobs: Vec::new(),
+                final_page: true,
+                ack: final_ack,
+            })
+            .unwrap();
+        wiring.evt_tx.send(final_page).await.unwrap();
+        peer.refresh();
+        assert!(final_acked.try_recv().is_ok());
+        let after = observer.current_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(Arc::ptr_eq(&untouched_before, &full(&after, untouched)));
+        assert!(
+            full(&after, collection)
+                .forest
+                .iter_ordered()
+                .any(|key| key[48..] == child_handle.raw)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_collection_want_marks_only_its_active_full_forest() {
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let routed_bytes = Bytes::from_source(b"externally fulfilled routed child".to_vec());
+        let routed = Blob::<UnknownBlob>::new(routed_bytes.clone()).get_handle();
+        let bare_bytes = Bytes::from_source(b"externally fulfilled bare child".to_vec());
+        let bare = Blob::<UnknownBlob>::new(bare_bytes.clone()).get_handle();
+        let mut store = MemoryRepo::default();
+        let routed_collection = store
+            .collection("routed-want-full", policy.clone())
+            .unwrap();
+        let bare_collection = store.collection("bare-want-full", policy.clone()).unwrap();
+        let late_route_collection = store.collection("late-route-full", policy).unwrap();
+        store
+            .commit(routed_collection, &key, fragment(6, routed))
+            .unwrap();
+        store
+            .commit(bare_collection, &key, fragment(7, bare))
+            .unwrap();
+        store
+            .commit(late_route_collection, &key, fragment(8, routed))
+            .unwrap();
+        let (sender, receiver, _wiring) = super::wire(id);
+        let observer = sender.clone();
+        let mut peer = Peer::with_wiring(
+            store,
+            ReconcileQos {
+                direction: crate::inventory::ReconcileDirection::Bidirectional,
+                blobs: BlobReplication::Full,
+            },
+            sender,
+            receiver,
+        );
+        peer.activate_collections([
+            routed_collection.handle(),
+            bare_collection.handle(),
+            late_route_collection.handle(),
+        ]);
+        let before = observer.current_snapshot().unwrap();
+        let routed_before = full(&before, routed_collection);
+        let bare_before = full(&before, bare_collection);
+        let late_route_before = full(&before, late_route_collection);
+        {
+            let mut store = peer.store();
+            store.put::<UnknownBlob, _>(routed_bytes).unwrap();
+            store.put::<UnknownBlob, _>(bare_bytes).unwrap();
+            store
+                .want(WantRequest::blob_in_collection(
+                    routed_collection.handle(),
+                    routed,
+                ))
+                .unwrap();
+            store.want(WantRequest::blob(bare)).unwrap();
+            store.flush().unwrap();
+        }
+
+        let mut reconciler = Reconciler::new();
+        reconciler.tick(&mut peer).await;
+
+        let after = observer.current_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(
+            &routed_before,
+            &full(&after, routed_collection)
+        ));
+        assert!(Arc::ptr_eq(&bare_before, &full(&after, bare_collection)));
+        assert!(
+            full(&after, routed_collection)
+                .forest
+                .iter_ordered()
+                .any(|key| key[48..] == routed.raw)
+        );
+        assert!(
+            !full(&after, bare_collection)
+                .forest
+                .iter_ordered()
+                .any(|key| key[48..] == bare.raw)
+        );
+        assert!(Arc::ptr_eq(
+            &late_route_before,
+            &full(&after, late_route_collection)
+        ));
+
+        {
+            let mut store = peer.store();
+            store
+                .want(WantRequest::blob_in_collection(
+                    late_route_collection.handle(),
+                    routed,
+                ))
+                .unwrap();
+            store.flush().unwrap();
+        }
+        reconciler.tick(&mut peer).await;
+
+        let after_late_route = observer.current_snapshot().unwrap();
+        assert!(Arc::ptr_eq(
+            &full(&after, routed_collection),
+            &full(&after_late_route, routed_collection)
+        ));
+        assert!(!Arc::ptr_eq(
+            &late_route_before,
+            &full(&after_late_route, late_route_collection)
+        ));
+        assert!(
+            full(&after_late_route, late_route_collection)
+                .forest
+                .iter_ordered()
+                .any(|key| key[48..] == routed.raw)
+        );
+    }
 
     #[test]
     fn collection_participant_hints_are_bounded_under_signed_wake_flood() {

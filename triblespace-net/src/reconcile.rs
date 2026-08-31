@@ -45,6 +45,7 @@ struct WantState {
 pub struct Reconciler {
     states: HashMap<WantRequest, WantState>,
     durable_blob_answers: HashSet<[u8; 32]>,
+    durable_collection_blob_answers: HashSet<WantRequest>,
     initial_backoff: Duration,
     max_backoff: Duration,
     fetch_budget: Duration,
@@ -67,6 +68,7 @@ impl Reconciler {
         Self {
             states: HashMap::new(),
             durable_blob_answers: HashSet::new(),
+            durable_collection_blob_answers: HashSet::new(),
             initial_backoff: initial,
             max_backoff: max,
             fetch_budget: RECONCILE_FETCH_DEADLINE,
@@ -175,6 +177,13 @@ impl Reconciler {
         self.durable_blob_answers.retain(|handle| {
             wanted_blob_handles.contains(handle) && visible_blobs.contains(handle)
         });
+        let durable_blob_answers = &self.durable_blob_answers;
+        self.durable_collection_blob_answers.retain(|request| {
+            blob_wants.contains(request)
+                && request
+                    .blob_handle()
+                    .is_some_and(|handle| durable_blob_answers.contains(&handle.raw))
+        });
         let newly_visible: HashSet<_> = visible_blobs
             .difference(&self.durable_blob_answers)
             .copied()
@@ -182,11 +191,37 @@ impl Reconciler {
         if !newly_visible.is_empty() {
             let durable = peer.store().flush();
             match durable {
-                Ok(()) => self.durable_blob_answers.extend(newly_visible),
+                Ok(()) => {
+                    self.durable_blob_answers
+                        .extend(newly_visible.iter().copied());
+                }
                 Err(error) => tracing::warn!(
                     ?error,
                     "visible wanted blobs are not durable; keeping them pending"
                 ),
+            }
+        }
+        let newly_routed: Vec<_> = blob_wants
+            .iter()
+            .copied()
+            .filter(|request| matches!(request, WantRequest::BlobInCollection { .. }))
+            .filter(|request| {
+                self.durable_blob_answers
+                    .contains(&request.blob_handle().expect("routed blob WANT").raw)
+            })
+            .filter(|request| !self.durable_collection_blob_answers.contains(request))
+            .collect();
+        if !newly_routed.is_empty() {
+            let mut refresh = false;
+            for request in &newly_routed {
+                let WantRequest::BlobInCollection { collection, .. } = request else {
+                    unreachable!("newly routed set contains only collection routes");
+                };
+                refresh |= peer.mark_collection_blobs_dirty(*collection);
+            }
+            self.durable_collection_blob_answers.extend(newly_routed);
+            if refresh {
+                peer.refresh();
             }
         }
 
@@ -273,6 +308,12 @@ impl Reconciler {
                             continue;
                         }
                         self.durable_blob_answers.insert(handle);
+                        for request in &requests {
+                            if let WantRequest::BlobInCollection { collection, .. } = request {
+                                peer.mark_collection_blobs_dirty(*collection);
+                                self.durable_collection_blob_answers.insert(*request);
+                            }
+                        }
                         for request in &requests {
                             self.states.remove(request);
                         }

@@ -9,7 +9,7 @@ use anybytes::Bytes;
 use triblespace_core::capability::CapabilityProofBundle;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
-    CollectionRecord,
+    CollectionHandle, CollectionRecord,
 };
 
 /// A changed immutable local serving observation.
@@ -52,6 +52,7 @@ pub(crate) enum NetEvent {
     /// blob reader, then acknowledges it. A final page is the sole checkpoint
     /// that rebuilds and publishes the authoritative serving snapshot.
     FullPage {
+        collection: CollectionHandle,
         blobs: Vec<([u8; 32], Bytes)>,
         final_page: bool,
         ack: tokio::sync::oneshot::Sender<()>,
@@ -92,9 +93,13 @@ impl std::fmt::Debug for NetEvent {
                 .field(bundle)
                 .finish(),
             Self::FullPage {
-                blobs, final_page, ..
+                collection,
+                blobs,
+                final_page,
+                ..
             } => formatter
                 .debug_struct("FullPage")
+                .field("collection", collection)
                 .field("blobs", &blobs.len())
                 .field("final_page", final_page)
                 .finish_non_exhaustive(),
