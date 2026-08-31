@@ -174,9 +174,7 @@ fn run_sync(
         .collect::<Result<Vec<_>>>()?;
     let pile = open_pile(&pile_path)?;
     let mut peer = Peer::new(pile, key, PeerConfig { peers, qos })?;
-    for collection in collections.iter().copied() {
-        peer.activate_collection(collection);
-    }
+    peer.activate_collections(collections.iter().copied());
 
     eprintln!("node: {}", peer.id());
     eprintln!("active collections: {}", collections.len());

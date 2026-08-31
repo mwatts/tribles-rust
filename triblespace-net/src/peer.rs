@@ -131,6 +131,8 @@ where
     /// store prefix itself did not change.
     last_provider_observation: ProviderObservation,
     last_event_at: crate::clock::Mono,
+    #[cfg(test)]
+    serving_snapshot_rebuilds: usize,
 }
 
 impl<S> Peer<S>
@@ -190,6 +192,8 @@ where
             last_observed_at: None,
             last_provider_observation: ProviderObservation::default(),
             last_event_at: crate::clock::mono_now(),
+            #[cfg(test)]
+            serving_snapshot_rebuilds: 0,
         };
         peer.refresh();
         peer
@@ -221,8 +225,23 @@ where
     /// This is ephemeral process state. It writes no OFFER/GOSSIP marker and
     /// creates no global collection registry.
     pub fn activate_collection(&mut self, collection: CollectionHandle) {
-        self.active_dirty |= self.active.get(&collection.raw).is_none();
-        self.active.insert(&PatchEntry::new(&collection.raw));
+        self.activate_collections([collection]);
+    }
+
+    /// Activate several collections and publish one coherent serving snapshot.
+    ///
+    /// Activation is ephemeral process state, just like
+    /// [`Self::activate_collection`]. Batching only collapses the refresh
+    /// boundary: every supplied handle is visible together in the one snapshot
+    /// published after the iterator has been consumed.
+    pub fn activate_collections(
+        &mut self,
+        collections: impl IntoIterator<Item = CollectionHandle>,
+    ) {
+        for collection in collections {
+            self.active_dirty |= self.active.get(&collection.raw).is_none();
+            self.active.insert(&PatchEntry::new(&collection.raw));
+        }
         self.refresh();
     }
 
@@ -496,6 +515,10 @@ where
                 *self.sender.id().as_bytes(),
             );
             self.sender.update_snapshot(serving, &self.active);
+            #[cfg(test)]
+            {
+                self.serving_snapshot_rebuilds += 1;
+            }
             self.active_dirty = false;
             self.last_store_snapshot = Some(snapshot);
             self.last_authorization_change = next_authorization_change;
@@ -879,6 +902,7 @@ where
 mod tests {
     use ed25519_dalek::SigningKey;
     use iroh_base::EndpointId;
+    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
     use super::*;
@@ -903,5 +927,36 @@ mod tests {
 
         let after = observer.current_snapshot().unwrap();
         assert!(Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn bulk_activation_publishes_all_collections_in_one_rebuild() {
+        let key = SigningKey::from_bytes(&[92; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(key.verifying_key()),
+            AdmissionPolicy::direct(key.verifying_key()),
+        );
+        let mut store = MemoryRepo::default();
+        let collections = (0..4)
+            .map(|index| {
+                let name = format!("bulk-activation-{index}");
+                store.collection(&name, policy.clone()).unwrap().handle()
+            })
+            .collect::<Vec<_>>();
+        let (sender, receiver, _wiring) = host::wire(id);
+        let observer = sender.clone();
+        let mut peer = Peer::with_wiring(store, ReconcileQos::default(), sender, receiver);
+        let rebuilds_before = peer.serving_snapshot_rebuilds;
+
+        peer.activate_collections(collections.iter().copied());
+
+        assert_eq!(peer.serving_snapshot_rebuilds - rebuilds_before, 1);
+        let snapshot = observer.current_snapshot().unwrap();
+        let active = snapshot
+            .collections()
+            .map(|collection| collection.collection())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(active, collections.into_iter().collect());
     }
 }
