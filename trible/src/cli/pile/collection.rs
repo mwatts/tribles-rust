@@ -38,7 +38,8 @@ use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
-    descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy,
+    descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, CollectionPolicy,
+    CollectionStoreExt,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
@@ -57,6 +58,21 @@ const ABBREV: usize = 16;
 
 #[derive(Parser)]
 pub enum Command {
+    /// Register one named root collection and print its exact handle.
+    ///
+    /// The existing signing key becomes the direct READ and WRITE root. This
+    /// stores only the canonical descriptor closure: it does not create a
+    /// synthetic commit, and repeating it is idempotent.
+    Init {
+        /// Path to the pile file to update.
+        pile: PathBuf,
+        /// Stable name carried by the root collection descriptor.
+        name: String,
+        /// Existing READ/WRITE-root signing key. Defaults to TRIBLESPACE_KEY
+        /// or self.key beside the pile; a missing key is never created.
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
     /// List every collection the pile references, named ones first.
     ///
     /// A collection is "referenced" when some commit, merge, or derive record
@@ -150,6 +166,7 @@ pub enum Command {
 
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
+        Command::Init { pile, name, key } => run_init(pile, name, key),
         Command::List {
             path,
             named,
@@ -176,6 +193,35 @@ pub fn run(cmd: Command) -> Result<()> {
             key,
         } => run_grant_write(pile, collection, recipient, key),
     }
+}
+
+fn run_init(path: PathBuf, name: String, key: Option<PathBuf>) -> Result<()> {
+    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
+    let root = triblespace_core::signing_key_file::load_existing(&key_path).map_err(|error| {
+        anyhow!(
+            "load collection-root signing key {}: {error}",
+            key_path.display()
+        )
+    })?;
+
+    let mut pile = open_refreshed(&path)?;
+    let handle_res = pile
+        .collection(
+            &name,
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(root.verifying_key()),
+                AdmissionPolicy::direct(root.verifying_key()),
+            ),
+        )
+        .map(|collection| collection.handle())
+        .map_err(|error| anyhow!("register collection descriptor: {error}"));
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    let handle = handle_res.and_then(|handle| close_res.map(|()| handle))?;
+
+    println!("blake3:{}", handle_hex(handle));
+    Ok(())
 }
 
 /// Parse a collection handle, accepting both `blake3:HEX` and a bare `HEX`.

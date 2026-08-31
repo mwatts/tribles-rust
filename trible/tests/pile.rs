@@ -7,12 +7,17 @@ use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStoreList;
 use triblespace::prelude::SnapshotSource;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+    descriptor, AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionStoreExt,
 };
+use triblespace_core::inline::encodings::hash::{Blake3, Hash};
+use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::CapabilityProofRead;
+use triblespace_core::trible::TribleSet;
 
 fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
     let mut record = vec![0u8; 256];
@@ -87,6 +92,102 @@ fn create_creates_parent_directories() {
 
     assert!(path.exists());
     assert!(path.parent().unwrap().exists());
+}
+
+#[test]
+fn collection_init_registers_direct_root_without_a_commit_and_is_idempotent() {
+    use triblespace::prelude::TryToInline;
+
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("init.pile");
+    let key_path = dir.path().join("operator.key");
+    std::fs::File::create(&pile_path).unwrap();
+    let root = triblespace_core::signing_key_file::init(&key_path).unwrap();
+
+    let invoke = || {
+        Command::cargo_bin("trible")
+            .unwrap()
+            .args(["pile", "collection", "init"])
+            .arg(&pile_path)
+            .arg("shared-relations")
+            .arg("--key")
+            .arg(&key_path)
+            .output()
+            .unwrap()
+    };
+
+    let first = invoke();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stderr.is_empty());
+    let output = std::str::from_utf8(&first.stdout).unwrap();
+    assert!(predicate::str::is_match(r"^blake3:[0-9a-f]{64}\n$")
+        .unwrap()
+        .eval(output));
+    let encoded: Inline<Hash<Blake3>> = output.trim().try_to_inline().unwrap();
+    let handle = encoded.into();
+    let first_len = std::fs::metadata(&pile_path).unwrap().len();
+
+    let second = invoke();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), first_len);
+
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    Collection::<SimpleArchive>::open(&snapshot, handle).unwrap();
+    let descriptor_blob: Blob<SimpleArchive> = snapshot.get(handle).unwrap();
+    let facts = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(descriptor_blob).unwrap();
+    let name: Blob<UTF8String> = snapshot
+        .get(descriptor::name(&facts).unwrap().unwrap())
+        .unwrap();
+    assert_eq!(name.bytes.as_ref(), b"shared-relations");
+    let direct = AdmissionPolicy::direct(root.verifying_key());
+    assert_eq!(
+        descriptor::policy(&facts).unwrap(),
+        CollectionPolicy::new(direct.clone(), direct)
+    );
+    assert_eq!(snapshot.records().unwrap().count(), 0);
+    drop(snapshot);
+    pile.close().unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "collection", "list"])
+        .arg(&pile_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no collections referenced"));
+}
+
+#[test]
+fn collection_init_requires_an_existing_signing_key() {
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("init-missing-key.pile");
+    let key_path = dir.path().join("missing.key");
+    std::fs::File::create(&pile_path).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "collection", "init"])
+        .arg(&pile_path)
+        .arg("shared-relations")
+        .arg("--key")
+        .arg(&key_path)
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("load collection-root signing key"));
+
+    assert!(!key_path.exists());
+    assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), 0);
 }
 
 #[test]

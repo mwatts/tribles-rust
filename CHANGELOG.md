@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `pile collection init <PILE> <NAME> [--key PATH]` to register one
+  canonical `SimpleArchive` root descriptor under an existing durable signing
+  key's direct READ and WRITE authority. It prints the exact descriptor handle,
+  emits no synthetic commit, and is replay-idempotent.
+
 - Add symmetric `grant_collection_read` / `grant_collection_write` APIs and
   `pile collection grant-read` / `grant-write` commands for an exact existing
   collection and recipient key. Each root-only operation validates the

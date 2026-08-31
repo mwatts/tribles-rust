@@ -101,6 +101,10 @@ and WRITE admission policies, representation, and concrete mapping, together
 with the encoding and mapping-algorithm descriptions.
 `pile blob inspect` sees only the encoded blob; these subcommands decode it.
 
+- `pile collection init <PILE> <NAME> [--key PATH]` — register a canonical
+  named `SimpleArchive` descriptor whose direct READ and WRITE root is an
+  existing durable signing key, then print its exact handle. It stores no
+  synthetic commit and is idempotent.
 - `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded name/source anchor, READ and WRITE policies, representation, and mapping algorithm (known representation and algorithm ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
 - `pile collection show <PILE> <HANDLE>` — decode one descriptor, its anchor,
   READ and WRITE policies, representation, mapping, and referencing record
