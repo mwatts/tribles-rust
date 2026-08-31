@@ -202,9 +202,9 @@ where
 /// Discover the source/target equations that may realize one exact source
 /// cover.
 ///
-/// The cover already crossed admission or validated collection operations
-/// when it was constructed. Replaying it therefore needs equations, not
-/// another signature scan over provenance claims for the same payloads.
+/// The cover already crossed admission or stored collection operations when it
+/// was constructed. Reusing it therefore needs equations, not another
+/// signature scan over provenance claims for the same payloads.
 pub(crate) fn discover_collection_records_for_derived_cover<S, L>(
     snapshot: &S,
     cover: &Cover<L>,

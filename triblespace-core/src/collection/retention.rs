@@ -103,7 +103,7 @@ where
 /// authorization and claim-validation policy over `records`. Unauthorized
 /// commits are absent from [`CollectionResolution::admitted_claims`], so they
 /// cannot retain anything. Admitted unsigned equations are deliberately
-/// ignored: validation and activation do not turn cache work into authority.
+/// ignored: storing and using materialized work does not turn it into authority.
 ///
 /// Every admitted commit requires its referenced collection descriptor blob
 /// to be resident and retains the descriptor, signed data, and metadata

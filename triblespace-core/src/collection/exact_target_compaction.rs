@@ -1,10 +1,10 @@
 //! Explicit size-tiered maintenance for exact derived target collections.
 //!
 //! Compaction remains separate from cover construction. It starts from an
-//! opaque exact cover, publishes only canonical target blobs and unsigned
-//! `MERGE` equations, then proves the result again through a fresh attachment.
-//! The source cover remains the value boundary, and published equations add
-//! neither provenance, retention roots, nor durable validation receipts.
+//! opaque exact cover and publishes every canonical target blob it computes
+//! together with its `MERGE` equation. A later failed or unsupported join does
+//! not erase earlier useful work. The source cover remains the value boundary,
+//! and yard/GC policy alone decides the lifetime of materialized nodes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -110,15 +110,14 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// round attempts at most `n - 1` pairs. No policy knobs, manifest, receipt,
 /// signed record, retention record, or implicit flush are involved.
 ///
-/// Each maintenance round first stages its complete deterministic carry in
-/// memory. Fatal construction errors and rounds with no successful join write
-/// nothing. Otherwise, after the attachment reader has been dropped, the target
-/// stored descriptor is loaded from the same snapshot, then every staged
-/// result is stored before the topologically ordered `MERGE` records. A fresh
-/// read pass then validates the result. Freshly
-/// selected covers are compacted again when concurrent or older evidence
-/// exposes another collision. Repetition of any non-stable canonical cover
-/// returns [`ExactTargetCompactionError::Stalled`].
+/// Each maintenance round stages its deterministic carry under one immutable
+/// reader. After that reader has been dropped, every successfully computed
+/// result is stored before its topologically ordered `MERGE` record—even when
+/// a later pair failed or had no directly materialized join. A fresh read pass
+/// then selects the resulting physical cover without replaying the equations.
+/// Freshly selected covers are compacted again when concurrent or older
+/// evidence exposes another collision. Repetition of any non-stable canonical
+/// cover returns [`ExactTargetCompactionError::Stalled`].
 pub fn compact_exact_target<S, H>(
     exact: &ExactDerivedCollection<H>,
     store: &mut S,
@@ -205,6 +204,7 @@ where
 
     let mut outputs = BTreeMap::<CollectionData, Blob<Target>>::new();
     let mut claims = Vec::<CollectionMerge>::new();
+    let mut deferred_error = None;
     loop {
         let Some(tier) = tiers
             .iter()
@@ -223,13 +223,14 @@ where
 
         let constructed = match Target::join_members(&descriptor, &low, &high, &reader) {
             Ok(Some(constructed)) => constructed,
-            Ok(None) => return Ok(RoundOutcome::Stable(cover)),
+            Ok(None) => break,
             Err(CollectionOperationError::Fatal(reason)) => {
-                return Err(ExactTargetCompactionError::Merge {
+                deferred_error = Some(ExactTargetCompactionError::Merge {
                     low: low_data,
                     high: high_data,
                     reason,
                 });
+                break;
             }
             Err(CollectionOperationError::Capacity(_)) => {
                 locations.insert(high_data, tier);
@@ -261,6 +262,9 @@ where
     }
 
     if claims.is_empty() {
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
         return Ok(RoundOutcome::Stable(cover));
     }
 
@@ -268,15 +272,22 @@ where
     // retain it across publication.
     drop(reader);
 
-    for result in outputs.into_values() {
-        store.put::<Target, _>(result).map_err(|error| {
-            ExactTargetCompactionError::storage("store compacted target", error)
-        })?;
-    }
     for claim in claims {
+        if let Some(result) = outputs.remove(&claim.result()) {
+            store.put::<Target, _>(result).map_err(|error| {
+                ExactTargetCompactionError::storage("store compacted target", error)
+            })?;
+        }
         store
             .insert(CollectionRecord::Merge(claim))
             .map_err(|error| ExactTargetCompactionError::storage("publish target MERGE", error))?;
+    }
+    debug_assert!(
+        outputs.is_empty(),
+        "every computed result has a MERGE claim"
+    );
+    if let Some(error) = deferred_error {
+        return Err(error);
     }
     Ok(RoundOutcome::Published)
 }

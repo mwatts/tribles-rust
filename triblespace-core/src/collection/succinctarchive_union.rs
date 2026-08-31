@@ -9,10 +9,11 @@
 //! succinct(a ∪ b) = succinct(a) ∪ succinct(b)
 //! ```
 //!
-//! This module validates exactly those `DERIVE` and `MERGE` equations. It does
-//! not authorize commits, select semantic roots, retain artifacts, or assign
-//! authority to construction records. `DERIVE` and `MERGE` remain unsigned,
-//! reproducible evidence.
+//! This module can explicitly validate those `DERIVE` and `MERGE` equations at
+//! producer, ingress, or offline-audit boundaries. Warm collection resolution
+//! does not replay them. It does not authorize commits, select semantic roots,
+//! retain artifacts, or assign authority to construction records. `DERIVE` and
+//! `MERGE` remain unsigned, reusable materialized work.
 
 use super::descriptor as descriptor_facts;
 use super::records::{mapping_algorithm, RecordDecodeError, KIND_COLLECTION_MAPPING};

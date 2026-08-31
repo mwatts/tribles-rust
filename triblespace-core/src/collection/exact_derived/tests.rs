@@ -21,6 +21,7 @@ use crate::collection::{CollectionCommit, CollectionRead, CollectionStoreExt};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
+use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use crate::repo::{
@@ -531,7 +532,7 @@ fn mapping_entity_id_substitution_preserves_binding_semantics() {
 }
 
 #[test]
-fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() {
+fn ensure_resolves_source_member_attachments_through_the_reader() {
     let authority = SigningKey::from_bytes(&[1; 32]);
     let source_descriptor = simplearchive_union::descriptor(
         "reader-aware-source",
@@ -565,8 +566,8 @@ fn ensure_and_validation_resolve_source_member_attachments_through_the_reader() 
         snapshot.get(attached.members().next().unwrap()).unwrap();
     assert_eq!(attached_blob.bytes.as_ref(), expected.as_bytes());
 
-    // A second read-only pass forward-validates the resident DERIVE through
-    // the same attachment lookup rather than trusting its output handle.
+    // A second read-only pass follows the resident DERIVE without remapping the
+    // source attachment.
     let reattached = exact.attach(&mut store, &cover).unwrap();
     let snapshot = store.snapshot().unwrap();
     let reattached_blob: Blob<AttachedTextBlob> =
@@ -933,10 +934,6 @@ fn empty_cover_still_belongs_to_one_exact_collection() {
             Err(ExactDerivedCollectionError::InvalidCover(_))
         ));
     }
-    assert!(matches!(
-        kernel().probe_exact(&mut store, &foreign, &BTreeSet::new()),
-        Err(ExactDerivedCollectionError::InvalidCover(_))
-    ));
 }
 
 #[derive(Default)]
@@ -1102,6 +1099,95 @@ fn complete_probe_ensure_performs_zero_writes() {
 }
 
 #[test]
+fn warm_attach_and_ensure_execute_no_collection_algebra() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
+    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut inner, index as u8 + 1, source))
+        .collect();
+    for (source, target) in sources.iter().zip(&targets) {
+        inner.put::<TestTargetBlob, _>(target.clone()).unwrap();
+        inner
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                kernel().target_collection().handle(),
+                data(source),
+                data(target),
+            )))
+            .unwrap();
+    }
+    inner.put::<TestTargetBlob, _>(upper.clone()).unwrap();
+    inner
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().target_collection().handle(),
+            data(&targets[0]),
+            data(&targets[1]),
+            data(&upper),
+        )))
+        .unwrap();
+
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = source_cover(&commits);
+    with_selective(&algebra, |kernel| {
+        assert_eq!(
+            cover_ids(&kernel.attach(&mut store, &source_cover).unwrap()),
+            vec![data(&upper)]
+        );
+        assert_eq!(
+            cover_ids(&kernel.ensure(&mut store, &source_cover).unwrap()),
+            vec![data(&upper)]
+        );
+    });
+
+    assert_eq!((store.puts, store.inserts), (0, 0));
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert!(algebra.derive_attempts.lock().unwrap().is_empty());
+    assert!(algebra.target_attempts.lock().unwrap().is_empty());
+}
+
+#[test]
+fn newly_published_derives_activate_a_resident_target_merge() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
+    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
+    let mut store = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
+        .collect();
+
+    // The MERGE is useful stored work even while its inputs are absent. Once
+    // ensure publishes those inputs and their DERIVEs, fresh resolution must
+    // select the existing result rather than return both inputs for a caller
+    // to join again.
+    store.put::<TestTargetBlob, _>(upper.clone()).unwrap();
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            kernel().target_collection().handle(),
+            data(&targets[0]),
+            data(&targets[1]),
+            data(&upper),
+        )))
+        .unwrap();
+
+    let ensured = kernel()
+        .ensure(&mut store, &source_cover(&commits))
+        .unwrap();
+    assert_eq!(cover_ids(&ensured), vec![data(&upper)]);
+    let mut expected_inputs: Vec<_> = sources.iter().map(data).collect();
+    expected_inputs.sort_unstable();
+    assert_eq!(derived_inputs(&mut store), expected_inputs);
+}
+
+#[test]
 fn registration_publishes_the_complete_descriptor_attachment_closure() {
     let mut store = MemoryRepo::default();
     let exact = register_kernel(&mut store);
@@ -1262,6 +1348,33 @@ fn unrelated_optional_result_metadata_failure_is_inert() {
 }
 
 #[test]
+fn relevant_warm_metadata_failure_does_not_trigger_remapping() {
+    let source = archive([(1, 3)]);
+    let mut inner = MemoryRepo::default();
+    inner.put::<TestSourceBlob, _>(source.clone()).unwrap();
+    let target = publish_derive(&mut inner, &source);
+    let algebra = SelectiveMapping::default();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    store
+        .metadata_failures
+        .lock()
+        .unwrap()
+        .insert(target.get_handle().raw);
+    let source_cover = Cover::from_members(kernel().source_collection(), [source.get_handle()]);
+
+    assert!(matches!(
+        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)),
+        Err(ExactDerivedCollectionError::Storage { .. })
+    ));
+    assert_eq!((store.puts, store.inserts), (0, 0));
+    assert!(algebra.derive_attempts.lock().unwrap().is_empty());
+    assert!(algebra.target_attempts.lock().unwrap().is_empty());
+}
+
+#[test]
 fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
     let c = archive([(9, 9)]);
     let mut inner = MemoryRepo::default();
@@ -1299,7 +1412,7 @@ fn missing_optional_decomposition_inputs_fall_back_to_direct_construction() {
 }
 
 #[test]
-fn forged_reverse_decomposition_cannot_supply_a_cover() {
+fn stored_reverse_decomposition_supplies_a_cover_without_replay() {
     let a = archive([(1, 3)]);
     let b = archive([(2, 4)]);
     let c = archive([(9, 9)]);
@@ -1324,23 +1437,17 @@ fn forged_reverse_decomposition_cannot_supply_a_cover() {
     };
     let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
 
-    assert!(matches!(
-        with_selective(&algebra, |kernel| kernel.attach(&mut store, &source_cover)),
-        Err(ExactDerivedCollectionError::IncompleteCover { .. })
-    ));
-    assert_eq!((store.puts, store.inserts), (0, 0));
-
     let target =
-        with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)).unwrap();
-    assert_eq!(target.len(), 1);
-    let actual: Blob<TestTargetBlob> = store
-        .snapshot()
-        .unwrap()
-        .get(target.members().next().unwrap())
-        .unwrap();
-    assert_eq!(actual.bytes, derive(&c).unwrap().bytes);
-    assert!(algebra.derive_attempts.lock().unwrap().contains(&data(&c)));
-    assert!(store.puts > 0 && store.inserts > 0);
+        with_selective(&algebra, |kernel| kernel.attach(&mut store, &source_cover)).unwrap();
+    let expected: BTreeSet<_> = [&a, &b]
+        .into_iter()
+        .map(|source| data(&derive(source).unwrap()))
+        .collect();
+    assert_eq!(target.data_members().collect::<BTreeSet<_>>(), expected);
+    assert_eq!((store.puts, store.inserts), (0, 0));
+    assert!(algebra.source_attempts.lock().unwrap().is_empty());
+    assert!(algebra.derive_attempts.lock().unwrap().is_empty());
+    assert!(algebra.target_attempts.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1472,8 +1579,8 @@ fn capacity_source_replan_is_global_across_overlapping_uppers() {
             .iter()
             .filter(|input| **input == data(successful_upper))
             .count(),
-        2,
-        "one planning attempt is reused after replanning, then fresh admission recomputes it",
+        1,
+        "each successful mapping is executed exactly once across replanning",
     );
 }
 
@@ -1503,7 +1610,7 @@ fn terminal_source_capacity_is_repeatable_and_zero_write() {
 }
 
 #[test]
-fn mixed_terminal_capacity_publishes_no_prepared_sibling() {
+fn mixed_terminal_capacity_publishes_the_successful_sibling() {
     let first = archive([(1, 3)]);
     let second = archive([(2, 4)]);
     let (successful, blocked) = if data(&first) < data(&second) {
@@ -1530,8 +1637,8 @@ fn mixed_terminal_capacity_publishes_no_prepared_sibling() {
         with_selective(&algebra, |kernel| kernel.ensure(&mut store, &source_cover)),
         Err(ExactDerivedCollectionError::UnrepresentableCover { .. })
     ));
-    assert_eq!((store.puts, store.inserts), (0, 0));
-    assert!(derived_inputs(&mut store.inner).is_empty());
+    assert_eq!((store.puts, store.inserts), (2, 1));
+    assert_eq!(derived_inputs(&mut store.inner), vec![data(successful)]);
     assert!(algebra
         .derive_attempts
         .lock()
@@ -1770,6 +1877,32 @@ fn ensure_stores_source_before_target_and_derive() {
     assert!(target_put < insert);
 }
 
+#[test]
+fn later_derive_put_failure_preserves_the_complete_published_prefix() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut inner, index as u8 + 1, source))
+        .collect();
+    let mut store = RejectPutStore {
+        inner,
+        puts: 0,
+        // source + output for the first map, source + rejected output for the
+        // second map.
+        reject_at: 4,
+    };
+
+    assert!(matches!(
+        kernel().ensure(&mut store, &source_cover(&commits)),
+        Err(ExactDerivedCollectionError::Storage { .. })
+    ));
+    let derives = derived_inputs(&mut store.inner);
+    assert_eq!(derives.len(), 1);
+    assert!(sources.iter().map(data).any(|input| input == derives[0]));
+}
+
 fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
     collection_records(store)
         .into_iter()
@@ -1801,23 +1934,6 @@ fn joined_cover(store: &mut MemoryRepo, cover: &Cover<TestTargetBlob>) -> Blob<T
 fn cover_ids(cover: &Cover<TestTargetBlob>) -> Vec<CollectionData> {
     cover
         .members()
-        .map(Handle::<TestTargetBlob>::to_hash)
-        .collect()
-}
-
-fn target_handles(
-    data: impl IntoIterator<Item = CollectionData>,
-) -> BTreeSet<Inline<Handle<TestTargetBlob>>> {
-    data.into_iter()
-        .map(Handle::<TestTargetBlob>::from_hash)
-        .collect()
-}
-
-fn target_ids(
-    handles: impl IntoIterator<Item = Inline<Handle<TestTargetBlob>>>,
-) -> Vec<CollectionData> {
-    handles
-        .into_iter()
         .map(Handle::<TestTargetBlob>::to_hash)
         .collect()
 }
@@ -1898,8 +2014,8 @@ fn target_capacity_retires_only_low() {
     assert_eq!(cover.len(), 2);
     assert_eq!(
         algebra.target_attempts.lock().unwrap().as_slice(),
-        &[first_pair, second_pair, second_pair],
-        "the carry attempts two pairs, then fresh admission recomputes the published equation",
+        &[first_pair, second_pair],
+        "each target join is executed exactly once",
     );
     let merges = target_merge_records(&mut store.inner);
     assert_eq!(merges.len(), 1);
@@ -1907,7 +2023,7 @@ fn target_capacity_retires_only_low() {
 }
 
 #[test]
-fn fatal_late_target_join_publishes_no_staged_prefix() {
+fn fatal_late_target_join_preserves_the_successful_prefix() {
     let sources = [
         archive([(1, 3)]),
         archive([(2, 4)]),
@@ -1952,8 +2068,10 @@ fn fatal_late_target_join_publishes_no_staged_prefix() {
         algebra.target_attempts.lock().unwrap().as_slice(),
         &[first_pair, fatal_pair],
     );
-    assert_eq!((store.puts, store.inserts), (0, 0));
-    assert!(target_merge_records(&mut store.inner).is_empty());
+    assert_eq!((store.puts, store.inserts), (1, 1));
+    let merges = target_merge_records(&mut store.inner);
+    assert_eq!(merges.len(), 1);
+    assert_eq!(merges[0].inputs(), first_pair);
 }
 
 #[test]
@@ -2000,7 +2118,7 @@ fn capacity_stable_target_collision_is_repeatable_and_zero_write() {
 }
 
 #[test]
-fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof() {
+fn compaction_substitutes_new_resident_uppers_through_an_old_stored_equation() {
     let sources = [archive([(1, 3)]), archive([(2, 4)]), archive([(3, 5)])];
     let mut store = MemoryRepo::default();
     let commits: Vec<_> = sources
@@ -2125,27 +2243,23 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
 
     compact_exact_target(&kernel(), &mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
-    let first_merge = store
-        .events
-        .iter()
-        .position(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
-        .expect("colliding cover publishes a MERGE");
     let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection().handle());
     assert!(!store
         .events
         .iter()
         .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
-    let results: Vec<_> = store
+    let merges: Vec<_> = store
         .events
         .iter()
-        .filter_map(|event| match event {
-            WriteEvent::Insert(CollectionRecord::Merge(claim)) => Some(claim.result()),
+        .enumerate()
+        .filter_map(|(position, event)| match event {
+            WriteEvent::Insert(CollectionRecord::Merge(claim)) => Some((position, claim.result())),
             _ => None,
         })
         .collect();
-    assert!(!results.is_empty());
-    for result in results {
-        assert!(store.events[..first_merge]
+    assert!(!merges.is_empty());
+    for (position, result) in merges {
+        assert!(store.events[..position]
             .iter()
             .any(|event| matches!(event, WriteEvent::Put(data) if *data == result)));
     }
@@ -2165,6 +2279,7 @@ impl Error for RejectedPut {}
 struct RejectPutStore {
     inner: MemoryRepo,
     puts: usize,
+    reject_at: usize,
 }
 
 impl BlobStorePut for RejectPutStore {
@@ -2177,7 +2292,7 @@ impl BlobStorePut for RejectPutStore {
         Handle<S>: InlineEncoding,
     {
         self.puts += 1;
-        if self.puts == 1 {
+        if self.puts == self.reject_at {
             Err(RejectedPut)
         } else {
             Ok(self
@@ -2278,12 +2393,47 @@ fn join_and_put_failures_publish_no_target_merge() {
         })
         .collect();
     let put_cover = source_cover(&put_commits);
-    let mut put_store = RejectPutStore { inner, puts: 0 };
+    let mut put_store = RejectPutStore {
+        inner,
+        puts: 0,
+        reject_at: 1,
+    };
     assert!(matches!(
         compact_exact_target(&kernel(), &mut put_store, &put_cover),
         Err(ExactTargetCompactionError::Storage { .. })
     ));
     assert!(target_merge_records(&mut put_store.inner).is_empty());
+}
+
+#[test]
+fn later_target_put_failure_preserves_the_complete_published_prefix() {
+    let sources = [
+        archive([(1, 3)]),
+        archive([(2, 4)]),
+        archive([(3, 5)]),
+        archive([(4, 6)]),
+    ];
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut inner, index as u8 + 1, source);
+            publish_derive(&mut inner, source);
+            commit
+        })
+        .collect();
+    let mut store = RejectPutStore {
+        inner,
+        puts: 0,
+        reject_at: 2,
+    };
+
+    assert!(matches!(
+        compact_exact_target(&kernel(), &mut store, &source_cover(&commits)),
+        Err(ExactTargetCompactionError::Storage { .. })
+    ));
+    assert_eq!(target_merge_records(&mut store.inner).len(), 1);
 }
 
 #[test]
@@ -2309,64 +2459,6 @@ fn discarded_merge_insert_stalls_instead_of_looping() {
     assert!(target_merge_records(&mut store.inner).is_empty());
 }
 
-struct LossyStore {
-    inner: MemoryRepo,
-    discard: CollectionData,
-}
-
-impl BlobStorePut for LossyStore {
-    type PutError = <MemoryRepo as BlobStorePut>::PutError;
-
-    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
-    where
-        S: BlobEncoding + 'static,
-        T: IntoBlob<S>,
-        Handle<S>: InlineEncoding,
-    {
-        let blob = item.to_blob();
-        if Handle::<S>::to_hash(blob.get_handle()) == self.discard {
-            Ok(blob.get_handle())
-        } else {
-            self.inner.put(blob)
-        }
-    }
-}
-
-impl SnapshotSource for LossyStore {
-    type Snapshot = MemoryRepoSnapshot;
-    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
-
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.inner.snapshot()
-    }
-}
-
-impl CollectionStore for LossyStore {
-    type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-
-    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        self.inner.insert(record)
-    }
-}
-
-#[test]
-fn fresh_reprobe_rejects_a_lossy_output_put() {
-    let source = archive([(1, 3)]);
-    let mut inner = MemoryRepo::default();
-    let commit = source_commit(&mut inner, 1, &source);
-    let output = derive(&source).unwrap();
-    let mut store = LossyStore {
-        inner,
-        discard: data(&output),
-    };
-    let source_cover = source_cover(&[commit]);
-    match kernel().ensure(&mut store, &source_cover) {
-        Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
-        Err(error) => panic!("unexpected fresh-reprobe error: {error:?}"),
-        Ok(_) => panic!("lossy output was incorrectly admitted"),
-    }
-}
-
 #[test]
 fn missing_derive_output_is_pending_and_ensure_rebuilds() {
     let source = archive([(1, 3)]);
@@ -2387,205 +2479,6 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
         Ok(_) => panic!("missing output was incorrectly admitted"),
     }
     assert_eq!(kernel().ensure(&mut store, &source_cover).unwrap().len(), 1,);
-}
-
-#[test]
-fn offered_upper_is_selected_as_one_remote_cover_member() {
-    let sources = [archive([(1, 3)]), archive([(2, 4)])];
-    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
-    let mut store = MemoryRepo::default();
-    let commits: Vec<_> = sources
-        .iter()
-        .enumerate()
-        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
-        .collect();
-    let source_cover = source_cover(&commits);
-    for (source, target) in sources.iter().zip(&targets) {
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection().handle(),
-                data(source),
-                data(target),
-            )))
-            .unwrap();
-    }
-    store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection().handle(),
-            data(&targets[0]),
-            data(&targets[1]),
-            data(&upper),
-        )))
-        .unwrap();
-
-    let offered = target_handles([data(&targets[0]), data(&targets[1]), data(&upper)]);
-    match kernel()
-        .probe_exact(&mut store, &source_cover, &offered)
-        .unwrap()
-    {
-        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![upper.get_handle()]),
-        ExactAttachPlan::Ready(_) => panic!("nonresident offered upper was already ready"),
-    }
-
-    store.put::<TestTargetBlob, _>(upper.clone()).unwrap();
-    match kernel()
-        .probe_exact(&mut store, &source_cover, &offered)
-        .unwrap()
-    {
-        ExactAttachPlan::Ready(cover) => {
-            assert_eq!(cover_ids(&cover), vec![data(&upper)]);
-        }
-        ExactAttachPlan::Fetch(fetch) => panic!("landed upper still requested: {fetch:?}"),
-    }
-}
-
-#[test]
-fn unavailable_offered_upper_replans_to_offered_lower_cover() {
-    let sources = [archive([(1, 3)]), archive([(2, 4)])];
-    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
-    let mut store = MemoryRepo::default();
-    let commits: Vec<_> = sources
-        .iter()
-        .enumerate()
-        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
-        .collect();
-    let source_cover = source_cover(&commits);
-    for (source, target) in sources.iter().zip(&targets) {
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection().handle(),
-                data(source),
-                data(target),
-            )))
-            .unwrap();
-    }
-    store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection().handle(),
-            data(&targets[0]),
-            data(&targets[1]),
-            data(&upper),
-        )))
-        .unwrap();
-
-    let mut offered = target_handles([data(&targets[0]), data(&targets[1]), data(&upper)]);
-    match kernel()
-        .probe_exact(&mut store, &source_cover, &offered)
-        .unwrap()
-    {
-        ExactAttachPlan::Fetch(fetch) => assert_eq!(fetch, vec![upper.get_handle()]),
-        ExactAttachPlan::Ready(_) => panic!("nonresident offered upper was already ready"),
-    }
-
-    offered.remove(&upper.get_handle());
-    let expected: Vec<_> = offered
-        .iter()
-        .copied()
-        .map(Handle::<TestTargetBlob>::to_hash)
-        .collect();
-    match kernel()
-        .probe_exact(&mut store, &source_cover, &offered)
-        .unwrap()
-    {
-        ExactAttachPlan::Fetch(fetch) => assert_eq!(target_ids(fetch), expected),
-        ExactAttachPlan::Ready(_) => panic!("nonresident offered lowers were already ready"),
-    }
-    for target in targets {
-        store.put::<TestTargetBlob, _>(target).unwrap();
-    }
-    match kernel()
-        .probe_exact(&mut store, &source_cover, &offered)
-        .unwrap()
-    {
-        ExactAttachPlan::Ready(cover) => assert_eq!(cover_ids(&cover), expected),
-        ExactAttachPlan::Fetch(fetch) => panic!("landed lowers still requested: {fetch:?}"),
-    }
-}
-
-#[test]
-fn offered_upper_does_not_displace_a_complete_resident_lower_cover() {
-    let sources = [archive([(1, 3)]), archive([(2, 4)])];
-    let targets = [derive(&sources[0]).unwrap(), derive(&sources[1]).unwrap()];
-    let upper = join_test_targets(&targets[0], &targets[1]).unwrap();
-    let mut store = MemoryRepo::default();
-    let commits: Vec<_> = sources
-        .iter()
-        .enumerate()
-        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
-        .collect();
-    let source_cover = source_cover(&commits);
-    for (source, target) in sources.iter().zip(&targets) {
-        store.put::<TestTargetBlob, _>(target.clone()).unwrap();
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
-                kernel().target_collection().handle(),
-                data(source),
-                data(target),
-            )))
-            .unwrap();
-    }
-    store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().target_collection().handle(),
-            data(&targets[0]),
-            data(&targets[1]),
-            data(&upper),
-        )))
-        .unwrap();
-
-    match kernel()
-        .probe_exact(
-            &mut store,
-            &source_cover,
-            &BTreeSet::from([upper.get_handle()]),
-        )
-        .unwrap()
-    {
-        ExactAttachPlan::Ready(cover) => {
-            let expected: Vec<_> = targets
-                .iter()
-                .map(data)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            assert_eq!(cover_ids(&cover), expected);
-        }
-        ExactAttachPlan::Fetch(fetch) => {
-            panic!("remote upper displaced a complete resident cover: {fetch:?}")
-        }
-    }
-}
-
-#[test]
-fn unrelated_and_rejected_offers_never_become_fetch_work() {
-    let source = archive([(1, 3)]);
-    let mut store = MemoryRepo::default();
-    let commit = source_commit(&mut store, 1, &source);
-    let source_cover = source_cover(&[commit]);
-    let lying_output = data(&derive(&archive([(9, 9)])).unwrap());
-    store
-        .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_collection().handle(),
-            data(&source),
-            lying_output,
-        )))
-        .unwrap();
-    let unrelated = CollectionData::new([0xEE; 32]);
-
-    match kernel().probe_exact(
-        &mut store,
-        &source_cover,
-        &target_handles([lying_output, unrelated]),
-    ) {
-        Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
-        Err(error) => panic!("unexpected rejected-offer error: {error:?}"),
-        Ok(ExactAttachPlan::Fetch(fetch)) => {
-            panic!("unrelated or rejected offers became fetch work: {fetch:?}")
-        }
-        Ok(ExactAttachPlan::Ready(_)) => panic!("rejected equation completed the cover"),
-    }
 }
 
 #[test]

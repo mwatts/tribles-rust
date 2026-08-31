@@ -2,8 +2,8 @@
 
 TribleSpace publishes data into self-describing grow-only collections. A
 collection has no mutable head and no privileged linear history: independent
-signed commits coexist, replicas combine records by set union, and validated
-merge or derivation equations provide reusable physical work.
+signed commits coexist, replicas combine records by set union, and stored
+merge or derivation equations preserve reusable physical work.
 
 ## Vocabulary
 
@@ -19,15 +19,15 @@ merge or derivation equations provide reusable physical work.
   concrete parameters. The descriptor's content handle is the
   `CollectionHandle`.
 - **`Collection<E>`** — a cheap descriptor handle whose
-  `CollectionEncoding` type `E` owns the canonical member bytes, validation,
-  and join. Constructing it validates that the runtime descriptor names `E`.
+  `CollectionEncoding` type `E` owns the canonical member bytes and join.
+  Constructing it validates that the runtime descriptor names `E`.
 - **`Cover<E>`** — one typed collection identity plus a PATCH of distinct
   `Handle<E>` members selected for one read or derivation.
   Signatures, authors, and metadata remain queryable provenance, but are not
   coordinates of the value.
-- **`TryFromCover<E>`** — reconstruction of one logical view from validated
-  physical members. A view may join eagerly or retain mmap-backed shards and
-  query their union lazily.
+- **`TryFromCover<E>`** — reconstruction of one logical view from selected
+  physical members. This is the payload-decoding boundary: a view may join
+  eagerly or retain mmap-backed shards and query their union lazily.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
 
@@ -180,10 +180,12 @@ Merge inputs are canonically ordered and every record has an intrinsic ID over
 its kind and exact payload. `CollectionStore::insert` therefore implements set
 insertion rather than an update. Concatenating stores unions evidence.
 
-Unsigned equations are replaceable computation, not authority. A resolver
-admits them only when the target encoding, declared mapping algorithm and
-parameters, and content identities validate. An invalid or unavailable result is a cache miss and
-cannot suppress an explicit cover member.
+Unsigned equations are materialized computation, not authority. Publishing a
+`MERGE` or `DERIVE` records work which has already been performed; warm
+resolution follows that equation without executing the join or mapping again.
+Equation trust belongs at the store/synchronization boundary. Blob residency
+is independent: an absent result is a cache miss and cannot suppress an
+available explicit cover member.
 
 Local publication remains unconditional. A publisher which needs to predict
 whether an authority-aware observation will admit a signer can freeze a store
@@ -207,7 +209,7 @@ let value = V::try_from_cover(&physical, &snapshot)?;
 `admitted` is the semantic COMMIT frontier: it verifies the descriptor's exact
 WRITE policy and forms a
 `Cover<E>` from distinct payload handles signed by the admitted subjects.
-`resolve` may select a resident support-equivalent decomposition using validated
+`resolve` may select a resident support-equivalent decomposition using stored
 `MERGE` and `DERIVE` evidence. `TryFromCover<E>` then constructs the logical
 value solely from that selected physical cover and the same frozen store
 snapshot. `collection.read::<V, _>(&snapshot)` is the convenience form of these
@@ -221,9 +223,10 @@ the same payload remain broader provenance rather than retroactive roots.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear on this call or a later
-call. Every cover member was nevertheless admitted and its payload validated
-for the returned snapshot, or the call fails instead of returning a partial
-set.
+call. Every cover member nevertheless has an admitted signed assertion in that
+snapshot. Admission does not fetch payload bytes; physical resolution selects a
+resident support-equivalent cover, and the requested typed view decodes its
+members.
 
 Admission does not fetch or materialize member blobs. Keep the returned cover
 when another component will select or build a representation:
@@ -237,7 +240,7 @@ let facts = TribleSet::try_from_cover(&physical, &snapshot)?;
 
 Exact replay does not need a publishing key, re-run admission, or retain any
 signed commit or metadata. The opaque cover itself names the exact descriptor
-and payload members to validate. Use `cover.commits(&snapshot)` when currently
+and payload identities. Use `cover.commits(&snapshot)` when currently
 resident authorship and metadata provenance matters; zero commits is a valid
 answer and does not invalidate replay. Commits whose data handles are absent
 from the cover remain inert. Replaying an opaque payload frontier still uses a
@@ -247,7 +250,7 @@ single store snapshot for resolution and member reads.
 
 A logical collection value is the join of a cover's members. It does not need
 one monolithic blob. A resolver may choose members consisting of committed
-payloads and validated merge results:
+payloads and stored merge results:
 
 ```text
     a       b       c           explicit payloads
@@ -258,7 +261,7 @@ payloads and validated merge results:
 ```
 
 Distinct covers can have the same support: `{a, b}` and `{a⊔b}` are different
-PATCH sets, but the validated `MERGE` equation proves that they denote the same
+PATCH sets, but the stored `MERGE` equation records that they denote the same
 join. This is useful for LSM-like maintenance: small commits remain
 independently attributable, while deterministic merges amortize reads into
 larger canonical shards. A selected target cover is replaceable computation,
@@ -274,12 +277,15 @@ f(a ⊔ b) = f(a) ⊔ f(b)
 ```
 
 Then a resolver may derive a merged source once, derive leaves separately and
-merge their images, or reuse any validated mixture already present. `DERIVE`
-records expose those reusable edges across collection lattices.
-Validation, canonical joins, mappings, and logical cover views all receive one
-frozen store snapshot. They may resolve immutable dependencies named by their
-input members (for example a text attachment or Merkle child); unrelated
-resident blobs are never ambient semantic input.
+merge their images, or reuse any stored mixture already present. `DERIVE`
+records expose those reusable edges across collection lattices. Newly executed
+joins and mappings publish every successful result and equation, even when a
+later planning or storage step fails or selects another route. Publication is
+operation-ordered rather than phase-batched, so a failure leaves the complete
+successful prefix addressable instead of stranding its blobs without their
+equations. Canonical joins, mappings, and logical cover views receive one
+frozen store snapshot and may resolve immutable dependencies named by their
+inputs; unrelated resident blobs are never ambient semantic input.
 
 The SuccinctArchive facade applies this model as two ordinary derivations:
 
@@ -304,9 +310,11 @@ let same_archive = succinct.attach(&mut storage, &cover)?;
 let compact_archive = succinct.compact_exact(&mut storage, &cover)?;
 ```
 
-- `attach` is read-only and requires a complete valid resident cover.
-- `ensure` reuses valid equations, computes missing canonical images, and
-  stores each selected source before its target image and new record.
+- `attach` is read-only, performs no collection algebra, and requires a
+  complete resident physical cover.
+- `ensure` reuses stored equations, computes missing canonical images, and
+  publishes every computed source/image/equation triple before beginning the
+  next one.
 - `compact_exact` deterministically compacts the raw target cover, then ensures
   the matching accelerated cover and returns its query view.
 
@@ -316,7 +324,7 @@ mixed across representations. `Cover<SimpleArchive>` contains only
 `Handle<SuccinctArchiveBlob>`; the second stage uses
 `Handle<Rank9AcceleratedSuccinctArchiveBlob>`. The target descriptor and its
 bound `CollectionMapping` determine route freedom. Ordinary raw
-Succinct derivation may choose any cheapest validated route whose support
+Succinct derivation may choose any cheapest resident route whose support
 equals the source cover. The accelerated stage maps the exact raw cover selected
 upstream. Its cover-aware view reads each embedded raw handle through the
 store snapshot and validates the exact raw/index pair before constructing the
@@ -411,10 +419,15 @@ branch. New code publishes directly to collections.
 ## Operational invariants
 
 - Persist dependencies before the record that makes them meaningful.
-- Treat an opaque cover's payload members as mandatory ground truth; fail loud
-  when its descriptor or data is absent or invalid. Signed commits and metadata
-  are unnecessary for replay and remain lazy provenance queried separately.
-- Treat unsigned equations as optional, freshly validated cache evidence.
+- Treat a cover's payload identities as semantic ground truth. Select a
+  complete resident support-equivalent physical cover, then let the requested
+  typed view decode exactly those members. Signed commits and metadata remain
+  lazy provenance queried separately.
+- Treat stored unsigned equations as reusable materialized LSM work. Never
+  replay algebra merely to trust a local equation; apply future trust/quorum
+  policy at record admission instead.
+- Persist every successful join or mapping. Yard/GC policy alone decides when
+  its result bytes leave local storage.
 - Keep admission, retention, and WANT policy orthogonal.
 - Carry exact covers across derivation boundaries instead of asking for an
   ambient “latest”.

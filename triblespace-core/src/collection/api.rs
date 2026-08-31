@@ -11,7 +11,7 @@
 //! an admitted cover or logical value is constructed. The descriptor policy
 //! independently governs READ and WRITE admission.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -43,10 +43,9 @@ use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
     CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
-    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError, CollectionRead,
-    CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
-    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ,
-    ACTION_WRITE,
+    CollectionFunctionalConflict, CollectionHandle, CollectionRead, CollectionResolutionError,
+    CollectionStore, CollectionTypeError, CollectionValidationRequest, DiscoveredCollectionRecords,
+    RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ, ACTION_WRITE,
 };
 use super::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
 
@@ -382,8 +381,8 @@ where
 /// Members are content identities, not signatures. Several commits may attest
 /// the same member with different authors or metadata without changing this
 /// value. The private constructor makes a `Cover` an opaque result of
-/// admission or validated collection operations rather than a caller-forged
-/// set of hashes.
+/// admission or stored collection operations rather than a caller-forged set
+/// of hashes.
 pub struct Cover<L: CollectionEncoding> {
     collection: Collection<L>,
     members: PATCH<32, IdentitySchema, (), Blake3Merkle>,
@@ -634,11 +633,11 @@ where
 
 /// Failure to materialize the complete value named by an opaque cover.
 ///
-/// Every cover member is explicit ground truth, so its descriptor and data
-/// fail loud. Signatures and metadata remain queryable provenance rather
-/// than becoming coordinates of the payload lattice. Unsigned equations are
-/// replaceable cache evidence: missing or invalid equations are omitted from
-/// the resolved semantics and cannot hide an explicit cover member.
+/// Signatures and metadata remain queryable provenance rather than becoming
+/// coordinates of the payload lattice. Stored equations are materialized LSM
+/// work: resolution follows them without replaying their algebra. Missing
+/// bytes remain an ordinary physical-cover miss, and the eventual typed view
+/// owns decoding of the selected members.
 #[derive(Debug)]
 pub enum CollectionMaterializationError<
     RecordsError,
@@ -674,14 +673,7 @@ pub enum CollectionMaterializationError<
         /// Backend fetch failure.
         source: GetError,
     },
-    /// A cover member failed exact encoding validation.
-    InvalidMember {
-        /// Exact payload identity.
-        member: CollectionData,
-        /// Exact representation or identity diagnostic.
-        source: CollectionOperationError,
-    },
-    /// Positively validated equations contradicted operation functionality.
+    /// Stored equations contradicted operation functionality.
     ResolutionConflict(Box<CollectionFunctionalConflict>),
     /// No resident physical cover spans every semantic obligation.
     Missing {
@@ -779,11 +771,6 @@ where
                 "failed to fetch cover member {}: {source}",
                 hex::encode_upper(member.raw),
             ),
-            Self::InvalidMember { member, source } => write!(
-                f,
-                "cover member {} is invalid: {source}",
-                hex::encode_upper(member.raw),
-            ),
             Self::ResolutionConflict(source) => source.fmt(f),
             Self::Missing { obligations } => write!(
                 f,
@@ -811,7 +798,6 @@ where
             Self::DescriptorGet { source, .. } => Some(source),
             Self::InvalidDescriptor { source, .. } => Some(source),
             Self::MemberGet { source, .. } => Some(source),
-            Self::InvalidMember { source, .. } => Some(source),
             Self::ResolutionConflict(source) => Some(source),
             Self::Missing { .. } => None,
             Self::View(source) => Some(source),
@@ -1413,15 +1399,11 @@ impl<L: CollectionEncoding> Collection<L> {
         S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
         V: TryFromCover<L>,
     {
-        let (descriptor, discovered, admitted) =
+        let (_descriptor, discovered, admitted) =
             discover_admitted_cover_at(snapshot, self, instant)
                 .map_err(CollectionMaterializationError::from)?;
-        let resolved = resolve_cover_from_observation::<S, L, V::Error, _>(
-            snapshot,
-            &descriptor,
-            discovered,
-            admitted,
-        )?;
+        let resolved =
+            resolve_cover_from_observation::<S, L, V::Error, _>(snapshot, discovered, admitted)?;
         V::try_from_cover(&resolved, snapshot).map_err(CollectionMaterializationError::from)
     }
 
@@ -1458,9 +1440,6 @@ impl<L: CollectionEncoding> Cover<L> {
     where
         S: BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
-        let descriptor = load_collection_descriptor(snapshot, self.collection().handle())
-            .map_err(CollectionMaterializationError::from)?
-            .fragment;
         let discovered = if self.is_empty() {
             DiscoveredCollectionRecords::default()
         } else {
@@ -1469,7 +1448,6 @@ impl<L: CollectionEncoding> Cover<L> {
         };
         resolve_cover_from_observation::<S, L, Infallible, Infallible>(
             snapshot,
-            &descriptor,
             discovered,
             self.clone(),
         )
@@ -1581,12 +1559,13 @@ impl<S> CollectionStoreExt for S where S: BlobStorePut + CollectionStore {}
 
 /// Resolve one already-discovered exact payload cover.
 ///
-/// Admission and opaque replay use this single validator so descriptor,
-/// mandatory member, and merge-cover semantics cannot drift apart. The result
-/// is the actual resident physical cover selected by the resolver.
+/// Stored equations describe support; blob metadata describes residency. This
+/// lookup performs no collection algebra and never reads a payload merely to
+/// prove work which was already materialized. The eventual [`TryFromCover`]
+/// implementation interprets exactly the physical members selected here;
+/// eager views may decode them, while lazy views may retain their shards.
 pub(crate) fn resolve_cover_from_observation<S, L, ViewError, EvidenceError>(
     snapshot: &S,
-    descriptor: &Fragment,
     discovered: DiscoveredCollectionRecords,
     cover: Cover<L>,
 ) -> Result<
@@ -1609,23 +1588,6 @@ where
         return Ok(cover);
     }
 
-    // The descriptor was fetched and bound to this typed collection through
-    // this same immutable snapshot. Its content address already binds these
-    // facts; another fetch cannot strengthen that proof.
-
-    // Fetch and validate each cover payload exactly once. Claims, authorship,
-    // and metadata are intentionally absent: replay remains valid even when no
-    // provenance record or metadata blob is resident.
-    let mut known = BTreeMap::new();
-    for member_handle in cover.members() {
-        let member = Handle::<L>::to_hash(member_handle);
-        let blob = reader
-            .get(member_handle)
-            .map_err(|source| CollectionMaterializationError::MemberGet { member, source })?;
-        L::validate_member(descriptor, &blob, reader)
-            .map_err(|source| CollectionMaterializationError::InvalidMember { member, source })?;
-        known.insert(member, blob);
-    }
     let roots: BTreeSet<_> = cover.data_members().collect();
     let explicit_roots: BTreeSet<_> = roots
         .iter()
@@ -1633,188 +1595,19 @@ where
         .map(|data| (collection, data))
         .collect();
 
-    // Unsigned merges are useful only when they can contribute to a
-    // resident physical cover. Walk backwards from resident result hashes
-    // first, then validate that finite subgraph forwards from the explicit
-    // cover roots. This retains the resolver's nonresident-intermediate model:
-    // an intermediate need not be stored when its computed bytes feed a
-    // later resident result.
-    let merges: Vec<_> = discovered
-        .merges()
-        .iter()
-        .filter(|claim| claim.collection() == collection)
-        .copied()
-        .collect();
-    let mut producers = BTreeMap::<CollectionData, Vec<usize>>::new();
-    for (index, claim) in merges.iter().enumerate() {
-        producers.entry(claim.result()).or_default().push(index);
-    }
-
-    let mut resident_results = BTreeSet::new();
-    let mut reverse_seen = BTreeSet::new();
-    let mut reverse_queue = VecDeque::new();
-    for result in producers.keys().copied() {
-        let resident = known.contains_key(&result)
-            || matches!(reader.metadata(Handle::<L>::from_hash(result)), Ok(Some(_)));
-        if resident {
-            resident_results.insert(result);
-            if reverse_seen.insert(result) {
-                reverse_queue.push_back(result);
-            }
-        }
-    }
-
-    let mut candidates = BTreeSet::new();
-    while let Some(result) = reverse_queue.pop_front() {
-        let Some(indices) = producers.get(&result) else {
-            continue;
-        };
-        for &index in indices {
-            candidates.insert(index);
-            let (low, high) = merges[index].inputs();
-            for input in [low, high] {
-                if reverse_seen.insert(input) {
-                    reverse_queue.push_back(input);
-                }
-            }
-        }
-    }
-
-    // Index each candidate by its missing inputs. Newly validated results
-    // wake only their direct dependants, avoiding repeated global scans as
-    // a deep LSM cover becomes grounded.
-    let mut missing = vec![u8::MAX; merges.len()];
-    let mut waiters = BTreeMap::<CollectionData, Vec<usize>>::new();
-    let mut remaining_uses = BTreeMap::<CollectionData, usize>::new();
-    let mut ready = BTreeSet::new();
-    for &index in &candidates {
-        let claim = &merges[index];
-        let (low, high) = claim.inputs();
-        *remaining_uses.entry(low).or_default() += 1;
-        if high != low {
-            *remaining_uses.entry(high).or_default() += 1;
-        }
-        let mut count = 0u8;
-        if !known.contains_key(&low) {
-            waiters.entry(low).or_default().push(index);
-            count += 1;
-        }
-        if high != low && !known.contains_key(&high) {
-            waiters.entry(high).or_default().push(index);
-            count += 1;
-        }
-        missing[index] = count;
-        if count == 0 {
-            ready.insert((claim.id(), index));
-        }
-    }
-
-    let mut accepted_merges = BTreeSet::new();
-    let mut expected_hashes = BTreeMap::<(CollectionData, CollectionData), CollectionData>::new();
-    while let Some((_, index)) = ready.pop_first() {
-        let claim = &merges[index];
-        let (low, high) = claim.inputs();
-        let pair = (low, high);
-
-        let mut joined = None;
-        let expected_data = if let Some(expected) = expected_hashes.get(&pair).copied() {
-            Some(expected)
-        } else {
-            match (known.get(&low), known.get(&high)) {
-                (Some(low_blob), Some(high_blob)) => {
-                    match L::join_members(descriptor, low_blob, high_blob, reader) {
-                        Ok(Some(value)) => {
-                            let expected = Handle::<L>::to_hash(value.get_handle());
-                            expected_hashes.insert(pair, expected);
-                            joined = Some(value);
-                            Some(expected)
-                        }
-                        // `Ok(None)` means this representation deliberately
-                        // performs compaction in another collection lattice.
-                        // Invalid optional cache evidence is equally inert.
-                        Ok(None) | Err(_) => None,
-                    }
-                }
-                _ => None,
-            }
-        };
-
-        if let Some(expected_data) = expected_data.filter(|data| *data == claim.result()) {
-            let retain_result = remaining_uses
-                .get(&expected_data)
-                .copied()
-                .unwrap_or_default()
-                > 0;
-            let inserted = if known.contains_key(&expected_data) || !retain_result {
-                false
-            } else {
-                if joined.is_none() {
-                    joined = match (known.get(&low), known.get(&high)) {
-                        (Some(low_blob), Some(high_blob)) => {
-                            L::join_members(descriptor, low_blob, high_blob, reader)
-                                .ok()
-                                .flatten()
-                        }
-                        _ => None,
-                    };
-                }
-                if let Some(value) = joined {
-                    debug_assert_eq!(Handle::<L>::to_hash(value.get_handle()), expected_data,);
-                    known.insert(expected_data, value);
-                    true
-                } else {
-                    false
-                }
-            };
-
-            // A terminal result needs no retained bytes: its canonical
-            // hash already validates the equation, and a selected
-            // physical artifact is exact-checked later. A nonterminal
-            // result is accepted only when its bytes remain available to
-            // validate its dependants.
-            if known.contains_key(&expected_data) || !retain_result {
-                accepted_merges.insert(claim.id());
-                if inserted {
-                    for dependent in waiters.remove(&expected_data).unwrap_or_default() {
-                        debug_assert!(missing[dependent] > 0 && missing[dependent] <= 2);
-                        missing[dependent] -= 1;
-                        if missing[dependent] == 0 {
-                            ready.insert((merges[dependent].id(), dependent));
-                        }
-                    }
-                };
-            }
-        }
-
-        // Computed intermediate bytes live only until their final
-        // candidate consumer has run. This keeps a balanced LSM to one
-        // live derived frontier instead of retaining the dataset once per
-        // level. Authenticated leaves stay cached for mandatory fallback.
-        for input in [Some(low), (high != low).then_some(high)]
-            .into_iter()
-            .flatten()
-        {
-            let uses = remaining_uses
-                .get_mut(&input)
-                .expect("candidate inputs have reference counts");
-            debug_assert!(*uses > 0);
-            *uses -= 1;
-            if *uses == 0 && !roots.contains(&input) {
-                known.remove(&input);
-            }
-        }
-    }
-
-    // A plain collection facade owns one root collection and derives
-    // nothing, so it declares no lineage.
+    // MERGE records are already materialized LSM equations. Resolution uses
+    // them as stored operational evidence; it never re-executes a join merely
+    // to prove work which was performed before the record was published.
+    // Trust admission for equations is a storage/synchronization concern, not
+    // hidden algebra in the read path.
     let resolution = resolve_collection_semantics_from_roots(
         &discovered,
         &BTreeMap::new(),
         &explicit_roots,
         |request| {
             Ok::<CollectionClaimValidation<()>, Infallible>(match request {
-                CollectionValidationRequest::Merge { claim, .. }
-                    if accepted_merges.contains(&claim.id()) =>
+                CollectionValidationRequest::Merge { claim }
+                    if claim.collection() == collection =>
                 {
                     CollectionClaimValidation::Accepted
                 }
@@ -1833,56 +1626,24 @@ where
         }
     };
 
-    // Optional physical results are accelerators, not failure authority.
-    // Offer only metadata-resident, semantically accepted results to the
-    // cover algorithm, then exact-check just the members it selects. A bad
-    // candidate is removed and the cover is recomputed, so corrupt or
-    // stale artifacts fall back to another cover without forcing eager
-    // reads of the full historical LSM. Mandatory root bytes already
-    // failed loud above.
+    // Equation semantics and blob residency are orthogonal. Select from every
+    // currently resident semantic member. Absent roots remain uncovered
+    // obligations; resident materializations inherit the BlobStore contract
+    // and are interpreted by the eventual view rather than re-proved here.
     let semantics = resolution.semantics();
-    let mut resident = roots.clone();
+    let mut resident = BTreeSet::new();
     for data in semantics.members(collection).into_iter().flatten().copied() {
-        if resident_results.contains(&data) {
+        if matches!(reader.metadata(Handle::<L>::from_hash(data)), Ok(Some(_))) {
             resident.insert(data);
         }
     }
 
-    let mut selected = BTreeMap::<CollectionData, Blob<L>>::new();
-    let physical_cover = loop {
-        let candidate = collection_physical_cover(semantics, collection, &resident);
-        if !candidate.missing.is_empty() {
-            return Err(CollectionMaterializationError::Missing {
-                obligations: candidate.missing,
-            });
-        }
+    let physical = collection_physical_cover(semantics, collection, &resident);
+    if !physical.missing.is_empty() {
+        return Err(CollectionMaterializationError::Missing {
+            obligations: physical.missing,
+        });
+    }
 
-        selected.retain(|data, _| candidate.cover.contains(data));
-        let mut rejected = Vec::new();
-        for data in candidate.cover.iter().copied() {
-            if roots.contains(&data) || selected.contains_key(&data) {
-                continue;
-            }
-            let handle = Handle::<L>::from_hash(data);
-            let root: Result<Blob<L>, _> = reader.get(handle);
-            match root {
-                Ok(root) => match L::validate_member(descriptor, &root, reader) {
-                    Ok(()) => {
-                        selected.insert(data, root);
-                    }
-                    Err(_) => rejected.push(data),
-                },
-                Err(_) => rejected.push(data),
-            }
-        }
-
-        if rejected.is_empty() {
-            break candidate.cover;
-        }
-        for data in rejected {
-            resident.remove(&data);
-        }
-    };
-
-    Ok(Cover::from_data(cover.collection(), physical_cover))
+    Ok(Cover::from_data(cover.collection(), physical.cover))
 }

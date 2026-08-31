@@ -195,20 +195,22 @@ hooks, and range planning.
 
 The derivation selects a target `Cover` whose support equals the source cover;
 the same value type represents both lattice positions. The path mapping permits
-any validated combination of source merges, target merges, and derivations
+any stored combination of source merges, target merges, and derivations
 with that support, so route choice is not encoded as a cover mode.
 
 The opaque cover is the value boundary. It must name the canonical
-policy-bearing `SimpleArchive` source descriptor, and every member must name
-resident canonical source data.
+policy-bearing `SimpleArchive` source descriptor, and every member names one
+exact source payload identity. Source bytes are needed only when missing target
+work must actually be computed.
 
 Distinct signed claims that name identical data collapse to one cover member
 and one unit of derivation work. Their authorship, signatures, and metadata are
 queryable, possibly absent provenance through `cover.commits(&snapshot)` and are
 intentionally unnecessary for replay or path semantics.
 
-`attach` never writes. It admits existing canonical source `MERGE`,
-path-summary `MERGE`, and source-to-target `DERIVE` equations, then requires
+`attach` never writes or executes collection algebra. It follows existing
+source `MERGE`, path-summary `MERGE`, and source-to-target `DERIVE` equations,
+then requires
 both:
 
 1. the union of support on the logical target frontier is exactly the supplied
@@ -217,15 +219,16 @@ both:
 
 Only then are selected summaries joined and closed once into `PathIndex`.
 
-`ensure` performs the same probe, selects a deterministic resident source
+`ensure` performs the same lookup, selects a deterministic resident source
 `Cover`, and lowers only cover members supporting
 at least one still-unsupported payload member. A resident source merge can
 therefore replace several leaf derivations, even when it overlaps a member that
-already has a target image. It publishes descriptor and output blobs before the
-unsigned `DERIVE` records and performs no implicit durability flush. It drops
-the old store snapshot before those writes and calls `attach` afterwards, so
-local construction never substitutes for fresh admission. Concurrent and
-repeated ensures are content-addressed and record-idempotent.
+already has a target image. It persists every successfully computed source,
+output, and unsigned `DERIVE` record—even if a later capacity or fatal result
+changes the selected route—and performs no implicit durability flush. It drops
+the old store snapshot before those writes. Concurrent and repeated ensures are
+content-addressed and record-idempotent; unchanged warm calls execute no maps or
+joins.
 
 An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.
@@ -257,7 +260,8 @@ independent policy.
 `derive_element` lowers one canonical `SimpleArchive` into direct product arcs,
 `join` unions two summaries, and `validate_derive` / `validate_merge` bind all
 supplied blobs to the record's exact identities and recompute the claimed
-equations byte for byte:
+equations byte for byte. Those explicit validators are producer, ingress, or
+offline-audit tools; warm attachment does not invoke them:
 
 ```text
 paths(∅) = ⊥

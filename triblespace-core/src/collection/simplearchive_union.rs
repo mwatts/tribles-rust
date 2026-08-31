@@ -8,12 +8,12 @@
 //! 64-byte tribles. Its join is ordinary set union, so canonical output bytes
 //! and their Blake3 identity are associative, commutative, and idempotent.
 //!
-//! Validation, joins, and publication operate directly on the canonical byte
-//! streams. They deliberately do not construct [`crate::trible::TribleSet`] or
-//! PATCH indexes; query-time decoding keeps its independently optimized path.
-//! Missing endpoint blobs are likewise outside this module: callers defer an
-//! equation until its three blobs are resident, then call
-//! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
+//! Joins and publication operate directly on the canonical byte streams. They
+//! deliberately do not construct [`crate::trible::TribleSet`] or PATCH indexes;
+//! query-time decoding keeps its independently optimized path. The explicit
+//! [`validate_merge`](crate::collection::simplearchive_union::validate_merge)
+//! helper is for producer checks, network ingress, and offline audits. Warm
+//! collection resolution trusts stored equations and never invokes it.
 
 #[cfg(test)]
 use super::policy::CollectionPolicy;

@@ -78,9 +78,9 @@ collection's identity; the handle of a data archive is one collection element.
 
 SuccinctArchive and other query-oriented formats are also typed blobs. Their
 collection encodings define canonical joins, while mappings define canonical
-cross-encoding transformations. A validated derived artifact can therefore be
-cached or forgotten without changing the authority of the signed source
-commits.
+cross-encoding transformations. A materialized derived artifact can therefore
+be stored, reused, or forgotten without changing the authority of the signed
+source commits.
 
 ## Conservative references
 

@@ -39,15 +39,14 @@ Planning an explicitly selected authoritative view fails if any required
 descriptor, data, or metadata blob is absent.
 
 Unsigned `MERGE` and `DERIVE` records are reproducible cache work. They add no
-strong roots even when validation accepts them and their equations are active;
-their named inputs, results, and otherwise-unowned descriptor blobs may all be
-collected. Conservative Pile and Yard rewrites preserve the equation records
-themselves as immutable ledger evidence, but that preservation creates no blob
-ownership edge. A future cache planner can choose useful materializations under
-a separate budget without letting append-only unsigned claims manufacture
-durable ownership. This boundary also means the strong planner needs neither a
-requested-view set nor persistent validation-verdict machinery: admitted
-strictly verified commits themselves determine the collections that are retained.
+strong roots merely because their equations are present; their named inputs,
+results, and otherwise-unowned descriptor blobs may all be collected.
+Conservative Pile and Yard rewrites preserve the equation records themselves
+as immutable ledger evidence, but that preservation creates no blob ownership
+edge. All successful computations are stored first; Yard/GC alone later chooses
+which materializations remain resident. This boundary also means the strong
+planner needs neither a requested-view set nor validation-verdict machinery:
+admitted strictly verified commits determine the collections that are retained.
 
 Rank9 acceleration uses the same rule through ordinary collection records.
 `Rank9AcceleratedSuccinctArchiveBlob` is a Merkle root whose first 32 bytes name
@@ -139,8 +138,9 @@ The retention procedure is therefore:
    preserving the immutable record ledger.
 
 `MERGE` and `DERIVE` records remain useful even when their result bytes are
-absent: a later resolver can rediscover the equation, recompute or fetch the
-canonical result, and validate it again.
+absent: a later resolver can request the exact recorded result from peers or,
+if no copy remains, recompute and republish it. Existing resident results are
+never recomputed merely to prove their equations.
 
 ## Operational Tips
 

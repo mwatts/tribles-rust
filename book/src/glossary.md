@@ -73,8 +73,9 @@ another principal from silently becoming an admission decision.
 
 ### Collection
 A self-describing grow-only join semilattice. Signed commits introduce members;
-validated merge records describe joins within the lattice; derivation records
-map elements into another collection through a canonical mapping. A
+stored merge records describe materialized joins within the lattice; derivation
+records describe materialized mappings into another collection. Warm resolution
+reuses those equations without executing their algebra again. A
 collection has no distinguished head. In Rust, `Collection<E>` is the cheap
 descriptor handle after the runtime member encoding has been validated against
 the `CollectionEncoding` type `E`.
@@ -85,9 +86,9 @@ descriptor and a PATCH set of distinct `Handle<E>` payload handles.
 Signatures, authors, and metadata are optional provenance fibers queryable from
 the store, not part of cover identity or required for replay, so several claims
 over identical data collapse to one member. Distinct covers may have the same
-support: a validated merge can prove that `{a, b}` and `{a⊔b}` denote the same
-join. Cover construction is opaque; admission and validated collection algebra
-produce them rather than accepting caller-forged hash sets.
+support: a stored merge records that `{a, b}` and `{a⊔b}` denote the same join.
+Cover construction is opaque; admission and stored collection algebra produce
+them rather than accepting caller-forged hash sets.
 
 ### Collection Admission
 The read-time signer decision performed by
@@ -196,12 +197,14 @@ child fragments into parent entities, giving Merkle trees for free.
 An unsigned exact equation mapping one source element into a derived collection.
 The target descriptor names both source and concrete mapping, so the
 record needs only the target, input, and output identities. Derivations are
-reproducible cache evidence, not authority.
+reusable materialized work, not authority. Every successful mapping is stored
+with its equation; Yard/GC decides later whether its bytes remain resident.
 
 ### Merge
-An unsigned exact equation `a ⊔ b = c` inside one collection. A validated merge
+An unsigned exact equation `a ⊔ b = c` inside one collection. A resident stored
 result can replace its inputs in a physical cover without changing the logical
-value or creating new authority.
+value or creating new authority. Warm resolution trusts the stored equation and
+does not recompute the join.
 
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.

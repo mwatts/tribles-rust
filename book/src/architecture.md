@@ -33,8 +33,9 @@ ambient current value.
 
 A signed `COMMIT` says that an author places one element in a collection. An
 unsigned `MERGE` or `DERIVE` says that reproducible computation connected known
-elements. The former is irreducible authority; the latter is replaceable cache
-evidence which a reader validates under the collection's encoding and mapping.
+elements. The former is irreducible authority; the latter is materialized LSM
+work which a reader reuses without executing the encoding join or mapping
+again. Trust policy belongs at equation ingress, not in every read.
 
 That separation is why a materialized index does not become ground truth merely
 because it is convenient, and why collecting an accelerator does not erase the
@@ -61,7 +62,7 @@ or irrelevant proof in storage grants nothing.
 │ publish, select exact covers, materialize views  │
 ├──────────────────────────────────────────────────┤
 │ Collection algebra                              │
-│ signed COMMIT · checked MERGE · checked DERIVE   │
+│ signed COMMIT · stored MERGE · stored DERIVE     │
 ├──────────────────────────────────────────────────┤
 │ Storage                                          │
 │ CollectionStore · BlobStore · WantStore          │
@@ -201,7 +202,7 @@ f(a ⊔ b) = f(a) ⊔ f(b)
 
 That law permits either route through the evidence graph: merge source shards
 and derive once, derive individual shards and merge their images, or reuse any
-validated mixture already present. An opaque source cover fixes the logical
+stored mixture already present. An opaque source cover fixes the logical
 value while a resolver chooses a target cover with equal support.
 Different target covers may denote the same join, and every lattice position
 uses the same `Cover<E>` shape while retaining its own typed member handles.
@@ -209,7 +210,7 @@ Missing derived artifacts are cache misses, not missing facts.
 
 Route freedom belongs to the input collection expected by the mapping rather
 than to a flag on `Cover`: ordinary Succinct construction may reuse any
-validated equal-support route. Rank9 acceleration is another ordinary derived
+resident equal-support route. Rank9 acceleration is another ordinary derived
 collection. Its members are ordinary
 `Blob<Rank9AcceleratedSuccinctArchiveBlob>` values whose first 32 bytes name the
 exact portable `SuccinctArchiveBlob` child carrying their source rows. The root

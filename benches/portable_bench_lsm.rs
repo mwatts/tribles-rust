@@ -786,9 +786,9 @@ fn main() {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }
 
-            // Inspect the raw physical cover outside the timer. This reports
-            // construction shape without charging validation a second time to
-            // the build metric.
+            // Inspect the resident raw physical cover outside the timer. This
+            // reports construction shape through a lookup-only attachment
+            // which executes no collection algebra.
             let exact = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw)
                 .expect("bind exact raw Succinct projection");
             let raw_cover = exact

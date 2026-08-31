@@ -134,9 +134,10 @@ impl PathSummaryCollection {
 
     /// Ensure and attach the exact endpoint relation for `source_cover`.
     ///
-    /// Existing source merges, target merges, and derivations are reused. New
-    /// target blobs precede unsigned records, no flush is implied, and a fresh
-    /// pass proves the frozen cover before path closure runs once.
+    /// Existing source merges, target merges, and derivations are reused
+    /// without algebra replay. Every newly computed target blob precedes its
+    /// unsigned record, no flush is implied, and path closure runs once over
+    /// the selected resident cover.
     pub fn ensure<S>(
         &self,
         store: &mut S,
@@ -484,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn old_cover_ignores_later_commit_and_its_cache_equation() {
+    fn old_cover_ignores_later_commit_and_its_stored_equation() {
         let name = test_name("c9");
         let mut store = CollectionOnly::default();
         let paths = test_paths(&mut store, name, plus());
@@ -743,8 +744,11 @@ mod tests {
         assert!(matches!(
             paths.attach(&mut store, &cover),
             Err(PathSummaryCollectionError::Collection(
-                ExactDerivedCollectionError::IncompleteMember(found)
-            )) if found == commit.data()
+                ExactDerivedCollectionError::IncompleteCover {
+                    unsupported_members,
+                    ..
+                }
+            )) if unsupported_members == vec![commit.data()]
         ));
     }
 }

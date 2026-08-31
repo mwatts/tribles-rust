@@ -67,8 +67,10 @@ proof store would disclose unrelated capability structure. The overlay is the
 smallest exact state whose union can change C.
 
 Unsigned MERGE and DERIVE records remain optional computation evidence. Their
-presence never activates a payload on its own, and a reader validates an
-equation before using it as a support-equivalent physical route.
+presence never activates a payload on its own. Once admitted into the local
+record store, an equation is reusable materialized LSM work; warm readers do
+not execute its join or mapping again. A future trust/quorum policy belongs at
+network ingress rather than in resolution.
 
 ## Opaque wakes over stock gossip
 

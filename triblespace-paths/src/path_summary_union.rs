@@ -271,12 +271,17 @@ impl PathSummaryView {
         self.segments.is_empty()
     }
 
-    /// Borrow the ordered, already validated physical summary members.
+    /// Borrow the ordered resident physical summary members.
+    ///
+    /// Stored collection equations are trusted materialized work, so this
+    /// lazy view does not replay summary decoding merely to expose its shards.
+    /// Consumers which interpret path semantics validate while constructing
+    /// that interpretation, as the collection's path-index construction does.
     pub fn segments(&self) -> &[(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)] {
         &self.segments
     }
 
-    /// Consume the view into its ordered, already validated physical members.
+    /// Consume the view into its ordered resident physical members.
     pub fn into_segments(self) -> Vec<(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)> {
         self.segments
     }

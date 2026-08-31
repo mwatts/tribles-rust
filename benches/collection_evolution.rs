@@ -13,13 +13,12 @@
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
-//! state; a bench-local mapping wrapper performs one untimed, zero-write
-//! raw fresh attachment for stateless arms to expose replay work that store
-//! totals hide. The maintained view reports the canonical projection calls
-//! made during its timed observation, so continuation reuse is measured rather
-//! than inferred from durable writes. It is intentionally not replayed after
-//! timing: that would measure the stateless operation it exists to avoid, not
-//! its actual work.
+//! state; a bench-local mapping wrapper counts canonical projection calls made
+//! by each timed operation. One untimed read-only raw attachment records the
+//! chosen physical cover and asserts that resident lookup performs zero
+//! algebra. The maintained view reports the projection calls made during its
+//! timed observation, so continuation reuse is measured rather than inferred
+//! from durable writes.
 //! No scan or diagnostic touches a measured store before its first timed call
 //! at a checkpoint, and the immediate no-op remains adjacent to that call.
 //!
@@ -311,7 +310,7 @@ struct Sample {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Diagnostic {
-    StatelessReplay {
+    StatelessOperation {
         calls: MappingCalls,
         cover: CoverIdentity,
     },
@@ -321,6 +320,7 @@ enum Diagnostic {
 struct TimedOperation {
     elapsed: Duration,
     union: UnionArchive<OrderedUniverse>,
+    calls: MappingCalls,
 }
 
 struct RunContext<'a> {
@@ -339,30 +339,40 @@ fn time_operation(
     cover: &Cover<SimpleArchive>,
     succinct: &SuccinctArchiveCollection,
 ) -> TimedOperation {
+    reset_mapping_calls();
     let start = Instant::now();
     let union = operation.execute(succinct, store, cover);
     let elapsed = start.elapsed();
+    let calls = mapping_calls();
     black_box(union.segment_count());
-    TimedOperation { elapsed, union }
+    TimedOperation {
+        elapsed,
+        union,
+        calls,
+    }
 }
 
-fn diagnose_raw(
+fn observe_raw_cover(
     store: &mut MemoryRepo,
     cover: &Cover<SimpleArchive>,
     exact: &ExactDerivedCollection<CountingSuccinctMapping>,
-) -> (MappingCalls, CoverIdentity) {
-    // This is outside the timer and must be a zero-write operation: it measures
-    // the scratch proof graph needed to revalidate the exact raw cover now held
-    // by this arm. The public accelerated phase remains represented by timing
-    // and its ordinary DERIVE/MERGE/blob delta.
+) -> CoverIdentity {
+    // This is outside the timer and must be a zero-write, zero-algebra lookup.
+    // The public accelerated phase remains represented by timing and its
+    // ordinary DERIVE/MERGE/blob delta.
     let diagnostic_before = store
         .snapshot()
         .expect("freeze pre-diagnostic store snapshot");
     reset_mapping_calls();
     let raw_cover = exact
-        .ensure(store, cover)
-        .expect("diagnose complete raw exact cover");
+        .attach(store, cover)
+        .expect("observe complete resident raw exact cover");
     let projection_calls = mapping_calls();
+    assert_eq!(
+        projection_calls,
+        MappingCalls::default(),
+        "resident raw attachment executed collection algebra"
+    );
     let diagnostic_after = store
         .snapshot()
         .expect("freeze post-diagnostic store snapshot");
@@ -373,7 +383,7 @@ fn diagnose_raw(
             .is_empty(),
         "post-operation raw mapping diagnostic wrote sync-visible storage"
     );
-    (projection_calls, cover)
+    cover
 }
 
 fn finish_sample(
@@ -415,7 +425,7 @@ fn run_warm_pair(
         .expect("freeze snapshot between warm and no-op calls");
 
     // Keep these public calls adjacent. In particular, do not materialize the
-    // first result or replay the exact proof before timing the unchanged call.
+    // first result or inspect its raw cover before timing the unchanged call.
     let timed_noop = time_operation(operation, store, context.cover, context.succinct);
     let snapshot_after_noop = store.snapshot().expect("freeze snapshot after no-op call");
     assert!(
@@ -427,29 +437,31 @@ fn run_warm_pair(
 
     let after = store_shape(store, context.collections);
     let warm_work = after.difference(before);
-    let diagnostic = diagnose_raw(store, context.cover, context.exact);
+    let raw_cover = observe_raw_cover(store, context.cover, context.exact);
+    let warm_calls = timed_warm.calls;
     let warm = finish_sample(
         warm_arm,
         context,
         context.newly_supported_rows,
         timed_warm,
         warm_work,
-        Diagnostic::StatelessReplay {
-            calls: diagnostic.0,
-            cover: diagnostic.1,
+        Diagnostic::StatelessOperation {
+            calls: warm_calls,
+            cover: raw_cover,
         },
     );
     assert_eq!(warm.relation, context.expected);
 
+    let noop_calls = timed_noop.calls;
     let noop = finish_sample(
         noop_arm,
         context,
         context.total_rows,
         timed_noop,
         StoreShape::default(),
-        Diagnostic::StatelessReplay {
-            calls: diagnostic.0,
-            cover: diagnostic.1,
+        Diagnostic::StatelessOperation {
+            calls: noop_calls,
+            cover: raw_cover,
         },
     );
     assert_eq!(noop.relation, context.expected);
@@ -465,16 +477,17 @@ fn run_cold(
 ) -> Sample {
     let timed = time_operation(operation, store, context.cover, context.succinct);
     let after = store_shape(store, context.collections);
-    let diagnostic = diagnose_raw(store, context.cover, context.exact);
+    let raw_cover = observe_raw_cover(store, context.cover, context.exact);
+    let calls = timed.calls;
     let cold = finish_sample(
         arm,
         context,
         context.total_rows,
         timed,
         after.difference(before),
-        Diagnostic::StatelessReplay {
-            calls: diagnostic.0,
-            cover: diagnostic.1,
+        Diagnostic::StatelessOperation {
+            calls,
+            cover: raw_cover,
         },
     );
     assert_eq!(cold.relation, context.expected);
@@ -517,7 +530,11 @@ fn time_exact_view(
         .expect("advance maintained exact Succinct view");
     let elapsed = start.elapsed();
     black_box(union.segment_count());
-    TimedOperation { elapsed, union }
+    TimedOperation {
+        elapsed,
+        union,
+        calls: MappingCalls::default(),
+    }
 }
 
 fn run_exact_view_pair(
@@ -552,7 +569,7 @@ fn run_exact_view_pair(
             reused_members: context.cover.len(),
             ..SuccinctArchiveViewWork::default()
         },
-        "an identical exact-view cover must not replay raw proof work",
+        "an identical exact-view cover must not execute projection work",
     );
     assert!(
         store
@@ -863,8 +880,8 @@ impl Aggregate {
 
 fn raw_cover(aggregate: &Aggregate) -> CoverIdentity {
     match aggregate.diagnostic.expect("diagnostic observation") {
-        Diagnostic::StatelessReplay { cover, .. } => cover,
-        Diagnostic::ViewActual(_) => panic!("view arm has no stateless raw-cover replay"),
+        Diagnostic::StatelessOperation { cover, .. } => cover,
+        Diagnostic::ViewActual(_) => panic!("view arm has no stateless raw-cover observation"),
     }
 }
 
@@ -980,7 +997,7 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; maps=canonical source-to-target mapping calls and cumulative input MiB (stateless=replayed after timing, view=actual timed observation); support=admitted/reused commits for views"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; maps=canonical source-to-target mapping calls and cumulative input MiB from the timed operation; support=admitted/reused commits for views"
     );
     println!(
         "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
@@ -992,8 +1009,8 @@ fn main() {
             let work = aggregate.work.expect("store work");
             let (support, calls, argument_mib) =
                 match aggregate.diagnostic.expect("diagnostic observation") {
-                    Diagnostic::StatelessReplay { calls, .. } => (
-                        "replay/full".to_owned(),
+                    Diagnostic::StatelessOperation { calls, .. } => (
+                        "stateless".to_owned(),
                         calls.derive.to_string(),
                         format!("{:.2}", calls.input_bytes as f64 / (1024.0 * 1024.0)),
                     ),

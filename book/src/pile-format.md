@@ -144,10 +144,10 @@ The re-encode is semantic and in source order, which is what makes it faithful:
   grow-only sets, so order is irrelevant and re-insertion is idempotent.
 - Records that never carried live state are dropped and counted: inert legacy
   V3 collection headers, retired local cells, and kinds no longer interpreted.
-  Derived collections fall in the same category by design — a derivation is a
-  computation with a checkable artifact, so a stale one is recomputed rather
-  than migrated. Only committed state, the signed assertions nobody can
-  recompute, has to survive, and it does.
+  This includes retired derivation record generations whose old wire shape
+  cannot express the current collection algebra. Current native `MERGE` and
+  `DERIVE` records are grow-only materialized work and are preserved exactly;
+  their result blobs remain subject only to ordinary Yard/GC policy.
 
 A commit's signature covers a domain-separated transcript over its fields, not
 the bytes of its frame, so re-encoding cannot invalidate one. That is a claim

@@ -57,7 +57,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -68,7 +68,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::RegisterOrder;
-use crate::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
+use crate::trible::{Fragment, Trible, A_START, TRIBLE_LEN, V_START};
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 #[cfg(test)]
@@ -120,6 +120,8 @@ impl MetaDescribe for ObservedSetBlob {
 /// Canonical observed-set validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObservedSetError {
+    /// The source is not a canonical `SimpleArchive`.
+    InvalidSource(UnarchiveError),
     /// The payload is not a whole number of ids.
     BadLength(usize),
     /// The ids are not strictly increasing.
@@ -129,6 +131,7 @@ pub enum ObservedSetError {
 impl fmt::Display for ObservedSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSource(source) => write!(formatter, "invalid source archive: {source}"),
             Self::BadLength(len) => {
                 write!(
                     formatter,
@@ -179,10 +182,28 @@ pub fn derive_element(
 ) -> Result<Blob<ObservedSetBlob>, ObservedSetError> {
     let bytes = source.bytes.as_ref();
     if bytes.len() % TRIBLE_LEN != 0 {
-        return Err(ObservedSetError::BadLength(bytes.len()));
+        return Err(ObservedSetError::InvalidSource(UnarchiveError::BadArchive));
     }
     let mut observed: Vec<[u8; ID_LEN]> = Vec::new();
+    let mut previous = None;
     for trible in bytes.chunks_exact(TRIBLE_LEN) {
+        let row: &[u8; TRIBLE_LEN] = trible.try_into().expect("64-byte archive row");
+        if Trible::as_transmute_force_raw(row).is_none() {
+            return Err(ObservedSetError::InvalidSource(UnarchiveError::BadTrible));
+        }
+        if let Some(previous) = previous {
+            if previous == row {
+                return Err(ObservedSetError::InvalidSource(
+                    UnarchiveError::BadCanonicalizationRedundancy,
+                ));
+            }
+            if previous > row {
+                return Err(ObservedSetError::InvalidSource(
+                    UnarchiveError::BadCanonicalizationOrdering,
+                ));
+            }
+        }
+        previous = Some(row);
         if trible[A_START..A_START + ID_LEN] != observes[..] {
             continue;
         }
@@ -760,6 +781,20 @@ mod tests {
         assert_eq!(
             descriptor_facts::policy(target_descriptor.facts()),
             Ok(target_policy)
+        );
+    }
+
+    #[test]
+    fn derive_rejects_a_non_trible_source_row_while_scanning_it() {
+        let observed = ufoid();
+        let mut row = [0u8; TRIBLE_LEN];
+        row[A_START..A_START + ID_LEN].copy_from_slice(&metadata::supersedes.id()[..]);
+        row[V_START + ID_LEN..V_START + ID_LEN * 2].copy_from_slice(&observed[..]);
+        let source: Blob<SimpleArchive> = Blob::new(Bytes::from_source(row.to_vec()));
+
+        assert_eq!(
+            derive_element(&source, metadata::supersedes.id()),
+            Err(ObservedSetError::InvalidSource(UnarchiveError::BadTrible))
         );
     }
 

@@ -168,7 +168,7 @@ for (first, last, quote) in find!(
 backend state at one coherent known prefix. `library.admitted(&snapshot)` then
 applies the descriptor's WRITE policy in that same observation and returns the
 exact semantic payload cover. `resolve` may replace
-that cover with any resident physical decomposition proven to have equal
+that cover with any resident physical decomposition recorded to have equal
 support, and `TryFromCover` constructs the logical value from exactly those
 members through the same immutable snapshot. `library.read(&snapshot)` is the
 convenience form of admission, resolution, and logical reconstruction.

@@ -1,29 +1,19 @@
 //! Exact-cover attachment shared by canonical derived collections.
 //!
-//! Concrete facades bind one [`CollectionMapping`] to typed source and
-//! target descriptors, then choose a final logical view. Validation and join
-//! belong to the two [`CollectionEncoding`] types; the mapping contributes
-//! only the map between them. This kernel owns the common I/O lifecycle around
-//! opaque source-cover roots and reproducible unsigned evidence.
-//!
-//! Unsigned equations are cache evidence, not durable validation receipts.
-//! Resolution walks backwards from resident source and target results, then
-//! recomputes that finite proof graph forwards from explicit source-cover
-//! members and any validated source decompositions rooted beneath them.
-//! Canonical intermediates live only in use-counted scratch, so garbage
-//! collection may discard them without invalidating a resident upper result.
-//! Selected optional artifacts are representation-validated at the point
-//! where stored bytes acquire collection meaning. Content identity itself is
-//! supplied by the `BlobStore` contract and is never recomputed in this layer.
+//! Concrete facades bind one [`CollectionMapping`] to typed source and target
+//! descriptors, then choose a final logical view. Stored `MERGE` and `DERIVE`
+//! equations are materialized LSM work: resolution consumes them without
+//! replaying their algebra. When completion executes a map, it persists the
+//! source, target, and equation before returning. Yard/GC policy alone decides
+//! when reusable artifacts leave local storage.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::{Blob, BlobEncoding};
-use crate::id::Id;
+use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::{Inline, InlineEncoding};
+use crate::inline::InlineEncoding;
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use crate::trible::Fragment;
 
@@ -33,31 +23,12 @@ use super::{
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation, CollectionData,
     CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
     CollectionOperationError, CollectionRead, CollectionRecord, CollectionSemantics,
-    CollectionStore, Cover, DiscoveredCollectionRecords,
+    CollectionStore, CollectionValidationRequest, Cover,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 type MappingSource<M> = <M as CollectionMapping>::Source;
 type MappingTarget<M> = <M as CollectionMapping>::Target;
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum TypedData {
-    Source(CollectionData),
-    Target(CollectionData),
-}
-
-impl TypedData {
-    fn data(self) -> CollectionData {
-        match self {
-            Self::Source(data) | Self::Target(data) => data,
-        }
-    }
-}
-
-enum ScratchValue<Source: CollectionEncoding, Target: CollectionEncoding> {
-    Source(Blob<Source>),
-    Target(Blob<Target>),
-}
 
 #[derive(Clone, Copy)]
 enum SourceRoute {
@@ -72,77 +43,6 @@ enum ProbeScope {
     ExactMembers,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Candidate {
-    SourceMerge(CollectionMerge),
-    Derive(CollectionDerive),
-    TargetMerge(CollectionMerge),
-}
-
-impl Candidate {
-    fn id(self) -> Id {
-        match self {
-            Self::SourceMerge(claim) | Self::TargetMerge(claim) => claim.id(),
-            Self::Derive(claim) => claim.id(),
-        }
-    }
-
-    fn inputs(self) -> (TypedData, Option<TypedData>) {
-        match self {
-            Self::SourceMerge(claim) => {
-                let (low, high) = claim.inputs();
-                (
-                    TypedData::Source(low),
-                    (high != low).then_some(TypedData::Source(high)),
-                )
-            }
-            Self::Derive(claim) => (TypedData::Source(claim.input()), None),
-            Self::TargetMerge(claim) => {
-                let (low, high) = claim.inputs();
-                (
-                    TypedData::Target(low),
-                    (high != low).then_some(TypedData::Target(high)),
-                )
-            }
-        }
-    }
-
-    fn result(self) -> TypedData {
-        match self {
-            Self::SourceMerge(claim) => TypedData::Source(claim.result()),
-            Self::Derive(claim) => TypedData::Target(claim.output()),
-            Self::TargetMerge(claim) => TypedData::Target(claim.result()),
-        }
-    }
-
-    fn kind_order(self) -> u8 {
-        match self {
-            Self::SourceMerge(_) => 0,
-            Self::Derive(_) => 1,
-            Self::TargetMerge(_) => 2,
-        }
-    }
-}
-
-/// Read-only outcome of probing an exact derived collection with speculative
-/// target-artifact availability.
-///
-/// Offers are operational hints, never semantic evidence. The kernel first
-/// validates the source cover's named bytes and recomputes the relevant
-/// equations from those explicit roots. Only then may an offered target member appear in
-/// [`Self::Fetch`]. A caller that cannot obtain one of those exact handles
-/// removes it from the offered set and probes again; ordinary physical-cover
-/// selection then chooses another valid cover or reports incompleteness.
-pub enum ExactAttachPlan<Target: CollectionEncoding> {
-    /// Every selected physical member is resident and freshly validated.
-    Ready(Cover<Target>),
-    /// Exact target members selected from the offered set but not resident.
-    ///
-    /// Handles are returned in ascending content-identity order. Fetching them
-    /// is deliberately outside this synchronous storage kernel.
-    Fetch(Vec<Inline<Handle<Target>>>),
-}
-
 /// Failure to attach or complete one exact derived cover.
 #[derive(Debug)]
 pub enum ExactDerivedCollectionError {
@@ -155,15 +55,6 @@ pub enum ExactDerivedCollectionError {
     },
     /// The supplied value is not an exact resident source cover.
     InvalidCover(String),
-    /// One source-cover member lacks resident bytes.
-    IncompleteMember(CollectionData),
-    /// One source-cover member failed concrete validation.
-    RejectedMember {
-        /// Exact payload identity.
-        member: CollectionData,
-        /// Concrete diagnostic.
-        reason: String,
-    },
     /// Resolution, identity, or freshly constructed evidence was invalid.
     Resolution(String),
     /// The target does not yet physically and logically cover the source.
@@ -205,18 +96,6 @@ impl fmt::Display for ExactDerivedCollectionError {
         match self {
             Self::Storage { operation, source } => write!(f, "{operation}: {source}"),
             Self::InvalidCover(reason) => write!(f, "invalid exact cover: {reason}"),
-            Self::IncompleteMember(member) => write!(
-                f,
-                "source cover member {} is incomplete",
-                hex::encode_upper(member.raw),
-            ),
-            Self::RejectedMember { member, reason } => {
-                write!(
-                    f,
-                    "source cover member {} was rejected: {reason}",
-                    hex::encode_upper(member.raw),
-                )
-            }
             Self::Resolution(reason) => write!(f, "resolve derived collection: {reason}"),
             Self::IncompleteCover {
                 missing,
@@ -385,9 +264,9 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
 
     /// Attach an already complete exact cover without writing.
     ///
-    /// Missing unsigned intermediates are reconstructed in use-counted scratch
-    /// from explicit source-cover roots. Scratch validation never publishes a
-    /// blob or equation.
+    /// Stored equations are followed as materialized LSM evidence. Attachment
+    /// performs no joins, mappings, or payload validation; it only selects
+    /// resident members. The eventual typed view owns payload decoding.
     pub fn attach<S>(
         &self,
         store: &mut S,
@@ -417,70 +296,14 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         self.attach_with_route(store, source_cover, SourceRoute::ExactMembers)
     }
 
-    /// Probe an exact cover while treating target handles as speculative
-    /// remote availability hints.
-    ///
-    /// This method performs no writes and no network I/O. Unknown, unrelated,
-    /// or offers invalid under the bound encodings and mapping are ignored. A
-    /// [`ExactAttachPlan::Fetch`] result contains only members of the exact
-    /// physical cover selected by the ordinary collection resolver. Once valid
-    /// bytes have been landed and remain visible under the same immutable
-    /// record evidence, calling this method again returns
-    /// [`ExactAttachPlan::Ready`]. If a fetch fails, remove that handle from
-    /// `offered_target` and re-probe.
-    ///
-    /// Every source Cover member remains mandatory resident evidence. Remote
-    /// offers cannot replace those bytes or establish a source decomposition.
-    pub fn probe_exact<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        offered_target: &BTreeSet<Inline<Handle<MappingTarget<Mapping>>>>,
-    ) -> Result<ExactAttachPlan<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        self.require_source_cover(source_cover)?;
-        if source_cover.is_empty() {
-            return Ok(ExactAttachPlan::Ready(Cover::from_members(
-                self.target_collection,
-                [],
-            )));
-        }
-        let offered_target = offered_target
-            .iter()
-            .copied()
-            .map(Handle::<MappingTarget<Mapping>>::to_hash)
-            .collect();
-        let probe = self.probe(store, source_cover, false, &offered_target)?;
-        if probe.is_complete() {
-            return Ok(ExactAttachPlan::Ready(probe.into_target_cover()));
-        }
-        if probe.missing.is_empty()
-            && probe.unsupported_members.is_empty()
-            && !probe.target_fetch.is_empty()
-        {
-            return Ok(ExactAttachPlan::Fetch(
-                probe
-                    .target_fetch
-                    .iter()
-                    .copied()
-                    .map(Handle::<MappingTarget<Mapping>>::from_hash)
-                    .collect(),
-            ));
-        }
-        Err(probe.incomplete_error())
-    }
-
     /// Complete missing derivations, then attach through a fresh read pass.
     ///
     /// Empty covers perform no I/O. A complete first probe returns without
     /// writes. Deterministic capacity excludes the selected source member and
-    /// globally replans under the same snapshot; terminal unrepresentability
-    /// returns before any write. For a final feasible plan, the reader is
-    /// dropped before descriptors and all output blobs are written ahead of
-    /// unsigned `DERIVE` records. No flush or signed record is emitted.
+    /// globally replans under the same snapshot. Every successful mapping is
+    /// persisted even when a later capacity or fatal result changes the final
+    /// plan. The reader is dropped before source and output blobs are written
+    /// ahead of their `DERIVE` records. No flush or signed record is emitted.
     pub fn ensure<S>(
         &self,
         store: &mut S,
@@ -522,16 +345,10 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         }
 
         let probe = match route {
-            SourceRoute::SupportEquivalent => {
-                self.probe(store, source_cover, true, &BTreeSet::new())?
+            SourceRoute::SupportEquivalent => self.probe(store, source_cover, true)?,
+            SourceRoute::ExactMembers => {
+                self.probe_once(store, source_cover, true, ProbeScope::ExactMembers)?
             }
-            SourceRoute::ExactMembers => self.probe_once(
-                store,
-                source_cover,
-                true,
-                &BTreeSet::new(),
-                ProbeScope::ExactMembers,
-            )?,
         };
         if probe.is_complete() {
             return Ok(probe.into_target_cover());
@@ -547,27 +364,30 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         // logical support. Excluding that member can expose a completely
         // different overlap-aware cover, so every capacity result restarts
         // global cover selection against this same reader/resolution snapshot.
-        // Successful images are cached by source identity, but only members of
-        // the final feasible plan are ever published.
+        // Successful images are retained by source identity. Planning may
+        // later choose another overlapping cover, but executed algebra is
+        // still useful LSM work and is always published.
         let mut blocked = BTreeMap::<CollectionData, String>::new();
         let mut cached = BTreeMap::<
             CollectionData,
             PreparedDerive<MappingSource<Mapping>, MappingTarget<Mapping>>,
         >::new();
-        let prepared = loop {
-            let source_cover = probe.source_residual_cover(&blocked)?;
+        let plan = 'planning: loop {
+            let source_cover = match probe.source_residual_cover(&blocked) {
+                Ok(source_cover) => source_cover,
+                Err(error) => break Err(error),
+            };
             if source_cover.is_empty() {
-                return Err(probe.incomplete_error());
+                break Err(probe.incomplete_error());
             }
 
-            let mut selected = Vec::with_capacity(source_cover.len());
             let mut replan = None;
             for (input_data, input) in source_cover {
                 if !cached.contains_key(&input_data) {
                     let output = match mapping.map(&input, &probe.reader) {
                         Ok(output) => output,
                         Err(CollectionOperationError::Fatal(reason)) => {
-                            return Err(ExactDerivedCollectionError::Derive {
+                            break 'planning Err(ExactDerivedCollectionError::Derive {
                                 input: input_data,
                                 reason,
                             });
@@ -592,26 +412,18 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                         },
                     );
                 }
-                selected.push(input_data);
             }
 
             if let Some((input, reason)) = replan {
                 blocked.insert(input, reason);
                 continue;
             }
-            break selected
-                .into_iter()
-                .map(|input| {
-                    cached
-                        .remove(&input)
-                        .expect("every feasible source member has a cached image")
-                })
-                .collect::<Vec<_>>();
+            break Ok(());
         };
 
         // Never retain an observed store snapshot across publication.
         drop(probe);
-        for prepared in &prepared {
+        for prepared in cached.values() {
             store
                 .put::<MappingSource<Mapping>, _>(prepared.input.clone())
                 .map_err(|error| {
@@ -622,15 +434,19 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                 .map_err(|error| {
                     ExactDerivedCollectionError::storage("store derived target", error)
                 })?;
-        }
-        for prepared in prepared {
             store
                 .insert(CollectionRecord::Derive(prepared.claim))
                 .map_err(|error| ExactDerivedCollectionError::storage("publish DERIVE", error))?;
         }
 
-        // Construction does not change the opaque source cover; a fresh
-        // attachment validates the outputs just published.
+        plan?;
+
+        // Publication may activate resident target equations which the
+        // pre-write snapshot could not yet observe. Resolve once more from a
+        // fresh snapshot so an already materialized MERGE is selected instead
+        // of handing its inputs to a compactor which would recompute it. This
+        // pass is metadata-only: stored equations are trusted and no algebra
+        // is replayed.
         self.attach_with_route(store, source_cover, route)
     }
 
@@ -649,16 +465,10 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             return Ok(Cover::from_members(self.target_collection, []));
         }
         let probe = match route {
-            SourceRoute::SupportEquivalent => {
-                self.probe(store, source_cover, false, &BTreeSet::new())?
+            SourceRoute::SupportEquivalent => self.probe(store, source_cover, false)?,
+            SourceRoute::ExactMembers => {
+                self.probe_once(store, source_cover, false, ProbeScope::ExactMembers)?
             }
-            SourceRoute::ExactMembers => self.probe_once(
-                store,
-                source_cover,
-                false,
-                &BTreeSet::new(),
-                ProbeScope::ExactMembers,
-            )?,
         };
         if !probe.is_complete() {
             return Err(probe.incomplete_error());
@@ -671,11 +481,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
         plan_source_residual: bool,
-        offered_target: &BTreeSet<CollectionData>,
-    ) -> Result<
-        ExactProbe<S::Snapshot, MappingSource<Mapping>, MappingTarget<Mapping>>,
-        ExactDerivedCollectionError,
-    >
+    ) -> Result<ExactProbe<S::Snapshot, MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -688,7 +494,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             store,
             source_cover,
             plan_source_residual,
-            offered_target,
             ProbeScope::Direct,
         )?;
         if direct.is_complete() {
@@ -699,7 +504,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             store,
             source_cover,
             plan_source_residual,
-            offered_target,
             ProbeScope::SupportEquivalent,
         )
     }
@@ -709,12 +513,8 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
         plan_source_residual: bool,
-        offered_target: &BTreeSet<CollectionData>,
         scope: ProbeScope,
-    ) -> Result<
-        ExactProbe<S::Snapshot, MappingSource<Mapping>, MappingTarget<Mapping>>,
-        ExactDerivedCollectionError,
-    >
+    ) -> Result<ExactProbe<S::Snapshot, MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
@@ -724,13 +524,11 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             ExactDerivedCollectionError::storage("open exact-cover snapshot", error)
         })?;
         let (source_descriptor, target_descriptor) = self.load_descriptors(&reader)?;
-        let bound_mapping =
-            Mapping::bind(&source_descriptor, &target_descriptor).map_err(|error| {
-                ExactDerivedCollectionError::Resolution(format!(
-                    "invalid exact collection mapping: {error}"
-                ))
-            })?;
-        let mapping = self.mapping_override.as_ref().unwrap_or(&bound_mapping);
+        Mapping::bind(&source_descriptor, &target_descriptor).map_err(|error| {
+            ExactDerivedCollectionError::Resolution(format!(
+                "invalid exact collection mapping: {error}"
+            ))
+        })?;
         let discovered = discover_collection_records_for_derived_cover(
             &reader,
             source_cover,
@@ -738,171 +536,34 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         )
         .map_err(|error| ExactDerivedCollectionError::storage("discover exact cover", error))?;
 
-        let mut known = BTreeMap::<
-            TypedData,
-            ScratchValue<MappingSource<Mapping>, MappingTarget<Mapping>>,
-        >::new();
-        let mut roots = BTreeSet::new();
-        for member_handle in source_cover.members() {
-            let member = Handle::<MappingSource<Mapping>>::to_hash(member_handle);
-            let node = TypedData::Source(member);
-            if !known.contains_key(&node) {
-                let Some(artifact) = load_candidate::<_, MappingSource<Mapping>>(
-                    &reader,
-                    &source_descriptor,
-                    member,
-                    "read source cover member",
-                )?
-                else {
-                    return Err(ExactDerivedCollectionError::IncompleteMember(member));
-                };
-                known.insert(node, ScratchValue::Source(artifact));
-            }
-            roots.insert(node);
-        }
+        // Cover identities are sufficient for lookup. Warm attachment never
+        // reads source payloads; an incomplete ensure loads only the physical
+        // residual members it actually maps.
+        let roots: BTreeSet<_> = source_cover.data_members().collect();
 
-        let mut candidates = self.candidates(&discovered);
-        if scope == ProbeScope::ExactMembers {
-            // A source-bound target denotes the image of each named physical
-            // member, not merely any cover with equal logical support. Keep
-            // only direct DERIVEs of those roots: source MERGEs could replace
-            // `{a, b}` with `{a join b}`, while target MERGEs could erase the
-            // one-image-per-member boundary after mapping.
-            candidates.retain(|candidate| {
-                matches!(
-                    candidate,
-                    Candidate::Derive(claim)
-                        if roots.contains(&TypedData::Source(claim.input()))
-                )
-            });
-        }
-        let mut producers = BTreeMap::<TypedData, Vec<usize>>::new();
-        for (index, candidate) in candidates.iter().copied().enumerate() {
-            producers.entry(candidate.result()).or_default().push(index);
-        }
-
-        let mut local_results = roots.clone();
-        let mut resident_results = roots.clone();
-
-        // A Cover may name a compacted member `c` while resident canonical
-        // evidence proves `a join b = c`. Walk only source-MERGE producers of
-        // the supplied roots (and their recursive inputs), then load the
-        // optional input bytes into scratch. The equations are still accepted
-        // only after `evaluate_candidates` recomputes every join forwards.
-        // Restricting this walk to producers of Cover roots prevents unrelated
-        // resident source data from becoming semantic support by proximity.
-        let mut decomposition_seen = roots.clone();
+        // A Cover may name a compacted source member `c` while stored LSM
+        // evidence says `a join b = c`. Support-equivalent derivation may walk
+        // that exact reverse lineage. No bytes are reconstructed here: every
+        // equation is already a materialized store record.
+        let mut semantic_roots = roots.clone();
         if scope == ProbeScope::SupportEquivalent {
+            let mut producers = BTreeMap::<CollectionData, Vec<CollectionMerge>>::new();
+            for claim in discovered
+                .merges()
+                .iter()
+                .filter(|claim| claim.collection() == self.source_collection.handle())
+                .copied()
+            {
+                producers.entry(claim.result()).or_default().push(claim);
+            }
             let mut decomposition_queue: VecDeque<_> = roots.iter().copied().collect();
             while let Some(result) = decomposition_queue.pop_front() {
-                for &index in producers.get(&result).into_iter().flatten() {
-                    if !matches!(candidates[index], Candidate::SourceMerge(_)) {
-                        continue;
-                    }
-                    let (first, second) = candidates[index].inputs();
-                    for input in [Some(first), second].into_iter().flatten() {
-                        if decomposition_seen.insert(input) {
+                for claim in producers.get(&result).into_iter().flatten() {
+                    let (low, high) = claim.inputs();
+                    for input in [low, high] {
+                        if semantic_roots.insert(input) {
                             decomposition_queue.push_back(input);
                         }
-                    }
-                }
-            }
-        }
-        for node in decomposition_seen.iter().copied() {
-            let TypedData::Source(member) = node else {
-                continue;
-            };
-            if known.contains_key(&node) {
-                continue;
-            }
-            // Decomposition inputs are optional local cache evidence. Never
-            // route an absent input through a reader whose miss semantics may
-            // record a durable WANT (for example `LazyReader`).
-            let Ok(Some(_)) = reader.metadata(Handle::<MappingSource<Mapping>>::from_hash(member))
-            else {
-                continue;
-            };
-            let Ok(blob) = reader.get(Handle::<MappingSource<Mapping>>::from_hash(member)) else {
-                continue;
-            };
-            let Ok(()) =
-                MappingSource::<Mapping>::validate_member(&source_descriptor, &blob, &reader)
-            else {
-                continue;
-            };
-            known.insert(node, ScratchValue::Source(blob));
-            local_results.insert(node);
-            resident_results.insert(node);
-        }
-
-        // Source compaction results are seeds too: ensure may reuse a resident
-        // source upper bound even when no target artifact exists yet.
-        let mut reverse_seen = BTreeSet::new();
-        let mut reverse_queue = VecDeque::new();
-        for result in producers.keys().copied() {
-            let offered = match result {
-                TypedData::Source(_) => false,
-                TypedData::Target(data) => offered_target.contains(&data),
-            };
-            let local = known.contains_key(&result) || self.contains_typed(&reader, result);
-            if local {
-                local_results.insert(result);
-            }
-            if offered || local {
-                resident_results.insert(result);
-                if reverse_seen.insert(result) {
-                    reverse_queue.push_back(result);
-                }
-            }
-        }
-
-        // Include every producer path, including producers of explicit roots:
-        // another payload member may be reachable only through that merge
-        // history, so first-proof traversal would lose support.
-        let mut candidate_indices = BTreeSet::new();
-        while let Some(result) = reverse_queue.pop_front() {
-            let Some(indices) = producers.get(&result) else {
-                continue;
-            };
-            for &index in indices {
-                candidate_indices.insert(index);
-                let (first, second) = candidates[index].inputs();
-                for input in [Some(first), second].into_iter().flatten() {
-                    if reverse_seen.insert(input) {
-                        reverse_queue.push_back(input);
-                    }
-                }
-            }
-        }
-
-        let (accepted, rejected) = evaluate_candidates(
-            &candidates,
-            &candidate_indices,
-            &roots,
-            &mut known,
-            &source_descriptor,
-            &target_descriptor,
-            mapping,
-            &reader,
-        );
-
-        // Only successfully recomputed decompositions become semantic seeds.
-        // They are alternative physical leaves of the supplied Cover, not
-        // ambient resident data discovered elsewhere in the collection.
-        let mut semantic_roots = roots.clone();
-        let mut semantic_queue: VecDeque<_> = roots.iter().copied().collect();
-        while let Some(result) = semantic_queue.pop_front() {
-            for &index in producers.get(&result).into_iter().flatten() {
-                let candidate = candidates[index];
-                if !matches!(candidate, Candidate::SourceMerge(_))
-                    || !accepted.contains(&candidate.id())
-                {
-                    continue;
-                }
-                let (first, second) = candidate.inputs();
-                for input in [Some(first), second].into_iter().flatten() {
-                    if semantic_roots.insert(input) {
-                        semantic_queue.push_back(input);
                     }
                 }
             }
@@ -916,26 +577,35 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         )]);
         let explicit_roots: BTreeSet<_> = semantic_roots
             .iter()
-            .filter_map(|node| match node {
-                TypedData::Source(member) => Some((self.source_collection.handle(), *member)),
-                TypedData::Target(_) => None,
-            })
+            .map(|member| (self.source_collection.handle(), *member))
             .collect();
         let resolution = resolve_collection_semantics_from_roots(
             &discovered,
             &lineage,
             &explicit_roots,
             |request| {
-                let claim = request.claim_id();
-                Ok::<CollectionClaimValidation<String>, std::convert::Infallible>(
-                    if accepted.contains(&claim) {
+                let verdict = match request {
+                    CollectionValidationRequest::Merge { claim }
+                        if scope != ProbeScope::ExactMembers
+                            && (claim.collection() == self.source_collection.handle()
+                                || claim.collection() == self.target_collection.handle()) =>
+                    {
                         CollectionClaimValidation::Accepted
-                    } else if let Some(reason) = rejected.get(&claim) {
-                        CollectionClaimValidation::Rejected(reason.clone())
-                    } else {
+                    }
+                    CollectionValidationRequest::Derive { claim }
+                        if claim.collection() == self.target_collection.handle()
+                            && (scope != ProbeScope::ExactMembers
+                                || roots.contains(&claim.input())) =>
+                    {
+                        CollectionClaimValidation::Accepted
+                    }
+                    CollectionValidationRequest::Commit { .. }
+                    | CollectionValidationRequest::Merge { .. }
+                    | CollectionValidationRequest::Derive { .. } => {
                         CollectionClaimValidation::Pending
-                    },
-                )
+                    }
+                };
+                Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(verdict)
             },
         );
         let resolution = match resolution {
@@ -960,7 +630,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         let source = self.source_collection.handle();
 
         // Compare supports in the source lattice, not as raw handle sets. A
-        // validated `a join b = c` makes Covers `{a, b}` and `{c}` distinct
+        // stored `a join b = c` makes Covers `{a, b}` and `{c}` distinct
         // physical representations of the same support. Both directions are
         // required: target support must not escape the supplied Cover, and it
         // must jointly discharge every supplied Cover member.
@@ -984,77 +654,53 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         )
         .missing;
 
-        let target_local = resolution
+        let mut target_resident = BTreeSet::new();
+        for data in resolution
             .semantics()
             .members(target)
             .into_iter()
             .flatten()
             .copied()
-            .filter(|data| local_results.contains(&TypedData::Target(*data)))
-            .collect();
-        let local_physical: ValidatedPhysicalCover<MappingTarget<Mapping>> =
-            validated_physical_cover(
-                &reader,
-                &target_descriptor,
-                resolution.semantics(),
-                target,
-                target_local,
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-            );
-        // A speculative offer must never displace a complete resident cover.
-        // Only widen physical selection to offered members when local bytes do
-        // not already answer the exact cover without network I/O.
-        let target_physical = if local_physical.missing.is_empty() && unsupported_members.is_empty()
         {
-            local_physical
-        } else {
-            let target_resident = resolution
-                .semantics()
-                .members(target)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|data| resident_results.contains(&TypedData::Target(*data)))
-                .collect();
-            validated_physical_cover(
-                &reader,
-                &target_descriptor,
-                resolution.semantics(),
-                target,
-                target_resident,
-                &BTreeMap::new(),
-                offered_target,
-            )
-        };
+            if reader
+                .metadata(Handle::<MappingTarget<Mapping>>::from_hash(data))
+                .map_err(|error| {
+                    ExactDerivedCollectionError::storage("inspect exact target residency", error)
+                })?
+                .is_some()
+            {
+                target_resident.insert(data);
+            }
+        }
+        let target_physical =
+            collection_physical_cover(resolution.semantics(), target, &target_resident);
 
-        let complete = target_physical.missing.is_empty()
-            && target_physical.fetch.is_empty()
-            && unsupported_members.is_empty();
+        let complete = target_physical.missing.is_empty() && unsupported_members.is_empty();
         let source_plan_parts = if !plan_source_residual || complete {
             None
         } else {
             let source = self.source_collection.handle();
-            let source_roots: BTreeMap<_, _> = roots
-                .iter()
-                .filter_map(|node| match (node, known.get(node)) {
-                    (TypedData::Source(data), Some(ScratchValue::Source(blob))) => {
-                        Some((*data, blob.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            let source_resident = resolution
+            let mut source_resident = BTreeSet::new();
+            for data in resolution
                 .semantics()
                 .members(source)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|data| {
-                    source_roots.contains_key(data)
-                        || resident_results.contains(&TypedData::Source(*data))
-                })
-                .collect();
+            {
+                if reader
+                    .metadata(Handle::<MappingSource<Mapping>>::from_hash(data))
+                    .map_err(|error| {
+                        ExactDerivedCollectionError::storage(
+                            "inspect exact source residency",
+                            error,
+                        )
+                    })?
+                    .is_some()
+                {
+                    source_resident.insert(data);
+                }
+            }
             // A logically supported target may have lost its bytes. Its
             // support is required work just like a root missing logically.
             let mut required = unsupported_members.clone();
@@ -1062,80 +708,28 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                 required.extend(resolution.semantics().supporting_data(target, *data));
             }
 
-            Some((source, source_resident, source_roots, required))
+            Some((source, source_resident, required))
         };
         let source_plan =
-            source_plan_parts.map(|(collection, resident, mandatory, required_members)| {
-                SourcePlan {
-                    descriptor: source_descriptor.clone(),
-                    semantics: resolution.into_semantics(),
-                    collection,
-                    resident,
-                    mandatory,
-                    required_members,
-                }
+            source_plan_parts.map(|(collection, resident, required_members)| SourcePlan {
+                semantics: resolution.into_semantics(),
+                collection,
+                resident,
+                required_members,
             });
 
         Ok(ExactProbe {
             reader,
             source_descriptor,
             target_descriptor,
-            target_cover: target_physical.fetch.is_empty().then(|| {
-                Cover::from_data(
-                    self.target_collection,
-                    target_physical.cover.iter().copied(),
-                )
-            }),
-            target_fetch: target_physical.fetch,
+            target_cover: Cover::from_data(
+                self.target_collection,
+                target_physical.cover.iter().copied(),
+            ),
             missing: target_physical.missing,
             unsupported_members,
             source_plan,
         })
-    }
-
-    fn candidates(&self, discovered: &DiscoveredCollectionRecords) -> Vec<Candidate> {
-        let mut candidates = Vec::new();
-        candidates.extend(
-            discovered
-                .merges()
-                .iter()
-                .filter(|claim| claim.collection() == self.source_collection.handle())
-                .copied()
-                .map(Candidate::SourceMerge),
-        );
-        candidates.extend(
-            discovered
-                .derives()
-                .iter()
-                .filter(|claim| claim.collection() == self.target_collection.handle())
-                .copied()
-                .map(Candidate::Derive),
-        );
-        candidates.extend(
-            discovered
-                .merges()
-                .iter()
-                .filter(|claim| claim.collection() == self.target_collection.handle())
-                .copied()
-                .map(Candidate::TargetMerge),
-        );
-        candidates.sort_unstable_by_key(|candidate| (candidate.id(), candidate.kind_order()));
-        candidates
-    }
-
-    fn contains_typed<R: BlobStoreMeta>(&self, reader: &R, data: TypedData) -> bool {
-        match data {
-            TypedData::Source(data) => reader
-                .metadata(Handle::<MappingSource<Mapping>>::from_hash(data))
-                .ok()
-                .flatten()
-                .is_some(),
-            TypedData::Target(data) => reader
-                .metadata(Handle::<MappingTarget<Mapping>>::from_hash(data))
-                .ok()
-                .flatten()
-                .is_some(),
-        }
     }
 }
 
@@ -1145,32 +739,26 @@ struct PreparedDerive<Source: CollectionEncoding, Target: CollectionEncoding> {
     claim: CollectionDerive,
 }
 
-struct SourcePlan<Source: CollectionEncoding> {
-    descriptor: Fragment,
+struct SourcePlan {
     semantics: CollectionSemantics,
     collection: CollectionHandle,
     resident: BTreeSet<CollectionData>,
-    mandatory: BTreeMap<CollectionData, Blob<Source>>,
     required_members: BTreeSet<CollectionData>,
 }
 
-struct ExactProbe<R, Source: CollectionEncoding, Target: CollectionEncoding> {
+struct ExactProbe<R, Target: CollectionEncoding> {
     reader: R,
     source_descriptor: Fragment,
     target_descriptor: Fragment,
-    target_cover: Option<Cover<Target>>,
-    target_fetch: BTreeSet<CollectionData>,
+    target_cover: Cover<Target>,
     missing: BTreeSet<CollectionData>,
     unsupported_members: BTreeSet<CollectionData>,
-    source_plan: Option<SourcePlan<Source>>,
+    source_plan: Option<SourcePlan>,
 }
 
-impl<R, Source: CollectionEncoding, Target: CollectionEncoding> ExactProbe<R, Source, Target> {
+impl<R, Target: CollectionEncoding> ExactProbe<R, Target> {
     fn is_complete(&self) -> bool {
-        self.target_cover.is_some()
-            && self.target_fetch.is_empty()
-            && self.missing.is_empty()
-            && self.unsupported_members.is_empty()
+        self.missing.is_empty() && self.unsupported_members.is_empty()
     }
 
     fn incomplete_error(&self) -> ExactDerivedCollectionError {
@@ -1182,17 +770,15 @@ impl<R, Source: CollectionEncoding, Target: CollectionEncoding> ExactProbe<R, So
 
     fn into_target_cover(self) -> Cover<Target> {
         self.target_cover
-            .expect("complete exact probe has a resident target cover")
     }
 }
 
-impl<R, Source, Target> ExactProbe<R, Source, Target>
+impl<R, Target> ExactProbe<R, Target>
 where
     R: BlobStoreGet + BlobStoreMeta,
-    Source: CollectionEncoding,
     Target: CollectionEncoding,
 {
-    fn source_residual_cover(
+    fn source_residual_cover<Source: CollectionEncoding>(
         &self,
         blocked: &BTreeMap<CollectionData, String>,
     ) -> Result<Vec<(CollectionData, Blob<Source>)>, ExactDerivedCollectionError> {
@@ -1201,19 +787,12 @@ where
         };
         let blocked_set: BTreeSet<_> = blocked.keys().copied().collect();
         let resident = plan.resident.difference(&blocked_set).copied().collect();
-        let physical: ValidatedPhysicalCover<Source> = validated_physical_cover(
-            &self.reader,
-            &plan.descriptor,
-            &plan.semantics,
-            plan.collection,
-            resident,
-            &plan.mandatory,
-            &BTreeSet::new(),
-        );
+        let physical: LoadedPhysicalCover<Source> =
+            loaded_physical_cover(&self.reader, &plan.semantics, plan.collection, resident)?;
         if !physical.missing.is_empty() {
             if blocked.is_empty() {
                 return Err(ExactDerivedCollectionError::Resolution(format!(
-                    "validated source lacks a resident cover for {} frontier element(s)",
+                    "source lacks a resident cover for {} frontier element(s)",
                     physical.missing.len(),
                 )));
             }
@@ -1245,7 +824,7 @@ where
                 let blob = physical
                     .blobs
                     .get(&data)
-                    .expect("validated source cover retains selected bytes")
+                    .expect("loaded source cover retains selected bytes")
                     .clone();
                 (data, blob)
             })
@@ -1253,309 +832,36 @@ where
     }
 }
 
-struct ValidatedPhysicalCover<E: CollectionEncoding> {
+struct LoadedPhysicalCover<E: CollectionEncoding> {
     cover: BTreeSet<CollectionData>,
     missing: BTreeSet<CollectionData>,
     blobs: BTreeMap<CollectionData, Blob<E>>,
-    fetch: BTreeSet<CollectionData>,
 }
 
-fn validated_physical_cover<R, E>(
+fn loaded_physical_cover<R, E>(
     reader: &R,
-    descriptor: &Fragment,
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
-    mut resident: BTreeSet<CollectionData>,
-    mandatory: &BTreeMap<CollectionData, Blob<E>>,
-    offered: &BTreeSet<CollectionData>,
-) -> ValidatedPhysicalCover<E>
+    resident: BTreeSet<CollectionData>,
+) -> Result<LoadedPhysicalCover<E>, ExactDerivedCollectionError>
 where
-    R: BlobStoreGet + BlobStoreMeta,
+    R: BlobStoreGet,
     E: CollectionEncoding,
     Handle<E>: InlineEncoding,
 {
-    let mut selected = BTreeMap::new();
-    loop {
-        let physical = collection_physical_cover(semantics, collection, &resident);
-        selected.retain(|data, _| physical.cover.contains(data));
-        let mut rejected = Vec::new();
-        let mut fetch = BTreeSet::new();
-        for data in physical.cover.iter().copied() {
-            if mandatory.contains_key(&data) || selected.contains_key(&data) {
-                continue;
-            }
-            let handle = Handle::<E>::from_hash(data);
-            // `resident` may include a speculative remote offer. Presence
-            // metadata is the non-demanding probe; calling `get` for an
-            // absent handle can itself publish a durable WANT on lazy stores.
-            match reader.metadata(handle) {
-                Ok(Some(_)) => {}
-                Ok(None) if offered.contains(&data) => {
-                    fetch.insert(data);
-                    continue;
-                }
-                Ok(None) | Err(_) => {
-                    rejected.push(data);
-                    continue;
-                }
-            }
-            match reader.get(handle) {
-                Ok(root) => match E::validate_member(descriptor, &root, reader) {
-                    Ok(()) => {
-                        selected.insert(data, root);
-                    }
-                    Err(_) => rejected.push(data),
-                },
-                Err(_) => rejected.push(data),
-            }
-        }
-        if rejected.is_empty() {
-            let mut blobs = selected;
-            for data in &physical.cover {
-                if let Some(blob) = mandatory.get(data) {
-                    blobs.insert(*data, blob.clone());
-                }
-            }
-            return ValidatedPhysicalCover {
-                cover: physical.cover,
-                missing: physical.missing,
-                blobs,
-                fetch,
-            };
-        }
-        for data in rejected {
-            resident.remove(&data);
-        }
+    let physical = collection_physical_cover(semantics, collection, &resident);
+    let mut blobs = BTreeMap::new();
+    for data in physical.cover.iter().copied() {
+        let root = reader.get(Handle::<E>::from_hash(data)).map_err(|error| {
+            ExactDerivedCollectionError::storage("load exact source member", error)
+        })?;
+        blobs.insert(data, root);
     }
-}
-
-fn evaluate_candidates<Source, Target, Mapping>(
-    candidates: &[Candidate],
-    candidate_indices: &BTreeSet<usize>,
-    roots: &BTreeSet<TypedData>,
-    known: &mut BTreeMap<TypedData, ScratchValue<Source, Target>>,
-    source_descriptor: &Fragment,
-    target_descriptor: &Fragment,
-    mapping: &Mapping,
-    reader: &(impl BlobStoreGet + BlobStoreMeta),
-) -> (BTreeSet<Id>, BTreeMap<Id, String>)
-where
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-    Mapping: CollectionMapping<Source = Source, Target = Target>,
-{
-    let mut missing = vec![u8::MAX; candidates.len()];
-    let mut waiters = BTreeMap::<TypedData, Vec<usize>>::new();
-    let mut remaining_uses = BTreeMap::<TypedData, usize>::new();
-    let mut ready = BTreeSet::new();
-
-    for &index in candidate_indices {
-        let candidate = candidates[index];
-        let (first, second) = candidate.inputs();
-        let mut count = 0u8;
-        for input in [Some(first), second].into_iter().flatten() {
-            *remaining_uses.entry(input).or_default() += 1;
-            if !known.contains_key(&input) {
-                waiters.entry(input).or_default().push(index);
-                count += 1;
-            }
-        }
-        missing[index] = count;
-        if count == 0 {
-            ready.insert((candidate.id(), candidate.kind_order(), index));
-        }
-    }
-
-    let mut accepted = BTreeSet::new();
-    let mut rejected = BTreeMap::new();
-    while let Some((_, _, index)) = ready.pop_first() {
-        let candidate = candidates[index];
-        let result = candidate.result();
-        match evaluate_candidate::<Source, Target, Mapping>(
-            candidate,
-            known,
-            source_descriptor,
-            target_descriptor,
-            mapping,
-            reader,
-        ) {
-            Ok(value) => {
-                let actual = match &value {
-                    ScratchValue::Source(artifact) => data_identity::<Source>(artifact),
-                    ScratchValue::Target(artifact) => data_identity::<Target>(artifact),
-                };
-                if actual != result.data() {
-                    rejected.insert(
-                        candidate.id(),
-                        format!(
-                            "canonical result hashes to {} instead of {}",
-                            hex::encode_upper(actual.raw),
-                            hex::encode_upper(result.data().raw),
-                        ),
-                    );
-                } else {
-                    let retain_result =
-                        remaining_uses.get(&result).copied().unwrap_or_default() > 0;
-                    let inserted = !known.contains_key(&result) && retain_result;
-                    if inserted {
-                        known.insert(result, value);
-                    }
-                    accepted.insert(candidate.id());
-                    if inserted {
-                        for dependent_index in waiters.remove(&result).unwrap_or_default() {
-                            debug_assert!(
-                                missing[dependent_index] > 0 && missing[dependent_index] <= 2
-                            );
-                            missing[dependent_index] -= 1;
-                            if missing[dependent_index] == 0 {
-                                let dependent = candidates[dependent_index];
-                                ready.insert((
-                                    dependent.id(),
-                                    dependent.kind_order(),
-                                    dependent_index,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            Err(CollectionOperationError::Fatal(reason)) => {
-                rejected.insert(candidate.id(), reason);
-            }
-            Err(CollectionOperationError::Capacity(reason)) => {
-                rejected.insert(
-                    candidate.id(),
-                    format!("canonical operation exceeded representation capacity: {reason}"),
-                );
-            }
-        }
-
-        let (first, second) = candidate.inputs();
-        for input in [Some(first), second].into_iter().flatten() {
-            let uses = remaining_uses
-                .get_mut(&input)
-                .expect("candidate inputs have reference counts");
-            debug_assert!(*uses > 0);
-            *uses -= 1;
-            if *uses == 0 && !roots.contains(&input) {
-                known.remove(&input);
-            }
-        }
-    }
-
-    (accepted, rejected)
-}
-
-fn evaluate_candidate<Source, Target, Mapping>(
-    candidate: Candidate,
-    known: &BTreeMap<TypedData, ScratchValue<Source, Target>>,
-    source_descriptor: &Fragment,
-    target_descriptor: &Fragment,
-    mapping: &Mapping,
-    reader: &(impl BlobStoreGet + BlobStoreMeta),
-) -> Result<ScratchValue<Source, Target>, CollectionOperationError>
-where
-    Source: CollectionEncoding,
-    Target: CollectionEncoding,
-    Mapping: CollectionMapping<Source = Source, Target = Target>,
-{
-    match candidate {
-        Candidate::SourceMerge(claim) => {
-            let (low, high) = claim.inputs();
-            let Some(ScratchValue::Source(low)) = known.get(&TypedData::Source(low)) else {
-                return Err(CollectionOperationError::Fatal(
-                    "source merge became ready without its low input".to_owned(),
-                ));
-            };
-            let Some(ScratchValue::Source(high)) = known.get(&TypedData::Source(high)) else {
-                return Err(CollectionOperationError::Fatal(
-                    "source merge became ready without its high input".to_owned(),
-                ));
-            };
-            Source::join_members(source_descriptor, low, high, reader)?
-                .map(ScratchValue::Source)
-                .ok_or_else(|| {
-                    CollectionOperationError::Fatal(
-                        "source encoding has no directly materialized join".to_owned(),
-                    )
-                })
-        }
-        Candidate::Derive(claim) => {
-            let input = claim.input();
-            let Some(ScratchValue::Source(input)) = known.get(&TypedData::Source(input)) else {
-                return Err(CollectionOperationError::Fatal(
-                    "derive became ready without its source input".to_owned(),
-                ));
-            };
-            mapping.map(input, reader).map(ScratchValue::Target)
-        }
-        Candidate::TargetMerge(claim) => {
-            let (low, high) = claim.inputs();
-            let Some(ScratchValue::Target(low)) = known.get(&TypedData::Target(low)) else {
-                return Err(CollectionOperationError::Fatal(
-                    "target merge became ready without its low input".to_owned(),
-                ));
-            };
-            let Some(ScratchValue::Target(high)) = known.get(&TypedData::Target(high)) else {
-                return Err(CollectionOperationError::Fatal(
-                    "target merge became ready without its high input".to_owned(),
-                ));
-            };
-            Target::join_members(target_descriptor, low, high, reader)?
-                .map(ScratchValue::Target)
-                .ok_or_else(|| {
-                    CollectionOperationError::Fatal(
-                        "target encoding has no directly materialized join".to_owned(),
-                    )
-                })
-        }
-    }
-}
-
-fn contains<R, E>(
-    reader: &R,
-    data: CollectionData,
-    operation: &'static str,
-) -> Result<bool, ExactDerivedCollectionError>
-where
-    R: BlobStoreMeta,
-    E: BlobEncoding + 'static,
-    Handle<E>: InlineEncoding,
-{
-    reader
-        .metadata(Handle::<E>::from_hash(data))
-        .map(|metadata| metadata.is_some())
-        .map_err(|error| ExactDerivedCollectionError::storage(operation, error))
-}
-
-fn load_candidate<R, E>(
-    reader: &R,
-    descriptor: &Fragment,
-    data: CollectionData,
-    operation: &'static str,
-) -> Result<Option<Blob<E>>, ExactDerivedCollectionError>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-    E: CollectionEncoding,
-    Handle<E>: InlineEncoding,
-{
-    if !contains::<R, E>(reader, data, operation)? {
-        return Ok(None);
-    }
-    let root = reader
-        .get(Handle::<E>::from_hash(data))
-        .map_err(|error| ExactDerivedCollectionError::storage(operation, error))?;
-    E::validate_member(descriptor, &root, reader)
-        .map(|()| Some(root))
-        .map_err(|error| ExactDerivedCollectionError::RejectedMember {
-            member: data,
-            reason: match error {
-                CollectionOperationError::Fatal(reason) => reason,
-                CollectionOperationError::Capacity(reason) => {
-                    format!("persisted member exceeds representation capacity: {reason}")
-                }
-            },
-        })
+    Ok(LoadedPhysicalCover {
+        cover: physical.cover,
+        missing: physical.missing,
+        blobs,
+    })
 }
 
 pub(super) fn data_identity<E: CollectionEncoding>(blob: &Blob<E>) -> CollectionData {

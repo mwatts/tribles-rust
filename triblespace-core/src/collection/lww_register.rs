@@ -56,7 +56,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -68,7 +68,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::{register_identity, register_orders, RegisterOrder};
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
-use crate::trible::{Fragment, A_START, E_START, TRIBLE_LEN, V_START};
+use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN, V_START};
 use anybytes::Bytes;
 
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
@@ -120,6 +120,8 @@ impl MetaDescribe for LwwRegisterBlob {
 /// Failure to decode, derive, or join a canonical LWW register projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LwwRegisterError {
+    /// The source is not a canonical `SimpleArchive`.
+    InvalidSource(UnarchiveError),
     /// A payload's declared row counts do not match its byte length.
     BadLength {
         /// Expected length computed from the header.
@@ -146,6 +148,7 @@ pub enum LwwRegisterError {
 impl fmt::Display for LwwRegisterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSource(source) => write!(formatter, "invalid source archive: {source}"),
             Self::BadLength { expected, actual } => write!(
                 formatter,
                 "LWW register projection declares {expected} bytes but contains {actual}"
@@ -318,14 +321,28 @@ pub fn derive_element(
 ) -> Result<Blob<LwwRegisterBlob>, LwwRegisterError> {
     let bytes = source.bytes.as_ref();
     if bytes.len() % TRIBLE_LEN != 0 {
-        let expected = bytes.len() - (bytes.len() % TRIBLE_LEN);
-        return Err(LwwRegisterError::BadLength {
-            expected,
-            actual: bytes.len(),
-        });
+        return Err(LwwRegisterError::InvalidSource(UnarchiveError::BadArchive));
     }
     let mut projection = Projection::default();
+    let mut previous = None;
     for trible in bytes.chunks_exact(TRIBLE_LEN) {
+        let row: &[u8; TRIBLE_LEN] = trible.try_into().expect("64-byte archive row");
+        if Trible::as_transmute_force_raw(row).is_none() {
+            return Err(LwwRegisterError::InvalidSource(UnarchiveError::BadTrible));
+        }
+        if let Some(previous) = previous {
+            if previous == row {
+                return Err(LwwRegisterError::InvalidSource(
+                    UnarchiveError::BadCanonicalizationRedundancy,
+                ));
+            }
+            if previous > row {
+                return Err(LwwRegisterError::InvalidSource(
+                    UnarchiveError::BadCanonicalizationOrdering,
+                ));
+            }
+        }
+        previous = Some(row);
         let state: RawId = trible[E_START..E_START + ID_LEN]
             .try_into()
             .expect("16-byte entity id");
@@ -943,6 +960,20 @@ mod tests {
             .tiebreak_by_id();
         assert_eq!(resolve(&index, [*state]), resolve(&live, [*state]));
         assert_eq!(index.unresolved_count(), 1);
+    }
+
+    #[test]
+    fn derive_rejects_a_non_trible_source_row_while_scanning_it() {
+        let register = ufoid();
+        let mut row = [0u8; TRIBLE_LEN];
+        row[A_START..A_START + ID_LEN].copy_from_slice(&state_of.id()[..]);
+        row[V_START + ID_LEN..V_START + KEY_LEN].copy_from_slice(&register[..]);
+        let source: Blob<SimpleArchive> = Blob::new(Bytes::from_source(row.to_vec()));
+
+        assert_eq!(
+            derive_element(&source, state_of.id(), written_at.id()),
+            Err(LwwRegisterError::InvalidSource(UnarchiveError::BadTrible))
+        );
     }
 
     #[test]

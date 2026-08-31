@@ -73,11 +73,13 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
         Ok(())
     }
 
-    /// Validate one member independently of its provenance.
+    /// Explicitly validate one member independently of its provenance.
     ///
     /// The root bytes have already passed the blob store's content-address
     /// boundary. A Merkle encoding may inspect children through `reader`; a
-    /// monolithic encoding normally ignores it.
+    /// monolithic encoding normally ignores it. Warm collection resolution
+    /// does not invoke this hook; it is available to producers, untrusted
+    /// ingress, and offline audits.
     fn validate_member<R>(
         descriptor: &Fragment,
         member: &Blob<Self>,
@@ -88,6 +90,9 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
 
     /// Compute the exact canonical join of two members when this encoding owns
     /// one directly materializable join law.
+    ///
+    /// The implementation owns decoding and rejecting malformed inputs while
+    /// it performs this new work; warm resolution never calls this method.
     ///
     /// `reader` resolves immutable content-addressed dependencies named by the
     /// two members. Other resident content is not an input to the join.
@@ -138,10 +143,11 @@ pub trait CollectionMapping: Sized {
 
     /// Compute the canonical target image of one source member.
     ///
-    /// `reader` is the same frozen content-addressed boundary used to validate
-    /// the source cover. A mapping may use it only to resolve immutable
-    /// dependencies named by `source`; ambient store contents are not semantic
-    /// inputs to the mapping.
+    /// `reader` is the same frozen content-addressed boundary from which the
+    /// source was loaded. The mapping owns decoding and rejecting malformed
+    /// input while it performs new work. It may use `reader` only to resolve
+    /// immutable dependencies named by `source`; ambient store contents are
+    /// not semantic inputs to the mapping.
     fn map<R>(
         &self,
         source: &Blob<Self::Source>,
