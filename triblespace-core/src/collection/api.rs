@@ -21,8 +21,7 @@ use std::sync::Arc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::UnknownBlob;
-use crate::blob::{Blob, IntoBlob};
+use crate::blob::Blob;
 use crate::capability::{
     capability_quorum_authorizes, capability_quorum_observation_valid_through, CapabilityAction,
     CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityRequest,
@@ -32,13 +31,13 @@ use crate::clock;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
-use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead, SnapshotSource};
+use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
     discover_collection_claims_for_cover, discover_collection_equations_for_cover, ExactCoverError,
 };
-use super::simplearchive_union::FactViewError;
+use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
     collection_physical_cover, descriptor, discover_collection_records_authorized,
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
@@ -139,6 +138,42 @@ where
         match self {
             Self::Get { source, .. } => Some(source),
             Self::Invalid { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Failure to open an existing collection as one concrete member encoding.
+///
+/// Opening is a read-only validation boundary. It neither registers the
+/// descriptor nor writes any of its attachment closure into the store.
+#[derive(Debug)]
+pub enum CollectionOpenError<GetError> {
+    /// The descriptor could not be fetched or decoded generically.
+    Descriptor(CollectionDescriptorError<GetError>),
+    /// The descriptor does not denote the requested member encoding.
+    WrongType(CollectionTypeError),
+}
+
+impl<GetError> fmt::Display for CollectionOpenError<GetError>
+where
+    GetError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Descriptor(source) => source.fmt(formatter),
+            Self::WrongType(source) => write!(formatter, "wrong collection type: {source}"),
+        }
+    }
+}
+
+impl<GetError> Error for CollectionOpenError<GetError>
+where
+    GetError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Descriptor(source) => Some(source),
+            Self::WrongType(source) => Some(source),
         }
     }
 }
@@ -950,6 +985,26 @@ pub fn collection_reader_is_admitted_by_policy_at(
 }
 
 impl<L: CollectionEncoding> Collection<L> {
+    /// Open an existing descriptor as a typed collection without mutating the
+    /// backing store.
+    ///
+    /// `snapshot` should be the caller's coherent immutable read boundary. The
+    /// descriptor is fetched by `handle`, validated generically, and then
+    /// checked against `L` before the cheap typed handle is returned.
+    pub fn open<S>(
+        snapshot: &S,
+        handle: CollectionHandle,
+    ) -> Result<Self, CollectionOpenError<S::GetError<Infallible>>>
+    where
+        S: BlobStoreGet,
+    {
+        let descriptor = load_collection_descriptor(snapshot, handle)
+            .map_err(CollectionOpenError::Descriptor)?;
+        super::encoding::validate_descriptor_type::<L>(&descriptor.fragment)
+            .map_err(CollectionOpenError::WrongType)?;
+        Ok(Self::from_handle(handle))
+    }
+
     /// Decide whether `subject` is admitted as a writer at `instant`.
     ///
     /// Open policy admits every subject. A quorum admits the subject only when
@@ -1284,39 +1339,9 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             <Self as CollectionStore>::InsertError,
         >,
     > {
-        // A signed commit introduces authored graph facts. Other collection
-        // encodings are reproducible representations introduced through
-        // DERIVE and MERGE records, not alternative signed leaf formats.
-        let (_, facts, metadata_facts, mut fragment_blobs) = fragment.into_parts();
-        let data_root: Blob<SimpleArchive> = facts.to_blob();
-        let metadata: Blob<SimpleArchive> = metadata_facts.to_blob();
-        let mut attachments: Vec<Blob<UnknownBlob>> = fragment_blobs
-            .snapshot()
-            .expect("MemoryBlobStore::snapshot is infallible")
-            .into_iter()
-            .map(|(_, blob)| blob)
-            .collect();
-        attachments.sort_unstable_by_key(|blob| blob.get_handle().raw);
-
-        for blob in attachments {
-            self.put::<UnknownBlob, _>(blob)
-                .map_err(CollectionCommitError::DependencyPut)?;
-        }
-        let data_handle = self
-            .put::<SimpleArchive, _>(data_root)
-            .map_err(CollectionCommitError::DependencyPut)?;
-        let metadata = self
-            .put::<SimpleArchive, _>(metadata)
-            .map_err(CollectionCommitError::DependencyPut)?;
-        let commit = CollectionCommit::sign(
-            signing_key,
-            collection.handle(),
-            Handle::<SimpleArchive>::to_hash(data_handle),
-            metadata,
-        );
-        self.insert(super::CollectionRecord::Commit(commit))
-            .map_err(CollectionCommitError::RecordInsert)?;
-        Ok(commit)
+        PreparedCollectionCommit::from_fragment(fragment)
+            .stage_for(self, collection, signing_key)?
+            .finalize()
     }
 }
 

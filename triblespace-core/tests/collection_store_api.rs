@@ -11,9 +11,11 @@ use triblespace_core::capability::{
     CapabilityRequest, CapabilityResource,
 };
 use triblespace_core::collection::descriptor;
+use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionRecord, CollectionStore,
-    CollectionStoreExt, ACTION_READ, ACTION_WRITE,
+    AdmissionPolicy, Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy,
+    CollectionRecord, CollectionStore, CollectionStoreExt, CollectionTypeError,
+    PreparedCollectionCommit, ACTION_READ, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -125,6 +127,61 @@ fn root_creation_registers_a_self_contained_descriptor() {
 }
 
 #[test]
+fn typed_collection_open_accepts_the_registered_encoding() {
+    let root = key(20);
+    let mut store = MemoryRepo::default();
+    let registered = store
+        .collection("typed-open", policy(root.verifying_key()))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let opened = Collection::<SimpleArchive>::open(&snapshot, registered.handle()).unwrap();
+
+    assert_eq!(opened, registered);
+}
+
+#[test]
+fn typed_collection_open_rejects_the_wrong_encoding() {
+    let root = key(21);
+    let mut store = MemoryRepo::default();
+    let source = store
+        .collection("source", policy(root.verifying_key()))
+        .unwrap();
+    let registered = store
+        .derive(
+            source,
+            SimpleToSuccinctMapping,
+            policy(root.verifying_key()),
+        )
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let error = Collection::<SimpleArchive>::open(&snapshot, registered.handle()).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CollectionOpenError::WrongType(CollectionTypeError::WrongEncoding { .. })
+    ));
+}
+
+#[test]
+fn typed_collection_open_rejects_an_invalid_descriptor() {
+    let mut store = MemoryRepo::default();
+    let invalid = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let error = Collection::<SimpleArchive>::open(&snapshot, invalid).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CollectionOpenError::Descriptor(CollectionDescriptorError::Invalid {
+            collection,
+            ..
+        }) if collection == invalid
+    ));
+}
+
+#[test]
 fn commit_is_local_and_correct_by_construction() {
     let root = key(2);
     let mut store = CountingRepo::default();
@@ -144,6 +201,43 @@ fn commit_is_local_and_correct_by_construction() {
     assert_eq!(descriptor_puts, 1);
     assert_eq!(store.puts_for(collection.handle()), descriptor_puts);
     assert_eq!(store.events.last(), Some(&StoreEvent::Insert(commit.id())));
+}
+
+#[test]
+fn prepared_fragment_preserves_data_and_metadata_identity_until_commit_last() {
+    let root = key(22);
+    let mut store = CountingRepo::default();
+    let collection = store
+        .collection("prepared", policy(root.verifying_key()))
+        .unwrap();
+    store.events.clear();
+
+    let mut candidate = fragment(23);
+    candidate.describe_with(fragment(24));
+    let expected_data = candidate.facts().clone().to_blob().get_handle();
+    let expected_metadata = candidate.metafacts().clone().to_blob().get_handle();
+
+    let prepared = PreparedCollectionCommit::from_fragment(candidate);
+    let mut staged = prepared.stage_for(&mut store, collection, &root).unwrap();
+    let withheld = *staged.commit();
+
+    assert_eq!(
+        Handle::<SimpleArchive>::from_hash(withheld.data()),
+        expected_data
+    );
+    assert_eq!(withheld.metadata(), expected_metadata);
+    assert!(staged
+        .store_mut()
+        .events
+        .iter()
+        .all(|event| matches!(event, StoreEvent::Put(_))));
+
+    let committed = staged.finalize().unwrap();
+    assert_eq!(committed, withheld);
+    assert_eq!(
+        store.events.last(),
+        Some(&StoreEvent::Insert(withheld.id()))
+    );
 }
 
 #[test]

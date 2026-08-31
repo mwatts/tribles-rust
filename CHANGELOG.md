@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a read-only `Collection::<E>::open` boundary for validating an existing
+  descriptor handle against a coherent snapshot, plus descriptor-free
+  `PreparedCollectionCommit` staging against an already typed
+  `Collection<SimpleArchive>`. Importers can write fragment dependencies once,
+  validate or publish derived artifacts, and insert the native signed commit
+  last through `finalize`.
+
 - Add a stock `iroh-gossip` collection wake plane on the existing endpoint and
   router. The collection handle is exactly the topic and its discovery
   capability; a dense non-serde envelope carries only a strictly signed

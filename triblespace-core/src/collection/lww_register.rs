@@ -1094,12 +1094,6 @@ mod tests {
             )
             .unwrap();
         let collection = LwwRegisterCollection::new(source, target);
-        let snapshot = store.snapshot().unwrap();
-        let source_descriptor =
-            crate::collection::api::load_collection_descriptor(&snapshot, source.handle())
-                .unwrap()
-                .fragment;
-        drop(snapshot);
         let register = ufoid();
         let state = ufoid();
         let identity_data = archive(&identity(&state, &register));
@@ -1107,7 +1101,7 @@ mod tests {
         let metadata = TribleSet::new().to_blob();
         let identity_commit = simplearchive_union::publish_commit(
             &mut store,
-            &source_descriptor,
+            source,
             &identity_data,
             &metadata,
             &signing_key,
@@ -1115,7 +1109,7 @@ mod tests {
         .unwrap();
         let order_commit = simplearchive_union::publish_commit(
             &mut store,
-            &source_descriptor,
+            source,
             &order_data,
             &metadata,
             &signing_key,

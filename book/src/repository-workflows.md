@@ -35,6 +35,18 @@ merge or derivation equations provide reusable physical work.
 blob and native collection surfaces. A collection is its descriptor handle;
 the store remains the sole owner of I/O, durability, and lifetime.
 
+An existing descriptor is opened through the same frozen read boundary used
+for later observation:
+
+```rust,ignore
+let snapshot = storage.snapshot()?;
+let models = Collection::<SimpleArchive>::open(&snapshot, collection_handle)?;
+```
+
+`open` fetches and validates the canonical descriptor and checks that its
+member encoding is `SimpleArchive`. It never registers, rewrites, or otherwise
+mutates the store.
+
 ## Publish a root collection
 
 Register the descriptor once, then pass its returned handle to store
@@ -111,11 +123,13 @@ network-wide team scope.
 
 One `store.commit(collection, signer, fragment)` performs these semantic steps:
 
-1. fetch and structurally validate the already registered descriptor;
+1. consume the fragment once into attachments, facts, and metafacts;
 2. store the fragment's attachments;
-3. encode the fragment's facts as the canonical `SimpleArchive` member;
-4. encode metafacts as the mandatory canonical metadata `SimpleArchive`;
-5. insert a signed `COMMIT` naming the descriptor, data, and metadata handles.
+3. encode and store the facts as the canonical `SimpleArchive` member;
+4. encode and store metafacts as the mandatory canonical metadata
+   `SimpleArchive`;
+5. insert a signed `COMMIT` naming the already typed collection, data, and
+   metadata handles.
 
 Dependencies precede the record which gives them authority. Publication does
 not flush implicitly. Call `flush()` at the application's chosen durability
@@ -126,6 +140,24 @@ commits coexist.
 `COMMIT` is deliberately a source operation over authored `Fragment` values.
 Other collection encodings enter the lattice through reproducible `DERIVE` and
 `MERGE` records rather than alternative signed leaf formats.
+
+Importers which must validate additional artifacts before making the source
+commit visible use the same path with an explicit pause before step 5:
+
+```rust,ignore
+let prepared = PreparedCollectionCommit::from_fragment(candidate);
+let mut staged = prepared.stage_for(&mut storage, models, &signer)?;
+
+// Dependencies are resident, but COMMIT is still withheld. Any validation or
+// reproducible DERIVE/MERGE publication can use this exact store now.
+validate_candidate(staged.store_mut())?;
+
+let commit = staged.finalize()?; // the sole signed COMMIT insertion
+```
+
+Preparation is store-free and dropping either a prepared or staged value never
+publishes a commit. `stage_for` accepts `Collection<SimpleArchive>`, not a raw
+handle or a reconstructed descriptor fragment.
 
 ## The native algebra
 

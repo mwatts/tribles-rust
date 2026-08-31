@@ -44,8 +44,8 @@ use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::descriptor as descriptor_facts;
 use super::{
-    CollectionCommit, CollectionData, CollectionEncoding, CollectionHandle, CollectionMerge,
-    CollectionOperationError, CollectionRecord, CollectionStore,
+    Collection, CollectionCommit, CollectionCommitError, CollectionData, CollectionEncoding,
+    CollectionHandle, CollectionMerge, CollectionOperationError, CollectionRecord, CollectionStore,
 };
 
 mod materialize;
@@ -211,130 +211,89 @@ pub enum PublicationError<PutError, InsertError> {
 /// to report an I/O failure: preparation does not touch the destination store.
 pub type PreparationError = PublicationError<Infallible, Infallible>;
 
-/// A canonical collection commit whose bytes have not been published.
+/// A canonical `SimpleArchive` collection commit whose bytes have not been
+/// published.
 ///
-/// Preparation structurally validates the descriptor, data, and metadata while
-/// retaining their trusted cached identities and embedded fragment blobs. It
-/// touches no store and needs no signing key. Call [`Self::stage`] to write every
+/// Preparation consumes one [`Fragment`] exactly once, retaining its canonical
+/// data, metadata, and embedded blobs. It touches no store and needs no signing
+/// key. Call [`Self::stage_for`] with an already typed collection to write every
 /// dependency and sign the resulting commit over the handles the store itself
 /// returned. Dropping a prepared value has no storage effect.
 #[derive(Clone, Debug)]
 #[must_use = "a prepared collection commit has no effect until it is staged and finalized"]
 pub struct PreparedCollectionCommit {
     embedded: Vec<Blob<UnknownBlob>>,
-    descriptor: Fragment,
     data: Blob<SimpleArchive>,
     metadata: Blob<SimpleArchive>,
 }
 
 impl PreparedCollectionCommit {
-    /// Stage every dependency and sign the commit over the stored handles.
+    /// Prepare one self-contained fact fragment entirely in memory.
     ///
-    /// The exact store-call order is descriptor attachments (in handle order),
-    /// the collection descriptor blob, element attachments (in handle order),
-    /// data, and metadata. Every handle the signed commit names is a handle one
-    /// of those writes handed back, so the commit's whole dependency closure is
-    /// present by construction rather than by two independent hash computations
-    /// happening to agree.
+    /// Facts become collection data and metafacts become commit metadata. The
+    /// fragment's shared blob store may back handles in either set; those
+    /// attachments are retained in canonical handle order for staging. Fragment
+    /// exports are not serialized.
+    pub fn from_fragment(fragment: Fragment) -> Self {
+        let (_, facts, metafacts, mut blobs) = fragment.into_parts();
+
+        let mut embedded: Vec<Blob<UnknownBlob>> = blobs
+            .snapshot()
+            .expect("MemoryBlobStore::snapshot is infallible")
+            .into_iter()
+            .map(|(_, blob)| blob)
+            .collect();
+        embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
+
+        Self {
+            embedded,
+            data: crate::blob::IntoBlob::to_blob(facts),
+            metadata: crate::blob::IntoBlob::to_blob(metafacts),
+        }
+    }
+
+    /// Stage every dependency against an already typed collection and sign the
+    /// withheld commit.
+    ///
+    /// The exact store-call order is embedded fragment blobs (in handle order),
+    /// data, and metadata. Every handle the signed commit names is returned by
+    /// one of those writes, so its complete dependency closure is present before
+    /// publication. The descriptor and its attachment closure must already be
+    /// resident; this operation never registers or rewrites them.
     ///
     /// On success the returned value retains the same mutable store borrow, so
     /// a caller may append unsigned `MERGE` or `DERIVE` artifacts through
     /// [`StagedCollectionCommit::store_mut`] before consuming the value with
     /// [`StagedCollectionCommit::finalize`].
-    pub fn stage<'store, S>(
-        self,
-        store: &'store mut S,
-        signing_key: &SigningKey,
-    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::InsertError>>
-    where
-        S: BlobStorePut + CollectionStore,
-    {
-        let collection =
-            crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor.facts().clone())
-                .get_handle();
-        self.stage_inner(store, collection, true, signing_key)
-    }
-
-    /// Stage element dependencies against an already registered descriptor.
-    ///
-    /// Unlike [`stage`](Self::stage), this does not write the descriptor again.
-    /// It first binds `collection` to the prepared descriptor's canonical
-    /// identity, then writes embedded fragment blobs, data, and metadata before
-    /// signing. The descriptor and its attachment closure must already have
-    /// been registered by the caller.
     pub fn stage_for<'store, S>(
         self,
         store: &'store mut S,
-        collection: CollectionHandle,
+        collection: Collection<SimpleArchive>,
         signing_key: &SigningKey,
-    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::InsertError>>
-    where
-        S: BlobStorePut + CollectionStore,
-    {
-        self.stage_inner(store, collection, false, signing_key)
-    }
-
-    fn stage_inner<'store, S>(
-        self,
-        store: &'store mut S,
-        mut collection: CollectionHandle,
-        put_descriptor: bool,
-        signing_key: &SigningKey,
-    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::InsertError>>
+    ) -> Result<StagedCollectionCommit<'store, S>, CollectionCommitError<S::PutError, S::InsertError>>
     where
         S: BlobStorePut + CollectionStore,
     {
         let Self {
             embedded,
-            descriptor,
             data,
             metadata,
         } = self;
-        let (_, descriptor_facts, _, mut descriptor_blobs) = descriptor.into_parts();
-
-        if put_descriptor {
-            let mut attachments: Vec<Blob<UnknownBlob>> = descriptor_blobs
-                .snapshot()
-                .expect("MemoryBlobStore::snapshot is infallible")
-                .into_iter()
-                .map(|(_, blob)| blob)
-                .collect();
-            attachments.sort_unstable_by_key(|blob| blob.get_handle().raw);
-            for blob in attachments {
-                store
-                    .put::<UnknownBlob, _>(blob)
-                    .map_err(PublicationError::DependencyPut)?;
-            }
-            collection = store
-                .put::<SimpleArchive, _>(descriptor_facts)
-                .map_err(PublicationError::DependencyPut)?;
-        } else {
-            let expected =
-                crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor_facts).get_handle();
-            if collection != expected {
-                return Err(PublicationError::Validation(
-                    SimpleArchiveUnionValidationError::WrongCollection {
-                        expected,
-                        actual: collection,
-                    },
-                ));
-            }
-        }
         for blob in embedded {
             store
                 .put::<UnknownBlob, _>(blob)
-                .map_err(PublicationError::DependencyPut)?;
+                .map_err(CollectionCommitError::DependencyPut)?;
         }
         let data_handle = store
             .put::<SimpleArchive, _>(data)
-            .map_err(PublicationError::DependencyPut)?;
+            .map_err(CollectionCommitError::DependencyPut)?;
         let metadata_handle = store
             .put::<SimpleArchive, _>(metadata)
-            .map_err(PublicationError::DependencyPut)?;
+            .map_err(CollectionCommitError::DependencyPut)?;
 
         let commit = CollectionCommit::sign(
             signing_key,
-            collection,
+            collection.handle(),
             Handle::<SimpleArchive>::to_hash(data_handle),
             metadata_handle,
         );
@@ -383,11 +342,11 @@ where
     /// Durability remains an explicit caller-selected store operation.
     pub fn finalize(
         self,
-    ) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>> {
+    ) -> Result<CollectionCommit, CollectionCommitError<S::PutError, S::InsertError>> {
         let Self { store, commit } = self;
         store
             .insert(CollectionRecord::Commit(commit))
-            .map_err(PublicationError::RecordInsert)?;
+            .map_err(CollectionCommitError::RecordInsert)?;
         Ok(commit)
     }
 }
@@ -729,60 +688,25 @@ pub fn validate_merge(
     Ok(())
 }
 
-/// Prepare a canonical membership root entirely in memory.
+/// Prepare canonical data and metadata blobs as one unpublished membership
+/// root.
 ///
-/// Supplied data and metadata retain their cached content identities and are
-/// validated structurally. A [`Blob`] is a trusted typed value produced by this
-/// process or by a [`crate::repo::BlobStore`] that upholds its handle contract;
-/// this layer does not defensively rehash it. No store is touched and no key is needed:
-/// the commit is signed by [`PreparedCollectionCommit::stage`] over the
-/// handles the store returns. The returned value can be staged, abandoned
-/// inertly, or finalized later.
+/// Supplied blobs retain their cached content identities and are validated
+/// structurally. No store is touched and no key is needed. The returned value
+/// can be staged against any already typed `SimpleArchive` collection,
+/// abandoned inertly, or finalized later.
 pub fn prepare_commit(
-    descriptor: &Fragment,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
-    prepare_commit_with_embedded(descriptor, data, metadata, Vec::new())
-}
-
-/// Prepare a self-contained fact fragment as a canonical membership root.
-///
-/// The fragment's facts become collection data and its metafacts become commit
-/// metadata. Its one shared blob store may back handles in either set, and its
-/// blobs are staged under the identities they already carry: bytes are hashed
-/// where they enter a trust boundary, and an in-memory fragment we just built
-/// is not such a boundary. Fragment exports are not serialized. No destination
-/// store is touched.
-pub fn prepare_fragment_commit(
-    descriptor: &Fragment,
-    fragment: Fragment,
-) -> Result<PreparedCollectionCommit, PreparationError> {
-    let (_, facts, metafacts, mut blobs) = fragment.into_parts();
-
-    // The sort key is the identity `put` will file each blob under, so the
-    // staged order is the documented handle order.
-    let mut embedded: Vec<Blob<UnknownBlob>> = blobs
-        .snapshot()
-        .expect("MemoryBlobStore::snapshot is infallible")
-        .into_iter()
-        .map(|(_, blob)| blob)
-        .collect();
-    embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
-
-    let data: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(facts);
-    let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metafacts);
-    prepare_commit_with_embedded(descriptor, &data, &metadata, embedded)
+    prepare_commit_with_embedded(data, metadata, Vec::new())
 }
 
 fn prepare_commit_with_embedded(
-    descriptor: &Fragment,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
     embedded: Vec<Blob<UnknownBlob>>,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
-    validate_descriptor(descriptor).map_err(PublicationError::Validation)?;
-
     validate_element(data).map_err(|source| {
         PublicationError::Validation(SimpleArchiveUnionValidationError::InvalidElement {
             role: ElementRole::CommitData,
@@ -794,7 +718,6 @@ fn prepare_commit_with_embedded(
 
     Ok(PreparedCollectionCommit {
         embedded,
-        descriptor: descriptor.clone(),
         data: data.clone(),
         metadata: metadata.clone(),
     })
@@ -816,13 +739,21 @@ fn widen_preparation_error<PutError, InsertError>(
     }
 }
 
+fn widen_commit_error<PutError, InsertError>(
+    error: CollectionCommitError<PutError, InsertError>,
+) -> PublicationError<PutError, InsertError> {
+    match error {
+        CollectionCommitError::DependencyPut(source) => PublicationError::DependencyPut(source),
+        CollectionCommitError::RecordInsert(source) => PublicationError::RecordInsert(source),
+    }
+}
+
 /// Publish a signed membership root after writing its dependencies.
 ///
 /// Supplied data and metadata retain their trusted cached identities and are
 /// structurally validated before storage. The exact write order is:
 ///
-/// 1. descriptor attachments, collection-descriptor blob, data blob,
-///    metadata blob;
+/// 1. data blob and metadata blob;
 /// 2. signed commit record.
 ///
 /// A completed prefix before the record write leaves only content-addressed
@@ -834,7 +765,7 @@ fn widen_preparation_error<PutError, InsertError>(
 /// policy decision.
 pub fn publish_commit<S>(
     store: &mut S,
-    descriptor: &Fragment,
+    collection: Collection<SimpleArchive>,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
     signing_key: &SigningKey,
@@ -842,8 +773,12 @@ pub fn publish_commit<S>(
 where
     S: BlobStorePut + CollectionStore,
 {
-    let prepared = prepare_commit(descriptor, data, metadata).map_err(widen_preparation_error)?;
-    prepared.stage(store, signing_key)?.finalize()
+    let prepared = prepare_commit(data, metadata).map_err(widen_preparation_error)?;
+    prepared
+        .stage_for(store, collection, signing_key)
+        .map_err(widen_commit_error)?
+        .finalize()
+        .map_err(widen_commit_error)
 }
 
 /// Publish a self-contained fact fragment as a signed membership root.
@@ -854,22 +789,24 @@ where
 ///
 /// Fragment exports are not serialized. The two fact sets become canonical
 /// `SimpleArchive` data and metadata elements. The shared prepared-publication
-/// path writes descriptor attachments, the descriptor blob, element
-/// attachments, and both archives before inserting the signed record last.
+/// path writes element attachments and both archives before inserting the
+/// signed record last. The typed collection descriptor is already registered.
 /// The same backend-recovery boundary documented by [`PublicationError`]
 /// applies.
 pub fn publish_fragment_commit<S>(
     store: &mut S,
-    descriptor: &Fragment,
+    collection: Collection<SimpleArchive>,
     fragment: Fragment,
     signing_key: &SigningKey,
 ) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>>
 where
     S: BlobStorePut + CollectionStore,
 {
-    let prepared =
-        prepare_fragment_commit(descriptor, fragment).map_err(widen_preparation_error)?;
-    prepared.stage(store, signing_key)?.finalize()
+    PreparedCollectionCommit::from_fragment(fragment)
+        .stage_for(store, collection, signing_key)
+        .map_err(widen_commit_error)?
+        .finalize()
+        .map_err(widen_commit_error)
 }
 
 /// Read one merge input out of the store.
@@ -1165,6 +1102,7 @@ mod tests {
     use crate::collection::{
         discover_collection_records, empty_metadata_handle, plan_collection_retention,
         resolve_collection_semantics, CollectionClaimValidation, CollectionDerive,
+        CollectionStoreExt,
     };
     use crate::inline::InlineEncoding;
     use crate::macros::entity;
@@ -1390,6 +1328,16 @@ mod tests {
         handles.into_iter().map(ProbeEvent::Put).collect()
     }
 
+    fn register_collection<S>(store: &mut S, descriptor: &Fragment) -> Collection<SimpleArchive>
+    where
+        S: BlobStorePut + CollectionStore,
+        S::PutError: fmt::Debug,
+    {
+        store
+            .register_collection::<SimpleArchive>(descriptor.clone())
+            .unwrap()
+    }
+
     fn commit_fixture() -> (
         Fragment,
         Blob<SimpleArchive>,
@@ -1426,8 +1374,8 @@ mod tests {
             metadata_archive.get_handle(),
         );
 
-        let prepared = prepare_fragment_commit(&source_descriptor, fragment.clone()).unwrap();
-        let repeated = prepare_fragment_commit(&source_descriptor, fragment).unwrap();
+        let prepared = PreparedCollectionCommit::from_fragment(fragment.clone());
+        let repeated = PreparedCollectionCommit::from_fragment(fragment);
 
         let derive = CollectionDerive::new(
             identity_for_tests(&target),
@@ -1437,10 +1385,6 @@ mod tests {
         let derive_record = CollectionRecord::Derive(derive);
         let commit_record = CollectionRecord::Commit(expected);
         let mut sequence = [
-            embedded_put_events(&source_descriptor),
-            vec![put_event(&IntoBlob::<SimpleArchive>::to_blob(
-                source_descriptor.facts().clone(),
-            ))],
             embedded,
             vec![put_event(&content_archive), put_event(&metadata_archive)],
         ]
@@ -1449,9 +1393,13 @@ mod tests {
         sequence.push(insert_event(commit_record));
 
         let mut store = ProbeStore::default();
+        let source = register_collection(&mut store, &source_descriptor);
+        store.events.clear();
         let mut signed = Vec::new();
         for prepared in [prepared, repeated] {
-            let mut staged = prepared.stage(&mut store, &signing_key).unwrap();
+            let mut staged = prepared
+                .stage_for(&mut store, source, &signing_key)
+                .unwrap();
             assert_eq!(staged.commit(), &expected);
             signed.push(*staged.commit());
             staged.store_mut().insert(derive_record).unwrap();
@@ -1479,10 +1427,13 @@ mod tests {
         let (fragment, text_handle, payload_handle) = fragment_fixture();
         let expected_content: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
         let expected_metadata: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
-        let prepared = prepare_fragment_commit(&descriptor, fragment).unwrap();
+        let prepared = PreparedCollectionCommit::from_fragment(fragment);
 
         let mut pile = Pile::open(&path).unwrap();
-        let mut staged = prepared.stage(&mut pile, &signing_key).unwrap();
+        let collection = register_collection(&mut pile, &descriptor);
+        let mut staged = prepared
+            .stage_for(&mut pile, collection, &signing_key)
+            .unwrap();
         let withheld = *staged.commit();
         {
             let reader = staged.store_mut().snapshot().unwrap();
@@ -1553,17 +1504,20 @@ mod tests {
     }
 
     #[test]
-    fn direct_stage_retains_the_descriptor_name_before_commit() {
+    fn staging_for_registered_collection_does_not_rewrite_its_descriptor() {
         let descriptor = root("attached descriptor name");
         let name_handle = descriptor_facts::name(descriptor.facts())
             .unwrap()
             .expect("root descriptor name");
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
-        let prepared = prepare_commit(&descriptor, &empty, &empty).unwrap();
+        let prepared = prepare_commit(&empty, &empty).unwrap();
         let mut store = MemoryRepo::default();
+        let collection = register_collection(&mut store, &descriptor);
 
-        let mut staged = prepared.stage(&mut store, &signing_key).unwrap();
+        let mut staged = prepared
+            .stage_for(&mut store, collection, &signing_key)
+            .unwrap();
         let commit = *staged.commit();
         {
             let reader = staged.store_mut().snapshot().unwrap();
@@ -1589,13 +1543,17 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let empty_archive: Blob<SimpleArchive> = TribleSet::new().to_blob();
 
-        let prepared = prepare_fragment_commit(&descriptor, Fragment::empty()).unwrap();
+        let prepared = PreparedCollectionCommit::from_fragment(Fragment::empty());
 
         assert_eq!(prepared.metadata.get_handle(), empty_metadata_handle());
         assert_eq!(prepared.metadata, empty_archive);
 
         let mut store = ProbeStore::default();
-        let staged = prepared.stage(&mut store, &signing_key).unwrap();
+        let collection = register_collection(&mut store, &descriptor);
+        store.events.clear();
+        let staged = prepared
+            .stage_for(&mut store, collection, &signing_key)
+            .unwrap();
         assert_eq!(staged.commit().metadata(), empty_metadata_handle());
         drop(staged);
         assert_eq!(
@@ -1614,10 +1572,13 @@ mod tests {
         let descriptor = root("first");
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let (fragment, _, _) = fragment_fixture();
-        let prepared = prepare_fragment_commit(&descriptor, fragment).unwrap();
+        let prepared = PreparedCollectionCommit::from_fragment(fragment);
         let mut store = MemoryRepo::default();
+        let collection = register_collection(&mut store, &descriptor);
 
-        let mut staged = prepared.stage(&mut store, &signing_key).unwrap();
+        let mut staged = prepared
+            .stage_for(&mut store, collection, &signing_key)
+            .unwrap();
         let commit = *staged.commit();
         let snapshot = staged.store_mut().snapshot().unwrap();
         assert!(discover_collection_records(&snapshot)
@@ -1638,16 +1599,21 @@ mod tests {
     fn staged_finalize_insert_failure_withholds_commit() {
         let descriptor = root("first");
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let prepared = prepare_fragment_commit(&descriptor, Fragment::empty()).unwrap();
-        // Descriptor attachments, descriptor, data, metadata, then COMMIT.
-        let insert_at = embedded_put_events(&descriptor).len() + 4;
-        let mut store = ProbeStore::failing_before_effect_at(insert_at);
-        let staged = prepared.stage(&mut store, &signing_key).unwrap();
+        let prepared = PreparedCollectionCommit::from_fragment(Fragment::empty());
+        // Empty data, empty metadata, then COMMIT.
+        let insert_at = 3;
+        let mut store = ProbeStore::default();
+        let collection = register_collection(&mut store, &descriptor);
+        store.events.clear();
+        store.fail_at = Some(insert_at);
+        let staged = prepared
+            .stage_for(&mut store, collection, &signing_key)
+            .unwrap();
         let commit = *staged.commit();
 
         assert!(matches!(
             staged.finalize(),
-            Err(PublicationError::RecordInsert(ProbeFailure(at))) if at == insert_at
+            Err(CollectionCommitError::RecordInsert(ProbeFailure(at))) if at == insert_at
         ));
         assert!(!store.records.contains_key(&commit.id()));
     }
@@ -1656,24 +1622,16 @@ mod tests {
     fn commit_publication_orders_and_replays_idempotently() {
         let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
         let descriptor_embedded = embedded_put_events(&descriptor);
-        let mut sequence = [
-            descriptor_embedded.clone(),
-            vec![
-                put_event(&IntoBlob::<SimpleArchive>::to_blob(
-                    descriptor.facts().clone(),
-                )),
-                put_event(&data_blob),
-                put_event(&metadata),
-            ],
-        ]
-        .concat();
+        let mut sequence = vec![put_event(&data_blob), put_event(&metadata)];
         sequence.push(insert_event(CollectionRecord::Commit(expected)));
 
         let mut store = ProbeStore::default();
+        let collection = register_collection(&mut store, &descriptor);
+        store.events.clear();
         let first =
-            publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key).unwrap();
+            publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key).unwrap();
         let second =
-            publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key).unwrap();
+            publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key).unwrap();
 
         assert_eq!(first, expected);
         assert_eq!(second, expected);
@@ -1720,10 +1678,6 @@ mod tests {
             metadata_archive.get_handle(),
         );
         let mut sequence = [
-            descriptor_embedded.clone(),
-            vec![put_event(&IntoBlob::<SimpleArchive>::to_blob(
-                descriptor.facts().clone(),
-            ))],
             embedded.clone(),
             vec![put_event(&content_archive), put_event(&metadata_archive)],
         ]
@@ -1731,11 +1685,12 @@ mod tests {
         sequence.push(insert_event(CollectionRecord::Commit(expected)));
 
         let mut store = ProbeStore::default();
-        let first =
-            publish_fragment_commit(&mut store, &descriptor, fragment.clone(), &signing_key)
-                .unwrap();
+        let collection = register_collection(&mut store, &descriptor);
+        store.events.clear();
+        let first = publish_fragment_commit(&mut store, collection, fragment.clone(), &signing_key)
+            .unwrap();
         let second =
-            publish_fragment_commit(&mut store, &descriptor, fragment, &signing_key).unwrap();
+            publish_fragment_commit(&mut store, collection, fragment, &signing_key).unwrap();
 
         assert_eq!(first, expected);
         assert_eq!(second, expected);
@@ -1828,13 +1783,14 @@ mod tests {
     #[test]
     fn commit_publication_orders_completed_prefixes_and_replays_after_recovery() {
         let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
-        let descriptor_count = embedded_put_events(&descriptor).len();
-        let insert_at = descriptor_count + 4;
+        let insert_at = 3;
         for fail_at in 1..=insert_at {
-            let mut store = ProbeStore::failing_before_effect_at(fail_at);
-            let error =
-                publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key)
-                    .unwrap_err();
+            let mut store = ProbeStore::default();
+            let collection = register_collection(&mut store, &descriptor);
+            store.events.clear();
+            store.fail_at = Some(fail_at);
+            let error = publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key)
+                .unwrap_err();
             match (fail_at, error) {
                 (at, PublicationError::DependencyPut(ProbeFailure(observed))) if at < insert_at => {
                     assert_eq!(observed, fail_at)
@@ -1852,7 +1808,7 @@ mod tests {
 
             store.recover();
             let retried =
-                publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key)
+                publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key)
                     .unwrap();
             assert_eq!(retried, expected);
             assert!(store.records.contains_key(&expected.id()));
@@ -1909,26 +1865,14 @@ mod tests {
     fn publication_rejects_every_invalid_input_before_writing() {
         let (descriptor, data_blob, metadata, signing_key, _) = commit_fixture();
         let mut store = ProbeStore::default();
-        let wrong_descriptor = test_naming(id(8));
-        assert!(matches!(
-            publish_commit(
-                &mut store,
-                &wrong_descriptor,
-                &data_blob,
-                &metadata,
-                &signing_key,
-            ),
-            Err(PublicationError::Validation(
-                SimpleArchiveUnionValidationError::WrongRepresentation { .. }
-            ))
-        ));
-        assert!(store.events.is_empty());
+        let collection = register_collection(&mut store, &descriptor);
+        store.events.clear();
 
         let invalid_data = raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]);
         assert!(matches!(
             publish_commit(
                 &mut store,
-                &descriptor,
+                collection,
                 &invalid_data,
                 &metadata,
                 &signing_key,
@@ -1943,7 +1887,7 @@ mod tests {
         assert!(matches!(
             publish_commit(
                 &mut store,
-                &descriptor,
+                collection,
                 &data_blob,
                 &invalid_metadata,
                 &signing_key,
@@ -1986,13 +1930,14 @@ mod tests {
 
         let (commit, right_commit, merge, result) = {
             let mut pile = Pile::open(&path).unwrap();
+            let collection = register_collection(&mut pile, &descriptor);
             let commit =
-                publish_commit(&mut pile, &descriptor, &left, &metadata, &signing_key).unwrap();
+                publish_commit(&mut pile, collection, &left, &metadata, &signing_key).unwrap();
             // Both sides must be states before they can be merged -- the merge
             // reads them rather than writing them, so a side nobody committed
             // is refused by identity.
             let right_commit =
-                publish_commit(&mut pile, &descriptor, &right, &metadata, &signing_key).unwrap();
+                publish_commit(&mut pile, collection, &right, &metadata, &signing_key).unwrap();
             let (merge, result) =
                 publish_merge(&mut pile, &descriptor, data(&right), data(&left)).unwrap();
             pile.close().unwrap();
@@ -2050,8 +1995,9 @@ mod tests {
 
         let commit = {
             let mut pile = Pile::open(&path).unwrap();
+            let collection = register_collection(&mut pile, &descriptor);
             let commit =
-                publish_fragment_commit(&mut pile, &descriptor, fragment, &signing_key).unwrap();
+                publish_fragment_commit(&mut pile, collection, fragment, &signing_key).unwrap();
             pile.close().unwrap();
             commit
         };

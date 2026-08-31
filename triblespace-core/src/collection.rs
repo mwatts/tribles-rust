@@ -68,6 +68,7 @@ pub use policy::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;
+pub use simplearchive_union::{PreparedCollectionCommit, StagedCollectionCommit};
 pub use store::*;
 pub use view::*;
 
