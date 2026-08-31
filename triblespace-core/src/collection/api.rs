@@ -23,9 +23,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::capability::{
-    capability_quorum_authorizes, capability_quorum_observation_valid_through, CapabilityAction,
-    CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityRequest,
-    CapabilityResource,
+    capability_quorum_authorizes, CapabilityAction, CapabilityAtom, CapabilityMode,
+    CapabilityProof, CapabilityProofBundle, CapabilityRequest, CapabilityResource,
 };
 use crate::clock;
 use crate::inline::encodings::hash::Handle;
@@ -857,32 +856,6 @@ impl AdmissionEvidence {
             ),
         }
     }
-
-    /// Conservative inclusive bound on this immutable authority observation.
-    ///
-    /// `None` means no currently usable proof path is time-bounded. A returned
-    /// bound can precede the actual loss of authorization when another proof
-    /// path is redundant; callers should reobserve rather than infer
-    /// revocation.
-    pub(crate) fn observation_valid_through(
-        &self,
-        instant: hifitime::Epoch,
-    ) -> Option<hifitime::Epoch> {
-        match self {
-            Self::Open => None,
-            Self::Quorum {
-                roots,
-                request,
-                bundles,
-                ..
-            } => capability_quorum_observation_valid_through(
-                bundles.iter(),
-                roots.iter().copied(),
-                instant,
-                request.atom(),
-            ),
-        }
-    }
 }
 
 pub(crate) fn load_resident_proof_bundles<R>(
@@ -1132,6 +1105,29 @@ pub fn collection_reader_is_admitted_by_policy_at(
     let evidence = admission_evidence_from_bundles(
         policy.read(),
         ACTION_READ,
+        CapabilityMode::Invoke,
+        collection,
+        bundles.to_vec().into(),
+    );
+    evidence.authorizes(subject, instant)
+}
+
+/// Decide WRITE admission against one already validated collection policy and
+/// an explicitly supplied portable proof forest.
+///
+/// This pure seam lets a network repair client discard inert records before
+/// they cross the local admission boundary. It performs no store access,
+/// persistence, or clock sampling.
+pub fn collection_writer_is_admitted_by_policy_at(
+    collection: CollectionHandle,
+    policy: &CollectionPolicy,
+    subject: VerifyingKey,
+    bundles: &[CapabilityProofBundle],
+    instant: hifitime::Epoch,
+) -> bool {
+    let evidence = admission_evidence_from_bundles(
+        policy.write(),
+        ACTION_WRITE,
         CapabilityMode::Invoke,
         collection,
         bundles.to_vec().into(),

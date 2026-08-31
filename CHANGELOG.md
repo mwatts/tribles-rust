@@ -23,18 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last through `finalize`.
 
 - Add a stock `iroh-gossip` collection wake plane on the existing endpoint and
-  router. The collection handle is exactly the topic and its discovery
-  capability; a dense non-serde envelope carries only a strictly signed
-  endpoint origin and opaque anti-entropy root. Payload synchronization remains
-  separate and capability-gated.
+  router. A domain-separated one-way image of the collection handle is the
+  topic, while C remains its discovery capability; a dense 177-byte non-serde
+  nonce-v3 envelope carries only version, strictly signed endpoint origin,
+  separate opaque semantic/payload roots, fresh nonce, and signature. Payload synchronization
+  remains separate and capability-gated.
 
 - Add an immutable per-collection activation overlay: exact collection records
   and every complete, structurally valid WRITE proof bundle relevant to the
   descriptor policy form two canonical grow-only PATCHes and one opaque,
   domain-separated wake digest. Portable bundle framing is strict and bounded,
-  evidence inventory is deliberately independent of wall-clock expiry, and
-  request-supplied READ proof forests now have pure untyped admission and
-  deterministic bounded selection seams for collection networking.
+  evidence inventory is deliberately independent of wall-clock expiry.
+  Request-supplied READ proof forests have pure untyped admission and
+  deterministic, current-instant, bounded selection seams; repair validates the
+  receiver's witness before revealing a manifest, while exact H fetch separately
+  requires the provider to prove READ(C) before H is revealed.
 
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies
@@ -190,8 +193,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Route immutable-artifact provider placement and lookup through authenticated
   alpha-3 FIND_NODE walks. Exact fetch no longer probes the learned peer set:
-  serving holders publish only their snapshot-bound READ-open collection
-  disclosure through the DHT, while undisclosed artifacts remain clean misses.
+  serving holders publish only their snapshot-bound admitted collection
+  closure through the DHT, while ambient or WRITE-inactive artifacts remain
+  clean misses.
   Wire protocol identity advances to pile-sync ALPN v13.
 
 - Add lattice-aware exact derived-collection reuse over the existing team
@@ -285,13 +289,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Derive global DHT provider publication from one immutable collection
-  disclosure observation instead of durable `OFFER` intent. Only resident
-  closure beneath strict, currently WRITE-admitted COMMITs in READ-open
-  collections is published; restricted and unauthorized handles remain absent.
-  A conservative proof-expiry bound stops autonomous lease renewal until the
-  store is reobserved, while raw artifact serving remains behind the existing
-  authenticated team session.
+- Replace per-artifact global publication with one endpoint-bound KDF(C) lease
+  per active served collection. The provider proves READ(C) before H is
+  revealed, then possession of H authorizes those exact resident bytes. Bare
+  WANT(H) remains local retention intent; routed C,H reads and Full custody use
+  collection discovery. Directory nodes see neither C nor H.
 
 - Make store registration the sole source of typed collection values.
   `register_collection` validates a raw descriptor and returns the exact handle
@@ -2134,11 +2136,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace the global 8-bit provider-cover rendezvous with exact full-width
   derived-key DHT PUT/GET leases. Directory requests still never carry bearer
   blob handles, while unrelated artifacts no longer collapse onto 256 fixed
-  hotspots. The explicit publication input remains separate from the mechanic:
-  derived keys do not protect guessable plaintext, so the collection-policy
-  cut must globally publish only READ-open reachability and keep restricted
-  availability inside its authorized overlay. The incompatible wire is now
-  pile-sync ALPN v16.
+  hotspots. The publication input remains the exact resident closure of
+  WRITE-admitted COMMITs in READ-open collections. Restricted collections use
+  READ(C)-scoped exact fetch rather than a global KDF(H) oracle. The
+  incompatible wire is now pile-sync ALPN v18.
 
 - Make nonempty exact-derived network attachment fail closed when refreshing
   discovers a conflicting store scope, rather than clearing the serving view

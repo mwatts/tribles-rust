@@ -12,18 +12,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add collection-scoped anti-entropy over one direct stream. Each request
   carries portable READ(C) evidence and pins the exact product of the native
   record PATCH and portable WRITE-evidence PATCH.
-- Add stock `iroh-gossip` wake subscriptions keyed exactly by collection
-  handle. Signed origin plus opaque activation-root mismatches accelerate the
-  same repair path; periodic anti-entropy remains authoritative.
+- Add stock `iroh-gossip` wake subscriptions keyed by a domain-separated image
+  of the collection handle. A 177-byte nonce-v3 signed origin wake carries
+  separate opaque semantic and payload roots and accelerates the same bounded participant
+  repair path; sampled periodic anti-entropy remains authoritative.
+- Add local `Demand | Full` payload QoS. Full repair pins a canonical 80-byte
+  disclosure-forest PATCH and accepts only locally authenticated roots and
+  parent-byte-verified edges, with bounded partial progress on the same session.
 
 ### Changed
 
 - Replace team-scoped connection authorization and global inventory with
-  immutable per-collection activation overlays. DHT routing, provider lookup,
-  and exact GET by a known handle remain bearer/public; provider advertising
-  now follows collection disclosure policy.
+  immutable per-collection activation overlays. Provider discovery is one
+  endpoint-bound KDF(C) lease per active served collection; no resident H is
+  published globally. Collection-agnostic blob WANTs infer candidate
+  collections from admitted direct roots, verify a provider's READ(C) witness
+  before revealing bearer H, and accept bytes only from C's resident closure.
 - Move the incompatible direct protocol to ALPN
-  `/triblespace/pile-sync/17`.
+  `/triblespace/pile-sync/20`. Anti-entropy is receiver-authorized by READ(C);
+  scoped bearer GET is asymmetric because possession of H is read authority,
+  but the provider still proves READ(C) before H crosses TLS. Unattributed
+  WANTs fail closed, and unsigned remote derived artifacts are not mirrored.
 
 ### Removed
 

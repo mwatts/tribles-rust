@@ -48,6 +48,26 @@ impl CollectionRecordPatch {
         self.records.is_empty()
     }
 
+    pub(crate) fn filter(
+        &self,
+        mut keep: impl FnMut(CollectionRecord) -> bool,
+    ) -> CollectionRecordPatch {
+        let mut records = PATCH::new();
+        for id in self.records.iter_ordered() {
+            let record = *self
+                .records
+                .get(id)
+                .expect("an ordered collection record key retains its value");
+            if keep(record) {
+                records.insert(&PatchEntry::with_value(id, record));
+            }
+        }
+        CollectionRecordPatch {
+            collection: self.collection,
+            records,
+        }
+    }
+
     /// Look up one record by intrinsic id.
     pub fn get(&self, id: Id) -> Option<CollectionRecord> {
         self.records.get(&id.raw()).copied()
@@ -96,25 +116,13 @@ where
     }
 }
 
-/// Result of comparing two coherent, monotone collection-record snapshots.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CollectionDeltaSelection {
-    /// Complete bounded push delta, in intrinsic record-id order.
-    Push(Vec<CollectionRecord>),
-    /// The gap is too large for push. Send only the collection root/count wake
-    /// hint and let the per-collection PATCH repair protocol reconcile it.
-    Repair { missing: usize },
-}
-
 /// Failure at the sparse immutable-evidence boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionDeltaError {
     Decode(RecordDecodeError),
     InvalidCommit(CommitVerificationError),
     WrongCollection,
-    MismatchedCollections,
     IntrinsicIdCollision(Id),
-    NonMonotoneSnapshot,
 }
 
 impl fmt::Display for CollectionDeltaError {
@@ -123,14 +131,8 @@ impl fmt::Display for CollectionDeltaError {
             Self::Decode(error) => write!(f, "decode collection record: {error}"),
             Self::InvalidCommit(error) => write!(f, "verify collection COMMIT: {error}"),
             Self::WrongCollection => write!(f, "record names another collection"),
-            Self::MismatchedCollections => {
-                write!(f, "collection-record snapshots name different collections")
-            }
             Self::IntrinsicIdCollision(id) => {
                 write!(f, "distinct records share intrinsic id {id}")
-            }
-            Self::NonMonotoneSnapshot => {
-                write!(f, "current collection-record snapshot is not a superset")
             }
         }
     }
@@ -193,46 +195,6 @@ pub fn decode_record(
     let record = CollectionRecord::from_bytes(bytes)?;
     validate_record(expected, record)?;
     Ok(record)
-}
-
-/// Select one bounded complete live delta from coherent old/new snapshots.
-///
-/// This function requires an actual prior snapshot; it is not a durable
-/// announced cursor. A caller with no prior in-memory snapshot, a nonmonotone
-/// observation, or `Repair` must send only `(collection, root, count)` as a
-/// wake hint and use PATCH repair rather than flooding the current set.
-pub fn select_bounded_delta(
-    previous: &CollectionRecordPatch,
-    current: &CollectionRecordPatch,
-    max_push_records: usize,
-) -> Result<CollectionDeltaSelection, CollectionDeltaError> {
-    if previous.collection != current.collection {
-        return Err(CollectionDeltaError::MismatchedCollections);
-    }
-    if previous
-        .records
-        .iter_ordered()
-        .any(|id| current.records.get(id) != previous.records.get(id))
-    {
-        return Err(CollectionDeltaError::NonMonotoneSnapshot);
-    }
-
-    let delta = current.records.difference(&previous.records);
-    let missing = usize::try_from(delta.len())
-        .expect("a PATCH built from one process-local iterator fits usize");
-    if missing > max_push_records {
-        return Ok(CollectionDeltaSelection::Repair { missing });
-    }
-    Ok(CollectionDeltaSelection::Push(
-        delta
-            .iter_ordered()
-            .map(|id| {
-                *delta
-                    .get(id)
-                    .expect("an ordered PATCH key retains its record value")
-            })
-            .collect(),
-    ))
 }
 
 fn validate_record(
@@ -316,13 +278,6 @@ mod tests {
         ]
     }
 
-    fn patch(
-        expected: CollectionHandle,
-        records: impl IntoIterator<Item = CollectionRecord>,
-    ) -> CollectionRecordPatch {
-        canonical_records(expected, records).unwrap()
-    }
-
     #[test]
     fn all_sparse_record_variants_roundtrip_for_the_implicit_collection() {
         let expected = collection(1);
@@ -373,58 +328,6 @@ mod tests {
             Err(CollectionDeltaError::Decode(
                 RecordDecodeError::NonCanonicalMergeInputs
             ))
-        ));
-    }
-
-    #[test]
-    fn selection_is_actual_sorted_deduplicated_set_difference() {
-        let expected = collection(1);
-        let [commit, merge, derive] = records(expected);
-        let previous = patch(expected, [commit]);
-        let current = patch(expected, [derive, commit, merge, merge]);
-        let selected = select_bounded_delta(&previous, &current, 2).unwrap();
-        let CollectionDeltaSelection::Push(selected) = selected else {
-            panic!("two records fit the push bound")
-        };
-        assert_eq!(selected.len(), 2);
-        assert!(selected.contains(&merge));
-        assert!(selected.contains(&derive));
-        assert!(selected.windows(2).all(|pair| pair[0].id() < pair[1].id()));
-    }
-
-    #[test]
-    fn large_gap_returns_only_a_repair_decision() {
-        let expected = collection(1);
-        let previous = patch(expected, std::iter::empty());
-        let current = patch(expected, records(expected));
-        assert_eq!(
-            select_bounded_delta(&previous, &current, 2).unwrap(),
-            CollectionDeltaSelection::Repair { missing: 3 }
-        );
-    }
-
-    #[test]
-    fn old_snapshot_must_be_a_subset_of_current_truth() {
-        let expected = collection(1);
-        let [commit, merge, _] = records(expected);
-        let previous = patch(expected, [commit, merge]);
-        let current = patch(expected, [commit]);
-        assert_eq!(
-            select_bounded_delta(&previous, &current, 8),
-            Err(CollectionDeltaError::NonMonotoneSnapshot)
-        );
-    }
-
-    #[test]
-    fn sparse_unsigned_equations_need_no_referenced_blobs_or_write_principal() {
-        let expected = collection(1);
-        let [_, merge, derive] = records(expected);
-        let previous = patch(expected, std::iter::empty());
-        let current = patch(expected, [derive, merge]);
-        let selected = select_bounded_delta(&previous, &current, 2).unwrap();
-        assert!(matches!(
-            selected,
-            CollectionDeltaSelection::Push(records) if records.len() == 2
         ));
     }
 
@@ -494,18 +397,5 @@ mod tests {
         );
         assert_eq!(store.selections.get(), 1);
         assert_eq!(store.global_enumerations.get(), 0);
-    }
-
-    #[test]
-    fn delta_rejects_patches_for_different_collections() {
-        let left_collection = collection(1);
-        let right_collection = collection(2);
-        let left = patch(left_collection, records(left_collection));
-        let right = patch(right_collection, records(right_collection));
-
-        assert_eq!(
-            select_bounded_delta(&left, &right, usize::MAX),
-            Err(CollectionDeltaError::MismatchedCollections)
-        );
     }
 }

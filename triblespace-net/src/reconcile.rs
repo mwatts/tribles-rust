@@ -3,9 +3,9 @@
 //! Collection repair converges relevant records, including conflicting
 //! MERGE/DERIVE receipts. This reconciler never claims global absence: an operation WANT is
 //! satisfied iff at least one matching local receipt is visible; otherwise it
-//! remains pending while periodic inventory sweeps continue. Blob WANTs retain
-//! their explicit DHT-provider lookup, exact authenticated fetch, and
-//! exponential retry backoff.
+//! remains pending while periodic inventory sweeps continue. Bare Blob WANTs
+//! are local retention intent and remain pending without a collection route;
+//! this reconciler never guesses provenance by scanning payload bytes.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -201,7 +201,7 @@ impl Reconciler {
             };
             stats.attempted += 1;
             match peer
-                .fetch_blob_with_deadline(handle.raw, self.fetch_budget)
+                .fetch_wanted_blob_with_deadline(handle.raw, self.fetch_budget)
                 .await
             {
                 Some(bytes) => {

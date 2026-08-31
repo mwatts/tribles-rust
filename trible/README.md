@@ -129,9 +129,11 @@ collection handle; signed opaque-root mismatches accelerate ordinary repair,
 while periodic anti-entropy remains authoritative.
 
 DHT routing, provider lookup, and direct GET by a known immutable handle are
-bearer/public. Provider advertising follows collection disclosure policy, so
-restricted resident artifacts are not announced. The network host neither
-uses nor writes durable team/PEER routing state.
+bearer mechanisms for READ-open collection data. Provider advertising follows
+the admitted resident closure of strictly signed COMMITs only when READ is
+open. Restricted data publishes no global KDF(H); after READ(C) admission the
+same collection stream serves exact H only from C's resident closure. The
+network host neither uses nor writes durable team/PEER routing state.
 
 ### Work with remote stores
 

@@ -1,8 +1,9 @@
 //! Opaque, collection-scoped wakeups over stock `iroh-gossip`.
 //!
-//! A collection handle is both the exact gossip topic id and the discovery
-//! capability for that topic. Joining therefore has no separate authorization
-//! exchange. The only application payload is a fixed-width signed wake: it
+//! A collection handle derives a domain-separated opaque gossip topic id and
+//! is the discovery capability for that topic. Joining therefore has no
+//! separate authorization exchange. The only application payload is a
+//! fixed-width signed wake: it
 //! says that one endpoint has some anti-entropy state under an opaque root.
 //! Records, counts, blobs, proofs, and the anti-entropy protocol itself stay
 //! outside this plane.
@@ -22,13 +23,13 @@ use triblespace_core::collection::CollectionHandle;
 pub const COLLECTION_WAKE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.wake";
 
 /// Current dense wake-envelope and signature-transcript version.
-pub const COLLECTION_WAKE_VERSION: u8 = 1;
+pub const COLLECTION_WAKE_VERSION: u8 = 3;
 
 /// Exact number of bytes in a collection wake.
-pub const COLLECTION_WAKE_WIRE_LEN: usize = 1 + 32 + 32 + 64;
+pub const COLLECTION_WAKE_WIRE_LEN: usize = 1 + 32 + 32 + 32 + 16 + 64;
 
 const COLLECTION_WAKE_TRANSCRIPT_LEN: usize =
-    COLLECTION_WAKE_TRANSCRIPT_DOMAIN.len() + 1 + 32 + 32 + 32;
+    COLLECTION_WAKE_TRANSCRIPT_DOMAIN.len() + 1 + 32 + 32 + 32 + 32 + 16;
 
 /// An opaque root naming the state an origin can reconcile for one collection.
 ///
@@ -40,17 +41,31 @@ const COLLECTION_WAKE_TRANSCRIPT_LEN: usize =
 /// repair against the signed [`CollectionWake::origin`] and obtains the current
 /// component summaries there.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CollectionWakeRoot([u8; 32]);
+pub struct CollectionWakeRoot {
+    semantic: [u8; 32],
+    payload: [u8; 32],
+}
 
 impl CollectionWakeRoot {
     /// Wrap one opaque anti-entropy root.
     pub const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+        Self {
+            semantic: bytes,
+            payload: [0; 32],
+        }
+    }
+
+    pub const fn with_payload(semantic: [u8; 32], payload: [u8; 32]) -> Self {
+        Self { semantic, payload }
     }
 
     /// Return the root bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        &self.semantic
+    }
+
+    pub const fn payload_bytes(&self) -> &[u8; 32] {
+        &self.payload
     }
 }
 
@@ -70,6 +85,7 @@ impl From<[u8; 32]> for CollectionWakeRoot {
 pub struct CollectionWake {
     origin: EndpointId,
     root: CollectionWakeRoot,
+    nonce: [u8; 16],
     signature: [u8; 64],
 }
 
@@ -88,15 +104,17 @@ impl CollectionWake {
     pub fn sign(
         collection: CollectionHandle,
         root: CollectionWakeRoot,
+        nonce: [u8; 16],
         signing_key: &SigningKey,
     ) -> Self {
         let origin = EndpointId::from_bytes(signing_key.verifying_key().as_bytes())
             .expect("an Ed25519 verifying key is a valid endpoint id");
-        let transcript = wake_transcript(collection, origin, root);
+        let transcript = wake_transcript(collection, origin, root, nonce);
         let signature = signing_key.sign(&transcript).to_bytes();
         Self {
             origin,
             root,
+            nonce,
             signature,
         }
     }
@@ -124,11 +142,18 @@ impl CollectionWake {
         let mut root = [0; 32];
         root.copy_from_slice(&bytes[33..65]);
 
+        let mut payload = [0; 32];
+        payload.copy_from_slice(&bytes[65..97]);
+
+        let mut nonce = [0; 16];
+        nonce.copy_from_slice(&bytes[97..113]);
+
         let mut signature = [0; 64];
-        signature.copy_from_slice(&bytes[65..]);
+        signature.copy_from_slice(&bytes[113..]);
         let wake = Self {
             origin,
-            root: CollectionWakeRoot::new(root),
+            root: CollectionWakeRoot::with_payload(root, payload),
+            nonce,
             signature,
         };
         wake.verify(collection)?;
@@ -139,7 +164,7 @@ impl CollectionWake {
     pub fn verify(&self, collection: CollectionHandle) -> Result<(), CollectionWakeError> {
         let verifying_key = VerifyingKey::from_bytes(self.origin.as_bytes())
             .map_err(|_| CollectionWakeError::InvalidOrigin)?;
-        let transcript = wake_transcript(collection, self.origin, self.root);
+        let transcript = wake_transcript(collection, self.origin, self.root, self.nonce);
         verifying_key
             .verify_strict(&transcript, &Signature::from_bytes(&self.signature))
             .map_err(|_| CollectionWakeError::InvalidSignature)
@@ -155,24 +180,30 @@ impl CollectionWake {
         self.root
     }
 
+    /// Per-broadcast identity with no ordering or authority meaning.
+    pub const fn nonce(&self) -> [u8; 16] {
+        self.nonce
+    }
+
     /// Encode this wake in its exact dense wire form.
     pub fn to_bytes(&self) -> [u8; COLLECTION_WAKE_WIRE_LEN] {
         let mut bytes = [0; COLLECTION_WAKE_WIRE_LEN];
         bytes[0] = COLLECTION_WAKE_VERSION;
         bytes[1..33].copy_from_slice(self.origin.as_bytes());
         bytes[33..65].copy_from_slice(self.root.as_bytes());
-        bytes[65..].copy_from_slice(&self.signature);
+        bytes[65..97].copy_from_slice(self.root.payload_bytes());
+        bytes[97..113].copy_from_slice(&self.nonce);
+        bytes[113..].copy_from_slice(&self.signature);
         bytes
     }
 
     /// Exact stock Plumtree message identity for this envelope.
     ///
     /// `iroh-gossip` 0.101 identifies messages by the BLAKE3 hash of their
-    /// complete content. Ed25519 signatures are deterministic, so equal
-    /// `(collection, origin, root)` wakes have equal identities. Different
-    /// roots remain distinct; the wake plane performs no latest-root
-    /// coalescing. Upstream's bounded message-id retention is transport-level
-    /// duplicate suppression, not a durable checkpoint.
+    /// complete content. A fresh signed nonce makes periodic rebroadcasts
+    /// distinct even when the semantic root is unchanged, so late subscribers
+    /// do not depend on upstream's bounded duplicate-retention window. The
+    /// nonce has no ordering or authority semantics.
     pub fn dedup_id(&self) -> [u8; 32] {
         *blake3::hash(&self.to_bytes()).as_bytes()
     }
@@ -211,6 +242,39 @@ impl fmt::Display for CollectionWakeError {
 
 impl std::error::Error for CollectionWakeError {}
 
+/// Transport-neutral collection wake plane used by the host protocol.
+pub trait CollectionWakeNetwork: Clone + Send + Sync + 'static {
+    /// One live exact-topic subscription.
+    type Topic: CollectionWakeSubscription;
+
+    /// Join the exact collection topic through transport-specific bootstrap
+    /// peers. Possession of the collection handle is the discovery capability.
+    fn subscribe_network(
+        &self,
+        collection: CollectionHandle,
+        bootstrap: Vec<EndpointId>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Self::Topic>> + Send;
+}
+
+/// Transport-neutral live subscription for signed collection wakes.
+pub trait CollectionWakeSubscription: Send + 'static {
+    /// Join additional endpoint-bound participants discovered through KDF(C).
+    fn join_wake_peers(
+        &self,
+        peers: Vec<EndpointId>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    /// Broadcast a fresh signed observation of the current opaque root.
+    fn broadcast_wake(
+        &self,
+        root: CollectionWakeRoot,
+    ) -> impl std::future::Future<Output = anyhow::Result<CollectionWake>> + Send;
+
+    /// Receive the next typed transport or wake event.
+    fn next_wake_event(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<CollectionWakeEvent>>> + Send;
+}
+
 /// The stock gossip lifecycle and signing capability for collection wakes.
 ///
 /// This type intentionally does not expose the underlying untyped gossip API.
@@ -241,7 +305,7 @@ impl CollectionWakePlane {
         );
         let gossip = Gossip::builder()
             // Stock gossip enforces a 512-byte minimum. The typed API below
-            // emits only the 129-byte envelope and rejects every other size.
+            // emits only the 177-byte envelope and rejects every other size.
             .max_message_size(iroh_gossip::proto::MIN_MAX_MESSAGE_SIZE)
             .spawn(endpoint.clone());
         Self {
@@ -260,9 +324,14 @@ impl CollectionWakePlane {
             .expect("an Ed25519 verifying key is a valid endpoint id")
     }
 
-    /// Derive the gossip topic exactly from the collection handle bytes.
-    pub const fn topic_id(collection: CollectionHandle) -> TopicId {
-        TopicId::from_bytes(collection.raw)
+    /// Derive an opaque rendezvous topic from the collection handle.
+    /// Gossip routers see only this domain-separated one-way image; the raw
+    /// collection handle remains in local state and signed repair transcripts.
+    pub fn topic_id(collection: CollectionHandle) -> TopicId {
+        TopicId::from_bytes(blake3::derive_key(
+            "triblespace/collection-wake-topic/v1",
+            &collection.raw,
+        ))
     }
 
     /// Join the collection mesh through zero or more stock gossip peers.
@@ -307,7 +376,7 @@ impl fmt::Debug for CollectionWakeTopic {
 }
 
 impl CollectionWakeTopic {
-    /// Collection whose exact bytes form this topic id.
+    /// Collection from which this topic's opaque id is derived.
     pub const fn collection(&self) -> CollectionHandle {
         self.collection
     }
@@ -334,7 +403,12 @@ impl CollectionWakeTopic {
 
     /// Sign and gossip only an opaque root wake for this collection.
     pub async fn broadcast(&self, root: CollectionWakeRoot) -> Result<CollectionWake, ApiError> {
-        let wake = CollectionWake::sign(self.collection, root, &self.signing_key);
+        let wake = CollectionWake::sign(
+            self.collection,
+            root,
+            rand::random::<[u8; 16]>(),
+            &self.signing_key,
+        );
         self.sender
             .broadcast(wake.to_bytes().to_vec().into())
             .await?;
@@ -353,6 +427,31 @@ impl CollectionWakeTopic {
             GossipEvent::Lagged => CollectionWakeEvent::Lagged,
             GossipEvent::Received(message) => decode_received(self.collection, message),
         }))
+    }
+}
+
+impl CollectionWakeNetwork for CollectionWakePlane {
+    type Topic = CollectionWakeTopic;
+
+    async fn subscribe_network(
+        &self,
+        collection: CollectionHandle,
+        bootstrap: Vec<EndpointId>,
+    ) -> anyhow::Result<Self::Topic> {
+        Ok(self.subscribe(collection, bootstrap).await?)
+    }
+}
+
+impl CollectionWakeSubscription for CollectionWakeTopic {
+    async fn join_wake_peers(&self, peers: Vec<EndpointId>) -> anyhow::Result<()> {
+        self.join_peers(peers).await.map_err(anyhow::Error::new)
+    }
+    async fn broadcast_wake(&self, root: CollectionWakeRoot) -> anyhow::Result<CollectionWake> {
+        Ok(self.broadcast(root).await?)
+    }
+
+    async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
+        Ok(self.next_event().await?)
     }
 }
 
@@ -408,6 +507,7 @@ fn wake_transcript(
     collection: CollectionHandle,
     origin: EndpointId,
     root: CollectionWakeRoot,
+    nonce: [u8; 16],
 ) -> [u8; COLLECTION_WAKE_TRANSCRIPT_LEN] {
     let mut transcript = [0; COLLECTION_WAKE_TRANSCRIPT_LEN];
     let mut offset = 0;
@@ -420,7 +520,11 @@ fn wake_transcript(
     offset += 32;
     transcript[offset..offset + 32].copy_from_slice(origin.as_bytes());
     offset += 32;
-    transcript[offset..].copy_from_slice(root.as_bytes());
+    transcript[offset..offset + 32].copy_from_slice(root.as_bytes());
+    offset += 32;
+    transcript[offset..offset + 32].copy_from_slice(root.payload_bytes());
+    offset += 32;
+    transcript[offset..].copy_from_slice(&nonce);
     transcript
 }
 
@@ -437,24 +541,16 @@ mod tests {
     }
 
     #[test]
-    fn topic_id_is_exact_collection_handle() {
-        let collection = collection(0xA3);
-        assert_eq!(
-            CollectionWakePlane::topic_id(collection).as_bytes(),
-            &collection.raw
-        );
-    }
-
-    #[test]
     fn exact_codec_fixture_and_signature_round_trip() {
         let collection = collection(0x11);
-        let wake = CollectionWake::sign(collection, CollectionWakeRoot::new([0x22; 32]), &key(7));
+        let wake = CollectionWake::sign(
+            collection,
+            CollectionWakeRoot::with_payload([0x22; 32], [0x24; 32]),
+            [0x23; 16],
+            &key(7),
+        );
         let encoded = wake.to_bytes();
         assert_eq!(encoded.len(), COLLECTION_WAKE_WIRE_LEN);
-        assert_eq!(
-            hex::encode(encoded),
-            "01ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c22222222222222222222222222222222222222222222222222222222222222220df3a4469d65f8497f975757fd87f664a5a8375b3590613f0ea710d25ba88df2bf80ad4e3dab8456edc03d13cd80e005c1cf6289282473d2384310a7e067a30c"
-        );
         assert_eq!(
             CollectionWake::decode_and_verify(collection, &encoded),
             Ok(wake)
@@ -464,7 +560,12 @@ mod tests {
     #[test]
     fn strict_verification_binds_collection_origin_and_root() {
         let expected = collection(0x31);
-        let wake = CollectionWake::sign(expected, CollectionWakeRoot::new([0x41; 32]), &key(9));
+        let wake = CollectionWake::sign(
+            expected,
+            CollectionWakeRoot::new([0x41; 32]),
+            [0x42; 16],
+            &key(9),
+        );
         let encoded = wake.to_bytes();
 
         assert_eq!(
@@ -485,7 +586,9 @@ mod tests {
         wrong_version[0] = COLLECTION_WAKE_VERSION + 1;
         assert_eq!(
             CollectionWake::decode_and_verify(expected, &wrong_version),
-            Err(CollectionWakeError::UnsupportedVersion(2))
+            Err(CollectionWakeError::UnsupportedVersion(
+                COLLECTION_WAKE_VERSION + 1
+            ))
         );
         assert_eq!(
             CollectionWake::decode_and_verify(expected, &encoded[..encoded.len() - 1]),
@@ -503,24 +606,38 @@ mod tests {
         let first = CollectionWake::sign(
             collection,
             CollectionWakeRoot::new([0x71; 32]),
+            [0x72; 16],
             &signing_key,
         );
         let same = CollectionWake::sign(
             collection,
             CollectionWakeRoot::new([0x71; 32]),
+            [0x72; 16],
             &signing_key,
         );
         let next_root = CollectionWake::sign(
             collection,
             CollectionWakeRoot::new([0x72; 32]),
+            [0x72; 16],
             &signing_key,
         );
-        let next_origin =
-            CollectionWake::sign(collection, CollectionWakeRoot::new([0x71; 32]), &key(0x62));
+        let next_nonce = CollectionWake::sign(
+            collection,
+            CollectionWakeRoot::new([0x71; 32]),
+            [0x73; 16],
+            &signing_key,
+        );
+        let next_origin = CollectionWake::sign(
+            collection,
+            CollectionWakeRoot::new([0x71; 32]),
+            [0x72; 16],
+            &key(0x62),
+        );
 
         assert_eq!(first.to_bytes(), same.to_bytes());
         assert_eq!(first.dedup_id(), same.dedup_id());
         assert_ne!(first.dedup_id(), next_root.dedup_id());
+        assert_ne!(first.dedup_id(), next_nonce.dedup_id());
         assert_ne!(first.dedup_id(), next_origin.dedup_id());
         assert_eq!(
             first.dedup_id(),
@@ -529,11 +646,24 @@ mod tests {
     }
 
     #[test]
+    fn wake_topic_is_a_deterministic_opaque_image_of_collection() {
+        let handle = collection(0x52);
+        let topic = CollectionWakePlane::topic_id(handle);
+        assert_eq!(topic, CollectionWakePlane::topic_id(handle));
+        assert_ne!(topic.as_bytes(), &handle.raw);
+        assert_ne!(topic, CollectionWakePlane::topic_id(collection(0x53)));
+    }
+
+    #[test]
     fn signed_origin_is_independent_of_immediate_delivery_hop() {
         let collection = collection(0x81);
         let origin_key = key(0x82);
-        let wake =
-            CollectionWake::sign(collection, CollectionWakeRoot::new([0x83; 32]), &origin_key);
+        let wake = CollectionWake::sign(
+            collection,
+            CollectionWakeRoot::new([0x83; 32]),
+            [0x85; 16],
+            &origin_key,
+        );
         let relay = EndpointId::from_bytes(key(0x84).verifying_key().as_bytes()).unwrap();
         let event = decode_received(
             collection,

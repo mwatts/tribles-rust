@@ -584,9 +584,10 @@ rather than the scan's.
 An intermediate design replaced grants with a `collection_reach` descriptor
 attribute. That design is retired too. Current descriptors carry mandatory,
 independent READ and WRITE policies; collection-scoped repair proves READ(C),
-commit admission proves WRITE(C), and open READ is also the condition for
-permissionless provider publication. There is no ambient full-team inventory
-or separate durable gossip permission.
+commit admission proves WRITE(C), and READ-open collections may publish opaque
+KDF(H) provider keys for bearer lookup. Restricted collections publish no
+global key and serve exact H only inside an admitted READ(C) session. There is
+no ambient full-team inventory or separate durable gossip permission.
 
 The semantic kind ID `9BB5B1F4D6FD8FB850B494C2CF51B5CA` (minted 2026-08-12,
 retired 2026-08-21) and its record kind

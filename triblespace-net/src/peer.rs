@@ -11,13 +11,13 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anybytes::Bytes;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRead, CollectionStore, DisclosureSnapshot,
+    CollectionHandle, CollectionRead, CollectionStore, next_authorization_change_at,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -33,7 +33,7 @@ use triblespace_core::repo::{
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, ActiveCollections, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
-use crate::provider::{ArtifactId, ProviderObservation};
+use crate::provider::ProviderObservation;
 use crate::wake::CollectionWakePlane;
 
 pub use crate::host::PeerConfig;
@@ -114,6 +114,7 @@ where
     wake_plane: Option<CollectionWakePlane>,
     qos: ReconcileQos,
     active: ActiveCollections,
+    active_dirty: bool,
     /// Network admissions stay outside the advertised snapshot until their
     /// shared durability barrier succeeds. A failed flush is retried on every
     /// refresh without requiring the remote to redeliver the event first.
@@ -122,7 +123,9 @@ where
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
     last_store_snapshot: Option<S::Snapshot>,
-    /// Last snapshot-bound public provider set sent to the host. Rebuilding it
+    last_authorization_change: Option<hifitime::Epoch>,
+    last_observed_at: Option<hifitime::Epoch>,
+    /// Last snapshot-bound provider set sent to the host. Rebuilding it
     /// on every refresh lets proof expiry narrow publication even when the
     /// store prefix itself did not change.
     last_provider_observation: ProviderObservation,
@@ -179,8 +182,11 @@ where
             wake_plane,
             qos,
             active: PATCH::new(),
+            active_dirty: true,
             pending_network_flush: false,
             last_store_snapshot: None,
+            last_authorization_change: None,
+            last_observed_at: None,
             last_provider_observation: ProviderObservation::default(),
             last_event_at: crate::clock::mono_now(),
         };
@@ -214,35 +220,49 @@ where
     /// This is ephemeral process state. It writes no OFFER/GOSSIP marker and
     /// creates no global collection registry.
     pub fn activate_collection(&mut self, collection: CollectionHandle) {
+        self.active_dirty |= self.active.get(&collection.raw).is_none();
         self.active.insert(&PatchEntry::new(&collection.raw));
-        self.last_store_snapshot = None;
         self.refresh();
     }
 
-    /// Fetch exact content through its authenticated DHT provider hints.
-    /// This primitive neither records a WANT nor mutates the store.
-    pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
-        self.sender
-            .fetch_blob(hash, host::INTERACTIVE_FETCH_DEADLINE)
-            .await
+    /// Bare WANT(H) is local retention intent and carries no discovery route.
+    /// Collection-aware callers use [`Self::fetch_collection_blob`] with C.
+    pub async fn fetch_wanted_blob(&self, hash: RawHash) -> Option<Bytes> {
+        let _ = hash;
+        None
     }
 
-    pub async fn fetch_blob_with_deadline(
+    pub async fn fetch_wanted_blob_with_deadline(
         &self,
         hash: RawHash,
         budget: std::time::Duration,
-    ) -> Option<Vec<u8>> {
-        self.sender.fetch_blob(hash, budget).await
+    ) -> Option<Bytes> {
+        let _ = (hash, budget);
+        None
     }
 
-    /// Look up soft provider hints for an already-known physical artifact.
-    pub async fn find_artifact_providers(&self, artifact: ArtifactId) -> Vec<EndpointId> {
+    /// Fetch exact bearer content through a collection-discovered provider.
+    /// The provider proves READ(C) before this endpoint reveals H; possession
+    /// of H then authorizes those exact bytes.
+    pub async fn fetch_collection_blob(
+        &self,
+        collection: CollectionHandle,
+        hash: RawHash,
+    ) -> Option<Bytes> {
         self.sender
-            .find_artifact_providers(artifact, host::INTERACTIVE_FETCH_DEADLINE)
+            .fetch_collection_blob(collection, hash, host::INTERACTIVE_FETCH_DEADLINE)
             .await
-            .into_iter()
-            .filter_map(|provider| EndpointId::from_bytes(&provider).ok())
-            .collect()
+    }
+
+    pub async fn fetch_collection_blob_with_deadline(
+        &self,
+        collection: CollectionHandle,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> Option<Bytes> {
+        self.sender
+            .fetch_collection_blob(collection, hash, budget)
+            .await
     }
 
     /// Drain authenticated collection progress, cross one durability barrier,
@@ -261,6 +281,8 @@ where
         if result.is_err() {
             self.sender.clear_snapshot();
             self.last_store_snapshot = None;
+            self.last_authorization_change = None;
+            self.last_observed_at = None;
             self.last_provider_observation = ProviderObservation::default();
         }
         result
@@ -280,9 +302,26 @@ where
         let received = incoming.iter().map(|batch| batch.len()).sum::<usize>();
         let mut store = self.store.lock().expect("store mutex");
         let mut admitted = false;
+        let mut full_page_acks = Vec::new();
+        let mut full_checkpoint = false;
         for batch in incoming {
             for event in batch.into_events() {
                 match event {
+                    NetEvent::Blob { expected, bytes } => {
+                        match store.put::<UnknownBlob, _>(bytes) {
+                            Ok(handle) if handle.raw == expected => admitted = true,
+                            Ok(_) => {
+                                return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                    "network blob hash changed while landing"
+                                )));
+                            }
+                            Err(error) => {
+                                return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                    "landing network blob failed: {error:?}"
+                                )));
+                            }
+                        }
+                    }
                     NetEvent::CollectionRecord(record) => match store.insert(record) {
                         Ok(()) => admitted = true,
                         Err(error) => {
@@ -291,26 +330,49 @@ where
                     },
                     NetEvent::CapabilityProofBundle(bundle) => {
                         let (proof, claims) = bundle.into_parts();
-                        let mut complete = true;
                         for claim in claims {
                             if let Err(error) = store.put::<SimpleArchive, _>(claim) {
-                                complete = false;
                                 tracing::warn!(
                                     ?error,
                                     "landing collection WRITE claim blob failed"
                                 );
-                                break;
+                                return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                    "landing collection WRITE claim blob failed: {error:?}"
+                                )));
                             }
                         }
-                        if complete {
-                            match store.insert_proof(proof) {
-                                Ok(()) => admitted = true,
-                                Err(error) => tracing::warn!(
-                                    ?error,
-                                    "admitting collection WRITE proof failed"
-                                ),
+                        match store.insert_proof(proof) {
+                            Ok(()) => admitted = true,
+                            Err(error) => {
+                                tracing::warn!(?error, "admitting collection WRITE proof failed");
+                                return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                    "admitting collection WRITE proof failed: {error:?}"
+                                )));
                             }
                         }
+                    }
+                    NetEvent::FullPage {
+                        blobs,
+                        final_page,
+                        ack,
+                    } => {
+                        for (expected, bytes) in blobs {
+                            match store.put::<UnknownBlob, _>(bytes) {
+                                Ok(handle) if handle.raw == expected => admitted = true,
+                                Ok(_) => {
+                                    return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                        "Full page blob hash changed while landing"
+                                    )));
+                                }
+                                Err(error) => {
+                                    return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                        "landing Full page blob failed: {error:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        full_checkpoint |= final_page;
+                        full_page_acks.push(ack);
                     }
                 }
             }
@@ -344,22 +406,16 @@ where
                         ?error,
                         "store snapshot unavailable; keeping prior collection view"
                     );
-                    let provider_observation = Self::provider_observation_from_snapshot(
-                        self.last_store_snapshot.as_ref(),
-                        self.qos.direction.serves(),
-                    );
-                    Self::observe_provider_observation(
-                        &self.sender,
-                        &mut self.last_provider_observation,
-                        provider_observation,
-                    );
                     return Ok(());
                 }
             };
-            let provider_observation = Self::provider_observation_from_snapshot(
-                Some(&snapshot),
-                self.qos.direction.serves(),
-            );
+            self.sender.update_operational_blobs(snapshot.clone());
+            if !full_page_acks.is_empty() && !full_checkpoint {
+                for ack in full_page_acks {
+                    let _ = ack.send(());
+                }
+                return Ok(());
+            }
             let previous_snapshot = self.sender.current_snapshot();
             let changes = if previous_snapshot.is_none() {
                 StoreChanges::ALL
@@ -370,54 +426,77 @@ where
                         snapshot.changes_since(previous)
                     })
             };
+            let now = crate::clock::epoch_now();
+            let authorization_inputs_changed = changes.contains(StoreChanges::BLOBS)
+                || changes.contains(StoreChanges::COLLECTION_RECORDS)
+                || changes.contains(StoreChanges::CAPABILITY_PROOFS);
+            let authorization_changed =
+                self.last_observed_at.is_some_and(|observed| now < observed)
+                    || self
+                        .last_authorization_change
+                        .is_some_and(|boundary| now >= boundary);
+            if received == 0
+                && changes == StoreChanges::NONE
+                && !authorization_changed
+                && !self.active_dirty
+                && !full_checkpoint
+                && previous_snapshot.is_some()
+            {
+                self.last_store_snapshot = Some(snapshot);
+                return Ok(());
+            }
+            let next_authorization_change =
+                if !authorization_inputs_changed && !authorization_changed {
+                    self.last_authorization_change
+                } else {
+                    next_authorization_change_at(&snapshot, now)
+                        .map_err(anyhow::Error::new)
+                        .map_err(PeerSnapshotError::Overlay)?
+                };
             // Even a semantic no-op installs the fresh read lease. Unchanged
             // activation PATCHes retain their Arc while exact-GET advances to
             // the new immutable store observation.
             let serving = StoreSnapshot::from_store_changes(
                 snapshot.clone(),
                 &self.active,
+                VerifyingKey::from_bytes(self.sender.id().as_bytes())
+                    .expect("endpoint id is an Ed25519 key"),
                 previous_snapshot.as_deref(),
                 changes,
+                authorization_changed,
+                matches!(self.qos.blobs, crate::inventory::BlobReplication::Full),
+                next_authorization_change,
+                now,
             )
             .map_err(PeerSnapshotError::Overlay)?;
-            self.sender.update_snapshot(serving);
+            let provider_observation = ProviderObservation::from_collections(
+                serving
+                    .collections()
+                    .map(|collection| collection.collection()),
+                self.qos.direction.serves(),
+                *self.sender.id().as_bytes(),
+            );
+            self.sender.update_snapshot(serving, &self.active);
+            self.active_dirty = false;
             self.last_store_snapshot = Some(snapshot);
+            self.last_authorization_change = next_authorization_change;
+            self.last_observed_at = Some(now);
             Self::observe_provider_observation(
                 &self.sender,
                 &mut self.last_provider_observation,
                 provider_observation,
             );
+            for ack in full_page_acks {
+                let _ = ack.send(());
+            }
         } else {
             // A failed admission flush withholds a new snapshot, but the
             // already-installed prefix remains a valid read lease. Recompute
-            // only its time-sensitive disclosure boundary.
-            let provider_observation = Self::provider_observation_from_snapshot(
-                self.last_store_snapshot.as_ref(),
-                self.qos.direction.serves(),
-            );
-            Self::observe_provider_observation(
-                &self.sender,
-                &mut self.last_provider_observation,
-                provider_observation,
-            );
+            // only its time-sensitive authorization boundary.
+            // Keep the last immutable serving/provider observation until the
+            // failed admission batch is retried successfully.
         }
         Ok(())
-    }
-
-    fn provider_observation_from_snapshot(
-        snapshot: Option<&S::Snapshot>,
-        serves: bool,
-    ) -> ProviderObservation {
-        let Some(snapshot) = snapshot else {
-            return ProviderObservation::default();
-        };
-        match DisclosureSnapshot::build_at(snapshot, crate::clock::epoch_now()) {
-            Ok(disclosure) => ProviderObservation::from_disclosure(&disclosure, serves),
-            Err(error) => {
-                tracing::warn!(%error, "collection disclosure snapshot unavailable");
-                ProviderObservation::default()
-            }
-        }
     }
 
     fn observe_provider_observation(
@@ -426,7 +505,7 @@ where
         observation: ProviderObservation,
     ) {
         if *last != observation {
-            sender.update_public_providers(observation.clone());
+            sender.update_providers(observation.clone());
             *last = observation;
         }
     }
@@ -452,8 +531,8 @@ where
             .ok()
     }
 
-    /// Local lookup followed by durable WANT, exact authenticated fetch, and
-    /// best-effort landing. A failed fetch leaves the flushed WANT pending.
+    /// Local lookup followed by durable local retention intent. Bare H carries
+    /// no discovery route, so collection-aware callers must fetch with C.
     pub async fn get_or_fetch_async(
         &mut self,
         hash: RawHash,
@@ -468,10 +547,10 @@ where
                 .map_err(WantRecordError::Want)?;
             store.flush().map_err(WantRecordError::Flush)?;
         }
-        let Some(raw) = self.fetch_blob(hash).await else {
+        let Some(raw) = self.fetch_wanted_blob(hash).await else {
             return Ok(None);
         };
-        let bytes = Bytes::from(raw);
+        let bytes = raw;
         {
             let mut store = self.store.lock().expect("store mutex");
             if let Err(error) = store.put::<UnknownBlob, Bytes>(bytes.clone()) {
@@ -526,7 +605,6 @@ where
         let local = store.snapshot().map_err(PeerSnapshotError::Store)?;
         drop(store);
         let fetch = Some(FetchCap {
-            sender: self.sender.clone(),
             sink: Arc::new(SharedStore {
                 store: self.store.clone(),
             }),
@@ -535,8 +613,7 @@ where
     }
 }
 
-/// A frozen local store observation plus an optional live exact-fetch
-/// capability.
+/// A frozen local store observation plus an optional durable-WANT sink.
 ///
 /// Synchronous reads and listings remain fixed at `local`. Async retrieval may
 /// acquire explicitly addressed immutable bytes through the swarm and cache
@@ -548,13 +625,11 @@ pub struct PeerSnapshot<L> {
 
 #[derive(Clone)]
 struct FetchCap {
-    sender: NetSender,
     sink: Arc<dyn StoreSink>,
 }
 
 trait StoreSink: Send + Sync {
     fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    fn land(&self, bytes: Bytes);
 }
 
 struct SharedStore<S> {
@@ -578,14 +653,6 @@ where
             Box::new(WantRecordError::<S::WantError, _>::Flush(error))
                 as Box<dyn std::error::Error + Send + Sync>
         })
-    }
-
-    fn land(&self, bytes: Bytes) {
-        if let Ok(mut store) = self.store.lock() {
-            if let Err(error) = store.put::<UnknownBlob, Bytes>(bytes) {
-                tracing::warn!(?error, "reader fetch landing failed");
-            }
-        }
     }
 }
 
@@ -778,16 +845,7 @@ where
                     .sink
                     .record_want(raw)
                     .map_err(PeerSnapshotGetError::WantRecord)?;
-                let Some(bytes) = fetch
-                    .sender
-                    .fetch_blob(raw, crate::host::INTERACTIVE_FETCH_DEADLINE)
-                    .await
-                else {
-                    return Err(PeerSnapshotGetError::Unavailable);
-                };
-                let bytes = Bytes::from(bytes);
-                fetch.sink.land(bytes.clone());
-                bytes
+                return Err(PeerSnapshotGetError::Unavailable);
             } else {
                 return Err(PeerSnapshotGetError::Unavailable);
             };
@@ -795,5 +853,36 @@ where
                 .try_from_blob()
                 .map_err(PeerSnapshotGetError::Conversion)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+    use iroh_base::EndpointId;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+
+    use super::*;
+
+    #[test]
+    fn idle_refresh_reuses_the_installed_serving_snapshot() {
+        let key = SigningKey::from_bytes(&[91; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(id);
+        let observer = sender.clone();
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        );
+        let before = observer.current_snapshot().unwrap();
+
+        for _ in 0..100 {
+            peer.refresh();
+        }
+
+        let after = observer.current_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
     }
 }

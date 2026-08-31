@@ -257,11 +257,13 @@ records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
 content-derived object keys. The network layer uses an opaque collection-topic
 wake and READ(C)-authorized Merkle walks to union that collection's records and
-activation-relevant WRITE proof bundles. Blob handles remain lazy bearer
-capabilities; an opaque XOR DHT locates providers for openly disclosed exact
-artifacts. Merge/derive questions are answered from the converged local record
-index. In every case convergence means unioning evidence; it does not mean
-electing a winner.
+activation-relevant WRITE proof bundles. For READ-open collections, blob
+handles remain lazy bearer capabilities and an opaque XOR DHT locates providers
+for exact handles already known to the caller. Restricted exact handles are
+fetched only within a READ(C)-admitted collection session and only from that
+collection's resident closure. Merge/derive questions are answered from the
+converged local record index. In every case convergence means unioning
+evidence; it does not mean electing a winner.
 
 Legacy branch and pin records remain decodable only so old piles can be
 inspected, conservatively retained, and explicitly migrated. They are not part

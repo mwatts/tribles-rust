@@ -36,10 +36,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
+use iroh_base::EndpointId;
+use iroh_gossip::proto::DeliveryScope;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -47,6 +50,10 @@ use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
+use crate::wake::{
+    CollectionWake, CollectionWakeEvent, CollectionWakeNetwork, CollectionWakeRoot,
+    CollectionWakeSubscription, ReceivedCollectionWake,
+};
 
 /// Capacity of each in-memory stream pipe. Bounded inventory blob ranges are
 /// at most 1 MiB; larger exact reads rely on normal concurrent backpressure.
@@ -77,6 +84,7 @@ struct SimNetInner {
     /// Every live conn pair, for fault injection: crash() resets all
     /// conns touching the node, like a dead process's QUIC conns.
     conns: Vec<ConnHandle>,
+    dials: Vec<(PeerId, PeerId)>,
     /// Symmetric partition set; (a, b) stored with a <= b.
     partitions: BTreeSet<(PeerId, PeerId)>,
     /// Dial targets whose connection setup stalls forever (the
@@ -87,6 +95,9 @@ struct SimNetInner {
     /// pending, so an un-deadlined singleflight pool wedges every
     /// later walk to that peer behind one stalled attempt.
     stalled_dials: BTreeSet<PeerId>,
+    wake_topics:
+        BTreeMap<[u8; 32], BTreeMap<PeerId, (u64, mpsc::UnboundedSender<CollectionWakeEvent>)>>,
+    next_wake_subscription: u64,
     rng: StdRng,
     config: SimConfig,
 }
@@ -128,8 +139,11 @@ impl SimNet {
             inner: Arc::new(Mutex::new(SimNetInner {
                 nodes: BTreeMap::new(),
                 conns: Vec::new(),
+                dials: Vec::new(),
                 partitions: BTreeSet::new(),
                 stalled_dials: BTreeSet::new(),
+                wake_topics: BTreeMap::new(),
+                next_wake_subscription: 0,
                 rng: StdRng::seed_from_u64(seed),
                 config,
             })),
@@ -138,7 +152,8 @@ impl SimNet {
 
     /// Join the network as `id`. Returns the transport harness for the node's
     /// host loop.
-    pub fn join(&self, id: PeerId) -> Harness<SimTransport> {
+    pub fn join(&self, signing_key: &SigningKey) -> Harness<SimTransport> {
+        let id = signing_key.verifying_key().to_bytes();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let mut inner = self.inner.lock().unwrap();
@@ -154,6 +169,7 @@ impl SimNet {
         let transport = SimTransport {
             net: self.clone(),
             id,
+            signing_key: Arc::new(signing_key.clone()),
         };
         // The bounded receivers the host loop expects: bridge from our
         // unbounded internals. (Unbounded internally so fault-time
@@ -270,6 +286,17 @@ impl SimNet {
         tokio::time::sleep(dur).await;
         clock.advance(dur);
     }
+
+    /// Number of attempted direct dials between two exact endpoints.
+    pub fn dial_count(&self, from: PeerId, to: PeerId) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .dials
+            .iter()
+            .filter(|(actual_from, actual_to)| *actual_from == from && *actual_to == to)
+            .count()
+    }
 }
 
 /// Forward from the unbounded internal channel to the bounded one the
@@ -287,10 +314,12 @@ async fn bridge<T: Send + 'static>(mut rx: mpsc::UnboundedReceiver<T>, tx: mpsc:
 pub struct SimTransport {
     net: SimNet,
     id: PeerId,
+    signing_key: Arc<SigningKey>,
 }
 
 impl Transport for SimTransport {
     type Conn = SimConn;
+    type WakePlane = SimWakePlane;
 
     fn local_id(&self) -> PeerId {
         self.id
@@ -299,6 +328,7 @@ impl Transport for SimTransport {
     async fn dial(&self, peer: PeerId, alpn: Alpn) -> anyhow::Result<Self::Conn> {
         let (latency, incoming_tx, stalled) = {
             let mut inner = self.net.inner.lock().unwrap();
+            inner.dials.push((self.id, peer));
             if inner.partitioned(&self.id, &peer) {
                 anyhow::bail!(
                     "simnet: {} -> {}: partitioned",
@@ -362,6 +392,139 @@ impl Transport for SimTransport {
     }
 
     async fn shutdown(&self) {}
+
+    fn collection_wake_plane(&self) -> Self::WakePlane {
+        SimWakePlane {
+            net: self.net.clone(),
+            signing_key: self.signing_key.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SimWakePlane {
+    net: SimNet,
+    signing_key: Arc<SigningKey>,
+}
+
+pub struct SimWakeTopic {
+    net: SimNet,
+    collection: triblespace_core::collection::CollectionHandle,
+    signing_key: Arc<SigningKey>,
+    id: PeerId,
+    subscription: u64,
+    sequence: AtomicU64,
+    rx: mpsc::UnboundedReceiver<CollectionWakeEvent>,
+}
+
+impl CollectionWakeNetwork for SimWakePlane {
+    type Topic = SimWakeTopic;
+
+    async fn subscribe_network(
+        &self,
+        collection: triblespace_core::collection::CollectionHandle,
+        _bootstrap: Vec<EndpointId>,
+    ) -> anyhow::Result<Self::Topic> {
+        let id = self.signing_key.verifying_key().to_bytes();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (subscription, existing) = {
+            let mut inner = self.net.inner.lock().unwrap();
+            let subscription = inner.next_wake_subscription;
+            inner.next_wake_subscription = subscription.wrapping_add(1);
+            let existing = inner
+                .wake_topics
+                .get(&collection.raw)
+                .map(|topics| {
+                    topics
+                        .iter()
+                        .map(|(peer, (_, tx))| (*peer, tx.clone()))
+                        .collect()
+                })
+                .unwrap_or_else(Vec::new);
+            inner
+                .wake_topics
+                .entry(collection.raw)
+                .or_default()
+                .insert(id, (subscription, tx.clone()));
+            (subscription, existing)
+        };
+        for (peer, existing_tx) in existing {
+            let peer_id = EndpointId::from_bytes(&peer)?;
+            let id_endpoint = EndpointId::from_bytes(&id)?;
+            let _ = existing_tx.send(CollectionWakeEvent::NeighborUp(id_endpoint));
+            let _ = tx.send(CollectionWakeEvent::NeighborUp(peer_id));
+        }
+        Ok(SimWakeTopic {
+            net: self.net.clone(),
+            collection,
+            signing_key: self.signing_key.clone(),
+            id,
+            subscription,
+            sequence: AtomicU64::new(0),
+            rx,
+        })
+    }
+}
+
+impl CollectionWakeSubscription for SimWakeTopic {
+    async fn join_wake_peers(&self, _peers: Vec<EndpointId>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn broadcast_wake(&self, root: CollectionWakeRoot) -> anyhow::Result<CollectionWake> {
+        let mut nonce = [0; 16];
+        nonce[..8].copy_from_slice(&self.subscription.to_be_bytes());
+        nonce[8..].copy_from_slice(&self.sequence.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+        let wake = CollectionWake::sign(self.collection, root, nonce, &self.signing_key);
+        let recipients = {
+            let inner = self.net.inner.lock().unwrap();
+            inner
+                .wake_topics
+                .get(&self.collection.raw)
+                .into_iter()
+                .flat_map(|topics| topics.iter())
+                .filter(|(peer, _)| **peer != self.id)
+                .filter(|(peer, _)| {
+                    inner.nodes.get(*peer).is_some_and(|slot| slot.up)
+                        && !inner.partitioned(&self.id, peer)
+                })
+                .map(|(_, (_, tx))| tx.clone())
+                .collect::<Vec<_>>()
+        };
+        let origin = EndpointId::from_bytes(&self.id)?;
+        for tx in recipients {
+            let _ = tx.send(CollectionWakeEvent::Received(ReceivedCollectionWake {
+                wake: wake.clone(),
+                delivered_from: origin,
+                scope: DeliveryScope::Neighbors,
+            }));
+        }
+        Ok(wake)
+    }
+
+    async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
+        Ok(self.rx.recv().await)
+    }
+}
+
+impl Drop for SimWakeTopic {
+    fn drop(&mut self) {
+        let mut inner = self.net.inner.lock().unwrap();
+        let empty = if let Some(topics) = inner.wake_topics.get_mut(&self.collection.raw) {
+            if topics
+                .get(&self.id)
+                .is_some_and(|(subscription, _)| *subscription == self.subscription)
+            {
+                topics.remove(&self.id);
+            }
+            topics.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            inner.wake_topics.remove(&self.collection.raw);
+        }
+    }
 }
 
 /// A simulated connection: two endpoints exchanging bidirectional

@@ -10,6 +10,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
+use ed25519_dalek::VerifyingKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::capability::{
@@ -18,7 +19,8 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
-    CollectionPolicy, CollectionRead, RecordDecodeError, descriptor,
+    CollectionPolicy, CollectionRead, CollectionRecord, RecordDecodeError,
+    collection_writer_is_admitted_by_policy_at, descriptor,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead};
@@ -110,7 +112,7 @@ impl CollectionActivationOverlay {
         &self.policy
     }
 
-    /// Structurally valid COMMIT/MERGE/DERIVE evidence for this collection.
+    /// Currently WRITE-admitted signed COMMITs for this collection.
     pub const fn records(&self) -> &CollectionRecordPatch {
         &self.records
     }
@@ -294,7 +296,8 @@ where
     }
 }
 
-/// Freeze the exact record and time-independent WRITE-evidence PATCHes for `C`.
+/// Freeze the exact currently WRITE-accountable COMMIT and structural
+/// WRITE-evidence PATCHes for `C`.
 ///
 /// Missing or malformed descriptors fail closed. Invalid, incomplete, or
 /// irrelevant ambient proofs are inert, matching ordinary collection
@@ -309,11 +312,39 @@ pub fn collection_activation_overlay<R>(
 where
     R: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
+    collection_activation_overlay_at(snapshot, collection, crate::clock::epoch_now())
+}
+
+pub(crate) fn collection_activation_overlay_at<R>(
+    snapshot: &R,
+    collection: CollectionHandle,
+    instant: hifitime::Epoch,
+) -> Result<
+    CollectionActivationOverlay,
+    CollectionActivationOverlayError<R::RecordsError, R::ProofsError, R::GetError<Infallible>>,
+>
+where
+    R: BlobStoreGet + CapabilityProofRead + CollectionRead,
+{
     let policy = load_collection_policy(snapshot, collection)
         .map_err(CollectionActivationOverlayError::Descriptor)?;
+    let write_evidence = collection_write_evidence_patch(snapshot, collection, policy.write())?;
     let records = collection_record_patch(snapshot, collection)
         .map_err(CollectionActivationOverlayError::Records)?;
-    let write_evidence = collection_write_evidence_patch(snapshot, collection, policy.write())?;
+    let bundles = write_evidence.bundles().cloned().collect::<Vec<_>>();
+    let mut admitted = BTreeMap::new();
+    let records = records.filter(|record| {
+        let CollectionRecord::Commit(commit) = record else {
+            return false;
+        };
+        *admitted.entry(commit.public_key().raw).or_insert_with(|| {
+            VerifyingKey::from_bytes(&commit.public_key().raw).is_ok_and(|writer| {
+                collection_writer_is_admitted_by_policy_at(
+                    collection, &policy, writer, &bundles, instant,
+                )
+            })
+        })
+    });
     Ok(CollectionActivationOverlay {
         collection,
         policy,
@@ -345,16 +376,39 @@ where
 /// Select the deterministic bounded portable proof forest for exact READ(C).
 ///
 /// The descriptor's canonical READ roots shape the result. Each returned
-/// bundle has a valid signature/claim chain and exact READ atom, but validity
-/// is deliberately not evaluated against a clock: the receiver applies its
-/// own current instant during admission. Invalid, incomplete, irrelevant, and
-/// duplicate ambient proofs are inert. The caller chooses `max_bundles`; a
+/// bundle has a valid signature/claim chain and exact READ atom. Selection and
+/// deletion minimization sample one current instant; the receiver independently
+/// applies its own current instant during admission. Invalid, incomplete,
+/// irrelevant, and duplicate ambient proofs are inert. The caller chooses `max_bundles`; a
 /// larger forest fails rather than silently dropping paths required by quorum
 /// or fixed-point delegation.
 pub fn collection_read_evidence_bundles<R>(
     snapshot: &R,
     collection: CollectionHandle,
+    subject: VerifyingKey,
     max_bundles: usize,
+) -> Result<
+    Vec<CapabilityProofBundle>,
+    CollectionReadEvidenceError<R::ProofsError, R::GetError<Infallible>>,
+>
+where
+    R: BlobStoreGet + CapabilityProofRead,
+{
+    collection_read_evidence_bundles_at(
+        snapshot,
+        collection,
+        subject,
+        max_bundles,
+        crate::clock::epoch_now(),
+    )
+}
+
+pub(crate) fn collection_read_evidence_bundles_at<R>(
+    snapshot: &R,
+    collection: CollectionHandle,
+    subject: VerifyingKey,
+    max_bundles: usize,
+    instant: hifitime::Epoch,
 ) -> Result<
     Vec<CapabilityProofBundle>,
     CollectionReadEvidenceError<R::ProofsError, R::GetError<Infallible>>,
@@ -403,13 +457,32 @@ where
         }
         canonical.insert(id.raw, bundle);
     }
-    if canonical.len() > max_bundles {
+    let mut selected = canonical.into_values().collect::<Vec<_>>();
+    if !triblespace_core::collection::collection_reader_is_admitted_by_policy_at(
+        collection, &policy, subject, &selected, instant,
+    ) {
+        return Ok(Vec::new());
+    }
+    // Delete every bundle that is not required by the actual fixed-point
+    // witness. This preserves intermediate multi-root delegation support while
+    // withholding unrelated ambient grants from the remote endpoint.
+    let mut index = selected.len();
+    while index > 0 {
+        index -= 1;
+        let removed = selected.remove(index);
+        if !triblespace_core::collection::collection_reader_is_admitted_by_policy_at(
+            collection, &policy, subject, &selected, instant,
+        ) {
+            selected.insert(index, removed);
+        }
+    }
+    if selected.len() > max_bundles {
         return Err(CollectionReadEvidenceError::TooMany {
-            count: canonical.len(),
+            count: selected.len(),
             limit: max_bundles,
         });
     }
-    Ok(canonical.into_values().collect())
+    Ok(selected)
 }
 
 fn collection_write_evidence_patch<R>(
@@ -652,7 +725,8 @@ mod tests {
                 .unwrap()
         );
 
-        assert_eq!(before.records().summary(), after.records().summary());
+        assert!(before.records().summary().root().is_none());
+        assert_eq!(after.records().summary().leaf_count(), 1);
         assert_ne!(
             before.write_evidence().summary(),
             after.write_evidence().summary()
@@ -915,12 +989,26 @@ mod tests {
             CapabilityMode::Invoke,
             None,
         );
+        let unrelated_reader = root_bundle(
+            &root,
+            &key(28),
+            collection_atom(ACTION_READ, collection.handle()),
+            CapabilityMode::Invoke,
+            None,
+        );
         store_bundle(&mut store, wrong_root);
+        store_bundle(&mut store, unrelated_reader);
         store_bundle(&mut store, relevant.clone());
         store_bundle(&mut store, wrong_action);
 
         let snapshot = store.snapshot().unwrap();
-        let selected = collection_read_evidence_bundles(&snapshot, collection.handle(), 1).unwrap();
+        let selected = collection_read_evidence_bundles(
+            &snapshot,
+            collection.handle(),
+            reader.verifying_key(),
+            1,
+        )
+        .unwrap();
         assert_eq!(selected, [relevant]);
         let overlay = collection_activation_overlay(&snapshot, collection.handle()).unwrap();
         assert!(
@@ -933,7 +1021,12 @@ mod tests {
             )
         );
         assert!(matches!(
-            collection_read_evidence_bundles(&snapshot, collection.handle(), 0),
+            collection_read_evidence_bundles(
+                &snapshot,
+                collection.handle(),
+                reader.verifying_key(),
+                0
+            ),
             Err(CollectionReadEvidenceError::TooMany { count: 1, limit: 0 })
         ));
     }
@@ -948,7 +1041,13 @@ mod tests {
             )
             .unwrap();
         let snapshot = store.snapshot().unwrap();
-        let selected = collection_read_evidence_bundles(&snapshot, collection.handle(), 0).unwrap();
+        let selected = collection_read_evidence_bundles(
+            &snapshot,
+            collection.handle(),
+            key(27).verifying_key(),
+            0,
+        )
+        .unwrap();
         assert!(selected.is_empty());
         assert!(
             triblespace_core::collection::collection_reader_is_admitted_by_policy_at(

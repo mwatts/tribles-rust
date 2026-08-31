@@ -1,8 +1,7 @@
 //! Local scheduling policy for collection-scoped repair.
 //!
-//! The former global team inventory and blob-mirroring policy were removed at
-//! the collection-host cutover. Collection authority is carried by each
-//! repair request, while exact blob acquisition remains demand-driven.
+//! Collection authority is carried by each repair request. Payload QoS is a
+//! local choice between demand acquisition and authenticated full replication.
 
 /// Local direction policy for periodic collection repair.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -12,8 +11,18 @@ pub enum ReconcileDirection {
     Bidirectional,
     /// Pull active collections without serving local collection state or data.
     ReadOnly,
-    /// Serve active collections and public exact data without initiating repair.
+    /// Serve active collection state and resident exact data without initiating repair.
     WriteOnly,
+}
+
+/// Local blob-replication policy for active collections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlobReplication {
+    /// Fetch exact bytes only in response to durable/local demand.
+    #[default]
+    Demand,
+    /// Incrementally mirror each admitted collection's resident closure.
+    Full,
 }
 
 impl ReconcileDirection {
@@ -37,4 +46,6 @@ impl ReconcileDirection {
 pub struct ReconcileQos {
     /// Whether this peer pulls, serves, or does both.
     pub direction: ReconcileDirection,
+    /// Whether collection repair also mirrors resident blob bytes.
+    pub blobs: BlobReplication,
 }

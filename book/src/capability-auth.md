@@ -155,9 +155,16 @@ not permit issuing another grant.
 WRITE(C) decides which signed COMMITs are active when a store snapshot is
 observed. Local insertion remains unconditional: a store may retain an inactive
 claim, and later proof evidence may activate it monotonically. READ(C) is the
-network disclosure boundary. A collection repair request carries the bounded
-proof forest needed to admit the TLS-authenticated iroh endpoint; the server
-does not search for or fetch a credential on the caller's behalf.
+collection-evidence disclosure boundary. A collection repair request carries
+the bounded proof forest needed to admit the TLS-authenticated iroh endpoint;
+the server does not search for or fetch a credential on the caller's behalf.
+For a READ-open collection, exact blob retrieval remains bearer-authorized by
+knowledge of H and provider directories receive only KDF(H), never H. A
+restricted collection publishes no global KDF(H): after READ(C) admission the
+same collection stream accepts H and returns bytes only when H lies in that
+collection's resident admitted closure. This avoids turning the global
+directory or an unrelated collection session into a confirmation oracle for a
+guessable private handle.
 
 The iroh connection itself already authenticates endpoint keys. TribleSpace
 therefore adds no generic CONNECT capability and no second team-inventory

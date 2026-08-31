@@ -149,8 +149,10 @@ The exact `ACTION_READ` capability over one collection descriptor handle.
 Network repair presents a bounded proof forest for the authenticated endpoint
 and the descriptor's READ policy. Knowing the collection handle permits joining
 its opaque wake topic, but does not reveal records, proofs, counts, or blobs;
-those cross only after READ(C) admission. `Open` READ needs no proof and also
-permits permissionless provider publication for that collection's disclosed
+those cross only after READ(C) admission. `Open` READ needs no proof. A
+READ-open collection may advertise opaque KDF(H) provider keys and knowing H is
+then the bearer capability. A restricted collection advertises no global key;
+READ(C) admits an exact-H request only within that collection's resident
 closure.
 
 ### Constraint

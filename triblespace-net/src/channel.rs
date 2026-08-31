@@ -5,6 +5,7 @@
 //! available batches and crosses a single durability barrier.
 
 use crate::provider::ProviderObservation;
+use anybytes::Bytes;
 use triblespace_core::capability::CapabilityProofBundle;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
@@ -17,7 +18,11 @@ use triblespace_core::collection::{
 /// notices update exact-handle wake subscriptions and periodic repair roots.
 pub(crate) struct SnapshotNotice {
     /// Exact active collection handles and their opaque activation roots.
-    pub(crate) collections: Vec<(triblespace_core::collection::CollectionHandle, [u8; 32])>,
+    pub(crate) collections: Vec<(
+        triblespace_core::collection::CollectionHandle,
+        [u8; 32],
+        [u8; 32],
+    )>,
     /// Whether an immutable serving snapshot is now installed.
     pub(crate) installed: bool,
 }
@@ -25,45 +30,87 @@ pub(crate) struct SnapshotNotice {
 /// Commands sent from [`crate::peer::Peer`] to the host runtime.
 pub(crate) enum NetCommand {
     SnapshotChanged(SnapshotNotice),
-    /// Replace the exact provider keys selected by the current public
-    /// disclosure observation. Restricted collection handles never cross this
-    /// boundary.
-    PublicProvidersUpdated(ProviderObservation),
+    /// Replace the exact opaque provider keys selected by the current admitted
+    /// artifact observation. Raw handles never cross this boundary.
+    ProvidersUpdated(ProviderObservation),
 }
 
 /// Authenticated, structurally canonical collection items returned by repair.
 ///
 /// These values remain inert evidence. In particular, transferred WRITE
 /// proofs are never reused as ambient READ authority.
-#[derive(Debug)]
 pub(crate) enum NetEvent {
+    Blob {
+        expected: [u8; 32],
+        bytes: Bytes,
+    },
     CollectionRecord(CollectionRecord),
     /// Complete portable WRITE evidence, including its exact claim closure.
     CapabilityProofBundle(CapabilityProofBundle),
+    /// One validated Full-replica page. The store side admits and flushes the
+    /// page atomically at the network boundary, refreshes only its operational
+    /// blob reader, then acknowledges it. A final page is the sole checkpoint
+    /// that rebuilds and publishes the authoritative serving snapshot.
+    FullPage {
+        blobs: Vec<([u8; 32], Bytes)>,
+        final_page: bool,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 impl NetEvent {
     fn admission_bytes(&self) -> usize {
         match self {
+            Self::Blob { bytes, .. } => bytes.len(),
             Self::CollectionRecord(CollectionRecord::Commit(_)) => 1 + COLLECTION_COMMIT_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Merge(_)) => 1 + COLLECTION_MERGE_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Derive(_)) => 1 + COLLECTION_DERIVE_BYTES_LEN,
             Self::CapabilityProofBundle(bundle) => {
                 bundle.to_bytes().map_or(usize::MAX, |bytes| bytes.len())
             }
+            Self::FullPage { blobs, .. } => blobs.iter().fold(0_usize, |total, (_, bytes)| {
+                total.saturating_add(bytes.len())
+            }),
+        }
+    }
+}
+
+impl std::fmt::Debug for NetEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blob { expected, bytes } => formatter
+                .debug_struct("Blob")
+                .field("expected", expected)
+                .field("len", &bytes.len())
+                .finish(),
+            Self::CollectionRecord(record) => formatter
+                .debug_tuple("CollectionRecord")
+                .field(record)
+                .finish(),
+            Self::CapabilityProofBundle(bundle) => formatter
+                .debug_tuple("CapabilityProofBundle")
+                .field(bundle)
+                .finish(),
+            Self::FullPage {
+                blobs, final_page, ..
+            } => formatter
+                .debug_struct("FullPage")
+                .field("blobs", &blobs.len())
+                .field("final_page", final_page)
+                .finish_non_exhaustive(),
         }
     }
 }
 
 /// Maximum number of independently authenticated items carried by one
 /// host-to-store message.
-pub(crate) const MAX_ADMISSION_BATCH_ITEMS: usize = 256;
+pub(crate) const MAX_ADMISSION_BATCH_ITEMS: usize = 4_096;
 /// Soft byte ceiling for one host-to-store message.
 ///
 /// Blob values are indivisible at this boundary. One blob larger than this
 /// ceiling is therefore carried alone; `Bytes` keeps the file-backed receive
 /// mapping shared instead of copying it into the channel.
-pub(crate) const MAX_ADMISSION_BATCH_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_ADMISSION_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum number of batches buffered across the async/synchronous bridge and
 /// consumed by one refresh drain.
 pub(crate) const MAX_ADMISSION_BRIDGE_BATCHES: usize = 16;

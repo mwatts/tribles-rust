@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Project every resident descriptor, data, metadata, and aligned attachment in
+  a strictly signed, WRITE-admitted COMMIT closure into a collection-scoped
+  snapshot index. Only READ-open collections also enter the global bearer
+  projection; restricted closure membership is consumed after READ(C)
+  admission.
+
 - Make store registration the sole source of typed collection values.
   `register_collection` validates a raw descriptor and returns the exact handle
   produced while storing its attachment closure; canonical root/derive builders

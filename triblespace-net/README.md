@@ -34,6 +34,7 @@ let mut peer = Peer::new(
         peers: vec![bootstrap_endpoint],
         qos: ReconcileQos {
             direction: ReconcileDirection::Bidirectional,
+            ..ReconcileQos::default()
         },
     },
 )?;
@@ -52,16 +53,20 @@ does not create an ambient collection registry.
 
 The QUIC/TLS connection authenticates endpoint identities but grants no team
 or collection authority. Every collection repair request names exactly one
-collection and carries the caller's complete portable READ(C) proof bundles.
-The server verifies those bundles against the collection descriptor before it
-reveals the repair manifest or any PATCH leaf. An endpoint with WRITE(C) but
+collection. The repair client presents its bounded READ(C) witness first. The
+server verifies the TLS client before revealing a manifest or PATCH leaf; the
+publisher itself needs no READ(C). Exact bearer fetch remains asymmetric in
+the other direction: the provider proves READ(C) before the requester reveals H. Claims and
+proofs are non-secret authorization certificates: a C-knower can elicit the
+server witness, but cannot learn collection data without READ(C). An endpoint with WRITE(C) but
 without READ(C) cannot learn collection records, WRITE evidence, or roots.
 
-DHT `FIND_NODE`, provider-directory operations, and exact `GET_BLOB` by an
-already-known immutable handle remain bearer/public mechanisms. Provider
-advertising is built only from the store's collection disclosure snapshot, so
-restricted material is never published as a provider hint merely because the
-bytes are resident.
+DHT `FIND_NODE` and provider-directory operations discover participants under
+opaque KDF(C), with a token binding each result to the advertised endpoint.
+There is one lease per active served collection, not one per resident blob.
+Before revealing bearer handle H, the requester verifies the candidate's
+READ(C) witness; the server then serves H only from C's admitted resident
+closure. No global KDF(H) oracle exists.
 
 ## Repair and wake
 
@@ -72,12 +77,14 @@ nodes. Complete proof bundles include their claim bytes, so landing later
 WRITE evidence can activate an older record without a separate claim-fetch
 protocol.
 
-Production iroh peers also subscribe to stock `iroh-gossip` topics keyed
-exactly by the 32-byte collection handle. A wake contains only a signed origin
-endpoint and the opaque activation root. A root mismatch schedules ordinary
+Production iroh peers also subscribe to stock `iroh-gossip` topics keyed by a
+domain-separated one-way image of the 32-byte collection handle. A 177-byte
+nonce-v3 wake contains only version, signed origin endpoint, separate opaque
+semantic and payload roots, and a fresh nonce. Demand peers react only to the
+semantic root; Full peers react to both. A mismatch schedules ordinary
 READ-authorized repair from that signed origin; the wake itself carries no
 authority or collection state. Missed or lagged wakes are harmless because
-the periodic repair path remains active.
+bounded sampled anti-entropy through leased signed wake origins remains active.
 
 Direction is local policy:
 
@@ -86,17 +93,22 @@ Direction is local policy:
 - `WriteOnly` serves admitted readers and bearer data but does not initiate
   repair or service local WANTs.
 
-Configured endpoint addresses are bootstrap repair targets. DHT referrals and
-wake origins may provide transient routes, but no durable PEER record is
-created or consumed by the network host.
+Configured endpoint addresses bootstrap gossip and DHT only. Repair targets
+come from signed wake origins or endpoint-bound KDF(C) leases; unrelated
+configured peers never receive C or its proofs.
 
 ## Exact content
 
-Durable blob WANTs use the authenticated DHT to find policy-approved provider
-hints and then fetch the exact known handle. Exact reads are independent of
-collection repair: no broad blob inventory or mirror mode exists. Collection
-operation WANTs observe matching records through the local indexed record
-selection after `Peer::refresh`.
+`BlobReplication::Demand` keeps exact reads lazy. A bare durable
+`WantRequest::Blob(H)` has no general discovery promise because it carries no
+collection route. Explicit `(C,H)` fetches discover providers
+through KDF(C), verify the provider's READ(C) witness, and then exercise H as
+the exact-byte capability. `BlobReplication::Full` instead walks a third,
+stream-pinned 80-byte-key disclosure-forest PATCH. Each key commits to depth,
+parent, aligned chunk index, and child handle; the receiver accepts roots only
+from locally WRITE-admitted COMMITs and descendants only after verifying the
+parent bytes. The same command and
+byte budgets paginate large mirrors across ordinary repair sessions.
 
 The full model, wire formats, authorization boundaries, and CLI surface live
 in the book's [Distributed Sync](https://docs.rs/triblespace/latest/triblespace/)
@@ -107,8 +119,8 @@ chapter.
 - `collection_activation` — per-collection record and WRITE-evidence PATCHes
 - `collection_session` / `collection_wire` — one READ-authorized repair stream
 - `patch_repair` — root-pinned Merkle difference walker
-- `peer` — synchronous store wrapper, durable admission, and exact WANT reads
-- `reconcile` — durable WANT observation and exact blob fulfillment
+- `peer` — synchronous store wrapper, durable admission, and local WANT intent
+- `reconcile` — durable WANT observation and reproducible-operation fulfillment
 - `provider` / `routing` — bounded bearer provider directory and XOR routing
 - `protocol` — public direct-operation framing
 - `host` — immutable overlays, connection pool, wake bridge, and scheduler

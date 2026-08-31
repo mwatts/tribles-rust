@@ -22,9 +22,9 @@ pub const ACTION_READ: Id = id_hex!("76583A671BBD61A6A8E66405DE75873F");
 
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
+mod authorization_clock;
 /// Reading one collection descriptor's facts.
 pub mod descriptor;
-mod disclosure;
 pub mod discovery;
 /// Canonical collection encodings and join-preserving mappings.
 pub mod encoding;
@@ -61,7 +61,7 @@ pub mod view;
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
-pub use disclosure::{DisclosureBuildError, DisclosureSnapshot};
+pub use authorization_clock::next_authorization_change_at;
 pub use discovery::*;
 pub use encoding::*;
 pub use policy::*;

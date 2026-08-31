@@ -88,6 +88,7 @@ impl Conn for IrohConn {
 
 impl Transport for IrohTransport {
     type Conn = IrohConn;
+    type WakePlane = CollectionWakePlane;
 
     fn local_id(&self) -> PeerId {
         *self.ep.id().as_bytes()
@@ -160,8 +161,8 @@ impl Transport for IrohTransport {
         }
     }
 
-    fn collection_wake_plane(&self) -> Option<CollectionWakePlane> {
-        Some(self.wake_plane.clone())
+    fn collection_wake_plane(&self) -> CollectionWakePlane {
+        self.wake_plane.clone()
     }
 }
 
