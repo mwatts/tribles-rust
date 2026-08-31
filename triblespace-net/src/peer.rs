@@ -423,7 +423,6 @@ where
                         final_page,
                         ack,
                     } => {
-                        let page_has_blobs = !blobs.is_empty();
                         for (expected, bytes) in blobs {
                             match store.put::<UnknownBlob, _>(bytes) {
                                 Ok(handle) => {
@@ -433,6 +432,7 @@ where
                                             "Full page blob hash changed while landing"
                                         )));
                                     }
+                                    self.full_dirty.insert(&PatchEntry::new(&collection.raw));
                                 }
                                 Err(error) => {
                                     return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
@@ -440,9 +440,6 @@ where
                                     )));
                                 }
                             }
-                        }
-                        if page_has_blobs {
-                            self.full_dirty.insert(&PatchEntry::new(&collection.raw));
                         }
                         if final_page {
                             if self.full_dirty.get(&collection.raw).is_some() {
@@ -1032,11 +1029,17 @@ mod tests {
         );
         peer.activate_collection(collection.handle());
 
+        let valid_bytes = Bytes::from_source(b"valid prefix before mismatch".to_vec());
+        let valid =
+            triblespace_core::blob::Blob::<UnknownBlob>::new(valid_bytes.clone()).get_handle();
         let (ack, _acked) = tokio::sync::oneshot::channel();
         let mut page = NetEventBatch::default();
         page.try_push(NetEvent::FullPage {
             collection: collection.handle(),
-            blobs: vec![([0xFF; 32], Bytes::from_source(b"hash mismatch".to_vec()))],
+            blobs: vec![
+                (valid.raw, valid_bytes),
+                ([0xFF; 32], Bytes::from_source(b"hash mismatch".to_vec())),
+            ],
             final_page: true,
             ack,
         })
@@ -1046,5 +1049,10 @@ mod tests {
         assert!(peer.try_refresh().is_err());
         assert!(peer.pending_network_flush);
         assert!(peer.full_dirty.get(&collection.handle().raw).is_some());
+        assert!(
+            peer.full_checkpointed
+                .get(&collection.handle().raw)
+                .is_none()
+        );
     }
 }
