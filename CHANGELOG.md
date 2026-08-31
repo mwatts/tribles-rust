@@ -2153,6 +2153,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Activate a `pile net sync` collection cohort through one coherent serving
+  snapshot instead of rebuilding the increasingly large Full-replica view
+  once per `--collection` argument during startup.
+
 - Replace the global 8-bit provider-cover rendezvous with exact full-width
   derived-key DHT PUT/GET leases. Directory requests still never carry bearer
   blob handles, while unrelated artifacts no longer collapse onto 256 fixed
