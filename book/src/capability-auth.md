@@ -195,6 +195,21 @@ cannot nominate its own authority, collection, or subject. There is no global
 roster to enumerate and no requirement that two collections share roots or
 delegation geometry.
 
+`grant_collection_read(&mut store, collection, &root, recipient)` is the
+root-only persistence seam for the common direct case. It validates the exact
+descriptor and READ root against one snapshot, creates an unbounded
+READ/Invoke bundle, stores its claim closure, and only then inserts the native
+proof record. Repeating the same inputs reproduces the same identities. The
+equivalent pile operation is:
+
+```text
+trible pile collection grant-read PILE COLLECTION RECIPIENT [--key PATH]
+```
+
+`RECIPIENT` is the authenticated iroh endpoint id. The command refuses open
+READ policies (which need no proof) and keys absent from the descriptor's READ
+root set.
+
 Validity bounds are optional monotone restrictions, not mutable revocation.
 Ending an unexpired grant requires changing the served trust root or another
 explicit application epoch. That cost keeps the kernel local, portable, and

@@ -5,28 +5,32 @@ use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
-use triblespace_core::blob::{BlobEncoding, IntoBlob};
+use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-    CapabilityRequest, CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+    CapabilityProofBundle, CapabilityRequest, CapabilityResource,
 };
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy,
-    CollectionRecord, CollectionStore, CollectionStoreExt, CollectionTypeError,
-    PreparedCollectionCommit, ACTION_READ, ACTION_WRITE,
+    grant_collection_read, AdmissionPolicy, Collection, CollectionDescriptorError,
+    CollectionOpenError, CollectionPolicy, CollectionReadGrantError, CollectionRecord,
+    CollectionStore, CollectionStoreExt, CollectionTypeError, PreparedCollectionCommit,
+    ACTION_READ, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
+use triblespace_core::repo::{
+    BlobStoreGet, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+};
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreEvent {
     Put([u8; 32]),
     Insert(triblespace_core::id::Id),
+    Proof([u8; 32]),
 }
 
 #[derive(Default)]
@@ -68,6 +72,24 @@ impl CollectionStore for CountingRepo {
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.events.push(StoreEvent::Insert(record.id()));
         self.inner.insert(record)
+    }
+}
+
+impl SnapshotSource for CountingRepo {
+    type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
+
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
+    }
+}
+
+impl CapabilityProofStore for CountingRepo {
+    type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        self.events.push(StoreEvent::Proof(proof.id().raw));
+        self.inner.insert_proof(proof)
     }
 }
 
@@ -179,6 +201,156 @@ fn typed_collection_open_rejects_an_invalid_descriptor() {
             ..
         }) if collection == invalid
     ));
+}
+
+#[test]
+fn read_grant_is_root_checked_commit_last_and_replay_deterministic() {
+    let root = key(25);
+    let reader = key(26);
+    let mut store = CountingRepo::default();
+    let collection = store
+        .collection("root-granted-read", policy(root.verifying_key()))
+        .unwrap();
+    store.events.clear();
+
+    let first = grant_collection_read(
+        &mut store,
+        collection.handle(),
+        &root,
+        reader.verifying_key(),
+    )
+    .unwrap();
+    let claim_handle = first.proof().leaf_claim();
+    assert_eq!(
+        store.events,
+        vec![
+            StoreEvent::Put(claim_handle.raw),
+            StoreEvent::Proof(first.proof().id().raw),
+        ]
+    );
+
+    let claim = CapabilityClaim::from_blob(first.claims()[0].clone()).unwrap();
+    assert_eq!(claim.parent(), None);
+    assert_eq!(claim.mode(), CapabilityMode::Invoke);
+    assert_eq!(claim.validity(), None);
+    assert_eq!(claim.atom(), atom(ACTION_READ, collection));
+    assert_eq!(first.proof().leaf_key(), reader.verifying_key());
+
+    store.events.clear();
+    let replay = grant_collection_read(
+        &mut store,
+        collection.handle(),
+        &root,
+        reader.verifying_key(),
+    )
+    .unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(
+        store.events,
+        vec![
+            StoreEvent::Put(claim_handle.raw),
+            StoreEvent::Proof(first.proof().id().raw),
+        ]
+    );
+
+    let snapshot = store.snapshot().unwrap();
+    let proofs = snapshot
+        .proofs()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(proofs, vec![first.proof().clone()]);
+    let stored_claim: Blob<SimpleArchive> = snapshot.get(claim_handle).unwrap();
+    assert_eq!(stored_claim, first.claims()[0]);
+    assert!(collection
+        .reader_is_admitted_at(
+            &snapshot,
+            reader.verifying_key(),
+            Epoch::from_tai_seconds(0.0),
+        )
+        .unwrap());
+}
+
+#[test]
+fn read_grant_rejects_non_root_without_writing() {
+    let root = key(27);
+    let stranger = key(28);
+    let reader = key(29);
+    let mut store = CountingRepo::default();
+    let collection = store
+        .collection("root-checked-read", policy(root.verifying_key()))
+        .unwrap();
+    store.events.clear();
+
+    let error = grant_collection_read(
+        &mut store,
+        collection.handle(),
+        &stranger,
+        reader.verifying_key(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CollectionReadGrantError::RootNotAuthorized {
+            collection: rejected,
+            root: rejected_root,
+        } if rejected == collection.handle() && rejected_root == stranger.verifying_key()
+    ));
+    assert!(store.events.is_empty());
+}
+
+#[test]
+fn read_grant_rejects_an_invalid_descriptor_without_writing() {
+    let root = key(32);
+    let reader = key(33);
+    let mut store = CountingRepo::default();
+    let invalid = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+    store.events.clear();
+
+    let error =
+        grant_collection_read(&mut store, invalid, &root, reader.verifying_key()).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CollectionReadGrantError::Descriptor(CollectionDescriptorError::Invalid {
+            collection,
+            ..
+        }) if collection == invalid
+    ));
+    assert!(store.events.is_empty());
+}
+
+#[test]
+fn read_grant_rejects_redundant_open_policy_without_writing() {
+    let root = key(30);
+    let reader = key(31);
+    let mut store = CountingRepo::default();
+    let collection = store
+        .collection(
+            "already-open-read",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(root.verifying_key()),
+            ),
+        )
+        .unwrap();
+    store.events.clear();
+
+    let error = grant_collection_read(
+        &mut store,
+        collection.handle(),
+        &root,
+        reader.verifying_key(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CollectionReadGrantError::OpenPolicy { collection: rejected }
+            if rejected == collection.handle()
+    ));
+    assert!(store.events.is_empty());
 }
 
 #[test]

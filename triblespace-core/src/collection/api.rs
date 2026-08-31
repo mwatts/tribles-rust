@@ -32,6 +32,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
+use crate::repo::{CapabilityProofStore, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
@@ -174,6 +175,93 @@ where
         match self {
             Self::Descriptor(source) => Some(source),
             Self::WrongType(source) => Some(source),
+        }
+    }
+}
+
+/// Failure to persist one root-issued, unbounded READ grant for a collection.
+///
+/// The operation validates the descriptor and its READ roots before writing
+/// anything. Claim blobs are then stored before the native proof record, so a
+/// failed or interrupted publication can only leave inert content behind.
+#[derive(Debug)]
+pub enum CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError> {
+    /// The store could not freeze the read boundary used to validate policy.
+    Snapshot(SnapshotError),
+    /// The collection descriptor was unavailable or malformed.
+    Descriptor(CollectionDescriptorError<GetError>),
+    /// The collection is already readable without proof.
+    OpenPolicy {
+        /// Exact collection whose READ policy is open.
+        collection: CollectionHandle,
+    },
+    /// The supplied signing key is not one of this collection's READ roots.
+    RootNotAuthorized {
+        /// Exact collection whose policy rejected the signer.
+        collection: CollectionHandle,
+        /// Public half of the supplied root signing key.
+        root: VerifyingKey,
+    },
+    /// A canonical claim blob could not be stored.
+    ClaimPut(PutError),
+    /// The native proof record could not be inserted after its claim closure.
+    ProofInsert(InsertError),
+}
+
+impl<SnapshotError, GetError, PutError, InsertError> fmt::Display
+    for CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError>
+where
+    SnapshotError: fmt::Display,
+    GetError: fmt::Display,
+    PutError: fmt::Display,
+    InsertError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Snapshot(source) => {
+                write!(formatter, "failed to freeze store snapshot: {source}")
+            }
+            Self::Descriptor(source) => source.fmt(formatter),
+            Self::OpenPolicy { collection } => write!(
+                formatter,
+                "collection {} has an open READ policy; no proof is required",
+                hex::encode_upper(collection.raw),
+            ),
+            Self::RootNotAuthorized { collection, root } => write!(
+                formatter,
+                "key {} is not a READ root of collection {}",
+                hex::encode_upper(root.to_bytes()),
+                hex::encode_upper(collection.raw),
+            ),
+            Self::ClaimPut(source) => {
+                write!(
+                    formatter,
+                    "failed to store capability claim before proof: {source}"
+                )
+            }
+            Self::ProofInsert(source) => write!(
+                formatter,
+                "failed to insert capability proof after its claims: {source}",
+            ),
+        }
+    }
+}
+
+impl<SnapshotError, GetError, PutError, InsertError> Error
+    for CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError>
+where
+    SnapshotError: Error + 'static,
+    GetError: Error + 'static,
+    PutError: Error + 'static,
+    InsertError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Snapshot(source) => Some(source),
+            Self::Descriptor(source) => Some(source),
+            Self::OpenPolicy { .. } | Self::RootNotAuthorized { .. } => None,
+            Self::ClaimPut(source) => Some(source),
+            Self::ProofInsert(source) => Some(source),
         }
     }
 }
@@ -933,6 +1021,73 @@ where
         discovered.commits().iter().map(CollectionCommit::data),
     );
     Ok((loaded.fragment, discovered, cover))
+}
+
+/// Persist one deterministic root-issued READ/Invoke proof for `recipient`.
+///
+/// This is deliberately representation-neutral: READ authority concerns the
+/// exact descriptor handle, not the collection member encoding. The
+/// descriptor is first loaded and structurally validated through one coherent
+/// store snapshot. `root` must be named by its READ quorum; an open READ policy
+/// needs no grant and is rejected as a redundant operation.
+///
+/// The claim closure is written before the proof record. Repeating the same
+/// call with the same collection, root, and recipient therefore reproduces the
+/// same content identities and is idempotent on a conforming store.
+pub fn grant_collection_read<S>(
+    store: &mut S,
+    collection: CollectionHandle,
+    root: &SigningKey,
+    recipient: VerifyingKey,
+) -> Result<
+    CapabilityProofBundle,
+    CollectionReadGrantError<
+        <S as SnapshotSource>::SnapshotError,
+        <<S as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
+        <S as BlobStorePut>::PutError,
+        <S as CapabilityProofStore>::InsertError,
+    >,
+>
+where
+    S: SnapshotSource + BlobStorePut + CapabilityProofStore,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+{
+    let snapshot = store
+        .snapshot()
+        .map_err(CollectionReadGrantError::Snapshot)?;
+    let descriptor = load_collection_descriptor(&snapshot, collection)
+        .map_err(CollectionReadGrantError::Descriptor)?;
+    let roots = descriptor
+        .policy
+        .read()
+        .roots()
+        .ok_or(CollectionReadGrantError::OpenPolicy { collection })?;
+    let root_key = root.verifying_key();
+    if !roots.contains(&root_key) {
+        return Err(CollectionReadGrantError::RootNotAuthorized {
+            collection,
+            root: root_key,
+        });
+    }
+    drop(snapshot);
+
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_READ),
+        CapabilityResource::from(collection),
+    );
+    let claim = crate::capability::CapabilityClaim::root(atom, CapabilityMode::Invoke, None);
+    let bundle = CapabilityProofBundle::issue_root(root, claim, recipient)
+        .expect("the root READ claim constructed here has no parent");
+
+    for claim in bundle.claims().iter().cloned() {
+        store
+            .put::<SimpleArchive, _>(claim)
+            .map_err(CollectionReadGrantError::ClaimPut)?;
+    }
+    store
+        .insert_proof(bundle.proof().clone())
+        .map_err(CollectionReadGrantError::ProofInsert)?;
+    Ok(bundle)
 }
 
 /// Decide READ admission for an untyped collection handle from explicitly

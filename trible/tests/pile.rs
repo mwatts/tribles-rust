@@ -1,9 +1,18 @@
 use assert_cmd::Command;
+use ed25519_dalek::SigningKey;
+use hifitime::Epoch;
 use predicates::prelude::*;
 use tempfile::tempdir;
+use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStoreList;
 use triblespace::prelude::SnapshotSource;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::Blob;
+use triblespace_core::collection::{
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+};
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::CapabilityProofRead;
 
 fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
     let mut record = vec![0u8; 256];
@@ -78,6 +87,79 @@ fn create_creates_parent_directories() {
 
     assert!(path.exists());
     assert!(path.parent().unwrap().exists());
+}
+
+#[test]
+fn collection_grant_read_is_replay_idempotent_and_admits_the_endpoint() {
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("grant-read.pile");
+    let key_path = dir.path().join("self.key");
+    std::fs::File::create(&pile_path).unwrap();
+    let root = triblespace_core::signing_key_file::init(&key_path).unwrap();
+    let reader = SigningKey::from_bytes(&[77; 32]);
+    let endpoint = iroh_base::PublicKey::from_bytes(&reader.verifying_key().to_bytes())
+        .unwrap()
+        .to_string();
+
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let collection = pile
+        .collection(
+            "cli-read-grant",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(root.verifying_key()),
+                AdmissionPolicy::direct(root.verifying_key()),
+            ),
+        )
+        .unwrap();
+    pile.close().unwrap();
+
+    let handle = format!("blake3:{}", hex::encode(collection.handle().raw));
+    let invoke = || {
+        Command::cargo_bin("trible")
+            .unwrap()
+            .args(["pile", "collection", "grant-read"])
+            .arg(&pile_path)
+            .arg(&handle)
+            .arg(&endpoint)
+            .output()
+            .unwrap()
+    };
+
+    let first = invoke();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_len = std::fs::metadata(&pile_path).unwrap().len();
+    let second = invoke();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), first_len);
+
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let opened = Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap();
+    assert!(opened
+        .reader_is_admitted_at(
+            &snapshot,
+            reader.verifying_key(),
+            Epoch::from_tai_seconds(0.0),
+        )
+        .unwrap());
+    let proofs = snapshot
+        .proofs()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(proofs.len(), 1);
+    let _: Blob<SimpleArchive> = snapshot.get(proofs[0].leaf_claim()).unwrap();
+    drop(snapshot);
+    pile.close().unwrap();
 }
 
 #[test]

@@ -105,6 +105,10 @@ with the encoding and mapping-algorithm descriptions.
 - `pile collection show <PILE> <HANDLE>` — decode one descriptor, its anchor,
   READ and WRITE policies, representation, mapping, and referencing record
   counts. The handle is accepted with or without the `blake3:` prefix.
+- `pile collection grant-read <PILE> <COLLECTION> <RECIPIENT> [--key PATH]` —
+  issue one deterministic, unbounded READ/Invoke proof from a configured READ
+  root to an iroh endpoint id. Claims are persisted before the proof; replaying
+  the exact command is idempotent.
 
 ### Distributed pile sync
 

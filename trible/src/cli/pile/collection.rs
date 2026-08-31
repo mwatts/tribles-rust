@@ -24,6 +24,7 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use ed25519_dalek::VerifyingKey;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -36,7 +37,7 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::CollectionRead;
-use triblespace_core::collection::{descriptor, AdmissionPolicy};
+use triblespace_core::collection::{descriptor, grant_collection_read, AdmissionPolicy};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
 use triblespace_core::inline::Inline;
@@ -107,6 +108,24 @@ pub enum Command {
         #[arg(long)]
         long: bool,
     },
+    /// Grant one endpoint unbounded READ access to an existing collection.
+    ///
+    /// The signing key must be one of the collection descriptor's READ roots.
+    /// Claim blobs are stored before the native proof record, and repeating
+    /// the exact command is idempotent.
+    GrantRead {
+        /// Path to the pile file to update.
+        pile: PathBuf,
+        /// Collection name, or descriptor handle. Use `name:` or `blake3:`
+        /// to disambiguate a name that itself looks like a handle.
+        collection: String,
+        /// Recipient's canonical iroh endpoint id (hex or z-base-32).
+        recipient: String,
+        /// READ-root signing key. Defaults to TRIBLESPACE_KEY or self.key
+        /// beside the pile.
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
 }
 
 pub fn run(cmd: Command) -> Result<()> {
@@ -124,6 +143,12 @@ pub fn run(cmd: Command) -> Result<()> {
             limit,
             long,
         } => run_log(pile, collection, limit, long),
+        Command::GrantRead {
+            pile,
+            collection,
+            recipient,
+            key,
+        } => run_grant_read(pile, collection, recipient, key),
     }
 }
 
@@ -149,6 +174,16 @@ fn parse_collection_handle(handle: &str) -> Result<CollectionHandle> {
         )
     })?;
     Ok(hash.into())
+}
+
+fn parse_recipient_endpoint(value: &str) -> Result<VerifyingKey> {
+    let endpoint = value.trim().parse::<iroh_base::PublicKey>().map_err(|_| {
+        anyhow!(
+            "invalid recipient {value:?}: expected a canonical iroh endpoint id in hex or z-base-32"
+        )
+    })?;
+    Ok(VerifyingKey::from_bytes(endpoint.as_bytes())
+        .expect("iroh public keys are validated Ed25519 points"))
 }
 
 fn handle_hex(handle: CollectionHandle) -> String {
@@ -785,6 +820,46 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
     res.and(close_res)
 }
 
+fn run_grant_read(
+    path: PathBuf,
+    reference: String,
+    recipient: String,
+    key: Option<PathBuf>,
+) -> Result<()> {
+    let recipient = parse_recipient_endpoint(&recipient)?;
+    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
+    let root = triblespace_core::signing_key_file::load_existing(&key_path)
+        .map_err(|error| anyhow!("load READ-root signing key {}: {error}", key_path.display()))?;
+
+    let mut pile = open_refreshed(&path)?;
+    let res = (|| -> Result<()> {
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        let rows = enumerate(&snapshot)?;
+        let collection = resolve(&rows, &reference)?;
+        drop(snapshot);
+
+        let bundle = grant_collection_read(&mut pile, collection, &root, recipient)
+            .map_err(|error| anyhow!("grant collection READ: {error}"))?;
+        println!("collection: blake3:{}", handle_hex(collection));
+        println!(
+            "root:       {}",
+            hex::encode_upper(root.verifying_key().to_bytes())
+        );
+        println!("recipient:  {}", hex::encode(recipient.to_bytes()));
+        println!(
+            "proof:      blake3:{}",
+            hex::encode(bundle.proof().id().raw)
+        );
+        Ok(())
+    })();
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    res.and(close_res)
+}
+
 fn run_show(path: PathBuf, reference: String) -> Result<()> {
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
@@ -1094,6 +1169,18 @@ mod tests {
 
         assert!(parse_collection_handle("sha256:00").is_err());
         assert!(parse_collection_handle("not-hex").is_err());
+    }
+
+    #[test]
+    fn recipient_endpoint_accepts_the_iroh_identity_spelling() {
+        let expected = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let endpoint = iroh_base::PublicKey::from_bytes(&expected.to_bytes()).unwrap();
+
+        assert_eq!(
+            parse_recipient_endpoint(&endpoint.to_string()).unwrap(),
+            expected
+        );
+        assert!(parse_recipient_endpoint("not-an-endpoint").is_err());
     }
 
     /// Enumeration must see collections named by merges and by *both* sides
