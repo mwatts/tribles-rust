@@ -2122,6 +2122,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_page_checkpoints_only_its_own_collection() {
+        let key = SigningKey::from_bytes(&[0x34; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let child_bytes = Bytes::from_source(b"cross-collection partial child".to_vec());
+        let child = Blob::<UnknownBlob>::new(child_bytes.clone());
+        let child_handle = child.get_handle();
+        let mut store = MemoryRepo::default();
+        let partial = store
+            .collection("full-page-partial", policy.clone())
+            .unwrap();
+        let completed = store.collection("full-page-completed", policy).unwrap();
+        store
+            .commit(partial, &key, fragment(9, child_handle))
+            .unwrap();
+        store
+            .commit(completed, &key, fragment(10, Inline::new([0xAA; 32])))
+            .unwrap();
+        let (sender, receiver, wiring) = super::wire(id);
+        let observer = sender.clone();
+        let mut peer = Peer::with_wiring(
+            store,
+            ReconcileQos {
+                direction: crate::inventory::ReconcileDirection::Bidirectional,
+                blobs: BlobReplication::Full,
+            },
+            sender,
+            receiver,
+        );
+        peer.activate_collections([partial.handle(), completed.handle()]);
+        let before = observer.current_snapshot().unwrap();
+        let partial_before = full(&before, partial);
+
+        let (partial_ack, mut partial_acked) = tokio::sync::oneshot::channel();
+        let (completed_ack, mut completed_acked) = tokio::sync::oneshot::channel();
+        let mut interleaved = NetEventBatch::default();
+        interleaved
+            .try_push(NetEvent::FullPage {
+                collection: partial.handle(),
+                blobs: vec![(child_handle.raw, child_bytes)],
+                final_page: false,
+                ack: partial_ack,
+            })
+            .unwrap();
+        interleaved
+            .try_push(NetEvent::FullPage {
+                collection: completed.handle(),
+                blobs: Vec::new(),
+                final_page: true,
+                ack: completed_ack,
+            })
+            .unwrap();
+        wiring.evt_tx.send(interleaved).await.unwrap();
+        peer.refresh();
+        assert!(partial_acked.try_recv().is_ok());
+        assert!(completed_acked.try_recv().is_ok());
+        let interleaved_snapshot = observer.current_snapshot().unwrap();
+        assert!(Arc::ptr_eq(
+            &partial_before,
+            &full(&interleaved_snapshot, partial)
+        ));
+        assert!(
+            !full(&interleaved_snapshot, partial)
+                .forest
+                .iter_ordered()
+                .any(|key| key[48..] == child_handle.raw)
+        );
+
+        let (final_ack, mut final_acked) = tokio::sync::oneshot::channel();
+        let mut final_page = NetEventBatch::default();
+        final_page
+            .try_push(NetEvent::FullPage {
+                collection: partial.handle(),
+                blobs: Vec::new(),
+                final_page: true,
+                ack: final_ack,
+            })
+            .unwrap();
+        wiring.evt_tx.send(final_page).await.unwrap();
+        peer.refresh();
+        assert!(final_acked.try_recv().is_ok());
+        let after = observer.current_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&partial_before, &full(&after, partial)));
+        assert!(
+            full(&after, partial)
+                .forest
+                .iter_ordered()
+                .any(|key| key[48..] == child_handle.raw)
+        );
+    }
+
+    #[tokio::test]
     async fn durable_collection_want_marks_only_its_active_full_forest() {
         let key = SigningKey::from_bytes(&[0x33; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();

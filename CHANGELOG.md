@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rebuild Full-replica disclosure forests only when a collection's activation
   changes or bytes arrive through an explicit collection route. Full repair
   pages and `BlobInCollection` fulfillment preserve that route through the
-  durability boundary, while unrelated blob appends reuse immutable forests.
+  durability boundary, publication checkpoints are scoped per collection, and
+  unrelated blob appends reuse immutable forests.
 
 ### Added
 

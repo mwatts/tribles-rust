@@ -119,6 +119,10 @@ where
     /// Active collections whose resident closure gained explicitly routed
     /// bytes after the last published serving snapshot.
     full_dirty: ActiveCollections,
+    /// Dirty Full-replica collections whose routed acquisition crossed its
+    /// own publication checkpoint. Partial pages remain dirty without entering
+    /// this set, so another collection's final page cannot publish them early.
+    full_checkpointed: ActiveCollections,
     /// Network admissions stay outside the advertised snapshot until their
     /// shared durability barrier succeeds. A failed flush is retried on every
     /// refresh without requiring the remote to redeliver the event first.
@@ -190,6 +194,7 @@ where
             active: PATCH::new(),
             active_dirty: true,
             full_dirty: PATCH::new(),
+            full_checkpointed: PATCH::new(),
             pending_network_flush: false,
             last_store_snapshot: None,
             last_authorization_change: None,
@@ -261,6 +266,8 @@ where
             return false;
         }
         self.full_dirty.insert(&PatchEntry::new(&collection.raw));
+        self.full_checkpointed
+            .insert(&PatchEntry::new(&collection.raw));
         true
     }
 
@@ -358,8 +365,8 @@ where
         let received_batches = incoming.len();
         let received = incoming.iter().map(|batch| batch.len()).sum::<usize>();
         let mut store = self.store.lock().expect("store mutex");
-        let mut full_page_acks = Vec::new();
-        let mut full_checkpoint = false;
+        let mut partial_page_acks = Vec::new();
+        let mut final_page_acks = Vec::new();
         for batch in incoming {
             for event in batch.into_events() {
                 match event {
@@ -416,9 +423,7 @@ where
                         final_page,
                         ack,
                     } => {
-                        if !blobs.is_empty() {
-                            self.full_dirty.insert(&PatchEntry::new(&collection.raw));
-                        }
+                        let page_has_blobs = !blobs.is_empty();
                         for (expected, bytes) in blobs {
                             match store.put::<UnknownBlob, _>(bytes) {
                                 Ok(handle) => {
@@ -436,8 +441,18 @@ where
                                 }
                             }
                         }
-                        full_checkpoint |= final_page;
-                        full_page_acks.push(ack);
+                        if page_has_blobs {
+                            self.full_dirty.insert(&PatchEntry::new(&collection.raw));
+                        }
+                        if final_page {
+                            if self.full_dirty.get(&collection.raw).is_some() {
+                                self.full_checkpointed
+                                    .insert(&PatchEntry::new(&collection.raw));
+                            }
+                            final_page_acks.push(ack);
+                        } else {
+                            partial_page_acks.push(ack);
+                        }
                     }
                 }
             }
@@ -474,11 +489,13 @@ where
                 }
             };
             self.sender.update_operational_blobs(snapshot.clone());
-            if !full_page_acks.is_empty() && !full_checkpoint {
-                for ack in full_page_acks {
+            if !partial_page_acks.is_empty() {
+                for ack in partial_page_acks {
                     let _ = ack.send(());
                 }
-                return Ok(());
+                if final_page_acks.is_empty() {
+                    return Ok(());
+                }
             }
             let previous_snapshot = self.sender.current_snapshot();
             let changes = if previous_snapshot.is_none() {
@@ -499,12 +516,12 @@ where
                     || self
                         .last_authorization_change
                         .is_some_and(|boundary| now >= boundary);
+            let full_ready = self.full_dirty.intersect(&self.full_checkpointed);
             if received == 0
                 && changes == StoreChanges::NONE
                 && !authorization_changed
                 && !self.active_dirty
-                && self.full_dirty.is_empty()
-                && !full_checkpoint
+                && full_ready.is_empty()
                 && previous_snapshot.is_some()
             {
                 self.last_store_snapshot = Some(snapshot);
@@ -524,7 +541,7 @@ where
             let serving = StoreSnapshot::from_store_changes(
                 snapshot.clone(),
                 &self.active,
-                &self.full_dirty,
+                &full_ready,
                 VerifyingKey::from_bytes(self.sender.id().as_bytes())
                     .expect("endpoint id is an Ed25519 key"),
                 previous_snapshot.as_deref(),
@@ -549,10 +566,11 @@ where
             }
             self.active_dirty = false;
             // `refresh_checked` owns `&mut self` from event drain through
-            // publication, so no routed mark can race this clear. Events
-            // queued concurrently have not mutated `full_dirty` yet and will
-            // be marked by the next drain.
-            self.full_dirty = PATCH::new();
+            // publication, so no routed mark can race this clear. Preserve
+            // dirty-but-uncheckpointed collections until their own final page;
+            // concurrently queued events will be marked by the next drain.
+            self.full_dirty = self.full_dirty.difference(&full_ready);
+            self.full_checkpointed = self.full_checkpointed.difference(&full_ready);
             self.last_store_snapshot = Some(snapshot);
             self.last_authorization_change = next_authorization_change;
             self.last_observed_at = Some(now);
@@ -561,7 +579,7 @@ where
                 &mut self.last_provider_observation,
                 provider_observation,
             );
-            for ack in full_page_acks {
+            for ack in final_page_acks {
                 let _ = ack.send(());
             }
         } else {
