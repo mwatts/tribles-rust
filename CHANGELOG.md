@@ -888,11 +888,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   higher input remains eligible for another deterministic pair and every
   attempt shrinks the active set. A no-claim round returns a capacity-stable
   cover (which may retain a tier collision) with zero writes. Repeated and
-  concurrent work is content-addressed and idempotent; no flush, planner,
-  manifest, receipt, retention root, background task, or authority record is
-  introduced. Accelerated members are derived only for the final selected raw
-  cover, never for compacted-away leaves; each raw shard retains the explicit
-  `u32::MAX` row/domain boundary.
+  concurrent work is content-addressed and idempotent; if an acknowledged
+  `MERGE` or `DERIVE` remains absent from a fresh store snapshot, maintenance
+  reports a stalled backend instead of repeating it indefinitely. No flush,
+  planner, manifest, receipt, retention root, background task, or authority
+  record is introduced. Accelerated members are derived only for the final
+  selected raw cover, never for compacted-away leaves; each raw shard retains
+  the explicit `u32::MAX` row/domain boundary.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach, ensure}` validates a frozen
   source `Cover`, reuses canonical source merges, target

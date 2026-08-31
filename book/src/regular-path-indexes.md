@@ -219,16 +219,22 @@ both:
 
 Only then are selected summaries joined and closed once into `PathIndex`.
 
-`ensure` performs the same lookup, selects a deterministic resident source
-`Cover`, and lowers only cover members supporting
-at least one still-unsupported payload member. A resident source merge can
-therefore replace several leaf derivations, even when it overlaps a member that
-already has a target image. It persists every successfully computed source,
-output, and unsigned `DERIVE` record—even if a later capacity or fatal result
-changes the selected route—and performs no implicit durability flush. It drops
-the old store snapshot before those writes. Concurrent and repeated ensures are
-content-addressed and record-idempotent; unchanged warm calls execute no maps or
-joins.
+`ensure` performs the same lookup and plans deterministically at each source-
+lattice point. It reuses an exact resident target image, otherwise joins exact
+resident target-child images, otherwise maps the resident corresponding source
+node, and only then descends through the first fully actionable canonical
+source decomposition. It never constructs a source merge merely to enable a
+mapping. Once every exact point is represented, it performs at most one global
+size-tiered target carry before re-entering the pointwise planner.
+
+Every successfully computed source, output, `MERGE`, and unsigned `DERIVE`
+record is persisted, even if a later capacity or fatal result changes the
+selected route, and no implicit durability flush is performed. The old store
+snapshot is dropped before those writes. Concurrent and repeated ensures are
+content-addressed and record-idempotent. An unchanged warm call whose stored
+target cover already satisfies both pointwise and global maintenance executes
+no maps or joins; capacity and unsupported decisions are call-local and may be
+retried by a later call.
 
 An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.

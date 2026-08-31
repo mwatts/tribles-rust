@@ -2843,6 +2843,46 @@ impl CollectionStore for DropMergeStore {
     }
 }
 
+struct DropDeriveStore {
+    inner: MemoryRepo,
+    dropped_derives: usize,
+}
+
+impl BlobStorePut for DropDeriveStore {
+    type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.inner.put(item)
+    }
+}
+
+impl SnapshotSource for DropDeriveStore {
+    type Snapshot = MemoryRepoSnapshot;
+    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
+
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
+    }
+}
+
+impl CollectionStore for DropDeriveStore {
+    type InsertError = <MemoryRepo as CollectionStore>::InsertError;
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        if matches!(record, CollectionRecord::Derive(_)) {
+            self.dropped_derives += 1;
+            Ok(())
+        } else {
+            self.inner.insert(record)
+        }
+    }
+}
+
 impl SnapshotSource for RejectPutStore {
     type Snapshot = MemoryRepoSnapshot;
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
@@ -2959,6 +2999,28 @@ fn discarded_merge_insert_stalls_instead_of_looping() {
         Err(ExactDerivedCollectionError::Stalled { cover }) if cover.len() == 2
     ));
     assert!(target_merge_records(&mut store.inner).is_empty());
+}
+
+#[test]
+fn discarded_batched_derive_insert_stalls_instead_of_looping() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut inner, index as u8 + 1, source))
+        .collect();
+    let source_cover = source_cover(&commits);
+    let mut store = DropDeriveStore {
+        inner,
+        dropped_derives: 0,
+    };
+
+    assert!(matches!(
+        kernel().ensure_member_images(&mut store, &source_cover),
+        Err(ExactDerivedCollectionError::Stalled { cover }) if cover.is_empty()
+    ));
+    assert_eq!(store.dropped_derives, 2);
 }
 
 #[test]

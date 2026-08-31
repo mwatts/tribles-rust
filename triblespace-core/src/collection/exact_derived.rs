@@ -611,6 +611,15 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
 
                 let mut replan = None;
                 for (input_data, input) in source_cover {
+                    if published_source_derives.contains(&input_data) {
+                        break 'planning Err(ExactDerivedCollectionError::Stalled {
+                            cover: probe
+                                .target_cover
+                                .members()
+                                .map(Handle::<MappingTarget<Mapping>>::to_hash)
+                                .collect(),
+                        });
+                    }
                     if !cached.contains_key(&input_data) {
                         let output = match mapping.map(&input, &probe.reader) {
                             Ok(output) => output,
@@ -668,6 +677,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                     .map_err(|error| {
                         ExactDerivedCollectionError::storage("publish DERIVE", error)
                     })?;
+                published_source_derives.insert(prepared.claim.input());
             }
 
             match plan {
@@ -1022,8 +1032,9 @@ struct PreferredRoutes {
 /// reuse its exact resident target image; otherwise prefer a target join when
 /// one canonical source decomposition already has both exact target images;
 /// otherwise cross the mapping if the source point itself is resident; only
-/// then descend through the first canonical source decomposition. No source
-/// join is executed here or anywhere else in exact target maintenance.
+/// then descend through the first fully actionable canonical source
+/// decomposition. No source join is executed here or anywhere else in exact
+/// target maintenance.
 fn preferred_routes(
     semantics: &CollectionSemantics,
     source: CollectionHandle,
