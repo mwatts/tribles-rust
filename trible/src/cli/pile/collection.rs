@@ -249,7 +249,21 @@ fn parse_collection_handle(handle: &str) -> Result<CollectionHandle> {
 }
 
 fn parse_recipient_key(value: &str) -> Result<VerifyingKey> {
-    let endpoint = value.trim().parse::<iroh_base::PublicKey>().map_err(|_| {
+    let value = value.trim();
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(value, &mut bytes).map_err(|_| {
+            anyhow!(
+                "invalid recipient {value:?}: expected an Ed25519 public key in hex or z-base-32"
+            )
+        })?;
+        return VerifyingKey::from_bytes(&bytes).map_err(|_| {
+            anyhow!(
+                "invalid recipient {value:?}: expected an Ed25519 public key in hex or z-base-32"
+            )
+        });
+    }
+    let endpoint = value.parse::<iroh_base::PublicKey>().map_err(|_| {
         anyhow!("invalid recipient {value:?}: expected an Ed25519 public key in hex or z-base-32")
     })?;
     Ok(VerifyingKey::from_bytes(endpoint.as_bytes())
@@ -1284,12 +1298,16 @@ mod tests {
     }
 
     #[test]
-    fn recipient_key_accepts_the_iroh_identity_spelling() {
+    fn recipient_key_accepts_iroh_and_signing_key_init_spellings() {
         let expected = SigningKey::from_bytes(&[9; 32]).verifying_key();
         let endpoint = iroh_base::PublicKey::from_bytes(&expected.to_bytes()).unwrap();
 
         assert_eq!(
             parse_recipient_key(&endpoint.to_string()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_recipient_key(&hex::encode_upper(expected.to_bytes())).unwrap(),
             expected
         );
         assert!(parse_recipient_key("not-an-endpoint").is_err());

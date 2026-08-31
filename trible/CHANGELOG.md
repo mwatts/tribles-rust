@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept uppercase hexadecimal recipient keys in collection READ/WRITE grants,
+  matching the exact public-key spelling emitted by `pile signing-key init`.
+
 ### Added
 
 - Add explicit `pile net sync --collection HANDLE` activation for
