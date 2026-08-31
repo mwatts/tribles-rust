@@ -131,16 +131,19 @@ the server checks them before disclosing a manifest or PATCH leaf.
 The exact repair state is the product of the collection's native record PATCH
 and its portable WRITE-evidence PATCH. A later WRITE proof can therefore
 activate an older commit without inventing a second synchronization protocol.
-Production peers subscribe to stock `iroh-gossip` topics keyed exactly by
-collection handle; signed opaque-root mismatches accelerate ordinary repair,
-while periodic anti-entropy remains authoritative.
+Production peers subscribe to stock `iroh-gossip` topics keyed by the
+domain-separated image of the collection handle; signed opaque-root
+mismatches accelerate ordinary repair, while periodic anti-entropy remains
+authoritative.
 
 DHT routing, provider lookup, and direct GET by a known immutable handle are
-bearer mechanisms for READ-open collection data. Provider advertising follows
-the admitted resident closure of strictly signed COMMITs only when READ is
-open. Restricted data publishes no global KDF(H); after READ(C) admission the
-same collection stream serves exact H only from C's resident closure. The
-network host neither uses nor writes durable team/PEER routing state.
+collection-independent bearer mechanisms. Every served resident blob may
+publish an opaque KDF(H) lease with an H-bound endpoint token. Direct GET sends
+only that locator: the provider proves H first, the requester second, both
+proofs bind the authenticated endpoints, and returned bytes must hash to H.
+Collection READ(C) remains exclusively the admission boundary for collection
+anti-entropy and Full repair. The network host neither uses nor writes durable
+team/PEER routing state.
 
 ### Work with remote stores
 

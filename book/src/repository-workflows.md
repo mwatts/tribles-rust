@@ -337,26 +337,22 @@ route which `ensure_exact` can reconstruct.
 ## WANT missing content or computation
 
 Sparse evidence discovery deliberately does not fetch commit dependencies.
-`WantStore` records operational interest with four request shapes:
+`WantStore` records operational interest with three request shapes:
 
-- `Blob(handle)` — obtain exact bytes as a bare local-only intent;
-- `BlobInCollection(collection, handle)` — obtain the same exact bytes through
-  one collection route;
+- `Blob(handle)` — obtain those exact bytes;
 - `Merge(collection, low, high)` — discover an existing matching merge result;
   and
 - `Derive(target, input)` — discover an existing matching derivation; the
   target descriptor already names the source collection and concrete mapping.
 
-A collection route participates in WANT identity, so retracting `(C1,H)` does
-not retract `(C2,H)` or bare `Blob(H)`. Local presence of `H` nevertheless
-satisfies every route, and retention budgets charge it once. A reconciler may
-satisfy those questions from local workers or peers. For a routed blob request,
-the network reconciler validates the resident C descriptor from its store
-snapshot and looks up providers only under KDF(C), without activating C. An
-absent or malformed descriptor leaves the request pending, and a bare blob
-request never supplies a network route. The answer to an operation WANT is the
+`Blob(H)` is the only exact-content identity. A reconciler may satisfy it from
+local workers or discover providers under opaque KDF(H), without activating or
+even naming a collection. The provider proves H first and the requester second,
+with both proofs bound to the authenticated endpoints; H itself is never sent,
+and landed bytes must hash to H. The answer to an operation WANT is the
 ordinary native equation; obtaining its result bytes is a separate blob WANT.
-A WANT grants no authority and does not change the value of any collection.
+A WANT grants no collection authority and does not change the value of any
+collection.
 
 ## Migrate a legacy branch explicitly
 

@@ -231,20 +231,18 @@ from that raw source.
 ## WANT is operational, not semantic
 
 A `WantStore` records operational interest in obtaining a blob or discovering
-a particular merge/derive result. Bare `Blob(H)` is local-only;
-`BlobInCollection(C,H)` carries one exact discovery route. The route remains
-part of request identity, while local presence and retention accounting project
-all routes for the same handle onto one `H`. WANTs do not add collection
-members, authorize authors, retain all referenced data, or force another node
-to perform work. They are durable coordination-free questions which a
-reconciler may satisfy by fetching content or unioning a matching native
-equation into the local store.
+a particular merge/derive result. `Blob(H)` is the sole exact-content request
+and names no collection. WANTs do not add collection members, authorize
+authors, retain all referenced data, or force another node to perform work.
+They are durable coordination-free questions which a reconciler may satisfy by
+fetching content or unioning a matching native equation into the local store.
 
-The network reconciler validates C's resident descriptor policy from its
-coherent store snapshot and uses exact KDF(C) provider discovery without adding
-C to the peer's active collection set. Missing or malformed descriptor bytes
-leave the routed WANT pending; bare `Blob(H)` and configured peers never become
-implicit fallback routes.
+The network reconciler discovers exact providers under the opaque,
+domain-separated locator KDF(H). An H-bound endpoint token rejects false
+directory entries before dialing. The direct stream then performs a
+provider-first, requester-second proof of H, bound to both authenticated
+endpoint identities, without ever transmitting H. Returned bytes must hash to
+H. This path does not load a collection descriptor or consult READ(C).
 
 Keeping WANT orthogonal prevents evidence convergence from becoming
 involuntary blob mirroring. A peer can repair a READ-authorized collection's
@@ -267,13 +265,13 @@ records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
 content-derived object keys. The network layer uses an opaque collection-topic
 wake and READ(C)-authorized Merkle walks to union that collection's records and
-activation-relevant WRITE proof bundles. For READ-open collections, blob
-handles remain lazy bearer capabilities and an opaque XOR DHT locates providers
-for exact handles already known to the caller. Restricted exact handles are
-fetched only within a READ(C)-admitted collection session and only from that
-collection's resident closure. Merge/derive questions are answered from the
-converged local record index. In every case convergence means unioning
-evidence; it does not mean electing a winner.
+activation-relevant WRITE proof bundles. Independently, every served resident
+blob may publish an opaque XOR-DHT lease under KDF(H); knowing H is the bearer
+capability for its exact bytes regardless of collection policy. Collection
+READ(C) still gates collection anti-entropy and Full repair, but never exact
+GET. Merge/derive questions are answered from the converged local record index.
+In every case convergence means unioning evidence; it does not mean electing a
+winner.
 
 Legacy branch and pin records remain decodable only so old piles can be
 inspected, conservatively retained, and explicitly migrated. They are not part

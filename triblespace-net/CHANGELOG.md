@@ -19,25 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add local `Demand | Full` payload QoS. Full repair pins a canonical 80-byte
   disclosure-forest PATCH and accepts only locally authenticated roots and
   parent-byte-verified edges, with bounded partial progress on the same session.
-- Service durable `BlobInCollection(C, H)` requests through exact KDF(C)
-  provider lookup. The reconciler loads and validates the resident descriptor
-  policy from one store snapshot without activating C; absent or malformed
-  descriptors remain pending, bare `Blob(H)` never triggers network discovery,
-  and one landed H satisfies every durable route identity for that handle.
+- Service durable `Blob(H)` requests through collection-independent exact
+  provider lookup. Discovery uses the full-width domain-separated locator
+  KDF(H), while H-bound endpoint tokens reject forged directory entries before
+  dialing.
 
 ### Changed
 
 - Replace team-scoped connection authorization and global inventory with
-  immutable per-collection activation overlays. Provider discovery is one
-  endpoint-bound KDF(C) lease per active served collection; no resident H is
-  published globally. Collection-routed blob WANTs use only their exact C,
-  verify a provider's READ(C) witness before revealing bearer H, and never
-  infer routes from configured peers, active collections, or resident bytes.
+  immutable per-collection activation overlays. Collection repair discovery
+  uses one endpoint-bound KDF(C) lease per active served collection. Exact
+  content has a separate global KDF(H) directory populated from resident
+  blobs; exact GET consults neither collection identity nor READ(C).
 - Move the incompatible direct protocol to ALPN
-  `/triblespace/pile-sync/20`. Anti-entropy is receiver-authorized by READ(C);
-  scoped bearer GET is asymmetric because possession of H is read authority,
-  but the provider still proves READ(C) before H crosses TLS. Unattributed
-  WANTs fail closed, and unsigned remote derived artifacts are not mirrored.
+  `/triblespace/pile-sync/21`. Anti-entropy is receiver-authorized by READ(C).
+  Exact bearer GET instead uses a provider-first, requester-second mutual
+  proof of H bound to both authenticated endpoint identities; raw H never
+  crosses TLS, and returned bytes must hash to H. Unsigned remote derived
+  artifacts are not mirrored.
 
 ### Removed
 
@@ -75,19 +74,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 
+- Renew the complete provider-key publication set on an eight-hour sweep under
+  a 24-hour lease, interleaving additions and retries so neither can starve old
+  keys. Local directory acceptance no longer masks failed remote publication.
+- Bound exact provider directories to 64 endpoints per key and a provisional
+  aggregate soft cap while allowing one endpoint to publish more than 1024
+  distinct keys. Exact-key expiry cleanup cannot be blocked by unrelated stale
+  memberships.
 - Route provider PUT and GET through the full 256-bit derived key instead of
   one of 256 fixed global prefix targets. Provider publication now uses bounded
-  exact soft leases and a fair exact-key scheduler; the explicit publication
-  input remains a fail-closed policy seam because derived keys do not protect
-  guessable plaintext from dictionary confirmation. Replace the prefix
+  exact soft leases and a fair exact-key scheduler over resident handles.
+  Replace the prefix
   PROBE/BODY exchange with one exact `PROVIDER_PUT` and move the incompatible
-  pile-sync wire protocol to ALPN `/triblespace/pile-sync/16`.
+  pile-sync wire protocol forward.
 
 - Keep bearer blob handles out of provider-directory queries. `PROVIDER_GET`
-  now carries an opaque global provider key derived only from the handle; its
-  DHT prefix target is global as well. Only the final provider-facing
-  `GET_BLOB` receives the raw handle. Move the incompatible pile-sync wire
-  protocol to ALPN `/triblespace/pile-sync/15`.
+  carries an opaque global locator derived only from the handle; its DHT target
+  is global as well. The final provider-facing `GET_BLOB` also sends only that
+  locator and exchanges endpoint-bound mutual proofs, never the raw handle.
 
 - Report checked-refresh scope conflicts to nonempty exact-derived attachment
   before ticket discovery or mutation, while preserving the same serving-view

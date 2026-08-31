@@ -584,10 +584,9 @@ rather than the scan's.
 An intermediate design replaced grants with a `collection_reach` descriptor
 attribute. That design is retired too. Current descriptors carry mandatory,
 independent READ and WRITE policies; collection-scoped repair proves READ(C),
-commit admission proves WRITE(C), and READ-open collections may publish opaque
-KDF(H) provider keys for bearer lookup. Restricted collections publish no
-global key and serve exact H only inside an admitted READ(C) session. There is
-no ambient full-team inventory or separate durable gossip permission.
+and commit admission proves WRITE(C). Exact-content provider leases are instead
+derived from every served resident H and are independent of collection policy.
+There is no ambient full-team inventory or separate durable gossip permission.
 
 The semantic kind ID `9BB5B1F4D6FD8FB850B494C2CF51B5CA` (minted 2026-08-12,
 retired 2026-08-21) and its record kind
@@ -679,24 +678,20 @@ request; reopening a pile reconstructs the asserted set.
 | Blob | 1 | blob handle | zero | zero |
 | Merge | 2 | collection descriptor handle | lower input digest | higher input digest |
 | Derive | 4 | target descriptor handle | input digest | zero |
-| BlobInCollection | 5 | collection descriptor handle | blob handle | zero |
 
 The canonical key is `tag || A || B || C`: byte `0` is the versioned tag,
-`1..33` is A, `33..65` is B, and `65..97` is C. The Blob, Derive, and
-BlobInCollection decoders reject nonzero unused fields. Merge inputs must be in
+`1..33` is A, `33..65` is B, and `65..97` is C. The Blob and Derive decoders
+reject nonzero unused fields. Merge inputs must be in
 lexicographic order (`low <= high`), so operand order cannot create a second
 request key.
 
-The four request kinds deliberately share durability but not policy. Bare
-`Blob(H)` is a local-only fetch/retention intent. `BlobInCollection(C,H)` is a
-collection-routed intent whose exact `(C,H)` participates in assertion and
-retraction identity; local presence and bounded retention project every route
-for one handle onto the same `H`. `Merge` and `Derive` are durable questions
-about reproducible collection work; an answer is the corresponding native
-`MERGE` or `DERIVE` receipt already defined by `CollectionStore`, not mutable
-state inside the want. The storage format persists those questions
-independently of whether a local or remote worker eventually supplies the
-receipt.
+The three request kinds deliberately share durability but not policy.
+`Blob(H)` is the sole exact-content fetch/retention intent. `Merge` and
+`Derive` are durable questions about reproducible collection work; an answer is
+the corresponding native `MERGE` or `DERIVE` receipt already defined by
+`CollectionStore`, not mutable state inside the want. The storage format
+persists those questions independently of whether a local or remote worker
+eventually supplies the receipt.
 
 Blob assertions continue to be written under the historical weak-pin kind
 (`EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346`, rooted at
@@ -708,8 +703,7 @@ weak-unpin kind
 canonical `Blob` request. Keeping bare Blob writes on these kinds is essential
 to the envelope's forgetful-projection rule: an older reader sees the complete
 bare-Blob LWW history and may safely ignore the new independent typed request
-kinds. BlobInCollection uses the typed assertion/retraction envelope because
-its collection field participates in identity.
+kinds.
 
 ## Legacy unenveloped records
 

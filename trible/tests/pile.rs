@@ -506,19 +506,16 @@ fn diagnose_reports_healthy() {
 }
 
 #[test]
-fn diagnose_decodes_and_locates_collection_routed_blob_wants() {
+fn diagnose_decodes_and_locates_bearer_blob_wants() {
     let dir = tempdir().unwrap();
-    let pile_path = dir.path().join("routed-want.pile");
+    let pile_path = dir.path().join("blob-want.pile");
     std::fs::File::create(&pile_path).unwrap();
 
-    let collection = Inline::new([0x31; 32]);
     let handle = Inline::<Handle<UnknownBlob>>::new([0x42; 32]);
     let mut pile = Pile::open(&pile_path).unwrap();
-    pile.want(WantRequest::blob_in_collection(collection, handle))
-        .unwrap();
+    pile.want(WantRequest::blob(handle)).unwrap();
     pile.close().unwrap();
 
-    let collection_hex = hex::encode_upper(collection.raw);
     let handle_hex = hex::encode_upper(handle.raw);
     Command::cargo_bin("trible")
         .unwrap()
@@ -531,30 +528,26 @@ fn diagnose_decodes_and_locates_collection_routed_blob_wants() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("classification: want-assertion"))
-        .stdout(predicate::str::contains("request_kind: blob-in-collection"))
-        .stdout(predicate::str::contains(format!(
-            "collection: {collection_hex}"
-        )))
+        .stdout(predicate::str::contains(
+            "classification: want-assertion (legacy weak-pin encoding)",
+        ))
         .stdout(predicate::str::contains(format!("handle: {handle_hex}")));
 
-    for (needle, field) in [(&collection_hex, "collection"), (&handle_hex, "handle")] {
-        Command::cargo_bin("trible")
-            .unwrap()
-            .args([
-                "pile",
-                "diagnose",
-                "locate-hash",
-                pile_path.to_str().unwrap(),
-                needle,
-            ])
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(format!(
-                "typed want reference at byte 0 (request field {field})"
-            )))
-            .stdout(predicate::str::contains("want markers:   1"));
-    }
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "diagnose",
+            "locate-hash",
+            pile_path.to_str().unwrap(),
+            &handle_hex,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "want marker match at byte 0 (legacy weak-pin encoding)",
+        ))
+        .stdout(predicate::str::contains("want markers:   1"));
 }
 
 #[test]

@@ -490,11 +490,6 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  target: {}", hex::encode_upper(target.raw));
                 println!("  input: {}", hex::encode_upper(input.raw));
             }
-            WantRequest::BlobInCollection { collection, handle } => {
-                println!("  request_kind: blob-in-collection");
-                println!("  collection: {}", hex::encode_upper(collection.raw));
-                println!("  handle: {}", hex::encode_upper(handle.raw));
-            }
         }
     }
 
@@ -634,12 +629,6 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
             .collect(),
             WantRequest::Derive { target, input } => {
                 { [("target", target.raw), ("input", input.raw)] }
-                    .into_iter()
-                    .filter_map(|(field, value)| (value == *needle).then_some(field))
-                    .collect()
-            }
-            WantRequest::BlobInCollection { collection, handle } => {
-                [("collection", collection.raw), ("handle", handle.raw)]
                     .into_iter()
                     .filter_map(|(field, value)| (value == *needle).then_some(field))
                     .collect()

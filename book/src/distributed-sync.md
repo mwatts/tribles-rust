@@ -9,8 +9,8 @@ model:
 2. one READ(C)-authorized PATCH walk repairs the exact evidence which can
    change that collection's value; and
 3. exact blob handles fetch only the immutable bytes a resolver actually
-   chooses through collection-scoped provider discovery and an authenticated
-   collection session.
+   chooses through a collection-independent, mutually authenticated bearer
+   protocol.
 
 No global team, mutable roster, durable OFFER/GOSSIP bit, or second replicated
 inventory is needed. The collection descriptor already states independent
@@ -24,17 +24,16 @@ The boundaries are deliberately small:
 ```text
 know C           -> join C's wake topic and learn (origin, opaque state root)
 prove READ(C)    -> receive and repair C's activation evidence
-know H           -> authorize the exact immutable bytes H
-know C           -> discover a provider which proves READ(C) before H is revealed
+know H           -> derive its opaque locator, discover providers, and authorize H
 satisfy WRITE(C) -> make a signed COMMIT active in C
 ```
 
 `C` is the exact 32-byte collection descriptor handle. `H` is an exact blob
 handle. Knowing either value is already unforgeable naming power, but they do
 different jobs: `C` discovers a collection participant, while `H` is the bearer
-capability for one exact immutable value. Before the requester reveals `H`, the
-selected participant proves current READ(C); the provider directory never sees
-either raw handle.
+capability and private discovery secret for one exact immutable value. The
+provider directory sees only separately domain-separated KDF images and
+endpoint-bound tokens, never either raw handle.
 
 READ and WRITE are independent `AdmissionPolicy` values embedded in the
 descriptor. Each is either `Open` or a canonical quorum over Ed25519 roots with
@@ -127,11 +126,10 @@ two moments together and need no historical-root cache. The client validates
 node summaries, intrinsic leaf keys, record bodies, proof signatures, and claim
 handles before insertion.
 
-The exact-blob stream uses C only for private rendezvous. The provider proves
-READ(C) before the requester reveals H; possession of H then authorizes those
-exact resident bytes. Bare WANT(H) is local retention intent and has no network
-discovery promise. Full custody separately validates reachability through the
-authenticated disclosure forest before retaining payloads.
+Exact-content GET is not part of this collection stream. Full custody validates
+reachability through the authenticated disclosure forest before retaining
+payloads, while an independent exact-content request is authorized solely by
+knowledge of H.
 
 Repair is one-way pull. Two peers converge by each eventually pulling after a
 wake or periodic sweep. This keeps authorization and failure local to one
@@ -148,33 +146,31 @@ support-equivalent cover and request only the missing immutable handles that
 matter to that computation.
 
 Knowledge of a full content hash H is the read capability for those exact
-bytes. Discovery is nevertheless collection-scoped: the requester discovers
-participants through opaque KDF(C), verifies that a candidate proves READ(C)
-before revealing H, and then requests those exact resident bytes by H. The
-provider does not perform a second collection-membership check on H: the
-requester need not prove READ(C) merely to exercise a bearer handle it already
-holds. Fetching does not assert
-collection membership, activate a commit, or create a durable WANT unless the
-caller chooses to record one.
-
-Provider discovery never sends C to directory nodes. Both publication and
-lookup derive one full-width rendezvous key:
+bytes and the secret needed to discover them. Publication and lookup derive a
+full-width opaque locator under a dedicated domain:
 
 ```text
-provider_key = BLAKE3-KDF("triblespace.net/collection-provider-key/v1", C)
+L = BLAKE3-KDF("triblespace.net/blob-locator/v1", H)
 ```
 
-Providers renew one soft lease per active collection for that opaque key at
-nearby XOR-DHT nodes. Each lease carries an endpoint-binding token derived
-independently from C and the provider id; clients verify it before dialing. A
-lookup returns endpoint candidates, never bytes or authority. The directory is
-bounded soft state: routing and provider leases may disappear without changing
-the collection or local retention.
+Every served resident blob may renew a soft lease at L on nearby XOR-DHT
+nodes. The lease contains an independently domain-separated token bound to H
+and the provider's authenticated endpoint ID. A requester who knows H rejects
+forged candidate entries before dialing; the directory learns neither H nor
+collection membership.
 
-Autonomous provider publication follows active serving policy rather than a
-durable OFFER record. It is O(collections), not O(resident blobs). There is no
-global per-H directory and possession of a detached H does not promise global
-discovery; a caller needs a C route or an already-known provider.
+The direct stream also keeps H off the wire. The requester sends only L. The
+provider resolves L in its resident locator index and proves knowledge of H
+first, binding the proof to both authenticated endpoint IDs. Only after
+verifying that proof does the requester send its role-separated proof of H.
+The provider then returns bytes, which the requester hashes and compares with
+H. A party which merely copied L therefore cannot learn H from a requester or
+successfully serve bytes for it.
+
+Fetching neither asserts collection membership nor activates a commit. It does
+not consult C or READ(C), and creates a durable WANT only when the caller asks
+the `WantStore` to record `Blob(H)`. Provider leases are bounded soft state and
+may disappear without changing semantic data or local retention.
 
 ## Routing is process state
 
@@ -187,8 +183,7 @@ soft state; restarting may forget them without losing semantic data.
 One connection pool is shared by collection repair and bearer/DHT operations.
 Iroh's transport authentication binds each connection to its endpoint ID.
 There is no generic AUTH or SYNC_TEAM exchange: collection evidence is gated by
-READ(C). Exact bytes are gated by H, with the collection route additionally
-requiring the provider to prove READ(C) before the requester reveals H.
+READ(C). Exact bytes are gated only by the endpoint-bound mutual proof of H.
 
 ## Lattice-aware sparse replication
 
@@ -210,38 +205,26 @@ not remote publication authority and are not reused over the network in this
 release. Evidence and computation still converge by union; no central
 scheduler or query planner is required.
 
-Durable WANT remains orthogonal operational policy. Bare
-`WantRequest::Blob(H)` is local-only, while `BlobInCollection(C,H)` names the
-exact route through which the reconciler discovers `H`. For every pending
-route, it loads and validates C's descriptor policy from the same coherent
-store snapshot used to observe the WANT, then performs provider discovery under
-KDF(C). C need not be active or configured on the requester, and this lookup
-does not activate it. If C's descriptor is absent or malformed, the WANT stays
-pending; the reconciler neither guesses another collection nor falls back to a
-configured peer.
-Exact routes remain distinct intents even though local presence of `H`
-satisfies all of them. `Merge(C,a,b)` and `Derive(D,input)` let one process
-state demand while a network or worker process fulfills it. WANT grants no
-READ, WRITE, retention, or membership semantics.
-
-A bare blob WANT does not carry C and therefore triggers no network discovery.
-For a routed WANT, the provider proves READ(C) under the validated resident
-policy before the requester reveals bearer H. Multiple routes for one H share
-one fetch budget, and a successful durable landing satisfies every route plus
-any separate bare intent for H. The DHT never publishes or queries KDF(H).
+Durable WANT remains orthogonal operational policy.
+`WantRequest::Blob(H)` is the sole exact-content request. The reconciler
+performs KDF(H) discovery and the mutual bearer proof directly from its coherent
+store snapshot; no collection descriptor, activation, or proof is involved. A
+successful landing satisfies the request, while a DHT miss or failed proof
+leaves it pending. `Merge(C,a,b)` and `Derive(D,input)` let one process state
+demand while a network or worker process fulfills it. WANT grants no READ,
+WRITE, retention, or membership semantics.
 
 ## Wire surface
 
-Protocol version 20 keeps the direct operation set narrow:
+Protocol version 21 keeps the direct operation set narrow:
 
 | Operation | Code | Meaning |
 |---|---:|---|
-| `GET_BLOB` | `0x02` | low-level exact bearer transport after scoped discovery |
+| `GET_BLOB` | `0x02` | locator-addressed, mutual-proof exact bearer transport |
 | `PROVIDER_PUT` | `0x06` | renew this endpoint's opaque provider lease |
 | `PROVIDER_GET` | `0x07` | obtain bounded candidates for one opaque key |
 | `FIND_NODE` | `0x0C` | iterative XOR-DHT routing step |
 | `COLLECTION_REPAIR` | `0x0D` | receiver-authorized semantic and Full PATCH repair |
-| `COLLECTION_BLOB` | `0x0E` | provider-proved READ(C), then exact bearer H fetch |
 
 There is deliberately no store manifest, global inventory authorization,
 push-broadcast record, receipt RPC, remote mutable head, or unpublish operation.
@@ -272,6 +255,7 @@ collection identity and cannot change which evidence is semantically valid.
 - Concurrent writers and offline replicas reconverge without preserving pile
   byte order.
 
-The result is one elemental loop: gossip says *where to ask*, READ(C)-gated
-PATCH repair says *what changed*, and bearer content addressing retrieves only
-the immutable bytes the local lattice resolver decides to use.
+The result is two orthogonal elemental loops: gossip plus READ(C)-gated PATCH
+repair says *what changed in a collection*, while KDF(H) discovery plus mutual
+bearer proof retrieves only the immutable bytes the local lattice resolver
+decides to use.

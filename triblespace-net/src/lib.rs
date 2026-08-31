@@ -5,16 +5,15 @@
 //! portable WRITE evidence. A separate stock-gossip
 //! wake plane carries only a signed endpoint origin and opaque per-collection
 //! anti-entropy root; knowing the collection handle is its discovery
-//! capability, while every useful byte remains capability-gated. Exact content
-//! reads use collection-granular provider discovery under a domain-separated
-//! derived key of the collection handle. Before the requester reveals an exact
-//! blob handle, the selected endpoint must prove current READ authority for
-//! that collection. The handle itself then authorizes the exact bytes. Bare
-//! durable blob WANTs remain local retention intent; network discovery needs
-//! the collection route explicitly.
+//! capability, while every useful collection byte remains capability-gated.
+//! Exact content reads are independent: every served resident blob may publish
+//! a full-width opaque locator derived from its bearer handle H. The selected
+//! endpoint proves H before the requester proves H, both proofs bind their
+//! authenticated endpoint identities, and returned bytes must hash to H.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
+pub(crate) mod bearer;
 mod channel;
 pub mod collection_activation;
 pub mod collection_delta;

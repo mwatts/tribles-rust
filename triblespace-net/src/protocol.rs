@@ -2,23 +2,25 @@
 //!
 //! One QUIC stream carries one operation. Establishing the TLS connection
 //! grants no collection authority: `COLLECTION_REPAIR` carries READ(C)
-//! evidence in its own request. DHT provider operations carry only opaque,
-//! endpoint-bound collection rendezvous hints; exact reads remain inside an
-//! admitted collection session.
+//! evidence in its own request. Exact blob reads use only bearer-handle key
+//! confirmation. Collection identity and collection authority do not
+//! participate in exact discovery or transfer.
 
 use anybytes::{ByteArea, Bytes};
 use anyhow::{Result, anyhow};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{CapabilityProofBundle, MAX_CAPABILITY_PROOF_BUNDLE_BYTES};
 
+use crate::bearer::{blob_locator, proof_matches, provider_proof, requester_proof};
 use crate::transport::Conn;
+use crate::transport::PeerId;
 
 /// Clean collection-scoped protocol generation.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/20";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/21";
 
 // Operation types — first byte on each stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;
-// 0x05 was connection AUTH. None are accepted in v20.
+// 0x05 was connection AUTH. None are accepted in v21.
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_PROVIDER_PUT: u8 = 0x06;
 pub const OP_PROVIDER_GET: u8 = 0x07;
@@ -27,6 +29,9 @@ pub const OP_FIND_NODE: u8 = 0x0C;
 
 pub const PROVIDER_PUT_OK: u8 = 0x00;
 pub const PROVIDER_PUT_FULL: u8 = 0x01;
+
+const BLOB_UNAVAILABLE: u8 = 0x00;
+const BLOB_PROVIDER_PROOF: u8 = 0x01;
 
 pub type RawHash = [u8; 32];
 /// File-backed exact-transfer ceiling. Receives are serialized and land in a
@@ -128,18 +133,120 @@ pub async fn recv_capability_proof_bundle<R: AsyncRead + Unpin>(
     Ok(CapabilityProofBundle::from_bytes(&bytes)?)
 }
 
-/// Bearer exact GET by an already-known content handle.
-pub async fn op_get_blob<C: Conn>(conn: &C, hash: &RawHash) -> Result<Option<Bytes>> {
+/// Bearer exact GET without revealing the content handle.
+///
+/// The directory or caller has already selected a candidate. This stream
+/// discloses only `KDF(H)`. The candidate proves knowledge of `H` before the
+/// requester sends its own endpoint-bound proof.
+pub async fn op_get_blob<C: Conn>(
+    conn: &C,
+    requester: PeerId,
+    hash: &RawHash,
+) -> Result<Option<Bytes>> {
+    let provider = conn.remote_id();
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|error| anyhow!("open_bi: {error}"))?;
     send_u8(&mut send, OP_GET_BLOB).await?;
-    send_hash(&mut send, hash).await?;
+    fetch_get_blob_stream(&mut send, &mut recv, requester, provider, hash).await
+}
+
+async fn fetch_get_blob_stream<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    requester: PeerId,
+    provider: PeerId,
+    hash: &RawHash,
+) -> Result<Option<Bytes>>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    send_hash(send, &blob_locator(*hash)).await?;
+    let proof = match recv_u8(recv).await? {
+        BLOB_UNAVAILABLE => {
+            send.shutdown()
+                .await
+                .map_err(|error| anyhow!("finish: {error}"))?;
+            require_response_eof(recv).await?;
+            return Ok(None);
+        }
+        BLOB_PROVIDER_PROOF => recv_hash(recv).await?,
+        other => return Err(anyhow!("unknown exact-blob response: {other:#x}")),
+    };
+    let expected = provider_proof(*hash, requester, provider);
+    if !proof_matches(&proof, &expected) {
+        return Err(anyhow!("candidate failed bearer provider proof"));
+    }
+    send_hash(send, &requester_proof(*hash, requester, provider)).await?;
     send.shutdown()
         .await
         .map_err(|error| anyhow!("finish: {error}"))?;
-    recv_blob_response(&mut recv).await
+    let bytes = recv_blob_response(recv).await?;
+    if let Some(bytes) = bytes.as_ref()
+        && blake3::hash(bytes).as_bytes() != hash
+    {
+        return Err(anyhow!("exact blob bytes do not match bearer handle"));
+    }
+    Ok(bytes)
+}
+
+/// Serve one provider-first bearer key-confirmation exchange.
+pub(crate) async fn serve_get_blob<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    requester: PeerId,
+    provider: PeerId,
+    resolve: impl FnOnce(RawHash) -> Option<RawHash>,
+    get: impl FnOnce(RawHash) -> Option<Bytes>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let locator = recv_hash(recv).await?;
+    let Some(handle) = resolve(locator) else {
+        send_u8(send, BLOB_UNAVAILABLE).await?;
+        send.shutdown()
+            .await
+            .map_err(|error| anyhow!("finish: {error}"))?;
+        return Ok(());
+    };
+    send_u8(send, BLOB_PROVIDER_PROOF).await?;
+    send_hash(send, &provider_proof(handle, requester, provider)).await?;
+    let supplied = recv_hash(recv).await?;
+    require_response_eof(recv).await?;
+    let expected = requester_proof(handle, requester, provider);
+    if !proof_matches(&supplied, &expected) {
+        return Err(anyhow!("requester failed bearer proof"));
+    }
+    let bytes = get(handle);
+    send_blob_response(send, bytes.as_deref()).await?;
+    send.shutdown()
+        .await
+        .map_err(|error| anyhow!("finish: {error}"))?;
+    Ok(())
+}
+
+async fn send_blob_response<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    bytes: Option<&[u8]>,
+) -> Result<()> {
+    match bytes {
+        Some(bytes) => {
+            send_u64_be(
+                send,
+                u64::try_from(bytes.len()).expect("an addressable blob length fits u64"),
+            )
+            .await?;
+            send.write_all(bytes)
+                .await
+                .map_err(|error| anyhow!("send exact blob: {error}"))?;
+        }
+        None => send_u64_be(send, u64::MAX).await?,
+    }
+    Ok(())
 }
 
 /// Install or renew one opaque provider key for the TLS-authenticated caller.
@@ -282,6 +389,195 @@ pub(crate) async fn recv_exact_blob_body<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, duplex, split};
+
+    fn handle(bytes: &[u8]) -> RawHash {
+        *blake3::hash(bytes).as_bytes()
+    }
+
+    #[tokio::test]
+    async fn exact_get_mutual_proof_succeeds_without_a_collection() {
+        let requester = [7; 32];
+        let provider = [8; 32];
+        let content = b"bearer capability";
+        let content_handle = handle(content);
+        let (client, server) = duplex(4096);
+        let (mut client_recv, mut client_send) = split(client);
+        let (mut server_recv, mut server_send) = split(server);
+
+        let serving = tokio::spawn(async move {
+            serve_get_blob(
+                &mut server_recv,
+                &mut server_send,
+                requester,
+                provider,
+                |locator| (locator == blob_locator(content_handle)).then_some(content_handle),
+                |hash| (hash == content_handle).then(|| Bytes::from_source(content.to_vec())),
+            )
+            .await
+        });
+        let received = fetch_get_blob_stream(
+            &mut client_send,
+            &mut client_recv,
+            requester,
+            provider,
+            &content_handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(&*received, content);
+        serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_locator_advertiser_learns_no_handle_or_requester_proof() {
+        let requester = [11; 32];
+        let provider = [12; 32];
+        let content_handle = handle(b"secret bytes");
+        let expected_locator = blob_locator(content_handle);
+        let (client, server) = duplex(4096);
+        let (mut client_recv, mut client_send) = split(client);
+        let (mut server_recv, mut server_send) = split(server);
+
+        let fake = tokio::spawn(async move {
+            let observed = recv_hash(&mut server_recv).await.unwrap();
+            send_u8(&mut server_send, BLOB_PROVIDER_PROOF)
+                .await
+                .unwrap();
+            send_hash(&mut server_send, &[0; 32]).await.unwrap();
+            server_send.shutdown().await.unwrap();
+            let mut disclosed = Vec::new();
+            server_recv.read_to_end(&mut disclosed).await.unwrap();
+            (observed, disclosed)
+        });
+        let result = fetch_get_blob_stream(
+            &mut client_send,
+            &mut client_recv,
+            requester,
+            provider,
+            &content_handle,
+        )
+        .await;
+        drop(client_send);
+        drop(client_recv);
+        let (observed, disclosed) = fake.await.unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(observed, expected_locator);
+        assert_ne!(observed, content_handle);
+        assert!(disclosed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bad_requester_proof_reveals_no_blob_bytes() {
+        let requester = [17; 32];
+        let provider = [18; 32];
+        let content_handle = handle(b"provider-held secret");
+        let (client, server) = duplex(4096);
+        let (mut client_recv, mut client_send) = split(client);
+        let (mut server_recv, mut server_send) = split(server);
+
+        let serving = tokio::spawn(async move {
+            serve_get_blob(
+                &mut server_recv,
+                &mut server_send,
+                requester,
+                provider,
+                |locator| (locator == blob_locator(content_handle)).then_some(content_handle),
+                |_| panic!("blob storage must not be read before requester key confirmation"),
+            )
+            .await
+        });
+
+        send_hash(&mut client_send, &blob_locator(content_handle))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_u8(&mut client_recv).await.unwrap(),
+            BLOB_PROVIDER_PROOF
+        );
+        assert!(proof_matches(
+            &recv_hash(&mut client_recv).await.unwrap(),
+            &provider_proof(content_handle, requester, provider)
+        ));
+        send_hash(&mut client_send, &[0; 32]).await.unwrap();
+        client_send.shutdown().await.unwrap();
+
+        assert!(serving.await.unwrap().is_err());
+        let mut disclosed = Vec::new();
+        client_recv.read_to_end(&mut disclosed).await.unwrap();
+        assert!(disclosed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_get_with_wrong_handle_is_unavailable() {
+        let requester = [13; 32];
+        let provider = [14; 32];
+        let actual = handle(b"resident");
+        let requested = handle(b"not resident");
+        let (client, server) = duplex(4096);
+        let (mut client_recv, mut client_send) = split(client);
+        let (mut server_recv, mut server_send) = split(server);
+
+        let serving = tokio::spawn(async move {
+            serve_get_blob(
+                &mut server_recv,
+                &mut server_send,
+                requester,
+                provider,
+                |locator| (locator == blob_locator(actual)).then_some(actual),
+                |_| unreachable!("an unresolved locator cannot reach blob storage"),
+            )
+            .await
+        });
+        let received = fetch_get_blob_stream(
+            &mut client_send,
+            &mut client_recv,
+            requester,
+            provider,
+            &requested,
+        )
+        .await
+        .unwrap();
+
+        assert!(received.is_none());
+        serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_get_rejects_bytes_that_do_not_hash_to_the_handle() {
+        let requester = [15; 32];
+        let provider = [16; 32];
+        let expected = handle(b"expected");
+        let (client, server) = duplex(4096);
+        let (mut client_recv, mut client_send) = split(client);
+        let (mut server_recv, mut server_send) = split(server);
+
+        let serving = tokio::spawn(async move {
+            serve_get_blob(
+                &mut server_recv,
+                &mut server_send,
+                requester,
+                provider,
+                |locator| (locator == blob_locator(expected)).then_some(expected),
+                |_| Some(Bytes::from_source(b"wrong bytes".to_vec())),
+            )
+            .await
+        });
+        let result = fetch_get_blob_stream(
+            &mut client_send,
+            &mut client_recv,
+            requester,
+            provider,
+            &expected,
+        )
+        .await;
+
+        assert!(result.is_err());
+        serving.await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn proof_frame_bound_is_checked_before_body_allocation() {

@@ -17,8 +17,7 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::collection::{
-    CollectionHandle, CollectionPolicy, CollectionRead, CollectionStore,
-    next_authorization_change_at,
+    CollectionHandle, CollectionRead, CollectionStore, next_authorization_change_at,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -116,12 +115,12 @@ where
     qos: ReconcileQos,
     active: ActiveCollections,
     active_dirty: bool,
-    /// Active collections whose resident closure gained explicitly routed
-    /// bytes after the last published serving snapshot.
+    /// Active collections whose resident closure gained bytes from a Full
+    /// repair page after the last published serving snapshot.
     full_dirty: ActiveCollections,
-    /// Dirty Full-replica collections whose routed acquisition crossed its
-    /// own publication checkpoint. Partial pages remain dirty without entering
-    /// this set, so another collection's final page cannot publish them early.
+    /// Dirty Full-replica collections whose repair acquisition crossed its own
+    /// publication checkpoint. Partial pages remain dirty without entering this
+    /// set, so another collection's final page cannot publish them early.
     full_checkpointed: ActiveCollections,
     /// Network admissions stay outside the advertised snapshot until their
     /// shared durability barrier succeeds. A failed flush is retried on every
@@ -254,28 +253,11 @@ where
         self.refresh();
     }
 
-    /// Schedule one active Full-replica forest for reconstruction after a
-    /// collection-routed blob became durable.
-    ///
-    /// Bare blob possession carries no collection relation. Callers use this
-    /// seam only when the acquisition itself named `collection`.
-    pub(crate) fn mark_collection_blobs_dirty(&mut self, collection: CollectionHandle) -> bool {
-        if !matches!(self.qos.blobs, crate::inventory::BlobReplication::Full)
-            || self.active.get(&collection.raw).is_none()
-        {
-            return false;
-        }
-        self.full_dirty.insert(&PatchEntry::new(&collection.raw));
-        self.full_checkpointed
-            .insert(&PatchEntry::new(&collection.raw));
-        true
-    }
-
-    /// Bare WANT(H) is local retention intent and carries no discovery route.
-    /// Collection-aware callers use [`Self::fetch_collection_blob`] with C.
+    /// Discover and fetch the exact bytes named by bearer handle `H`.
     pub async fn fetch_wanted_blob(&self, hash: RawHash) -> Option<Bytes> {
-        let _ = hash;
-        None
+        self.sender
+            .fetch_blob(hash, host::INTERACTIVE_FETCH_DEADLINE)
+            .await
     }
 
     pub async fn fetch_wanted_blob_with_deadline(
@@ -283,50 +265,7 @@ where
         hash: RawHash,
         budget: std::time::Duration,
     ) -> Option<Bytes> {
-        let _ = (hash, budget);
-        None
-    }
-
-    /// Fetch exact bearer content through a collection-discovered provider.
-    /// The provider proves READ(C) before this endpoint reveals H; possession
-    /// of H then authorizes those exact bytes.
-    pub async fn fetch_collection_blob(
-        &self,
-        collection: CollectionHandle,
-        hash: RawHash,
-    ) -> Option<Bytes> {
-        self.sender
-            .fetch_collection_blob(collection, hash, host::INTERACTIVE_FETCH_DEADLINE)
-            .await
-    }
-
-    pub async fn fetch_collection_blob_with_deadline(
-        &self,
-        collection: CollectionHandle,
-        hash: RawHash,
-        budget: std::time::Duration,
-    ) -> Option<Bytes> {
-        self.sender
-            .fetch_collection_blob(collection, hash, budget)
-            .await
-    }
-
-    /// Fetch through a descriptor policy already validated against the
-    /// caller's coherent store snapshot.
-    ///
-    /// This internal seam lets the durable WANT reconciler route `(C, H)`
-    /// without making C an active collection. Public interactive fetches keep
-    /// using the active serving snapshot as their policy source.
-    pub(crate) async fn fetch_collection_blob_with_policy_and_deadline(
-        &self,
-        collection: CollectionHandle,
-        policy: CollectionPolicy,
-        hash: RawHash,
-        budget: std::time::Duration,
-    ) -> Option<Bytes> {
-        self.sender
-            .fetch_collection_blob_with_policy(collection, policy, hash, budget)
-            .await
+        self.sender.fetch_blob(hash, budget).await
     }
 
     /// Drain authenticated collection progress, cross one durability barrier,
@@ -541,6 +480,7 @@ where
                 &full_ready,
                 VerifyingKey::from_bytes(self.sender.id().as_bytes())
                     .expect("endpoint id is an Ed25519 key"),
+                self.last_store_snapshot.as_ref(),
                 previous_snapshot.as_deref(),
                 changes,
                 authorization_changed,
@@ -549,12 +489,13 @@ where
                 now,
             )
             .map_err(PeerSnapshotError::Overlay)?;
-            let provider_observation = ProviderObservation::from_collections(
+            let serves = self.qos.direction.serves();
+            let provider_observation = ProviderObservation::from_locators(
                 serving
                     .collections()
                     .map(|collection| collection.collection()),
-                self.qos.direction.serves(),
-                *self.sender.id().as_bytes(),
+                serves,
+                serving.bearer_locators(),
             );
             self.sender.update_snapshot(serving, &self.active);
             #[cfg(test)]
@@ -621,8 +562,7 @@ where
             .ok()
     }
 
-    /// Local lookup followed by durable local retention intent. Bare H carries
-    /// no discovery route, so collection-aware callers must fetch with C.
+    /// Local lookup followed by durable bearer-handle discovery and retention.
     pub async fn get_or_fetch_async(
         &mut self,
         hash: RawHash,

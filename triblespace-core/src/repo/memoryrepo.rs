@@ -43,9 +43,9 @@ pub struct MemoryRepo {
     pub blobs: MemoryBlobStore,
     /// LWW-resolved typed requests (see [`WantStore`]). In memory the
     /// last-writer-wins resolution is just insert/remove of the complete
-    /// request identity, including a collection route. Wants here are exactly
-    /// as ephemeral as the blobs themselves — the trait is a capability,
-    /// durability is the store's own property.
+    /// request identity. Wants here are exactly as ephemeral as the blobs
+    /// themselves — the trait is a capability, durability is the store's own
+    /// property.
     pub wants: HashSet<WantRequest>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: CollectionRecordIndex,
@@ -633,47 +633,6 @@ mod tests {
         // A later want wins over the earlier retraction.
         repo.want(first).unwrap();
         assert_eq!(repo.wants().unwrap().count(), 2);
-    }
-
-    #[test]
-    fn routed_blob_wants_keep_exact_identity_while_local_presence_satisfies_each() {
-        let blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"shared bytes".to_vec()));
-        let handle = blob.get_handle();
-        let first_route = WantRequest::blob_in_collection(Inline::new([3; 32]), handle);
-        let second_route = WantRequest::blob_in_collection(Inline::new([4; 32]), handle);
-        let local = WantRequest::blob(handle);
-
-        let mut repo = MemoryRepo::default();
-        repo.put::<UnknownBlob, _>(blob).unwrap();
-        for request in [second_route, local, first_route] {
-            repo.want(request).unwrap();
-        }
-
-        assert_eq!(
-            repo.wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![local, first_route, second_route]
-        );
-        let snapshot = repo.snapshot().unwrap();
-        for request in [local, first_route, second_route] {
-            let requested = request
-                .blob_handle()
-                .expect("all fixtures are blob requests");
-            assert!(snapshot.get::<Blob<UnknownBlob>, _>(requested).is_ok());
-        }
-        drop(snapshot);
-
-        repo.unwant(first_route).unwrap();
-        assert_eq!(
-            repo.wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![local, second_route],
-            "retracting one route must not erase another route or bare local intent"
-        );
     }
 
     #[test]

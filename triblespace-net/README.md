@@ -55,18 +55,23 @@ The QUIC/TLS connection authenticates endpoint identities but grants no team
 or collection authority. Every collection repair request names exactly one
 collection. The repair client presents its bounded READ(C) witness first. The
 server verifies the TLS client before revealing a manifest or PATCH leaf; the
-publisher itself needs no READ(C). Exact bearer fetch remains asymmetric in
-the other direction: the provider proves READ(C) before the requester reveals H. Claims and
-proofs are non-secret authorization certificates: a C-knower can elicit the
-server witness, but cannot learn collection data without READ(C). An endpoint with WRITE(C) but
-without READ(C) cannot learn collection records, WRITE evidence, or roots.
+publisher itself needs no READ(C). Claims and proofs are non-secret
+authorization certificates. A caller without READ(C) receives no collection
+manifest, PATCH leaf, record, WRITE evidence, or root; merely knowing C grants
+no disclosure.
 
-DHT `FIND_NODE` and provider-directory operations discover participants under
-opaque KDF(C), with a token binding each result to the advertised endpoint.
-There is one lease per active served collection, not one per resident blob.
-Before revealing bearer handle H, the requester verifies the candidate's
-READ(C) witness; the server then serves H only from C's admitted resident
-closure. No global KDF(H) oracle exists.
+DHT `FIND_NODE` and provider-directory operations use two independent opaque
+namespaces. KDF(C) locates participants for READ(C)-authorized collection
+repair. KDF(H) locates providers of exact resident content without naming a
+collection. Each exact-content lease carries a token derived from H and the
+provider endpoint, which a requester who knows H verifies before dialing.
+
+The exact stream never sends H. The authenticated provider proves knowledge of
+H first, bound to both TLS endpoint identities; only then does the requester
+return its independently domain-separated proof. A false locator advertiser
+therefore cannot make the requester disclose H or masquerade as a provider.
+Returned bytes are accepted only when they hash to H. READ(C) is not consulted
+by exact GET and remains exclusively the collection-repair disclosure boundary.
 
 ## Repair and wake
 
@@ -94,28 +99,26 @@ Direction is local policy:
   repair or service local WANTs.
 
 Configured endpoint addresses bootstrap gossip and DHT only. Repair targets
-come from signed wake origins or endpoint-bound KDF(C) leases; unrelated
-configured peers never receive C or its proofs.
+come from signed wake origins or endpoint-bound KDF(C) leases. Exact-content
+targets come from KDF(H) leases. Unrelated configured peers never receive C or
+its proofs.
 
 ## Exact content
 
 `BlobReplication::Demand` keeps exact reads lazy. A bare durable
-`WantRequest::Blob(H)` has no general discovery promise because it carries no
-collection route. Explicit `(C,H)` fetches discover providers
-through KDF(C), verify the provider's READ(C) witness, and then exercise H as
-the exact-byte capability. `BlobReplication::Full` instead walks a third,
-stream-pinned 80-byte-key disclosure-forest PATCH. Each key commits to depth,
-parent, aligned chunk index, and child handle; the receiver accepts roots only
-from locally WRITE-admitted COMMITs and descendants only after verifying the
-parent bytes. The same command and
-byte budgets paginate large mirrors across ordinary repair sessions.
+`WantRequest::Blob(H)` asks the reconciler to discover and obtain those exact
+bytes through KDF(H). It needs no collection descriptor, activation, or READ
+proof. `BlobReplication::Full` instead walks a third, stream-pinned
+80-byte-key disclosure-forest PATCH inside an admitted collection-repair
+session. Each key commits to depth, parent, aligned chunk index, and child
+handle; the receiver accepts roots only from locally WRITE-admitted COMMITs and
+descendants only after verifying the parent bytes. The same command and byte
+budgets paginate large mirrors across ordinary repair sessions.
 
-The durable WANT reconciler performs that same scoped fetch for
-`BlobInCollection(C,H)`. It loads and validates C's descriptor policy directly
-from the coherent store snapshot; C does not need to be active or configured
-on the requester. If the descriptor is absent or malformed, the request stays
-pending and no route is guessed. All exact request identities remain durable,
-while one landed H satisfies them locally with one per-handle fetch budget.
+All exact requests share the one `Blob(H)` identity. A successful landing
+satisfies the durable request locally; failed discovery leaves it pending.
+Collection membership, proof state, and activation are irrelevant to that
+exact-content operation.
 
 The full model, wire formats, authorization boundaries, and CLI surface live
 in the book's [Distributed Sync](https://docs.rs/triblespace/latest/triblespace/)

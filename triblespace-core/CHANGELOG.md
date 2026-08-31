@@ -9,10 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add canonical `WantRequest::BlobInCollection(C, H)` tag 5. Repository
-  implementations retain exact route identity; local presence satisfies every
-  route for `H`, and Yard charges one bounded-retention slot per unique `H`
-  without conflating a routed request with bare local-only `Blob(H)` intent.
+- Make canonical `WantRequest::Blob(H)` the sole durable exact-content
+  request. Repository implementations retain its exact identity, and Yard
+  charges one bounded-retention slot per requested handle.
 
 - Add independent descriptor-local READ and WRITE admission policies. Each is
   `Open` or a canonical multi-root quorum with invocation and optional
@@ -60,11 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make `YardSnapshot::blobs_diff` use the PATCH difference of the two immutable
+  live-set unions, so exact-provider locator refresh is proportional to changed
+  handles instead of relisting the complete Yard twice.
+
 - Project every resident descriptor, data, metadata, and aligned attachment in
   a strictly signed, WRITE-admitted COMMIT closure into a collection-scoped
-  snapshot index. Only READ-open collections also enter the global bearer
-  projection; restricted closure membership is consumed after READ(C)
-  admission.
+  snapshot index. Exact-content availability remains a separate,
+  collection-independent property of resident blobs.
 
 - Make store registration the sole source of typed collection values.
   `register_collection` validates a raw descriptor and returns the exact handle

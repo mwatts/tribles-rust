@@ -48,7 +48,7 @@ type WantIndex = PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema, WantEntry>;
 
 #[derive(Debug, Clone, Copy)]
 enum WantEntry {
-    /// One exact bare or collection-routed blob request.
+    /// One exact bearer blob request.
     Blob { last_used: u64 },
     /// One merge or derive question, which has no blob-retention projection.
     Operation,
@@ -57,8 +57,7 @@ enum WantEntry {
 #[derive(Debug, Default)]
 struct WantState {
     /// Every request is keyed by its complete canonical identity. Blob
-    /// requests additionally carry per-request recency; retention projects
-    /// all active routes onto unique handles only when applying the budget.
+    /// requests additionally carry per-request recency.
     requests: WantIndex,
     clock: u64,
 }
@@ -92,10 +91,8 @@ impl WantState {
     }
 
     fn trim_to_present_budget(&mut self, present: &HandleSet, budget: usize) -> HandleSet {
-        // Several exact requests may ask for one H: bare local intent and any
-        // number of collection routes. Local residency satisfies all of them,
-        // so cache pressure is charged once at the greatest active recency for
-        // H while request identity remains untouched.
+        // Blob requests are already unique by H. Keep the aggregation here so
+        // operation requests remain excluded from the retention budget.
         let mut by_handle = BTreeMap::<[u8; INLINE_LEN], u64>::new();
         for bytes in &self.requests {
             let request = WantRequest::from_bytes(*bytes)
@@ -1030,9 +1027,7 @@ impl WantStore for Yard {
 
     /// Assert one exact request and persist its marker to the young
     /// generation's pile, so it survives a restart ([`Yard::open`] reloads
-    /// it). Blob requests also refresh per-request LRU recency; collection
-    /// routes are projected to unique handles only when applying the cache
-    /// budget.
+    /// it). Blob requests also refresh per-request LRU recency.
     ///
     /// Automatic lazy reads call this only on a miss. Explicit callers may
     /// also want an already-resident blob; that assertion is persisted and
@@ -1298,6 +1293,18 @@ impl BlobStoreList for YardSnapshot {
     fn blobs(&self) -> Self::Iter<'_> {
         YardListIter {
             inner: self.live_set().into_iter(),
+            generations: self.generations.clone(),
+        }
+    }
+
+    /// PATCH-level difference across the immutable live unions of two Yard
+    /// observations. This keeps locator/publication refresh proportional to
+    /// the changed handles instead of relisting both complete inventories.
+    fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
+        let current = self.live_set();
+        let previous = old.live_set();
+        YardListIter {
+            inner: current.difference(&previous).into_iter(),
             generations: self.generations.clone(),
         }
     }
@@ -1769,6 +1776,31 @@ mod tests {
     }
 
     #[test]
+    fn yard_blob_difference_returns_only_new_live_handles() {
+        let (_dir, mut yard) = yard_with(2, YardConfig::default());
+        let empty = yard.snapshot().unwrap();
+        let first = yard
+            .put::<RawBytes, _>(raw_blob(b"first delta blob"))
+            .unwrap();
+        let after_first = yard.snapshot().unwrap();
+        let second = yard
+            .put::<RawBytes, _>(raw_blob(b"second delta blob"))
+            .unwrap();
+        let after_second = yard.snapshot().unwrap();
+
+        let first_delta = after_first
+            .blobs_diff(&empty)
+            .map(|info| info.unwrap().handle.raw)
+            .collect::<Vec<_>>();
+        let second_delta = after_second
+            .blobs_diff(&after_first)
+            .map(|info| info.unwrap().handle.raw)
+            .collect::<Vec<_>>();
+        assert_eq!(first_delta, vec![first.raw]);
+        assert_eq!(second_delta, vec![second.raw]);
+    }
+
+    #[test]
     fn yard_store_scope_is_idempotent_and_survives_reclaim_and_reopen() {
         let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
         let team = SigningKey::from_bytes(&[71; 32]).verifying_key();
@@ -1889,14 +1921,6 @@ mod tests {
             WantRequest::derive(Inline::new([5; INLINE_LEN]), Inline::new([7; INLINE_LEN]));
         let derive_high =
             WantRequest::derive(Inline::new([6; INLINE_LEN]), Inline::new([8; INLINE_LEN]));
-        let routed_low = WantRequest::blob_in_collection(
-            Inline::new([7; INLINE_LEN]),
-            Inline::<Handle<UnknownBlob>>::new([9; INLINE_LEN]),
-        );
-        let routed_high = WantRequest::blob_in_collection(
-            Inline::new([8; INLINE_LEN]),
-            Inline::<Handle<UnknownBlob>>::new([9; INLINE_LEN]),
-        );
         let expected = vec![
             blob_low,
             blob_high,
@@ -1904,8 +1928,6 @@ mod tests {
             merge_high,
             derive_low,
             derive_high,
-            routed_low,
-            routed_high,
         ];
 
         let mut state = WantState::default();
@@ -1922,9 +1944,6 @@ mod tests {
 
         state.unwant(merge_low);
         assert!(!state.requests().contains(&merge_low));
-        state.unwant(routed_low);
-        assert!(!state.requests().contains(&routed_low));
-        assert!(state.requests().contains(&routed_high));
     }
 
     fn pin_id(byte: u8) -> Id {
@@ -2710,59 +2729,6 @@ mod tests {
         );
         let reader = reopened.snapshot().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached blob"));
-    }
-
-    #[test]
-    fn routed_blob_wants_preserve_routes_but_share_one_retention_budget_slot() {
-        let config = YardConfig {
-            want_budget: 1,
-            ..YardConfig::default()
-        };
-        let (_dir, paths, mut yard) = yard_with_paths(1, config);
-        let blob = Blob::<RawBytes>::new(raw_blob(b"one resident blob, several intents"));
-        let handle = blob.get_handle();
-        yard.put::<RawBytes, _>(blob).unwrap();
-
-        let local = WantRequest::blob(handle);
-        let first_route = WantRequest::blob_in_collection(Inline::new([41; INLINE_LEN]), handle);
-        let second_route = WantRequest::blob_in_collection(Inline::new([42; INLINE_LEN]), handle);
-        for request in [local, first_route, second_route] {
-            yard.want(request).unwrap();
-        }
-        yard.unwant(first_route).unwrap();
-        assert_eq!(
-            yard.wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![local, second_route],
-            "route retraction must be exact rather than keyed only by H"
-        );
-        yard.want(first_route).unwrap();
-
-        yard.collect(&RetentionRoots::new()).unwrap();
-        assert!(yard.contains_in_generation(0, handle));
-        assert_eq!(
-            yard.wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![local, first_route, second_route],
-            "all identities over one resident H must survive one budget slot"
-        );
-
-        yard.reclaim().unwrap();
-        drop(yard);
-        let mut reopened = Yard::open(paths, config).unwrap();
-        assert!(reopened.contains_in_generation(0, handle));
-        assert_eq!(
-            reopened
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![local, first_route, second_route]
-        );
     }
 
     #[test]

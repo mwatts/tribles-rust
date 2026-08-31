@@ -936,10 +936,8 @@ impl StoreScopeRecordHeader {
 
 impl WantRecordHeader {
     /// Construct the physical envelope used by every non-bare typed want.
-    /// Bare blob wants deliberately retain the blob-want kind so an older
-    /// reader sees the same local-only projection as a current one. Routed
-    /// blob wants need this typed envelope because `(collection, handle)` is
-    /// their exact request identity.
+    /// Blob wants deliberately retain the compact native blob-want record;
+    /// their exact request identity is the bearer handle itself.
     fn new_typed(request: WantRequest, asserted: bool) -> Option<Self> {
         if matches!(request, WantRequest::Blob { .. }) {
             return None;
@@ -4169,9 +4167,7 @@ impl Pile {
                 WantRequest::Blob { handle } => self
                     .file
                     .write(BlobWantRecordHeader::new(handle, asserted).as_bytes()),
-                WantRequest::BlobInCollection { .. }
-                | WantRequest::Merge { .. }
-                | WantRequest::Derive { .. } => self.file.write(
+                WantRequest::Merge { .. } | WantRequest::Derive { .. } => self.file.write(
                     WantRecordHeader::new_typed(request, asserted)
                         .expect("non-bare want must have a typed envelope")
                         .as_bytes(),
@@ -8307,96 +8303,6 @@ mod tests {
             vec![merge, derive]
         );
         reopened.close().unwrap();
-    }
-
-    #[test]
-    fn routed_blob_wants_keep_full_identity_through_replay_and_rewrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = fresh_empty_pile_path(&dir, "routed-wants.pile");
-        let destination_path = fresh_empty_pile_path(&dir, "rewritten-routed-wants.pile");
-        let handle = Inline::<Handle<UnknownBlob>>::new([36; 32]);
-        let local = WantRequest::blob(handle);
-        let first_route = WantRequest::blob_in_collection(collection_test_collection(37), handle);
-        let second_route = WantRequest::blob_in_collection(collection_test_collection(38), handle);
-
-        let mut source = Pile::open(&source_path).unwrap();
-        source.want(local).unwrap();
-        source.want(first_route).unwrap();
-        source.want(second_route).unwrap();
-        source.unwant(first_route).unwrap();
-        source.flush().unwrap();
-
-        assert_eq!(
-            source
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![local, second_route],
-            "one route retraction must leave the other route and bare local intent"
-        );
-        source.close().unwrap();
-
-        let records = PileRecords::open(&source_path)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(records
-            .iter()
-            .all(|record| record.len == ENVELOPE_HEADER_LEN));
-        assert!(matches!(
-            records[0].content,
-            PileRecordContent::WeakPin { handle: actual } if actual == handle
-        ));
-        assert!(matches!(
-            records[1].content,
-            PileRecordContent::WantAssert { request } if request == first_route
-        ));
-        assert!(matches!(
-            records[2].content,
-            PileRecordContent::WantAssert { request } if request == second_route
-        ));
-        assert!(matches!(
-            records[3].content,
-            PileRecordContent::WantRetract { request } if request == first_route
-        ));
-
-        let mut source = Pile::open(&source_path).unwrap();
-        let mut destination = Pile::open(&destination_path).unwrap();
-        let stats = source
-            .rewrite_retained_into(
-                &mut destination,
-                &RetentionRoots::new(),
-                WantRewritePolicy::Preserve,
-            )
-            .unwrap();
-        assert_eq!(stats.wants, 2);
-        assert_eq!(
-            destination
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![local, second_route]
-        );
-        destination.close().unwrap();
-        source.close().unwrap();
-
-        let rewritten = PileRecords::open(&destination_path)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(rewritten
-            .iter()
-            .all(|record| record.len == ENVELOPE_HEADER_LEN));
-        assert!(matches!(
-            rewritten[0].content,
-            PileRecordContent::WeakPin { handle: actual } if actual == handle
-        ));
-        assert!(matches!(
-            rewritten[1].content,
-            PileRecordContent::WantAssert { request } if request == second_route
-        ));
     }
 
     #[test]

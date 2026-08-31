@@ -9,27 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Rebuild Full-replica disclosure forests only when a collection's activation
-  changes or bytes arrive through an explicit collection route. Full repair
-  pages and `BlobInCollection` fulfillment preserve that route through the
-  durability boundary, publication checkpoints are scoped per collection, and
-  unrelated blob appends reuse immutable forests.
+- Rebuild every active Full-replica disclosure forest whenever resident blobs
+  change. Exact H-only arrivals carry no collection provenance, so this
+  conservative invalidation lets a newly resident Merkle child advance every
+  affected payload root without reintroducing collection-coupled transfer.
+  Full repair page checkpoints remain scoped per collection.
 
 ### Added
 
-- Add `WantRequest::BlobInCollection(C, H)` as canonical request tag 5 in the
-  existing 97-byte codec. `MemoryRepo`, `Pile`, Yard, retained rewrites, and
-  pile diagnostics preserve the exact `(C, H)` request identity, while local
-  satisfaction and Yard's bounded retention budget project all routes onto one
-  unique `H`. Bare `Blob(H)` remains a distinct local-only intent, and no wire
-  protocol changes are included.
+- Make `WantRequest::Blob(H)` the sole durable exact-content request.
+  `MemoryRepo`, `Pile`, Yard, retained rewrites, and pile diagnostics preserve
+  its canonical identity, while collection-independent reconciliation can
+  satisfy it from the global exact-content provider directory.
 
-- Materialize durable `BlobInCollection(C, H)` requests through exact
-  collection-provider discovery. The reconciler validates C's resident
-  descriptor policy from its coherent store snapshot without activating C,
-  keeps absent or malformed descriptors pending, verifies the provider's
-  READ(C) witness before revealing H, and shares one fetch budget across all
-  routes for the same H. Bare `Blob(H)` remains local-only.
+- Add private exact-content discovery under the full-width, domain-separated
+  locator `L = KDF(H)`. DHT leases carry an H-bound endpoint token. On the
+  direct stream the authenticated provider proves knowledge of H first and the
+  requester proves it second, with both proofs bound to the two TLS endpoint
+  identities. H never crosses the wire, and returned bytes are accepted only
+  after hashing to H. Collection READ(C) remains solely the admission boundary
+  for collection anti-entropy and Full repair.
 
 - Add `pile collection init <PILE> <NAME> [--key PATH]` to register one
   canonical `SimpleArchive` root descriptor under an existing durable signing
@@ -64,8 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence inventory is deliberately independent of wall-clock expiry.
   Request-supplied READ proof forests have pure untyped admission and
   deterministic, current-instant, bounded selection seams; repair validates the
-  receiver's witness before revealing a manifest, while exact H fetch separately
-  requires the provider to prove READ(C) before H is revealed.
+  receiver's witness before revealing a manifest, while exact H fetch is an
+  independent mutual bearer-proof protocol which never transmits H.
 
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies
@@ -317,11 +316,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Replace per-artifact global publication with one endpoint-bound KDF(C) lease
-  per active served collection. The provider proves READ(C) before H is
-  revealed, then possession of H authorizes those exact resident bytes. Bare
-  WANT(H) remains local retention intent; routed C,H reads and Full custody use
-  collection discovery. Directory nodes see neither C nor H.
+- Separate collection repair discovery from exact-content discovery. Active
+  collections use endpoint-bound KDF(C) leases for READ(C)-authorized
+  anti-entropy, while every served resident blob uses an opaque KDF(H) lease
+  with an H-bound provider token. Directory nodes see neither C nor H, and
+  WANT(H) can be fulfilled without naming a collection.
 
 - Make store registration the sole source of typed collection values.
   `register_collection` validates a raw descriptor and returns the exact handle
@@ -2166,12 +2165,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once per `--collection` argument during startup.
 
 - Replace the global 8-bit provider-cover rendezvous with exact full-width
-  derived-key DHT PUT/GET leases. Directory requests still never carry bearer
-  blob handles, while unrelated artifacts no longer collapse onto 256 fixed
-  hotspots. The publication input remains the exact resident closure of
-  WRITE-admitted COMMITs in READ-open collections. Restricted collections use
-  READ(C)-scoped exact fetch rather than a global KDF(H) oracle. The
-  incompatible wire is now pile-sync ALPN v18.
+  derived-key DHT PUT/GET leases. Directory requests never carry bearer blob
+  handles, while unrelated artifacts no longer collapse onto 256 fixed
+  hotspots. Exact-content publication covers every served resident blob and
+  remains independent of collection READ policy. The incompatible wire uses a
+  new pile-sync ALPN generation, currently `/triblespace/pile-sync/21`.
 
 - Make nonempty exact-derived network attachment fail closed when refreshing
   discovers a conflicting store scope, rather than clearing the serving view

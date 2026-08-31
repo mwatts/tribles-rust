@@ -31,8 +31,8 @@ impl ReconcileDirection {
         !matches!(self, Self::WriteOnly)
     }
 
-    /// Whether inbound admitted readers may receive collection state and exact
-    /// public/bearer reads may be served.
+    /// Whether inbound admitted readers may receive collection state and
+    /// H-authorized bearer reads may be served.
     pub const fn serves(self) -> bool {
         !matches!(self, Self::ReadOnly)
     }

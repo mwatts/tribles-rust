@@ -4,7 +4,8 @@
 //! connection grants no team or collection authority. Each semantic repair is
 //! one stream whose request carries complete READ(C) evidence. DHT routing,
 //! provider-directory operations discover collection participants through an
-//! opaque KDF(C). Exact bytes stay inside the admitted collection stream.
+//! opaque KDF(C). Exact bytes use a separate H-only DHT rendezvous and mutual
+//! key-confirmation stream; collection identity never participates.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
@@ -19,36 +20,34 @@ use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::{UnknownBlob, simplearchive::SimpleArchive};
 use triblespace_core::capability::CapabilityProofBundle;
-use triblespace_core::collection::{CollectionHandle, CollectionPolicy, CollectionRecord};
+use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{BlobChildren, BlobStoreGet, StoreChanges, StoreRead};
 
+use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetCommand, NetEvent, NetEventBatch, SnapshotNotice};
 use crate::collection_activation::{
     CollectionActivationOverlay, CollectionActivationOverlayError, CollectionReadEvidenceError,
     collection_activation_overlay_at, collection_read_evidence_bundles_at,
 };
 use crate::collection_session::{
-    DisclosureForestPatch, FullReplicaCursor, FullReplicaState,
-    fetch_collection_blob as fetch_collection_blob_session, pull_collection, serve_collection_blob,
+    DisclosureForestPatch, FullReplicaCursor, FullReplicaState, pull_collection,
     serve_collection_repair,
 };
-use crate::collection_wire::{
-    MAX_COLLECTION_READ_BUNDLES, OP_COLLECTION_BLOB, OP_COLLECTION_REPAIR,
-};
+use crate::collection_wire::{MAX_COLLECTION_READ_BUNDLES, OP_COLLECTION_REPAIR};
 use crate::identity::iroh_secret;
 use crate::inventory::{BlobReplication, ReconcileQos};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::{
     OP_FIND_NODE, OP_GET_BLOB, OP_PROVIDER_GET, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL,
     PROVIDER_PUT_OK, RawHash, op_find_node, op_get_blob, op_provider_get, op_provider_put,
-    recv_hash, recv_u8, send_hash, send_u8, send_u64_be,
+    recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
 };
 use crate::provider::{
-    PROVIDER_LEASE_LIFETIME, ProviderDirectory, ProviderKey, ProviderObservation, ProviderToken,
-    collection_provider_key, collection_provider_token,
+    ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublisher, ProviderToken,
+    blob_provider_token, collection_provider_key, collection_provider_token, provider_lease_token,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
@@ -195,6 +194,7 @@ where
 pub(crate) struct StoreSnapshot {
     collections: CollectionSnapshotIndex,
     blobs: Arc<dyn BlobSnapshotReader>,
+    bearer_locators: Arc<BearerLocatorIndex>,
     observed_at: hifitime::Epoch,
     next_authorization_change: Option<hifitime::Epoch>,
 }
@@ -205,6 +205,7 @@ impl StoreSnapshot {
         active: &ActiveCollections,
         full_dirty: &ActiveCollections,
         local: VerifyingKey,
+        previous_store: Option<&R>,
         previous: Option<&Self>,
         changes: StoreChanges,
         authorization_changed: bool,
@@ -216,6 +217,17 @@ impl StoreSnapshot {
         R: StoreRead + BlobChildren + Clone,
     {
         let mut collections = CollectionSnapshotIndex::new();
+        let bearer_locators = match (previous_store, previous) {
+            (Some(previous_store), Some(previous)) if changes.contains(StoreChanges::BLOBS) => {
+                Arc::new(update_locator_index(
+                    &snapshot,
+                    previous_store,
+                    &previous.bearer_locators,
+                )?)
+            }
+            (_, Some(previous)) => previous.bearer_locators.clone(),
+            _ => Arc::new(locator_index(&snapshot)?),
+        };
         let blob_reader: Arc<dyn BlobSnapshotReader> =
             Arc::new(CloneableBlobSnapshotReader(Mutex::new(snapshot.clone())));
         let activation_inputs_changed = changes.contains(StoreChanges::BLOBS)
@@ -292,6 +304,7 @@ impl StoreSnapshot {
                 })
             } else if let Some(prior) = prior.as_ref().filter(|prior| {
                 Arc::ptr_eq(&activation, &prior.activation)
+                    && !changes.contains(StoreChanges::BLOBS)
                     && full_dirty.get(&collection.raw).is_none()
             }) {
                 prior.full.clone()
@@ -309,6 +322,7 @@ impl StoreSnapshot {
         Ok(Self {
             collections,
             blobs: blob_reader,
+            bearer_locators,
             observed_at: instant,
             next_authorization_change,
         })
@@ -353,8 +367,12 @@ impl StoreSnapshot {
         self.blobs.get_blob(*hash)
     }
 
-    fn get_bearer_blob(&self, hash: RawHash) -> Option<Bytes> {
-        self.get_blob(&hash)
+    fn bearer_handle(&self, locator: RawHash) -> Option<RawHash> {
+        self.bearer_locators.get(&locator).copied()
+    }
+
+    pub(crate) fn bearer_locators(&self) -> &BearerLocatorIndex {
+        &self.bearer_locators
     }
 }
 
@@ -364,17 +382,10 @@ type OperationalBlobSlot = Arc<Mutex<Option<Arc<dyn BlobSnapshotReader>>>>;
 
 /// The async capability cloned into lazy readers.
 pub(crate) trait NetCapability: Send + Sync {
-    fn fetch_collection_blob(
-        &self,
-        collection: CollectionHandle,
-        policy: CollectionPolicy,
-        hash: RawHash,
-    ) -> futures::future::BoxFuture<'static, Option<Bytes>>;
+    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>>;
 }
 
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
-type CollectionParticipants = Arc<Mutex<HashMap<[u8; 32], HashMap<PeerId, crate::clock::Mono>>>>;
-
 const MAX_COLLECTION_PARTICIPANTS: usize = 128;
 const COLLECTION_PARTICIPANT_LEASE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const PERIODIC_REPAIR_SAMPLE: usize = 8;
@@ -543,7 +554,6 @@ struct ProviderClient<T: Transport> {
     pool: SharedPool<T::Conn>,
     providers: Arc<Mutex<ProviderDirectory>>,
     candidates: RoutingCandidates,
-    participants: CollectionParticipants,
     my_id: PeerId,
 }
 
@@ -553,19 +563,14 @@ struct NetCap<T: Transport> {
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
-    fn fetch_collection_blob(
-        &self,
-        collection: CollectionHandle,
-        policy: CollectionPolicy,
-        hash: RawHash,
-    ) -> futures::future::BoxFuture<'static, Option<Bytes>> {
+    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>> {
         let client = self.client.clone();
         let can_fetch = self.can_fetch;
         Box::pin(async move {
             if !can_fetch {
                 return None;
             }
-            client.fetch_collection_blob(collection, policy, hash).await
+            client.fetch_blob(hash).await
         })
     }
 }
@@ -648,35 +653,9 @@ impl NetSender {
         }
     }
 
-    pub async fn fetch_collection_blob(
-        &self,
-        collection: CollectionHandle,
-        hash: RawHash,
-        budget: std::time::Duration,
-    ) -> Option<Bytes> {
-        let policy = self
-            .current_snapshot()?
-            .collection(collection)?
-            .activation
-            .policy()
-            .clone();
-        self.fetch_collection_blob_with_policy(collection, policy, hash, budget)
-            .await
-    }
-
-    pub(crate) async fn fetch_collection_blob_with_policy(
-        &self,
-        collection: CollectionHandle,
-        policy: CollectionPolicy,
-        hash: RawHash,
-        budget: std::time::Duration,
-    ) -> Option<Bytes> {
+    pub async fn fetch_blob(&self, hash: RawHash, budget: std::time::Duration) -> Option<Bytes> {
         tokio::time::timeout(budget, async {
-            self.ready_capability()
-                .await
-                .ok()?
-                .fetch_collection_blob(collection, policy, hash)
-                .await
+            self.ready_capability().await.ok()?.fetch_blob(hash).await
         })
         .await
         .ok()
@@ -788,8 +767,6 @@ const MAX_REQUESTS_PER_CONNECTION: usize = 16;
 const MAX_REQUESTS_GLOBAL: usize = 16;
 const MAX_CONCURRENT_REPAIRS: usize = 8;
 const MAX_PENDING_REPAIRS: usize = 512;
-const PROVIDER_RENEWAL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(PROVIDER_LEASE_LIFETIME.as_secs() / 2);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct RepairTarget {
@@ -802,6 +779,11 @@ struct RepairOutcome {
     success: bool,
     more: bool,
     full_cursor: Option<FullReplicaCursor>,
+}
+
+struct PublicationOutcome {
+    key: ProviderKey,
+    success: bool,
 }
 
 fn enqueue_repair(
@@ -933,13 +915,12 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     )));
     let participants = Arc::new(Mutex::new(HashMap::new()));
     let pool = new_shared_pool();
-    let providers = Arc::new(Mutex::new(ProviderDirectory::default()));
+    let providers = Arc::new(Mutex::new(ProviderDirectory::new(my_id)));
     let provider_client = ProviderClient {
         transport: transport.clone(),
         pool: pool.clone(),
         providers: providers.clone(),
         candidates: candidates.clone(),
-        participants: participants.clone(),
         my_id,
     };
     let cap = Arc::new(NetCap {
@@ -953,6 +934,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         candidates: candidates.clone(),
         providers: providers.clone(),
         serve_data: config.qos.direction.serves(),
+        local_id: my_id,
         inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
     };
@@ -988,8 +970,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut full_cursors: HashMap<RepairTarget, FullReplicaCursor> = HashMap::new();
     let mut current_roots: HashMap<[u8; 32], ([u8; 32], [u8; 32])> = HashMap::new();
     let mut next_period = crate::clock::mono_now();
-    let mut provider_due: HashMap<ProviderKey, (ProviderToken, crate::clock::Mono)> =
-        HashMap::new();
+    let mut publisher = ProviderPublisher::new(crate::clock::mono_now());
+    let (publication_tx, mut publication_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PublicationOutcome>();
+    let mut publications_in_flight = HashSet::new();
 
     loop {
         let mut disconnected = false;
@@ -1043,12 +1027,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     }
                 }
                 Ok(NetCommand::ProvidersUpdated(observation)) => {
-                    let set = observation.into_set();
-                    let now = crate::clock::mono_now();
-                    provider_due.retain(|key, _| set.contains(key));
-                    for (key, token) in set.iter() {
-                        provider_due.entry(key).or_insert((token, now));
-                    }
+                    publisher.install(observation.into_set(), crate::clock::mono_now());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1134,6 +1113,15 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 }
             }
         }
+        while let Ok(outcome) = publication_rx.try_recv() {
+            publications_in_flight.remove(&outcome.key);
+            if !outcome.success && !publisher.retry(outcome.key, crate::clock::mono_now()) {
+                warn!(
+                    key = %hex::encode(&outcome.key[..4]),
+                    "provider retry budget full; exact discovery is degraded until the renewal cursor returns"
+                );
+            }
+        }
         while let Ok((collection, peers)) = discovery_rx.try_recv() {
             if let Some(topic) = wake_topics.get(&collection.raw) {
                 let joined = peers
@@ -1141,30 +1129,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     .filter_map(|peer| EndpointId::from_bytes(peer).ok())
                     .collect();
                 let _ = topic.send(WakeCommand::Join(joined));
-            }
-            let descriptor_missing = wiring
-                .snapshot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_none_or(|snapshot| snapshot.get_blob(&collection.raw).is_none());
-            if descriptor_missing && !peers.is_empty() {
-                let client = provider_client.clone();
-                let events = wiring.evt_tx.clone();
-                let descriptor_peers = peers.clone();
-                tokio::spawn(async move {
-                    if let Some(bytes) = client
-                        .fetch_from_providers(collection.raw, descriptor_peers)
-                        .await
-                    {
-                        let mut batch = NetEventBatch::default();
-                        let _ = batch.try_push(NetEvent::Blob {
-                            expected: collection.raw,
-                            bytes,
-                        });
-                        let _ = events.send(batch).await;
-                    }
-                });
             }
             for peer in peers {
                 observe_participant(
@@ -1187,6 +1151,26 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             for raw in current_roots.keys() {
                 if config.qos.direction.pulls() {
                     let collection = CollectionHandle::new(*raw);
+                    let descriptor_missing = wiring
+                        .snapshot
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_none_or(|snapshot| snapshot.get_blob(raw).is_none());
+                    if descriptor_missing {
+                        let client = provider_client.clone();
+                        let events = wiring.evt_tx.clone();
+                        tokio::spawn(async move {
+                            if let Some(bytes) = client.fetch_blob(collection.raw).await {
+                                let mut batch = NetEventBatch::default();
+                                let _ = batch.try_push(NetEvent::Blob {
+                                    expected: collection.raw,
+                                    bytes,
+                                });
+                                let _ = events.send(batch).await;
+                            }
+                        });
+                    }
                     let client = provider_client.clone();
                     let discovery_tx = discovery_tx.clone();
                     tokio::spawn(async move {
@@ -1284,16 +1268,20 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
         }
 
-        let due = provider_due
-            .iter()
-            .filter_map(|(key, (token, due))| (*due <= now).then_some((*key, *token)))
-            .take(ALPHA)
-            .collect::<Vec<_>>();
-        for (key, token) in due {
-            provider_due.insert(key, (token, now + PROVIDER_RENEWAL_INTERVAL));
+        while publications_in_flight.len() < ALPHA {
+            let Some((key, identity)) = publisher.next(now) else {
+                break;
+            };
+            if !publications_in_flight.insert(key) {
+                let _ = publisher.retry(key, now);
+                break;
+            }
             let client = provider_client.clone();
+            let publication_tx = publication_tx.clone();
+            let token = provider_lease_token(identity, key, my_id);
             tokio::spawn(async move {
-                client.announce_key(key, token).await;
+                let success = client.announce_key(key, token).await;
+                let _ = publication_tx.send(PublicationOutcome { key, success });
             });
         }
 
@@ -1496,13 +1484,20 @@ impl<T: Transport> ProviderClient<T> {
         }
     }
 
-    async fn announce_key(&self, key: ProviderKey, token: ProviderToken) {
+    async fn announce_key(&self, key: ProviderKey, token: ProviderToken) -> bool {
         let targets = self.lookup_replicas(key).await;
-        futures::stream::iter(targets)
-            .for_each_concurrent(ALPHA, |peer| async move {
-                self.put(peer, key, token).await;
-            })
-            .await;
+        let mut attempts = futures::stream::iter(targets)
+            .map(|peer| async move { (peer, self.put(peer, key, token).await) })
+            .buffer_unordered(ALPHA);
+        let mut stored_remotely = false;
+        while let Some((peer, success)) = attempts.next().await {
+            stored_remotely |= remote_lease_accepted(self.my_id, peer, success);
+        }
+        // A local directory copy is useful for single-node reads but cannot
+        // make this endpoint discoverable after an isolated startup. Keep the
+        // publication in the retry schedule until at least one authenticated
+        // remote replica accepted it.
+        stored_remotely
     }
 
     async fn get(&self, peer: PeerId, key: ProviderKey) -> Vec<(PeerId, ProviderToken)> {
@@ -1553,15 +1548,18 @@ impl<T: Transport> ProviderClient<T> {
         let mut attempts = futures::stream::iter(providers)
             .map(|peer| async move {
                 let connection = pool_get(&self.transport, &self.pool, peer).await.ok()?;
-                let response =
-                    tokio::time::timeout(OP_DEADLINE, op_get_blob(connection.conn(), &hash)).await;
+                let response = tokio::time::timeout(
+                    OP_DEADLINE,
+                    op_get_blob(connection.conn(), self.my_id, &hash),
+                )
+                .await;
                 match response {
-                    Ok(Ok(Some(bytes))) if blake3::hash(&bytes).as_bytes() == &hash => {
+                    Ok(Ok(Some(bytes))) => {
                         self.candidates.lock().unwrap().promote_authenticated(peer);
                         Some(bytes)
                     }
                     Ok(Ok(None)) => None,
-                    Ok(Ok(Some(_))) | Ok(Err(_)) | Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         pool_invalidate(&self.pool, peer, &connection.entry);
                         None
                     }
@@ -1576,59 +1574,20 @@ impl<T: Transport> ProviderClient<T> {
         None
     }
 
-    /// Ask known collection participants directly, but reveal `hash` only
-    /// after the remote endpoint admits our READ(C) proof forest.
-    async fn fetch_collection_blob(
-        &self,
-        collection: CollectionHandle,
-        policy: CollectionPolicy,
-        hash: RawHash,
-    ) -> Option<Bytes> {
-        let peers = live_participants(
-            &mut self.participants.lock().unwrap(),
-            collection.raw,
-            crate::clock::mono_now(),
-        );
-        let mut peers = peers;
-        for peer in self
-            .find_key(
-                collection_provider_key(collection),
-                collection_provider_token,
-                collection.raw,
-            )
+    /// Discover candidates only from H, then complete the H-only handshake.
+    async fn fetch_blob(&self, hash: RawHash) -> Option<Bytes> {
+        let providers = self
+            .find_key(blob_locator(hash), blob_provider_token, hash)
             .await
-        {
-            if !peers.contains(&peer) {
-                peers.push(peer);
-            }
-        }
-        let mut attempts = futures::stream::iter(peers)
-            .filter(|peer| futures::future::ready(*peer != self.my_id))
-            .map(|peer| {
-                let policy = policy.clone();
-                async move {
-                    let connection = pool_get(&self.transport, &self.pool, peer).await.ok()?;
-                    let response =
-                        fetch_collection_blob_session(connection.conn(), collection, policy, hash)
-                            .await;
-                    match response {
-                        Ok(Some(bytes)) if blake3::hash(&bytes).as_bytes() == &hash => Some(bytes),
-                        Ok(None) => None,
-                        Ok(Some(_)) | Err(_) => {
-                            pool_invalidate(&self.pool, peer, &connection.entry);
-                            None
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(ALPHA);
-        while let Some(result) = attempts.next().await {
-            if result.is_some() {
-                return result;
-            }
-        }
-        None
+            .into_iter()
+            .filter(|peer| *peer != self.my_id)
+            .collect();
+        self.fetch_from_providers(hash, providers).await
     }
+}
+
+fn remote_lease_accepted(local: PeerId, replica: PeerId, accepted: bool) -> bool {
+    replica != local && accepted
 }
 
 #[derive(Clone)]
@@ -1637,6 +1596,7 @@ struct SnapshotHandler {
     candidates: RoutingCandidates,
     providers: Arc<Mutex<ProviderDirectory>>,
     serve_data: bool,
+    local_id: PeerId,
     inbound_connections: Arc<tokio::sync::Semaphore>,
     inbound_requests: Arc<tokio::sync::Semaphore>,
 }
@@ -1712,35 +1672,6 @@ impl SnapshotHandler {
         let span = debug_span!("stream", op = op_name(op));
         let _entered = span.enter();
         match op {
-            OP_COLLECTION_BLOB => {
-                let snapshot = self.snapshot.lock().unwrap().clone();
-                let blob_snapshot = snapshot.clone();
-                serve_collection_blob(
-                    recv,
-                    send,
-                    move |collection| {
-                        snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.collection(collection))
-                            .map(|collection| {
-                                (
-                                    collection.activation.clone(),
-                                    collection.read_evidence.clone(),
-                                )
-                            })
-                    },
-                    move |_collection, hash| {
-                        self.serve_data
-                            .then(|| {
-                                blob_snapshot
-                                    .as_ref()
-                                    .and_then(|snapshot| snapshot.get_bearer_blob(hash))
-                            })
-                            .flatten()
-                    },
-                )
-                .await?;
-            }
             OP_COLLECTION_REPAIR => {
                 if !self.serve_data {
                     serve_collection_repair(recv, send, peer, |_| None, |_, _| None).await?;
@@ -1766,30 +1697,36 @@ impl SnapshotHandler {
                         move |_collection, hash| {
                             blob_snapshot
                                 .as_ref()
-                                .and_then(|snapshot| snapshot.get_bearer_blob(hash))
+                                .and_then(|snapshot| snapshot.get_blob(&hash))
                         },
                     )
                     .await?;
                 }
             }
             OP_GET_BLOB => {
-                if !self.serve_data {
-                    anyhow::bail!("local direction policy does not serve data");
-                }
-                let hash = recv_hash(recv).await?;
-                require_stream_eof(recv).await?;
-                let bytes = self
-                    .snapshot
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.get_bearer_blob(hash));
-                if let Some(bytes) = bytes {
-                    send_u64_be(send, bytes.len() as u64).await?;
-                    send.write_all(&bytes).await?;
-                } else {
-                    send_u64_be(send, u64::MAX).await?;
-                }
+                let snapshot = self.snapshot.lock().unwrap().clone();
+                let blob_snapshot = snapshot.clone();
+                serve_get_blob(
+                    recv,
+                    send,
+                    peer.to_bytes(),
+                    self.local_id,
+                    move |locator| {
+                        self.serve_data
+                            .then(|| {
+                                snapshot
+                                    .as_ref()
+                                    .and_then(|snapshot| snapshot.bearer_handle(locator))
+                            })
+                            .flatten()
+                    },
+                    move |handle| {
+                        blob_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.get_blob(&handle))
+                    },
+                )
+                .await?;
             }
             OP_PROVIDER_PUT => {
                 let key = recv_hash(recv).await?;
@@ -1864,7 +1801,6 @@ fn op_name(op: u8) -> &'static str {
         OP_PROVIDER_GET => "PROVIDER_GET",
         OP_FIND_NODE => "FIND_NODE",
         OP_COLLECTION_REPAIR => "COLLECTION_REPAIR",
-        OP_COLLECTION_BLOB => "COLLECTION_BLOB",
         _ => "UNKNOWN",
     }
 }
@@ -1889,19 +1825,18 @@ mod tests {
     use triblespace_core::patch::{Entry as PatchEntry, PATCH};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{
-        BlobStorePut, SnapshotSource, StorageFlush, StoreChanges,
-        StoreSnapshot as CoreStoreSnapshot, WantRequest, WantStore,
+        BlobStorePut, SnapshotSource, StoreChanges, StoreSnapshot as CoreStoreSnapshot,
     };
     use triblespace_core::trible::{Fragment, Trible, TribleSet};
 
     use crate::channel::{NetEvent, NetEventBatch};
     use crate::inventory::{BlobReplication, ReconcileQos};
     use crate::peer::Peer;
-    use crate::reconcile::Reconciler;
 
     use super::{
         ActiveCollections, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
         RepairTarget, StoreSnapshot, enqueue_repair, live_participants, observe_participant,
+        remote_lease_accepted,
     };
 
     fn fragment(seed: u8, value: Inline<Handle<UnknownBlob>>) -> Fragment {
@@ -1944,7 +1879,15 @@ mod tests {
     }
 
     #[test]
-    fn full_forests_rebuild_only_for_changed_activation_or_explicit_route() {
+    fn local_directory_acceptance_does_not_complete_remote_publication() {
+        let local = [1; 32];
+        assert!(!remote_lease_accepted(local, local, true));
+        assert!(!remote_lease_accepted(local, [2; 32], false));
+        assert!(remote_lease_accepted(local, [2; 32], true));
+    }
+
+    #[test]
+    fn full_forests_rebuild_on_every_blob_change_or_explicit_dirty_mark() {
         let key = SigningKey::from_bytes(&[0x31; 32]);
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
         let mut store = MemoryRepo::default();
@@ -1966,6 +1909,7 @@ mod tests {
             &active,
             &clean,
             key.verifying_key(),
+            None,
             None,
             StoreChanges::ALL,
             false,
@@ -1989,6 +1933,7 @@ mod tests {
             &active,
             &clean,
             key.verifying_key(),
+            Some(&first_store),
             Some(&first_serving),
             second_store.changes_since(&first_store),
             false,
@@ -1998,9 +1943,9 @@ mod tests {
         )
         .unwrap();
         let first_changed = full(&second_serving, first);
-        let second_unchanged = full(&second_serving, second);
+        let second_changed = full(&second_serving, second);
         assert!(!Arc::ptr_eq(&first_before, &first_changed));
-        assert!(Arc::ptr_eq(&second_before, &second_unchanged));
+        assert!(!Arc::ptr_eq(&second_before, &second_changed));
 
         store
             .put::<UnknownBlob, _>(Bytes::from_source(b"another unrelated cache blob".to_vec()))
@@ -2011,6 +1956,7 @@ mod tests {
             &active,
             &clean,
             key.verifying_key(),
+            Some(&second_store),
             Some(&second_serving),
             third_store.changes_since(&second_store),
             false,
@@ -2019,19 +1965,17 @@ mod tests {
             observed_at(),
         )
         .unwrap();
-        assert!(Arc::ptr_eq(&first_changed, &full(&third_serving, first)));
-        assert!(Arc::ptr_eq(
-            &second_unchanged,
-            &full(&third_serving, second)
-        ));
+        assert!(!Arc::ptr_eq(&first_changed, &full(&third_serving, first)));
+        assert!(!Arc::ptr_eq(&second_changed, &full(&third_serving, second)));
 
-        let mut routed = ActiveCollections::new();
-        routed.insert(&PatchEntry::new(&second.handle().raw));
-        let routed_serving = StoreSnapshot::from_store_changes(
-            third_store,
+        let mut dirty = ActiveCollections::new();
+        dirty.insert(&PatchEntry::new(&second.handle().raw));
+        let dirty_serving = StoreSnapshot::from_store_changes(
+            third_store.clone(),
             &active,
-            &routed,
+            &dirty,
             key.verifying_key(),
+            Some(&third_store),
             Some(&third_serving),
             StoreChanges::NONE,
             false,
@@ -2042,12 +1986,72 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(
             &full(&third_serving, first),
-            &full(&routed_serving, first)
+            &full(&dirty_serving, first)
         ));
         assert!(!Arc::ptr_eq(
             &full(&third_serving, second),
-            &full(&routed_serving, second)
+            &full(&dirty_serving, second)
         ));
+    }
+
+    #[test]
+    fn generic_blob_arrival_advances_an_active_full_forest() {
+        let key = SigningKey::from_bytes(&[0x35; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let child_bytes = Bytes::from_source(b"bearer-fetched child".to_vec());
+        let child = Blob::<UnknownBlob>::new(child_bytes.clone()).get_handle();
+        let mut store = MemoryRepo::default();
+        let collection = store.collection("generic-full-arrival", policy).unwrap();
+        store.commit(collection, &key, fragment(11, child)).unwrap();
+        let active = active([collection]);
+        let clean = ActiveCollections::new();
+        let before_store = store.snapshot().unwrap();
+        let before = StoreSnapshot::from_store_changes(
+            before_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            None,
+            None,
+            StoreChanges::ALL,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        let before_payload = before.notices()[0].2;
+        assert!(
+            !full(&before, collection)
+                .forest
+                .iter_ordered()
+                .any(|entry| entry[48..] == child.raw)
+        );
+
+        store.put::<UnknownBlob, _>(child_bytes).unwrap();
+        let after_store = store.snapshot().unwrap();
+        let after = StoreSnapshot::from_store_changes(
+            after_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            Some(&before_store),
+            Some(&before),
+            after_store.changes_since(&before_store),
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+
+        assert_ne!(before_payload, after.notices()[0].2);
+        assert!(
+            full(&after, collection)
+                .forest
+                .iter_ordered()
+                .any(|entry| entry[48..] == child.raw)
+        );
     }
 
     #[tokio::test]
@@ -2112,7 +2116,10 @@ mod tests {
         assert!(final_acked.try_recv().is_ok());
         let after = observer.current_snapshot().unwrap();
         assert!(!Arc::ptr_eq(&before, &after));
-        assert!(Arc::ptr_eq(&untouched_before, &full(&after, untouched)));
+        assert!(
+            !Arc::ptr_eq(&untouched_before, &full(&after, untouched)),
+            "H-only blob arrivals conservatively invalidate every active Full forest"
+        );
         assert!(
             full(&after, collection)
                 .forest
@@ -2122,7 +2129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_page_checkpoints_only_its_own_collection() {
+    async fn any_published_blob_arrival_invalidates_every_active_full_forest() {
         let key = SigningKey::from_bytes(&[0x34; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
@@ -2179,12 +2186,12 @@ mod tests {
         assert!(partial_acked.try_recv().is_ok());
         assert!(completed_acked.try_recv().is_ok());
         let interleaved_snapshot = observer.current_snapshot().unwrap();
-        assert!(Arc::ptr_eq(
+        assert!(!Arc::ptr_eq(
             &partial_before,
             &full(&interleaved_snapshot, partial)
         ));
         assert!(
-            !full(&interleaved_snapshot, partial)
+            full(&interleaved_snapshot, partial)
                 .forest
                 .iter_ordered()
                 .any(|key| key[48..] == child_handle.raw)
@@ -2210,119 +2217,6 @@ mod tests {
                 .forest
                 .iter_ordered()
                 .any(|key| key[48..] == child_handle.raw)
-        );
-    }
-
-    #[tokio::test]
-    async fn durable_collection_want_marks_only_its_active_full_forest() {
-        let key = SigningKey::from_bytes(&[0x33; 32]);
-        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let routed_bytes = Bytes::from_source(b"externally fulfilled routed child".to_vec());
-        let routed = Blob::<UnknownBlob>::new(routed_bytes.clone()).get_handle();
-        let bare_bytes = Bytes::from_source(b"externally fulfilled bare child".to_vec());
-        let bare = Blob::<UnknownBlob>::new(bare_bytes.clone()).get_handle();
-        let mut store = MemoryRepo::default();
-        let routed_collection = store
-            .collection("routed-want-full", policy.clone())
-            .unwrap();
-        let bare_collection = store.collection("bare-want-full", policy.clone()).unwrap();
-        let late_route_collection = store.collection("late-route-full", policy).unwrap();
-        store
-            .commit(routed_collection, &key, fragment(6, routed))
-            .unwrap();
-        store
-            .commit(bare_collection, &key, fragment(7, bare))
-            .unwrap();
-        store
-            .commit(late_route_collection, &key, fragment(8, routed))
-            .unwrap();
-        let (sender, receiver, _wiring) = super::wire(id);
-        let observer = sender.clone();
-        let mut peer = Peer::with_wiring(
-            store,
-            ReconcileQos {
-                direction: crate::inventory::ReconcileDirection::Bidirectional,
-                blobs: BlobReplication::Full,
-            },
-            sender,
-            receiver,
-        );
-        peer.activate_collections([
-            routed_collection.handle(),
-            bare_collection.handle(),
-            late_route_collection.handle(),
-        ]);
-        let before = observer.current_snapshot().unwrap();
-        let routed_before = full(&before, routed_collection);
-        let bare_before = full(&before, bare_collection);
-        let late_route_before = full(&before, late_route_collection);
-        {
-            let mut store = peer.store();
-            store.put::<UnknownBlob, _>(routed_bytes).unwrap();
-            store.put::<UnknownBlob, _>(bare_bytes).unwrap();
-            store
-                .want(WantRequest::blob_in_collection(
-                    routed_collection.handle(),
-                    routed,
-                ))
-                .unwrap();
-            store.want(WantRequest::blob(bare)).unwrap();
-            store.flush().unwrap();
-        }
-
-        let mut reconciler = Reconciler::new();
-        reconciler.tick(&mut peer).await;
-
-        let after = observer.current_snapshot().unwrap();
-        assert!(!Arc::ptr_eq(
-            &routed_before,
-            &full(&after, routed_collection)
-        ));
-        assert!(Arc::ptr_eq(&bare_before, &full(&after, bare_collection)));
-        assert!(
-            full(&after, routed_collection)
-                .forest
-                .iter_ordered()
-                .any(|key| key[48..] == routed.raw)
-        );
-        assert!(
-            !full(&after, bare_collection)
-                .forest
-                .iter_ordered()
-                .any(|key| key[48..] == bare.raw)
-        );
-        assert!(Arc::ptr_eq(
-            &late_route_before,
-            &full(&after, late_route_collection)
-        ));
-
-        {
-            let mut store = peer.store();
-            store
-                .want(WantRequest::blob_in_collection(
-                    late_route_collection.handle(),
-                    routed,
-                ))
-                .unwrap();
-            store.flush().unwrap();
-        }
-        reconciler.tick(&mut peer).await;
-
-        let after_late_route = observer.current_snapshot().unwrap();
-        assert!(Arc::ptr_eq(
-            &full(&after, routed_collection),
-            &full(&after_late_route, routed_collection)
-        ));
-        assert!(!Arc::ptr_eq(
-            &late_route_before,
-            &full(&after_late_route, late_route_collection)
-        ));
-        assert!(
-            full(&after_late_route, late_route_collection)
-                .forest
-                .iter_ordered()
-                .any(|key| key[48..] == routed.raw)
         );
     }
 

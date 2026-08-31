@@ -149,11 +149,10 @@ The exact `ACTION_READ` capability over one collection descriptor handle.
 Network repair presents a bounded proof forest for the authenticated endpoint
 and the descriptor's READ policy. Knowing the collection handle permits joining
 its opaque wake topic, but does not reveal records, proofs, counts, or blobs;
-those cross only after READ(C) admission. `Open` READ needs no proof. A
-READ-open collection may advertise opaque KDF(H) provider keys and knowing H is
-then the bearer capability. A restricted collection advertises no global key;
-READ(C) admits an exact-H request only within that collection's resident
-closure.
+collection evidence crosses only after READ(C) admission. `Open` READ needs no
+proof. Exact immutable content is a separate bearer system: every served
+resident H may be advertised under opaque KDF(H), and exact GET neither names a
+collection nor consults READ(C).
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
@@ -269,7 +268,6 @@ entities or handles referencing larger blobs.
 
 ### WANT
 A durable operational request for a blob or for an existing merge/derive
-result. Bare `Blob(H)` is local-only; `BlobInCollection(C,H)` identifies a
-collection route without changing the fact that resident `H` satisfies every
-route. WANT is operational policy: it neither adds collection authority nor
-changes a collection's logical value.
+result. `Blob(H)` is the sole exact-content request and can be fulfilled through
+collection-independent KDF(H) discovery. WANT is operational policy: it
+neither adds collection authority nor changes a collection's logical value.

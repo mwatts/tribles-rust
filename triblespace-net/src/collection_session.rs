@@ -9,8 +9,8 @@ use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{CapabilityProofBundle, CapabilityProofId};
 use triblespace_core::collection::{
-    CollectionHandle, CollectionPolicy, CollectionRecord,
-    collection_reader_is_admitted_by_policy_at, collection_writer_is_admitted_by_policy_at,
+    CollectionHandle, CollectionRecord, collection_reader_is_admitted_by_policy_at,
+    collection_writer_is_admitted_by_policy_at,
 };
 use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 
@@ -21,10 +21,9 @@ use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{
     CollectionRepairAdmission, CollectionRepairCommand, CollectionRepairComponent,
     CollectionRepairManifest, recv_repair_admission, recv_repair_blob_response,
-    recv_repair_challenge, recv_repair_collection, recv_repair_command, recv_repair_hello,
-    recv_repair_node_response, send_repair_admission, send_repair_blob_request,
-    send_repair_blob_response, send_repair_challenge, send_repair_done, send_repair_evidence,
-    send_repair_node_request, send_repair_node_response,
+    recv_repair_collection, recv_repair_command, recv_repair_hello, recv_repair_node_response,
+    send_repair_admission, send_repair_blob_request, send_repair_blob_response, send_repair_done,
+    send_repair_evidence, send_repair_node_request, send_repair_node_response,
 };
 use crate::patch_repair::{
     PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary, patch_node_response,
@@ -241,74 +240,6 @@ pub(crate) async fn pull_collection<C: Conn>(
         full,
     )
     .await
-}
-
-/// Fetch one exact resident artifact through a collection-scoped READ session.
-///
-/// The handle is sent only after the remote endpoint proves READ(C). Possession
-/// of H then authorizes those exact bytes; the caller presents no READ proof.
-/// A conforming server answers any resident hash-matching H: the handle itself
-/// is the byte-read capability.
-pub(crate) async fn fetch_collection_blob<C: Conn>(
-    conn: &C,
-    collection: triblespace_core::collection::CollectionHandle,
-    policy: CollectionPolicy,
-    handle: [u8; 32],
-) -> Result<Option<Bytes>> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    crate::protocol::send_u8(&mut send, crate::collection_wire::OP_COLLECTION_BLOB).await?;
-    crate::protocol::send_hash(&mut send, &collection.raw).await?;
-    let Some(remote_evidence) = recv_repair_challenge(&mut recv).await? else {
-        send.shutdown().await?;
-        require_eof(&mut recv).await?;
-        return Ok(None);
-    };
-    let remote = VerifyingKey::from_bytes(&conn.remote_id())?;
-    if !collection_reader_is_admitted_by_policy_at(
-        collection,
-        &policy,
-        remote,
-        &remote_evidence,
-        crate::clock::epoch_now(),
-    ) {
-        send.shutdown().await?;
-        return Ok(None);
-    }
-    crate::protocol::send_hash(&mut send, &handle).await?;
-    send.shutdown().await?;
-    let bytes = recv_repair_blob_response(&mut recv).await?;
-    require_eof(&mut recv).await?;
-    Ok(bytes)
-}
-
-pub(crate) async fn serve_collection_blob<R, W>(
-    recv: &mut R,
-    send: &mut W,
-    lookup: impl FnOnce(
-        CollectionHandle,
-    ) -> Option<(
-        Arc<CollectionActivationOverlay>,
-        Arc<[CapabilityProofBundle]>,
-    )>,
-    disclosed_blob: impl FnOnce(CollectionHandle, [u8; 32]) -> Option<Bytes>,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let collection = recv_repair_collection(recv).await?;
-    let Some((_overlay, read_evidence)) = lookup(collection) else {
-        send_repair_challenge(send, None).await?;
-        send.shutdown().await?;
-        return Ok(());
-    };
-    send_repair_challenge(send, Some(&read_evidence)).await?;
-    let handle = crate::protocol::recv_hash(recv).await?;
-    require_eof(recv).await?;
-    let bytes = disclosed_blob(collection, handle);
-    send_repair_blob_response(send, bytes.as_deref()).await?;
-    send.shutdown().await?;
-    Ok(())
 }
 
 async fn pull_collection_stream<W, R>(

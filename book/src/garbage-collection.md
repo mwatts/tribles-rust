@@ -93,8 +93,8 @@ missing, and an invalidly signed proof roots nothing. This signature check
 establishes only a safe local lifetime edge: semantic authority still requires
 an external trust root, expected leaf, instant, and exact request.
 Blob WANT records are an explicit rewrite choice. Preserving them copies each
-exact bare or collection-routed demand marker but does not promote the
-requested blob to an ownership root; dropping them omits the markers entirely.
+exact demand marker but does not promote the requested blob to an ownership
+root; dropping them omits the markers entirely.
 
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
 collection registry. A caller selecting one semantic view must rediscover its

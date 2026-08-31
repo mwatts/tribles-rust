@@ -28,7 +28,6 @@ use crate::protocol::{
 /// `0x0D` was a pre-v17 provider-cover operation. The ALPN generation change
 /// deliberately frees the byte for this clean-slate meaning.
 pub(crate) const OP_COLLECTION_REPAIR: u8 = 0x0D;
-pub(crate) const OP_COLLECTION_BLOB: u8 = 0x0E;
 
 /// Maximum portable READ proof branches accepted at one session boundary.
 pub(crate) const MAX_COLLECTION_READ_BUNDLES: usize = 16;
@@ -41,7 +40,6 @@ pub(crate) const MAX_COLLECTION_LEAF_BYTES: usize = MAX_CAPABILITY_PROOF_BUNDLE_
 const REPAIR_ADMITTED: u8 = 0x00;
 const REPAIR_REJECTED: u8 = 0x01;
 const REPAIR_UNAVAILABLE: u8 = 0x02;
-const REPAIR_CHALLENGE: u8 = 0x03;
 
 const REQUEST_NODE: u8 = 0x01;
 const REQUEST_BLOB: u8 = 0x02;
@@ -210,29 +208,6 @@ pub(crate) async fn recv_repair_evidence<R: AsyncRead + Unpin>(
     Ok(read_evidence)
 }
 
-pub(crate) async fn send_repair_challenge<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    read_evidence: Option<&[CapabilityProofBundle]>,
-) -> Result<()> {
-    match read_evidence {
-        Some(evidence) => {
-            send_u8(send, REPAIR_CHALLENGE).await?;
-            send_repair_evidence(send, evidence).await
-        }
-        None => send_u8(send, REPAIR_UNAVAILABLE).await,
-    }
-}
-
-pub(crate) async fn recv_repair_challenge<R: AsyncRead + Unpin>(
-    recv: &mut R,
-) -> Result<Option<Vec<CapabilityProofBundle>>> {
-    match recv_u8(recv).await? {
-        REPAIR_CHALLENGE => Ok(Some(recv_repair_evidence(recv).await?)),
-        REPAIR_UNAVAILABLE => Ok(None),
-        other => bail!("unknown collection repair challenge {other:#x}"),
-    }
-}
-
 pub(crate) async fn send_repair_admission<W: AsyncWrite + Unpin>(
     send: &mut W,
     admission: CollectionRepairAdmission,
@@ -358,7 +333,7 @@ pub(crate) async fn recv_repair_command<R: AsyncRead + Unpin>(
     }
 }
 
-/// Return one exact bearer blob without ending the authenticated session.
+/// Return one exact resident member without ending the authenticated session.
 /// `u64::MAX` means no bytes are available for the requested exact handle in
 /// this snapshot.
 pub(crate) async fn send_repair_blob_response<W: AsyncWrite + Unpin>(
