@@ -19,15 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add local `Demand | Full` payload QoS. Full repair pins a canonical 80-byte
   disclosure-forest PATCH and accepts only locally authenticated roots and
   parent-byte-verified edges, with bounded partial progress on the same session.
+- Service durable `BlobInCollection(C, H)` requests through exact KDF(C)
+  provider lookup. The reconciler loads and validates the resident descriptor
+  policy from one store snapshot without activating C; absent or malformed
+  descriptors remain pending, bare `Blob(H)` never triggers network discovery,
+  and one landed H satisfies every durable route identity for that handle.
 
 ### Changed
 
 - Replace team-scoped connection authorization and global inventory with
   immutable per-collection activation overlays. Provider discovery is one
   endpoint-bound KDF(C) lease per active served collection; no resident H is
-  published globally. Collection-agnostic blob WANTs infer candidate
-  collections from admitted direct roots, verify a provider's READ(C) witness
-  before revealing bearer H, and accept bytes only from C's resident closure.
+  published globally. Collection-routed blob WANTs use only their exact C,
+  verify a provider's READ(C) witness before revealing bearer H, and never
+  infer routes from configured peers, active collections, or resident bytes.
 - Move the incompatible direct protocol to ALPN
   `/triblespace/pile-sync/20`. Anti-entropy is receiver-authorized by READ(C);
   scoped bearer GET is asymmetric because possession of H is read authority,

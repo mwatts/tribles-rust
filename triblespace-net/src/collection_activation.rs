@@ -353,7 +353,7 @@ where
     })
 }
 
-fn load_collection_policy<R>(
+pub(crate) fn load_collection_policy<R>(
     snapshot: &R,
     collection: CollectionHandle,
 ) -> Result<CollectionPolicy, CollectionDescriptorError<R::GetError<Infallible>>>

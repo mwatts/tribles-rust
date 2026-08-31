@@ -240,6 +240,12 @@ to perform work. They are durable coordination-free questions which a
 reconciler may satisfy by fetching content or unioning a matching native
 equation into the local store.
 
+The network reconciler validates C's resident descriptor policy from its
+coherent store snapshot and uses exact KDF(C) provider discovery without adding
+C to the peer's active collection set. Missing or malformed descriptor bytes
+leave the routed WANT pending; bare `Blob(H)` and configured peers never become
+implicit fallback routes.
+
 Keeping WANT orthogonal prevents evidence convergence from becoming
 involuntary blob mirroring. A peer can repair a READ-authorized collection's
 activation overlay, then decide which blobs and derived representations are

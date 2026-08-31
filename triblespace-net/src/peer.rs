@@ -17,7 +17,8 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRead, CollectionStore, next_authorization_change_at,
+    CollectionHandle, CollectionPolicy, CollectionRead, CollectionStore,
+    next_authorization_change_at,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -262,6 +263,24 @@ where
     ) -> Option<Bytes> {
         self.sender
             .fetch_collection_blob(collection, hash, budget)
+            .await
+    }
+
+    /// Fetch through a descriptor policy already validated against the
+    /// caller's coherent store snapshot.
+    ///
+    /// This internal seam lets the durable WANT reconciler route `(C, H)`
+    /// without making C an active collection. Public interactive fetches keep
+    /// using the active serving snapshot as their policy source.
+    pub(crate) async fn fetch_collection_blob_with_policy_and_deadline(
+        &self,
+        collection: CollectionHandle,
+        policy: CollectionPolicy,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> Option<Bytes> {
+        self.sender
+            .fetch_collection_blob_with_policy(collection, policy, hash, budget)
             .await
     }
 

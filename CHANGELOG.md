@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unique `H`. Bare `Blob(H)` remains a distinct local-only intent, and no wire
   protocol changes are included.
 
+- Materialize durable `BlobInCollection(C, H)` requests through exact
+  collection-provider discovery. The reconciler validates C's resident
+  descriptor policy from its coherent store snapshot without activating C,
+  keeps absent or malformed descriptors pending, verifies the provider's
+  READ(C) witness before revealing H, and shares one fetch budget across all
+  routes for the same H. Bare `Blob(H)` remains local-only.
+
 - Add `pile collection init <PILE> <NAME> [--key PATH]` to register one
   canonical `SimpleArchive` root descriptor under an existing durable signing
   key's direct READ and WRITE authority. It prints the exact descriptor handle,

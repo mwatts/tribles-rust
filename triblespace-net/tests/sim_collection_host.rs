@@ -1,6 +1,7 @@
 //! End-to-end collection-host cutover coverage over deterministic transport.
 #![cfg(feature = "sim")]
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anybytes::Bytes;
@@ -24,12 +25,14 @@ use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+    BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource, StorageFlush,
+    WantRequest, WantStore,
 };
 use triblespace_core::trible::{Fragment, Trible, TribleSet};
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::{BlobReplication, ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
+use triblespace_net::reconcile::{ReconcileStats, Reconciler};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 fn key(byte: u8) -> SigningKey {
@@ -517,5 +520,145 @@ fn restricted_full_replica_progresses_parent_first_without_orphan_disclosure() {
             Some(payload),
             "the requester needs H, not READ(C), after the provider proves READ(C)"
         );
+    }));
+}
+
+#[test]
+fn durable_routed_want_materializes_via_exact_collection_key_without_activation() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC74, SimConfig::default());
+        let server_key = key(41);
+        let reader_key = key(42);
+        let read_root = key(43);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(read_root.verifying_key()),
+            AdmissionPolicy::Open,
+        );
+
+        let mut server_store = MemoryRepo::default();
+        let collection = server_store
+            .collection("routed-want-provider", policy.clone())
+            .unwrap();
+        let wrong_collection = server_store
+            .collection("routed-want-wrong-route", policy.clone())
+            .unwrap();
+        let payload = Bytes::from_source(b"durable collection-routed WANT".to_vec());
+        let payload_handle = server_store.put::<UnknownBlob, _>(payload.clone()).unwrap();
+        store_bundle(
+            &mut server_store,
+            bundle(
+                &read_root,
+                &server_key,
+                CapabilityAction::new(ACTION_READ),
+                collection.handle(),
+            ),
+        );
+
+        let mut reader_store = MemoryRepo::default();
+        let reader_collection = reader_store
+            .collection("routed-want-provider", policy.clone())
+            .unwrap();
+        let reader_wrong_collection = reader_store
+            .collection("routed-want-wrong-route", policy)
+            .unwrap();
+        assert_eq!(reader_collection.handle(), collection.handle());
+        assert_eq!(reader_wrong_collection.handle(), wrong_collection.handle());
+        let bare = WantRequest::blob(payload_handle);
+        let wrong_route =
+            WantRequest::blob_in_collection(wrong_collection.handle(), payload_handle);
+        for request in [bare, wrong_route] {
+            reader_store.want(request).unwrap();
+        }
+        reader_store.flush().unwrap();
+
+        let server_id = server_key.verifying_key().to_bytes();
+        let mut server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+        );
+        let mut reader = bring_up(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_id],
+            ReconcileDirection::ReadOnly,
+        );
+        server.activate_collection(collection.handle());
+        // Deliberately do not activate either collection on the requester.
+        advance(&clock, &mut [&mut server, &mut reader], 4).await;
+
+        let mut reconciler = Reconciler::with_backoff(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .with_fetch_budget(std::time::Duration::from_secs(2));
+        let mut wrong_tick = Box::pin(reconciler.tick(&mut reader));
+        let wrong_stats = loop {
+            tokio::select! {
+                stats = &mut wrong_tick => break stats,
+                () = SimNet::step(&clock, std::time::Duration::from_millis(100)) => {
+                    server.refresh();
+                }
+            }
+        };
+        drop(wrong_tick);
+        assert_eq!(
+            wrong_stats,
+            ReconcileStats {
+                wants: 2,
+                missing: 2,
+                attempted: 1,
+                fulfilled: 0,
+                pending: 2,
+            },
+            "a configured provider of H is not a fallback for the wrong KDF(C) route"
+        );
+        assert_eq!(reader.try_local(payload_handle.raw), None);
+
+        let exact_route = WantRequest::blob_in_collection(collection.handle(), payload_handle);
+        {
+            let mut store = reader.store();
+            store.want(exact_route).unwrap();
+            store.flush().unwrap();
+        }
+        let mut exact_tick = Box::pin(reconciler.tick(&mut reader));
+        let exact_stats = loop {
+            tokio::select! {
+                stats = &mut exact_tick => break stats,
+                () = SimNet::step(&clock, std::time::Duration::from_millis(100)) => {
+                    server.refresh();
+                }
+            }
+        };
+        drop(exact_tick);
+        assert_eq!(
+            exact_stats,
+            ReconcileStats {
+                wants: 3,
+                missing: 3,
+                attempted: 1,
+                fulfilled: 3,
+                pending: 0,
+            },
+            "one exact (C,H) fetch satisfies every durable identity for H"
+        );
+        assert_eq!(reader.try_local(payload_handle.raw), Some(payload));
+        let wants: BTreeSet<_> = {
+            let mut store = reader.store();
+            store.wants().unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(wants, BTreeSet::from([bare, wrong_route, exact_route]));
     }));
 }

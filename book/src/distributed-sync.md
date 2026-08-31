@@ -212,16 +212,23 @@ scheduler or query planner is required.
 
 Durable WANT remains orthogonal operational policy. Bare
 `WantRequest::Blob(H)` is local-only, while `BlobInCollection(C,H)` names the
-collection route through which a reconciler may disclose or discover `H`.
+exact route through which the reconciler discovers `H`. For every pending
+route, it loads and validates C's descriptor policy from the same coherent
+store snapshot used to observe the WANT, then performs provider discovery under
+KDF(C). C need not be active or configured on the requester, and this lookup
+does not activate it. If C's descriptor is absent or malformed, the WANT stays
+pending; the reconciler neither guesses another collection nor falls back to a
+configured peer.
 Exact routes remain distinct intents even though local presence of `H`
 satisfies all of them. `Merge(C,a,b)` and `Derive(D,input)` let one process
 state demand while a network or worker process fulfills it. WANT grants no
 READ, WRITE, retention, or membership semantics.
 
-A blob WANT does not carry C and therefore promises no network discovery. A
-collection-aware caller can explicitly fetch `(C, H)`: discovery uses KDF(C),
-the provider proves READ(C), and only then does the requester reveal bearer H.
-The DHT never publishes or queries KDF(H).
+A bare blob WANT does not carry C and therefore triggers no network discovery.
+For a routed WANT, the provider proves READ(C) under the validated resident
+policy before the requester reveals bearer H. Multiple routes for one H share
+one fetch budget, and a successful durable landing satisfies every route plus
+any separate bare intent for H. The DHT never publishes or queries KDF(H).
 
 ## Wire surface
 

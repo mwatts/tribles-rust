@@ -660,6 +660,17 @@ impl NetSender {
             .activation
             .policy()
             .clone();
+        self.fetch_collection_blob_with_policy(collection, policy, hash, budget)
+            .await
+    }
+
+    pub(crate) async fn fetch_collection_blob_with_policy(
+        &self,
+        collection: CollectionHandle,
+        policy: CollectionPolicy,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> Option<Bytes> {
         tokio::time::timeout(budget, async {
             self.ready_capability()
                 .await

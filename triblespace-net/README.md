@@ -110,6 +110,13 @@ from locally WRITE-admitted COMMITs and descendants only after verifying the
 parent bytes. The same command and
 byte budgets paginate large mirrors across ordinary repair sessions.
 
+The durable WANT reconciler performs that same scoped fetch for
+`BlobInCollection(C,H)`. It loads and validates C's descriptor policy directly
+from the coherent store snapshot; C does not need to be active or configured
+on the requester. If the descriptor is absent or malformed, the request stays
+pending and no route is guessed. All exact request identities remain durable,
+while one landed H satisfies them locally with one per-handle fetch budget.
+
 The full model, wire formats, authorization boundaries, and CLI surface live
 in the book's [Distributed Sync](https://docs.rs/triblespace/latest/triblespace/)
 chapter.

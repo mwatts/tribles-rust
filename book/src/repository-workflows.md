@@ -350,10 +350,13 @@ Sparse evidence discovery deliberately does not fetch commit dependencies.
 A collection route participates in WANT identity, so retracting `(C1,H)` does
 not retract `(C2,H)` or bare `Blob(H)`. Local presence of `H` nevertheless
 satisfies every route, and retention budgets charge it once. A reconciler may
-satisfy those questions from local workers or peers. The answer to an operation
-WANT is the ordinary native equation; obtaining its result bytes is a separate
-blob WANT. A WANT grants no authority and does not change the value of any
-collection.
+satisfy those questions from local workers or peers. For a routed blob request,
+the network reconciler validates the resident C descriptor from its store
+snapshot and looks up providers only under KDF(C), without activating C. An
+absent or malformed descriptor leaves the request pending, and a bare blob
+request never supplies a network route. The answer to an operation WANT is the
+ordinary native equation; obtaining its result bytes is a separate blob WANT.
+A WANT grants no authority and does not change the value of any collection.
 
 ## Migrate a legacy branch explicitly
 
