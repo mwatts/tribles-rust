@@ -299,6 +299,13 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- Make `#[value_formatter]` WASM generation concurrency-safe. A cold parallel
+  workspace build can race after both macro processes observe the same missing
+  final path, then invoke `rustc` against the same stem and scratch object names;
+  one linker may read the other's partial object while the other successfully
+  produces the final `.wasm`. Compile under a per-stem inter-process lock or to
+  unique temporary paths followed by an atomic publish, and retain the existing
+  content-derived final name.
 - Add a separate bounded cache planner for useful unsigned `MERGE`/`DERIVE`
   equations and materialized results. Strong retention intentionally ignores
   them—even when accepted and active—so append-only cache work cannot
