@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `WantRequest::BlobInCollection(C, H)` as canonical request tag 5 in the
+  existing 97-byte codec. `MemoryRepo`, `Pile`, Yard, retained rewrites, and
+  pile diagnostics preserve the exact `(C, H)` request identity, while local
+  satisfaction and Yard's bounded retention budget project all routes onto one
+  unique `H`. Bare `Blob(H)` remains a distinct local-only intent, and no wire
+  protocol changes are included.
+
 - Add `pile collection init <PILE> <NAME> [--key PATH]` to register one
   canonical `SimpleArchive` root descriptor under an existing durable signing
   key's direct READ and WRITE authority. It prints the exact descriptor handle,

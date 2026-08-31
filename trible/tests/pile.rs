@@ -8,15 +8,16 @@ use triblespace::prelude::BlobStoreList;
 use triblespace::prelude::SnapshotSource;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::{
     descriptor, AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionStoreExt,
 };
-use triblespace_core::inline::encodings::hash::{Blake3, Hash};
+use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::CapabilityProofRead;
+use triblespace_core::repo::{CapabilityProofRead, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 
 fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
@@ -502,6 +503,58 @@ fn diagnose_reports_healthy() {
         .assert()
         .success()
         .stdout(predicate::str::contains("healthy"));
+}
+
+#[test]
+fn diagnose_decodes_and_locates_collection_routed_blob_wants() {
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("routed-want.pile");
+    std::fs::File::create(&pile_path).unwrap();
+
+    let collection = Inline::new([0x31; 32]);
+    let handle = Inline::<Handle<UnknownBlob>>::new([0x42; 32]);
+    let mut pile = Pile::open(&pile_path).unwrap();
+    pile.want(WantRequest::blob_in_collection(collection, handle))
+        .unwrap();
+    pile.close().unwrap();
+
+    let collection_hex = hex::encode_upper(collection.raw);
+    let handle_hex = hex::encode_upper(handle.raw);
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "diagnose",
+            "record-at",
+            pile_path.to_str().unwrap(),
+            "0",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("classification: want-assertion"))
+        .stdout(predicate::str::contains("request_kind: blob-in-collection"))
+        .stdout(predicate::str::contains(format!(
+            "collection: {collection_hex}"
+        )))
+        .stdout(predicate::str::contains(format!("handle: {handle_hex}")));
+
+    for (needle, field) in [(&collection_hex, "collection"), (&handle_hex, "handle")] {
+        Command::cargo_bin("trible")
+            .unwrap()
+            .args([
+                "pile",
+                "diagnose",
+                "locate-hash",
+                pile_path.to_str().unwrap(),
+                needle,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "typed want reference at byte 0 (request field {field})"
+            )))
+            .stdout(predicate::str::contains("want markers:   1"));
+    }
 }
 
 #[test]

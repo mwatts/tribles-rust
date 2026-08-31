@@ -210,10 +210,13 @@ not remote publication authority and are not reused over the network in this
 release. Evidence and computation still converge by union; no central
 scheduler or query planner is required.
 
-Durable WANT remains orthogonal local policy. `WantRequest::Blob(H)`,
-`Merge(C,a,b)`, and `Derive(D,input)` let one process state demand while a
-network or worker process fulfills it. WANT grants no READ, WRITE, retention,
-or membership semantics.
+Durable WANT remains orthogonal operational policy. Bare
+`WantRequest::Blob(H)` is local-only, while `BlobInCollection(C,H)` names the
+collection route through which a reconciler may disclose or discover `H`.
+Exact routes remain distinct intents even though local presence of `H`
+satisfies all of them. `Merge(C,a,b)` and `Derive(D,input)` let one process
+state demand while a network or worker process fulfills it. WANT grants no
+READ, WRITE, retention, or membership semantics.
 
 A blob WANT does not carry C and therefore promises no network discovery. A
 collection-aware caller can explicitly fetch `(C, H)`: discovery uses KDF(C),

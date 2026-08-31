@@ -669,8 +669,8 @@ rewrite while any such record remains.
 | Assert | `65EE9E4279FFE01D263E75A8E2DF6289B6DE403CB4468098A0EAB925F81C28ED` (`9A06797600FA90B8A8259B0ED029EC21`) | `64` request kind, `65..96` reserved zeros, `96..128` field A, `128..160` field B, `160..192` field C, `192..256` reserved zeros |
 | Retract | `A57C866A83A90635090A947D92464B19D9F898C0C961AB7A91C79A979F9F1483` (`2D957A780A52E474F58A06D44D6FE46C`) | same request layout |
 
-Both kind IDs were minted with `trible genid` on 2026-08-13 and encode `Merge`
-and `Derive` requests. An assertion and its retraction are keyed by the exact
+Both kind IDs were minted with `trible genid` on 2026-08-13 and encode every
+non-bare request. An assertion and its retraction are keyed by the exact
 canonical 97-byte `WantRequest` below. They resolve last-writer-wins per exact
 request; reopening a pile reconstructs the asserted set.
 
@@ -678,20 +678,25 @@ request; reopening a pile reconstructs the asserted set.
 |---|---:|---|---|---|
 | Blob | 1 | blob handle | zero | zero |
 | Merge | 2 | collection descriptor handle | lower input digest | higher input digest |
-| Derive | 3 | source descriptor handle | target descriptor handle | input digest |
+| Derive | 4 | target descriptor handle | input digest | zero |
+| BlobInCollection | 5 | collection descriptor handle | blob handle | zero |
 
 The canonical key is `tag || A || B || C`: byte `0` is the versioned tag,
-`1..33` is A, `33..65` is B, and `65..97` is C. Blob decoding rejects nonzero
-unused fields. Merge inputs must be in lexicographic order (`low <= high`), so
-operand order cannot create a second request key.
+`1..33` is A, `33..65` is B, and `65..97` is C. The Blob, Derive, and
+BlobInCollection decoders reject nonzero unused fields. Merge inputs must be in
+lexicographic order (`low <= high`), so operand order cannot create a second
+request key.
 
-The three request kinds deliberately share durability but not policy. `Blob`
-asks for content and participates in fetch-on-demand and bounded cache
-retention. `Merge` and `Derive` are durable questions about reproducible
-collection work; an answer is the corresponding native `MERGE` or `DERIVE`
-receipt already defined by `CollectionStore`, not mutable state inside the
-want. The storage format persists those questions independently of whether a
-local or remote worker eventually supplies the receipt.
+The four request kinds deliberately share durability but not policy. Bare
+`Blob(H)` is a local-only fetch/retention intent. `BlobInCollection(C,H)` is a
+collection-routed intent whose exact `(C,H)` participates in assertion and
+retraction identity; local presence and bounded retention project every route
+for one handle onto the same `H`. `Merge` and `Derive` are durable questions
+about reproducible collection work; an answer is the corresponding native
+`MERGE` or `DERIVE` receipt already defined by `CollectionStore`, not mutable
+state inside the want. The storage format persists those questions
+independently of whether a local or remote worker eventually supplies the
+receipt.
 
 Blob assertions continue to be written under the historical weak-pin kind
 (`EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346`, rooted at
@@ -700,10 +705,11 @@ weak-unpin kind
 (`ACCB531FC7489357C40FCEF0DDE8BD9088F2AC1924A652EA211ADD5C30B95B46`, rooted at
 `2D76662DFF0187EC36A8C90B12BB8B0D`). Their body is `64..96` the blob handle and
 `96..256` reserved zeros, and the single handle decodes as the equivalent
-canonical `Blob` request. Keeping Blob writes on these kinds
-is essential to the envelope's forgetful-projection rule: an older reader sees
-the complete Blob LWW history and may safely ignore the new independent
-operation-want kinds.
+canonical `Blob` request. Keeping bare Blob writes on these kinds is essential
+to the envelope's forgetful-projection rule: an older reader sees the complete
+bare-Blob LWW history and may safely ignore the new independent typed request
+kinds. BlobInCollection uses the typed assertion/retraction envelope because
+its collection field participates in identity.
 
 ## Legacy unenveloped records
 

@@ -635,6 +635,8 @@ pub const WANT_REQUEST_KIND_DERIVE_V1: u8 = 3;
 /// The source is what the target's descriptor says it is, so a want that
 /// restated it only offered a way to disagree with the descriptor.
 pub const WANT_REQUEST_KIND_DERIVE_V2: u8 = 4;
+/// Versioned tag of a collection-routed blob request.
+pub const WANT_REQUEST_KIND_BLOB_IN_COLLECTION_V1: u8 = 5;
 
 /// A durable request for absent content or reproducible collection work.
 ///
@@ -646,7 +648,7 @@ pub const WANT_REQUEST_KIND_DERIVE_V2: u8 = 4;
 pub enum WantRequest {
     /// Obtain and retain one content-addressed blob according to local policy.
     Blob {
-        /// Type-erased content handle requested from the store or network.
+        /// Type-erased content handle requested as a bare local-only intent.
         handle: Inline<Handle<UnknownBlob>>,
     },
     /// Discover or compute the exact merge of two collection elements.
@@ -669,6 +671,19 @@ pub enum WantRequest {
         /// Source element to derive.
         input: CollectionData,
     },
+    /// Obtain one content-addressed blob through one exact collection route.
+    ///
+    /// The collection participates in request identity and tells a reconciler
+    /// where it may disclose and discover the handle. Local presence of the
+    /// handle satisfies this request regardless of route, but it does not make
+    /// this request identical to [`Blob`](Self::Blob): the bare form remains a
+    /// separate local-only retention intent.
+    BlobInCollection {
+        /// Exact collection descriptor through which the blob may be fetched.
+        collection: CollectionHandle,
+        /// Type-erased content handle requested from that collection.
+        handle: Inline<Handle<UnknownBlob>>,
+    },
 }
 
 impl WantRequest {
@@ -680,6 +695,30 @@ impl WantRequest {
     {
         Self::Blob {
             handle: handle.transmute(),
+        }
+    }
+
+    /// Construct a collection-routed blob request from any typed handle.
+    pub fn blob_in_collection<S>(collection: CollectionHandle, handle: Inline<Handle<S>>) -> Self
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        Self::BlobInCollection {
+            collection,
+            handle: handle.transmute(),
+        }
+    }
+
+    /// Return the requested blob handle for either blob-request shape.
+    ///
+    /// This is the local satisfaction and retention projection: one resident
+    /// `H` satisfies every routed `(C, H)` request as well as a bare `Blob(H)`.
+    /// Request identity itself remains the complete variant and fields.
+    pub const fn blob_handle(self) -> Option<Inline<Handle<UnknownBlob>>> {
+        match self {
+            Self::Blob { handle } | Self::BlobInCollection { handle, .. } => Some(handle),
+            Self::Merge { .. } | Self::Derive { .. } => None,
         }
     }
 
@@ -729,6 +768,11 @@ impl WantRequest {
                 write_want_field(&mut bytes, 0, target.raw);
                 write_want_field(&mut bytes, 1, input.raw);
             }
+            Self::BlobInCollection { collection, handle } => {
+                bytes[0] = WANT_REQUEST_KIND_BLOB_IN_COLLECTION_V1;
+                write_want_field(&mut bytes, 0, collection.raw);
+                write_want_field(&mut bytes, 1, handle.raw);
+            }
         }
         bytes
     }
@@ -768,6 +812,17 @@ impl WantRequest {
                 Ok(Self::Derive {
                     target: Inline::new(read_want_field(&bytes, 0)),
                     input: Inline::new(read_want_field(&bytes, 1)),
+                })
+            }
+            WANT_REQUEST_KIND_BLOB_IN_COLLECTION_V1 => {
+                if read_want_field(&bytes, 2).iter().any(|byte| *byte != 0) {
+                    return Err(WantRequestDecodeError::NonZeroUnusedFields {
+                        kind: WANT_REQUEST_KIND_BLOB_IN_COLLECTION_V1,
+                    });
+                }
+                Ok(Self::BlobInCollection {
+                    collection: Inline::new(read_want_field(&bytes, 0)),
+                    handle: Inline::new(read_want_field(&bytes, 1)),
                 })
             }
             unknown => Err(WantRequestDecodeError::UnknownKind(unknown)),
@@ -827,7 +882,10 @@ fn read_want_field(bytes: &[u8; WANT_REQUEST_BYTES_LEN], index: usize) -> [u8; I
 /// records. A backend may support either capability without
 /// supporting the other. Repeated [`want`](Self::want) and
 /// [`unwant`](Self::unwant) operations resolve last-writer-wins per exact
-/// request; [`wants`](Self::wants) enumerates the currently asserted set.
+/// request; [`wants`](Self::wants) enumerates the currently asserted set. A
+/// collection route is part of exact request identity, but local satisfaction
+/// and retention may project either blob shape through
+/// [`WantRequest::blob_handle`] and deduplicate by the returned handle.
 pub trait WantStore {
     /// Error type for want operations.
     type WantError: Error + Debug + Send + Sync + 'static;
@@ -910,6 +968,25 @@ mod want_request_tests {
     }
 
     #[test]
+    fn collection_routed_blob_request_roundtrips_with_exact_identity() {
+        let handle = Inline::<Handle<SimpleArchive>>::new([0x61; INLINE_LEN]);
+        let request = WantRequest::blob_in_collection(collection(7), handle);
+        let bytes = request.to_bytes();
+
+        assert_eq!(bytes[0], WANT_REQUEST_KIND_BLOB_IN_COLLECTION_V1);
+        assert_eq!(&bytes[1..1 + INLINE_LEN], &collection(7).raw);
+        assert_eq!(&bytes[1 + INLINE_LEN..1 + 2 * INLINE_LEN], &handle.raw);
+        assert!(bytes[1 + 2 * INLINE_LEN..].iter().all(|byte| *byte == 0));
+        assert_eq!(WantRequest::from_bytes(bytes), Ok(request));
+        assert_eq!(request.blob_handle(), Some(handle.transmute()));
+        assert_ne!(request, WantRequest::blob(handle));
+        assert_ne!(
+            request,
+            WantRequest::blob_in_collection(collection(8), handle)
+        );
+    }
+
+    #[test]
     fn dense_decoder_rejects_noncanonical_shapes() {
         let mut unknown = [0; WANT_REQUEST_BYTES_LEN];
         unknown[0] = 99;
@@ -925,6 +1002,19 @@ mod want_request_tests {
             WantRequest::from_bytes(padded),
             Err(WantRequestDecodeError::NonZeroUnusedFields {
                 kind: WANT_REQUEST_KIND_BLOB_V1,
+            })
+        );
+
+        let mut routed = WantRequest::blob_in_collection(
+            collection(9),
+            Inline::<Handle<UnknownBlob>>::new([0x52; INLINE_LEN]),
+        )
+        .to_bytes();
+        routed[1 + 2 * INLINE_LEN] = 1;
+        assert_eq!(
+            WantRequest::from_bytes(routed),
+            Err(WantRequestDecodeError::NonZeroUnusedFields {
+                kind: WANT_REQUEST_KIND_BLOB_IN_COLLECTION_V1,
             })
         );
     }

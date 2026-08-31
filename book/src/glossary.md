@@ -268,6 +268,8 @@ through the attribute’s schema. They often embed identifiers for related
 entities or handles referencing larger blobs.
 
 ### WANT
-A durable local request for a blob or for an existing merge/derive result.
-WANT is operational policy: it neither adds collection authority nor changes a
-collection's logical value.
+A durable operational request for a blob or for an existing merge/derive
+result. Bare `Blob(H)` is local-only; `BlobInCollection(C,H)` identifies a
+collection route without changing the fact that resident `H` satisfies every
+route. WANT is operational policy: it neither adds collection authority nor
+changes a collection's logical value.

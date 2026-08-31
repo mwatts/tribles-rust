@@ -44,87 +44,104 @@ use super::{
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
-type WantIndex = PATCH<INLINE_LEN, IdentitySchema, WantEntry>;
-type OperationWantIndex = PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>;
+type WantIndex = PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema, WantEntry>;
 
 #[derive(Debug, Clone, Copy)]
-struct WantEntry {
-    last_used: u64,
+enum WantEntry {
+    /// One exact bare or collection-routed blob request.
+    Blob { last_used: u64 },
+    /// One merge or derive question, which has no blob-retention projection.
+    Operation,
 }
 
 #[derive(Debug, Default)]
 struct WantState {
-    /// Blob requests alone carry LRU cache semantics.
-    wants: WantIndex,
-    /// Operation requests are durable questions, never blob-retention roots
-    /// and never subject to the resident-blob cache budget.
-    operations: OperationWantIndex,
+    /// Every request is keyed by its complete canonical identity. Blob
+    /// requests additionally carry per-request recency; retention projects
+    /// all active routes onto unique handles only when applying the budget.
+    requests: WantIndex,
     clock: u64,
 }
 
 impl WantState {
     fn want(&mut self, request: WantRequest) {
-        match request {
-            WantRequest::Blob { handle } => {
-                self.clock = self.clock.wrapping_add(1).max(1);
-                let entry = Entry::with_value(
-                    &handle.raw,
-                    WantEntry {
-                        last_used: self.clock,
-                    },
-                );
-                self.wants.replace(&entry);
+        let value = if request.blob_handle().is_some() {
+            self.clock = self.clock.wrapping_add(1).max(1);
+            WantEntry::Blob {
+                last_used: self.clock,
             }
-            WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
-                self.operations.insert(&Entry::new(&request.to_bytes()));
-            }
-        }
+        } else {
+            WantEntry::Operation
+        };
+        self.requests
+            .replace(&Entry::with_value(&request.to_bytes(), value));
     }
 
     fn unwant(&mut self, request: WantRequest) {
-        match request {
-            WantRequest::Blob { handle } => self.wants.remove(&handle.raw),
-            WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
-                self.operations.remove(&request.to_bytes());
-            }
-        }
+        self.requests.remove(&request.to_bytes());
     }
 
     fn requests(&self) -> Vec<WantRequest> {
-        // The canonical tags and field layout follow WantRequest's derived
-        // order, so concatenating the Blob and operation indexes in key order
-        // is the same sequence the former whole-vector sort produced.
-        self.wants
+        self.requests
             .iter_ordered()
-            .map(|raw| WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(*raw)))
-            .chain(self.operations.iter_ordered().map(|bytes| {
+            .map(|bytes| {
                 WantRequest::from_bytes(*bytes)
-                    .expect("operation WANT index contains canonical request bytes")
-            }))
+                    .expect("Yard WANT index contains canonical request bytes")
+            })
             .collect()
     }
 
     fn trim_to_present_budget(&mut self, present: &HandleSet, budget: usize) -> HandleSet {
-        let mut candidates = Vec::new();
-        for raw in &self.wants {
-            if present.get(raw).is_some() {
+        // Several exact requests may ask for one H: bare local intent and any
+        // number of collection routes. Local residency satisfies all of them,
+        // so cache pressure is charged once at the greatest active recency for
+        // H while request identity remains untouched.
+        let mut by_handle = BTreeMap::<[u8; INLINE_LEN], u64>::new();
+        for bytes in &self.requests {
+            let request = WantRequest::from_bytes(*bytes)
+                .expect("Yard WANT index contains canonical request bytes");
+            let Some(handle) = request.blob_handle() else {
+                continue;
+            };
+            if present.get(&handle.raw).is_some() {
                 let entry = *self
-                    .wants
-                    .get(raw)
+                    .requests
+                    .get(bytes)
                     .expect("key from PATCH iterator must resolve in the same PATCH");
-                candidates.push((*raw, entry.last_used));
+                let WantEntry::Blob { last_used } = entry else {
+                    panic!("blob request in Yard WANT index has operation metadata");
+                };
+                by_handle
+                    .entry(handle.raw)
+                    .and_modify(|seen| *seen = (*seen).max(last_used))
+                    .or_insert(last_used);
             }
         }
 
+        let mut candidates: Vec<_> = by_handle.into_iter().collect();
         candidates.sort_by_key(|(_, last_used)| Reverse(*last_used));
 
-        let mut retained = WantIndex::new();
         let mut handles = HandleSet::new();
-        for (raw, last_used) in candidates.into_iter().take(budget) {
-            retained.replace(&Entry::with_value(&raw, WantEntry { last_used }));
+        for (raw, _) in candidates.into_iter().take(budget) {
             handles.insert(&Entry::new(&raw));
         }
-        self.wants = retained;
+
+        let mut retained = WantIndex::new();
+        for bytes in &self.requests {
+            let request = WantRequest::from_bytes(*bytes)
+                .expect("Yard WANT index contains canonical request bytes");
+            let keep = request
+                .blob_handle()
+                .is_none_or(|handle| handles.get(&handle.raw).is_some());
+            if keep {
+                let value = *self
+                    .requests
+                    .get(bytes)
+                    .expect("key from PATCH iterator must resolve in the same PATCH");
+                retained.insert(&Entry::with_value(bytes, value));
+            }
+        }
+        self.requests = retained;
         handles
     }
 }
@@ -1011,9 +1028,11 @@ impl WantStore for Yard {
 
     type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, PileWriteError>>;
 
-    /// Assert a want for a blob: refresh its LRU recency in memory AND persist a
-    /// want marker to the young generation's pile, so the want survives
-    /// a restart ([`Yard::open`] reloads it).
+    /// Assert one exact request and persist its marker to the young
+    /// generation's pile, so it survives a restart ([`Yard::open`] reloads
+    /// it). Blob requests also refresh per-request LRU recency; collection
+    /// routes are projected to unique handles only when applying the cache
+    /// budget.
     ///
     /// Automatic lazy reads call this only on a miss. Explicit callers may
     /// also want an already-resident blob; that assertion is persisted and
@@ -1870,6 +1889,14 @@ mod tests {
             WantRequest::derive(Inline::new([5; INLINE_LEN]), Inline::new([7; INLINE_LEN]));
         let derive_high =
             WantRequest::derive(Inline::new([6; INLINE_LEN]), Inline::new([8; INLINE_LEN]));
+        let routed_low = WantRequest::blob_in_collection(
+            Inline::new([7; INLINE_LEN]),
+            Inline::<Handle<UnknownBlob>>::new([9; INLINE_LEN]),
+        );
+        let routed_high = WantRequest::blob_in_collection(
+            Inline::new([8; INLINE_LEN]),
+            Inline::<Handle<UnknownBlob>>::new([9; INLINE_LEN]),
+        );
         let expected = vec![
             blob_low,
             blob_high,
@@ -1877,6 +1904,8 @@ mod tests {
             merge_high,
             derive_low,
             derive_high,
+            routed_low,
+            routed_high,
         ];
 
         let mut state = WantState::default();
@@ -1893,6 +1922,9 @@ mod tests {
 
         state.unwant(merge_low);
         assert!(!state.requests().contains(&merge_low));
+        state.unwant(routed_low);
+        assert!(!state.requests().contains(&routed_low));
+        assert!(state.requests().contains(&routed_high));
     }
 
     fn pin_id(byte: u8) -> Id {
@@ -2678,6 +2710,59 @@ mod tests {
         );
         let reader = reopened.snapshot().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached blob"));
+    }
+
+    #[test]
+    fn routed_blob_wants_preserve_routes_but_share_one_retention_budget_slot() {
+        let config = YardConfig {
+            want_budget: 1,
+            ..YardConfig::default()
+        };
+        let (_dir, paths, mut yard) = yard_with_paths(1, config);
+        let blob = Blob::<RawBytes>::new(raw_blob(b"one resident blob, several intents"));
+        let handle = blob.get_handle();
+        yard.put::<RawBytes, _>(blob).unwrap();
+
+        let local = WantRequest::blob(handle);
+        let first_route = WantRequest::blob_in_collection(Inline::new([41; INLINE_LEN]), handle);
+        let second_route = WantRequest::blob_in_collection(Inline::new([42; INLINE_LEN]), handle);
+        for request in [local, first_route, second_route] {
+            yard.want(request).unwrap();
+        }
+        yard.unwant(first_route).unwrap();
+        assert_eq!(
+            yard.wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![local, second_route],
+            "route retraction must be exact rather than keyed only by H"
+        );
+        yard.want(first_route).unwrap();
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        assert!(yard.contains_in_generation(0, handle));
+        assert_eq!(
+            yard.wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![local, first_route, second_route],
+            "all identities over one resident H must survive one budget slot"
+        );
+
+        yard.reclaim().unwrap();
+        drop(yard);
+        let mut reopened = Yard::open(paths, config).unwrap();
+        assert!(reopened.contains_in_generation(0, handle));
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![local, first_route, second_route]
+        );
     }
 
     #[test]

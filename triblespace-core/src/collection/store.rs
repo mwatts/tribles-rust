@@ -44,8 +44,7 @@ pub enum CollectionRecordSelector {
     DeriveTarget(CollectionHandle),
     /// Select every receipt answering one exact merge or derive request.
     ///
-    /// `WantRequest::Blob` has no collection-record answer and selects
-    /// nothing.
+    /// Blob requests have no collection-record answer and select nothing.
     Operation(WantRequest),
 }
 

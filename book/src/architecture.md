@@ -230,11 +230,15 @@ from that raw source.
 
 ## WANT is operational, not semantic
 
-A `WantStore` records local interest in obtaining a blob or discovering a
-particular merge/derive result. WANTs do not add collection members, authorize
-authors, retain all referenced data, or force another node to perform work.
-They are durable coordination-free questions which a reconciler may satisfy by
-fetching content or unioning a matching native equation into the local store.
+A `WantStore` records operational interest in obtaining a blob or discovering
+a particular merge/derive result. Bare `Blob(H)` is local-only;
+`BlobInCollection(C,H)` carries one exact discovery route. The route remains
+part of request identity, while local presence and retention accounting project
+all routes for the same handle onto one `H`. WANTs do not add collection
+members, authorize authors, retain all referenced data, or force another node
+to perform work. They are durable coordination-free questions which a
+reconciler may satisfy by fetching content or unioning a matching native
+equation into the local store.
 
 Keeping WANT orthogonal prevents evidence convergence from becoming
 involuntary blob mirroring. A peer can repair a READ-authorized collection's

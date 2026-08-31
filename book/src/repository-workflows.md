@@ -337,18 +337,23 @@ route which `ensure_exact` can reconstruct.
 ## WANT missing content or computation
 
 Sparse evidence discovery deliberately does not fetch commit dependencies.
-`WantStore` records local operational interest with three request shapes:
+`WantStore` records operational interest with four request shapes:
 
-- `Blob(handle)` — obtain exact bytes;
+- `Blob(handle)` — obtain exact bytes as a bare local-only intent;
+- `BlobInCollection(collection, handle)` — obtain the same exact bytes through
+  one collection route;
 - `Merge(collection, low, high)` — discover an existing matching merge result;
   and
 - `Derive(target, input)` — discover an existing matching derivation; the
   target descriptor already names the source collection and concrete mapping.
 
-A reconciler may satisfy those questions from local workers or peers. The
-answer to an operation WANT is the ordinary native equation; obtaining its
-result bytes is a separate blob WANT. A WANT grants no authority and does not
-change the value of any collection.
+A collection route participates in WANT identity, so retracting `(C1,H)` does
+not retract `(C2,H)` or bare `Blob(H)`. Local presence of `H` nevertheless
+satisfies every route, and retention budgets charge it once. A reconciler may
+satisfy those questions from local workers or peers. The answer to an operation
+WANT is the ordinary native equation; obtaining its result bytes is a separate
+blob WANT. A WANT grants no authority and does not change the value of any
+collection.
 
 ## Migrate a legacy branch explicitly
 

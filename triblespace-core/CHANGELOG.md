@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add canonical `WantRequest::BlobInCollection(C, H)` tag 5. Repository
+  implementations retain exact route identity; local presence satisfies every
+  route for `H`, and Yard charges one bounded-retention slot per unique `H`
+  without conflating a routed request with bare local-only `Blob(H)` intent.
+
 - Add independent descriptor-local READ and WRITE admission policies. Each is
   `Open` or a canonical multi-root quorum with invocation and optional
   delegation thresholds; the proof-forest evaluator counts distinct roots and
