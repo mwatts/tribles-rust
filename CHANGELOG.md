@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an optional resident CUDA scanner for canonical two-stage NVFP4 search.
+  Accelerators receive only validated compact planes and return raw `f64` dot
+  products; cover deduplication, conservative candidate certificates, exact
+  source fetches, reranking, and result ordering remain singular in
+  `triblespace-search`. One combined readback covers every physical LSM member.
+
 - Make `WantRequest::Blob(H)` the sole durable exact-content request.
   `MemoryRepo`, `Pile`, Yard, retained rewrites, and pile diagnostics preserve
   its canonical identity, while collection-independent reconciliation can

@@ -850,8 +850,125 @@ fn join_members<E: BlobEncoding>(
 
 #[derive(Clone, Debug)]
 struct Member {
+    content_handle: [u8; HANDLE_LEN],
     bytes: Bytes,
     layout: Layout,
+}
+
+/// Canonically prepared query coordinates for an NVFP4 candidate scan.
+///
+/// The coordinates are normalized, rotated, padded to the physical NVFP4
+/// dimension, and retained as `f64`. A scanner computes raw dot products over
+/// these coordinates; [`NvFp4CosineIndex`] alone turns those dots into
+/// certified candidates and exact results.
+#[derive(Clone, Copy, Debug)]
+pub struct NvFp4ScanQuery<'a> {
+    coordinates: &'a [f64],
+}
+
+impl<'a> NvFp4ScanQuery<'a> {
+    /// Normalized, rotated, physically padded query coordinates.
+    pub fn coordinates(self) -> &'a [f64] {
+        self.coordinates
+    }
+}
+
+/// One quantization stage in a validated canonical NVFP4 segment.
+#[derive(Clone, Copy, Debug)]
+pub struct NvFp4ScanStage<'a> {
+    globals: &'a [u8],
+    block_scales: &'a [u8],
+    codes: &'a [u8],
+}
+
+impl<'a> NvFp4ScanStage<'a> {
+    /// Little-endian `f32` row-global scales, four bytes per row.
+    pub fn global_scale_bytes(self) -> &'a [u8] {
+        self.globals
+    }
+
+    /// Row-major canonical nonnegative E4M3 block-scale bytes.
+    pub fn block_scales(self) -> &'a [u8] {
+        self.block_scales
+    }
+
+    /// Row-major packed E2M1 pairs, low coordinate in the low nibble.
+    pub fn codes(self) -> &'a [u8] {
+        self.codes
+    }
+}
+
+/// Read-only physical planes of one validated canonical NVFP4 segment.
+///
+/// This is the storage/accelerator seam: it exposes the existing byte grammar
+/// without putting an accelerator type into [`NvFp4CosineSet`]. The segment's
+/// own content identity is exposed so resident state can reject a mismatched
+/// sequence cheaply; row handles, persisted certificates, deduplication, and
+/// exact source blobs deliberately remain private to the search implementation.
+#[derive(Clone, Copy, Debug)]
+pub struct NvFp4ScanSegment<'a> {
+    content_handle: [u8; HANDLE_LEN],
+    rows: usize,
+    dimension: usize,
+    blocks_per_row: usize,
+    codes_per_row: usize,
+    stages: [NvFp4ScanStage<'a>; QUANT_STAGES],
+}
+
+impl<'a> NvFp4ScanSegment<'a> {
+    /// Content identity of the exact canonical segment bytes.
+    pub fn content_handle(self) -> [u8; HANDLE_LEN] {
+        self.content_handle
+    }
+
+    /// Physical rows in this segment.
+    pub fn rows(self) -> usize {
+        self.rows
+    }
+
+    /// Logical, unpadded embedding dimension.
+    pub fn dimension(self) -> usize {
+        self.dimension
+    }
+
+    /// E4M3 scale bytes stored for each row and stage.
+    pub fn blocks_per_row(self) -> usize {
+        self.blocks_per_row
+    }
+
+    /// Packed E2M1 bytes stored for each row and stage.
+    pub fn codes_per_row(self) -> usize {
+        self.codes_per_row
+    }
+
+    /// Primary and residual-correction stages, in canonical order.
+    pub fn stages(self) -> [NvFp4ScanStage<'a>; 2] {
+        self.stages
+    }
+}
+
+/// Backend for the compact, approximate part of an exact NVFP4 search.
+///
+/// `scan` writes one raw `f64` dot product for every physical row, in
+/// segment-major then row-major order. Every decoded coordinate must match the
+/// canonical `f64` operation sequence and value: global-scale multiplication,
+/// E2M1 multiplication, then the primary-plus-correction addition. Only the
+/// subsequent query products and their accumulation/reduction order may differ;
+/// the search-owned dimension-wide gamma bound encloses those roundings.
+///
+/// This trait does not expose thresholds, candidate envelopes, handles, or
+/// reranking. Those semantics stay singular inside [`NvFp4CosineIndex`].
+pub trait NvFp4DotScanner {
+    /// Device or execution failure.
+    type Error: fmt::Display;
+
+    /// Fill `dots` for all physical rows in `segments`.
+    fn scan(
+        &self,
+        query: NvFp4ScanQuery<'_>,
+        segments: &[NvFp4ScanSegment<'_>],
+        dots: &mut [f64],
+    ) -> Result<(), Self::Error>;
 }
 
 /// Lazy cover-aware query view over canonical NVFP4 members.
@@ -1137,12 +1254,120 @@ struct Candidate {
     upper: f64,
 }
 
-impl<E> NvFp4CosineIndex<E>
-where
-    E: BlobEncoding,
-    View<[f32]>: TryFromBlob<E>,
-    <View<[f32]> as TryFromBlob<E>>::Error: fmt::Display + Send + Sync + 'static,
-{
+struct CandidateCertificate<'a> {
+    query: &'a PreparedQuery,
+    compact_gamma: f64,
+    division_gamma: f64,
+    exact_gamma: f64,
+    exact_query_norm_bound: f64,
+}
+
+impl<'a> CandidateCertificate<'a> {
+    fn new(query: &'a PreparedQuery, exact_dimension: usize) -> Self {
+        Self {
+            query,
+            compact_gamma: dot_gamma(query.approximate.len()),
+            division_gamma: roundoff_gamma(1),
+            exact_gamma: dot_gamma(exact_dimension),
+            exact_query_norm_bound: add_up_nonnegative(query.approximate_norm, query.error),
+        }
+    }
+
+    fn certify(
+        &self,
+        handle: [u8; HANDLE_LEN],
+        member: &Member,
+        row: usize,
+        raw_dot: f64,
+    ) -> Result<Candidate, NvFp4Error> {
+        if !raw_dot.is_finite() {
+            return Err(NvFp4Error::new("NVFP4 raw candidate dot is not finite"));
+        }
+        let bytes = member.bytes.as_ref();
+        let reconstruction_norm = f64::from(member.layout.norm(bytes, row));
+        let raw_row_error = f64::from(member.layout.error(bytes, row));
+        // Let y be the canonical f64 sum of both decoded stages and n the
+        // stored upward norm. The scan centers its cosine certificate on
+        // c = y/n. Since ||y|| <= n,
+        //   ||y - y/n|| = ||y|| |n - 1| / n <= |n - 1|.
+        // Add that normalization displacement to the persisted ||x-y||
+        // certificate, rounding the final sum outward.
+        let normalization_displacement = if reconstruction_norm == 0.0 {
+            0.0
+        } else {
+            absolute_difference_up(reconstruction_norm, 1.0)
+        };
+        let row_error = add_up_nonnegative(raw_row_error, normalization_displacement);
+        let approximate = if reconstruction_norm == 0.0 {
+            0.0
+        } else {
+            raw_dot / reconstruction_norm
+        };
+        if !approximate.is_finite() {
+            return Err(NvFp4Error::new("NVFP4 approximate cosine is not finite"));
+        }
+        // Cauchy gives sum |q_i y_i| <= ||q|| ||y||. Dividing the
+        // fixed-order dot by n >= ||y|| cancels the stored row norm, so
+        // the dot-product allowance is gamma * ||q||. The division itself
+        // contributes one separately certified rounding.
+        let accumulation_error =
+            multiply_up_nonnegative(self.compact_gamma, self.query.approximate_norm);
+        let division_error = multiply_up_nonnegative(self.division_gamma, approximate.abs());
+        let exact_row_norm_bound = add_up_nonnegative(1.0, row_error);
+        // Exact reranking uses the same fixed-order normalized-coordinate dot.
+        // Its possible upward accumulation error must be included too when
+        // comparing that returned f64 score against this envelope.
+        let exact_accumulation_error = multiply_up_nonnegative(
+            multiply_up_nonnegative(self.exact_gamma, self.exact_query_norm_bound),
+            exact_row_norm_bound,
+        );
+        let envelope = [
+            multiply_up_nonnegative(self.query.error, exact_row_norm_bound),
+            multiply_up_nonnegative(self.query.approximate_norm, row_error),
+            accumulation_error,
+            division_error,
+            exact_accumulation_error,
+        ]
+        .into_iter()
+        .fold(0.0, add_up_nonnegative);
+        Ok(Candidate {
+            handle,
+            upper: certified_cosine_upper(approximate, envelope),
+        })
+    }
+}
+
+impl<E: BlobEncoding> NvFp4CosineIndex<E> {
+    /// Validated physical segments retained by this lazy cover view.
+    ///
+    /// Accelerators may copy these planes into a resident representation. The
+    /// returned views expose each segment's own content identity, but never
+    /// the row handles or certificate planes.
+    pub fn scan_segments(&self) -> Vec<NvFp4ScanSegment<'_>> {
+        self.members
+            .iter()
+            .map(|member| {
+                let bytes = member.bytes.as_ref();
+                let stages = std::array::from_fn(|stage| {
+                    let layout = &member.layout.stages[stage];
+                    NvFp4ScanStage {
+                        globals: &bytes[layout.globals.clone()],
+                        block_scales: &bytes[layout.block_scales.clone()],
+                        codes: &bytes[layout.codes.clone()],
+                    }
+                });
+                NvFp4ScanSegment {
+                    content_handle: member.content_handle,
+                    rows: member.layout.rows,
+                    dimension: member.layout.dimension,
+                    blocks_per_row: member.layout.blocks_per_row,
+                    codes_per_row: member.layout.codes_per_row,
+                    stages,
+                }
+            })
+            .collect()
+    }
+
     /// Logical embedding dimension shared by every member in the cover.
     pub fn dimension(&self) -> usize {
         self.dimension
@@ -1152,7 +1377,14 @@ where
     pub fn segment_count(&self) -> usize {
         self.members.len()
     }
+}
 
+impl<E> NvFp4CosineIndex<E>
+where
+    E: BlobEncoding,
+    View<[f32]>: TryFromBlob<E>,
+    <View<[f32]> as TryFromBlob<E>>::Error: fmt::Display + Send + Sync + 'static,
+{
     /// Exact top `k` cosine neighbours, ranked by score then handle.
     ///
     /// Candidate discovery scans the compact rows once. Original embeddings
@@ -1171,7 +1403,44 @@ where
             return Ok(Vec::new());
         }
         let prepared = PreparedQuery::new(query, self.dimension)?;
-        let mut candidates = self.candidates(&prepared)?;
+        let candidates = self.candidates(&prepared)?;
+        self.top_k_candidates(snapshot, &prepared, k, candidates)
+    }
+
+    /// Exact top `k` cosine neighbours using `scanner` for compact row dots.
+    ///
+    /// The scanner replaces only the physical candidate dot pass. This method
+    /// retains cover deduplication, conservative certificates, geometric exact
+    /// reranking, blob fetches, and result ordering inside the search crate.
+    pub fn top_k_with_scanner<R, S>(
+        &self,
+        snapshot: &R,
+        query: &[f32],
+        k: usize,
+        scanner: &S,
+    ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
+    where
+        R: BlobStoreGet,
+        S: NvFp4DotScanner,
+    {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let prepared = PreparedQuery::new(query, self.dimension)?;
+        let candidates = self.candidates_with_scanner(&prepared, scanner)?;
+        self.top_k_candidates(snapshot, &prepared, k, candidates)
+    }
+
+    fn top_k_candidates<R>(
+        &self,
+        snapshot: &R,
+        prepared: &PreparedQuery,
+        k: usize,
+        mut candidates: Vec<Candidate>,
+    ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
+    where
+        R: BlobStoreGet,
+    {
         candidates.sort_unstable_by(|left, right| {
             right
                 .upper
@@ -1228,8 +1497,46 @@ where
             return Ok(Vec::new());
         }
         let prepared = PreparedQuery::new(query, self.dimension)?;
+        let candidates = self.candidates(&prepared)?;
+        self.above_candidates(snapshot, &prepared, floor, candidates)
+    }
+
+    /// Every exact cosine hit at or above `floor`, using `scanner` for compact
+    /// row dots and retaining all pruning semantics in this crate.
+    pub fn above_with_scanner<R, S>(
+        &self,
+        snapshot: &R,
+        query: &[f32],
+        floor: f64,
+        scanner: &S,
+    ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
+    where
+        R: BlobStoreGet,
+        S: NvFp4DotScanner,
+    {
+        if floor.is_nan() {
+            return Err(NvFp4Error::new("cosine floor must not be NaN"));
+        }
+        if floor > 1.0 {
+            return Ok(Vec::new());
+        }
+        let prepared = PreparedQuery::new(query, self.dimension)?;
+        let candidates = self.candidates_with_scanner(&prepared, scanner)?;
+        self.above_candidates(snapshot, &prepared, floor, candidates)
+    }
+
+    fn above_candidates<R>(
+        &self,
+        snapshot: &R,
+        prepared: &PreparedQuery,
+        floor: f64,
+        candidates: Vec<Candidate>,
+    ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
+    where
+        R: BlobStoreGet,
+    {
         let mut exact = Vec::new();
-        for candidate in self.candidates(&prepared)? {
+        for candidate in candidates {
             if candidate.upper < floor {
                 continue;
             }
@@ -1244,95 +1551,90 @@ where
 
     fn candidates(&self, query: &PreparedQuery) -> Result<Vec<Candidate>, NvFp4Error> {
         let mut candidates = Vec::new();
-        let compact_gamma = dot_gamma(query.approximate.len());
-        let division_gamma = roundoff_gamma(1);
-        let exact_gamma = dot_gamma(self.dimension);
-        let exact_query_norm_bound = add_up_nonnegative(query.approximate_norm, query.error);
-        self.for_each_unique_row(|handle, member, row| {
-            let bytes = member.bytes.as_ref();
-            let reconstruction_norm = f64::from(member.layout.norm(bytes, row));
-            let raw_row_error = f64::from(member.layout.error(bytes, row));
-            // Let y be the canonical f64 sum of both decoded stages and n the
-            // stored upward norm. The scan centers its cosine certificate on
-            // c = y/n. Since ||y|| <= n,
-            //   ||y - y/n|| = ||y|| |n - 1| / n <= |n - 1|.
-            // Add that normalization displacement to the persisted ||x-y||
-            // certificate, rounding the final sum outward.
-            let normalization_displacement = if reconstruction_norm == 0.0 {
-                0.0
-            } else {
-                absolute_difference_up(reconstruction_norm, 1.0)
-            };
-            let row_error = add_up_nonnegative(raw_row_error, normalization_displacement);
-            let globals: [f64; QUANT_STAGES] =
-                std::array::from_fn(|stage| f64::from(member.layout.global(bytes, row, stage)));
-            let scales: [&[u8]; QUANT_STAGES] =
-                std::array::from_fn(|stage| member.layout.block_scales(bytes, row, stage));
-            let codes: [&[u8]; QUANT_STAGES] =
-                std::array::from_fn(|stage| member.layout.codes(bytes, row, stage));
-            let mut raw_dot_lanes = [0.0f64; QUANT_BLOCK / 2];
-            let mut coordinate = 0;
-            for block in 0..member.layout.blocks_per_row {
-                let decoded_scales: [f64; QUANT_STAGES] =
-                    std::array::from_fn(|stage| globals[stage] * decode_e4m3(scales[stage][block]));
-                let code_start = block * (QUANT_BLOCK / 2);
-                for (lane, code) in (code_start..code_start + QUANT_BLOCK / 2).enumerate() {
-                    let primary = DECODED_E2M1_PAIRS[usize::from(codes[0][code])];
-                    let correction = DECODED_E2M1_PAIRS[usize::from(codes[1][code])];
-                    // These sums are the canonical reconstructed coordinates
-                    // and exactly match construction-time decoding.
-                    let low = primary[0] * decoded_scales[0] + correction[0] * decoded_scales[1];
-                    let high = primary[1] * decoded_scales[0] + correction[1] * decoded_scales[1];
-                    raw_dot_lanes[lane] += query.approximate[coordinate] * low;
-                    raw_dot_lanes[lane] += query.approximate[coordinate + 1] * high;
-                    coordinate += 2;
-                }
-            }
-            debug_assert_eq!(coordinate, query.approximate.len());
-            // Eight fixed lanes break the long scalar dependency chain. Each
-            // product crosses a shallower reduction than the sequential
-            // 2D-rounding model, so `compact_gamma` remains conservative.
-            let mut raw_dot = raw_dot_lanes[0];
-            for lane in &raw_dot_lanes[1..] {
-                raw_dot += *lane;
-            }
-
-            let approximate = if reconstruction_norm == 0.0 {
-                0.0
-            } else {
-                raw_dot / reconstruction_norm
-            };
-            if !approximate.is_finite() {
-                return Err(NvFp4Error::new("NVFP4 approximate cosine is not finite"));
-            }
-            // Cauchy gives sum |q_i y_i| <= ||q|| ||y||. Dividing the
-            // fixed-order dot by n >= ||y|| cancels the stored row norm, so
-            // the dot-product allowance is gamma * ||q||. The division itself
-            // contributes one separately certified rounding.
-            let accumulation_error = multiply_up_nonnegative(compact_gamma, query.approximate_norm);
-            let division_error = multiply_up_nonnegative(division_gamma, approximate.abs());
-            let exact_row_norm_bound = add_up_nonnegative(1.0, row_error);
-            // Exact reranking uses the same fixed-order normalized-coordinate
-            // dot. Its possible upward accumulation error must be included too
-            // when comparing that returned f64 score against this envelope.
-            let exact_accumulation_error = multiply_up_nonnegative(
-                multiply_up_nonnegative(exact_gamma, exact_query_norm_bound),
-                exact_row_norm_bound,
-            );
-            let envelope = [
-                multiply_up_nonnegative(query.error, exact_row_norm_bound),
-                multiply_up_nonnegative(query.approximate_norm, row_error),
-                accumulation_error,
-                division_error,
-                exact_accumulation_error,
-            ]
-            .into_iter()
-            .fold(0.0, add_up_nonnegative);
-            let upper = certified_cosine_upper(approximate, envelope);
-            candidates.push(Candidate { handle, upper });
+        let certificate = CandidateCertificate::new(query, self.dimension);
+        self.for_each_unique_row(|handle, _member_index, member, row| {
+            let raw_dot = Self::cpu_raw_dot(member, row, &query.approximate);
+            candidates.push(certificate.certify(handle, member, row, raw_dot)?);
             Ok(())
         })?;
         Ok(candidates)
+    }
+
+    fn candidates_with_scanner<S>(
+        &self,
+        query: &PreparedQuery,
+        scanner: &S,
+    ) -> Result<Vec<Candidate>, NvFp4Error>
+    where
+        S: NvFp4DotScanner,
+    {
+        let segments = self.scan_segments();
+        let mut offsets = Vec::with_capacity(segments.len());
+        let mut physical_rows = 0usize;
+        for segment in &segments {
+            offsets.push(physical_rows);
+            physical_rows = physical_rows
+                .checked_add(segment.rows())
+                .ok_or_else(|| NvFp4Error::new("NVFP4 physical row count overflows usize"))?;
+        }
+        let mut dots = vec![0.0; physical_rows];
+        scanner
+            .scan(
+                NvFp4ScanQuery {
+                    coordinates: &query.approximate,
+                },
+                &segments,
+                &mut dots,
+            )
+            .map_err(|source| NvFp4Error::new(format!("NVFP4 dot scan failed: {source}")))?;
+
+        let certificate = CandidateCertificate::new(query, self.dimension);
+        let mut candidates = Vec::new();
+        self.for_each_unique_row(|handle, member_index, member, row| {
+            let dot_index = offsets[member_index]
+                .checked_add(row)
+                .expect("validated physical row offset");
+            candidates.push(certificate.certify(handle, member, row, dots[dot_index])?);
+            Ok(())
+        })?;
+        Ok(candidates)
+    }
+
+    fn cpu_raw_dot(member: &Member, row: usize, query: &[f64]) -> f64 {
+        let bytes = member.bytes.as_ref();
+        let globals: [f64; QUANT_STAGES] =
+            std::array::from_fn(|stage| f64::from(member.layout.global(bytes, row, stage)));
+        let scales: [&[u8]; QUANT_STAGES] =
+            std::array::from_fn(|stage| member.layout.block_scales(bytes, row, stage));
+        let codes: [&[u8]; QUANT_STAGES] =
+            std::array::from_fn(|stage| member.layout.codes(bytes, row, stage));
+        let mut raw_dot_lanes = [0.0f64; QUANT_BLOCK / 2];
+        let mut coordinate = 0;
+        for block in 0..member.layout.blocks_per_row {
+            let decoded_scales: [f64; QUANT_STAGES] =
+                std::array::from_fn(|stage| globals[stage] * decode_e4m3(scales[stage][block]));
+            let code_start = block * (QUANT_BLOCK / 2);
+            for (lane, code) in (code_start..code_start + QUANT_BLOCK / 2).enumerate() {
+                let primary = DECODED_E2M1_PAIRS[usize::from(codes[0][code])];
+                let correction = DECODED_E2M1_PAIRS[usize::from(codes[1][code])];
+                // These sums are the canonical reconstructed coordinates and
+                // exactly match construction-time decoding.
+                let low = primary[0] * decoded_scales[0] + correction[0] * decoded_scales[1];
+                let high = primary[1] * decoded_scales[0] + correction[1] * decoded_scales[1];
+                raw_dot_lanes[lane] += query[coordinate] * low;
+                raw_dot_lanes[lane] += query[coordinate + 1] * high;
+                coordinate += 2;
+            }
+        }
+        debug_assert_eq!(coordinate, query.len());
+        // Eight fixed lanes break the long scalar dependency chain. Each
+        // product crosses a shallower reduction than the sequential
+        // 2D-rounding model, so `dot_gamma` remains conservative.
+        let mut raw_dot = raw_dot_lanes[0];
+        for lane in &raw_dot_lanes[1..] {
+            raw_dot += *lane;
+        }
+        raw_dot
     }
 
     fn exact_hit<R>(
@@ -1371,7 +1673,7 @@ where
 
     fn for_each_unique_row<F>(&self, mut visit: F) -> Result<(), NvFp4Error>
     where
-        F: FnMut([u8; HANDLE_LEN], &Member, usize) -> Result<(), NvFp4Error>,
+        F: FnMut([u8; HANDLE_LEN], usize, &Member, usize) -> Result<(), NvFp4Error>,
     {
         let mut heap = BinaryHeap::new();
         for (member, segment) in self.members.iter().enumerate() {
@@ -1410,7 +1712,7 @@ where
                     ));
                 }
             }
-            visit(handle, &self.members[member], row)?;
+            visit(handle, member, &self.members[member], row)?;
 
             for &(member, row) in &occurrences {
                 let next = row + 1;
@@ -1685,6 +1987,7 @@ where
                 ))));
             }
             members.push(Member {
+                content_handle: handle.raw,
                 bytes: blob.bytes,
                 layout,
             });
@@ -1781,11 +2084,64 @@ mod tests {
     fn index(blob: &Blob<NvFp4CosineSet<Embedding>>) -> NvFp4CosineIndex<Embedding> {
         NvFp4CosineIndex {
             members: vec![Member {
+                content_handle: blob.get_handle().raw,
                 layout: Layout::parse(blob.bytes.as_ref()).unwrap(),
                 bytes: blob.bytes.clone(),
             }],
             dimension: Layout::parse(blob.bytes.as_ref()).unwrap().dimension,
             _encoding: PhantomData,
+        }
+    }
+
+    struct PublicPlaneScanner;
+
+    impl NvFp4DotScanner for PublicPlaneScanner {
+        type Error = std::convert::Infallible;
+
+        fn scan(
+            &self,
+            query: NvFp4ScanQuery<'_>,
+            segments: &[NvFp4ScanSegment<'_>],
+            dots: &mut [f64],
+        ) -> Result<(), Self::Error> {
+            let query = query.coordinates();
+            let expected = segments.iter().map(|segment| segment.rows()).sum::<usize>();
+            assert_eq!(dots.len(), expected);
+            let mut output = 0;
+            for &segment in segments {
+                assert_eq!(query.len(), segment.codes_per_row() * 2);
+                let stages = segment.stages();
+                for row in 0..segment.rows() {
+                    let globals = stages.map(|stage| {
+                        let offset = row * FLOAT_LEN;
+                        f64::from(read_f32(
+                            &stage.global_scale_bytes()[offset..offset + FLOAT_LEN],
+                        ))
+                    });
+                    let mut lanes = [0.0f64; QUANT_BLOCK / 2];
+                    let mut coordinate = 0;
+                    for block in 0..segment.blocks_per_row() {
+                        let scales = std::array::from_fn::<_, QUANT_STAGES, _>(|stage| {
+                            let offset = row * segment.blocks_per_row() + block;
+                            globals[stage] * decode_e4m3(stages[stage].block_scales()[offset])
+                        });
+                        let code_start = row * segment.codes_per_row() + block * (QUANT_BLOCK / 2);
+                        for (lane, code) in (code_start..code_start + QUANT_BLOCK / 2).enumerate() {
+                            let primary = DECODED_E2M1_PAIRS[usize::from(stages[0].codes()[code])];
+                            let correction =
+                                DECODED_E2M1_PAIRS[usize::from(stages[1].codes()[code])];
+                            let low = primary[0] * scales[0] + correction[0] * scales[1];
+                            let high = primary[1] * scales[0] + correction[1] * scales[1];
+                            lanes[lane] += query[coordinate] * low;
+                            lanes[lane] += query[coordinate + 1] * high;
+                            coordinate += 2;
+                        }
+                    }
+                    dots[output] = lanes.into_iter().sum();
+                    output += 1;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -2070,6 +2426,61 @@ mod tests {
                     candidate.upper,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn public_scan_seam_preserves_candidate_certificates_and_segment_identity() {
+        const DIMENSION: usize = 37;
+        let rows = [
+            row(
+                1,
+                &(0..DIMENSION).map(|index| index as f32).collect::<Vec<_>>(),
+            ),
+            row(
+                2,
+                &(0..DIMENSION)
+                    .map(|index| (index as f32 - 11.0).sin())
+                    .collect::<Vec<_>>(),
+            ),
+            row(
+                3,
+                &(0..DIMENSION)
+                    .map(|index| (index as f32 + 3.0).cos())
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        let low = member(rows[..2].iter().cloned(), DIMENSION);
+        let high = member(rows[1..].iter().cloned(), DIMENSION);
+        let index = NvFp4CosineIndex {
+            members: [&low, &high]
+                .into_iter()
+                .map(|blob| Member {
+                    content_handle: blob.get_handle().raw,
+                    layout: Layout::parse(blob.bytes.as_ref()).unwrap(),
+                    bytes: blob.bytes.clone(),
+                })
+                .collect(),
+            dimension: DIMENSION,
+            _encoding: PhantomData::<Embedding>,
+        };
+        let segments = index.scan_segments();
+        assert_eq!(segments[0].content_handle(), low.get_handle().raw);
+        assert_eq!(segments[1].content_handle(), high.get_handle().raw);
+
+        let query: Vec<_> = (0..DIMENSION)
+            .map(|index| ((index * 17 + 5) as f32).sin())
+            .collect();
+        let prepared = PreparedQuery::new(&query, DIMENSION).unwrap();
+        let cpu = index.candidates(&prepared).unwrap();
+        let external = index
+            .candidates_with_scanner(&prepared, &PublicPlaneScanner)
+            .unwrap();
+        assert_eq!(cpu.len(), 3, "the overlapping row is deduplicated");
+        assert_eq!(cpu.len(), external.len());
+        for (cpu, external) in cpu.iter().zip(&external) {
+            assert_eq!(cpu.handle, external.handle);
+            assert_eq!(cpu.upper.to_bits(), external.upper.to_bits());
         }
     }
 

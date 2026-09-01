@@ -6,6 +6,8 @@ use std::fmt;
 mod batch_confirm;
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 mod cubecl_backend;
+#[cfg(feature = "nvfp4")]
+mod nvfp4;
 
 #[cfg(feature = "wgpu")]
 pub use batch_confirm::{
@@ -18,6 +20,8 @@ pub use cubecl_backend::CubeClWaveletFreeze;
 pub use cubecl_backend::CudaWaveletFreeze;
 #[cfg(feature = "wgpu")]
 pub use cubecl_backend::WgpuWaveletFreeze;
+#[cfg(feature = "nvfp4")]
+pub use nvfp4::{CudaNvFp4DotScanner, NvFp4CudaError};
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]
 const BLOCK_SIZE: u32 = 256;

@@ -299,6 +299,14 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- CubeCL 0.10's CUDA type registry does not advertise `f64`, even though the
+  resident NVFP4 kernels compile and run correctly on GB10. Make the fork's
+  capability report truthful before treating the scanner as portable across
+  CUDA runtimes.
+- Measure resident NVFP4 query latency against LSM cover fragmentation. The
+  scanner intentionally performs one launch per nonempty member and one joined
+  readback; if many small members dominate, batch descriptors or compaction may
+  matter more than kernel arithmetic.
 - Make `#[value_formatter]` WASM generation concurrency-safe. A cold parallel
   workspace build can race after both macro processes observe the same missing
   final path, then invoke `rustc` against the same stem and scratch object names;
