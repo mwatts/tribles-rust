@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 
-use crate::blob::encodings::UnknownBlob;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::descriptor;
 use crate::collection::simplearchive_union;
@@ -17,15 +17,15 @@ use crate::collection::{AdmissionPolicy, CollectionPolicy};
 use crate::collection::{CollectionCommit, CollectionRead, CollectionStoreExt};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
-use crate::inline::Inline;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
+use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use crate::repo::{
     BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, SnapshotSource, StoreChanges,
     StoreSnapshot,
 };
-use crate::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
+use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 /// The one team every collection in these tests belongs to.
 fn test_team() -> ed25519_dalek::VerifyingKey {
@@ -938,6 +938,7 @@ struct CountingStore {
     inner: MemoryRepo,
     puts: usize,
     inserts: usize,
+    snapshots: usize,
     missing_gets: Arc<AtomicUsize>,
     metadata_failures: Arc<Mutex<BTreeSet<[u8; 32]>>>,
 }
@@ -1060,6 +1061,7 @@ impl SnapshotSource for CountingStore {
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.snapshots += 1;
         Ok(DemandGuardSnapshot {
             inner: self.inner.snapshot()?,
             missing_gets: Arc::clone(&self.missing_gets),
@@ -2213,13 +2215,11 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
     let mut expected = vec![data(&a), data(&b)];
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    assert!(
-        algebra
-            .derive_attempts
-            .lock()
-            .unwrap()
-            .contains(&data(&upper))
-    );
+    assert!(algebra
+        .derive_attempts
+        .lock()
+        .unwrap()
+        .contains(&data(&upper)));
     assert_eq!(algebra.target_attempts.lock().unwrap().len(), 1);
 }
 
@@ -2325,13 +2325,11 @@ fn mixed_terminal_capacity_publishes_the_successful_sibling() {
     ));
     assert_eq!((store.puts, store.inserts), (2, 1));
     assert_eq!(derived_inputs(&mut store.inner), vec![data(successful)]);
-    assert!(
-        algebra
-            .derive_attempts
-            .lock()
-            .unwrap()
-            .contains(&data(successful))
-    );
+    assert!(algebra
+        .derive_attempts
+        .lock()
+        .unwrap()
+        .contains(&data(successful)));
 }
 
 #[test]
@@ -2910,11 +2908,9 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_stored_equation() {
     assert!(tier_stable);
     assert_eq!(after.len(), 2);
     assert_eq!(joined_cover(&mut store, &after).bytes, old_upper.bytes);
-    assert!(
-        target_merge_records(&mut store)
-            .iter()
-            .any(|claim| claim.inputs() == (targets[0].0, targets[1].0))
-    );
+    assert!(target_merge_records(&mut store)
+        .iter()
+        .any(|claim| claim.inputs() == (targets[0].0, targets[1].0)));
 }
 
 #[test]
@@ -2985,12 +2981,10 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
     kernel().ensure(&mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
     let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection().handle());
-    assert!(
-        !store
-            .events
-            .iter()
-            .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data))
-    );
+    assert!(!store
+        .events
+        .iter()
+        .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
     let merges: Vec<_> = store
         .events
         .iter()
@@ -3002,11 +2996,9 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
         .collect();
     assert!(!merges.is_empty());
     for (position, result) in merges {
-        assert!(
-            store.events[..position]
-                .iter()
-                .any(|event| matches!(event, WriteEvent::Put(data) if *data == result))
-        );
+        assert!(store.events[..position]
+            .iter()
+            .any(|event| matches!(event, WriteEvent::Put(data) if *data == result)));
     }
 }
 
@@ -3245,7 +3237,7 @@ fn discarded_merge_insert_stalls_instead_of_looping() {
 }
 
 #[test]
-fn discarded_derive_insert_stalls_after_the_first_unobserved_publication() {
+fn discarded_derive_insert_stalls_after_one_unobserved_batch() {
     let sources = [archive([(1, 3)]), archive([(2, 4)])];
     let mut inner = MemoryRepo::default();
     let commits: Vec<_> = sources
@@ -3263,7 +3255,37 @@ fn discarded_derive_insert_stalls_after_the_first_unobserved_publication() {
         kernel().ensure(&mut store, &source_cover),
         Err(ExactDerivedCollectionError::Stalled { cover }) if cover.is_empty()
     ));
-    assert_eq!(store.dropped_derives, 1);
+    assert_eq!(store.dropped_derives, sources.len());
+}
+
+#[test]
+fn flat_frontier_maintenance_uses_batched_snapshot_rounds() {
+    const MEMBERS: usize = 128;
+    let sources: Vec<_> = (0..MEMBERS)
+        .map(|index| archive([(index as u8 + 1, index as u8 + 2)]))
+        .collect();
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut inner, index as u8 + 1, source))
+        .collect();
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+
+    let cover = kernel()
+        .ensure(&mut store, &source_cover(&commits))
+        .unwrap();
+
+    assert_eq!(derived_inputs(&mut store.inner).len(), MEMBERS);
+    assert!(cover.len() <= usize::BITS as usize);
+    assert!(
+        store.snapshots < MEMBERS / 2,
+        "{MEMBERS} flat members took {} snapshots instead of batched rounds",
+        store.snapshots,
+    );
 }
 
 #[test]
