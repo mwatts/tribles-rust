@@ -31,14 +31,19 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
+use crate::repo::{
+    BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead,
+};
 use crate::repo::{CapabilityProofStore, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
     discover_collection_claims_for_cover, discover_collection_equations_for_cover,
 };
-use super::encoding::{collection_member_availability, CollectionMemberAvailability};
+use super::encoding::{
+    collection_member_availability, collection_member_structural_availability,
+    CollectionMemberAvailability,
+};
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
@@ -591,29 +596,30 @@ impl Error for CoverAlgebraError {}
 /// not an error. These variants mean the immutable snapshot itself could not
 /// be observed coherently or its stored equations were contradictory.
 #[derive(Debug)]
-pub enum CoverAvailabilityError<RecordsError, MetaError> {
+pub enum CoverAvailabilityError<RecordsError, ResidencyError> {
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
     /// Blob residency could not be observed for one semantic member.
-    Metadata {
+    Residency {
         /// Exact member whose residency was being inspected.
         member: CollectionData,
-        /// Backend metadata failure.
-        source: MetaError,
+        /// Backend residency-observation failure.
+        source: ResidencyError,
     },
     /// Stored equations contradicted operation functionality.
     ResolutionConflict(Box<CollectionFunctionalConflict>),
 }
 
-impl<RecordsError, MetaError> fmt::Display for CoverAvailabilityError<RecordsError, MetaError>
+impl<RecordsError, ResidencyError> fmt::Display
+    for CoverAvailabilityError<RecordsError, ResidencyError>
 where
     RecordsError: fmt::Display,
-    MetaError: fmt::Display,
+    ResidencyError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Discovery(source) => source.fmt(formatter),
-            Self::Metadata { member, source } => write!(
+            Self::Residency { member, source } => write!(
                 formatter,
                 "failed to inspect residency of collection member {}: {source}",
                 hex::encode_upper(member.raw),
@@ -623,15 +629,15 @@ where
     }
 }
 
-impl<RecordsError, MetaError> Error for CoverAvailabilityError<RecordsError, MetaError>
+impl<RecordsError, ResidencyError> Error for CoverAvailabilityError<RecordsError, ResidencyError>
 where
     RecordsError: Error + 'static,
-    MetaError: Error + 'static,
+    ResidencyError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Discovery(source) => Some(source),
-            Self::Metadata { source, .. } => Some(source),
+            Self::Residency { source, .. } => Some(source),
             Self::ResolutionConflict(source) => Some(source),
         }
     }
@@ -1574,23 +1580,28 @@ impl<L: CollectionEncoding> Collection<L> {
 }
 
 impl<L: CollectionEncoding> Cover<L> {
-    /// Return the greatest subset with a complete resident realization.
+    /// Return the greatest subset with a structurally resident realization.
     ///
     /// The result remains in this cover's semantic coordinates. A compacted
     /// resident member may therefore make several requested members available
     /// without appearing in the returned value itself. Consequently
-    /// `cover.available(snapshot)? == cover` means a complete physical
-    /// realization is resident in that same immutable snapshot, while
-    /// `cover.difference(&available)?` names its missing semantic support.
+    /// `cover.available(snapshot)? == cover` means a complete representation
+    /// closure is structurally resident in that same immutable snapshot, while
+    /// `cover.difference(&available)?` names its missing semantic support. This
+    /// is not a payload-validation claim: [`Self::materialize`] remains the
+    /// boundary which validates content addresses and decodes the selected
+    /// representation.
     ///
-    /// This method performs no fetch and records no demand. Network acquisition
-    /// belongs to a store-level workflow which produces a later snapshot.
+    /// This method does not acquire missing content or record demand. An
+    /// encoding may read a structurally resident root to discover its named
+    /// representation dependencies. Network acquisition belongs to a
+    /// store-level workflow which produces a later snapshot.
     pub fn available<S>(
         &self,
         snapshot: &S,
-    ) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::MetaError>>
+    ) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::Err>>
     where
-        S: BlobStoreGet + BlobStoreMeta + CollectionRead,
+        S: BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead,
     {
         let discovered = if self.is_empty() {
             DiscoveredCollectionRecords::default()
@@ -1802,21 +1813,21 @@ fn available_cover_from_semantics<S, L>(
     snapshot: &S,
     semantics: &CollectionSemantics,
     cover: &Cover<L>,
-) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::MetaError>>
+) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::Err>>
 where
-    S: BlobStoreGet + BlobStoreMeta + CollectionRead,
+    S: BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead,
     L: CollectionEncoding,
 {
     let collection = cover.collection().handle();
     let mut complete = Vec::new();
     for member in semantics.members(collection).into_iter().flatten().copied() {
-        match collection_member_availability::<L, _>(member, snapshot) {
+        match collection_member_structural_availability::<L, _>(member, snapshot) {
             Ok(CollectionMemberAvailability::Complete) => complete.push((collection, member)),
             Ok(CollectionMemberAvailability::Absent)
             | Ok(CollectionMemberAvailability::Incomplete)
             | Ok(CollectionMemberAvailability::Unusable) => {}
             Err(source) => {
-                return Err(CoverAvailabilityError::Metadata { member, source });
+                return Err(CoverAvailabilityError::Residency { member, source });
             }
         }
     }

@@ -636,11 +636,12 @@ pub(crate) fn collection_physical_cover(
 /// Select a deterministic physical cover whose representation closure is
 /// resident.
 ///
-/// Root metadata remains the cheap first filter. Only members selected by the
-/// current physical proof invoke the encoding-specific dependency query; each
-/// incomplete or unusable root is removed and the cover is recomputed. The
-/// loop therefore performs no payload work for irrelevant historical
-/// materializations and terminates after at most one retry per rejected root.
+/// Validated root residency is supplied as the first filter. Only members
+/// selected by the current physical proof invoke the encoding-specific
+/// dependency query; each incomplete or unusable root is removed and the cover
+/// is recomputed. The loop therefore performs no payload work for irrelevant
+/// historical materializations and terminates after at most one retry per
+/// rejected root.
 pub(crate) fn collection_complete_physical_cover<E, R>(
     semantics: &CollectionSemantics,
     collection: CollectionHandle,

@@ -4961,7 +4961,7 @@ mod tests {
         CapabilityResource,
     };
     use crate::collection::descriptor::named_for_tests;
-    use crate::collection::{empty_metadata_handle, CollectionHandle};
+    use crate::collection::{empty_metadata_handle, Collection, CollectionHandle, Cover};
     use crate::macros::entity;
     use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
@@ -7253,6 +7253,114 @@ mod tests {
         drop(reader);
         drop(cloned);
         replay.close().unwrap();
+    }
+
+    #[test]
+    fn cover_availability_does_not_validate_a_cold_simplearchive_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "cold-cover-availability.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        let blob = Blob::<SimpleArchive>::new(Bytes::from_source(Vec::<u8>::new()));
+        let handle = pile.put::<SimpleArchive, _>(blob).unwrap();
+        let occurrence = first_blob_occurrence(&pile.blobs, &handle.raw).unwrap();
+        assert_eq!(
+            blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
+            None,
+        );
+
+        let collection = Collection::<SimpleArchive>::from_handle(collection_test_collection(90));
+        let cover = Cover::from_members(collection, [handle]);
+        let snapshot = pile.snapshot().unwrap();
+        assert_eq!(cover.available(&snapshot).unwrap(), cover);
+        assert_eq!(
+            blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
+            None,
+        );
+
+        let materialized = cover.materialize::<TribleSet, _>(&snapshot).unwrap();
+        assert!(materialized.is_empty());
+        assert_eq!(
+            blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
+            Some(ValidationState::Validated),
+        );
+
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn structural_cover_availability_does_not_bypass_materialize_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "corrupt-cover-availability.pile");
+        let expected = Blob::<SimpleArchive>::new(Bytes::from_source(Vec::<u8>::new()));
+        let handle = expected.get_handle();
+        append_v3_blob_candidate(&path, handle.into(), b"not the empty archive", 1);
+
+        let mut pile = Pile::open(&path).unwrap();
+        let collection = Collection::<SimpleArchive>::from_handle(collection_test_collection(91));
+        let cover = Cover::from_members(collection, [handle]);
+        let snapshot = pile.snapshot().unwrap();
+        let occurrence = first_blob_occurrence(&snapshot.blobs, &handle.raw).unwrap();
+        assert_eq!(cover.available(&snapshot).unwrap(), cover);
+        assert_eq!(
+            blob_occurrence_validation(&snapshot.blobs, &handle.raw, occurrence).cached(),
+            None,
+        );
+        assert!(cover.materialize::<TribleSet, _>(&snapshot).is_err());
+        assert_eq!(
+            blob_occurrence_validation(&snapshot.blobs, &handle.raw, occurrence).cached(),
+            Some(ValidationState::Invalid),
+        );
+
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn corrupt_compacted_root_does_not_shadow_valid_finer_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "corrupt-compacted-cover.pile");
+        let a_facts: TribleSet = entity! {
+            crate::metadata::tag: collection_test_id(92)
+        }
+        .into();
+        let b_facts: TribleSet = entity! {
+            crate::metadata::tag: collection_test_id(93)
+        }
+        .into();
+        let expected = a_facts.clone() + b_facts.clone();
+        let a = a_facts.to_blob();
+        let b = b_facts.to_blob();
+        let c = expected.clone().to_blob();
+        let a_handle = a.get_handle();
+        let b_handle = b.get_handle();
+        let c_handle = c.get_handle();
+        let collection = Collection::<SimpleArchive>::from_handle(collection_test_collection(94));
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.put::<SimpleArchive, _>(a).unwrap();
+        pile.put::<SimpleArchive, _>(b).unwrap();
+        pile.insert(CollectionRecord::Merge(CollectionMerge::new(
+            collection.handle(),
+            Handle::<SimpleArchive>::to_hash(a_handle),
+            Handle::<SimpleArchive>::to_hash(b_handle),
+            Handle::<SimpleArchive>::to_hash(c_handle),
+        )))
+        .unwrap();
+        pile.close().unwrap();
+
+        append_v3_blob_candidate(&path, c_handle.into(), b"corrupt compacted archive", 3);
+        let mut pile = Pile::open(&path).unwrap();
+        let cover = Cover::from_members(collection, [a_handle, b_handle]);
+        let snapshot = pile.snapshot().unwrap();
+        assert_eq!(cover.available(&snapshot).unwrap(), cover);
+        assert_eq!(
+            cover.materialize::<TribleSet, _>(&snapshot).unwrap(),
+            expected,
+        );
+
+        drop(snapshot);
+        pile.close().unwrap();
     }
 
     #[test]

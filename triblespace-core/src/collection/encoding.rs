@@ -22,7 +22,7 @@ use std::marker::PhantomData;
 use crate::blob::{Blob, BlobEncoding};
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
-use crate::repo::{BlobStoreGet, BlobStoreMeta};
+use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta};
 use crate::trible::Fragment;
 
 use super::{descriptor, CollectionData, CollectionHandle, RecordDecodeError};
@@ -157,9 +157,25 @@ pub(crate) enum CollectionMemberAvailability {
 
 /// Inspect root and representation-closure residency through one snapshot.
 ///
-/// Metadata failure remains distinct so callers with a typed storage error can
-/// propagate it, while read paths whose legacy surface treats metadata failure
-/// as unavailability may conservatively collapse it to [`Absent`](CollectionMemberAvailability::Absent).
+/// Residency failure remains distinct so callers with a typed storage error can
+/// propagate it, while read paths whose legacy surface treats observation
+/// failure as unavailability may conservatively collapse it to
+/// [`Absent`](CollectionMemberAvailability::Absent).
+pub(crate) fn collection_member_structural_availability<E, R>(
+    member: CollectionData,
+    reader: &R,
+) -> Result<CollectionMemberAvailability, R::Err>
+where
+    E: CollectionEncoding,
+    R: BlobStoreGet + BlobStoreList + BlobStoreMeta,
+{
+    if !reader.contains_blob(Handle::<E>::from_hash(member))? {
+        return Ok(CollectionMemberAvailability::Absent);
+    }
+    Ok(resident_member_availability::<E, _>(member, reader))
+}
+
+/// Inspect validated root and representation-closure residency.
 pub(crate) fn collection_member_availability<E, R>(
     member: CollectionData,
     reader: &R,
@@ -171,13 +187,22 @@ where
     if reader.metadata(Handle::<E>::from_hash(member))?.is_none() {
         return Ok(CollectionMemberAvailability::Absent);
     }
-    Ok(
-        match E::missing_representation_dependencies(member, reader) {
-            Ok(missing) if missing.is_empty() => CollectionMemberAvailability::Complete,
-            Ok(_) => CollectionMemberAvailability::Incomplete,
-            Err(_) => CollectionMemberAvailability::Unusable,
-        },
-    )
+    Ok(resident_member_availability::<E, _>(member, reader))
+}
+
+fn resident_member_availability<E, R>(
+    member: CollectionData,
+    reader: &R,
+) -> CollectionMemberAvailability
+where
+    E: CollectionEncoding,
+    R: BlobStoreGet + BlobStoreMeta,
+{
+    match E::missing_representation_dependencies(member, reader) {
+        Ok(missing) if missing.is_empty() => CollectionMemberAvailability::Complete,
+        Ok(_) => CollectionMemberAvailability::Incomplete,
+        Err(_) => CollectionMemberAvailability::Unusable,
+    }
 }
 
 /// One parameterized mapping between collection encodings.
