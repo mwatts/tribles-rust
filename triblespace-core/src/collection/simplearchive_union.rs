@@ -69,13 +69,11 @@ impl CollectionEncoding for SimpleArchive {
         low: &Blob<Self>,
         high: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        join(low, high)
-            .map(Some)
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 

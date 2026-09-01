@@ -52,17 +52,21 @@ Rank9 acceleration uses the same rule through ordinary collection records.
 `Rank9AcceleratedSuccinctArchiveBlob` is a Merkle root whose first 32 bytes name
 its portable raw `SuccinctArchiveBlob` child. A raw-to-accelerated `DERIVE` may
 survive a conservative ledger rewrite, but the unsigned equation still
-manufactures no ownership. Raw Succinct members are directly joinable; Rank9
-roots have no direct `MERGE`. If policy retains the accelerated root, ordinary
-child traversal also retains its named raw child.
+manufactures no ownership. Raw Succinct and Rank9-accelerated members are both
+directly joinable. A Rank9 join depends on the exact raw union being resident;
+when storage materializes that raw `MERGE`, the accelerated `MERGE` can follow.
+If policy retains the accelerated root, ordinary child traversal also retains
+its named raw child.
 
 Read-only materialization accepts only a complete resident source-bound member.
-Its cover-aware view loads the embedded raw child through its store snapshot,
-validates the exact raw/index pair, and then constructs a transient query
-runtime. A missing root is not a resident route; a selected root with a missing
-child is rejected by the typed view. Normal `ensure` publication stores the raw
-source before its accelerated target and inserts the ordinary `DERIVE` record
-last. No accelerator-specific retention relation or hidden root is involved.
+Cover resolution checks the encoding's required representation closure before
+selecting a root, so an accelerated root with a missing raw child is unavailable
+and a complete finer cover may replace it. The cover-aware view still loads the
+embedded raw child through the same snapshot and validates the exact raw/index
+pair before constructing a transient query runtime. Normal `ensure` publication
+stores every dependency before the member that names it and publishes the
+corresponding ordinary `MERGE` or `DERIVE` last. No accelerator-specific
+retention relation or hidden root is involved.
 
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` accept explicit policy roots in addition to the native collection

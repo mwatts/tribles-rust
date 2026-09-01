@@ -28,8 +28,8 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
-    SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
+    merge_ordered_archives, OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive,
+    SuccinctArchiveBlob, SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
 };
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
@@ -45,6 +45,34 @@ use super::{
 
 mod collection;
 pub use collection::*;
+
+fn resident_raw<R>(
+    source: crate::inline::Inline<Handle<SuccinctArchiveBlob>>,
+    reader: &R,
+) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError>
+where
+    R: BlobStoreGet + BlobStoreMeta,
+{
+    let resident = reader
+        .metadata(source)
+        .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?
+        .is_some();
+    if !resident {
+        return Err(CollectionOperationError::MissingDependency(Handle::<
+            SuccinctArchiveBlob,
+        >::to_hash(
+            source
+        )));
+    }
+    reader
+        .get::<Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(source)
+        .map_err(|error| {
+            CollectionOperationError::Fatal(format!(
+                "resident raw SuccinctArchive {} could not be read: {error}",
+                hex::encode_upper(source.raw),
+            ))
+        })
+}
 
 impl CollectionEncoding for SuccinctArchiveBlob {
     fn validate_member<R>(
@@ -65,11 +93,11 @@ impl CollectionEncoding for SuccinctArchiveBlob {
         low: &Blob<Self>,
         high: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        join(low, high).map(Some).map_err(|source| match source {
+        join(low, high).map_err(|source| match source {
             SuccinctArchiveRawMergeError::DomainTooWide
             | SuccinctArchiveRawMergeError::TooManyRows => {
                 CollectionOperationError::Capacity(source.to_string())
@@ -93,16 +121,127 @@ impl CollectionEncoding for Rank9AcceleratedSuccinctArchiveBlob {
     {
         let source = Self::source_handle(member)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        let raw = reader
-            .get::<Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(source)
-            .map_err(|source| {
-                CollectionOperationError::Fatal(format!(
-                    "accelerated SuccinctArchive raw child is not resident: {source}"
-                ))
-            })?;
+        let raw = resident_raw(source, reader)?;
         SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, member.clone())
             .map(|_| ())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    }
+
+    fn missing_representation_dependencies<R>(
+        member: CollectionData,
+        reader: &R,
+    ) -> Result<Vec<CollectionData>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        let root = reader
+            .get::<Blob<Self>, Self>(Handle::<Self>::from_hash(member))
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        let source = Self::source_handle(&root)
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        let resident = reader
+            .metadata(source)
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?
+            .is_some();
+        Ok(if resident {
+            Vec::new()
+        } else {
+            vec![Handle::<SuccinctArchiveBlob>::to_hash(source)]
+        })
+    }
+
+    fn join_members<R>(
+        _descriptor: &Fragment,
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+        reader: &R,
+    ) -> Result<Blob<Self>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        fn attach<R>(
+            root: &Blob<Rank9AcceleratedSuccinctArchiveBlob>,
+            reader: &R,
+        ) -> Result<
+            (Blob<SuccinctArchiveBlob>, SuccinctArchive<OrderedUniverse>),
+            CollectionOperationError,
+        >
+        where
+            R: BlobStoreGet + BlobStoreMeta,
+        {
+            let source = Rank9AcceleratedSuccinctArchiveBlob::source_handle(root)
+                .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+            let raw = resident_raw(source, reader)?;
+            let attached = SuccinctArchive::from_accelerated_parts(raw.clone(), root.clone())
+                .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+            Ok((raw, attached))
+        }
+
+        let (low_raw, low) = attach(low, reader)?;
+        let (high_raw, high) = attach(high, reader)?;
+
+        // The raw source lattice currently has a u32 in-memory construction
+        // boundary. Usually the sum of the child geometries proves that their
+        // union also fits, and the accelerated join can proceed directly. At
+        // the astronomical boundary where that upper bound is inconclusive,
+        // ask the raw lattice for the exact answer first. This keeps source and
+        // target capacity behavior aligned without charging ordinary Rank9
+        // joins for a redundant raw merge.
+        let may_cross_raw_capacity = low
+            .eav_c
+            .len()
+            .checked_add(high.eav_c.len())
+            .map_or(true, |rows| rows > u32::MAX as usize)
+            || low
+                .domain
+                .len()
+                .checked_add(high.domain.len())
+                .map_or(true, |values| values > u32::MAX as usize);
+        if may_cross_raw_capacity {
+            let raw =
+                SuccinctArchiveBlob::merge(&[low_raw, high_raw]).map_err(
+                    |source| match source {
+                        SuccinctArchiveRawMergeError::DomainTooWide
+                        | SuccinctArchiveRawMergeError::TooManyRows => {
+                            CollectionOperationError::Capacity(source.to_string())
+                        }
+                        SuccinctArchiveRawMergeError::InvalidInput { .. }
+                        | SuccinctArchiveRawMergeError::Construction(_) => {
+                            CollectionOperationError::Fatal(source.to_string())
+                        }
+                    },
+                )?;
+            let raw_handle = raw.get_handle();
+            let resident = reader
+                .metadata(raw_handle)
+                .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
+                .is_some();
+            if !resident {
+                return Err(CollectionOperationError::MissingDependency(Handle::<
+                    SuccinctArchiveBlob,
+                >::to_hash(
+                    raw_handle
+                )));
+            }
+            return SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw)
+                .map_err(|source| CollectionOperationError::Fatal(source.to_string()));
+        }
+
+        let merged = merge_ordered_archives(&[low, high]);
+        let (raw, accelerated) = merged.to_accelerated_parts();
+        let raw_handle = raw.get_handle();
+        let resident = reader
+            .metadata(raw_handle)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
+            .is_some();
+        if !resident {
+            return Err(CollectionOperationError::MissingDependency(Handle::<
+                SuccinctArchiveBlob,
+            >::to_hash(
+                raw_handle
+            )));
+        }
+        Ok(accelerated)
     }
 }
 
@@ -210,7 +349,7 @@ impl MetaDescribe for RawToRank9AcceleratedMappingV1 {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "raw-to-rank9-accelerated-succinctarchive-v1",
-                metadata::description: "Canonical join-homomorphic mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Construction first joins in the portable lattice and then derives the accelerated member as a separate ordinary operation.",
+                metadata::description: "Canonical join-homomorphic mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Raw and accelerated collections are full lattices; maintenance may derive or join either side and materializes a named raw-union dependency before publishing an accelerated union.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -524,7 +663,7 @@ pub fn validate_derive(
             return Err(SuccinctArchiveUnionValidationError::WrongSource {
                 expected: source_collection,
                 actual: actual_source,
-            })
+            });
         }
     }
     validate_collection(

@@ -161,28 +161,27 @@ The crate also ships with these blob encodings:
   This is a complete source-bound accelerated encoding, not a sidecar. Member
   validation follows the embedded handle and requires the raw child to be
   resident. A cover-aware query view then loads that child through its store snapshot,
-  validates the exact raw/index pair, and reconstructs the runtime. The raw
-  `SuccinctArchiveBlob` encoding owns the directly materialized union.
-  `SuccinctArchiveCollection::ensure` therefore performs deterministic
-  size-tiered maintenance in the raw lattice first and maps that result through
-  ordinary `DERIVE` records. The accelerated collection has the same logical
-  join because the mapping is a join homomorphism: its physical construction is
-  `MERGE` in the raw lattice followed by `DERIVE`, not one operation that emits
-  both blobs. Ordinary support-equivalent cover resolution may reuse any
-  already-derived accelerated cover with the same foundation. Normal
-  construction stores the raw source before its accelerated image, and the
-  typed view rejects an image whose named raw child is unavailable.
+  validates the exact raw/index pair, and reconstructs the runtime. The raw and
+  accelerated encodings each own a canonical union. An accelerated join
+  publishes only the accelerated result, but requires the matching raw union
+  to be resident because its header names that exact child. Generic storage
+  maintenance can therefore publish the raw source `MERGE` first and retry the
+  accelerated `MERGE`; no operation emits both blobs. Ordinary
+  support-equivalent cover resolution may reuse any already-derived or joined
+  accelerated cover with the same foundation. Resolution first excludes an
+  image whose named raw child is unavailable and falls back to a complete finer
+  cover; direct typed-view construction retains the same check defensively.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 
 `BlobEncoding` says what bytes mean. `CollectionEncoding` is the stronger
 contract for formats used as collection members: every member is an ordinary
-typed `Blob`, the encoding owns canonical member validation, and it may expose
-one directly materializable join. Returning no direct join means that physical
-compaction belongs in another lattice; multi-member covers and logical views
-remain valid. `SimpleArchive` and `SuccinctArchiveBlob` are directly joinable,
-while `Rank9AcceleratedSuccinctArchiveBlob` realizes union by deriving after
-raw-target maintenance.
+typed `Blob`, and the encoding owns canonical member validation and one
+canonical member-join operation. When one blob hits a deterministic geometry
+limit, a multi-member `Cover<E>` retains the same logical value, so every
+collection remains a full join-semilattice. "Derived" describes provenance
+across a join-preserving mapping, not weaker algebraic capability; covers are
+lazy physical decompositions of the same join.
 Validation and joining share one immutable store snapshot, so Merkle-shaped
 encodings can resolve children named by their members without consulting
 ambient mutable state.

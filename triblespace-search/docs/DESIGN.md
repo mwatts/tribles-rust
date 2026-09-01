@@ -2,16 +2,19 @@
 
 Three typed content-addressed representations sit on top of a triblespace pile:
 a portable BM25 carrier, a direct native BM25 accelerator, and a native HNSW
-accelerator for approximate nearest-neighbour search. They follow the same
-logical invariants:
+accelerator for approximate nearest-neighbour search. All are immutable typed
+artifacts, but only the portable BM25 carrier is currently a collection lattice;
+the native accelerators remain standalone derived blobs.
 
-1. **Content-addressed.** Same corpus → same blob hash. Rebuilds
-   are free when nothing has changed; same content embedded with
-   the same model yields the same blob everywhere in the pile.
-2. **Immutable artifacts, no mutation.** A build or merge returns a fresh
-   content-addressed artifact without replacing prior nodes. Collection-owned
-   callers publish exact joins through their own evidence model; direct callers
-   may also persist the handle in ordinary tribles.
+1. **Content-addressed.** Identical encoded bytes have the same blob hash.
+   Portable BM25 also has canonical bytes for its logical exact-TF carrier.
+   Native HNSW construction order remains part of the resulting artifact, so it
+   is not yet a canonical semantic-search collection encoding.
+2. **Immutable artifacts, no mutation.** A build returns a fresh
+   content-addressed artifact without replacing prior nodes. Encodings with a
+   canonical join may also return a fresh merged artifact. Collection-owned
+   callers publish joins through collection evidence; direct callers may
+   persist standalone handles in ordinary tribles.
 3. **Typed self-contained bytes.** `try_from_blob` validates the representation
    selected by the handle type. Portable BM25 keeps a gapless fixed-width
    grammar; the native succinct accelerators use jerky. Every attached view

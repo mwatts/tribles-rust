@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Make Rank9 acceleration an ordinary second collection derivation. Raw
-  Succinct members are merged first and the resulting member is then derived
-  into one complete accelerated encoding; the exact-member side path is gone,
-  support-equivalent covers use the normal resolver, and no construction emits
-  raw and accelerated blobs together.
+- Make Rank9 acceleration an ordinary full derived lattice. Raw Succinct and
+  Rank9-accelerated members each own a canonical join. When the accelerated
+  join's exact raw union is absent, generic collection maintenance materializes
+  that immutable source dependency and retries; each step still emits one blob
+  and one ordinary `MERGE`, while the homomorphism implies the cross-lattice
+  `DERIVE`.
 
 - Rebuild every active Full-replica disclosure forest whenever resident blobs
   change. Exact H-only arrivals carry no collection provenance, so this
@@ -117,11 +118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ambient resident content a semantic input.
 
 - Make every collection member an ordinary typed `Blob<E>`.
-  `CollectionEncoding` validates that blob and may expose one directly
-  materializable canonical join; encodings whose physical compaction belongs
-  in another lattice keep multi-member covers instead. `CollectionMapping`
-  maps blobs to blobs, and exact derivation stores a selected source member
-  before its target image and ordinary `DERIVE` record.
+  `CollectionEncoding` validates that blob and defines one canonical join;
+  `Cover<E>` keeps the logical join total when one member hits a deterministic
+  capacity boundary, so every source and derived collection is a full lattice.
+  `CollectionMapping` maps blobs to blobs as a join homomorphism, while storage
+  owns deterministic merge/derive sequencing and immutable dependencies.
 
 - Add a typed collection API above the representation-neutral wire records.
   `Collection<E>` validates a descriptor's canonical member encoding,
@@ -129,8 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconstructs either eager values or lazy mmap-backed unions. Signed
   `store.commit` introduces authored `Fragment` leaves into `SimpleArchive`
   source collections; typed covers and logical materialization work across
-  encodings. Each `CollectionEncoding` owns canonical validation and may expose
-  one direct physical join, while exact derivations bind one parameterized
+  encodings. Each `CollectionEncoding` owns canonical validation and one direct
+  physical join operation, while covers retain finer equivalent shapes across
+  deterministic capacity boundaries and exact derivations bind one parameterized
   `CollectionMapping<Source, Target>` whose ordinary trible fragment is
   embedded in the target descriptor.
 
@@ -842,12 +844,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Four explicitly minted encoding ids and four mapping-algorithm ids distinguish
   32/64-bit and little/big-endian profiles; the current target selects one of
   each. The raw-to-accelerated stage is an ordinary `DERIVE`. Raw
-  `SuccinctArchiveBlob` members own the joinable lattice; Rank9 roots have no
-  direct `MERGE`, so maintenance compacts raw members first and then derives
-  the matching accelerated member. A cover-aware view reads the embedded raw
-  handle through its immutable store snapshot and validates the exact
-  raw/index pair before constructing the query runtime. Exact derivation stores
-  the selected raw source before its accelerated root and semantic record.
+  `SuccinctArchiveBlob` and Rank9-accelerated members each own a canonical
+  `MERGE`. The accelerated join names the corresponding raw union as an
+  immutable dependency; generic maintenance materializes that source merge
+  when necessary, then retries the target join. A cover-aware view reads the
+  embedded raw handle through its immutable store snapshot and validates the
+  exact raw/index pair before constructing the query runtime.
   The typed view rejects an accelerated root whose named raw child is absent;
   normal construction prevents that state by publishing source before target.
 
@@ -863,10 +865,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewrite collects intermediate cache blobs; `ensure` repairs only the
   missing canonical closure and is write-free again once it is resident.
 
-  Lattice operations return
-  `CollectionOperationError::{Fatal, Capacity}`. `Capacity` is reserved for
+  Lattice operations return `CollectionOperationError::{Fatal, Capacity,
+  MissingDependency}`. `Capacity` is reserved for
   deterministic fixed-representation geometry, never transient allocation,
-  I/O, or malformed persisted bytes. When a selected source upper exceeds that
+  I/O, or malformed persisted bytes. `MissingDependency` names exact immutable
+  content which generic storage may materialize or fetch before retrying the
+  otherwise pure operation. When a selected source upper exceeds that
   geometry, completion excludes it and globally replans the physical cover
   under the same read/resolution snapshot, caching successful images but
   publishing only the final feasible plan. An indispensable source-cover member
@@ -896,14 +900,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MERGE` or `DERIVE` remains absent from a fresh store snapshot, maintenance
   reports a stalled backend instead of repeating it indefinitely. No flush,
   planner, manifest, receipt, retention root, background task, or authority
-  record is introduced. Accelerated members are derived only for the final
-  selected raw cover, never for compacted-away leaves; each raw shard retains
-  the explicit `u32::MAX` row/domain boundary.
+  record is introduced. Each raw shard retains the explicit `u32::MAX`
+  row/domain boundary.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach, ensure}` validates a frozen
   source `Cover`, reuses canonical source merges, target
   merges, and derives, and closes the exact resident summary cover once into a
-  `PathIndex`. Ensuring lowers only unsupported distinct source elements,
+  `PathIndex`. Ensuring lowers only capacity-limited distinct source elements,
   publishes blobs before unsigned records without an implicit flush, and
   reattaches through a fresh store snapshot. The empty cover is a no-write
   local bottom. `PathRollup`, its range attribute, range-manifest attachment,

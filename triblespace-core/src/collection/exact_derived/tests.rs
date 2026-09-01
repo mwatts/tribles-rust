@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
-use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::descriptor;
 use crate::collection::simplearchive_union;
@@ -17,15 +17,15 @@ use crate::collection::{AdmissionPolicy, CollectionPolicy};
 use crate::collection::{CollectionCommit, CollectionRead, CollectionStoreExt};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
-use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
+use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use crate::repo::{
     BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, SnapshotSource, StoreChanges,
     StoreSnapshot,
 };
-use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
+use crate::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 
 /// The one team every collection in these tests belongs to.
 fn test_team() -> ed25519_dalek::VerifyingKey {
@@ -78,26 +78,39 @@ impl CollectionEncoding for TestSourceBlob {
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-        _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+        reader: &R,
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        SELECTIVE_POLICY.with(|policy| {
+        let dependency = SELECTIVE_POLICY.with(|policy| {
             if let Some(policy) = policy.borrow().as_ref() {
                 policy
                     .source_attempts
                     .lock()
                     .unwrap()
                     .push(SelectiveMapping::pair(low, high));
+                return policy
+                    .source_dependencies
+                    .get(&SelectiveMapping::pair(low, high))
+                    .copied();
             }
+            None
         });
+        if let Some(dependency) = dependency {
+            let resident = reader
+                .metadata(Handle::<TestSourceBlob>::from_hash(dependency))
+                .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?
+                .is_some();
+            if !resident {
+                return Err(CollectionOperationError::MissingDependency(dependency));
+            }
+        }
         simplearchive_union::join(
             low.as_transmute::<SimpleArchive>(),
             high.as_transmute::<SimpleArchive>(),
         )
         .map(Blob::transmute::<TestSourceBlob>)
-        .map(Some)
         .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 }
@@ -116,6 +129,8 @@ struct SelectiveMapping {
     fatal_derives: BTreeSet<CollectionData>,
     capacity_target_pairs: BTreeSet<(CollectionData, CollectionData)>,
     fatal_target_pairs: BTreeSet<(CollectionData, CollectionData)>,
+    source_dependencies: BTreeMap<(CollectionData, CollectionData), CollectionData>,
+    target_dependencies: BTreeMap<(CollectionData, CollectionData), CollectionData>,
     source_attempts: Arc<Mutex<Vec<(CollectionData, CollectionData)>>>,
     derive_attempts: Arc<Mutex<Vec<CollectionData>>>,
     target_attempts: Arc<Mutex<Vec<(CollectionData, CollectionData)>>>,
@@ -158,40 +173,6 @@ impl MetaDescribe for TestTargetBlob {
     }
 }
 
-/// Test-only UTF-8 target whose bytes come from a source attachment.
-/// Minted with `trible genid` on 2026-08-30.
-const ATTACHED_TEXT_ENCODING_V1: Id = id_hex!("9E0CC64DE6D66EC9231B781D7215C2EC");
-
-struct AttachedTextBlob;
-
-impl BlobEncoding for AttachedTextBlob {}
-
-impl MetaDescribe for AttachedTextBlob {
-    fn describe() -> Fragment {
-        let id = ATTACHED_TEXT_ENCODING_V1;
-        crate::macros::entity! { ExclusiveId::force_ref(&id) @
-            crate::metadata::name: "exact-derived-attached-text-v1",
-            crate::metadata::description: "Test-only UTF-8 target resolved from a handle carried by one SimpleArchive source member.",
-            crate::metadata::tag: crate::metadata::KIND_BLOB_ENCODING,
-        }
-    }
-}
-
-impl CollectionEncoding for AttachedTextBlob {
-    fn validate_member<R>(
-        _descriptor: &Fragment,
-        member: &Blob<Self>,
-        _reader: &R,
-    ) -> Result<(), CollectionOperationError>
-    where
-        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
-    {
-        std::str::from_utf8(member.bytes.as_ref())
-            .map(|_| ())
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
-    }
-}
-
 /// Test-only source-attachment dereference mapping.
 /// Minted with `trible genid` on 2026-08-30.
 const ATTACHED_TEXT_MAPPING_V1: Id = id_hex!("B0DF19D3C1B35052C31E722F1294D9CB");
@@ -220,7 +201,7 @@ struct AttachedTextMapping;
 
 impl CollectionMapping for AttachedTextMapping {
     type Source = SimpleArchive;
-    type Target = AttachedTextBlob;
+    type Target = SimpleArchive;
 
     fn fragment(&self) -> Fragment {
         attached_text_mapping_fragment()
@@ -235,33 +216,41 @@ impl CollectionMapping for AttachedTextMapping {
         &self,
         source: &Blob<SimpleArchive>,
         reader: &R,
-    ) -> Result<Blob<AttachedTextBlob>, CollectionOperationError>
+    ) -> Result<Blob<SimpleArchive>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        let description = source
+        let descriptions: Vec<_> = source
             .bytes
             .as_ref()
             .chunks_exact(TRIBLE_LEN)
-            .find(|row| row[16..32] == crate::metadata::description.id()[..])
+            .filter(|row| row[16..32] == crate::metadata::description.id()[..])
             .map(|row| {
-                Inline::<Handle<UTF8String>>::new(
-                    row[32..64]
-                        .try_into()
-                        .expect("SimpleArchive rows have a 32-byte value"),
+                (
+                    row,
+                    Inline::<Handle<UTF8String>>::new(
+                        row[32..64]
+                            .try_into()
+                            .expect("SimpleArchive rows have a 32-byte value"),
+                    ),
                 )
             })
-            .ok_or_else(|| {
-                CollectionOperationError::Fatal(
-                    "source member has no metadata::description attachment".to_owned(),
-                )
+            .collect();
+        if descriptions.is_empty() {
+            return Err(CollectionOperationError::Fatal(
+                "source member has no metadata::description attachment".to_owned(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(descriptions.len() * TRIBLE_LEN);
+        for (row, description) in descriptions {
+            let _: Blob<UTF8String> = reader.get(description).map_err(|source| {
+                CollectionOperationError::Fatal(format!(
+                    "resolve source metadata::description attachment: {source}"
+                ))
             })?;
-        let text: Blob<UTF8String> = reader.get(description).map_err(|source| {
-            CollectionOperationError::Fatal(format!(
-                "resolve source metadata::description attachment: {source}"
-            ))
-        })?;
-        Ok(Blob::new(text.bytes))
+            bytes.extend_from_slice(row);
+        }
+        Ok(Blob::new(bytes.into()))
     }
 }
 
@@ -281,19 +270,19 @@ impl CollectionEncoding for TestTargetBlob {
         _descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-        _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+        reader: &R,
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        let injected = SELECTIVE_POLICY.with(|policy| {
+        let (injected, dependency) = SELECTIVE_POLICY.with(|policy| {
             let policy = policy.borrow();
             let Some(policy) = policy.as_ref() else {
-                return None;
+                return (None, None);
             };
             let pair = SelectiveMapping::pair(low, high);
             policy.target_attempts.lock().unwrap().push(pair);
-            if policy.fatal_target_pairs.contains(&pair) {
+            let injected = if policy.fatal_target_pairs.contains(&pair) {
                 Some(CollectionOperationError::Fatal(
                     "injected fatal target join".to_owned(),
                 ))
@@ -303,12 +292,22 @@ impl CollectionEncoding for TestTargetBlob {
                 ))
             } else {
                 None
-            }
+            };
+            (injected, policy.target_dependencies.get(&pair).copied())
         });
         if let Some(error) = injected {
             return Err(error);
         }
-        join_test_targets(low, high).map(Some)
+        if let Some(dependency) = dependency {
+            let resident = reader
+                .metadata(Handle::<TestSourceBlob>::from_hash(dependency))
+                .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?
+                .is_some();
+            if !resident {
+                return Err(CollectionOperationError::MissingDependency(dependency));
+            }
+        }
+        join_test_targets(low, high)
     }
 }
 
@@ -348,7 +347,7 @@ impl CollectionEncoding for SecondTestTargetBlob {
         low: &Blob<Self>,
         high: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
@@ -362,7 +361,7 @@ impl CollectionEncoding for SecondTestTargetBlob {
         let joined = join_test_targets(&low, &high)?;
         let mut bytes = joined.bytes.as_ref().to_vec();
         bytes.push(0xB6);
-        Ok(Some(Blob::new(bytes.into())))
+        Ok(Blob::new(bytes.into()))
     }
 }
 
@@ -559,17 +558,21 @@ fn ensure_resolves_source_member_attachments_through_the_reader() {
     let attached = exact.ensure(&mut store, &cover).unwrap();
     assert_eq!(attached.len(), 1);
     let snapshot = store.snapshot().unwrap();
-    let attached_blob: Blob<AttachedTextBlob> =
+    let attached_blob: Blob<SimpleArchive> =
         snapshot.get(attached.members().next().unwrap()).unwrap();
-    assert_eq!(attached_blob.bytes.as_ref(), expected.as_bytes());
+    assert_eq!(attached_blob.bytes.len(), TRIBLE_LEN);
+    let description =
+        Inline::<Handle<UTF8String>>::new(attached_blob.bytes.as_ref()[32..64].try_into().unwrap());
+    let text: Blob<UTF8String> = snapshot.get(description).unwrap();
+    assert_eq!(text.bytes.as_ref(), expected.as_bytes());
 
     // A second read-only pass follows the resident DERIVE without remapping the
     // source attachment.
     let reattached = exact.attach(&mut store, &cover).unwrap();
     let snapshot = store.snapshot().unwrap();
-    let reattached_blob: Blob<AttachedTextBlob> =
+    let reattached_blob: Blob<SimpleArchive> =
         snapshot.get(reattached.members().next().unwrap()).unwrap();
-    assert_eq!(reattached_blob.bytes.as_ref(), expected.as_bytes());
+    assert_eq!(reattached_blob.get_handle(), attached_blob.get_handle());
 }
 
 fn selective_kernel(mapping: SelectiveMapping) -> ExactDerivedCollection<SelectiveMapping> {
@@ -1282,6 +1285,179 @@ fn ensure_joins_resident_target_children_before_crossing_the_mapping() {
     assert!(algebra.source_attempts.lock().unwrap().is_empty());
     assert_eq!(algebra.target_attempts.lock().unwrap().as_slice(), &[pair]);
     assert_eq!((store.puts, store.inserts), (1, 1));
+}
+
+#[test]
+fn target_dependency_materializes_the_matching_source_join_then_retries() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let c = join_test_sources(&a, &b);
+    let fa = derive(&a).unwrap();
+    let fb = derive(&b).unwrap();
+    let fc = join_test_targets(&fa, &fb).unwrap();
+    let source_pair = SelectiveMapping::pair(&a, &b);
+    let target_pair = SelectiveMapping::pair(&fa, &fb);
+
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    for source in [&a, &b] {
+        inner.put::<TestSourceBlob, _>(source.clone()).unwrap();
+        publish_derive(&mut inner, source);
+    }
+    let algebra = SelectiveMapping {
+        target_dependencies: BTreeMap::from([(target_pair, data(&c))]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(
+        kernel().source_collection(),
+        [a.get_handle(), b.get_handle()],
+    );
+
+    let (ensured, attached) = with_selective(&algebra, |kernel| {
+        let ensured = kernel.ensure(&mut store, &source_cover).unwrap();
+        let attached = kernel.attach(&mut store, &source_cover).unwrap();
+        (ensured, attached)
+    });
+
+    assert_eq!(cover_ids(&ensured), vec![data(&fc)]);
+    assert_eq!(cover_ids(&attached), vec![data(&fc)]);
+    assert_eq!(
+        algebra.source_attempts.lock().unwrap().as_slice(),
+        &[source_pair]
+    );
+    assert_eq!(
+        algebra.target_attempts.lock().unwrap().as_slice(),
+        &[target_pair, target_pair]
+    );
+    let records = collection_records(&mut store.inner);
+    assert!(records.iter().any(|record| matches!(
+        record,
+        CollectionRecord::Merge(merge)
+            if merge.collection() == kernel().source_collection().handle()
+                && merge.inputs() == source_pair
+                && merge.result() == data(&c)
+    )));
+    assert!(records.iter().any(|record| matches!(
+        record,
+        CollectionRecord::Merge(merge)
+            if merge.collection() == kernel().target_collection().handle()
+                && merge.inputs() == target_pair
+                && merge.result() == data(&fc)
+    )));
+    assert!(!records.iter().any(|record| matches!(
+        record,
+        CollectionRecord::Derive(derive)
+            if derive.collection() == kernel().target_collection().handle()
+                && derive.input() == data(&c)
+    )));
+}
+
+#[test]
+fn nested_source_dependency_is_reported_without_partial_publication() {
+    let a = archive([(1, 3)]);
+    let b = archive([(2, 4)]);
+    let c = join_test_sources(&a, &b);
+    let nested = archive([(100, 101)]);
+    let fa = derive(&a).unwrap();
+    let fb = derive(&b).unwrap();
+    let source_pair = SelectiveMapping::pair(&a, &b);
+    let target_pair = SelectiveMapping::pair(&fa, &fb);
+    let nested_dependency = data(&nested);
+
+    let mut inner = MemoryRepo::default();
+    register_kernel(&mut inner);
+    for source in [&a, &b] {
+        inner.put::<TestSourceBlob, _>(source.clone()).unwrap();
+        publish_derive(&mut inner, source);
+    }
+    let algebra = SelectiveMapping {
+        source_dependencies: BTreeMap::from([(source_pair, nested_dependency)]),
+        target_dependencies: BTreeMap::from([(target_pair, data(&c))]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(
+        kernel().source_collection(),
+        [a.get_handle(), b.get_handle()],
+    );
+
+    let error = with_selective(&algebra, |kernel| {
+        kernel.ensure(&mut store, &source_cover).unwrap_err()
+    });
+
+    assert!(matches!(
+        error,
+        ExactDerivedCollectionError::MissingDependency { member }
+            if member == nested_dependency
+    ));
+    assert_eq!(
+        algebra.source_attempts.lock().unwrap().as_slice(),
+        &[source_pair]
+    );
+    assert_eq!(
+        algebra.target_attempts.lock().unwrap().as_slice(),
+        &[target_pair]
+    );
+    assert_eq!((store.puts, store.inserts), (0, 0));
+    assert!(target_merge_records(&mut store.inner).is_empty());
+}
+
+#[test]
+fn unmatched_local_target_dependency_is_reported_without_publishing_a_merge() {
+    let a = archive([(1, 3)]);
+    let b = archive((2u8..=9).map(|entity| (entity, entity + 20)));
+    let unrelated = archive([(100, 101)]);
+    let mut inner = MemoryRepo::default();
+    inner.put::<TestSourceBlob, _>(a.clone()).unwrap();
+    inner.put::<TestSourceBlob, _>(b.clone()).unwrap();
+    let c = publish_source_merge(&mut inner, &a, &b);
+    let fa = publish_derive(&mut inner, &a);
+    let fb = publish_derive(&mut inner, &b);
+    let source_pair = SelectiveMapping::pair(&a, &b);
+    let target_pair = SelectiveMapping::pair(&fa, &fb);
+    let dependency = data(&unrelated);
+    assert_ne!(dependency, data(&c));
+    assert_ne!(
+        fa.bytes.len().max(1).ilog2(),
+        fb.bytes.len().max(1).ilog2(),
+        "exercise the per-point target join rather than global compaction",
+    );
+    let algebra = SelectiveMapping {
+        target_dependencies: BTreeMap::from([(target_pair, dependency)]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+    let source_cover = Cover::from_members(kernel().source_collection(), [c.get_handle()]);
+
+    let error = with_selective(&algebra, |kernel| {
+        kernel.ensure(&mut store, &source_cover).unwrap_err()
+    });
+
+    assert!(matches!(
+        error,
+        ExactDerivedCollectionError::MissingDependency { member }
+            if member == dependency
+    ));
+    assert_eq!(
+        algebra.source_attempts.lock().unwrap().as_slice(),
+        &[source_pair]
+    );
+    assert_eq!(
+        algebra.target_attempts.lock().unwrap().as_slice(),
+        &[target_pair]
+    );
+    assert_eq!((store.puts, store.inserts), (0, 0));
+    assert!(target_merge_records(&mut store.inner).is_empty());
 }
 
 #[test]
@@ -2037,11 +2213,13 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
     let mut expected = vec![data(&a), data(&b)];
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    assert!(algebra
-        .derive_attempts
-        .lock()
-        .unwrap()
-        .contains(&data(&upper)));
+    assert!(
+        algebra
+            .derive_attempts
+            .lock()
+            .unwrap()
+            .contains(&data(&upper))
+    );
     assert_eq!(algebra.target_attempts.lock().unwrap().len(), 1);
 }
 
@@ -2147,11 +2325,13 @@ fn mixed_terminal_capacity_publishes_the_successful_sibling() {
     ));
     assert_eq!((store.puts, store.inserts), (2, 1));
     assert_eq!(derived_inputs(&mut store.inner), vec![data(successful)]);
-    assert!(algebra
-        .derive_attempts
-        .lock()
-        .unwrap()
-        .contains(&data(successful)));
+    assert!(
+        algebra
+            .derive_attempts
+            .lock()
+            .unwrap()
+            .contains(&data(successful))
+    );
 }
 
 #[test]
@@ -2529,6 +2709,63 @@ fn target_capacity_retires_only_low() {
 }
 
 #[test]
+fn unmatched_global_target_dependency_is_reported_without_publishing_a_merge() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let unrelated = archive([(100, 101)]);
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut inner, index as u8 + 1, source);
+            publish_derive(&mut inner, source);
+            commit
+        })
+        .collect();
+    let source_cover = source_cover(&commits);
+    let targets: Vec<_> = sources
+        .iter()
+        .map(|source| derive(source).unwrap())
+        .collect();
+    assert_eq!(
+        targets[0].bytes.len().max(1).ilog2(),
+        targets[1].bytes.len().max(1).ilog2(),
+        "exercise global same-tier compaction",
+    );
+    let source_pair = SelectiveMapping::pair(&sources[0], &sources[1]);
+    let target_pair = SelectiveMapping::pair(&targets[0], &targets[1]);
+    let dependency = data(&unrelated);
+    let algebra = SelectiveMapping {
+        target_dependencies: BTreeMap::from([(target_pair, dependency)]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+
+    let error = with_selective(&algebra, |kernel| {
+        kernel.ensure(&mut store, &source_cover).unwrap_err()
+    });
+
+    assert!(matches!(
+        error,
+        ExactDerivedCollectionError::MissingDependency { member }
+            if member == dependency
+    ));
+    assert_eq!(
+        algebra.source_attempts.lock().unwrap().as_slice(),
+        &[source_pair]
+    );
+    assert_eq!(
+        algebra.target_attempts.lock().unwrap().as_slice(),
+        &[target_pair]
+    );
+    assert_eq!((store.puts, store.inserts), (0, 0));
+    assert!(target_merge_records(&mut store.inner).is_empty());
+}
+
+#[test]
 fn fatal_late_target_join_preserves_the_successful_prefix() {
     let sources = [
         archive([(1, 3)]),
@@ -2673,9 +2910,11 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_stored_equation() {
     assert!(tier_stable);
     assert_eq!(after.len(), 2);
     assert_eq!(joined_cover(&mut store, &after).bytes, old_upper.bytes);
-    assert!(target_merge_records(&mut store)
-        .iter()
-        .any(|claim| claim.inputs() == (targets[0].0, targets[1].0)));
+    assert!(
+        target_merge_records(&mut store)
+            .iter()
+            .any(|claim| claim.inputs() == (targets[0].0, targets[1].0))
+    );
 }
 
 #[test]
@@ -2746,10 +2985,12 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
     kernel().ensure(&mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
     let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection().handle());
-    assert!(!store
-        .events
-        .iter()
-        .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
+    assert!(
+        !store
+            .events
+            .iter()
+            .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data))
+    );
     let merges: Vec<_> = store
         .events
         .iter()
@@ -2761,9 +3002,11 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
         .collect();
     assert!(!merges.is_empty());
     for (position, result) in merges {
-        assert!(store.events[..position]
-            .iter()
-            .any(|event| matches!(event, WriteEvent::Put(data) if *data == result)));
+        assert!(
+            store.events[..position]
+                .iter()
+                .any(|event| matches!(event, WriteEvent::Put(data) if *data == result))
+        );
     }
 }
 

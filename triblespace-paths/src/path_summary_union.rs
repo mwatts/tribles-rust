@@ -174,14 +174,12 @@ impl CollectionEncoding for PathSummaryBlob {
         low: &Blob<Self>,
         high: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: triblespace_core::repo::BlobStoreGet,
     {
         let automaton = automaton_from_descriptor(descriptor)?;
-        PathSummaryBlob::join(low, high, &automaton)
-            .map(Some)
-            .map_err(summary_operation_error)
+        PathSummaryBlob::join(low, high, &automaton).map_err(summary_operation_error)
     }
 }
 

@@ -17,10 +17,11 @@ use std::error::Error;
 use std::fmt;
 
 use crate::id::Id;
+use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
 use super::{
-    CollectionCommit, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
-    DiscoveredCollectionRecords,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
+    CollectionMerge, CollectionOperationError, DiscoveredCollectionRecords,
 };
 
 type MemberKey = (CollectionHandle, CollectionData);
@@ -353,6 +354,36 @@ impl CollectionSemantics {
             .map(|(output, _)| *output)
     }
 
+    /// Canonical source members currently known to map to one exact target
+    /// member.
+    ///
+    /// The reverse relation is intentionally allowed to contain more than one
+    /// member: a join homomorphism need not be injective. Asserted and
+    /// commuting-square-implied derives share the same index, so callers do
+    /// not need a second lineage mechanism for construction planning.
+    pub(crate) fn derive_preimages(
+        &self,
+        source: CollectionHandle,
+        target: CollectionHandle,
+        output: CollectionData,
+    ) -> Vec<CollectionData> {
+        let mut previous = None;
+        self.derive_inputs_by_output
+            .get(&(target, output))
+            .into_iter()
+            .flatten()
+            .filter(|(actual_source, _, _)| *actual_source == source)
+            .filter_map(|(_, input, _)| {
+                if previous == Some(*input) {
+                    None
+                } else {
+                    previous = Some(*input);
+                    Some(*input)
+                }
+            })
+            .collect()
+    }
+
     /// Intrinsic ids of the exact authorized commit records supporting one
     /// member through every known active construction path.
     ///
@@ -552,6 +583,18 @@ pub(crate) struct CollectionPhysicalCover {
     pub missing: BTreeSet<CollectionData>,
 }
 
+/// Closure-aware result of selecting a physical collection cover.
+pub(crate) struct CollectionCompletePhysicalCover {
+    /// Complete resident members selected for immediate interpretation.
+    pub physical: CollectionPhysicalCover,
+    /// Missing representation blobs selected by the best otherwise-complete
+    /// hypothetical cover.
+    pub dependencies: BTreeSet<CollectionData>,
+    /// Unusable selected member required only when no complete or merely
+    /// incomplete alternative can cover the frontier.
+    pub unusable: Option<(CollectionData, CollectionOperationError)>,
+}
+
 /// Compute a deterministic, overlap-aware resident cover of one collection.
 ///
 /// This is a pure view over a resolved semantic snapshot and a caller-supplied
@@ -570,6 +613,110 @@ pub(crate) fn collection_physical_cover(
 ) -> CollectionPhysicalCover {
     let obligations = semantics.frontier(collection).cloned().unwrap_or_default();
     collection_physical_cover_for(semantics, collection, &obligations, resident)
+}
+
+/// Select a deterministic physical cover whose representation closure is
+/// resident.
+///
+/// Root metadata remains the cheap first filter. Only members selected by the
+/// current physical proof invoke the encoding-specific dependency query; each
+/// incomplete or unusable root is removed and the cover is recomputed. The
+/// loop therefore performs no payload work for irrelevant historical
+/// materializations and terminates after at most one retry per rejected root.
+pub(crate) fn collection_complete_physical_cover<E, R>(
+    semantics: &CollectionSemantics,
+    collection: CollectionHandle,
+    root_resident: &BTreeSet<CollectionData>,
+    reader: &R,
+) -> CollectionCompletePhysicalCover
+where
+    E: CollectionEncoding,
+    R: BlobStoreGet + BlobStoreMeta,
+{
+    let mut candidates = root_resident.clone();
+    let mut incomplete = BTreeMap::<CollectionData, Vec<CollectionData>>::new();
+    let mut unusable = BTreeMap::<CollectionData, CollectionOperationError>::new();
+
+    loop {
+        let physical = collection_physical_cover(semantics, collection, &candidates);
+        let mut removed = false;
+        for member in &physical.cover {
+            match E::missing_representation_dependencies(*member, reader) {
+                Ok(missing) if missing.is_empty() => {}
+                Ok(missing) => {
+                    candidates.remove(member);
+                    incomplete.insert(*member, missing);
+                    removed = true;
+                }
+                Err(source) => {
+                    candidates.remove(member);
+                    unusable.insert(*member, source);
+                    removed = true;
+                }
+            }
+        }
+        if removed {
+            continue;
+        }
+        if physical.missing.is_empty() {
+            return CollectionCompletePhysicalCover {
+                physical,
+                dependencies: BTreeSet::new(),
+                unusable: None,
+            };
+        }
+
+        // Reinsert only rejected roots to explain the failed selection. A
+        // missing dependency is useful only if its member participates in the
+        // best hypothetical cover; unrelated historical roots stay silent.
+        let mut with_incomplete = candidates.clone();
+        with_incomplete.extend(incomplete.keys().copied());
+        let tentative = collection_physical_cover(semantics, collection, &with_incomplete);
+        let dependencies = tentative
+            .cover
+            .iter()
+            .filter_map(|member| incomplete.get(member))
+            .flatten()
+            .copied()
+            .collect();
+        if tentative.missing.is_empty() {
+            return CollectionCompletePhysicalCover {
+                physical,
+                dependencies,
+                unusable: None,
+            };
+        }
+
+        let mut with_unusable = with_incomplete;
+        with_unusable.extend(unusable.keys().copied());
+        let last_resort = collection_physical_cover(semantics, collection, &with_unusable);
+        if last_resort.missing.is_empty() {
+            if let Some(member) = last_resort
+                .cover
+                .iter()
+                .find(|member| unusable.contains_key(*member))
+                .copied()
+            {
+                return CollectionCompletePhysicalCover {
+                    physical,
+                    dependencies,
+                    unusable: Some((
+                        member,
+                        unusable.remove(&member).expect("selected unusable member"),
+                    )),
+                };
+            }
+        }
+
+        return CollectionCompletePhysicalCover {
+            physical: CollectionPhysicalCover {
+                cover: physical.cover,
+                missing: tentative.missing,
+            },
+            dependencies,
+            unusable: None,
+        };
+    }
 }
 
 /// Compute a resident proof for caller-selected semantic obligations.

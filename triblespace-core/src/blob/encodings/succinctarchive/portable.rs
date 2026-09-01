@@ -42,7 +42,7 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::id::{id_from_value, Id};
+use crate::id::{Id, id_from_value};
 use crate::inline::RawInline;
 
 const COUNT_FOOTER_LEN: usize = 16;
@@ -235,7 +235,7 @@ impl PortableView<'_> {
     /// A small, independent canonical writer then derives all three prefixes,
     /// all six masks, and all six wavelet matrices from those rows. Only exact
     /// byte equality succeeds. This makes the proof independent of Jerky's
-    /// native runtime and its detached Rank9 accelerator.
+    /// native runtime and its source-bound Rank9 accelerated root.
     pub(crate) fn prove_canonical(&self) -> Result<RuntimeParts, PortableError> {
         let rows = self.candidate_eav_codes()?;
         if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -583,8 +583,14 @@ fn canonical_bytes_from_eav(
         )
     });
 
-    let [eav_changes, vea_changes, ave_changes, vae_changes, eva_changes, aev_changes] =
-        rotation_changes;
+    let [
+        eav_changes,
+        vea_changes,
+        ave_changes,
+        vae_changes,
+        eva_changes,
+        aev_changes,
+    ] = rotation_changes;
     let changes = [
         eav_changes,
         eva_changes,
@@ -698,7 +704,7 @@ fn set_bit(words: &mut [u64], position: usize) {
 /// Small, validation-only rank directory over one portable wavelet matrix.
 /// It is intentionally not retained by the query runtime: exact derivation
 /// rebuilds the canonical native/CubeCL-facing representation and attaches the
-/// detached accelerator there.
+/// source-bound accelerated root there.
 struct PortableWavelet<'a> {
     view: &'a PortableView<'a>,
     rotation: Rotation,
@@ -902,11 +908,7 @@ const fn words_for_bits(bits: usize) -> usize {
 pub(crate) const fn alphabet_width(domain_len: usize) -> usize {
     let max_code = domain_len.saturating_sub(1);
     let width = usize::BITS as usize - max_code.leading_zeros() as usize;
-    if width == 0 {
-        1
-    } else {
-        width
-    }
+    if width == 0 { 1 } else { width }
 }
 
 /// Writes one portable payload and validates its raw-layout invariants.

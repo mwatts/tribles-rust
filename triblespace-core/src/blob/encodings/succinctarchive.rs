@@ -5,7 +5,7 @@ mod universe;
 
 // Internal codec for the one public, architecture-independent raw layout. Its
 // schema identity lives on `SuccinctArchiveBlob`; native runtime arenas and
-// detached Rank9 indexes never pass through this module.
+// source-bound Rank9 accelerated roots never pass through this module.
 mod portable;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
@@ -94,7 +94,7 @@ impl MetaDescribe for SuccinctArchiveBlob {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "succinctarchive",
-                metadata::description: "Portable canonical Ring archive for fast offline trible queries. The architecture-independent bytes contain the ordered raw domain and logical prefix, pair-change, and wavelet bit vectors. Query runtimes and detached Rank9 accelerators are reproducibly derived and excluded from its content identity.",
+                metadata::description: "Portable canonical Ring archive for fast offline trible queries. The architecture-independent bytes contain the ordered raw domain and logical prefix, pair-change, and wavelet bit vectors. Query runtimes and source-bound Rank9 accelerated roots are reproducibly derived and excluded from its content identity.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -135,7 +135,10 @@ impl std::fmt::Display for SuccinctArchiveRawBuildError {
                 "succinct domain contains {values} values, exceeding the in-memory u32 raw-builder limit"
             ),
             Self::Construction(message) => {
-                write!(formatter, "cannot construct portable succinct archive: {message}")
+                write!(
+                    formatter,
+                    "cannot construct portable succinct archive: {message}"
+                )
             }
         }
     }
@@ -214,7 +217,7 @@ impl SuccinctArchiveBlob {
     /// derive the remaining Ring rotations while their prefixes, pair-change
     /// masks, and minimal-width wavelet planes are written directly into the
     /// final portable allocation. The method constructs neither a six-PATCH
-    /// [`TribleSet`], a native [`SuccinctArchive`] query arena, nor a detached
+    /// [`TribleSet`], a native [`SuccinctArchive`] query arena, nor a source-bound
     /// Rank9 accelerator. The returned [`Blob`] hashes the completed portable
     /// bytes exactly once and caches that handle.
     ///
@@ -492,7 +495,7 @@ struct SuccinctArchiveMeta<D: Metadata> {
     pub aev_c: WaveletMatrixMeta,
 }
 
-/// Stable marker for the detached Rank9 index format, minted with
+/// Stable marker for the source-bound Rank9 accelerated-root format, minted with
 /// `trible genid` on 2026-07-13.
 const RANK9_INDEX_MARKER: [u8; 16] = [
     0xFE, 0xFF, 0x44, 0xEF, 0x2D, 0x61, 0xBD, 0x45, 0x0F, 0xE2, 0x54, 0xA0, 0xAA, 0xE8, 0xB4, 0xA5,
@@ -616,7 +619,7 @@ fn reserve_rank9_index_header<'area>(
     header
 }
 
-/// Appends the relative index table and exact native-ABI footer to a detached
+/// Appends the relative index table and exact native-ABI footer to a source-bound
 /// Rank9 blob. Its fixed header must already occupy offset zero.
 fn try_finalize_rank9_index(
     writer: &mut SectionWriter<'_>,
@@ -702,7 +705,7 @@ pub struct SuccinctArchive<U> {
     raw_handle: Inline<Handle<SuccinctArchiveBlob>>,
     /// Detached persisted Rank9/select accelerator bytes.
     rank9_index_bytes: Bytes,
-    /// Cached identity of the detached Rank9/select accelerator bytes.
+    /// Cached identity of the source-bound Rank9/select accelerator bytes.
     rank9_handle: Inline<Handle<Rank9AcceleratedSuccinctArchiveBlob>>,
     /// The universe — maps integer codes to raw 32-byte values (the
     /// domain of all distinct values appearing in E, A, or V positions).
@@ -806,7 +809,17 @@ where
         .into_iter()
         .map(|vector| copy_raw_words(vector.handle, runtime_bytes))
         .collect::<Result<Vec<_>, _>>()?;
-    let [e_a, a_a, v_a, changed_e_a, changed_e_v, changed_a_e, changed_a_v, changed_v_e, changed_v_a]: [Vec<u64>; TOP_LEVEL_RANK9_INDEX_COUNT] =
+    let [
+        e_a,
+        a_a,
+        v_a,
+        changed_e_a,
+        changed_e_v,
+        changed_a_e,
+        changed_a_v,
+        changed_v_e,
+        changed_v_a,
+    ]: [Vec<u64>; TOP_LEVEL_RANK9_INDEX_COUNT] =
         top_level.try_into().expect("nine top-level raw vectors");
 
     let mut wavelets = Vec::with_capacity(SuccinctRotation::ALL.len());
@@ -944,7 +957,7 @@ where
     let aev_c = write_runtime_wavelet(&aev_words, domain_len, parts.triple_count, &mut sections)?;
 
     // Keep changed_v_a physically last: its end is the compact runtime-arena
-    // boundary used by detached Rank9 validation.
+    // boundary used by source-bound Rank9 validation.
     let [changed_e_a_words, changed_e_v_words, changed_a_e_words, changed_a_v_words, changed_v_e_words, changed_v_a_words] =
         parts.changes;
     let changed_e_a =
@@ -3357,10 +3370,18 @@ where
                 Rank9SelIndex::from_bytes_for_data(&data, index_handle.bytes(&rank9_index_bytes))?;
             top_level.push(BitVector::new(data, index));
         }
-        let [e_a, a_a, v_a, changed_e_a, changed_e_v, changed_a_e, changed_a_v, changed_v_e, changed_v_a]: [
-            BitVector<Rank9SelIndex>;
-            TOP_LEVEL_RANK9_INDEX_COUNT
-        ] = top_level.try_into().expect("nine top-level Rank9 indexes");
+        let [
+            e_a,
+            a_a,
+            v_a,
+            changed_e_a,
+            changed_e_v,
+            changed_a_e,
+            changed_a_v,
+            changed_v_e,
+            changed_v_a,
+        ]: [BitVector<Rank9SelIndex>; TOP_LEVEL_RANK9_INDEX_COUNT] =
+            top_level.try_into().expect("nine top-level Rank9 indexes");
 
         let mut wavelets = Vec::with_capacity(SuccinctRotation::ALL.len());
         let mut handle_cursor = TOP_LEVEL_RANK9_INDEX_COUNT;
@@ -3509,7 +3530,7 @@ where
         archive.to_accelerated_parts()
     }
 
-    /// Returns the canonical raw archive and its detached, source-bound Rank9
+    /// Returns the canonical raw archive and its source-bound Rank9
     /// accelerator as two independently content-addressed blobs.
     pub fn to_accelerated_parts(
         &self,
@@ -3523,7 +3544,7 @@ where
         )
     }
 
-    /// Returns only this runtime's detached, source-bound Rank9 accelerator.
+    /// Returns only this runtime's source-bound Rank9 accelerated root.
     ///
     /// This is useful when the caller already owns the canonical raw blob and
     /// must persist the accelerator without hashing the raw bytes again.
@@ -3531,7 +3552,7 @@ where
         Blob::with_handle(self.rank9_index_bytes.clone(), self.rank9_handle)
     }
 
-    /// Rebuilds only the detached Rank9 artifact for a canonical raw archive.
+    /// Rebuilds only the Rank9 accelerated root for a canonical raw archive.
     /// The raw blob is exact-validated and its bytes/identity remain unchanged.
     pub fn build_accelerated_root(
         raw: Blob<SuccinctArchiveBlob>,
@@ -4032,7 +4053,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_portable_archive_and_detached_rank9_roundtrip() {
+    fn empty_portable_archive_and_source_bound_rank9_roundtrip() {
         let set = TribleSet::new();
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
         let (raw, rank9) = archive.to_accelerated_parts();
@@ -4142,7 +4163,7 @@ mod tests {
         assert_eq!(TribleSet::from(&compressed), set);
     }
 
-    fn assert_detached_rank9_corruption_rejected(mutate: impl FnOnce(&mut Vec<u8>)) {
+    fn assert_source_bound_rank9_corruption_rejected(mutate: impl FnOnce(&mut Vec<u8>)) {
         let archive: SuccinctArchive<OrderedUniverse> = (&varied_knights()).into();
         let (raw, rank9) = archive.to_accelerated_parts();
         let mut bytes = rank9.bytes.as_ref().to_vec();
@@ -4155,19 +4176,19 @@ mod tests {
     }
 
     #[test]
-    fn detached_rank9_rejects_header_table_and_payload_corruption_without_panicking() {
-        assert_detached_rank9_corruption_rejected(|bytes| {
+    fn source_bound_rank9_rejects_header_table_and_payload_corruption_without_panicking() {
+        assert_source_bound_rank9_corruption_rejected(|bytes| {
             bytes[std::mem::offset_of!(Rank9IndexHeader, marker)] ^= 1;
         });
 
-        assert_detached_rank9_corruption_rejected(|bytes| {
+        assert_source_bound_rank9_corruption_rejected(|bytes| {
             let footer_start = bytes.len() - std::mem::size_of::<Rank9IndexFooter>();
             let table_offset = footer_start + std::mem::offset_of!(Rank9IndexFooter, indexes);
             bytes[table_offset..table_offset + std::mem::size_of::<usize>()]
                 .copy_from_slice(&usize::MAX.to_ne_bytes());
         });
 
-        assert_detached_rank9_corruption_rejected(|bytes| {
+        assert_source_bound_rank9_corruption_rejected(|bytes| {
             let first_payload = std::mem::size_of::<Rank9IndexHeader>();
             bytes[first_payload + 2 * std::mem::size_of::<usize>()] ^= 1;
         });

@@ -476,13 +476,15 @@ these algebra records.
 These are the complete native collection-record family: there is no
 accelerator-specific fourth variant. A Rank9-accelerated member is an ordinary
 blob root plus its portable raw child, related to the raw collection by an
-ordinary `DERIVE`. The raw Succinct collection owns the direct join; there is no
-Rank9 `MERGE`. The accelerated root's first 32 bytes name the raw child, so
+ordinary `DERIVE`. Raw Succinct and Rank9-accelerated collections both own
+canonical joins and use the same `MERGE` record kind. The accelerated root's
+first 32 bytes name the raw child, so
 generic blob traversal can follow the dependency without a special pile index.
-Exact derivation stores the selected raw source before its accelerated root and
-then the semantic record. Collection resolution requires the root to be
-resident; typed materialization additionally requires and validates its named
-raw child.
+Exact maintenance stores a requested raw union before retrying and publishing
+the accelerated union. Collection resolution treats a member as physically
+available only when its root and required representation closure are resident;
+an incomplete compacted root is skipped in favor of a finer exact cover. Typed
+materialization then defensively validates the selected raw/index pair.
 The unpublished mapping-evidence record kind was clean-cutover removed after a
 scan found no live records requiring migration.
 

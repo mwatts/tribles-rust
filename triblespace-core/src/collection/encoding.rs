@@ -20,11 +20,12 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::blob::{Blob, BlobEncoding};
+use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::Fragment;
 
-use super::{descriptor, CollectionHandle, RecordDecodeError};
+use super::{descriptor, CollectionData, CollectionHandle, RecordDecodeError};
 
 /// Failure of one exact canonical collection operation.
 ///
@@ -39,12 +40,21 @@ pub enum CollectionOperationError {
     /// This exact encoding cannot hold the result, but a finer physical cover
     /// may still represent the same logical value.
     Capacity(String),
+    /// The canonical result names an immutable dependency which is not present
+    /// in the current snapshot. Storage may materialize or fetch it and retry
+    /// the otherwise pure operation.
+    MissingDependency(CollectionData),
 }
 
 impl fmt::Display for CollectionOperationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fatal(reason) | Self::Capacity(reason) => formatter.write_str(reason),
+            Self::MissingDependency(member) => write!(
+                formatter,
+                "collection operation requires resident blob {}",
+                hex::encode_upper(member.raw),
+            ),
         }
     }
 }
@@ -54,10 +64,12 @@ impl Error for CollectionOperationError {}
 /// One canonical physical shape carried by a blob encoding.
 ///
 /// Collection members are always ordinary typed [`Blob`] values. An encoding
-/// validates its own bytes and may additionally expose one canonical
-/// intra-shape join. Returning `Ok(None)` from [`join_members`](Self::join_members)
-/// means that physical joins are deliberately constructed in another lattice;
-/// the encoding can still form multi-member covers and logical views.
+/// validates its own bytes and owns one canonical intra-shape join. Derived
+/// collections are ordinary lattices connected to their source by a
+/// join-preserving [`CollectionMapping`], not a weaker kind of collection.
+/// The logical join remains total at the [`Cover`](super::Cover) level: when
+/// one physical member cannot represent the result, `Capacity` retains a finer
+/// cover of members with the same value.
 ///
 /// This is intentionally stronger than [`BlobEncoding`]: not every blob format
 /// is a collection member, while every `CollectionEncoding` has an exact
@@ -88,30 +100,84 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
     where
         R: BlobStoreGet + BlobStoreMeta;
 
-    /// Compute the exact canonical join of two members when this encoding owns
-    /// one directly materializable join law.
+    /// Return immutable representation dependencies missing from a resident
+    /// member root in this snapshot.
+    ///
+    /// Self-contained encodings need no extra work. Merkle encodings override
+    /// this narrow availability query so cover resolution can ignore an
+    /// incomplete compacted root and fall back to a finer support-equivalent
+    /// cover. Returned handles are only the blobs required to interpret this
+    /// representation, not optional attachments or semantic provenance.
+    ///
+    /// This is not semantic validation: it neither recomputes the member nor
+    /// proves its canonical bytes. It may read the named resident root, but
+    /// must not request missing dependencies, persist, or otherwise change
+    /// storage.
+    fn missing_representation_dependencies<R>(
+        _member: CollectionData,
+        _reader: &R,
+    ) -> Result<Vec<CollectionData>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        Ok(Vec::new())
+    }
+
+    /// Compute the exact canonical join of two members.
     ///
     /// The implementation owns decoding and rejecting malformed inputs while
     /// it performs this new work; warm resolution never calls this method.
     ///
     /// `reader` resolves immutable content-addressed dependencies named by the
-    /// two members. Other resident content is not an input to the join.
+    /// inputs or by their canonical result. Availability may delay publication
+    /// but cannot alter the result bytes. Other resident content is not an
+    /// input to the join.
     ///
-    /// `Ok(None)` is structural, not a capacity failure: callers should keep a
-    /// multi-member cover or perform maintenance in an upstream joinable
-    /// encoding and derive this representation afterwards.
     fn join_members<R>(
         descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
         reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
-        R: BlobStoreGet + BlobStoreMeta,
-    {
-        let _ = (descriptor, low, high, reader);
-        Ok(None)
+        R: BlobStoreGet + BlobStoreMeta;
+}
+
+/// Physical availability of one semantic collection member in a snapshot.
+pub(crate) enum CollectionMemberAvailability {
+    /// The member root itself is absent.
+    Absent,
+    /// The root and every representation dependency are resident.
+    Complete,
+    /// The root exists but named immutable representation dependencies do not.
+    Incomplete,
+    /// The resident root could not expose a valid representation closure.
+    Unusable,
+}
+
+/// Inspect root and representation-closure residency through one snapshot.
+///
+/// Metadata failure remains distinct so callers with a typed storage error can
+/// propagate it, while read paths whose legacy surface treats metadata failure
+/// as unavailability may conservatively collapse it to [`Absent`](CollectionMemberAvailability::Absent).
+pub(crate) fn collection_member_availability<E, R>(
+    member: CollectionData,
+    reader: &R,
+) -> Result<CollectionMemberAvailability, R::MetaError>
+where
+    E: CollectionEncoding,
+    R: BlobStoreGet + BlobStoreMeta,
+{
+    if reader.metadata(Handle::<E>::from_hash(member))?.is_none() {
+        return Ok(CollectionMemberAvailability::Absent);
     }
+    Ok(
+        match E::missing_representation_dependencies(member, reader) {
+            Ok(missing) if missing.is_empty() => CollectionMemberAvailability::Complete,
+            Ok(_) => CollectionMemberAvailability::Incomplete,
+            Err(_) => CollectionMemberAvailability::Unusable,
+        },
+    )
 }
 
 /// One parameterized mapping between collection encodings.
@@ -122,10 +188,7 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
 /// parameters rather than its minting history. Implementations
 /// must be a join homomorphism:
 ///
-/// `map(a join b) = map(a) logical_join map(b)`.
-///
-/// The target's logical join may be represented by a multi-member cover even
-/// when its encoding deliberately has no directly materialized physical join.
+/// `map(a join b) = map(a) join map(b)`.
 pub trait CollectionMapping: Sized {
     /// Canonical source encoding.
     type Source: CollectionEncoding;

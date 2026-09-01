@@ -3,7 +3,6 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
 use triblespace_core::collection::{
@@ -77,8 +76,9 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
         .unwrap();
     let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
-    let derived = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, target).unwrap();
-    let cover = derived.ensure(&mut store, &source_cover).unwrap();
+    let cover = store
+        .ensure::<SimpleToSuccinctMapping>(target, &source_cover)
+        .unwrap();
     assert_eq!(cover.collection(), target);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
 

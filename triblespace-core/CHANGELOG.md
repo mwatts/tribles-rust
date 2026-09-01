@@ -25,15 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fragment, and `ExactDerivedCollection` needs only the mapping type.
 
 - Make every collection member an ordinary typed `Blob<E>`.
-  `CollectionEncoding` validates that blob and may expose one directly
-  materializable canonical join; encodings whose physical compaction belongs
-  in another lattice keep multi-member covers instead. `CollectionMapping`
-  maps blobs to blobs, and exact derivation stores a selected source member
-  before its target image and ordinary `DERIVE` record.
+  `CollectionEncoding` validates that blob and defines one canonical join;
+  `Cover<E>` keeps the logical join total when one member hits a deterministic
+  capacity boundary, so every source and derived collection is a full lattice.
+  `CollectionMapping` maps blobs to blobs as a join homomorphism, while storage
+  owns deterministic merge/derive sequencing and immutable dependencies.
 
 - Add direct typed collection encodings, covers, and logical cover
-  views. `CollectionEncoding` attaches canonical validation and an optional
-  directly materializable join to the member encoding; `Collection<E>` and
+  views. `CollectionEncoding` attaches canonical validation and one canonical
+  member join to the member encoding; `Collection<E>` and
   `Cover<E>` retain that encoding through the public API; signed commits accept
   authored `Fragment` values in `SimpleArchive` source collections, while
   typed materialization works for non-`SimpleArchive` collections. Derived
@@ -89,9 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Rank9AcceleratedSuccinctArchiveBlob` is now an ABI-qualified Merkle-root
   `CollectionEncoding` whose first 32 bytes name its portable raw
   `SuccinctArchiveBlob` child. `RawToRank9AcceleratedMappingV1` maps raw members
-  through ordinary `DERIVE` records. Raw Succinct members remain directly
-  joinable; accelerated roots have no direct `MERGE`, so exact maintenance
-  compacts raw first and derives the matching query-ready encoding. Cover-aware
+  through ordinary `DERIVE` records. Raw Succinct and accelerated roots both
+  own canonical joins. When the accelerated join's exact raw union is absent,
+  generic collection maintenance materializes that immutable source dependency
+  and retries before publishing the accelerated `MERGE`. Cover-aware
   views pull the named child through the immutable store snapshot and validate
   the complete raw/index pair. The former `Rank9MappingV1`/`RANK9_MAPPING_V1`,
   intermediate `Rank9SidecarMappingV1*`, old blob names, and their obsolete id

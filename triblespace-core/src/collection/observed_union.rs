@@ -78,7 +78,7 @@ use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use super::CollectionPolicy;
 use super::{
     Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
-    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    CollectionStore, CollectionStoreExt, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 
@@ -336,13 +336,11 @@ impl CollectionEncoding for ObservedSetBlob {
         low: &Blob<Self>,
         high: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        join(low, high)
-            .map(Some)
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -517,7 +515,7 @@ impl ObservedSetCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.ensure(store, source_cover)?;
+        let cover = store.ensure::<ObserveStatesMapping>(self.target, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;
@@ -667,21 +665,33 @@ mod tests {
     }
 
     #[test]
-    fn the_join_is_idempotent_commutative_and_has_empty_as_its_unit() {
+    fn the_join_is_associative_idempotent_commutative_and_has_empty_as_its_unit() {
         let a = ufoid();
         let b = ufoid();
         let c = ufoid();
+        let d = ufoid();
         let mut left = TribleSet::new();
         left += edge(&b, &a);
         let mut right = TribleSet::new();
         right += edge(&c, &b);
+        let mut third = TribleSet::new();
+        third += edge(&d, &c);
 
         let l = observed_of(&left);
         let r = observed_of(&right);
+        let t = observed_of(&third);
 
         let lr = join(&l, &r).expect("joins");
         let rl = join(&r, &l).expect("joins");
         assert_eq!(lr.bytes.as_ref(), rl.bytes.as_ref(), "commutative");
+        assert_eq!(
+            join(&lr, &t).expect("joins").bytes.as_ref(),
+            join(&l, &join(&r, &t).expect("joins"))
+                .expect("joins")
+                .bytes
+                .as_ref(),
+            "associative"
+        );
         assert_eq!(
             join(&lr, &lr).expect("joins").bytes.as_ref(),
             lr.bytes.as_ref(),

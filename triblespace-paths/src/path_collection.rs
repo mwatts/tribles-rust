@@ -147,7 +147,7 @@ impl PathSummaryCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.ensure(store, source_cover)?;
+        let cover = store.ensure::<RegularPathMapping>(self.target, source_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;

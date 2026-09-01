@@ -223,8 +223,10 @@ Only then are selected summaries joined and closed once into `PathIndex`.
 lattice point. It reuses an exact resident target image, otherwise joins exact
 resident target-child images, otherwise maps the resident corresponding source
 node, and only then descends through the first fully actionable canonical
-source decomposition. It never constructs a source merge merely to enable a
-mapping. Once every exact point is represented, it performs at most one global
+source decomposition. It never constructs a source merge merely as a planning
+preference. A target encoding may explicitly request one exact immutable
+representation dependency; storage materializes that dependency and retries.
+Once every exact point is represented, it performs at most one global
 size-tiered target carry before re-entering the pointwise planner.
 
 Every successfully computed source, output, `MERGE`, and unsigned `DERIVE`
@@ -233,8 +235,8 @@ selected route, and no implicit durability flush is performed. The old store
 snapshot is dropped before those writes. Concurrent and repeated ensures are
 content-addressed and record-idempotent. An unchanged warm call whose stored
 target cover already satisfies both pointwise and global maintenance executes
-no maps or joins; capacity and unsupported decisions are call-local and may be
-retried by a later call.
+no maps or joins; capacity decisions are call-local and may be retried by a
+later call.
 
 An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.

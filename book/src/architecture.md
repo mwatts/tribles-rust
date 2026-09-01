@@ -205,10 +205,12 @@ public `ExactDerivedCollection::ensure` owns one deterministic maintenance
 policy: reuse a resident target node; otherwise join both resident target
 children before crossing the mapping; otherwise derive the corresponding
 resident source node; and only then descend when that source node is missing
-or capacity-terminal. A capacity-terminal or unsupported target join likewise
-falls through to the corresponding source node. It never constructs a missing
-source merge merely to derive its image. An opaque source cover fixes the logical
-value while the resolver chooses a target cover with equal support.
+or capacity-terminal. A capacity-terminal target join likewise falls through
+to the corresponding source node. When a target join explicitly names a
+missing immutable representation dependency, storage may materialize that
+exact dependency in the source lattice and retry; it never constructs source
+merges merely as a planning preference. An opaque source cover fixes the
+logical value while the resolver chooses a target cover with equal support.
 Different target covers may denote the same join, and every lattice position
 uses the same `Cover<E>` shape while retaining its own typed member handles.
 Missing derived artifacts are cache misses, not missing facts.
@@ -222,18 +224,17 @@ exact portable `SuccinctArchiveBlob` child carrying their source rows. The root
 and named child together are a complete source-bound accelerated encoding, not
 a separate sidecar or runtime artifact.
 
-Raw Succinct members own the directly materializable join. Rank9 roots do not
-define another physical join: `ensure` deterministically carries the raw target
-lattice by dyadic serialized-size tier, then the ordinary raw-to-accelerated
-`DERIVE` maps the exact final raw cover to its query indexes. Target carries do
-not compact the source collection. If the corresponding source node already
-exists it can be mapped, but a missing source node is decomposed into its
-source children rather than synthesized with a source `MERGE`. Every computed
-raw `MERGE` and cross-lattice `DERIVE` is persisted. A cover-aware view follows
-each embedded handle through its store snapshot, validates the exact raw/index
-pair, and only then builds the transient query runtime. A root whose raw child
-is absent is not a usable query value. Normal construction prevents that state
-by storing the raw source before its accelerated image and `DERIVE` record.
+Both raw Succinct and Rank9-accelerated members own canonical joins. The Rank9
+join computes the same union, but its result names the exact raw Succinct union
+as an immutable child. If that child is absent, the target join reports its
+content identity as a representation dependency. Generic storage maintenance
+then materializes the corresponding raw `MERGE`, retries the Rank9 join, and
+persists the accelerated `MERGE`. The commuting-square law already implies the
+`DERIVE` from the merged raw member to the merged accelerated member, so no
+redundant record is needed. A cover-aware view follows each embedded handle
+through its store snapshot, validates the exact raw/index pair, and only then
+builds the transient query runtime. A root whose raw child is absent is not a
+usable query value.
 
 ## WANT is operational, not semantic
 

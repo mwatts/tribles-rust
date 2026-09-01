@@ -46,8 +46,8 @@ attribute's exact historical bytes when its old identity cannot be re-derived.
 
 A root collection is identified by the content handle of its descriptor. The
 descriptor carries its UTF-8 name, member encoding, and independent READ and
-WRITE admission policies. The encoding itself owns member validation and may
-expose one directly materializable canonical join; a root needs no mapping. The descriptor
+WRITE admission policies. The encoding itself owns member validation and
+defines one canonical member-join operation; a root needs no mapping. The descriptor
 is an ordinary self-contained `Fragment`, but applications ask the store to
 construct and register it rather than assembling its facts manually. Its
 canonical content handle is the collection identity:
@@ -200,8 +200,8 @@ the chosen backend rather than collection policy.
 - `entity!` builds intrinsic entities and carries required blobs.
 - `Fragment` is the self-contained publication value.
 - `Collection<E>` is a descriptor handle statically bound to the
-  `CollectionEncoding` which owns its member bytes, validation, and any direct
-  physical join; the store owns all I/O.
+  `CollectionEncoding` which owns its member bytes, validation, and canonical
+  physical join operation; the store owns all I/O.
 - `store.commit` publishes one signed, independent member without conflating
   local storage with network authorization.
 - `store.snapshot` freezes one coherent known-prefix store observation;

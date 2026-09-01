@@ -81,7 +81,7 @@ use super::simplearchive_union;
 use super::CollectionPolicy;
 use super::{
     Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
-    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    CollectionStore, CollectionStoreExt, FactCover, TryFromCover, TryFromCoverError,
 };
 
 const ID_LEN: usize = 16;
@@ -459,13 +459,11 @@ impl CollectionEncoding for LwwRegisterBlob {
         low: &Blob<Self>,
         high: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        join(low, high)
-            .map(Some)
-            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+        join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
 
@@ -694,7 +692,7 @@ impl LwwRegisterCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.ensure(store, source_cover)?;
+        let cover = store.ensure::<RegisterCoordinatesMapping>(self.target, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;

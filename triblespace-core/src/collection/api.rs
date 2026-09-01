@@ -29,23 +29,25 @@ use crate::capability::{
 use crate::clock;
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
+use crate::inline::{Inline, InlineEncoding};
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
-use crate::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
 use crate::repo::{CapabilityProofStore, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
     discover_collection_claims_for_cover, discover_collection_equations_for_cover, ExactCoverError,
 };
+use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
-    collection_physical_cover, descriptor, discover_collection_records_authorized,
+    collection_complete_physical_cover, descriptor, discover_collection_records_authorized,
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
     CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
-    CollectionFunctionalConflict, CollectionHandle, CollectionRead, CollectionResolutionError,
-    CollectionStore, CollectionTypeError, CollectionValidationRequest, DiscoveredCollectionRecords,
-    RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ, ACTION_WRITE,
+    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError, CollectionRead,
+    CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
+    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ,
+    ACTION_WRITE,
 };
 use super::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
 
@@ -673,12 +675,23 @@ pub enum CollectionMaterializationError<
         /// Backend fetch failure.
         source: GetError,
     },
+    /// One resident optional materialization could not expose its immutable
+    /// representation closure and no valid alternate cover was available.
+    InvalidMember {
+        /// Exact payload identity of the unusable materialization.
+        member: CollectionData,
+        /// Encoding-specific availability failure.
+        source: CollectionOperationError,
+    },
     /// Stored equations contradicted operation functionality.
     ResolutionConflict(Box<CollectionFunctionalConflict>),
     /// No resident physical cover spans every semantic obligation.
     Missing {
         /// Uncovered members of the collection's semantic frontier.
         obligations: BTreeSet<CollectionData>,
+        /// Named immutable representation dependencies which would make an
+        /// otherwise useful resident member complete.
+        dependencies: BTreeSet<CollectionData>,
     },
     /// The selected physical cover could not form the requested logical view.
     View(ViewError),
@@ -771,12 +784,30 @@ where
                 "failed to fetch cover member {}: {source}",
                 hex::encode_upper(member.raw),
             ),
-            Self::ResolutionConflict(source) => source.fmt(f),
-            Self::Missing { obligations } => write!(
+            Self::InvalidMember { member, source } => write!(
                 f,
-                "{} semantic frontier obligation(s) have no resident physical cover",
-                obligations.len(),
+                "resident collection member {} is unusable: {source}",
+                hex::encode_upper(member.raw),
             ),
+            Self::ResolutionConflict(source) => source.fmt(f),
+            Self::Missing {
+                obligations,
+                dependencies,
+            } => {
+                write!(
+                    f,
+                    "{} semantic frontier obligation(s) have no complete resident physical cover",
+                    obligations.len(),
+                )?;
+                if !dependencies.is_empty() {
+                    write!(
+                        f,
+                        " ({} representation dependency blob(s) missing)",
+                        dependencies.len(),
+                    )?;
+                }
+                Ok(())
+            }
             Self::View(source) => source.fmt(f),
         }
     }
@@ -798,6 +829,7 @@ where
             Self::DescriptorGet { source, .. } => Some(source),
             Self::InvalidDescriptor { source, .. } => Some(source),
             Self::MemberGet { source, .. } => Some(source),
+            Self::InvalidMember { source, .. } => Some(source),
             Self::ResolutionConflict(source) => Some(source),
             Self::Missing { .. } => None,
             Self::View(source) => Some(source),
@@ -1530,6 +1562,27 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         ))
     }
 
+    /// Ensure one derived lattice point through its canonical mapping.
+    ///
+    /// The source collection is carried by `source`; the target descriptor
+    /// carries the mapping parameters and policy. Storage owns the singular
+    /// deterministic merge/derive schedule, while the encoding and mapping
+    /// traits own only their algebra.
+    fn ensure<M>(
+        &mut self,
+        target: Collection<M::Target>,
+        source: &Cover<M::Source>,
+    ) -> Result<Cover<M::Target>, ExactDerivedCollectionError>
+    where
+        M: CollectionMapping,
+        Self: BlobStore,
+        Self::Snapshot: BlobStoreMeta + CollectionRead,
+        Handle<M::Source>: InlineEncoding,
+        Handle<M::Target>: InlineEncoding,
+    {
+        ExactDerivedCollection::<M>::new(source.collection(), target)?.ensure(self, source)
+    }
+
     /// Publish one signed fragment into an already registered collection.
     ///
     /// This performs no capability or descriptor check. Local storage is a
@@ -1627,23 +1680,32 @@ where
     };
 
     // Equation semantics and blob residency are orthogonal. Select from every
-    // currently resident semantic member. Absent roots remain uncovered
-    // obligations; resident materializations inherit the BlobStore contract
-    // and are interpreted by the eventual view rather than re-proved here.
+    // currently complete resident semantic member. Absent roots and incomplete
+    // Merkle closures remain uncovered obligations, allowing the physical
+    // cover algorithm to fall back to finer support-equivalent members. Exact
+    // semantic validation still belongs to the eventual view.
     let semantics = resolution.semantics();
-    let mut resident = BTreeSet::new();
+    let mut resident_roots = BTreeSet::new();
     for data in semantics.members(collection).into_iter().flatten().copied() {
         if matches!(reader.metadata(Handle::<L>::from_hash(data)), Ok(Some(_))) {
-            resident.insert(data);
+            resident_roots.insert(data);
         }
     }
 
-    let physical = collection_physical_cover(semantics, collection, &resident);
-    if !physical.missing.is_empty() {
-        return Err(CollectionMaterializationError::Missing {
-            obligations: physical.missing,
-        });
+    let selected =
+        collection_complete_physical_cover::<L, _>(semantics, collection, &resident_roots, reader);
+    if selected.physical.missing.is_empty() {
+        return Ok(Cover::from_data(
+            cover.collection(),
+            selected.physical.cover,
+        ));
+    }
+    if let Some((member, source)) = selected.unusable {
+        return Err(CollectionMaterializationError::InvalidMember { member, source });
     }
 
-    Ok(Cover::from_data(cover.collection(), physical.cover))
+    Err(CollectionMaterializationError::Missing {
+        obligations: selected.physical.missing,
+        dependencies: selected.dependencies,
+    })
 }

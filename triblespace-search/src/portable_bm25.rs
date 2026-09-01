@@ -104,7 +104,7 @@ impl CollectionEncoding for PortableBM25Blob {
         low: &Blob<Self>,
         high: &Blob<Self>,
         _reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
     {
@@ -119,7 +119,7 @@ impl CollectionEncoding for PortableBM25Blob {
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
         let joined = RawIndex::merge([&low, &high])
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        Ok(Some(Blob::new(joined.bytes)))
+        Ok(Blob::new(joined.bytes))
     }
 }
 
@@ -1061,9 +1061,8 @@ mod tests {
 
         PortableBM25Blob::validate_member(&Fragment::empty(), &low, &snapshot).unwrap();
         PortableBM25Blob::validate_member(&Fragment::empty(), &high, &snapshot).unwrap();
-        let joined = PortableBM25Blob::join_members(&Fragment::empty(), &low, &high, &snapshot)
-            .unwrap()
-            .expect("portable BM25 has a direct canonical join");
+        let joined =
+            PortableBM25Blob::join_members(&Fragment::empty(), &low, &high, &snapshot).unwrap();
 
         assert_eq!(joined.bytes.as_ref(), expected.bytes().as_ref());
         PortableBM25Blob::validate_member(&Fragment::empty(), &joined, &snapshot).unwrap();

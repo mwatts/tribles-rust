@@ -307,6 +307,11 @@ let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
 
 let archive = succinct.ensure(&mut storage, &cover)?;
 let same_archive = succinct.attach(&mut storage, &cover)?;
+
+// The same algebra edges are available directly on storage.
+let raw_cover = storage.ensure::<SimpleToSuccinctMapping>(raw, &cover)?;
+let accelerated_cover =
+    storage.ensure::<RawToRank9AcceleratedMapping>(accelerated, &raw_cover)?;
 ```
 
 - `attach` is read-only, performs no collection algebra, and requires a
@@ -318,18 +323,20 @@ let same_archive = succinct.attach(&mut storage, &cover)?;
 
 At each target lattice node, `ensure` reuses the resident result first. If the
 result is absent, it joins the two corresponding target children when both are
-resident. A capacity-terminal or unsupported target join falls through to the
-corresponding resident source node. If that source node is absent, or its
+resident. A capacity-terminal target join falls through to the corresponding
+resident source node. If that source node is absent, or its
 mapping reports a capacity boundary, planning reuses any already complete lower
 target cover and otherwise descends to the source children. It never creates a
-missing source merge as a shortcut. Every target `MERGE` or cross-lattice
+source merge merely as a planning shortcut. A source join is materialized only
+when the selected target join names its exact result as an immutable
+representation dependency. Every source or target `MERGE` and cross-lattice
 `DERIVE` it actually computes is stored with its equation, including useful
 work completed before a later capacity or fatal result.
 
 The maintenance policy has no knob: a raw target member belongs to
 `floor(log2(max(1, serialized_len)))`, and the lowest two content handles in
-the lowest colliding tier are carried first. A capacity-limited or non-joinable
-encoding may leave a collision stable; otherwise the resulting cover has at
+the lowest colliding tier are carried first. A capacity-limited encoding may
+leave a collision stable; otherwise the resulting cover has at
 most one member per tier. Each successful global carry re-enters the exact
 per-point planner before another dyadic pair is selected.
 
@@ -350,13 +357,16 @@ None of them signs a replacement root, advances a head, flushes implicitly, or
 adds a special manifest. [Regular-path summaries](regular-path-indexes.md) and
 Rank9 acceleration both use the same collection algebra. The accelerated
 encoding is a Merkle root whose first 32 bytes name its exact portable raw
-child, but it does not define a second physical Rank9 join. Raw Succinct members
-are joinable, and the raw-to-accelerated mapping is a join homomorphism, so
-`ensure` maintains that upstream lattice first and then derives an accelerated
-cover with the same support. Derivation
-stores the selected raw source before the accelerated root and ordinary
-`DERIVE` record. The typed view rejects an accelerated member whose named raw
-child is unavailable.
+child. It is also a full lattice: resident accelerated children `A(a)` and
+`A(b)` join canonically to `A(a ⊔ b)`. The named raw result must be resident
+before that accelerated result is published. If it is absent, the generic
+storage executor first publishes the ordinary source `MERGE(a,b,c)`, then
+retries and publishes `MERGE(A(a),A(b),A(c))`. Each operation emits one blob.
+The commuting-square law implies `DERIVE(c,A(c))`, so that redundant edge need
+not be stored explicitly. Physical-cover resolution excludes an accelerated
+member whose named raw child is unavailable and retries a finer
+support-equivalent route; the typed view repeats the raw/index check only as a
+defensive boundary for callers that construct a physical cover directly.
 
 ## WANT missing content or computation
 

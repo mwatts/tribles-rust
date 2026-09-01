@@ -2,7 +2,7 @@
 //!
 //! This is the horizontal half of [`ExactDerivedCollection::ensure`]. It starts
 //! from a completed cover and publishes one canonical target carry before
-//! re-entering the per-point planner. A later failed or unsupported join does
+//! re-entering the per-point planner. A later failed or capacity-limited join does
 //! not erase earlier useful work. The source cover remains the value boundary,
 //! and yard/GC policy alone decides the lifetime of materialized nodes.
 
@@ -14,10 +14,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::exact_derived::{
     data_identity, ExactDerivedCollection, ExactDerivedCollectionError, ExactPlannerBlocks,
-    TargetMergeBlock, TargetMergePair,
+    TargetMergePair,
 };
 use super::{
-    Collection, CollectionData, CollectionEncoding, CollectionMapping, CollectionMerge,
+    CollectionData, CollectionEncoding, CollectionMapping, CollectionMerge,
     CollectionOperationError, CollectionRead, CollectionRecord, CollectionStore, Cover,
 };
 
@@ -27,11 +27,9 @@ use super::{
 /// `floor(log2(max(1, serialized_len)))`, then repeatedly joins the two lowest
 /// content handles in the lowest colliding tier. A stable cover therefore has
 /// at most one physical member per dyadic byte-size tier, except when a fixed
-/// representation cannot encode the join or deliberately has no directly
-/// materialized join. A capacity-stable cover may retain colliding members:
+/// representation cannot encode the join. A capacity-stable cover may retain colliding members:
 /// the lower member is retired for that planning round while the higher member
-/// remains eligible for the next pair. `Ok(None)` leaves the original cover
-/// unchanged. Every capacity-limited attempt shrinks the active set, so a
+/// remains eligible for the next pair. Every capacity-limited attempt shrinks the active set, so a
 /// round attempts at most `n - 1` pairs. No policy knobs, manifest, receipt,
 /// signed record, retention record, or implicit flush are involved.
 ///
@@ -60,13 +58,12 @@ where
     seen.insert(cover_identity(&cover));
 
     loop {
-        match publish_round::<S, H::Target>(
-            exact.target_collection(),
-            store,
-            cover,
-            &blocks.target_merges,
-        )? {
-            RoundOutcome::Published => {}
+        match publish_round::<S, H>(exact, store, source_cover, cover, &mut blocks.target_merges)? {
+            RoundOutcome::TargetPublished => {}
+            RoundOutcome::Retry(current) => {
+                cover = current;
+                continue;
+            }
             RoundOutcome::Stable(cover) => return Ok(cover),
         }
         // Every successful carry can create an exact child image for a known
@@ -89,26 +86,30 @@ fn cover_identity<Target: CollectionEncoding>(cover: &Cover<Target>) -> Vec<Coll
 }
 
 enum RoundOutcome<Target: CollectionEncoding> {
-    Published,
+    TargetPublished,
+    Retry(Cover<Target>),
     Stable(Cover<Target>),
 }
 
-fn publish_round<S, Target>(
-    collection: Collection<Target>,
+fn publish_round<S, Mapping>(
+    exact: &ExactDerivedCollection<Mapping>,
     store: &mut S,
-    cover: Cover<Target>,
-    blocked_target_merges: &BTreeMap<TargetMergePair, TargetMergeBlock>,
-) -> Result<RoundOutcome<Target>, ExactDerivedCollectionError>
+    source_cover: &Cover<Mapping::Source>,
+    cover: Cover<Mapping::Target>,
+    blocked_target_merges: &mut BTreeSet<TargetMergePair>,
+) -> Result<RoundOutcome<Mapping::Target>, ExactDerivedCollectionError>
 where
     S: BlobStore + CollectionStore,
     S::Snapshot: BlobStoreMeta + CollectionRead,
-    Target: CollectionEncoding,
-    Handle<Target>: InlineEncoding,
+    Mapping: CollectionMapping,
+    Handle<Mapping::Source>: InlineEncoding,
+    Handle<Mapping::Target>: InlineEncoding,
 {
     if cover.len() < 2 {
         return Ok(RoundOutcome::Stable(cover));
     }
 
+    let collection = exact.target_collection();
     let reader = store.snapshot().map_err(|source| {
         ExactDerivedCollectionError::storage("open target-maintenance snapshot", source)
     })?;
@@ -117,16 +118,16 @@ where
             ExactDerivedCollectionError::Resolution(format!("load target descriptor: {error}"))
         })?
         .fragment;
-    super::encoding::validate_descriptor_type::<Target>(&descriptor).map_err(|error| {
+    super::encoding::validate_descriptor_type::<Mapping::Target>(&descriptor).map_err(|error| {
         ExactDerivedCollectionError::Resolution(format!("invalid target descriptor: {error}"))
     })?;
-    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
+    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Mapping::Target>>>::new();
     for handle in cover.members() {
-        let data = Handle::<Target>::to_hash(handle);
+        let data = Handle::<Mapping::Target>::to_hash(handle);
         let blob = reader.get(handle).map_err(|source| {
             ExactDerivedCollectionError::storage("load target-maintenance member", source)
         })?;
-        let tier = target_tier::<Target>(&blob);
+        let tier = target_tier::<Mapping::Target>(&blob);
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
@@ -143,20 +144,18 @@ where
         if !bin.is_empty() {
             tiers.insert(tier, bin);
         }
-        match blocked_target_merges.get(&(low_data, high_data)) {
-            Some(TargetMergeBlock::Unsupported) => {
-                return Ok(RoundOutcome::Stable(cover));
-            }
-            Some(TargetMergeBlock::Capacity) => {
-                tiers.entry(tier).or_default().insert(high_data, high);
-                continue;
-            }
-            None => {}
+        if blocked_target_merges.contains(&(low_data, high_data)) {
+            tiers.entry(tier).or_default().insert(high_data, high);
+            continue;
         }
 
-        let constructed = match Target::join_members(&descriptor, &low, &high, &reader) {
-            Ok(Some(constructed)) => constructed,
-            Ok(None) => return Ok(RoundOutcome::Stable(cover)),
+        let constructed = match <Mapping::Target as CollectionEncoding>::join_members(
+            &descriptor,
+            &low,
+            &high,
+            &reader,
+        ) {
+            Ok(constructed) => constructed,
             Err(CollectionOperationError::Fatal(reason)) => {
                 return Err(ExactDerivedCollectionError::Merge {
                     low: low_data,
@@ -168,8 +167,21 @@ where
                 tiers.entry(tier).or_default().insert(high_data, high);
                 continue;
             }
+            Err(CollectionOperationError::MissingDependency(member)) => {
+                drop(reader);
+                if exact.materialize_target_join_dependency(
+                    store,
+                    source_cover,
+                    low_data,
+                    high_data,
+                    member,
+                )? {
+                    return Ok(RoundOutcome::Retry(cover));
+                }
+                return Err(ExactDerivedCollectionError::MissingDependency { member });
+            }
         };
-        let result_data = data_identity::<Target>(&constructed);
+        let result_data = data_identity::<Mapping::Target>(&constructed);
         let claim = CollectionMerge::new(collection.handle(), low_data, high_data, result_data);
 
         // Closure-dependent joins observe one immutable reader boundary. Do
@@ -177,142 +189,11 @@ where
         // let the caller re-enter per-point planning against a fresh snapshot.
         drop(reader);
         store
-            .put::<Target, _>(constructed)
+            .put::<Mapping::Target, _>(constructed)
             .map_err(|error| ExactDerivedCollectionError::storage("store merged target", error))?;
         store
             .insert(CollectionRecord::Merge(claim))
             .map_err(|error| ExactDerivedCollectionError::storage("publish target MERGE", error))?;
-        return Ok(RoundOutcome::Published);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::convert::Infallible;
-
-    use ed25519_dalek::SigningKey;
-
-    use super::*;
-    use crate::blob::{BlobEncoding, IntoBlob};
-    use crate::collection::{CollectionPolicy, CollectionStoreExt};
-    use crate::id::{ExclusiveId, Id};
-    use crate::id_hex;
-    use crate::inline::Inline;
-    use crate::metadata::MetaDescribe;
-    use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::BlobStorePut;
-    use crate::trible::Fragment;
-
-    /// Test-only encoding with no directly materialized join.
-    /// Minted with `trible genid` on 2026-08-30.
-    const NO_JOIN_ENCODING_V1: Id = id_hex!("0C6D098C0E9E283EEAD323885B81E784");
-
-    struct NoJoinEncoding;
-
-    impl BlobEncoding for NoJoinEncoding {}
-
-    impl MetaDescribe for NoJoinEncoding {
-        fn describe() -> Fragment {
-            let id = NO_JOIN_ENCODING_V1;
-            crate::macros::entity! { ExclusiveId::force_ref(&id) @
-                crate::metadata::name: "exact-target-no-join-test-v1",
-                crate::metadata::description: "Test-only collection encoding without a directly materialized join.",
-                crate::metadata::tag: crate::metadata::KIND_BLOB_ENCODING,
-            }
-        }
-    }
-
-    impl CollectionEncoding for NoJoinEncoding {
-        fn validate_member<R>(
-            _descriptor: &Fragment,
-            _member: &Blob<Self>,
-            _reader: &R,
-        ) -> Result<(), CollectionOperationError>
-        where
-            R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
-        {
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct NoWriteStore {
-        blobs: MemoryRepo,
-    }
-
-    impl crate::repo::BlobStorePut for NoWriteStore {
-        type PutError = Infallible;
-
-        fn put<S, T>(&mut self, _: T) -> Result<Inline<Handle<S>>, Self::PutError>
-        where
-            S: BlobEncoding + 'static,
-            T: IntoBlob<S>,
-            Handle<S>: InlineEncoding,
-        {
-            panic!("stable no-join compaction attempted a blob write")
-        }
-    }
-
-    impl crate::repo::SnapshotSource for NoWriteStore {
-        type Snapshot = <MemoryRepo as crate::repo::SnapshotSource>::Snapshot;
-        type SnapshotError = Infallible;
-
-        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-            crate::repo::SnapshotSource::snapshot(&mut self.blobs)
-        }
-    }
-
-    impl CollectionStore for NoWriteStore {
-        type InsertError = Infallible;
-
-        fn insert(&mut self, _: CollectionRecord) -> Result<(), Self::InsertError> {
-            panic!("stable no-join compaction attempted to publish a MERGE")
-        }
-    }
-
-    fn descriptor() -> Fragment {
-        crate::collection::descriptor::naming::<NoJoinEncoding>(
-            "exact-target-no-join-test",
-            CollectionPolicy::new(
-                crate::collection::AdmissionPolicy::direct(
-                    SigningKey::from_bytes(&[7; 32]).verifying_key(),
-                ),
-                crate::collection::AdmissionPolicy::direct(
-                    SigningKey::from_bytes(&[7; 32]).verifying_key(),
-                ),
-            ),
-        )
-    }
-
-    #[test]
-    fn no_direct_join_leaves_a_colliding_cover_unchanged_without_writes() {
-        let descriptor = descriptor();
-        let mut blobs = MemoryRepo::default();
-        let collection = blobs
-            .register_collection::<NoJoinEncoding>(descriptor)
-            .unwrap();
-        let mut members = vec![
-            Blob::<NoJoinEncoding>::new(vec![1; 8].into()),
-            Blob::<NoJoinEncoding>::new(vec![2; 8].into()),
-        ];
-        members.sort_unstable_by_key(|member| member.get_handle().raw);
-        let cover =
-            Cover::from_members(collection, members.iter().map(|member| member.get_handle()));
-        let original = cover_identity(&cover);
-        for member in members {
-            blobs.put::<NoJoinEncoding, _>(member).unwrap();
-        }
-
-        let result = publish_round(
-            collection,
-            &mut NoWriteStore { blobs },
-            cover,
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        let RoundOutcome::Stable(result) = result else {
-            panic!("a no-join encoding published a compaction round");
-        };
-        assert_eq!(cover_identity(&result), original);
+        return Ok(RoundOutcome::TargetPublished);
     }
 }

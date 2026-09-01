@@ -111,18 +111,21 @@ descriptor states its own policies and never inherits them through its source.
 
 ### Collection Encoding
 A `BlobEncoding` with one canonical member validation rule, exposed by
-`CollectionEncoding`. Every member is an ordinary typed blob. The encoding may
-also expose one directly materializable canonical join; when it does not,
-physical compaction happens in another collection lattice while multi-member
-covers and logical views remain valid.
+`CollectionEncoding`. Every member is an ordinary typed blob, and every
+collection encoding defines one canonical associative, commutative, and
+idempotent member-join operation. When one blob cannot hold the result, a finer
+`Cover<E>` represents the same join, so the collection lattice remains total.
+Derived collections are full lattices connected by mappings, not
+projection-only representations.
 
 ### Collection Member
 One ordinary typed `Blob<E>` admitted into a `Collection<E>`. A source-bound
 encoding may name another blob in its bytes; validation and cover-aware views
 follow that handle through the same immutable store snapshot rather than
 wrapping the member in another runtime artifact. For Rank9-accelerated
-SuccinctArchive, the root embeds its exact raw source handle, has no direct
-join, and is derived after the raw Succinct lattice is compacted.
+SuccinctArchive, the root embeds its exact raw source handle. Its canonical join
+names the corresponding raw union as an immutable dependency and succeeds once
+that blob is resident.
 
 ### Collection Mapping
 A parameterized source-to-target conversion exposed by `CollectionMapping`
