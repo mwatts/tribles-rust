@@ -7,7 +7,7 @@
 //! opaque KDF(C). Exact bytes use a separate H-only DHT rendezvous and mutual
 //! key-confirmation stream; collection identity never participates.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -1588,12 +1588,12 @@ impl<T: Transport> ProviderClient<T> {
         let mut providers = Vec::new();
         while let Some(reply) = replies.next().await {
             for (provider, token) in reply {
-                if token_for(identity, provider) == token && !providers.contains(&provider) {
+                if token_for(identity, provider) == token {
                     providers.push(provider);
                 }
             }
         }
-        providers
+        canonical_provider_subset(key, providers)
     }
 
     async fn fetch_from_providers(&self, hash: RawHash, providers: Vec<PeerId>) -> Option<Bytes> {
@@ -1636,6 +1636,26 @@ impl<T: Transport> ProviderClient<T> {
             .collect();
         self.fetch_from_providers(hash, providers).await
     }
+}
+
+/// Canonical globally bounded union of provider replies for one exact key.
+///
+/// Each queried DHT replica independently bounds its response, but their union
+/// may still be `K` times larger. Ranking the deduplicated union by the same XOR
+/// order as routing makes the selected subset independent of asynchronous reply
+/// order and keeps one exact key's downstream connection fan-out bounded.
+fn canonical_provider_subset(
+    key: ProviderKey,
+    providers: impl IntoIterator<Item = PeerId>,
+) -> Vec<PeerId> {
+    let mut providers = providers
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    providers.sort_unstable_by(|left, right| crate::routing::distance_cmp(key, *left, *right));
+    providers.truncate(crate::provider::MAX_PROVIDERS_PER_KEY);
+    providers
 }
 
 fn remote_lease_accepted(local: PeerId, replica: PeerId, accepted: bool) -> bool {
@@ -1859,7 +1879,7 @@ fn op_name(op: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
     use anybytes::Bytes;
@@ -1884,12 +1904,14 @@ mod tests {
     use crate::channel::{NetEvent, NetEventBatch};
     use crate::inventory::{BlobReplication, ReconcileQos};
     use crate::peer::Peer;
-    use crate::provider::{ProviderObservation, ProviderPublisher};
+    use crate::provider::{MAX_PROVIDERS_PER_KEY, ProviderObservation, ProviderPublisher};
+    use crate::routing::K;
+    use crate::transport::PeerId;
 
     use super::{
         ActiveCollections, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
-        ProviderPublicationBudget, RepairTarget, StoreSnapshot, enqueue_repair, live_participants,
-        observe_participant, remote_lease_accepted,
+        ProviderPublicationBudget, RepairTarget, StoreSnapshot, canonical_provider_subset,
+        enqueue_repair, live_participants, observe_participant, remote_lease_accepted,
     };
 
     fn fragment(seed: u8, value: Inline<Handle<UnknownBlob>>) -> Fragment {
@@ -1990,6 +2012,59 @@ mod tests {
             budget.consume_attempt();
         }
         assert!(!budget.is_exhausted());
+    }
+
+    #[test]
+    fn aggregated_provider_replies_are_canonical_deduplicated_and_globally_bounded() {
+        fn provider(index: u16) -> PeerId {
+            let mut peer = [0; 32];
+            peer[30..].copy_from_slice(&index.to_be_bytes());
+            peer
+        }
+
+        let key_index = 0x0234_u16;
+        let mut key = [0; 32];
+        key[30..].copy_from_slice(&key_index.to_be_bytes());
+        let replies = (0..K)
+            .map(|replica| {
+                // Every replica repeats the same 16 providers and contributes
+                // 48 providers disjoint from every other replica.
+                (1..=16)
+                    .chain(100 + replica as u16 * 48..148 + replica as u16 * 48)
+                    .map(provider)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replies.len(), K);
+        assert!(
+            replies
+                .iter()
+                .all(|reply| reply.len() == MAX_PROVIDERS_PER_KEY)
+        );
+
+        let forward = canonical_provider_subset(key, replies.iter().flatten().copied());
+        let reversed = canonical_provider_subset(
+            key,
+            replies
+                .iter()
+                .rev()
+                .flat_map(|reply| reply.iter().rev().copied()),
+        );
+        let mut expected_indices = (1..=16).chain(100..100 + K as u16 * 48).collect::<Vec<_>>();
+        expected_indices.sort_unstable_by_key(|index| index ^ key_index);
+        expected_indices.truncate(MAX_PROVIDERS_PER_KEY);
+        let expected = expected_indices
+            .into_iter()
+            .map(provider)
+            .collect::<Vec<_>>();
+
+        assert_eq!(forward.len(), MAX_PROVIDERS_PER_KEY);
+        assert_eq!(forward, expected);
+        assert_eq!(reversed, forward);
+        assert_eq!(
+            forward.iter().copied().collect::<BTreeSet<_>>().len(),
+            forward.len()
+        );
     }
 
     #[test]
