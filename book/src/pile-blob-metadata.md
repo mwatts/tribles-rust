@@ -103,8 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 When `None` is returned, callers can treat it the same way they would handle a
 missing blob from `get`: the data is considered absent from the snapshot they
-are reading. Because validation is cached, later calls will continue to report
-`None` for the same handle until a future refresh revalidates the blob.
+are reading. Validation is cached in the physical occurrence's persistent PATCH
+leaf, which immutable snapshots share. Later calls therefore reuse the verdict;
+a future snapshot can recover when the pile acquires another occurrence of the
+same handle whose payload validates.
 
 For additional background on the binary layout and how the header interacts
 with padding, see the [Pile Format](./pile-format.md) chapter.

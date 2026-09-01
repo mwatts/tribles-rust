@@ -3615,6 +3615,17 @@ where
         PATCHPrefixIterator::new(self)
     }
 
+    /// View every distinct tree-ordered prefix as one member of a set.
+    ///
+    /// `PREFIX_LEN` must end at a declared segment boundary. Bytes in later
+    /// segments are deliberately projected away: adding or removing another
+    /// suffix under an existing prefix does not change this view's membership.
+    pub fn prefix_set<const PREFIX_LEN: usize>(
+        &self,
+    ) -> PATCHPrefixSet<'_, KEY_LEN, PREFIX_LEN, O, V, H> {
+        PATCHPrefixSet::new(self)
+    }
+
     /// Unions this PATCH with another PATCH.
     ///
     /// The other PATCH is consumed, and this PATCH is updated in place.
@@ -4888,6 +4899,90 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> PATCH<KEY_LEN
             _owners: owners,
         }
     }
+
+    /// Consume this PATCH and enumerate each distinct tree-ordered prefix once.
+    ///
+    /// Unlike mapping the full consuming iterator and deduplicating it, this
+    /// traversal stops at `PREFIX_LEN`: suffix subtrees are dropped without
+    /// visiting their leaves. `PREFIX_LEN` must end at a segment boundary.
+    pub fn into_prefixes<const PREFIX_LEN: usize>(
+        self,
+    ) -> PATCHIntoPrefixSetIterator<KEY_LEN, PREFIX_LEN, O, V, H> {
+        const {
+            assert!(PREFIX_LEN > 0, "a prefix set needs at least one byte");
+            assert!(PREFIX_LEN <= KEY_LEN);
+            if PREFIX_LEN < KEY_LEN {
+                assert!(
+                    <O as KeySchema<KEY_LEN>>::Segmentation::SEGMENTS
+                        [O::TREE_TO_KEY[PREFIX_LEN - 1]]
+                        != <O as KeySchema<KEY_LEN>>::Segmentation::SEGMENTS
+                            [O::TREE_TO_KEY[PREFIX_LEN]],
+                    "PREFIX_LEN must align to a segment boundary",
+                );
+            }
+        }
+
+        let PATCH { root, owners } = self;
+        let mut queue = Vec::new();
+        if let Some(root) = root {
+            queue.push(root);
+        }
+        PATCHIntoPrefixSetIterator {
+            queue,
+            _owners: owners,
+        }
+    }
+}
+
+/// Consuming iterator over the distinct prefixes at one PATCH segment boundary.
+///
+/// The iterator owns an immutable PATCH snapshot and drops every suffix subtree
+/// as soon as its one projected member has been emitted. This is useful when an
+/// iterator must outlive the snapshot value from which it was constructed.
+pub struct PATCHIntoPrefixSetIterator<
+    const KEY_LEN: usize,
+    const PREFIX_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+    H: PatchHash = XorSip128,
+> {
+    // Field order is deliberate: queued Heads drop before the owner cover.
+    queue: Vec<Head<KEY_LEN, O, V, H>>,
+    _owners: Option<Arc<OwnerCover>>,
+}
+
+impl<const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHIntoPrefixSetIterator<KEY_LEN, PREFIX_LEN, O, V, H>
+{
+    type Item = [u8; PREFIX_LEN];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(head) = self.queue.pop() {
+            if head.end_depth() >= PREFIX_LEN {
+                let key = O::tree_ordered(head.childleaf_key());
+                return Some(key[..PREFIX_LEN].try_into().unwrap());
+            }
+
+            let BodyRef::Branch(branch) = head.body_ref() else {
+                unreachable!("a leaf cannot end before a valid prefix boundary");
+            };
+            // Clone one-word persistent Heads from the immutable branch. Using
+            // `body_mut` here would copy-on-write every shared branch merely
+            // because the iterator owns a clone of the PATCH root.
+            let mut children = ArrayVec::<&Head<KEY_LEN, O, V, H>, 256>::new();
+            children.extend(branch.child_table.iter().filter_map(Option::as_ref));
+            children.sort_unstable_by_key(|child| child.key());
+            for child in children.into_iter().rev() {
+                self.queue.push((*child).clone());
+            }
+        }
+        None
+    }
+}
+
+impl<const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    std::iter::FusedIterator for PATCHIntoPrefixSetIterator<KEY_LEN, PREFIX_LEN, O, V, H>
+{
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
@@ -4930,6 +5025,104 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ExactSize
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> std::iter::FusedIterator
     for PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
+{
+}
+
+/// A zero-copy set view over distinct prefixes at one PATCH segment boundary.
+///
+/// The view borrows the physical trie. It neither allocates a second PATCH nor
+/// gives suffix multiplicity semantic weight. Iteration collapses every suffix
+/// subtree to its one shared prefix.
+#[derive(Clone, Copy)]
+pub struct PATCHPrefixSet<
+    'a,
+    const KEY_LEN: usize,
+    const PREFIX_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+    H: PatchHash = XorSip128,
+> {
+    patch: &'a PATCH<KEY_LEN, O, V, H>,
+}
+
+impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    PATCHPrefixSet<'a, KEY_LEN, PREFIX_LEN, O, V, H>
+{
+    fn new(patch: &'a PATCH<KEY_LEN, O, V, H>) -> Self {
+        const {
+            assert!(PREFIX_LEN > 0, "a prefix set needs at least one byte");
+            assert!(PREFIX_LEN <= KEY_LEN);
+            if PREFIX_LEN < KEY_LEN {
+                assert!(
+                    <O as KeySchema<KEY_LEN>>::Segmentation::SEGMENTS
+                        [O::TREE_TO_KEY[PREFIX_LEN - 1]]
+                        != <O as KeySchema<KEY_LEN>>::Segmentation::SEGMENTS
+                            [O::TREE_TO_KEY[PREFIX_LEN]],
+                    "PREFIX_LEN must align to a segment boundary",
+                );
+            }
+        }
+        Self { patch }
+    }
+
+    /// Whether at least one physical key has this projected prefix.
+    pub fn contains(&self, prefix: &[u8; PREFIX_LEN]) -> bool {
+        self.patch.has_prefix(prefix)
+    }
+
+    /// Enumerate each projected prefix once in tree order.
+    pub fn iter(&self) -> PATCHPrefixSetIterator<'a, KEY_LEN, PREFIX_LEN, O, V, H> {
+        PATCHPrefixSetIterator {
+            inner: self.patch.iter_prefix_count(),
+        }
+    }
+
+    /// Whether this projected set has no members.
+    pub fn is_empty(&self) -> bool {
+        self.patch.is_empty()
+    }
+
+    /// Intersect this projected set with an ordinary key-only PATCH.
+    ///
+    /// The returned PATCH retains `other`'s hash policy, making this suitable
+    /// for filtering a typed semantic cover through a larger physical index.
+    pub fn intersection<OH: PatchHash>(
+        &self,
+        other: &PATCH<PREFIX_LEN, IdentitySchema, (), OH>,
+    ) -> PATCH<PREFIX_LEN, IdentitySchema, (), OH> {
+        let keys = other
+            .iter_ordered()
+            .filter(|key| self.contains(key))
+            .copied()
+            .collect();
+        PATCH::from_owned_keys(keys)
+    }
+}
+
+/// Iterator over a [`PATCHPrefixSet`].
+pub struct PATCHPrefixSetIterator<
+    'a,
+    const KEY_LEN: usize,
+    const PREFIX_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+    H: PatchHash = XorSip128,
+> {
+    inner: PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V, H>,
+}
+
+impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    Iterator for PATCHPrefixSetIterator<'a, KEY_LEN, PREFIX_LEN, O, V, H>
+{
+    type Item = [u8; PREFIX_LEN];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(prefix, _count)| prefix)
+    }
+}
+
+impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    std::iter::FusedIterator for PATCHPrefixSetIterator<'a, KEY_LEN, PREFIX_LEN, O, V, H>
 {
 }
 
@@ -5529,6 +5722,83 @@ mod tests {
 
     crate::key_segmentation!(PermutedInfixSegments, 12, [4, 4, 4]);
     crate::key_schema!(PermutedInfixSchema, PermutedInfixSegments, 12, [1, 2, 0]);
+    crate::key_segmentation!(PrefixProjectionSegments, 6, [4, 2]);
+    crate::key_schema!(PrefixProjectionSchema, PrefixProjectionSegments, 6, [0, 1]);
+
+    #[test]
+    fn prefix_set_projects_away_suffix_multiplicity_and_order() {
+        let first = [1, 2, 3, 4];
+        let second = [5, 6, 7, 8];
+        let physical_key = |prefix: [u8; 4], suffix: [u8; 2]| {
+            let mut key = [0; 6];
+            key[..4].copy_from_slice(&prefix);
+            key[4..].copy_from_slice(&suffix);
+            key
+        };
+
+        let mut left = PATCH::<6, PrefixProjectionSchema>::new();
+        for key in [
+            physical_key(first, [0, 2]),
+            physical_key(second, [0, 9]),
+            physical_key(first, [0, 1]),
+        ] {
+            left.insert(&Entry::new(&key));
+        }
+        let mut right = PATCH::<6, PrefixProjectionSchema>::new();
+        for key in [physical_key(second, [7, 7]), physical_key(first, [8, 8])] {
+            right.insert(&Entry::new(&key));
+        }
+
+        assert_eq!(
+            left.clone().into_prefixes::<4>().collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        let left = left.prefix_set::<4>();
+        let right = right.prefix_set::<4>();
+        assert_eq!(left.iter().collect::<Vec<_>>(), vec![first, second]);
+        assert_eq!(right.iter().collect::<Vec<_>>(), vec![first, second]);
+        assert!(left.contains(&first));
+        assert!(left.contains(&second));
+        assert!(!left.contains(&[9; 4]));
+        assert_eq!(
+            left.iter().collect::<Vec<_>>(),
+            right.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prefix_set_intersection_retains_the_other_patch_policy() {
+        let physical_key = |prefix: [u8; 4], suffix: [u8; 2]| {
+            let mut key = [0; 6];
+            key[..4].copy_from_slice(&prefix);
+            key[4..].copy_from_slice(&suffix);
+            key
+        };
+        let resident = [[1; 4], [3; 4], [5; 4]];
+        let mut physical = PATCH::<6, PrefixProjectionSchema>::new();
+        for (prefix, suffix) in [
+            (resident[0], [0, 1]),
+            (resident[0], [0, 2]),
+            (resident[1], [0, 3]),
+            (resident[2], [0, 4]),
+        ] {
+            physical.insert(&Entry::new(&physical_key(prefix, suffix)));
+        }
+
+        let requested = PATCH::<4, IdentitySchema, (), Blake3Merkle>::from_keys([
+            [0; 4],
+            resident[0],
+            [2; 4],
+            resident[1],
+            [4; 4],
+            resident[2],
+            [6; 4],
+        ]);
+        let actual = physical.prefix_set::<4>().intersection(&requested);
+        let expected = PATCH::<4, IdentitySchema, (), Blake3Merkle>::from_keys(resident);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.merkle_root(), expected.merkle_root());
+    }
 
     struct PanicOnDrop(bool);
 

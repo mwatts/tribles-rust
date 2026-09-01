@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `materialize`, which selects a support-equivalent physical decomposition
   privately through the supplied snapshot before invoking the typed view.
 
+- Replace the pile's semantic-handle PATCH and Arc-linked duplicate chains with
+  one segmented `hash || offset` PATCH relation. Its zero-copy 32-byte prefix
+  projection provides semantic listing, membership, differences, and cover
+  intersection without duplicating every handle. Lazy validation lives inline
+  in occurrence leaves, walks offsets in file order, and can recover from any
+  valid duplicate.
+
 - Return exact empty NVFP4 search results before query preparation or scanner
   execution when a cover has no logical rows, and document that Mary scan
   segments receive the persisted reconstruction-norm and error-certificate

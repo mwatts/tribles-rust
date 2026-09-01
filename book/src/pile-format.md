@@ -336,10 +336,18 @@ torn-tail offsets or amputation's exclusive retry.
 
 `PileSnapshot` receives persistent PATCH roots when it is created. Later
 refreshes can extend the pile without changing existing snapshots.
+Blob replay maintains one segmented PATCH relation keyed by
+`hash || offset_be`. It retains every physical occurrence in file order, while
+its zero-copy view at the 32-byte segment boundary is the semantic resident-blob
+set used for listing, membership, differences, and cover intersection. Reads
+walk the offsets for one hash lazily when an earlier payload fails content
+validation. The validation byte lives in the persistent occurrence leaf, so
+snapshots share cached verdicts without a separate map or per-handle Arc-linked
+duplicate chain.
 `StoreSnapshot::changes_since` compares the Blob, collection-record,
-capability-proof, and peer-evidence PATCH roots directly. For Blobs it compares
-lineage-local root sharing rather than key-only equality, so replacing a
-corrupt same-handle candidate is visible while unrelated appended records are
+capability-proof, and peer-evidence PATCH roots directly. For Blobs the physical
+occurrence root means adding a duplicate fallback or replacing a corrupt
+same-handle candidate is visible while unrelated appended records are
 not. Classification is therefore constant in the number of semantic
 components rather than a scan of either snapshot; component-specific consumers
 can reuse unchanged derived state.
