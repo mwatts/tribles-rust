@@ -939,6 +939,7 @@ struct CountingStore {
     puts: usize,
     inserts: usize,
     snapshots: usize,
+    observed_derives: Vec<usize>,
     missing_gets: Arc<AtomicUsize>,
     metadata_failures: Arc<Mutex<BTreeSet<[u8; 32]>>>,
 }
@@ -1062,8 +1063,23 @@ impl SnapshotSource for CountingStore {
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.snapshots += 1;
+        let inner = self.inner.snapshot()?;
+        self.observed_derives.push(
+            inner
+                .records()
+                .expect("memory collection records are infallible")
+                .filter_map(Result::ok)
+                .filter(|record| {
+                    matches!(
+                        record,
+                        CollectionRecord::Derive(claim)
+                            if claim.collection() == kernel().target_collection().handle()
+                    )
+                })
+                .count(),
+        );
         Ok(DemandGuardSnapshot {
-            inner: self.inner.snapshot()?,
+            inner,
             missing_gets: Arc::clone(&self.missing_gets),
             metadata_failures: self.metadata_failures.lock().unwrap().clone(),
         })
@@ -2707,6 +2723,123 @@ fn target_capacity_retires_only_low() {
 }
 
 #[test]
+fn capacity_stable_lowest_tier_does_not_hide_a_joinable_higher_tier() {
+    let sources = [
+        archive([(1, 3)]),
+        archive([(2, 4)]),
+        archive((10..18).map(|entity| (entity, entity + 20))),
+        archive((30..38).map(|entity| (entity, entity + 20))),
+    ];
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut inner, index as u8 + 1, source);
+            publish_derive(&mut inner, source);
+            commit
+        })
+        .collect();
+    let targets: Vec<_> = sources
+        .iter()
+        .map(|source| derive(source).unwrap())
+        .collect();
+    let low_pair = SelectiveMapping::pair(&targets[0], &targets[1]);
+    let high_pair = SelectiveMapping::pair(&targets[2], &targets[3]);
+    assert!(
+        targets[0].bytes.len().ilog2() < targets[2].bytes.len().ilog2(),
+        "fixture must occupy two target tiers",
+    );
+    let algebra = SelectiveMapping {
+        capacity_target_pairs: BTreeSet::from([low_pair]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+
+    let cover = with_selective(&algebra, |kernel| {
+        kernel.ensure(&mut store, &source_cover(&commits))
+    })
+    .unwrap();
+
+    assert_eq!(cover.len(), 3);
+    let attempts = algebra.target_attempts.lock().unwrap();
+    let low_position = attempts
+        .iter()
+        .position(|pair| *pair == low_pair)
+        .expect("capacity pair was attempted");
+    let high_position = attempts
+        .iter()
+        .position(|pair| *pair == high_pair)
+        .expect("higher-tier pair was attempted");
+    assert!(low_position < high_position);
+    assert!(target_merge_records(&mut store.inner)
+        .iter()
+        .any(|claim| claim.inputs() == high_pair));
+}
+
+#[test]
+fn dependency_after_a_batched_prefix_reprobes_without_republishing_the_prefix() {
+    let sources = [
+        archive([(1, 3)]),
+        archive([(2, 4)]),
+        archive([(3, 5)]),
+        archive([(4, 6)]),
+    ];
+    let mut inner = MemoryRepo::default();
+    let commits: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut inner, index as u8 + 1, source);
+            publish_derive(&mut inner, source);
+            commit
+        })
+        .collect();
+    let mut ordered: Vec<_> = sources
+        .iter()
+        .map(|source| {
+            let target = derive(source).unwrap();
+            (data(&target), source, target)
+        })
+        .collect();
+    ordered.sort_unstable_by_key(|(target, _, _)| *target);
+    let first_pair = SelectiveMapping::pair(&ordered[0].2, &ordered[1].2);
+    let dependency_pair = SelectiveMapping::pair(&ordered[2].2, &ordered[3].2);
+    let dependency_source = join_test_sources(ordered[2].1, ordered[3].1);
+    let algebra = SelectiveMapping {
+        target_dependencies: BTreeMap::from([(dependency_pair, data(&dependency_source))]),
+        ..SelectiveMapping::default()
+    };
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+
+    with_selective(&algebra, |kernel| {
+        kernel.ensure(&mut store, &source_cover(&commits))
+    })
+    .unwrap();
+
+    let attempts = algebra.target_attempts.lock().unwrap();
+    assert_eq!(
+        attempts.iter().filter(|pair| **pair == first_pair).count(),
+        1,
+        "the successful prefix must not be recomputed after dependency repair",
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|pair| **pair == dependency_pair)
+            .count(),
+        2,
+        "the dependency pair is retried exactly once after its source appears",
+    );
+}
+
+#[test]
 fn unmatched_global_target_dependency_is_reported_without_publishing_a_merge() {
     let sources = [archive([(1, 3)]), archive([(2, 4)])];
     let unrelated = archive([(100, 101)]);
@@ -3281,6 +3414,14 @@ fn flat_frontier_maintenance_uses_batched_snapshot_rounds() {
 
     assert_eq!(derived_inputs(&mut store.inner).len(), MEMBERS);
     assert!(cover.len() <= usize::BITS as usize);
+    assert!(
+        store
+            .observed_derives
+            .iter()
+            .all(|count| *count == 0 || *count == MEMBERS),
+        "a snapshot observed a partial preferred-source batch: {:?}",
+        store.observed_derives,
+    );
     assert!(
         store.snapshots < MEMBERS / 2,
         "{MEMBERS} flat members took {} snapshots instead of batched rounds",

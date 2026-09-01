@@ -64,10 +64,6 @@ where
     loop {
         match publish_round::<S, H>(exact, store, source_cover, cover, &mut blocks.target_merges)? {
             RoundOutcome::TargetPublished => {}
-            RoundOutcome::Retry(current) => {
-                cover = current;
-                continue;
-            }
             RoundOutcome::Stable(cover) => return Ok(cover),
         }
         // Every successful carry can create an exact child image for a known
@@ -91,7 +87,6 @@ fn cover_identity<Target: CollectionEncoding>(cover: &Cover<Target>) -> Vec<Coll
 
 enum RoundOutcome<Target: CollectionEncoding> {
     TargetPublished,
-    Retry(Cover<Target>),
     Stable(Cover<Target>),
 }
 
@@ -140,99 +135,106 @@ where
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
-    let Some(tier) = tiers
-        .iter()
-        .find_map(|(tier, bin)| (bin.len() >= 2).then_some(*tier))
-    else {
-        return Ok(RoundOutcome::Stable(cover));
-    };
-    let mut bin = tiers.remove(&tier).expect("selected tier exists");
-    let mut prepared = Vec::with_capacity(bin.len() / 2);
-    let mut terminal: Option<
-        Result<(CollectionData, CollectionData, CollectionData), ExactDerivedCollectionError>,
-    > = None;
+    loop {
+        let Some(tier) = tiers
+            .iter()
+            .find_map(|(tier, bin)| (bin.len() >= 2).then_some(*tier))
+        else {
+            return Ok(RoundOutcome::Stable(cover));
+        };
+        let mut bin = tiers.remove(&tier).expect("selected tier exists");
+        let mut prepared = Vec::with_capacity(bin.len() / 2);
+        let mut terminal: Option<
+            Result<(CollectionData, CollectionData, CollectionData), ExactDerivedCollectionError>,
+        > = None;
 
-    while bin.len() >= 2 {
-        let (low_data, low) = bin.pop_first().expect("colliding tier has a low input");
-        let (high_data, high) = bin.pop_first().expect("colliding tier has a high input");
-        if blocked_target_merges.contains(&(low_data, high_data)) {
-            bin.insert(high_data, high);
-            continue;
-        }
-
-        let constructed = match <Mapping::Target as CollectionEncoding>::join_members(
-            &descriptor,
-            &low,
-            &high,
-            &reader,
-        ) {
-            Ok(constructed) => constructed,
-            Err(CollectionOperationError::Fatal(reason)) => {
-                terminal = Some(Err(ExactDerivedCollectionError::Merge {
-                    low: low_data,
-                    high: high_data,
-                    reason,
-                }));
-                break;
-            }
-            Err(CollectionOperationError::Capacity(_)) => {
-                // Retire only the lower input for this round. The higher input
-                // remains eligible for the next deterministic pair, exactly as
-                // in the scalar planner.
+        while bin.len() >= 2 {
+            let (low_data, low) = bin.pop_first().expect("colliding tier has a low input");
+            let (high_data, high) = bin.pop_first().expect("colliding tier has a high input");
+            if blocked_target_merges.contains(&(low_data, high_data)) {
                 bin.insert(high_data, high);
                 continue;
             }
-            Err(CollectionOperationError::MissingDependency(member)) => {
-                terminal = Some(Ok((low_data, high_data, member)));
-                break;
+
+            let constructed = match <Mapping::Target as CollectionEncoding>::join_members(
+                &descriptor,
+                &low,
+                &high,
+                &reader,
+            ) {
+                Ok(constructed) => constructed,
+                Err(CollectionOperationError::Fatal(reason)) => {
+                    terminal = Some(Err(ExactDerivedCollectionError::Merge {
+                        low: low_data,
+                        high: high_data,
+                        reason,
+                    }));
+                    break;
+                }
+                Err(CollectionOperationError::Capacity(_)) => {
+                    // Retire only the lower input for this round. The higher
+                    // input remains eligible for the next deterministic pair,
+                    // exactly as in the scalar planner.
+                    bin.insert(high_data, high);
+                    continue;
+                }
+                Err(CollectionOperationError::MissingDependency(member)) => {
+                    terminal = Some(Ok((low_data, high_data, member)));
+                    break;
+                }
+            };
+            let result_data = data_identity::<Mapping::Target>(&constructed);
+            let claim = CollectionMerge::new(collection.handle(), low_data, high_data, result_data);
+            prepared.push(PreparedTargetMerge {
+                output: constructed,
+                claim,
+            });
+        }
+
+        // A capacity-stable lower tier must not hide an actionable higher
+        // tier. Continue scanning under the same immutable snapshot until one
+        // deterministic batch has work (or a real terminal result).
+        if prepared.is_empty() && terminal.is_none() {
+            continue;
+        }
+
+        // Closure-dependent joins observe one immutable reader boundary. Do
+        // not retain it across publication. Every successful pair is complete
+        // work, so publish the deterministic prefix even if a later pair
+        // failed.
+        drop(reader);
+        for prepared in prepared {
+            store
+                .put::<Mapping::Target, _>(prepared.output)
+                .map_err(|error| {
+                    ExactDerivedCollectionError::storage("store merged target", error)
+                })?;
+            store
+                .insert(CollectionRecord::Merge(prepared.claim))
+                .map_err(|error| {
+                    ExactDerivedCollectionError::storage("publish target MERGE", error)
+                })?;
+        }
+
+        return match terminal {
+            Some(Err(error)) => Err(error),
+            Some(Ok((low_data, high_data, member))) => {
+                if exact.materialize_target_join_dependency(
+                    store,
+                    source_cover,
+                    low_data,
+                    high_data,
+                    member,
+                )? {
+                    // The dependency is itself a freshly published source
+                    // equation. Re-enter exact planning before selecting
+                    // another target pair, just as for a target batch.
+                    Ok(RoundOutcome::TargetPublished)
+                } else {
+                    Err(ExactDerivedCollectionError::MissingDependency { member })
+                }
             }
+            None => Ok(RoundOutcome::TargetPublished),
         };
-        let result_data = data_identity::<Mapping::Target>(&constructed);
-        let claim = CollectionMerge::new(collection.handle(), low_data, high_data, result_data);
-        prepared.push(PreparedTargetMerge {
-            output: constructed,
-            claim,
-        });
-    }
-
-    // Closure-dependent joins observe one immutable reader boundary. Do not
-    // retain it across publication. Every successful pair is complete work,
-    // so publish the deterministic prefix even if a later pair failed.
-    drop(reader);
-    let published = !prepared.is_empty();
-    for prepared in prepared {
-        store
-            .put::<Mapping::Target, _>(prepared.output)
-            .map_err(|error| ExactDerivedCollectionError::storage("store merged target", error))?;
-        store
-            .insert(CollectionRecord::Merge(prepared.claim))
-            .map_err(|error| ExactDerivedCollectionError::storage("publish target MERGE", error))?;
-    }
-
-    match terminal {
-        Some(Err(error)) => Err(error),
-        Some(Ok((low_data, high_data, member))) => {
-            if exact.materialize_target_join_dependency(
-                store,
-                source_cover,
-                low_data,
-                high_data,
-                member,
-            )? {
-                Ok(RoundOutcome::Retry(cover))
-            } else {
-                Err(ExactDerivedCollectionError::MissingDependency { member })
-            }
-        }
-        None => {
-            // A non-empty prepared batch changed the resident equation set;
-            // re-probe before selecting another tier. With no successes, every
-            // collision in the selected tier was capacity-terminal.
-            if published {
-                Ok(RoundOutcome::TargetPublished)
-            } else {
-                Ok(RoundOutcome::Stable(cover))
-            }
-        }
     }
 }
