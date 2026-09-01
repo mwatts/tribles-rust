@@ -11,7 +11,7 @@
 //!   exact score recompute it via the `score` inherent helper.
 //! * [`CosineAtLeast`] — an exact, symmetric, filter-only predicate
 //!   `cosine_at_least(a, b, score_floor)` over two
-//!   `Variable<Handle<Embedding>>` variables, produced by the
+//!   same-encoding `Variable<Handle<E>>` values, produced by the
 //!   `cosine_at_least()` method on
 //!   [`crate::hnsw::AttachedHNSWIndex`] /
 //!   [`crate::hnsw::AttachedFlatIndex`] /
@@ -20,8 +20,8 @@
 //!   like `InlineRange` in the core engine, it estimates
 //!   `usize::MAX` and proposes nothing.
 //! * [`SimilarTo`] — a unary set constraint over the result of one
-//!   fixed-probe backend search. Flat retrieval is complete; HNSW and
-//!   succinct HNSW retrieval is approximate.
+//!   fixed-probe backend search. Flat and NVFP4 retrieval are complete;
+//!   HNSW and succinct HNSW retrieval are approximate.
 //!
 //! All three speak the engine's cooperative protocol directly:
 //! `estimate` guides join ordering, `propose` appends candidate values
@@ -33,6 +33,7 @@
 
 use std::collections::HashSet;
 
+use triblespace_core::blob::BlobEncoding;
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
@@ -41,6 +42,7 @@ use triblespace_core::query::{
 };
 
 use crate::bm25::BM25Index;
+#[cfg(test)]
 use crate::schemas::Embedding;
 
 /// Minimum surface a BM25 index must expose for the
@@ -467,23 +469,19 @@ where
 
 // ── Similarity constraint ───────────────────────────────────────────
 
-/// Backing surface an attached embedding store must expose for the
-/// [`CosineAtLeast`] exact binary predicate. Implemented for the
-/// three attached views:
+/// Backing surface an attached embedding store must expose for the generic
+/// [`CosineAtLeast`] exact binary predicate. Implemented for the three
+/// `Embedding` attached views:
 /// [`crate::hnsw::AttachedHNSWIndex`],
 /// [`crate::hnsw::AttachedFlatIndex`], and
 /// [`crate::succinct::AttachedSuccinctHNSWIndex`].
 ///
 /// Fetch failures map to [`None`], which is exact "no match" behavior at the
 /// query boundary because constraint hooks have no error channel.
-pub trait CosineSimilarity {
+pub trait CosineSimilarity<E: BlobEncoding> {
     /// Exact cosine similarity between the two handles, or
     /// [`None`] if either blob can't be fetched / parsed.
-    fn cosine_between(
-        &self,
-        a: Inline<Handle<Embedding>>,
-        b: Inline<Handle<Embedding>>,
-    ) -> Option<f32>;
+    fn cosine_between(&self, a: Inline<Handle<E>>, b: Inline<Handle<E>>) -> Option<f32>;
 }
 
 /// Exact binary cosine predicate:
@@ -568,20 +566,28 @@ pub trait CosineSimilarity {
 /// For the common single-probe retrieval case use [`SimilarTo`], which owns
 /// one already-materialized backend search result instead of pretending an
 /// approximate graph walk is an exact binary relation.
-pub struct CosineAtLeast<'a, I: CosineSimilarity + ?Sized> {
+pub struct CosineAtLeast<'a, I, E>
+where
+    I: CosineSimilarity<E> + ?Sized,
+    E: BlobEncoding,
+{
     index: &'a I,
-    a: Variable<Handle<Embedding>>,
-    b: Variable<Handle<Embedding>>,
+    a: Variable<Handle<E>>,
+    b: Variable<Handle<E>>,
     score_floor: f32,
 }
 
-impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
+impl<'a, I, E> CosineAtLeast<'a, I, E>
+where
+    I: CosineSimilarity<E> + ?Sized,
+    E: BlobEncoding,
+{
     /// Build a constraint. Usually invoked through the `cosine_at_least`
     /// method on an attached index rather than directly.
     pub fn new(
         index: &'a I,
-        a: Variable<Handle<Embedding>>,
-        b: Variable<Handle<Embedding>>,
+        a: Variable<Handle<E>>,
+        b: Variable<Handle<E>>,
         score_floor: f32,
     ) -> Self {
         Self {
@@ -599,7 +605,11 @@ impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
     }
 }
 
-impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a, I> {
+impl<'a, I, E> Constraint<'a> for CosineAtLeast<'a, I, E>
+where
+    I: CosineSimilarity<E> + ?Sized + 'a,
+    E: BlobEncoding,
+{
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
     }
@@ -668,16 +678,17 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
 /// binds `var` to the candidate set returned by one backend search
 /// from `probe` at `score_floor`.
 ///
-/// The candidate set is pre-materialised at construction. Flat search
-/// produces every indexed handle above the threshold. HNSW and succinct
-/// HNSW are approximate and may omit qualifying handles. Once
+/// The candidate set is pre-materialised at construction. Flat and NVFP4
+/// search produce every indexed handle above the threshold. HNSW and
+/// succinct HNSW are approximate and may omit qualifying handles. Once
 /// constructed, query semantics are exact membership in this frozen
 /// set; no engine action re-walks the index. Duplicate occurrences in
 /// the backend's result list collapse at construction — the constraint
 /// denotes the raw [`RawInline`] support set, exactly the rows a query
 /// head can distinguish.
 ///
-/// Produced by the `similar_to` method on an
+/// Produced by the `similar_to` method on an [`crate::nvfp4::NvFp4CosineIndex`]
+/// or an
 /// [`crate::hnsw::AttachedHNSWIndex`] /
 /// [`crate::hnsw::AttachedFlatIndex`] /
 /// [`crate::succinct::AttachedSuccinctHNSWIndex`].
@@ -721,8 +732,8 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
 /// assert!(got.contains(&handles[1]));
 /// assert!(!got.contains(&handles[2])); // below floor
 /// ```
-pub struct SimilarTo {
-    var: Variable<Handle<Embedding>>,
+pub struct SimilarTo<E: BlobEncoding> {
+    var: Variable<Handle<E>>,
     /// Backend result list from the one walk at construction,
     /// deduplicated in first-occurrence order.
     candidates: Vec<RawInline>,
@@ -730,7 +741,7 @@ pub struct SimilarTo {
     membership: HashSet<RawInline>,
 }
 
-impl SimilarTo {
+impl<E: BlobEncoding> SimilarTo<E> {
     /// Build from a pre-computed candidate list. Usually invoked
     /// through the `similar_to` method on an attached index
     /// rather than directly. Duplicate occurrences collapse at
@@ -746,7 +757,7 @@ impl SimilarTo {
     /// backends and hands the repeat straight through. Nothing downstream
     /// would collapse it — the engine has no head-claiming layer, so a repeated
     /// proposal is a repeated row.
-    pub fn from_candidates(var: Variable<Handle<Embedding>>, candidates: Vec<RawInline>) -> Self {
+    pub fn from_candidates(var: Variable<Handle<E>>, candidates: Vec<RawInline>) -> Self {
         let mut membership = HashSet::with_capacity(candidates.len());
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -766,7 +777,7 @@ impl SimilarTo {
     }
 }
 
-impl<'a> Constraint<'a> for SimilarTo {
+impl<'a, E: BlobEncoding> Constraint<'a> for SimilarTo<E> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.var.index)
     }
@@ -816,6 +827,7 @@ mod tests {
     use super::*;
     use crate::bm25::BM25Builder;
     use crate::tokens::hash_tokens;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::inline::{InlineEncoding, IntoInline, TryFromInline};
@@ -1414,6 +1426,41 @@ mod tests {
     }
 
     // ── SimilarTo (unary frozen retrieval set) ─────────────────
+
+    #[test]
+    fn similarity_constraints_are_generic_over_blob_encoding() {
+        struct EqualityCosine;
+
+        impl CosineSimilarity<SimpleArchive> for EqualityCosine {
+            fn cosine_between(
+                &self,
+                a: Inline<Handle<SimpleArchive>>,
+                b: Inline<Handle<SimpleArchive>>,
+            ) -> Option<f32> {
+                Some(if a == b { 1.0 } else { 0.0 })
+            }
+        }
+
+        let value = Inline::<Handle<SimpleArchive>>::new([7; 32]);
+        let other = Inline::<Handle<SimpleArchive>>::new([8; 32]);
+        let a = Variable::<Handle<SimpleArchive>>::new(0);
+        let b = Variable::<Handle<SimpleArchive>>::new(1);
+        let cosine = EqualityCosine;
+        let exact = triblespace_core::and!(
+            a.is(value),
+            b.is(value),
+            CosineAtLeast::new(&cosine, a, b, 1.0),
+        );
+        assert_eq!(
+            Query::new(exact, project_pair).collect::<Vec<_>>(),
+            [(value.raw, value.raw)],
+        );
+
+        let similar = SimilarTo::from_candidates(a, vec![value.raw, other.raw]);
+        let mut rows = Query::new(similar, project_first).collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, [value.raw, other.raw]);
+    }
 
     #[test]
     fn similar_to_collapses_duplicates_and_speaks_the_protocol() {

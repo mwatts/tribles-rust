@@ -44,6 +44,7 @@ use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::inline::{Inline, IntoInline, TryFromInline};
 use triblespace_core::macros::{attributes, entity};
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::query::Variable;
 use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace_core::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
@@ -1499,6 +1500,46 @@ where
         let prepared = PreparedQuery::new(query, self.dimension)?;
         let candidates = self.candidates(&prepared)?;
         self.above_candidates(snapshot, &prepared, floor, candidates)
+    }
+
+    /// Freeze the exact above-threshold support for one probe blob as a query
+    /// constraint.
+    ///
+    /// The probe need not be a member of this index. Fetch and decoding errors
+    /// remain visible to the caller; an unavailable probe is not an empty
+    /// mathematical neighbourhood. Candidate discovery and exact membership
+    /// are delegated to [`Self::above`], so the resulting constraint contains
+    /// every and only indexed handle whose exact cosine clears `floor`.
+    pub fn similar_to<R>(
+        &self,
+        snapshot: &R,
+        probe: Inline<Handle<E>>,
+        variable: Variable<Handle<E>>,
+        floor: f64,
+    ) -> Result<crate::constraint::SimilarTo<E>, NvFp4Error>
+    where
+        R: BlobStoreGet,
+    {
+        let blob: Blob<E> = snapshot.get(probe).map_err(|source| {
+            NvFp4Error::new(format!(
+                "cannot fetch probe embedding {}: {source}",
+                uppercase_hex(&probe.raw),
+            ))
+        })?;
+        let query = View::<[f32]>::try_from_blob(blob).map_err(|source| {
+            NvFp4Error::new(format!(
+                "cannot decode probe embedding {}: {source}",
+                uppercase_hex(&probe.raw),
+            ))
+        })?;
+        let candidates = self
+            .above(snapshot, query.as_ref(), floor)?
+            .into_iter()
+            .map(|hit| hit.embedding.raw)
+            .collect();
+        Ok(crate::constraint::SimilarTo::from_candidates(
+            variable, candidates,
+        ))
     }
 
     /// Every exact cosine hit at or above `floor`, using `scanner` for compact

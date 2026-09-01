@@ -596,7 +596,7 @@ where
         a: Variable<EmbHandle>,
         b: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::CosineAtLeast<'_, Self> {
+    ) -> crate::constraint::CosineAtLeast<'_, Self, Embedding> {
         crate::constraint::CosineAtLeast::new(self, a, b, score_floor)
     }
 
@@ -618,7 +618,7 @@ where
         probe: Inline<EmbHandle>,
         var: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::SimilarTo {
+    ) -> crate::constraint::SimilarTo<Embedding> {
         let candidates = self
             .candidates_above(probe, score_floor)
             .map(|v| v.into_iter().map(|h| h.raw).collect())
@@ -1036,7 +1036,7 @@ where
         a: Variable<EmbHandle>,
         b: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::CosineAtLeast<'_, Self> {
+    ) -> crate::constraint::CosineAtLeast<'_, Self, Embedding> {
         crate::constraint::CosineAtLeast::new(self, a, b, score_floor)
     }
 
@@ -1057,7 +1057,7 @@ where
         probe: Inline<EmbHandle>,
         var: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::SimilarTo {
+    ) -> crate::constraint::SimilarTo<Embedding> {
         let candidates = self
             .candidates_above(probe, score_floor)
             .map(|v| v.into_iter().map(|h| h.raw).collect())
@@ -1115,7 +1115,7 @@ impl FlatIndex {
     }
 }
 
-impl<'a, B> crate::constraint::CosineSimilarity for AttachedHNSWIndex<'a, B>
+impl<'a, B> crate::constraint::CosineSimilarity<Embedding> for AttachedHNSWIndex<'a, B>
 where
     B: triblespace_core::repo::BlobStoreGet,
 {
@@ -1135,7 +1135,7 @@ where
     }
 }
 
-impl<'a, B> crate::constraint::CosineSimilarity for AttachedFlatIndex<'a, B>
+impl<'a, B> crate::constraint::CosineSimilarity<Embedding> for AttachedFlatIndex<'a, B>
 where
     B: triblespace_core::repo::BlobStoreGet,
 {

@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+
 use ed25519_dalek::SigningKey;
 
+use triblespace_core::and;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionStoreExt, TryFromCover,
@@ -7,6 +10,7 @@ use triblespace_core::collection::{
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
+use triblespace_core::query::ContainsConstraint;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 use triblespace_core::trible::{Fragment, Trible, TribleSet};
@@ -79,4 +83,34 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
             .collect::<Vec<Inline<Handle<Embedding>>>>(),
         vec![positive, diagonal],
     );
+
+    let direct_support: HashSet<_> = above.iter().map(|hit| hit.embedding).collect();
+    let engine_support: HashSet<_> = triblespace_core::find!(
+        neighbour: Inline<Handle<Embedding>>,
+        index
+            .similar_to(&snapshot, positive, neighbour, 0.7)
+            .unwrap()
+    )
+    .collect();
+    assert_eq!(engine_support, direct_support);
+
+    let allowed = HashSet::from([positive, negative]);
+    let composed: HashSet<_> = triblespace_core::find!(
+        neighbour: Inline<Handle<Embedding>>,
+        and!(
+            (&allowed).has(neighbour),
+            index
+                .similar_to(&snapshot, positive, neighbour, 0.7)
+                .unwrap(),
+        )
+    )
+    .collect();
+    assert_eq!(composed, HashSet::from([positive]));
+
+    let missing_probe = Inline::<Handle<Embedding>>::new([0xff; 32]);
+    let mut variables = triblespace_core::query::VariableContext::new();
+    let neighbour = variables.next_variable::<Handle<Embedding>>();
+    assert!(index
+        .similar_to(&snapshot, missing_probe, neighbour, 0.7)
+        .is_err());
 }
