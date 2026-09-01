@@ -14,8 +14,12 @@
 //! norm_f32[N] | error_f32[N] | N_u64 | D_u64`.
 //! Integers and floats are little-endian; handles are strictly ascending;
 //! negative FP4 zero is rejected. `norm_f32` is an upward-rounded norm of the
-//! summed reconstruction. `error_f32` is one final upward-rounded
-//! transform-and-two-stage-quantization L2 certificate.
+//! summed canonical `f64` reconstruction. `error_f32` is one upward-rounded
+//! row certificate which encloses both the transform-and-two-stage-
+//! quantization L2 error and the discrepancy between the canonical `f64`
+//! reconstruction and the encoding's prescribed explicit-`f32`
+//! reconstruction. The latter lets a binary32 scanner remain exact without a
+//! sidecar or another persisted plane.
 //!
 //! Approximation is confined to candidate discovery.  [`NvFp4CosineIndex`]
 //! uses conservative error bounds and fetches original embedding blobs for
@@ -30,6 +34,10 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
 use anybytes::{Bytes, View};
+use mary::nn::nvfp4_cosine::{
+    CandidateCertificate, PreparedQuery, QuantizedRow, ScanSegment, ScanStage, UpperScanner,
+    FLOAT_BYTES, QUANT_BLOCK, QUANT_STAGES, ROTATION_BLOCK,
+};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
@@ -49,24 +57,21 @@ use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace_core::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
 const HANDLE_LEN: usize = 32;
-const FLOAT_LEN: usize = 4;
+const FLOAT_LEN: usize = FLOAT_BYTES;
 const FOOTER_LEN: usize = 16;
-const QUANT_BLOCK: usize = 16;
-const ROTATION_BLOCK: usize = 256;
-const QUANT_STAGES: usize = 2;
-const FP4_MAX: f64 = 6.0;
-const FP8_MAX: f64 = 448.0;
 
 // Stable marker for this exact byte and cosine recipe. Minted with
-// `trible genid` on 2026-09-01. It is embedded in the derived encoding's
+// `trible genid` on 2026-09-01 after strengthening `error_f32` to cover the
+// prescribed explicit-f32 decode. It is embedded in the derived encoding's
 // identity together with E, so a recipe or exact embedding encoding change
 // necessarily produces another collection encoding.
-pub const NVFP4_COSINE_SET: Id = id_hex!("18F7786A9F916ADD0E06DF15FA818A2F");
+pub const NVFP4_COSINE_SET: Id = id_hex!("9F1A2851ADCA92BAB92688441B262DEA");
 
 // Stable identity for the SimpleArchive attribute-selection mapping. Minted
-// with `trible genid` on 2026-09-01. The selected attribute, exact blob
-// encoding, and dimension remain concrete mapping-instance parameters.
-pub const EMBEDDING_ATTRIBUTE_TO_NVFP4: Id = id_hex!("E8732C5918436416D071C0BAEF4F883F");
+// with `trible genid` on 2026-09-01 for the strengthened row certificate. The
+// selected attribute, exact blob encoding, and dimension remain concrete
+// mapping-instance parameters.
+pub const EMBEDDING_ATTRIBUTE_TO_NVFP4: Id = id_hex!("7B8668FD3857AD86B5AB24F5DD1BC1F9");
 
 attributes! {
     /// Logical embedding dimension selected by one concrete NVFP4 mapping.
@@ -100,6 +105,12 @@ impl fmt::Display for NvFp4Error {
 
 impl std::error::Error for NvFp4Error {}
 
+impl From<mary::nn::nvfp4_cosine::Error> for NvFp4Error {
+    fn from(source: mary::nn::nvfp4_cosine::Error) -> Self {
+        Self::new(source.to_string())
+    }
+}
+
 /// Canonical row-local NVFP4 carrier for exact embedding encoding `E`.
 pub struct NvFp4CosineSet<E: BlobEncoding>(PhantomData<E>);
 
@@ -110,7 +121,7 @@ impl MetaDescribe for NvFp4CosineRecipe {
         let id = NVFP4_COSINE_SET;
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "nvfp4-cosine-recipe",
-            metadata::description: "Canonical row-local two-stage residual NVFP4 cosine carrier. Rows are ordered by exact embedding handle and independently normalized, deterministically rotated, block-scaled, quantized twice, and conservatively error-bounded. Join is set union by handle; exact source embeddings remain lazy reranking dependencies.",
+            metadata::description: "Canonical row-local two-stage residual NVFP4 cosine carrier. Rows are ordered by exact embedding handle and independently normalized, deterministically rotated, block-scaled, quantized twice, and conservatively error-bounded for both canonical f64 and prescribed explicit-f32 reconstruction. Join is set union by handle; exact source embeddings remain lazy reranking dependencies.",
             metadata::tag: metadata::KIND_TAG,
         }
     }
@@ -129,7 +140,7 @@ where
         let id = description.root().expect("rooted NVFP4 encoding");
         description += entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "nvfp4-cosine-set",
-            metadata::description: "Typed canonical set of independently two-stage residual-NVFP4-quantized embedding rows. The exact embedding blob encoding participates in this encoding's intrinsic identity.",
+            metadata::description: "Typed canonical set of independently two-stage residual-NVFP4-quantized embedding rows with one shared row certificate for canonical f64 and prescribed explicit-f32 reconstruction. The exact embedding blob encoding participates in this encoding's intrinsic identity.",
         };
         description
     }
@@ -328,337 +339,46 @@ fn take_plane(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct QuantizedStage {
+struct StoredStage {
     global: [u8; FLOAT_LEN],
     block_scales: Vec<u8>,
     codes: Vec<u8>,
 }
 
-impl QuantizedStage {
-    fn quantize(values: &[f64]) -> Result<Self, NvFp4Error> {
-        debug_assert_eq!(values.len() % ROTATION_BLOCK, 0);
-        let maximum = values.iter().fold(
-            0.0f64,
-            |old, &value| {
-                if value.abs() > old {
-                    value.abs()
-                } else {
-                    old
-                }
-            },
-        );
-        if maximum == 0.0 {
-            return Ok(Self {
-                global: 0.0f32.to_le_bytes(),
-                block_scales: vec![0; values.len() / QUANT_BLOCK],
-                codes: vec![0; values.len() / 2],
-            });
-        }
-
-        let global = (maximum / (FP4_MAX * FP8_MAX)) as f32;
-        if !global.is_finite() || global <= 0.0 {
-            return Err(NvFp4Error::new(
-                "embedding produced an invalid NVFP4 global scale",
-            ));
-        }
-        let global64 = f64::from(global);
-        let mut block_scales = Vec::with_capacity(values.len() / QUANT_BLOCK);
-        let mut codes = Vec::with_capacity(values.len() / 2);
-
-        for block in values.chunks_exact(QUANT_BLOCK) {
-            let block_maximum =
-                block.iter().fold(
-                    0.0f64,
-                    |old, &value| {
-                        if value.abs() > old {
-                            value.abs()
-                        } else {
-                            old
-                        }
-                    },
-                );
-            let scale = if block_maximum == 0.0 {
-                0
-            } else {
-                encode_e4m3(block_maximum / (FP4_MAX * global64))
-            };
-            block_scales.push(scale);
-            let reconstructed_scale = global64 * decode_e4m3(scale);
-
-            for pair in block.chunks_exact(2) {
-                let low = if reconstructed_scale == 0.0 {
-                    0
-                } else {
-                    encode_e2m1(pair[0] / reconstructed_scale)
-                };
-                let high = if reconstructed_scale == 0.0 {
-                    0
-                } else {
-                    encode_e2m1(pair[1] / reconstructed_scale)
-                };
-                codes.push(low | (high << 4));
-            }
-        }
-
-        Ok(Self {
-            global: global.to_le_bytes(),
-            block_scales,
-            codes,
-        })
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct EncodedRow {
+struct StoredRow {
     handle: [u8; HANDLE_LEN],
-    stages: [QuantizedStage; QUANT_STAGES],
+    stages: [StoredStage; QUANT_STAGES],
     norm: [u8; FLOAT_LEN],
     error: [u8; FLOAT_LEN],
 }
 
-impl EncodedRow {
+impl StoredRow {
     fn quantize(
         handle: [u8; HANDLE_LEN],
         embedding: &[f32],
         dimension: usize,
     ) -> Result<Self, NvFp4Error> {
-        let normalized = normalized_embedding(embedding, dimension)?;
-        let transformed = rotate_normalized(&normalized)?;
-        let primary = QuantizedStage::quantize(&transformed)?;
-        let primary_decoded = decode_stage(&primary);
-        let residual: Vec<_> = transformed
-            .iter()
-            .zip(&primary_decoded)
-            .map(|(&exact, &approximate)| exact - approximate)
-            .collect();
-        let correction = QuantizedStage::quantize(&residual)?;
-        let correction_decoded = decode_stage(&correction);
-        let reconstruction: Vec<_> = primary_decoded
-            .iter()
-            .zip(&correction_decoded)
-            .map(|(&primary, &correction)| primary + correction)
-            .collect();
-        let quantization_residual = outward_l2(&transformed, &reconstruction)?;
-        // `scaled_hadamard` has eight rounded butterfly stages. Its final
-        // multiplication by 1/16 is an exact power-of-two scaling for the
-        // finite normal values emitted by this encoding. Componentwise gamma₈
-        // error and ||x||₁ <= 16||x||₂ therefore give this conservative
-        // forward-transform allowance. Adding it to the measured rotated-space
-        // quantization residual lets queries center their certificate on the
-        // streamed decoded dot without assuming that the computed FWHT is
-        // exactly orthogonal.
-        let transform_allowance = transform_allowance(&normalized)?;
-        let error = upward_f32(add_up_nonnegative(
-            quantization_residual,
-            transform_allowance,
-        ))?;
-        let norm = upward_f32(outward_norm(&reconstruction)?)?;
+        let quantized = QuantizedRow::quantize(embedding, dimension)?;
         Ok(Self {
             handle,
-            stages: [primary, correction],
-            norm: norm.to_le_bytes(),
-            error: error.to_le_bytes(),
+            stages: std::array::from_fn(|stage| {
+                let stage = &quantized.stages()[stage];
+                StoredStage {
+                    global: *stage.global_scale_bytes(),
+                    block_scales: stage.block_scales().to_vec(),
+                    codes: stage.codes().to_vec(),
+                }
+            }),
+            norm: *quantized.reconstruction_norm_bytes(),
+            error: *quantized.error_bound_bytes(),
         })
     }
 }
 
-fn normalized_embedding(embedding: &[f32], dimension: usize) -> Result<Vec<f64>, NvFp4Error> {
-    if embedding.len() != dimension {
-        return Err(NvFp4Error::new(format!(
-            "embedding has dimension {}, expected {dimension}",
-            embedding.len(),
-        )));
-    }
-    let mut norm_squared = 0.0f64;
-    for &value in embedding {
-        if !value.is_finite() {
-            return Err(NvFp4Error::new("embedding coordinates must all be finite"));
-        }
-        let value = f64::from(value);
-        norm_squared += value * value;
-    }
-    let norm = norm_squared.sqrt();
-    if norm == 0.0 {
-        return Ok(vec![0.0; dimension]);
-    }
-    Ok(embedding
-        .iter()
-        .map(|&value| f64::from(value) / norm)
-        .collect())
-}
-
-fn rotate_normalized(normalized: &[f64]) -> Result<Vec<f64>, NvFp4Error> {
-    let physical_dimension = normalized
-        .len()
-        .checked_add(ROTATION_BLOCK - 1)
-        .map(|value| value / ROTATION_BLOCK * ROTATION_BLOCK)
-        .ok_or_else(|| NvFp4Error::new("embedding padded dimension overflows usize"))?;
-    let mut transformed = vec![0.0; physical_dimension];
-    for (index, (&source, target)) in normalized.iter().zip(&mut transformed).enumerate() {
-        *target = source * rotation_sign(index);
-    }
-    for block in transformed.chunks_exact_mut(ROTATION_BLOCK) {
-        scaled_hadamard(block);
-    }
-    Ok(transformed)
-}
-
-fn scaled_hadamard(block: &mut [f64]) {
-    debug_assert_eq!(block.len(), ROTATION_BLOCK);
-    let mut width = 1;
-    while width < ROTATION_BLOCK {
-        for start in (0..ROTATION_BLOCK).step_by(width * 2) {
-            for offset in 0..width {
-                let low = block[start + offset];
-                let high = block[start + width + offset];
-                block[start + offset] = low + high;
-                block[start + width + offset] = low - high;
-            }
-        }
-        width *= 2;
-    }
-    for value in block {
-        *value *= 1.0 / 16.0;
-    }
-}
-
-fn rotation_sign(index: usize) -> f64 {
-    if splitmix64(index as u64 ^ 0x6B3F_7B4C_DA9E_0673) & 1 == 0 {
-        1.0
-    } else {
-        -1.0
-    }
-}
-
-fn transform_allowance(normalized: &[f64]) -> Result<f64, NvFp4Error> {
-    Ok(multiply_up_nonnegative(
-        multiply_up_nonnegative(16.0, roundoff_gamma(8)),
-        outward_norm(normalized)?,
-    ))
-}
-
-fn outward_l2(left: &[f64], right: &[f64]) -> Result<f64, NvFp4Error> {
-    if left.len() != right.len() {
-        return Err(NvFp4Error::new("L2 dimensions differ"));
-    }
-    let mut squared = 0.0f64;
-    for (&left, &right) in left.iter().zip(right) {
-        let raw_difference = (left - right).abs();
-        if raw_difference == 0.0 {
-            continue;
-        }
-        let difference = next_up_f64(raw_difference);
-        let term = next_up_f64(difference * difference);
-        squared = next_up_f64(squared + term);
-    }
-    Ok(next_up_f64(squared.sqrt()))
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
-fn encode_e4m3(value: f64) -> u8 {
-    let value = value.clamp(0.0, FP8_MAX);
-    let mut best = 0;
-    let mut best_distance = f64::INFINITY;
-    for raw in 0..=0x7e {
-        let candidate = decode_e4m3(raw);
-        let distance = (candidate - value).abs();
-        if distance < best_distance
-            || (distance == best_distance
-                && ((raw & 1 == 0 && best & 1 != 0) || (raw & 1 == best & 1 && raw < best)))
-        {
-            best = raw;
-            best_distance = distance;
-        }
-    }
-    best
-}
-
-fn decode_e4m3(raw: u8) -> f64 {
-    let exponent = (raw >> 3) & 0x0f;
-    let mantissa = raw & 0x07;
-    let (significand, power) = if exponent == 0 {
-        (mantissa, -9)
-    } else {
-        (8 + mantissa, i32::from(exponent) - 10)
-    };
-    // Every finite nonnegative E4M3 value is a small integer times an exact
-    // binary power. Constructing that power directly avoids a runtime `powi`
-    // call in every scanned block while producing the identical f64 bits.
-    let scale = f64::from_bits(((power + 1023) as u64) << (f64::MANTISSA_DIGITS - 1));
-    f64::from(significand) * scale
-}
-
-fn encode_e2m1(value: f64) -> u8 {
-    const POSITIVE: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let negative = value.is_sign_negative();
-    let magnitude = value.abs().min(FP4_MAX);
-    let mut best = 0usize;
-    let mut best_distance = f64::INFINITY;
-    for (raw, candidate) in POSITIVE.into_iter().enumerate() {
-        let distance = (candidate - magnitude).abs();
-        if distance < best_distance
-            || (distance == best_distance
-                && ((raw & 1 == 0 && best & 1 != 0) || (raw & 1 == best & 1 && raw < best)))
-        {
-            best = raw;
-            best_distance = distance;
-        }
-    }
-    if best == 0 {
-        0
-    } else if negative {
-        best as u8 | 0x08
-    } else {
-        best as u8
-    }
-}
-
-const fn decode_e2m1(raw: u8) -> f64 {
-    const POSITIVE: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let magnitude = POSITIVE[(raw & 0x07) as usize];
-    if raw & 0x08 == 0 {
-        magnitude
-    } else {
-        -magnitude
-    }
-}
-
-const fn decoded_e2m1_pairs() -> [[f64; 2]; 256] {
-    let mut pairs = [[0.0; 2]; 256];
-    let mut raw = 0usize;
-    while raw < pairs.len() {
-        let packed = raw as u8;
-        pairs[raw] = [decode_e2m1(packed & 0x0f), decode_e2m1(packed >> 4)];
-        raw += 1;
-    }
-    pairs
-}
-
-const DECODED_E2M1_PAIRS: [[f64; 2]; 256] = decoded_e2m1_pairs();
-
-fn upward_f32(value: f64) -> Result<f32, NvFp4Error> {
-    let mut rounded = value as f32;
-    if !rounded.is_finite() {
-        return Err(NvFp4Error::new("NVFP4 error bound exceeds f32"));
-    }
-    if f64::from(rounded) < value {
-        rounded = f32::from_bits(rounded.to_bits() + 1);
-    }
-    if !rounded.is_finite() {
-        return Err(NvFp4Error::new("NVFP4 error bound exceeds f32"));
-    }
-    Ok(rounded)
-}
-
 fn encode_rows<E: BlobEncoding>(
     dimension: usize,
-    mut rows: Vec<EncodedRow>,
+    mut rows: Vec<StoredRow>,
 ) -> Result<Blob<NvFp4CosineSet<E>>, NvFp4Error> {
     if dimension == 0 {
         return Err(NvFp4Error::new("NVFP4 dimension must be positive"));
@@ -670,7 +390,7 @@ fn encode_rows<E: BlobEncoding>(
         .ok_or_else(|| NvFp4Error::new("NVFP4 padded dimension overflows usize"))?;
     let blocks_per_row = physical_dimension / QUANT_BLOCK;
     let codes_per_row = physical_dimension / 2;
-    let mut distinct: Vec<EncodedRow> = Vec::with_capacity(rows.len());
+    let mut distinct: Vec<StoredRow> = Vec::with_capacity(rows.len());
     for row in rows {
         if row.stages.iter().any(|stage| {
             stage.block_scales.len() != blocks_per_row || stage.codes.len() != codes_per_row
@@ -744,13 +464,13 @@ fn encode_rows<E: BlobEncoding>(
     Ok(blob)
 }
 
-fn owned_row(bytes: &[u8], layout: &Layout, row: usize) -> EncodedRow {
-    EncodedRow {
+fn owned_row(bytes: &[u8], layout: &Layout, row: usize) -> StoredRow {
+    StoredRow {
         handle: layout
             .handle(bytes, row)
             .try_into()
             .expect("32-byte handle"),
-        stages: std::array::from_fn(|stage| QuantizedStage {
+        stages: std::array::from_fn(|stage| StoredStage {
             global: bytes[layout.stages[stage].globals.start + row * FLOAT_LEN..][..FLOAT_LEN]
                 .try_into()
                 .expect("four-byte global scale"),
@@ -856,122 +576,6 @@ struct Member {
     layout: Layout,
 }
 
-/// Canonically prepared query coordinates for an NVFP4 candidate scan.
-///
-/// The coordinates are normalized, rotated, padded to the physical NVFP4
-/// dimension, and retained as `f64`. A scanner computes raw dot products over
-/// these coordinates; [`NvFp4CosineIndex`] alone turns those dots into
-/// certified candidates and exact results.
-#[derive(Clone, Copy, Debug)]
-pub struct NvFp4ScanQuery<'a> {
-    coordinates: &'a [f64],
-}
-
-impl<'a> NvFp4ScanQuery<'a> {
-    /// Normalized, rotated, physically padded query coordinates.
-    pub fn coordinates(self) -> &'a [f64] {
-        self.coordinates
-    }
-}
-
-/// One quantization stage in a validated canonical NVFP4 segment.
-#[derive(Clone, Copy, Debug)]
-pub struct NvFp4ScanStage<'a> {
-    globals: &'a [u8],
-    block_scales: &'a [u8],
-    codes: &'a [u8],
-}
-
-impl<'a> NvFp4ScanStage<'a> {
-    /// Little-endian `f32` row-global scales, four bytes per row.
-    pub fn global_scale_bytes(self) -> &'a [u8] {
-        self.globals
-    }
-
-    /// Row-major canonical nonnegative E4M3 block-scale bytes.
-    pub fn block_scales(self) -> &'a [u8] {
-        self.block_scales
-    }
-
-    /// Row-major packed E2M1 pairs, low coordinate in the low nibble.
-    pub fn codes(self) -> &'a [u8] {
-        self.codes
-    }
-}
-
-/// Read-only physical planes of one validated canonical NVFP4 segment.
-///
-/// This is the storage/accelerator seam: it exposes the existing byte grammar
-/// without putting an accelerator type into [`NvFp4CosineSet`]. The segment's
-/// own content identity is exposed so resident state can reject a mismatched
-/// sequence cheaply; row handles, persisted certificates, deduplication, and
-/// exact source blobs deliberately remain private to the search implementation.
-#[derive(Clone, Copy, Debug)]
-pub struct NvFp4ScanSegment<'a> {
-    content_handle: [u8; HANDLE_LEN],
-    rows: usize,
-    dimension: usize,
-    blocks_per_row: usize,
-    codes_per_row: usize,
-    stages: [NvFp4ScanStage<'a>; QUANT_STAGES],
-}
-
-impl<'a> NvFp4ScanSegment<'a> {
-    /// Content identity of the exact canonical segment bytes.
-    pub fn content_handle(self) -> [u8; HANDLE_LEN] {
-        self.content_handle
-    }
-
-    /// Physical rows in this segment.
-    pub fn rows(self) -> usize {
-        self.rows
-    }
-
-    /// Logical, unpadded embedding dimension.
-    pub fn dimension(self) -> usize {
-        self.dimension
-    }
-
-    /// E4M3 scale bytes stored for each row and stage.
-    pub fn blocks_per_row(self) -> usize {
-        self.blocks_per_row
-    }
-
-    /// Packed E2M1 bytes stored for each row and stage.
-    pub fn codes_per_row(self) -> usize {
-        self.codes_per_row
-    }
-
-    /// Primary and residual-correction stages, in canonical order.
-    pub fn stages(self) -> [NvFp4ScanStage<'a>; 2] {
-        self.stages
-    }
-}
-
-/// Backend for the compact, approximate part of an exact NVFP4 search.
-///
-/// `scan` writes one raw `f64` dot product for every physical row, in
-/// segment-major then row-major order. Every decoded coordinate must match the
-/// canonical `f64` operation sequence and value: global-scale multiplication,
-/// E2M1 multiplication, then the primary-plus-correction addition. Only the
-/// subsequent query products and their accumulation/reduction order may differ;
-/// the search-owned dimension-wide gamma bound encloses those roundings.
-///
-/// This trait does not expose thresholds, candidate envelopes, handles, or
-/// reranking. Those semantics stay singular inside [`NvFp4CosineIndex`].
-pub trait NvFp4DotScanner {
-    /// Device or execution failure.
-    type Error: fmt::Display;
-
-    /// Fill `dots` for all physical rows in `segments`.
-    fn scan(
-        &self,
-        query: NvFp4ScanQuery<'_>,
-        segments: &[NvFp4ScanSegment<'_>],
-        dots: &mut [f64],
-    ) -> Result<(), Self::Error>;
-}
-
 /// Lazy cover-aware query view over canonical NVFP4 members.
 pub struct NvFp4CosineIndex<E: BlobEncoding> {
     members: Vec<Member>,
@@ -1019,7 +623,7 @@ impl MetaDescribe for EmbeddingAttributeToNvFp4Recipe {
         let id = EMBEDDING_ATTRIBUTE_TO_NVFP4;
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "embedding-attribute-to-nvfp4",
-            metadata::description: "Canonical join-preserving projection from one selected Handle<E>-valued SimpleArchive attribute to NvFp4CosineSet<E>. Each distinct exact handle contributes one independently normalized, fixed-sign block-Hadamard-rotated, two-stage residual-NVFP4 row with an upward-rounded reconstruction norm and final L2 certificate.",
+            metadata::description: "Canonical join-preserving projection from one selected Handle<E>-valued SimpleArchive attribute to NvFp4CosineSet<E>. Each distinct exact handle contributes one independently normalized, fixed-sign block-Hadamard-rotated, two-stage residual-NVFP4 row with an upward-rounded reconstruction norm and one L2 certificate covering both exact-source reconstruction and prescribed explicit-f32 decode.",
             metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -1180,7 +784,7 @@ where
                 ))
             })?;
             rows.push(
-                EncodedRow::quantize(raw, embedding.as_ref(), self.dimension.get())
+                StoredRow::quantize(raw, embedding.as_ref(), self.dimension.get())
                     .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?,
             );
         }
@@ -1255,116 +859,37 @@ struct Candidate {
     upper: f64,
 }
 
-struct CandidateCertificate<'a> {
-    query: &'a PreparedQuery,
-    compact_gamma: f64,
-    division_gamma: f64,
-    exact_gamma: f64,
-    exact_query_norm_bound: f64,
-}
-
-impl<'a> CandidateCertificate<'a> {
-    fn new(query: &'a PreparedQuery, exact_dimension: usize) -> Self {
-        Self {
-            query,
-            compact_gamma: dot_gamma(query.approximate.len()),
-            division_gamma: roundoff_gamma(1),
-            exact_gamma: dot_gamma(exact_dimension),
-            exact_query_norm_bound: add_up_nonnegative(query.approximate_norm, query.error),
-        }
-    }
-
-    fn certify(
-        &self,
-        handle: [u8; HANDLE_LEN],
-        member: &Member,
-        row: usize,
-        raw_dot: f64,
-    ) -> Result<Candidate, NvFp4Error> {
-        if !raw_dot.is_finite() {
-            return Err(NvFp4Error::new("NVFP4 raw candidate dot is not finite"));
-        }
-        let bytes = member.bytes.as_ref();
-        let reconstruction_norm = f64::from(member.layout.norm(bytes, row));
-        let raw_row_error = f64::from(member.layout.error(bytes, row));
-        // Let y be the canonical f64 sum of both decoded stages and n the
-        // stored upward norm. The scan centers its cosine certificate on
-        // c = y/n. Since ||y|| <= n,
-        //   ||y - y/n|| = ||y|| |n - 1| / n <= |n - 1|.
-        // Add that normalization displacement to the persisted ||x-y||
-        // certificate, rounding the final sum outward.
-        let normalization_displacement = if reconstruction_norm == 0.0 {
-            0.0
-        } else {
-            absolute_difference_up(reconstruction_norm, 1.0)
-        };
-        let row_error = add_up_nonnegative(raw_row_error, normalization_displacement);
-        let approximate = if reconstruction_norm == 0.0 {
-            0.0
-        } else {
-            raw_dot / reconstruction_norm
-        };
-        if !approximate.is_finite() {
-            return Err(NvFp4Error::new("NVFP4 approximate cosine is not finite"));
-        }
-        // Cauchy gives sum |q_i y_i| <= ||q|| ||y||. Dividing the
-        // fixed-order dot by n >= ||y|| cancels the stored row norm, so
-        // the dot-product allowance is gamma * ||q||. The division itself
-        // contributes one separately certified rounding.
-        let accumulation_error =
-            multiply_up_nonnegative(self.compact_gamma, self.query.approximate_norm);
-        let division_error = multiply_up_nonnegative(self.division_gamma, approximate.abs());
-        let exact_row_norm_bound = add_up_nonnegative(1.0, row_error);
-        // Exact reranking uses the same fixed-order normalized-coordinate dot.
-        // Its possible upward accumulation error must be included too when
-        // comparing that returned f64 score against this envelope.
-        let exact_accumulation_error = multiply_up_nonnegative(
-            multiply_up_nonnegative(self.exact_gamma, self.exact_query_norm_bound),
-            exact_row_norm_bound,
-        );
-        let envelope = [
-            multiply_up_nonnegative(self.query.error, exact_row_norm_bound),
-            multiply_up_nonnegative(self.query.approximate_norm, row_error),
-            accumulation_error,
-            division_error,
-            exact_accumulation_error,
-        ]
-        .into_iter()
-        .fold(0.0, add_up_nonnegative);
-        Ok(Candidate {
-            handle,
-            upper: certified_cosine_upper(approximate, envelope),
-        })
-    }
-}
-
 impl<E: BlobEncoding> NvFp4CosineIndex<E> {
     /// Validated physical segments retained by this lazy cover view.
     ///
     /// Accelerators may copy these planes into a resident representation. The
-    /// returned views expose each segment's own content identity, but never
-    /// the row handles or certificate planes.
-    pub fn scan_segments(&self) -> Vec<NvFp4ScanSegment<'_>> {
+    /// returned views expose each segment's own content identity and the two
+    /// scalar planes needed to complete a compact upper bound, but never row
+    /// handles or exact-source dependencies.
+    pub fn scan_segments(&self) -> Vec<ScanSegment<'_>> {
         self.members
             .iter()
             .map(|member| {
                 let bytes = member.bytes.as_ref();
                 let stages = std::array::from_fn(|stage| {
                     let layout = &member.layout.stages[stage];
-                    NvFp4ScanStage {
-                        globals: &bytes[layout.globals.clone()],
-                        block_scales: &bytes[layout.block_scales.clone()],
-                        codes: &bytes[layout.codes.clone()],
-                    }
+                    ScanStage::new(
+                        &bytes[layout.globals.clone()],
+                        &bytes[layout.block_scales.clone()],
+                        &bytes[layout.codes.clone()],
+                    )
                 });
-                NvFp4ScanSegment {
-                    content_handle: member.content_handle,
-                    rows: member.layout.rows,
-                    dimension: member.layout.dimension,
-                    blocks_per_row: member.layout.blocks_per_row,
-                    codes_per_row: member.layout.codes_per_row,
+                ScanSegment::new(
+                    member.content_handle,
+                    member.layout.rows,
+                    member.layout.dimension,
+                    member.layout.blocks_per_row,
+                    member.layout.codes_per_row,
                     stages,
-                }
+                    &bytes[member.layout.norms.clone()],
+                    &bytes[member.layout.errors.clone()],
+                )
+                .expect("validated canonical NVFP4 member has valid scan planes")
             })
             .collect()
     }
@@ -1391,29 +916,7 @@ where
     /// Candidate discovery scans the compact rows once. Original embeddings
     /// are fetched in descending certified-upper-bound order until the stored
     /// envelopes prove that no unseen row can enter the exact result.
-    pub fn top_k<R>(
-        &self,
-        snapshot: &R,
-        query: &[f32],
-        k: usize,
-    ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
-    where
-        R: BlobStoreGet,
-    {
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let prepared = PreparedQuery::new(query, self.dimension)?;
-        let candidates = self.candidates(&prepared)?;
-        self.top_k_candidates(snapshot, &prepared, k, candidates)
-    }
-
-    /// Exact top `k` cosine neighbours using `scanner` for compact row dots.
-    ///
-    /// The scanner replaces only the physical candidate dot pass. This method
-    /// retains cover deduplication, conservative certificates, geometric exact
-    /// reranking, blob fetches, and result ordering inside the search crate.
-    pub fn top_k_with_scanner<R, S>(
+    pub fn top_k<R, S>(
         &self,
         snapshot: &R,
         query: &[f32],
@@ -1422,13 +925,13 @@ where
     ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
     where
         R: BlobStoreGet,
-        S: NvFp4DotScanner,
+        S: UpperScanner,
     {
         if k == 0 {
             return Ok(Vec::new());
         }
         let prepared = PreparedQuery::new(query, self.dimension)?;
-        let candidates = self.candidates_with_scanner(&prepared, scanner)?;
+        let candidates = self.candidates(&prepared, scanner)?;
         self.top_k_candidates(snapshot, &prepared, k, candidates)
     }
 
@@ -1459,7 +962,7 @@ where
         while checked < candidates.len() {
             let end = target.min(candidates.len());
             for candidate in &candidates[checked..end] {
-                ranked.push(self.exact_hit(snapshot, &prepared.exact, candidate.handle)?);
+                ranked.push(self.exact_hit(snapshot, prepared, candidate.handle)?);
             }
             sort_hits(&mut ranked);
             ranked.truncate(wanted);
@@ -1482,14 +985,16 @@ where
     ///
     /// Only rows whose conservative upper bound can cross the threshold cause
     /// an exact blob fetch. Returned rows are ranked identically to `top_k`.
-    pub fn above<R>(
+    pub fn above<R, S>(
         &self,
         snapshot: &R,
         query: &[f32],
         floor: f64,
+        scanner: &S,
     ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
     where
         R: BlobStoreGet,
+        S: UpperScanner,
     {
         if floor.is_nan() {
             return Err(NvFp4Error::new("cosine floor must not be NaN"));
@@ -1498,7 +1003,7 @@ where
             return Ok(Vec::new());
         }
         let prepared = PreparedQuery::new(query, self.dimension)?;
-        let candidates = self.candidates(&prepared)?;
+        let candidates = self.candidates(&prepared, scanner)?;
         self.above_candidates(snapshot, &prepared, floor, candidates)
     }
 
@@ -1510,15 +1015,17 @@ where
     /// mathematical neighbourhood. Candidate discovery and exact membership
     /// are delegated to [`Self::above`], so the resulting constraint contains
     /// every and only indexed handle whose exact cosine clears `floor`.
-    pub fn similar_to<R>(
+    pub fn similar_to<R, S>(
         &self,
         snapshot: &R,
         probe: Inline<Handle<E>>,
         variable: Variable<Handle<E>>,
         floor: f64,
+        scanner: &S,
     ) -> Result<crate::constraint::SimilarTo<E>, NvFp4Error>
     where
         R: BlobStoreGet,
+        S: UpperScanner,
     {
         let blob: Blob<E> = snapshot.get(probe).map_err(|source| {
             NvFp4Error::new(format!(
@@ -1533,37 +1040,13 @@ where
             ))
         })?;
         let candidates = self
-            .above(snapshot, query.as_ref(), floor)?
+            .above(snapshot, query.as_ref(), floor, scanner)?
             .into_iter()
             .map(|hit| hit.embedding.raw)
             .collect();
         Ok(crate::constraint::SimilarTo::from_candidates(
             variable, candidates,
         ))
-    }
-
-    /// Every exact cosine hit at or above `floor`, using `scanner` for compact
-    /// row dots and retaining all pruning semantics in this crate.
-    pub fn above_with_scanner<R, S>(
-        &self,
-        snapshot: &R,
-        query: &[f32],
-        floor: f64,
-        scanner: &S,
-    ) -> Result<Vec<SimilarityHit<E>>, NvFp4Error>
-    where
-        R: BlobStoreGet,
-        S: NvFp4DotScanner,
-    {
-        if floor.is_nan() {
-            return Err(NvFp4Error::new("cosine floor must not be NaN"));
-        }
-        if floor > 1.0 {
-            return Ok(Vec::new());
-        }
-        let prepared = PreparedQuery::new(query, self.dimension)?;
-        let candidates = self.candidates_with_scanner(&prepared, scanner)?;
-        self.above_candidates(snapshot, &prepared, floor, candidates)
     }
 
     fn above_candidates<R>(
@@ -1581,7 +1064,7 @@ where
             if candidate.upper < floor {
                 continue;
             }
-            let hit = self.exact_hit(snapshot, &prepared.exact, candidate.handle)?;
+            let hit = self.exact_hit(snapshot, prepared, candidate.handle)?;
             if hit.score >= floor {
                 exact.push(hit);
             }
@@ -1590,24 +1073,13 @@ where
         Ok(exact)
     }
 
-    fn candidates(&self, query: &PreparedQuery) -> Result<Vec<Candidate>, NvFp4Error> {
-        let mut candidates = Vec::new();
-        let certificate = CandidateCertificate::new(query, self.dimension);
-        self.for_each_unique_row(|handle, _member_index, member, row| {
-            let raw_dot = Self::cpu_raw_dot(member, row, &query.approximate);
-            candidates.push(certificate.certify(handle, member, row, raw_dot)?);
-            Ok(())
-        })?;
-        Ok(candidates)
-    }
-
-    fn candidates_with_scanner<S>(
+    fn candidates<S>(
         &self,
         query: &PreparedQuery,
         scanner: &S,
     ) -> Result<Vec<Candidate>, NvFp4Error>
     where
-        S: NvFp4DotScanner,
+        S: UpperScanner,
     {
         let segments = self.scan_segments();
         let mut offsets = Vec::with_capacity(segments.len());
@@ -1618,70 +1090,31 @@ where
                 .checked_add(segment.rows())
                 .ok_or_else(|| NvFp4Error::new("NVFP4 physical row count overflows usize"))?;
         }
-        let mut dots = vec![0.0; physical_rows];
+        let mut upper_raw_dots = vec![0.0; physical_rows];
         scanner
-            .scan(
-                NvFp4ScanQuery {
-                    coordinates: &query.approximate,
-                },
-                &segments,
-                &mut dots,
-            )
-            .map_err(|source| NvFp4Error::new(format!("NVFP4 dot scan failed: {source}")))?;
+            .scan_upper(query.scan_query(), &segments, &mut upper_raw_dots)
+            .map_err(|source| NvFp4Error::new(format!("NVFP4 upper scan failed: {source}")))?;
 
-        let certificate = CandidateCertificate::new(query, self.dimension);
+        let certificate = CandidateCertificate::new(query);
         let mut candidates = Vec::new();
-        self.for_each_unique_row(|handle, member_index, member, row| {
+        self.for_each_unique_row(|handle, member_index, _member, row| {
             let dot_index = offsets[member_index]
                 .checked_add(row)
                 .expect("validated physical row offset");
-            candidates.push(certificate.certify(handle, member, row, dots[dot_index])?);
+            let upper = certificate.certify_upper(
+                segments[member_index].row_certificate(row)?,
+                upper_raw_dots[dot_index],
+            )?;
+            candidates.push(Candidate { handle, upper });
             Ok(())
         })?;
         Ok(candidates)
     }
 
-    fn cpu_raw_dot(member: &Member, row: usize, query: &[f64]) -> f64 {
-        let bytes = member.bytes.as_ref();
-        let globals: [f64; QUANT_STAGES] =
-            std::array::from_fn(|stage| f64::from(member.layout.global(bytes, row, stage)));
-        let scales: [&[u8]; QUANT_STAGES] =
-            std::array::from_fn(|stage| member.layout.block_scales(bytes, row, stage));
-        let codes: [&[u8]; QUANT_STAGES] =
-            std::array::from_fn(|stage| member.layout.codes(bytes, row, stage));
-        let mut raw_dot_lanes = [0.0f64; QUANT_BLOCK / 2];
-        let mut coordinate = 0;
-        for block in 0..member.layout.blocks_per_row {
-            let decoded_scales: [f64; QUANT_STAGES] =
-                std::array::from_fn(|stage| globals[stage] * decode_e4m3(scales[stage][block]));
-            let code_start = block * (QUANT_BLOCK / 2);
-            for (lane, code) in (code_start..code_start + QUANT_BLOCK / 2).enumerate() {
-                let primary = DECODED_E2M1_PAIRS[usize::from(codes[0][code])];
-                let correction = DECODED_E2M1_PAIRS[usize::from(codes[1][code])];
-                // These sums are the canonical reconstructed coordinates and
-                // exactly match construction-time decoding.
-                let low = primary[0] * decoded_scales[0] + correction[0] * decoded_scales[1];
-                let high = primary[1] * decoded_scales[0] + correction[1] * decoded_scales[1];
-                raw_dot_lanes[lane] += query[coordinate] * low;
-                raw_dot_lanes[lane] += query[coordinate + 1] * high;
-                coordinate += 2;
-            }
-        }
-        debug_assert_eq!(coordinate, query.len());
-        // Eight fixed lanes break the long scalar dependency chain. Each
-        // product crosses a shallower reduction than the sequential
-        // 2D-rounding model, so `dot_gamma` remains conservative.
-        let mut raw_dot = raw_dot_lanes[0];
-        for lane in &raw_dot_lanes[1..] {
-            raw_dot += *lane;
-        }
-        raw_dot
-    }
-
     fn exact_hit<R>(
         &self,
         snapshot: &R,
-        normalized_query: &[f64],
+        query: &PreparedQuery,
         raw: [u8; HANDLE_LEN],
     ) -> Result<SimilarityHit<E>, NvFp4Error>
     where
@@ -1708,7 +1141,7 @@ where
                 self.dimension,
             )));
         }
-        let score = exact_cosine_with_normalized_left(normalized_query, candidate.as_ref())?;
+        let score = query.exact_cosine(candidate.as_ref())?;
         Ok(SimilarityHit { embedding, score })
     }
 
@@ -1771,125 +1204,6 @@ where
     }
 }
 
-struct PreparedQuery {
-    exact: Vec<f64>,
-    approximate: Vec<f64>,
-    approximate_norm: f64,
-    error: f64,
-}
-
-impl PreparedQuery {
-    fn new(query: &[f32], dimension: usize) -> Result<Self, NvFp4Error> {
-        let exact = normalized_embedding(query, dimension)?;
-        // The CPU path already scans reconstructed rows as f64, so quantizing
-        // the query would add error without saving work. Keep the computed
-        // rotated query exact and certify only its eight FWHT butterfly stages.
-        let approximate = rotate_normalized(&exact)?;
-        let approximate_norm = outward_norm(&approximate)?;
-        let error = transform_allowance(&exact)?;
-        Ok(Self {
-            exact,
-            approximate,
-            approximate_norm,
-            error,
-        })
-    }
-}
-
-fn outward_norm(values: &[f64]) -> Result<f64, NvFp4Error> {
-    let mut squared = 0.0f64;
-    for &value in values {
-        if value == 0.0 {
-            continue;
-        }
-        let magnitude = next_up_f64(value.abs());
-        let term = next_up_f64(magnitude * magnitude);
-        squared = next_up_f64(squared + term);
-    }
-    outward_sqrt(squared)
-}
-
-fn outward_sqrt(squared: f64) -> Result<f64, NvFp4Error> {
-    if squared == 0.0 {
-        return Ok(0.0);
-    }
-    let norm = next_up_f64(squared.sqrt());
-    if norm.is_finite() {
-        Ok(norm)
-    } else {
-        Err(NvFp4Error::new("NVFP4 reconstructed norm is not finite"))
-    }
-}
-
-fn decode_stage(stage: &QuantizedStage) -> Vec<f64> {
-    let global = f64::from(read_f32(&stage.global));
-    let mut decoded = Vec::with_capacity(stage.codes.len() * 2);
-    for (&scale, codes) in stage
-        .block_scales
-        .iter()
-        .zip(stage.codes.chunks_exact(QUANT_BLOCK / 2))
-    {
-        let scale = global * decode_e4m3(scale);
-        for &pair in codes {
-            decoded.push(decode_e2m1(pair & 0x0f) * scale);
-            decoded.push(decode_e2m1(pair >> 4) * scale);
-        }
-    }
-    decoded
-}
-
-#[cfg(test)]
-fn decode_encoded_row(row: &EncodedRow) -> Vec<f64> {
-    let primary = decode_stage(&row.stages[0]);
-    let correction = decode_stage(&row.stages[1]);
-    primary
-        .into_iter()
-        .zip(correction)
-        // This fixed-order f64 sum defines the canonical reconstruction. The
-        // candidate scan reproduces the same sum, so its rounding is already
-        // enclosed by the stored reconstruction residual rather than being a
-        // new per-query uncertainty.
-        .map(|(primary, correction)| primary + correction)
-        .collect()
-}
-
-#[cfg(test)]
-fn exact_cosine(left: &[f32], right: &[f32]) -> Result<f64, NvFp4Error> {
-    if left.len() != right.len() {
-        return Err(NvFp4Error::new(format!(
-            "cosine dimensions differ: {} and {}",
-            left.len(),
-            right.len(),
-        )));
-    }
-    let left = normalized_embedding(left, left.len())?;
-    exact_cosine_with_normalized_left(&left, right)
-}
-
-fn exact_cosine_with_normalized_left(left: &[f64], right: &[f32]) -> Result<f64, NvFp4Error> {
-    if left.len() != right.len() {
-        return Err(NvFp4Error::new(format!(
-            "cosine dimensions differ: {} and {}",
-            left.len(),
-            right.len(),
-        )));
-    }
-    let right = normalized_embedding(right, right.len())?;
-    let mut dot = 0.0f64;
-    for (&left, &right) in left.iter().zip(&right) {
-        dot += left * right;
-    }
-    Ok(clamp_cosine(dot))
-}
-
-fn clamp_cosine(value: f64) -> f64 {
-    value.clamp(-1.0, 1.0)
-}
-
-fn certified_cosine_upper(center: f64, envelope: f64) -> f64 {
-    clamp_cosine(next_up_f64(center + envelope))
-}
-
 fn sort_hits<E: BlobEncoding>(hits: &mut [SimilarityHit<E>]) {
     hits.sort_unstable_by(|left, right| {
         right
@@ -1897,82 +1211,6 @@ fn sort_hits<E: BlobEncoding>(hits: &mut [SimilarityHit<E>]) {
             .total_cmp(&left.score)
             .then_with(|| left.embedding.raw.cmp(&right.embedding.raw))
     });
-}
-
-fn next_up_f64(value: f64) -> f64 {
-    if value.is_nan() || value == f64::INFINITY {
-        value
-    } else if value == -0.0 {
-        f64::from_bits(1)
-    } else if value >= 0.0 {
-        f64::from_bits(value.to_bits() + 1)
-    } else {
-        f64::from_bits(value.to_bits() - 1)
-    }
-}
-
-fn next_down_f64(value: f64) -> f64 {
-    if value.is_nan() || value == f64::NEG_INFINITY {
-        value
-    } else if value == 0.0 {
-        -f64::from_bits(1)
-    } else if value > 0.0 {
-        f64::from_bits(value.to_bits() - 1)
-    } else {
-        f64::from_bits(value.to_bits() + 1)
-    }
-}
-
-fn absolute_difference_up(left: f64, right: f64) -> f64 {
-    let difference = (left - right).abs();
-    if difference == 0.0 {
-        0.0
-    } else {
-        next_up_f64(difference)
-    }
-}
-
-fn add_up_nonnegative(left: f64, right: f64) -> f64 {
-    debug_assert!(left >= 0.0 && right >= 0.0);
-    next_up_f64(left + right)
-}
-
-fn multiply_up_nonnegative(left: f64, right: f64) -> f64 {
-    debug_assert!(left >= 0.0 && right >= 0.0);
-    if left == 0.0 || right == 0.0 {
-        return 0.0;
-    }
-    next_up_f64(left * right)
-}
-
-/// Higham's gamma bound for `operations` sequential roundings, rounded outward.
-fn roundoff_gamma(operations: usize) -> f64 {
-    if operations as u128 > 1u128 << f64::MANTISSA_DIGITS {
-        return f64::INFINITY;
-    }
-    let unit = f64::EPSILON / 2.0;
-    let numerator = multiply_up_nonnegative(operations as f64, unit);
-    if numerator >= 1.0 {
-        return f64::INFINITY;
-    }
-    let denominator = next_down_f64(1.0 - numerator);
-    if denominator <= 0.0 {
-        f64::INFINITY
-    } else {
-        next_up_f64(numerator / denominator)
-    }
-}
-
-/// Gamma bound for a fixed-order dot product.
-///
-/// Both multiplication and addition are counted. An impossibly large vector
-/// for which the standard bound's denominator is no longer positive simply
-/// receives an infinite error bound and therefore cannot be pruned.
-fn dot_gamma(dimension: usize) -> f64 {
-    dimension
-        .checked_mul(2)
-        .map(roundoff_gamma)
-        .unwrap_or(f64::INFINITY)
 }
 
 fn uppercase_hex(raw: &[u8]) -> String {
@@ -2066,6 +1304,7 @@ mod tests {
     use super::*;
     use crate::schemas::Embedding;
     use ed25519_dalek::SigningKey;
+    use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
     use std::cell::Cell;
     use std::error::Error;
     use triblespace_core::attribute::Attribute;
@@ -2111,79 +1350,15 @@ mod tests {
         }
     }
 
-    fn row(handle: u8, values: &[f32]) -> EncodedRow {
-        EncodedRow::quantize([handle; HANDLE_LEN], values, values.len()).unwrap()
+    fn row(handle: u8, values: &[f32]) -> StoredRow {
+        StoredRow::quantize([handle; HANDLE_LEN], values, values.len()).unwrap()
     }
 
     fn member(
-        rows: impl IntoIterator<Item = EncodedRow>,
+        rows: impl IntoIterator<Item = StoredRow>,
         dimension: usize,
     ) -> Blob<NvFp4CosineSet<Embedding>> {
         encode_rows(dimension, rows.into_iter().collect()).unwrap()
-    }
-
-    fn index(blob: &Blob<NvFp4CosineSet<Embedding>>) -> NvFp4CosineIndex<Embedding> {
-        NvFp4CosineIndex {
-            members: vec![Member {
-                content_handle: blob.get_handle().raw,
-                layout: Layout::parse(blob.bytes.as_ref()).unwrap(),
-                bytes: blob.bytes.clone(),
-            }],
-            dimension: Layout::parse(blob.bytes.as_ref()).unwrap().dimension,
-            _encoding: PhantomData,
-        }
-    }
-
-    struct PublicPlaneScanner;
-
-    impl NvFp4DotScanner for PublicPlaneScanner {
-        type Error = std::convert::Infallible;
-
-        fn scan(
-            &self,
-            query: NvFp4ScanQuery<'_>,
-            segments: &[NvFp4ScanSegment<'_>],
-            dots: &mut [f64],
-        ) -> Result<(), Self::Error> {
-            let query = query.coordinates();
-            let expected = segments.iter().map(|segment| segment.rows()).sum::<usize>();
-            assert_eq!(dots.len(), expected);
-            let mut output = 0;
-            for &segment in segments {
-                assert_eq!(query.len(), segment.codes_per_row() * 2);
-                let stages = segment.stages();
-                for row in 0..segment.rows() {
-                    let globals = stages.map(|stage| {
-                        let offset = row * FLOAT_LEN;
-                        f64::from(read_f32(
-                            &stage.global_scale_bytes()[offset..offset + FLOAT_LEN],
-                        ))
-                    });
-                    let mut lanes = [0.0f64; QUANT_BLOCK / 2];
-                    let mut coordinate = 0;
-                    for block in 0..segment.blocks_per_row() {
-                        let scales = std::array::from_fn::<_, QUANT_STAGES, _>(|stage| {
-                            let offset = row * segment.blocks_per_row() + block;
-                            globals[stage] * decode_e4m3(stages[stage].block_scales()[offset])
-                        });
-                        let code_start = row * segment.codes_per_row() + block * (QUANT_BLOCK / 2);
-                        for (lane, code) in (code_start..code_start + QUANT_BLOCK / 2).enumerate() {
-                            let primary = DECODED_E2M1_PAIRS[usize::from(stages[0].codes()[code])];
-                            let correction =
-                                DECODED_E2M1_PAIRS[usize::from(stages[1].codes()[code])];
-                            let low = primary[0] * scales[0] + correction[0] * scales[1];
-                            let high = primary[1] * scales[0] + correction[1] * scales[1];
-                            lanes[lane] += query[coordinate] * low;
-                            lanes[lane] += query[coordinate + 1] * high;
-                            coordinate += 2;
-                        }
-                    }
-                    dots[output] = lanes.into_iter().sum();
-                    output += 1;
-                }
-            }
-            Ok(())
-        }
     }
 
     fn embedding_facts(
@@ -2196,51 +1371,6 @@ mod tests {
             facts.insert(&Trible::force(&entity, &attribute, &embedding));
         }
         facts
-    }
-
-    #[test]
-    fn e4m3_dyadic_decode_matches_reference_for_every_canonical_byte() {
-        for raw in 0..=0x7e {
-            let exponent = (raw >> 3) & 0x0f;
-            let mantissa = raw & 0x07;
-            let reference = if exponent == 0 {
-                f64::from(mantissa) * 2f64.powi(-9)
-            } else {
-                (1.0 + f64::from(mantissa) / 8.0) * 2f64.powi(i32::from(exponent) - 7)
-            };
-            assert_eq!(
-                decode_e4m3(raw).to_bits(),
-                reference.to_bits(),
-                "E4M3 byte {raw:#04x}",
-            );
-        }
-    }
-
-    #[test]
-    fn packed_e2m1_pair_table_decodes_both_coordinates_bitwise() {
-        const POSITIVE: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-        let reference = |raw: u8| {
-            let magnitude = POSITIVE[usize::from(raw & 0x07)];
-            if raw & 0x08 == 0 {
-                magnitude
-            } else {
-                -magnitude
-            }
-        };
-
-        for raw in u8::MIN..=u8::MAX {
-            let decoded = DECODED_E2M1_PAIRS[usize::from(raw)];
-            assert_eq!(
-                decoded[0].to_bits(),
-                reference(raw & 0x0f).to_bits(),
-                "low E2M1 nibble of {raw:#04x}",
-            );
-            assert_eq!(
-                decoded[1].to_bits(),
-                reference(raw >> 4).to_bits(),
-                "high E2M1 nibble of {raw:#04x}",
-            );
-        }
     }
 
     #[test]
@@ -2351,7 +1481,13 @@ mod tests {
         let index = NvFp4CosineIndex::<Embedding>::try_from_cover(&target_cover, &counted).unwrap();
         assert_eq!(counted.gets(), 1 + target_cover.len());
         let prepared = PreparedQuery::new(&[1.0, 0.0, 0.0], DIMENSION).unwrap();
-        assert_eq!(index.candidates(&prepared).unwrap().len(), 1);
+        assert_eq!(
+            index
+                .candidates(&prepared, &CpuF64UpperScanner)
+                .unwrap()
+                .len(),
+            1,
+        );
         assert_eq!(counted.gets(), 1 + target_cover.len());
     }
 
@@ -2366,112 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_error_encloses_the_full_padded_rotated_residual() {
-        for dimension in [1, 3, 17, 255, 256, 257] {
-            let values: Vec<_> = (0..dimension)
-                .map(|index| {
-                    let raw = splitmix64(index as u64 ^ dimension as u64);
-                    (raw as i64 as f64 / i64::MAX as f64) as f32
-                })
-                .collect();
-            let normalized = normalized_embedding(&values, dimension).unwrap();
-            let encoded = row(1, &values);
-            let transformed = rotate_normalized(&normalized).unwrap();
-            let decoded = decode_encoded_row(&encoded);
-            assert_eq!(transformed.len(), decoded.len());
-            let measured = transformed
-                .iter()
-                .zip(&decoded)
-                .map(|(&exact, &approximate)| {
-                    let difference = exact - approximate;
-                    difference * difference
-                })
-                .sum::<f64>()
-                .sqrt();
-            assert!(measured <= f64::from(read_f32(&encoded.error)));
-            let measured_norm = decoded
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt();
-            assert!(measured_norm <= f64::from(read_f32(&encoded.norm)));
-        }
-    }
-
-    #[test]
-    fn residual_stage_strictly_reduces_reconstruction_error() {
-        const DIMENSION: usize = 257;
-        let values: Vec<_> = (0..DIMENSION)
-            .map(|index| {
-                let raw = splitmix64(index as u64 ^ 0xE873_2C59_1843_6416);
-                (raw as i64 as f64 / i64::MAX as f64) as f32
-            })
-            .collect();
-        let normalized = normalized_embedding(&values, DIMENSION).unwrap();
-        let transformed = rotate_normalized(&normalized).unwrap();
-        let encoded = row(1, &values);
-        let primary = decode_stage(&encoded.stages[0]);
-        let corrected = decode_encoded_row(&encoded);
-        let primary_error = transformed
-            .iter()
-            .zip(&primary)
-            .map(|(&exact, &approximate)| (exact - approximate).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let corrected_error = transformed
-            .iter()
-            .zip(&corrected)
-            .map(|(&exact, &approximate)| (exact - approximate).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            corrected_error < primary_error,
-            "residual stage should improve {primary_error}, got {corrected_error}",
-        );
-    }
-
-    #[test]
-    fn candidate_upper_bounds_dominate_exact_scores() {
-        const DIMENSION: usize = 37;
-        let mut seed = 0xA762_09BC_909B_8B0Fu64;
-        let mut next_vector = || {
-            (0..DIMENSION)
-                .map(|_| {
-                    seed = splitmix64(seed);
-                    let signed = (seed >> 11) as i64 - (1i64 << 52);
-                    (signed as f64 / (1u64 << 52) as f64) as f32
-                })
-                .collect::<Vec<_>>()
-        };
-        let rows: Vec<_> = (1..=32)
-            .map(|handle| {
-                let values = next_vector();
-                (handle, values)
-            })
-            .collect();
-        let encoded = member(
-            rows.iter().map(|(handle, values)| row(*handle, values)),
-            DIMENSION,
-        );
-        let index = index(&encoded);
-
-        for _ in 0..16 {
-            let query = next_vector();
-            let prepared = PreparedQuery::new(&query, DIMENSION).unwrap();
-            let candidates = index.candidates(&prepared).unwrap();
-            for (candidate, (_, exact)) in candidates.iter().zip(&rows) {
-                let score = exact_cosine(&query, exact).unwrap();
-                assert!(
-                    score <= candidate.upper,
-                    "exact {score} exceeded certified upper {}",
-                    candidate.upper,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn public_scan_seam_preserves_candidate_certificates_and_segment_identity() {
+    fn mary_scan_seam_preserves_segment_identity_and_cover_deduplication() {
         const DIMENSION: usize = 37;
         let rows = [
             row(
@@ -2506,39 +1537,15 @@ mod tests {
             _encoding: PhantomData::<Embedding>,
         };
         let segments = index.scan_segments();
-        assert_eq!(segments[0].content_handle(), low.get_handle().raw);
-        assert_eq!(segments[1].content_handle(), high.get_handle().raw);
+        assert_eq!(segments[0].identity(), low.get_handle().raw);
+        assert_eq!(segments[1].identity(), high.get_handle().raw);
 
         let query: Vec<_> = (0..DIMENSION)
             .map(|index| ((index * 17 + 5) as f32).sin())
             .collect();
         let prepared = PreparedQuery::new(&query, DIMENSION).unwrap();
-        let cpu = index.candidates(&prepared).unwrap();
-        let external = index
-            .candidates_with_scanner(&prepared, &PublicPlaneScanner)
-            .unwrap();
-        assert_eq!(cpu.len(), 3, "the overlapping row is deduplicated");
-        assert_eq!(cpu.len(), external.len());
-        for (cpu, external) in cpu.iter().zip(&external) {
-            assert_eq!(cpu.handle, external.handle);
-            assert_eq!(cpu.upper.to_bits(), external.upper.to_bits());
-        }
-    }
-
-    #[test]
-    fn certified_upper_uses_the_exact_rerankers_clamped_codomain() {
-        let exact = exact_cosine(&[1.0], &[-1.0]).unwrap();
-        assert_eq!(exact, -1.0);
-        // A certificate for the unclamped floating dot may legitimately fall
-        // below -1. The returned exact scorer raises that value to -1, so the
-        // upper certificate must undergo the same clamp before pruning.
-        assert_eq!(certified_cosine_upper(-1.5, 0.25), exact);
-    }
-
-    #[test]
-    fn outward_f32_rejects_an_unrepresentable_finite_bound() {
-        assert_eq!(upward_f32(f64::from(f32::MAX)).unwrap(), f32::MAX);
-        assert!(upward_f32(next_up_f64(f64::from(f32::MAX))).is_err());
+        let candidates = index.candidates(&prepared, &CpuF64UpperScanner).unwrap();
+        assert_eq!(candidates.len(), 3, "the overlapping row is deduplicated");
     }
 
     #[test]

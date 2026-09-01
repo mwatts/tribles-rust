@@ -14,15 +14,17 @@ or separate authority database.
 
 ## Getting started
 
-Most users should enable this crate through the facade crate's `net` feature:
+Networking is a downstream capability and is consumed directly rather than
+through the core TribleSpace facade:
 
 ```toml
 [dependencies]
-triblespace = { version = "0.47", features = ["net"] }
+triblespace = "0.47"
+triblespace-net = "0.47"
 ```
 
 ```rust,ignore
-use triblespace::net::peer::{
+use triblespace_net::peer::{
     Peer, PeerConfig, ReconcileDirection, ReconcileQos,
 };
 

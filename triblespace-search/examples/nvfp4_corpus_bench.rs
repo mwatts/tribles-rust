@@ -9,6 +9,7 @@ use std::fs;
 use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
+use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
 use triblespace_core::collection::{
@@ -246,12 +247,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut fetches = Vec::with_capacity(query_count);
     let mut cutoffs = Vec::with_capacity(query_count);
     let mut brute_us = Vec::with_capacity(query_count);
+    let scanner = CpuF64UpperScanner;
     for query_index in 0..query_count {
         let row = query_index * corpus.vectors.len() / query_count;
         let query = &corpus.vectors[row];
         let counting = Counting::new(&snapshot);
         let start = Instant::now();
-        let actual = index.top_k(&counting, query, 10)?;
+        let actual = index.top_k(&counting, query, 10, &scanner)?;
         latencies_us.push(start.elapsed().as_secs_f64() * 1_000_000.0);
         fetches.push(counting.gets() as f64);
         let brute_start = Instant::now();

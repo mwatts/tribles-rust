@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
+#[cfg(feature = "nvfp4-cuda")]
+use mary::nn::nvfp4_cosine::cuda::CudaUpperScanner;
+use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 
 use triblespace_core::and;
 use triblespace_core::attribute::Attribute;
@@ -68,14 +71,30 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
 
     assert_eq!(index.dimension(), 3);
     assert_eq!(index.segment_count(), 1);
-    let top = index.top_k(&snapshot, &[1.0, 0.0, 0.0], 2).unwrap();
+    let scanner = CpuF64UpperScanner;
+    let top = index
+        .top_k(&snapshot, &[1.0, 0.0, 0.0], 2, &scanner)
+        .unwrap();
     assert_eq!(top.len(), 2);
     assert_eq!(top[0].embedding, positive);
     assert_eq!(top[0].score, 1.0);
     assert_eq!(top[1].embedding, diagonal);
     assert!(top[1].score > 0.7 && top[1].score < 0.71);
 
-    let above = index.above(&snapshot, &[1.0, 0.0, 0.0], 0.7).unwrap();
+    #[cfg(feature = "nvfp4-cuda")]
+    {
+        let segments = index.scan_segments();
+        let cuda = CudaUpperScanner::new(&segments).unwrap();
+        let cuda_top = index.top_k(&snapshot, &[1.0, 0.0, 0.0], 2, &cuda).unwrap();
+        assert!(
+            cuda_top == top,
+            "CUDA and proof-oracle exact results differ"
+        );
+    }
+
+    let above = index
+        .above(&snapshot, &[1.0, 0.0, 0.0], 0.7, &scanner)
+        .unwrap();
     assert_eq!(
         above
             .iter()
@@ -88,7 +107,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     let engine_support: HashSet<_> = triblespace_core::find!(
         neighbour: Inline<Handle<Embedding>>,
         index
-            .similar_to(&snapshot, positive, neighbour, 0.7)
+            .similar_to(&snapshot, positive, neighbour, 0.7, &scanner)
             .unwrap()
     )
     .collect();
@@ -100,7 +119,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
         and!(
             (&allowed).has(neighbour),
             index
-                .similar_to(&snapshot, positive, neighbour, 0.7)
+                .similar_to(&snapshot, positive, neighbour, 0.7, &scanner)
                 .unwrap(),
         )
     )
@@ -111,6 +130,6 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     let mut variables = triblespace_core::query::VariableContext::new();
     let neighbour = variables.next_variable::<Handle<Embedding>>();
     assert!(index
-        .similar_to(&snapshot, missing_probe, neighbour, 0.7)
+        .similar_to(&snapshot, missing_probe, neighbour, 0.7, &scanner)
         .is_err());
 }

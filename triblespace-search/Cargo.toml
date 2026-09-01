@@ -7,7 +7,7 @@ edition = "2021"
 # dependency resolution.
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-description = "Content-addressed BM25 + HNSW indexes on top of triblespace piles."
+description = "Content-addressed full-text and exact embedding search over TribleSpace collections."
 authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
 homepage = "https://trible.space"
 repository = "https://github.com/triblespace/triblespace-rs"
@@ -32,10 +32,12 @@ tempfile = "3"
 # `triblespace` crate. The macros come from `triblespace_core::macros::*`
 # (re-exported from `triblespace-core-macros`), which emit
 # `::triblespace_core::…` absolute paths — so no umbrella
-# crate is needed in the dep graph. This avoids the
-# feature-gated cycle that would block the umbrella from
-# optionally re-exporting search at `triblespace::search`.
+# crate is needed in the dep graph. Search deliberately remains a downstream
+# capability rather than becoming part of the core facade.
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
+# Mary owns reusable numerical representations and accelerator arithmetic.
+# This crate owns only their collection/storage integration and exact reranking.
+mary = { version = "0.1.0", path = "../../mary" }
 anybytes = "0.20"
 # jerky — succinct data structures; optional for the v1 scaffold,
 # required once we flip from flat-array prototypes to the
@@ -55,6 +57,8 @@ unicode-properties = "0.1.4"
 unicode-segmentation = "=1.12.0"
 [features]
 default = ["succinct"]
+# The production execution path targets the provisioned GB10/Spark appliance.
+nvfp4-cuda = ["mary/nvfp4-cuda"]
 # Swap the naive flat-array implementations for the succinct
 # jerky-backed ones. On until we have both working; off lets us
 # test the naive path in isolation.

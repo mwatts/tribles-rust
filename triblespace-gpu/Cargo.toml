@@ -13,20 +13,18 @@ readme = "README.md"
 
 [package.metadata.docs.rs]
 no-default-features = true
-features = ["wgpu", "cuda", "nvfp4"]
+features = ["wgpu", "cuda"]
 
 [features]
 default = ["wgpu"]
 wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky", "dep:itertools"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
-nvfp4 = ["cuda", "dep:triblespace-search"]
 
 [dependencies]
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
 itertools = { version = "0.14.0", optional = true }
 jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "fc0be54529f6bc0a6c5e7312cd649de21a7f3316", default-features = false, features = ["gpu"], optional = true }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
-triblespace-search = { version = "0.47.0", path = "../triblespace-search", default-features = false, optional = true }
 
 [dev-dependencies]
 ed25519-dalek = "2.1.0"
