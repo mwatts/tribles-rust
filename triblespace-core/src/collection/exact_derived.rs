@@ -363,8 +363,9 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
     /// Complete the per-point target choices before global size-tiered maintenance.
     ///
     /// This internal phase executes exact target-child carries and source
-    /// mappings, re-probing after every preferred operation. Global LSM carries
-    /// alternate with it through the singular public [`Self::ensure`] path.
+    /// mappings, re-probing after each independently planned batch. Global LSM
+    /// carries alternate with it through the singular public [`Self::ensure`]
+    /// path.
     pub(super) fn complete<S>(
         &self,
         store: &mut S,
@@ -631,112 +632,82 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             })?;
             let mapping = self.mapping_override.as_ref().unwrap_or(&bound_mapping);
 
-            // Capacity belongs to a selected physical source member, not to
-            // its logical support. Excluding that member can expose another
-            // overlap-aware cover. Successful images are still persisted even
-            // when a later capacity result requires a fresh semantic probe.
-            let mut cached = BTreeMap::<
-                CollectionData,
-                PreparedDerive<MappingSource<Mapping>, MappingTarget<Mapping>>,
-            >::new();
-            let plan = 'planning: loop {
-                let source_cover = match probe.source_residual_cover(&blocks.sources) {
-                    Ok(source_cover) => source_cover,
-                    Err(error) => break Err(error),
-                };
-                if source_cover.is_empty() {
-                    break if probe.semantically_complete() {
-                        Ok(())
-                    } else {
-                        Err(probe.incomplete_error())
-                    };
+            // Select the whole deterministic residual cover from one semantic
+            // probe, but do not retain all newly mapped outputs. Each member is
+            // mapped against a cheap fresh storage snapshot, that snapshot is
+            // dropped, and the result is published immediately. Publication
+            // is monotone, so later candidates remain valid and concurrent
+            // readers may safely observe any successful prefix.
+            let residual = probe.source_residual_cover(&blocks.sources)?;
+            if residual.is_empty() {
+                if probe.semantically_complete() {
+                    drop(probe);
+                    return self.attach(store, source_cover);
+                }
+                return Err(probe.incomplete_error());
+            }
+            let stalled_cover = probe
+                .target_cover
+                .members()
+                .map(Handle::<MappingTarget<Mapping>>::to_hash)
+                .collect();
+            drop(probe);
+
+            for (input_data, input) in residual {
+                if published_source_derives.contains(&input_data) {
+                    return Err(ExactDerivedCollectionError::Stalled {
+                        cover: stalled_cover,
+                    });
                 }
 
-                let mut replan = None;
-                for (input_data, input) in source_cover {
-                    if published_source_derives.contains(&input_data) {
-                        break 'planning Err(ExactDerivedCollectionError::Stalled {
-                            cover: probe
-                                .target_cover
-                                .members()
-                                .map(Handle::<MappingTarget<Mapping>>::to_hash)
-                                .collect(),
+                let reader = store.snapshot().map_err(|source| {
+                    ExactDerivedCollectionError::storage("open mapping snapshot", source)
+                })?;
+                let output = mapping.map(&input, &reader);
+                drop(reader);
+                let output = match output {
+                    Ok(output) => output,
+                    Err(CollectionOperationError::Fatal(reason)) => {
+                        return Err(ExactDerivedCollectionError::Derive {
+                            input: input_data,
+                            reason,
                         });
                     }
-                    if !cached.contains_key(&input_data) {
-                        let output = match mapping.map(&input, &probe.reader) {
-                            Ok(output) => output,
-                            Err(CollectionOperationError::Fatal(reason)) => {
-                                break 'planning Err(ExactDerivedCollectionError::Derive {
-                                    input: input_data,
-                                    reason,
-                                });
-                            }
-                            Err(CollectionOperationError::Capacity(reason)) => {
-                                replan = Some((input_data, reason));
-                                break;
-                            }
-                            Err(CollectionOperationError::MissingDependency(member)) => {
-                                break 'planning Err(
-                                    ExactDerivedCollectionError::MissingDependency { member },
-                                );
-                            }
-                        };
-                        let output_data = data_identity::<MappingTarget<Mapping>>(&output);
-                        let claim = CollectionDerive::new(
-                            self.target_collection.handle(),
-                            input_data,
-                            output_data,
-                        );
-                        cached.insert(
-                            input_data,
-                            PreparedDerive {
-                                input: input.clone(),
-                                output,
-                                claim,
-                            },
-                        );
+                    Err(CollectionOperationError::Capacity(reason)) => {
+                        blocks.sources.insert(input_data, reason);
+                        break;
                     }
-                }
-
-                if let Some((input, reason)) = replan {
-                    blocks.sources.insert(input, reason);
-                    continue;
-                }
-                break Ok(());
-            };
-
-            // Never retain an observed store snapshot across publication.
-            drop(probe);
-            let published = !cached.is_empty();
-            for prepared in cached.values() {
+                    Err(CollectionOperationError::MissingDependency(member)) => {
+                        return Err(ExactDerivedCollectionError::MissingDependency { member });
+                    }
+                };
+                let output_data = data_identity::<MappingTarget<Mapping>>(&output);
+                let claim = CollectionDerive::new(
+                    self.target_collection.handle(),
+                    input_data,
+                    output_data,
+                );
                 store
-                    .put::<MappingSource<Mapping>, _>(prepared.input.clone())
+                    .put::<MappingSource<Mapping>, _>(input)
                     .map_err(|error| {
                         ExactDerivedCollectionError::storage("store derived source", error)
                     })?;
                 store
-                    .put::<MappingTarget<Mapping>, _>(prepared.output.clone())
+                    .put::<MappingTarget<Mapping>, _>(output)
                     .map_err(|error| {
                         ExactDerivedCollectionError::storage("store derived target", error)
                     })?;
                 store
-                    .insert(CollectionRecord::Derive(prepared.claim))
+                    .insert(CollectionRecord::Derive(claim))
                     .map_err(|error| {
                         ExactDerivedCollectionError::storage("publish DERIVE", error)
                     })?;
-                published_source_derives.insert(prepared.claim.input());
+                published_source_derives.insert(input_data);
             }
 
-            match plan {
-                Ok(()) if published => continue,
-                Ok(()) => return self.attach(store, source_cover),
-                Err(
-                    ExactDerivedCollectionError::UnrepresentableCover { .. }
-                    | ExactDerivedCollectionError::IncompleteCover { .. },
-                ) if published => continue,
-                Err(error) => return Err(error),
-            }
+            // Capacity can expose a different overlap-aware residual cover;
+            // successful prefixes need no recomputation and remain useful.
+            continue;
         }
     }
 
@@ -1237,12 +1208,6 @@ fn preferred_routes(
         );
     }
     selected
-}
-
-struct PreparedDerive<Source: CollectionEncoding, Target: CollectionEncoding> {
-    input: Blob<Source>,
-    output: Blob<Target>,
-    claim: CollectionDerive,
 }
 
 struct SourcePlan {

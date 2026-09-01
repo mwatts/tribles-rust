@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
-use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::descriptor;
 use crate::collection::simplearchive_union;
@@ -17,15 +17,15 @@ use crate::collection::{AdmissionPolicy, CollectionPolicy};
 use crate::collection::{CollectionCommit, CollectionRead, CollectionStoreExt};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
-use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
+use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use crate::repo::{
     BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, SnapshotSource, StoreChanges,
     StoreSnapshot,
 };
-use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
+use crate::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 
 /// The one team every collection in these tests belongs to.
 fn test_team() -> ed25519_dalek::VerifyingKey {
@@ -938,8 +938,7 @@ struct CountingStore {
     inner: MemoryRepo,
     puts: usize,
     inserts: usize,
-    snapshots: usize,
-    observed_derives: Vec<usize>,
+    record_scans: Arc<AtomicUsize>,
     missing_gets: Arc<AtomicUsize>,
     metadata_failures: Arc<Mutex<BTreeSet<[u8; 32]>>>,
 }
@@ -957,6 +956,7 @@ impl Error for InjectedMetadataError {}
 
 struct DemandGuardSnapshot {
     inner: MemoryRepoSnapshot,
+    record_scans: Arc<AtomicUsize>,
     missing_gets: Arc<AtomicUsize>,
     metadata_failures: BTreeSet<[u8; 32]>,
 }
@@ -965,6 +965,7 @@ impl Clone for DemandGuardSnapshot {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            record_scans: Arc::clone(&self.record_scans),
             missing_gets: Arc::clone(&self.missing_gets),
             metadata_failures: self.metadata_failures.clone(),
         }
@@ -1039,6 +1040,7 @@ impl CollectionRead for DemandGuardSnapshot {
         Self: 'a;
 
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.record_scans.fetch_add(1, Ordering::SeqCst);
         self.inner.records()
     }
 }
@@ -1062,24 +1064,10 @@ impl SnapshotSource for CountingStore {
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.snapshots += 1;
         let inner = self.inner.snapshot()?;
-        self.observed_derives.push(
-            inner
-                .records()
-                .expect("memory collection records are infallible")
-                .filter_map(Result::ok)
-                .filter(|record| {
-                    matches!(
-                        record,
-                        CollectionRecord::Derive(claim)
-                            if claim.collection() == kernel().target_collection().handle()
-                    )
-                })
-                .count(),
-        );
         Ok(DemandGuardSnapshot {
             inner,
+            record_scans: Arc::clone(&self.record_scans),
             missing_gets: Arc::clone(&self.missing_gets),
             metadata_failures: self.metadata_failures.lock().unwrap().clone(),
         })
@@ -2231,11 +2219,13 @@ fn capacity_source_upper_replans_to_lower_resident_cover() {
     let mut expected = vec![data(&a), data(&b)];
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    assert!(algebra
-        .derive_attempts
-        .lock()
-        .unwrap()
-        .contains(&data(&upper)));
+    assert!(
+        algebra
+            .derive_attempts
+            .lock()
+            .unwrap()
+            .contains(&data(&upper))
+    );
     assert_eq!(algebra.target_attempts.lock().unwrap().len(), 1);
 }
 
@@ -2341,11 +2331,13 @@ fn mixed_terminal_capacity_publishes_the_successful_sibling() {
     ));
     assert_eq!((store.puts, store.inserts), (2, 1));
     assert_eq!(derived_inputs(&mut store.inner), vec![data(successful)]);
-    assert!(algebra
-        .derive_attempts
-        .lock()
-        .unwrap()
-        .contains(&data(successful)));
+    assert!(
+        algebra
+            .derive_attempts
+            .lock()
+            .unwrap()
+            .contains(&data(successful))
+    );
 }
 
 #[test]
@@ -2778,6 +2770,17 @@ fn capacity_stable_lowest_tier_does_not_hide_a_joinable_higher_tier() {
     assert!(target_merge_records(&mut store.inner)
         .iter()
         .any(|claim| claim.inputs() == high_pair));
+    let expected_source = sources
+        .iter()
+        .skip(1)
+        .fold(sources[0].clone(), |joined, source| {
+            join_test_sources(&joined, source)
+        });
+    assert_eq!(
+        joined_cover(&mut store.inner, &cover).bytes,
+        derive(&expected_source).unwrap().bytes,
+        "capacity-stable batching must preserve the exact logical support",
+    );
 }
 
 #[test]
@@ -3041,9 +3044,11 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_stored_equation() {
     assert!(tier_stable);
     assert_eq!(after.len(), 2);
     assert_eq!(joined_cover(&mut store, &after).bytes, old_upper.bytes);
-    assert!(target_merge_records(&mut store)
-        .iter()
-        .any(|claim| claim.inputs() == (targets[0].0, targets[1].0)));
+    assert!(
+        target_merge_records(&mut store)
+            .iter()
+            .any(|claim| claim.inputs() == (targets[0].0, targets[1].0))
+    );
 }
 
 #[test]
@@ -3114,10 +3119,12 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
     kernel().ensure(&mut store, &source_cover).unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
     let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection().handle());
-    assert!(!store
-        .events
-        .iter()
-        .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
+    assert!(
+        !store
+            .events
+            .iter()
+            .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data))
+    );
     let merges: Vec<_> = store
         .events
         .iter()
@@ -3129,9 +3136,11 @@ fn compaction_drops_readers_and_puts_results_without_republishing_the_descriptor
         .collect();
     assert!(!merges.is_empty());
     for (position, result) in merges {
-        assert!(store.events[..position]
-            .iter()
-            .any(|event| matches!(event, WriteEvent::Put(data) if *data == result)));
+        assert!(
+            store.events[..position]
+                .iter()
+                .any(|event| matches!(event, WriteEvent::Put(data) if *data == result))
+        );
     }
 }
 
@@ -3415,17 +3424,9 @@ fn flat_frontier_maintenance_uses_batched_snapshot_rounds() {
     assert_eq!(derived_inputs(&mut store.inner).len(), MEMBERS);
     assert!(cover.len() <= usize::BITS as usize);
     assert!(
-        store
-            .observed_derives
-            .iter()
-            .all(|count| *count == 0 || *count == MEMBERS),
-        "a snapshot observed a partial preferred-source batch: {:?}",
-        store.observed_derives,
-    );
-    assert!(
-        store.snapshots < MEMBERS / 2,
-        "{MEMBERS} flat members took {} snapshots instead of batched rounds",
-        store.snapshots,
+        store.record_scans.load(Ordering::SeqCst) < MEMBERS / 2,
+        "{MEMBERS} flat members took {} full collection-record scans instead of batched planning",
+        store.record_scans.load(Ordering::SeqCst),
     );
 }
 
