@@ -515,6 +515,9 @@ impl ProviderDirectory {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
     use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
@@ -536,6 +539,71 @@ mod tests {
     use super::*;
 
     type BlobHandle = Inline<Handle<UnknownBlob>>;
+
+    const PROVIDER_SCALE_BATCH_LIMIT: usize = 256;
+
+    #[derive(Debug)]
+    struct PlacementBatchStats {
+        entries: usize,
+        frames: usize,
+        max_entries_per_frame: usize,
+    }
+
+    fn deterministic_bytes(domain: &'static str, index: usize) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(domain);
+        hasher.update(&(index as u64).to_be_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    fn scale_parameter(name: &str, default: usize) -> usize {
+        std::env::var(name).map_or(default, |value| {
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("{name} must be a positive integer: {error}"))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_rss_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kilobytes = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))?
+            .split_ascii_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        Some(kilobytes * 1024)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn linux_rss_bytes() -> Option<u64> {
+        None
+    }
+
+    fn placement_batch_stats(
+        keys: impl IntoIterator<Item = ProviderKey>,
+        peers: &[PeerId],
+    ) -> PlacementBatchStats {
+        assert!(peers.len() >= crate::routing::K);
+        let mut entries_by_peer = BTreeMap::<PeerId, usize>::new();
+        let mut ordered_peers = peers.to_vec();
+        let mut entries = 0;
+        for key in keys {
+            ordered_peers.copy_from_slice(peers);
+            ordered_peers
+                .sort_unstable_by(|left, right| crate::routing::distance_cmp(key, *left, *right));
+            for peer in ordered_peers.iter().take(crate::routing::K).copied() {
+                *entries_by_peer.entry(peer).or_default() += 1;
+                entries += 1;
+            }
+        }
+        PlacementBatchStats {
+            entries,
+            frames: entries_by_peer.len(),
+            max_entries_per_frame: entries_by_peer.values().copied().max().unwrap_or(0),
+        }
+    }
 
     fn signing_key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
@@ -948,5 +1016,138 @@ mod tests {
                 .is_empty()
         );
         assert!(directory.memberships.is_empty());
+    }
+
+    #[test]
+    fn prospective_provider_put_batching_preserves_every_placement() {
+        let keys = (0..16)
+            .map(|index| deterministic_bytes("triblespace.net/provider-scale-key/v1", index));
+        let peers = (0..64)
+            .map(|index| deterministic_bytes("triblespace.net/provider-scale-peer/v1", index))
+            .collect::<Vec<_>>();
+        let stats = placement_batch_stats(keys, &peers);
+
+        assert_eq!(stats.entries, 16 * crate::routing::K);
+        assert!(stats.frames <= stats.entries);
+        assert!(stats.max_entries_per_frame <= 16);
+    }
+
+    /// Deterministic, opt-in scale probe for the provider directory, publisher,
+    /// and a prospective bounded PUT-frame grouping. This intentionally stays
+    /// beside the private implementation seam instead of becoming public API.
+    ///
+    /// Run with `cargo test -p triblespace-net --release provider_scale_probe
+    /// -- --ignored --nocapture`. `TRIBLESPACE_PROVIDER_SCALE_KEYS` controls
+    /// directory/publisher cardinality (default 100,000), while
+    /// `TRIBLESPACE_PROVIDER_SCALE_PEERS` controls the synthetic XOR mesh
+    /// (default 1,024). At most 256 keys participate in the placement sample.
+    #[test]
+    #[ignore = "manual deterministic provider scale measurement"]
+    fn provider_scale_probe() {
+        let key_count = scale_parameter("TRIBLESPACE_PROVIDER_SCALE_KEYS", 100_000);
+        let peer_count = scale_parameter("TRIBLESPACE_PROVIDER_SCALE_PEERS", 1_024);
+        assert!(key_count > 0);
+        assert!(peer_count >= crate::routing::K);
+
+        let entries = (0..key_count)
+            .map(|index| {
+                (
+                    deterministic_bytes("triblespace.net/provider-scale-key/v1", index),
+                    deterministic_bytes("triblespace.net/provider-scale-token/v1", index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let provider = deterministic_bytes("triblespace.net/provider-scale-provider/v1", 0);
+        let now = crate::clock::mono_now();
+        let rss_before = linux_rss_bytes();
+        let mut directory = ProviderDirectory::new(deterministic_bytes(
+            "triblespace.net/provider-scale-directory/v1",
+            0,
+        ));
+
+        let insert_started = Instant::now();
+        for (key, token) in entries.iter().copied() {
+            assert!(directory.put(key, provider, token, now));
+        }
+        let insert_elapsed = insert_started.elapsed();
+        let rss_after = linux_rss_bytes();
+
+        let get_started = Instant::now();
+        let returned = entries
+            .iter()
+            .map(|(key, _)| directory.get(*key, now).len())
+            .sum::<usize>();
+        black_box(returned);
+        let get_elapsed = get_started.elapsed();
+        assert_eq!(returned, key_count);
+
+        let rss_delta = rss_before
+            .zip(rss_after)
+            .map(|(before, after)| after.saturating_sub(before));
+        println!(
+            "provider_directory keys={key_count} insert_seconds={:.6} insert_per_second={:.2} get_seconds={:.6} get_per_second={:.2} linux_rss_delta_bytes={} linux_rss_delta_bytes_per_key={}",
+            insert_elapsed.as_secs_f64(),
+            key_count as f64 / insert_elapsed.as_secs_f64(),
+            get_elapsed.as_secs_f64(),
+            key_count as f64 / get_elapsed.as_secs_f64(),
+            rss_delta.map_or_else(|| "n/a".to_owned(), |bytes| bytes.to_string()),
+            rss_delta.map_or_else(
+                || "n/a".to_owned(),
+                |bytes| format!("{:.2}", bytes as f64 / key_count as f64),
+            ),
+        );
+        drop(directory);
+
+        let mut resident = ProviderSet::default();
+        for (key, identity) in entries.iter().copied() {
+            resident
+                .leases
+                .replace(&PatchEntry::with_value(&key, identity));
+        }
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident, now);
+        while publisher.next(now).is_some() {}
+
+        let renewal_started = Instant::now();
+        let mut renewal_now = now + PROVIDER_RENEWAL_PERIOD;
+        let mut renewed = 0;
+        while renewed < key_count {
+            assert!(publisher.next(renewal_now).is_some());
+            renewed += 1;
+            if renewed < key_count {
+                renewal_now = publisher
+                    .cycle
+                    .as_ref()
+                    .expect("the renewal traversal remains active")
+                    .next_due;
+            }
+        }
+        let renewal_elapsed = renewal_started.elapsed();
+        let required_keys_per_second = key_count as f64 / PROVIDER_RENEWAL_PERIOD.as_secs_f64();
+        let required_put_entries_per_second = required_keys_per_second * crate::routing::K as f64;
+        println!(
+            "provider_scheduler keys={key_count} selection_seconds={:.6} selections_per_second={:.2} required_key_lookups_per_second_8h={required_keys_per_second:.6} required_put_entries_per_second_8h={required_put_entries_per_second:.6}",
+            renewal_elapsed.as_secs_f64(),
+            key_count as f64 / renewal_elapsed.as_secs_f64(),
+        );
+
+        let batch_size = key_count.min(PROVIDER_SCALE_BATCH_LIMIT);
+        let peers = (0..peer_count)
+            .map(|index| deterministic_bytes("triblespace.net/provider-scale-peer/v1", index))
+            .collect::<Vec<_>>();
+        let placement_started = Instant::now();
+        let stats =
+            placement_batch_stats(entries.iter().take(batch_size).map(|(key, _)| *key), &peers);
+        let placement_elapsed = placement_started.elapsed();
+        let frame_compression = stats.entries as f64 / stats.frames as f64;
+        let overlap = 1.0 - stats.frames as f64 / stats.entries as f64;
+        println!(
+            "provider_put_projection keys={batch_size} peers={peer_count} replicas_per_key={} placement_seconds={:.6} unbatched_frames={} grouped_frames={} frame_compression={frame_compression:.3} target_overlap={overlap:.6} max_entries_per_frame={}",
+            crate::routing::K,
+            placement_elapsed.as_secs_f64(),
+            stats.entries,
+            stats.frames,
+            stats.max_entries_per_frame,
+        );
     }
 }
