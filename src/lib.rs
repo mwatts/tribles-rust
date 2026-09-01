@@ -5,12 +5,6 @@ pub use triblespace_core::arrayvec;
 
 pub use triblespace_core as core;
 
-/// Distributed sync via iroh: [`net::peer::Peer<S>`] wraps any store with
-/// authenticated PATCH anti-entropy, durable wants, and DHT-located
-/// content-addressed blob fetching. Gated behind the `net` feature.
-#[cfg(feature = "net")]
-pub use triblespace_net as net;
-
 /// Opt-in WGPU acceleration for succinct-archive construction and batched
 /// query confirmation. Gated behind the `gpu` feature, which also enables the
 /// parallel query executor.
