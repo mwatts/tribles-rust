@@ -618,15 +618,28 @@ fn encode_e2m1(value: f64) -> u8 {
     }
 }
 
-fn decode_e2m1(raw: u8) -> f64 {
+const fn decode_e2m1(raw: u8) -> f64 {
     const POSITIVE: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let magnitude = POSITIVE[usize::from(raw & 0x07)];
+    let magnitude = POSITIVE[(raw & 0x07) as usize];
     if raw & 0x08 == 0 {
         magnitude
     } else {
         -magnitude
     }
 }
+
+const fn decoded_e2m1_pairs() -> [[f64; 2]; 256] {
+    let mut pairs = [[0.0; 2]; 256];
+    let mut raw = 0usize;
+    while raw < pairs.len() {
+        let packed = raw as u8;
+        pairs[raw] = [decode_e2m1(packed & 0x0f), decode_e2m1(packed >> 4)];
+        raw += 1;
+    }
+    pairs
+}
+
+const DECODED_E2M1_PAIRS: [[f64; 2]; 256] = decoded_e2m1_pairs();
 
 fn upward_f32(value: f64) -> Result<f32, NvFp4Error> {
     let mut rounded = value as f32;
@@ -1257,30 +1270,32 @@ where
                 std::array::from_fn(|stage| member.layout.block_scales(bytes, row, stage));
             let codes: [&[u8]; QUANT_STAGES] =
                 std::array::from_fn(|stage| member.layout.codes(bytes, row, stage));
-            let mut raw_dot = 0.0f64;
+            let mut raw_dot_lanes = [0.0f64; QUANT_BLOCK / 2];
             let mut coordinate = 0;
             for block in 0..member.layout.blocks_per_row {
                 let decoded_scales: [f64; QUANT_STAGES] =
                     std::array::from_fn(|stage| globals[stage] * decode_e4m3(scales[stage][block]));
                 let code_start = block * (QUANT_BLOCK / 2);
-                for code in code_start..code_start + QUANT_BLOCK / 2 {
-                    for nibble in 0..2 {
-                        let decode = |stage: usize| {
-                            let pair = codes[stage][code];
-                            let fp4 = if nibble == 0 { pair & 0x0f } else { pair >> 4 };
-                            decode_e2m1(fp4) * decoded_scales[stage]
-                        };
-                        // This fixed-order sum is the definition of the
-                        // canonical reconstructed coordinate and exactly
-                        // matches construction-time decoding.
-                        let row_value = decode(0) + decode(1);
-                        let query_value = query.approximate[coordinate];
-                        coordinate += 1;
-                        raw_dot += query_value * row_value;
-                    }
+                for (lane, code) in (code_start..code_start + QUANT_BLOCK / 2).enumerate() {
+                    let primary = DECODED_E2M1_PAIRS[usize::from(codes[0][code])];
+                    let correction = DECODED_E2M1_PAIRS[usize::from(codes[1][code])];
+                    // These sums are the canonical reconstructed coordinates
+                    // and exactly match construction-time decoding.
+                    let low = primary[0] * decoded_scales[0] + correction[0] * decoded_scales[1];
+                    let high = primary[1] * decoded_scales[0] + correction[1] * decoded_scales[1];
+                    raw_dot_lanes[lane] += query.approximate[coordinate] * low;
+                    raw_dot_lanes[lane] += query.approximate[coordinate + 1] * high;
+                    coordinate += 2;
                 }
             }
             debug_assert_eq!(coordinate, query.approximate.len());
+            // Eight fixed lanes break the long scalar dependency chain. Each
+            // product crosses a shallower reduction than the sequential
+            // 2D-rounding model, so `compact_gamma` remains conservative.
+            let mut raw_dot = raw_dot_lanes[0];
+            for lane in &raw_dot_lanes[1..] {
+                raw_dot += *lane;
+            }
 
             let approximate = if reconstruction_norm == 0.0 {
                 0.0
@@ -1800,6 +1815,33 @@ mod tests {
                 decode_e4m3(raw).to_bits(),
                 reference.to_bits(),
                 "E4M3 byte {raw:#04x}",
+            );
+        }
+    }
+
+    #[test]
+    fn packed_e2m1_pair_table_decodes_both_coordinates_bitwise() {
+        const POSITIVE: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let reference = |raw: u8| {
+            let magnitude = POSITIVE[usize::from(raw & 0x07)];
+            if raw & 0x08 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        };
+
+        for raw in u8::MIN..=u8::MAX {
+            let decoded = DECODED_E2M1_PAIRS[usize::from(raw)];
+            assert_eq!(
+                decoded[0].to_bits(),
+                reference(raw & 0x0f).to_bits(),
+                "low E2M1 nibble of {raw:#04x}",
+            );
+            assert_eq!(
+                decoded[1].to_bits(),
+                reference(raw >> 4).to_bits(),
+                "high E2M1 nibble of {raw:#04x}",
             );
         }
     }
