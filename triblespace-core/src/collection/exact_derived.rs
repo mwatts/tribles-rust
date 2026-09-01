@@ -631,65 +631,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             })?;
             let mapping = self.mapping_override.as_ref().unwrap_or(&bound_mapping);
 
-            if let Some(input_data) = probe.preferred_source_members.first().copied() {
-                if published_source_derives.contains(&input_data) {
-                    return Err(ExactDerivedCollectionError::Stalled {
-                        cover: probe
-                            .target_cover
-                            .members()
-                            .map(Handle::<MappingTarget<Mapping>>::to_hash)
-                            .collect(),
-                    });
-                }
-                let input = probe
-                    .reader
-                    .get(Handle::<MappingSource<Mapping>>::from_hash(input_data))
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage(
-                            "load preferred corresponding source node",
-                            error,
-                        )
-                    })?;
-                let output = match mapping.map(&input, &probe.reader) {
-                    Ok(output) => output,
-                    Err(CollectionOperationError::Capacity(reason)) => {
-                        blocks.sources.insert(input_data, reason);
-                        continue;
-                    }
-                    Err(CollectionOperationError::Fatal(reason)) => {
-                        return Err(ExactDerivedCollectionError::Derive {
-                            input: input_data,
-                            reason,
-                        });
-                    }
-                    Err(CollectionOperationError::MissingDependency(member)) => {
-                        return Err(ExactDerivedCollectionError::MissingDependency { member });
-                    }
-                };
-                let output_data = data_identity::<MappingTarget<Mapping>>(&output);
-                let claim =
-                    CollectionDerive::new(self.target_collection.handle(), input_data, output_data);
-
-                drop(probe);
-                store
-                    .put::<MappingSource<Mapping>, _>(input)
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage("store derived source", error)
-                    })?;
-                store
-                    .put::<MappingTarget<Mapping>, _>(output)
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage("store derived target", error)
-                    })?;
-                store
-                    .insert(CollectionRecord::Derive(claim))
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage("publish DERIVE", error)
-                    })?;
-                published_source_derives.insert(input_data);
-                continue;
-            }
-
             // Capacity belongs to a selected physical source member, not to
             // its logical support. Excluding that member can expose another
             // overlap-aware cover. Successful images are still persisted even

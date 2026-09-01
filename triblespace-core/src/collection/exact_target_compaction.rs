@@ -1,10 +1,11 @@
 //! Deterministic size-tiered maintenance for derived target collections.
 //!
 //! This is the horizontal half of [`ExactDerivedCollection::ensure`]. It starts
-//! from a completed cover and publishes one canonical target carry before
-//! re-entering the per-point planner. A later failed or capacity-limited join does
-//! not erase earlier useful work. The source cover remains the value boundary,
-//! and yard/GC policy alone decides the lifetime of materialized nodes.
+//! from a completed cover and publishes one deterministic batch of pairwise-
+//! disjoint canonical target carries before re-entering the per-point planner.
+//! A later failed or capacity-limited join does not erase earlier useful work.
+//! The source cover remains the value boundary, and yard/GC policy alone decides
+//! the lifetime of materialized nodes.
 
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
@@ -33,12 +34,15 @@ use super::{
 /// round attempts at most `n - 1` pairs. No policy knobs, manifest, receipt,
 /// signed record, retention record, or implicit flush are involved.
 ///
-/// Each maintenance round finds at most one successful deterministic carry
-/// under one immutable reader. After that reader has been dropped, the result
-/// is stored before its `MERGE` record. The per-point planner then observes the
-/// fresh equation before another arbitrary dyadic pair can be chosen. Freshly
-/// selected covers are carried again when concurrent or older evidence exposes
-/// another collision. Repetition of any non-stable canonical cover returns
+/// Each maintenance round takes the lowest colliding tier and pairs its members
+/// in content-handle order under one immutable reader. Every selected pair is
+/// disjoint, so computing the whole batch cannot make a later pair invalid:
+/// publication only adds equations and never consumes an input. After that
+/// reader has been dropped, each result is stored before its `MERGE` record in
+/// the same deterministic order. The per-point planner then observes the whole
+/// fresh batch before another dyadic tier is chosen. Freshly selected covers
+/// are carried again when concurrent or older evidence exposes another
+/// collision. Repetition of any non-stable canonical cover returns
 /// [`ExactDerivedCollectionError::Stalled`].
 pub(super) fn ensure_target<S, H>(
     exact: &ExactDerivedCollection<H>,
@@ -91,6 +95,11 @@ enum RoundOutcome<Target: CollectionEncoding> {
     Stable(Cover<Target>),
 }
 
+struct PreparedTargetMerge<Target: CollectionEncoding> {
+    output: Blob<Target>,
+    claim: CollectionMerge,
+}
+
 fn publish_round<S, Mapping>(
     exact: &ExactDerivedCollection<Mapping>,
     store: &mut S,
@@ -131,21 +140,23 @@ where
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
-    loop {
-        let Some(tier) = tiers
-            .iter()
-            .find_map(|(tier, bin)| (bin.len() >= 2).then_some(*tier))
-        else {
-            return Ok(RoundOutcome::Stable(cover));
-        };
-        let mut bin = tiers.remove(&tier).expect("selected tier exists");
+    let Some(tier) = tiers
+        .iter()
+        .find_map(|(tier, bin)| (bin.len() >= 2).then_some(*tier))
+    else {
+        return Ok(RoundOutcome::Stable(cover));
+    };
+    let mut bin = tiers.remove(&tier).expect("selected tier exists");
+    let mut prepared = Vec::with_capacity(bin.len() / 2);
+    let mut terminal: Option<
+        Result<(CollectionData, CollectionData, CollectionData), ExactDerivedCollectionError>,
+    > = None;
+
+    while bin.len() >= 2 {
         let (low_data, low) = bin.pop_first().expect("colliding tier has a low input");
         let (high_data, high) = bin.pop_first().expect("colliding tier has a high input");
-        if !bin.is_empty() {
-            tiers.insert(tier, bin);
-        }
         if blocked_target_merges.contains(&(low_data, high_data)) {
-            tiers.entry(tier).or_default().insert(high_data, high);
+            bin.insert(high_data, high);
             continue;
         }
 
@@ -157,43 +168,71 @@ where
         ) {
             Ok(constructed) => constructed,
             Err(CollectionOperationError::Fatal(reason)) => {
-                return Err(ExactDerivedCollectionError::Merge {
+                terminal = Some(Err(ExactDerivedCollectionError::Merge {
                     low: low_data,
                     high: high_data,
                     reason,
-                });
+                }));
+                break;
             }
             Err(CollectionOperationError::Capacity(_)) => {
-                tiers.entry(tier).or_default().insert(high_data, high);
+                // Retire only the lower input for this round. The higher input
+                // remains eligible for the next deterministic pair, exactly as
+                // in the scalar planner.
+                bin.insert(high_data, high);
                 continue;
             }
             Err(CollectionOperationError::MissingDependency(member)) => {
-                drop(reader);
-                if exact.materialize_target_join_dependency(
-                    store,
-                    source_cover,
-                    low_data,
-                    high_data,
-                    member,
-                )? {
-                    return Ok(RoundOutcome::Retry(cover));
-                }
-                return Err(ExactDerivedCollectionError::MissingDependency { member });
+                terminal = Some(Ok((low_data, high_data, member)));
+                break;
             }
         };
         let result_data = data_identity::<Mapping::Target>(&constructed);
         let claim = CollectionMerge::new(collection.handle(), low_data, high_data, result_data);
+        prepared.push(PreparedTargetMerge {
+            output: constructed,
+            claim,
+        });
+    }
 
-        // Closure-dependent joins observe one immutable reader boundary. Do
-        // not retain it across publication. Publish exactly this carry, then
-        // let the caller re-enter per-point planning against a fresh snapshot.
-        drop(reader);
+    // Closure-dependent joins observe one immutable reader boundary. Do not
+    // retain it across publication. Every successful pair is complete work,
+    // so publish the deterministic prefix even if a later pair failed.
+    drop(reader);
+    let published = !prepared.is_empty();
+    for prepared in prepared {
         store
-            .put::<Mapping::Target, _>(constructed)
+            .put::<Mapping::Target, _>(prepared.output)
             .map_err(|error| ExactDerivedCollectionError::storage("store merged target", error))?;
         store
-            .insert(CollectionRecord::Merge(claim))
+            .insert(CollectionRecord::Merge(prepared.claim))
             .map_err(|error| ExactDerivedCollectionError::storage("publish target MERGE", error))?;
-        return Ok(RoundOutcome::TargetPublished);
+    }
+
+    match terminal {
+        Some(Err(error)) => Err(error),
+        Some(Ok((low_data, high_data, member))) => {
+            if exact.materialize_target_join_dependency(
+                store,
+                source_cover,
+                low_data,
+                high_data,
+                member,
+            )? {
+                Ok(RoundOutcome::Retry(cover))
+            } else {
+                Err(ExactDerivedCollectionError::MissingDependency { member })
+            }
+        }
+        None => {
+            // A non-empty prepared batch changed the resident equation set;
+            // re-probe before selecting another tier. With no successes, every
+            // collision in the selected tier was capacity-terminal.
+            if published {
+                Ok(RoundOutcome::TargetPublished)
+            } else {
+                Ok(RoundOutcome::Stable(cover))
+            }
+        }
     }
 }
