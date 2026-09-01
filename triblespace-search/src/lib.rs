@@ -106,6 +106,7 @@
 pub mod bm25;
 pub mod constraint;
 pub mod hnsw;
+pub mod nvfp4;
 pub mod portable_bm25;
 #[cfg(feature = "succinct")]
 pub mod ring;

@@ -6,6 +6,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Canonical row-local NVFP4 cosine collection
+
+- Added an architecture-independent NVFP4 collection encoding whose sorted
+  rows are keyed by exact embedding handles and own independent global/block
+  scales. A second row-local NVFP4 stage quantizes the primary reconstruction's
+  residual; each row also persists one upward decoded norm and one final L2
+  certificate for the summed reconstruction. Canonical set union is therefore
+  associative, commutative, and idempotent without requantizing existing rows.
+- Added a typed SimpleArchive attribute projection and a lazy cover-aware
+  query view. Compact rows only discover candidates; conservative transform
+  and quantization certificates plus geometric widening fetch source
+  embeddings for exact deterministic `top_k` and threshold results.
+
 ### Portable exact-TF BM25 carrier
 
 - Added a new architecture-independent BM25 blob whose canonical logical value
