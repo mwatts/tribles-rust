@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Return exact empty NVFP4 search results before query preparation or scanner
+  execution when a cover has no logical rows, and document that Mary scan
+  segments receive the persisted reconstruction-norm and error-certificate
+  planes while row handles and exact sources remain search-owned.
+
 - Make Rank9 acceleration an ordinary full derived lattice. Raw Succinct and
   Rank9-accelerated members each own a canonical join. When the accelerated
   join's exact raw union is absent, generic collection maintenance materializes
@@ -25,10 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add an optional resident CUDA scanner for canonical two-stage NVFP4 search.
-  Accelerators receive only validated compact planes and return raw `f64` dot
-  products; cover deduplication, conservative candidate certificates, exact
-  source fetches, reranking, and result ordering remain singular in
-  `triblespace-search`. One combined readback covers every physical LSM member.
+  Mary receives validated compact stage and certificate planes and returns
+  conservative raw-dot uppers; cover deduplication, exact source fetches,
+  reranking, and result ordering remain singular in `triblespace-search`. One
+  combined readback covers every physical LSM member.
 
 - Make `WantRequest::Blob(H)` the sole durable exact-content request.
   `MemoryRepo`, `Pile`, Yard, retained rewrites, and pile diagnostics preserve

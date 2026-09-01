@@ -863,9 +863,9 @@ impl<E: BlobEncoding> NvFp4CosineIndex<E> {
     /// Validated physical segments retained by this lazy cover view.
     ///
     /// Accelerators may copy these planes into a resident representation. The
-    /// returned views expose each segment's own content identity and the two
-    /// scalar planes needed to complete a compact upper bound, but never row
-    /// handles or exact-source dependencies.
+    /// returned views expose each segment's content identity plus its persisted
+    /// reconstruction-norm and error-certificate planes. Row handles and exact
+    /// source dependencies remain private to this search view.
     pub fn scan_segments(&self) -> Vec<ScanSegment<'_>> {
         self.members
             .iter()
@@ -903,6 +903,10 @@ impl<E: BlobEncoding> NvFp4CosineIndex<E> {
     pub fn segment_count(&self) -> usize {
         self.members.len()
     }
+
+    fn is_empty(&self) -> bool {
+        self.members.iter().all(|member| member.layout.rows == 0)
+    }
 }
 
 impl<E> NvFp4CosineIndex<E>
@@ -927,7 +931,7 @@ where
         R: BlobStoreGet,
         S: UpperScanner,
     {
-        if k == 0 {
+        if k == 0 || self.is_empty() {
             return Ok(Vec::new());
         }
         let prepared = PreparedQuery::new(query, self.dimension)?;
@@ -999,7 +1003,7 @@ where
         if floor.is_nan() {
             return Err(NvFp4Error::new("cosine floor must not be NaN"));
         }
-        if floor > 1.0 {
+        if floor > 1.0 || self.is_empty() {
             return Ok(Vec::new());
         }
         let prepared = PreparedQuery::new(query, self.dimension)?;
@@ -1304,7 +1308,7 @@ mod tests {
     use super::*;
     use crate::schemas::Embedding;
     use ed25519_dalek::SigningKey;
-    use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
+    use mary::nn::nvfp4_cosine::{CpuF64UpperScanner, ScanQuery};
     use std::cell::Cell;
     use std::error::Error;
     use triblespace_core::attribute::Attribute;
@@ -1422,6 +1426,56 @@ mod tests {
         let empty = mapping.map(&TribleSet::new().to_blob(), &snapshot).unwrap();
         let with_empty = join_members(&mapped_left, &empty, DIMENSION).unwrap();
         assert_eq!(mapped_left.bytes.as_ref(), with_empty.bytes.as_ref());
+    }
+
+    struct UnexpectedScanner;
+
+    impl UpperScanner for UnexpectedScanner {
+        type Error = std::convert::Infallible;
+
+        fn scan_upper(
+            &self,
+            _query: ScanQuery<'_>,
+            _segments: &[ScanSegment<'_>],
+            _upper_raw_dots: &mut [f64],
+        ) -> Result<(), Self::Error> {
+            panic!("logically empty covers must not invoke their scanner")
+        }
+    }
+
+    #[test]
+    fn logically_empty_covers_short_circuit_before_query_preparation() {
+        const DIMENSION: usize = 3;
+        let empty_member = member(Vec::new(), DIMENSION);
+        let indices = [
+            NvFp4CosineIndex {
+                members: Vec::new(),
+                dimension: DIMENSION,
+                _encoding: PhantomData::<Embedding>,
+            },
+            NvFp4CosineIndex {
+                members: vec![Member {
+                    content_handle: empty_member.get_handle().raw,
+                    layout: Layout::parse(empty_member.bytes.as_ref()).unwrap(),
+                    bytes: empty_member.bytes.clone(),
+                }],
+                dimension: DIMENSION,
+                _encoding: PhantomData::<Embedding>,
+            },
+        ];
+        let mut store = MemoryRepo::default();
+        let snapshot = store.snapshot().unwrap();
+
+        for index in indices {
+            assert!(index
+                .top_k(&snapshot, &[f32::NAN], 1, &UnexpectedScanner)
+                .unwrap()
+                .is_empty());
+            assert!(index
+                .above(&snapshot, &[f32::NAN], 0.0, &UnexpectedScanner)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
