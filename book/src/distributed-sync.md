@@ -50,12 +50,12 @@ proof evidence may activate an old commit without rewriting or retracting it.
 
 For one collection, exactly two grow-only sets can change admission:
 
-- every structurally valid `COMMIT`, `MERGE`, and `DERIVE` record whose
-  intrinsic collection is C; and
+- every valid signed `COMMIT` for C whose signer currently satisfies WRITE(C);
+  and
 - every complete portable WRITE proof bundle relevant to C's WRITE-policy
   roots.
 
-Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection records
+Each set is represented by an immutable BLAKE3-Merkle PATCH. Admitted COMMITs
 are keyed by their 16-byte intrinsic record ID; proof bundles are keyed by
 their 32-byte proof ID and carry their exact ordered claim closure as the leaf
 value. The opaque activation root commits to C, both PATCH roots, and both leaf
@@ -66,11 +66,12 @@ case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
 proof store would disclose unrelated capability structure. The overlay is the
 smallest exact state whose union can change C.
 
-Unsigned MERGE and DERIVE records remain optional computation evidence. Their
-presence never activates a payload on its own. Once admitted into the local
-record store, an equation is reusable materialized LSM work; warm readers do
-not execute its join or mapping again. A future trust/quorum policy belongs at
-network ingress rather than in resolution.
+Unsigned MERGE and DERIVE records remain optional local computation evidence.
+They do not participate in the activation root or ordinary collection repair.
+Once present in a local record store, an equation is reusable materialized LSM
+work; warm readers do not execute its join or mapping again. Remote receipt
+reuse, if introduced, needs an explicit bounded request mechanism rather than
+silently widening every collection's activation surface.
 
 ## Opaque wakes over stock gossip
 

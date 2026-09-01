@@ -1,10 +1,10 @@
 //! Service durable exact-content and collection-operation WANTs.
 //!
-//! Collection repair converges relevant records, including conflicting
-//! MERGE/DERIVE receipts. This reconciler never claims global absence: an
-//! operation WANT is satisfied iff at least one matching local receipt is
-//! visible; otherwise it remains pending while periodic inventory sweeps
-//! continue. `Blob(H)` uses H-derived global provider discovery. No collection,
+//! Collection repair converges admitted COMMITs and their WRITE evidence, not
+//! unsigned MERGE/DERIVE receipts. This reconciler never claims global absence:
+//! an operation WANT is satisfied iff at least one matching local receipt is
+//! visible; otherwise it remains pending while the local store evolves.
+//! `Blob(H)` uses H-derived global provider discovery. No collection,
 //! provenance guess, or ambient authorization participates in that exact read.
 
 use std::collections::hash_map::Entry;

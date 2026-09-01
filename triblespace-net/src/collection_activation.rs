@@ -628,8 +628,8 @@ mod tests {
         capability_quorum_authorizes,
     };
     use triblespace_core::collection::{
-        CollectionCommit, CollectionData, CollectionPolicy, CollectionRecord, CollectionStore,
-        CollectionStoreExt, empty_metadata_handle,
+        CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionPolicy,
+        CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -732,6 +732,55 @@ mod tests {
             after.write_evidence().summary()
         );
         assert_ne!(before.wake_root(), after.wake_root());
+    }
+
+    #[test]
+    fn unsigned_receipts_do_not_participate_in_activation() {
+        let writer = key(3);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "commit-only-activation",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let commit = CollectionCommit::sign(
+            &writer,
+            collection.handle(),
+            data(31),
+            empty_metadata_handle(),
+        );
+        store.insert(CollectionRecord::Commit(commit)).unwrap();
+
+        let before_snapshot = store.snapshot().unwrap();
+        let before = collection_activation_overlay(&before_snapshot, collection.handle()).unwrap();
+
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                collection.handle(),
+                data(31),
+                data(32),
+                data(33),
+            )))
+            .unwrap();
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                collection.handle(),
+                data(33),
+                data(34),
+            )))
+            .unwrap();
+
+        let after_snapshot = store.snapshot().unwrap();
+        let after = collection_activation_overlay(&after_snapshot, collection.handle()).unwrap();
+
+        assert_eq!(before.records().summary(), after.records().summary());
+        assert_eq!(before.wake_root(), after.wake_root());
+        assert_eq!(after.records().len(), 1);
+        assert_eq!(
+            after.records().get(commit.id()),
+            Some(CollectionRecord::Commit(commit))
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@
 Collection-scoped anti-entropy for TribleSpace over
 [iroh](https://www.iroh.computer). A peer retains an immutable activation
 overlay for each explicitly active collection. One repair stream reconciles
-the exact product of two grow-only PATCHes: native collection records and
-portable WRITE-evidence bundles.
+the exact product of two grow-only PATCHes: currently WRITE-admitted signed
+COMMITs and portable WRITE-evidence bundles.
 
 The user-facing surface is `Peer<S>`, a synchronous store wrapper backed by an
 async host. `Peer::refresh` drains verified repair events, crosses one storage
