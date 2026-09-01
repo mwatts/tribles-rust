@@ -60,6 +60,21 @@ fn legacy_v3_definition_followed_by_blob() -> Vec<u8> {
     bytes
 }
 
+fn retired_team_record(kind: &str, seeds: &[u8]) -> Vec<u8> {
+    let mut record = vec![0u8; 256];
+    record[..28].copy_from_slice(
+        &hex::decode("0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B")
+            .expect("envelope marker"),
+    );
+    record[28..32].copy_from_slice(&1u32.to_le_bytes());
+    record[32..64].copy_from_slice(&hex::decode(kind).expect("record kind"));
+    for (slot, seed) in seeds.iter().enumerate() {
+        let key = SigningKey::from_bytes(&[*seed; 32]).verifying_key();
+        record[64 + slot * 32..96 + slot * 32].copy_from_slice(&key.to_bytes());
+    }
+    record
+}
+
 #[test]
 fn create_initializes_empty_pile() {
     let dir = tempdir().unwrap();
@@ -158,7 +173,9 @@ fn compact_uses_valid_blob_occurrence_without_collecting_blobs_or_equations() {
         .stdout(
             predicate::str::contains("blob records: 2 -> 1")
                 .and(predicate::str::contains("collection records: 2 -> 1"))
-                .and(predicate::str::contains("store scope: none")),
+                .and(predicate::str::contains(
+                    "retired team records: 0 -> 0 (dropped)",
+                )),
         );
 
     assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
@@ -206,6 +223,38 @@ fn compact_uses_valid_blob_occurrence_without_collecting_blobs_or_equations() {
     );
     drop(snapshot);
     compacted.close().unwrap();
+}
+
+#[test]
+fn compact_drops_retired_team_records() {
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("retired-team-source.pile");
+    let destination_path = dir.path().join("compacted.pile");
+
+    let mut bytes = retired_team_record(
+        "327FFCAAA3F5A10424DC2059E3A7A3517F837E7E56A3C850979EFA9F5E3A1ED7",
+        &[1, 2],
+    );
+    bytes.extend_from_slice(&retired_team_record(
+        "97C69C746D01741C8012A56F08D2C424E0291B5424EB9CD7637FD4A655C93DFB",
+        &[3],
+    ));
+    std::fs::write(&source_path, &bytes).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "retired team records: 2 -> 0 (dropped)",
+        ));
+
+    assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
+    assert_eq!(std::fs::metadata(&destination_path).unwrap().len(), 0);
 }
 
 #[cfg(unix)]

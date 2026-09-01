@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Retire the obsolete team-era repository state. `Store` snapshots no longer
+  require `PeerRead`, mutable stores no longer require `PeerStore`, and Pile,
+  Yard, Hybrid, Lazy, and MemoryRepo carry no PEER or STORE_SCOPE indexes.
+  Existing framed records remain structurally readable as known inert kinds;
+  semantic reframe, reclaim, and compaction deliberately drop them while still
+  refusing genuinely unknown records.
+
 - Keep `Cover<E>` as the sole public collection-lattice value and add checked
   PATCH-backed union, intersection, difference, and subset operations. Replace
   public physical `resolve` with `available`, which returns the greatest subset
@@ -46,9 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `trible pile compact <SOURCE> --into <DESTINATION>` for out-of-place,
   non-GC pile repacking. It retains every distinct valid blob, collapses exact
   duplicate native set records, preserves all distinct COMMIT/MERGE/DERIVE and
-  capability evidence, and projects active local WANT/pin state plus the unique
-  store scope once. Blob records receive fresh timestamps; corrupt duplicate
-  occurrences and known semantically inert retired records are omitted. It
+  capability evidence, and projects active local WANT/pin state once. Blob
+  records receive fresh timestamps; corrupt duplicate occurrences and known
+  semantically inert retired records—including PEER and STORE_SCOPE—are
+  omitted. It
   refuses opaque records, attempts to remove an incomplete fresh destination
   after failure, and reports cleanup failure. On Unix the destination is
   created no broader than mode 0600 before source permissions are applied

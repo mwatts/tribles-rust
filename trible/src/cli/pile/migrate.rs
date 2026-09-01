@@ -136,7 +136,8 @@ fn record_kind_description_census(
 ///
 /// A record kind is the 32-byte handle of a description archive. That makes it
 /// resolvable in principle; storing the archives makes it resolvable *here*,
-/// so a reader holding nothing but the file can say what any record in it is.
+/// so a reader holding nothing but the file can resolve every kind the current
+/// binary writes. Retired read-only kinds are intentionally not republished.
 fn migrate_record_kind_descriptions(pile_path: &PathBuf, dry_run: bool) -> Result<()> {
     let mut pile = super::open_refreshed(pile_path)?;
 

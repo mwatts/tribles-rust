@@ -4,8 +4,6 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use ed25519_dalek::VerifyingKey;
-
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
@@ -19,11 +17,10 @@ use crate::id::ID_LEN;
 use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::prelude::*;
-use crate::repo::peer::{PeerEvidence, PeerRead, PeerStore, PEER_EVIDENCE_BYTES_LEN};
 use crate::repo::proof::{CapabilityProofRead, CapabilityProofStore};
 use crate::repo::{
     BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, SnapshotSource,
-    StoreChanges, StoreScope, StoreScopeError, StoreSnapshot, WantRequest, WantStore,
+    StoreChanges, StoreSnapshot, WantRequest, WantStore,
 };
 
 use crate::inline::encodings::hash::Handle;
@@ -31,7 +28,6 @@ use crate::inline::InlineEncoding;
 
 type CollectionRecordIndex = PATCH<ID_LEN, IdentitySchema, CollectionRecord, XorSip128>;
 type CapabilityProofIndex = PATCH<INLINE_LEN, IdentitySchema, CapabilityProof, XorSip128>;
-type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
 
 /// Simple in-memory implementation of the repository storage traits.
 ///
@@ -51,46 +47,19 @@ pub struct MemoryRepo {
     collection_records: CollectionRecordIndex,
     /// Canonical complete capability proofs keyed by exact-body content id.
     capability_proofs: CapabilityProofIndex,
-    /// Positive peer-routing evidence keyed by its complete canonical body.
-    peer_evidence: PeerEvidenceIndex,
-    /// Monotone local safety assertion binding this store to one team.
-    store_scope: Option<VerifyingKey>,
-}
-
-impl StoreScope for MemoryRepo {
-    type ScopeError = Infallible;
-
-    fn store_scope(&mut self) -> Result<Option<VerifyingKey>, StoreScopeError<Self::ScopeError>> {
-        Ok(self.store_scope)
-    }
-
-    fn bind_store_scope(
-        &mut self,
-        team: VerifyingKey,
-    ) -> Result<(), StoreScopeError<Self::ScopeError>> {
-        match self.store_scope {
-            None => {
-                self.store_scope = Some(team);
-                Ok(())
-            }
-            Some(bound) if bound == team => Ok(()),
-            Some(bound) => Err(StoreScopeError::conflict(bound, team)),
-        }
-    }
 }
 
 /// One O(1)-clone immutable observation of a [`MemoryRepo`].
 ///
 /// The blob snapshot and all semantic indexes are frozen together, so
-/// collection admission, capability verification, peer discovery, and payload
-/// decoding cannot observe different prefixes. Local wants and store scope are
-/// operational state and intentionally excluded.
+/// collection admission, capability verification, and payload decoding cannot
+/// observe different prefixes. Local wants are operational state and
+/// intentionally excluded.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemoryRepoSnapshot {
     blobs: MemoryBlobStoreSnapshot,
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
-    peer_evidence: PeerEvidenceIndex,
 }
 
 impl StoreSnapshot for MemoryRepoSnapshot {
@@ -105,9 +74,6 @@ impl StoreSnapshot for MemoryRepoSnapshot {
         if previous.capability_proofs != self.capability_proofs {
             changes = changes.union(StoreChanges::CAPABILITY_PROOFS);
         }
-        if previous.peer_evidence != self.peer_evidence {
-            changes = changes.union(StoreChanges::PEERS);
-        }
         changes
     }
 }
@@ -121,49 +87,7 @@ impl SnapshotSource for MemoryRepo {
             blobs: self.blobs.snapshot()?,
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
-            peer_evidence: self.peer_evidence.clone(),
         })
-    }
-}
-
-/// Deterministic persistent snapshot of in-memory peer evidence.
-pub struct MemoryPeerIter {
-    inner: crate::patch::PATCHIntoOrderedIterator<
-        PEER_EVIDENCE_BYTES_LEN,
-        IdentitySchema,
-        (),
-        XorSip128,
-    >,
-}
-
-impl Iterator for MemoryPeerIter {
-    type Item = Result<PeerEvidence, Infallible>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|bytes| {
-            Ok(PeerEvidence::from_bytes(bytes)
-                .expect("MemoryRepo only indexes validated peer evidence"))
-        })
-    }
-}
-
-impl PeerRead for MemoryRepoSnapshot {
-    type PeersError = Infallible;
-    type PeerIter<'a> = MemoryPeerIter;
-
-    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
-        Ok(MemoryPeerIter {
-            inner: self.peer_evidence.clone().into_iter_ordered(),
-        })
-    }
-}
-
-impl PeerStore for MemoryRepo {
-    type InsertError = Infallible;
-
-    fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
-        self.peer_evidence.insert(&Entry::new(evidence.as_bytes()));
-        Ok(())
     }
 }
 
@@ -846,19 +770,10 @@ mod tests {
             after_proof.changes_since(&after_record),
             StoreChanges::CAPABILITY_PROOFS,
         );
-
-        repo.insert_peer(PeerEvidence::new(
-            root.verifying_key(),
-            leaf.verifying_key(),
-        ))
-        .unwrap();
-        let after_peer = repo.snapshot().unwrap();
-        assert!(after_proof != after_peer);
-        assert_eq!(after_peer.changes_since(&after_proof), StoreChanges::PEERS,);
     }
 
     #[test]
-    fn snapshot_freezes_blob_collection_and_peer_reads_together() {
+    fn snapshot_freezes_blob_and_collection_reads_together() {
         use crate::blob::encodings::utf8string::UTF8String;
 
         let mut repo = MemoryRepo::default();
@@ -876,26 +791,12 @@ mod tests {
             handle(83).into(),
         ));
         repo.insert(record).unwrap();
-        let evidence = PeerEvidence::new(
-            SigningKey::from_bytes(&[84; 32]).verifying_key(),
-            SigningKey::from_bytes(&[85; 32]).verifying_key(),
-        );
-        repo.insert_peer(evidence).unwrap();
         let after = repo.snapshot().unwrap();
 
         assert!(!before.contains_blob(blob).unwrap());
         assert_eq!(before.record(record.id()).unwrap(), None);
-        assert!(before.peers().unwrap().next().is_none());
 
         assert!(after.contains_blob(blob).unwrap());
         assert_eq!(after.record(record.id()).unwrap(), Some(record));
-        assert_eq!(
-            after
-                .peers()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![evidence],
-        );
     }
 }

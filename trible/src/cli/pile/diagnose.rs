@@ -54,6 +54,9 @@ struct RecordEvidence {
     retired_derive_count: usize,
     retired_derive_first: Option<usize>,
     retired_derive_last: Option<usize>,
+    retired_team_count: usize,
+    retired_team_first: Option<usize>,
+    retired_team_last: Option<usize>,
     legacy_collection_count: usize,
     legacy_collection_first: Option<usize>,
     legacy_collection_last: Option<usize>,
@@ -97,6 +100,14 @@ fn scan_record_evidence(pile_path: &Path) -> Result<RecordEvidence> {
                 &mut evidence.retired_derive_last,
                 record.offset,
             ),
+            PileRecordContent::RetiredPeerEvidenceV1 | PileRecordContent::RetiredStoreScopeV1 => {
+                observe_offset(
+                    &mut evidence.retired_team_count,
+                    &mut evidence.retired_team_first,
+                    &mut evidence.retired_team_last,
+                    record.offset,
+                )
+            }
             _ => {}
         }
     }
@@ -184,6 +195,18 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                             .expect("nonzero evidence has a first offset"),
                         evidence
                             .retired_derive_last
+                            .expect("nonzero evidence has a last offset"),
+                    );
+                }
+                if evidence.retired_team_count != 0 {
+                    println!(
+                        "Recognized {} retired team-state record(s) (first byte {}, last byte {}); omitted from current state",
+                        evidence.retired_team_count,
+                        evidence
+                            .retired_team_first
+                            .expect("nonzero evidence has a first offset"),
+                        evidence
+                            .retired_team_last
                             .expect("nonzero evidence has a last offset"),
                     );
                 }
@@ -592,6 +615,12 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
         }
         PileRecordContent::RetiredCollectionDeriveV4 => {
             println!("  classification: retired-v4-collection-derive (inert)");
+        }
+        PileRecordContent::RetiredPeerEvidenceV1 => {
+            println!("  classification: retired-peer-evidence-v1 (inert)");
+        }
+        PileRecordContent::RetiredStoreScopeV1 => {
+            println!("  classification: retired-store-scope-v1 (inert)");
         }
         PileRecordContent::Opaque { kind } => {
             println!("  classification: opaque (semantically skipped)");

@@ -16,8 +16,6 @@ use crate::repo::BlobStoreMeta;
 use crate::repo::BlobStorePut;
 use crate::repo::CapabilityProofRead;
 use crate::repo::CapabilityProofStore;
-use crate::repo::PeerRead;
-use crate::repo::PeerStore;
 use crate::repo::SnapshotSource;
 use crate::repo::StorageFlush;
 use crate::repo::StoreChanges;
@@ -42,8 +40,8 @@ pub struct HybridStore<B, R> {
 /// One immutable, dependency-consistent observation of both halves of a
 /// [`HybridStore`].
 ///
-/// Blob capabilities come exclusively from `blobs`; collection, proof, and
-/// peer capabilities come exclusively from `records`. Wants remain mutable
+/// Blob capabilities come exclusively from `blobs`; collection and proof
+/// capabilities come exclusively from `records`. Wants remain mutable
 /// local operational state and are intentionally absent. The record
 /// half is sampled first and the blob half second, mirroring dependency-first
 /// publication: every semantic record observed by a conforming writer can
@@ -71,7 +69,6 @@ where
         for component in [
             StoreChanges::COLLECTION_RECORDS,
             StoreChanges::CAPABILITY_PROOFS,
-            StoreChanges::PEERS,
         ] {
             if record_changes.contains(component) {
                 changes = changes.union(component);
@@ -347,21 +344,6 @@ where
     }
 }
 
-impl<B, R> PeerRead for HybridSnapshot<B, R>
-where
-    R: PeerRead,
-{
-    type PeersError = R::PeersError;
-    type PeerIter<'a>
-        = R::PeerIter<'a>
-    where
-        Self: 'a;
-
-    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
-        self.records.peers()
-    }
-}
-
 impl<B, R> CollectionStore for HybridStore<B, R>
 where
     R: CollectionStore,
@@ -381,20 +363,6 @@ where
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         self.records.insert_proof(proof)
-    }
-}
-
-impl<B, R> PeerStore for HybridStore<B, R>
-where
-    R: PeerStore,
-{
-    type InsertError = R::InsertError;
-
-    fn insert_peer(
-        &mut self,
-        evidence: crate::repo::peer::PeerEvidence,
-    ) -> Result<(), Self::InsertError> {
-        self.records.insert_peer(evidence)
     }
 }
 

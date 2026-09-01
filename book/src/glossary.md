@@ -142,7 +142,7 @@ idempotent by intrinsic record ID; combining two stores is set union.
 ### Store Snapshot
 One immutable, coherent known-prefix observation produced by
 `SnapshotSource::snapshot`. A snapshot owns all blob, collection-record,
-capability-proof, and peer-evidence reads for that prefix and implements
+and capability-proof reads for that prefix and implements
 `StoreSnapshot::changes_since` for conservative local invalidation. Collection
 admission produces a semantic `Cover<E>` from it; `Cover::available` returns
 the greatest semantic subset with a complete resident realization; and
@@ -222,8 +222,9 @@ segments relevant to their bindings, further described in
 
 ### Pile
 An append-only collection of blobs, native collection records, native
-capability proofs, WANT records, and possibly legacy peer-routing evidence
-stored in one file. Piles are memory
+capability proofs, WANT records, and legacy pin evidence stored in one file.
+Retired PEER and STORE_SCOPE records remain structurally readable but do not
+enter repository state and disappear under semantic compaction. Piles are memory
 mapped, recoverable after interrupted appends, and mergeable by byte
 concatenation. Legacy pin records remain decodable only for conservative
 retention and explicit migration.

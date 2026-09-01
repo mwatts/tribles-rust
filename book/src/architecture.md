@@ -264,8 +264,9 @@ Bootstrap peers are process configuration. Gossip origins, DHT referrals,
 connection liveness, provider leases, and backoff are bounded process-local
 state. Restarting may forget them without changing a collection, and none of
 them authorize a peer, promise content residency, or retain a blob. Historical
-PEER records remain physically decodable for old piles but do not participate
-in current synchronization.
+PEER and STORE_SCOPE records remain physically decodable for old piles but do
+not participate in current synchronization or repository snapshots; semantic
+rewrites drop them.
 
 ## Storage and synchronization compose by union
 

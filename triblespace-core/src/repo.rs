@@ -1,7 +1,6 @@
 #![allow(clippy::type_complexity)]
 //! Content-addressed blob storage, complete capability proofs, collection
-//! records, positive peer-routing evidence, durable wants,
-//! and read-only access to legacy named-pin snapshots.
+//! records, durable wants, and read-only access to legacy named-pin snapshots.
 //!
 //! Collections are the mutable-history replacement. Legacy pin and commit
 //! encodings remain readable so existing piles can be migrated and retained,
@@ -20,17 +19,11 @@ pub mod memoryrepo;
 #[cfg(feature = "object-store")]
 /// Storage backed by an `object_store`-compatible remote (S3, local FS, etc.).
 pub mod objectstore;
-/// Grow-only native storage for positive peer-routing evidence.
-pub mod peer;
 /// Local file-based pile storage backend.
 pub mod pile;
-pub use peer::{PeerRead, PeerStore};
 /// Grow-only native storage for complete capability proofs.
 pub mod proof;
 pub use proof::{CapabilityProofRead, CapabilityProofStore};
-/// Monotone local binding between one physical store and one network team.
-pub mod scope;
-pub use scope::{StoreScope, StoreScopeError};
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 
@@ -85,12 +78,9 @@ impl StoreChanges {
     pub const COLLECTION_RECORDS: Self = Self(1 << 1);
     /// Complete capability proofs may have changed.
     pub const CAPABILITY_PROOFS: Self = Self(1 << 2);
-    /// Peer-routing evidence may have changed.
-    pub const PEERS: Self = Self(1 << 3);
     /// Every sync-visible component may have changed.
-    pub const ALL: Self = Self(
-        Self::BLOBS.0 | Self::COLLECTION_RECORDS.0 | Self::CAPABILITY_PROOFS.0 | Self::PEERS.0,
-    );
+    pub const ALL: Self =
+        Self(Self::BLOBS.0 | Self::COLLECTION_RECORDS.0 | Self::CAPABILITY_PROOFS.0);
 
     /// Whether every bit in `change` is present.
     pub const fn contains(self, change: Self) -> bool {
@@ -128,9 +118,8 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
 /// A mutable store which can freeze one immutable read observation.
 ///
 /// Every semantic read capability implemented by a store shares this one
-/// associated snapshot. This prevents blob bytes, collection records,
-/// capability proofs, and peer evidence from being sampled at subtly
-/// different prefixes. A snapshot may additionally carry a live operational
+/// associated snapshot. This prevents blob bytes, collection records, and
+/// capability proofs from being sampled at subtly different prefixes. A snapshot may additionally carry a live operational
 /// acquisition capability; fetched bytes join only a later observation and
 /// remain outside `changes_since` until then.
 pub trait SnapshotSource {
@@ -413,13 +402,7 @@ where
 
 /// Immutable read surface of a complete repository snapshot.
 pub trait StoreRead:
-    StoreSnapshot
-    + BlobStoreGet
-    + BlobStoreList
-    + BlobStoreMeta
-    + CollectionRead
-    + CapabilityProofRead
-    + PeerRead
+    StoreSnapshot + BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead + CapabilityProofRead
 {
 }
 
@@ -430,19 +413,18 @@ impl<R> StoreRead for R where
         + BlobStoreMeta
         + CollectionRead
         + CapabilityProofRead
-        + PeerRead
 {
 }
 
 /// Mutable repository whose semantic reads all share one snapshot.
 pub trait Store:
-    BlobStore + CollectionStore + CapabilityProofStore + PeerStore + SnapshotSource<Snapshot: StoreRead>
+    BlobStore + CollectionStore + CapabilityProofStore + SnapshotSource<Snapshot: StoreRead>
 {
 }
 
 impl<S> Store for S
 where
-    S: BlobStore + CollectionStore + CapabilityProofStore + PeerStore + SnapshotSource,
+    S: BlobStore + CollectionStore + CapabilityProofStore + SnapshotSource,
     S::Snapshot: StoreRead,
 {
 }

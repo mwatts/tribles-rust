@@ -17,9 +17,6 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anybytes::Bytes;
-use ed25519_dalek::VerifyingKey;
-
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
@@ -30,8 +27,8 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, PATCH};
+use anybytes::Bytes;
 
-use super::peer::{PeerEvidence, PeerRead, PeerStore};
 use super::pile::{
     CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError, Pile,
     PileSnapshot, PileWriteError, ReadError,
@@ -39,8 +36,8 @@ use super::pile::{
 use super::proof::{CapabilityProofRead, CapabilityProofStore};
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    RetentionRoots, SnapshotSource, StorageClose, StoreChanges, StoreScope, StoreScopeError,
-    StoreSnapshot, TransferError, WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
+    RetentionRoots, SnapshotSource, StorageClose, StoreChanges, StoreSnapshot, TransferError,
+    WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -532,11 +529,11 @@ impl Yard {
     /// generation's live PATCH set, so evicted blobs stop being readable through
     /// Yard readers, but they do not mutate the underlying append-only pile
     /// files. `reclaim` is the explicit physical step. For each generation it
-    /// writes the current live handles, every native collection record, every
-    /// canonical complete proof, and every positive peer-routing fact to a
-    /// sibling temporary pile, closes both piles, atomically renames the
-    /// temporary file over the original on the same filesystem, and reopens
-    /// the generation.
+    /// writes the current live handles, every native collection record, and
+    /// every canonical complete proof to a sibling temporary pile, closes both
+    /// piles, atomically renames the temporary file over the original on the
+    /// same filesystem, and reopens the generation. Recognized retired PEER
+    /// and STORE_SCOPE records are deliberately omitted.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         let opaque_records = self.opaque_record_count().map_err(YardReclaimError::Pile)?;
         if opaque_records != 0 {
@@ -726,41 +723,6 @@ impl Yard {
     }
 }
 
-impl StoreScope for Yard {
-    type ScopeError = PileWriteError;
-
-    fn store_scope(&mut self) -> Result<Option<VerifyingKey>, StoreScopeError<Self::ScopeError>> {
-        let mut observed = None;
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                let Some(team) = segment.pile_mut().store_scope()? else {
-                    continue;
-                };
-                match observed {
-                    None => observed = Some(team),
-                    Some(bound) if bound == team => {}
-                    Some(bound) => return Err(StoreScopeError::conflict(bound, team)),
-                }
-            }
-        }
-        Ok(observed)
-    }
-
-    fn bind_store_scope(
-        &mut self,
-        team: VerifyingKey,
-    ) -> Result<(), StoreScopeError<Self::ScopeError>> {
-        match self.store_scope()? {
-            Some(bound) if bound == team => Ok(()),
-            Some(bound) => Err(StoreScopeError::conflict(bound, team)),
-            None => self.generations[0]
-                .active_mut()
-                .pile_mut()
-                .bind_store_scope(team),
-        }
-    }
-}
-
 /// Deterministic owned snapshot of the native collection records visible
 /// across all yard generations.
 pub struct YardCollectionRecordIter {
@@ -846,47 +808,6 @@ impl Error for YardCapabilityProofError {
             Self::Pile(error) => Some(error),
             Self::IdCollision { .. } => None,
         }
-    }
-}
-
-/// Deterministic union of peer-routing evidence across yard segments.
-pub struct YardPeerIter {
-    inner: std::collections::btree_set::IntoIter<PeerEvidence>,
-}
-
-impl Iterator for YardPeerIter {
-    type Item = Result<PeerEvidence, ReadError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Ok)
-    }
-}
-
-impl PeerRead for YardSnapshot {
-    type PeersError = ReadError;
-    type PeerIter<'a> = YardPeerIter;
-
-    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
-        let mut peers = BTreeSet::new();
-        for generation in &self.generations {
-            for evidence in generation.snapshot.peers()? {
-                peers.insert(evidence?);
-            }
-        }
-        Ok(YardPeerIter {
-            inner: peers.into_iter(),
-        })
-    }
-}
-
-impl PeerStore for Yard {
-    type InsertError = PileWriteError;
-
-    fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
-        self.generations[0]
-            .active_mut()
-            .pile_mut()
-            .insert_peer(evidence)
     }
 }
 
@@ -1437,11 +1358,6 @@ where
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
-    let peer_evidence = reader
-        .peers()
-        .map_err(YardReclaimError::Pile)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
     let handles: Vec<_> = live
@@ -1457,15 +1373,16 @@ where
         .preserve_legacy_collection_headers_into(&mut new_pile)
         .map_err(YardReclaimError::CollectionRecord)?;
     before_final_guard();
-    // Scope conflict and opaque-record refusal must come from one final source
-    // refresh. An opaque addition observed while checking scope must not escape
-    // an earlier opaque count and then be projected away by the rewrite.
-    let (store_scope, opaque_records) = match old_pile.physical_rewrite_guard() {
+    // Opaque-record refusal must come from one final source refresh. An opaque
+    // addition observed here must not escape an earlier count and then be
+    // projected away by the rewrite. Retired team records are known inert and
+    // are intentionally dropped.
+    let opaque_records = match old_pile.physical_rewrite_guard() {
         Ok(guard) => guard,
         Err(error) => {
             let _ = new_pile.close();
             let _ = old_pile.close();
-            return Err(YardReclaimError::StoreScope(error));
+            return Err(YardReclaimError::Pile(error));
         }
     };
     if opaque_records != 0 {
@@ -1474,11 +1391,6 @@ where
         return Err(YardReclaimError::OpaqueRecords {
             count: opaque_records,
         });
-    }
-    if let Some(team) = store_scope {
-        new_pile
-            .bind_store_scope(team)
-            .map_err(YardReclaimError::StoreScope)?;
     }
     for record in collection_records {
         new_pile
@@ -1489,11 +1401,6 @@ where
         new_pile
             .insert_proof(proof)
             .map_err(YardReclaimError::CapabilityProof)?;
-    }
-    for evidence in peer_evidence {
-        new_pile
-            .insert_peer(evidence)
-            .map_err(YardReclaimError::PeerEvidence)?;
     }
     new_pile.close().map_err(YardReclaimError::Close)?;
     drop(reader);
@@ -1656,10 +1563,6 @@ pub enum YardReclaimError {
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
     CapabilityProof(CapabilityProofInsertError),
-    /// Positive peer-routing evidence could not be copied.
-    PeerEvidence(PileWriteError),
-    /// The generation's local team scope conflicted or could not be copied.
-    StoreScope(StoreScopeError<PileWriteError>),
     Close(super::pile::FlushError),
     WantMarkers(std::io::Error),
     /// A generation rewrite failed (`primary`) and the subsequent
@@ -1691,10 +1594,6 @@ impl fmt::Display for YardReclaimError {
             Self::CapabilityProof(err) => {
                 write!(f, "failed to copy a yard capability proof: {err}")
             }
-            Self::PeerEvidence(err) => {
-                write!(f, "failed to copy yard peer-routing evidence: {err}")
-            }
-            Self::StoreScope(err) => write!(f, "failed to copy yard store scope: {err}"),
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WantMarkers(err) => {
                 write!(f, "failed to re-record want markers: {err}")
@@ -1798,109 +1697,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first_delta, vec![first.raw]);
         assert_eq!(second_delta, vec![second.raw]);
-    }
-
-    #[test]
-    fn yard_store_scope_is_idempotent_and_survives_reclaim_and_reopen() {
-        let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
-        let team = SigningKey::from_bytes(&[71; 32]).verifying_key();
-        let other = SigningKey::from_bytes(&[72; 32]).verifying_key();
-
-        assert_eq!(yard.store_scope().unwrap(), None);
-        yard.bind_store_scope(team).unwrap();
-        yard.bind_store_scope(team).unwrap();
-        assert_eq!(yard.store_scope().unwrap(), Some(team));
-        assert!(matches!(
-            yard.bind_store_scope(other),
-            Err(StoreScopeError::Conflict { .. })
-        ));
-
-        yard.reclaim().unwrap();
-        assert_eq!(yard.store_scope().unwrap(), Some(team));
-        yard.close().unwrap();
-
-        let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
-        assert_eq!(reopened.store_scope().unwrap(), Some(team));
-        reopened.close().unwrap();
-    }
-
-    #[test]
-    fn peer_evidence_unions_generations_and_survives_reclaim_and_reopen() {
-        let config = YardConfig::default();
-        let (_dir, paths, mut yard) = yard_with_paths(2, config);
-        let team = SigningKey::from_bytes(&[81; 32]).verifying_key();
-        let old_peer = SigningKey::from_bytes(&[82; 32]).verifying_key();
-        let young_peer = SigningKey::from_bytes(&[83; 32]).verifying_key();
-        let old = PeerEvidence::new(team, old_peer);
-        let young = PeerEvidence::new(team, young_peer);
-
-        yard.generations[1]
-            .active_mut()
-            .pile_mut()
-            .insert_peer(old)
-            .unwrap();
-        yard.insert_peer(young).unwrap();
-        let mut expected = vec![old, young];
-        expected.sort_unstable();
-
-        let snapshot = yard.snapshot().unwrap();
-        assert_eq!(
-            snapshot
-                .peers()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            expected
-        );
-        drop(snapshot);
-
-        yard.reclaim().unwrap();
-        let snapshot = yard.snapshot().unwrap();
-        assert_eq!(
-            snapshot
-                .peers()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            expected
-        );
-        drop(snapshot);
-        yard.close().unwrap();
-
-        let mut reopened = Yard::open(paths, config).unwrap();
-        let snapshot = reopened.snapshot().unwrap();
-        assert_eq!(
-            snapshot
-                .peers()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            expected
-        );
-        drop(snapshot);
-        reopened.close().unwrap();
-    }
-
-    #[test]
-    fn yard_observation_rejects_different_generation_scopes() {
-        let (_dir, mut yard) = yard_with(2, YardConfig::default());
-        let first = SigningKey::from_bytes(&[73; 32]).verifying_key();
-        let second = SigningKey::from_bytes(&[74; 32]).verifying_key();
-        yard.generations[0]
-            .active_mut()
-            .pile_mut()
-            .bind_store_scope(first)
-            .unwrap();
-        yard.generations[1]
-            .active_mut()
-            .pile_mut()
-            .bind_store_scope(second)
-            .unwrap();
-        assert!(matches!(
-            yard.store_scope(),
-            Err(StoreScopeError::Conflict { .. })
-        ));
-        yard.close().unwrap();
     }
 
     #[test]

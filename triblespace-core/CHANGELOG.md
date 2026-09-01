@@ -107,15 +107,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Replace split Reader and revision APIs with `SnapshotSource` and one coherent
   immutable `StoreSnapshot`. Blob access, collection records, capability
-  proofs, and PEER evidence are frozen together. `changes_since` defaults to
+  proofs are frozen together. `changes_since` defaults to
   conservative full invalidation, while `MemoryRepo`, `Pile`, and `Yard`
   compare persistent component PATCHes directly. `BLOBS` covers membership,
   metadata, and retrievability; Pile's lineage-local root-sharing comparison
   catches same-handle backing replacement while ignoring unrelated appended
   records, even though semantic PATCH equality intentionally hashes keys, not
   attached storage offsets. Yard retention planning now uses one snapshot for
-  opaque-record refusal, live membership, commits, and proofs, and physical
-  rewrites preserve peer evidence alongside collections, proofs, and offers.
+  opaque-record refusal, live membership, commits, and proofs.
+
+- Remove the obsolete `PeerRead`, `PeerStore`, and `StoreScope` repository
+  surfaces and their Pile, Yard, Hybrid, Lazy, and MemoryRepo state. Historical
+  framed PEER and STORE_SCOPE records decode as known inert records so old
+  piles still open, while semantic rewrites omit them and continue to refuse
+  unknown kinds.
 
 ## [0.41.4] - 2026-05-17
 

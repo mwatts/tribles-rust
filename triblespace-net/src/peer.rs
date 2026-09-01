@@ -26,8 +26,8 @@ use triblespace_core::patch::{Entry as PatchEntry, PATCH};
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    CapabilityProofRead, CapabilityProofStore, PeerRead, SnapshotSource, StorageFlush,
-    StoreChanges, StoreRead, StoreSnapshot as CoreStoreSnapshot, WantRequest, WantStore,
+    CapabilityProofRead, CapabilityProofStore, SnapshotSource, StorageFlush, StoreChanges,
+    StoreRead, StoreSnapshot as CoreStoreSnapshot, WantRequest, WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
@@ -826,21 +826,6 @@ where
 
     fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
         self.local.proofs()
-    }
-}
-
-impl<L> PeerRead for PeerSnapshot<L>
-where
-    L: PeerRead,
-{
-    type PeersError = L::PeersError;
-    type PeerIter<'a>
-        = L::PeerIter<'a>
-    where
-        Self: 'a;
-
-    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
-        self.local.peers()
     }
 }
 

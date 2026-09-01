@@ -197,8 +197,8 @@ collection commits or publishing anything.
 ## Known-prefix snapshots and covers
 
 `store.snapshot()` freezes one immutable observation containing blob bytes,
-collection records, capability proofs, and peer evidence from the same known
-prefix. A collection then performs admission against that observation:
+collection records, and capability proofs from the same known prefix. A
+collection then performs admission against that observation:
 
 ```rust,ignore
 let snapshot = store.snapshot()?;

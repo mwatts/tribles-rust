@@ -48,10 +48,10 @@ pub enum PileCommand {
     /// Repack one pile into a fresh file without garbage-collecting blobs.
     ///
     /// Every distinct valid blob is retained. Exact duplicate blob,
-    /// collection, proof, and peer records collapse through their native set
-    /// identities; active WANTs, legacy pin state, and the unique store scope
-    /// are projected once. All distinct current native COMMIT/MERGE/DERIVE
-    /// records remain.
+    /// collection, and proof records collapse through their native set
+    /// identities; active WANTs and legacy pin state are projected once. All
+    /// distinct current native COMMIT/MERGE/DERIVE records remain. Retired
+    /// PEER and STORE_SCOPE records are recognized and dropped.
     /// The source is never modified, the destination must not exist, and
     /// opaque record kinds make the operation fail rather than guess at their
     /// semantics. Quiesce writers when the output must cover the exact whole

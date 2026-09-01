@@ -93,8 +93,7 @@ use crate::capability::CapabilityProof;
 use crate::collection::{CollectionRead, CollectionRecord, CollectionStore};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
-use crate::repo::peer::PeerEvidence;
-use crate::repo::{CapabilityProofRead, CapabilityProofStore, PeerRead, PeerStore};
+use crate::repo::{CapabilityProofRead, CapabilityProofStore};
 
 use super::async_store::{
     AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut, AsyncSnapshotSource,
@@ -433,20 +432,6 @@ where
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         self.store.lock().expect("store mutex").insert_proof(proof)
-    }
-}
-
-impl<S> PeerStore for Lazy<S>
-where
-    S: PeerStore,
-{
-    type InsertError = S::InsertError;
-
-    fn insert_peer(&mut self, evidence: PeerEvidence) -> Result<(), Self::InsertError> {
-        self.store
-            .lock()
-            .expect("store mutex")
-            .insert_peer(evidence)
     }
 }
 
@@ -890,22 +875,6 @@ where
 
     fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
         self.local.proofs()
-    }
-}
-
-impl<S> PeerRead for LazySnapshot<S>
-where
-    S: SnapshotSource + WantStore + StorageFlush + Send + 'static,
-    S::Snapshot: PeerRead,
-{
-    type PeersError = <S::Snapshot as PeerRead>::PeersError;
-    type PeerIter<'a>
-        = <S::Snapshot as PeerRead>::PeerIter<'a>
-    where
-        Self: 'a;
-
-    fn peers<'a>(&'a self) -> Result<Self::PeerIter<'a>, Self::PeersError> {
-        self.local.peers()
     }
 }
 

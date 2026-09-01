@@ -42,6 +42,17 @@ pub const KIND_PILE_RECORD: Id = id_hex!("29D9F7F6B5062623F65D63DBF4F633B3");
 /// Canonical 32-byte name of one record kind: the handle of its description.
 pub type RecordKind = Inline<Handle<SimpleArchive>>;
 
+/// Historical PEER record kind, retained only so old piles can cross it as a
+/// known inert frame. Fresh piles do not publish or write this retired kind.
+pub const KIND_PEER_EVIDENCE: RawInline =
+    hex_literal::hex!("327FFCAAA3F5A10424DC2059E3A7A3517F837E7E56A3C850979EFA9F5E3A1ED7");
+
+/// Historical STORE_SCOPE record kind, retained only so old piles can cross it
+/// as a known inert frame. Fresh piles do not publish or write this retired
+/// kind.
+pub const KIND_STORE_SCOPE: RawInline =
+    hex_literal::hex!("97C69C746D01741C8012A56F08D2C424E0291B5424EB9CD7637FD4A655C93DFB");
+
 /// Archive one description fragment and take its content identity.
 ///
 /// Only the fragment's facts are archived, exactly as a collection descriptor
@@ -86,7 +97,7 @@ macro_rules! record_kinds {
             }
         )*
 
-        /// Every record kind this reader knows, as `(handle, description)`.
+        /// Every record kind this binary writes, as `(handle, description)`.
         ///
         /// The order is the declaration order above and is stable.
         pub fn described_kinds() -> Vec<(RawInline, Fragment)> {
@@ -164,25 +175,9 @@ record_kinds! {
         "pile-auth-proof-v1",
         "A canonical complete capability proof in K(S,C,K)+ order. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with the 32-byte root Ed25519 public key, followed by one or more 128-byte edges: a 64-byte Ed25519 signature, a 32-byte SimpleArchive claim handle, and the next 32-byte public key. The declared length is exactly 32 + 128n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id.";
 
-    /// Positive peer-routing evidence.
-    ///
-    /// Kind/schema id minted with `trible genid` on 2026-08-26.
-    PeerEvidenceRecordV1 = KIND_ID_PEER_EVIDENCE "E25B4427F30DCE7B36F3F80BB38E375A",
-        KIND_PEER_EVIDENCE "327FFCAAA3F5A10424DC2059E3A7A3517F837E7E56A3C850979EFA9F5E3A1ED7",
-        "pile-peer-v1",
-        "Positive routing evidence PEER(team_public_key, peer_public_key). Envelope bytes 64..96 hold the 32-byte Ed25519 team trust-root public key, 96..128 the 32-byte Ed25519 peer public key, and 128..256 are zeros. The record spans exactly one 256-byte block and has no payload. Presence grants no authority, liveness, reachability, residency, or retention semantics; no inverse or retraction record exists.";
-
-    /// Monotone local binding between this physical store and one team.
-    ///
-    /// Kind/schema id minted with `trible genid` on 2026-08-26.
-    StoreScopeRecordV1 = KIND_ID_STORE_SCOPE "EDDEDAF4E20AF86EC63A7F1F044E2D4A",
-        KIND_STORE_SCOPE "97C69C746D01741C8012A56F08D2C424E0291B5424EB9CD7637FD4A655C93DFB",
-        "pile-store-scope-v1",
-        "Monotone local safety assertion STORE_SCOPE(team_public_key). Envelope bytes 64..96 hold exactly one 32-byte Ed25519 team trust-root public key and 96..256 are zeros. The record spans exactly one 256-byte block and has no payload. Repeating the same assertion is idempotent; observing two distinct keys is a semantic conflict and network assembly must fail closed. This assertion is neither authorization nor peer, collection, proof, or blob inventory and is never gossiped.";
-
 }
 
-/// Every blob needed to resolve every known record kind.
+/// Every blob needed to resolve every record kind this binary writes.
 ///
 /// This is the description archives themselves plus the name and layout
 /// strings they reference by handle. Publishing all of them into a pile makes
@@ -235,10 +230,15 @@ mod tests {
                     .collect::<String>()
             );
         }
-        assert_eq!(
-            KIND_ID_PEER_EVIDENCE,
-            crate::repo::peer::KIND_PEER_EVIDENCE,
-            "PEER's dense semantic kind and pile description root must stay identical"
-        );
+    }
+
+    #[test]
+    fn retired_team_kinds_are_not_published_as_writable_formats() {
+        let writable = described_kinds()
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect::<BTreeSet<_>>();
+        assert!(!writable.contains(&KIND_PEER_EVIDENCE));
+        assert!(!writable.contains(&KIND_STORE_SCOPE));
     }
 }
