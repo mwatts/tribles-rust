@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep `Cover<E>` as the sole public collection-lattice value and add checked
+  PATCH-backed union, intersection, difference, and subset operations. Replace
+  public physical `resolve` with `available`, which returns the greatest subset
+  of requested semantic members having a complete resident realization, and
+  `materialize`, which selects a support-equivalent physical decomposition
+  privately through the supplied snapshot before invoking the typed view.
+
 - Return exact empty NVFP4 search results before query preparation or scanner
   execution when a cover has no logical rows, and document that Mary scan
   segments receive the persisted reconstruction-norm and error-certificate
@@ -359,9 +366,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PileSnapshot` compares persistent PATCH roots per component, including
   value-only root replacement, while unrelated append-only records remain a
   no-op. Collection reads now follow
-  `collection.admitted(&snapshot) -> cover.resolve(&snapshot) ->
-  TryFromCover::try_from_cover(&physical, &snapshot)`, with
-  `collection.read(&snapshot)` as the convenience path.
+  `collection.admitted(&snapshot) -> cover.materialize(&snapshot)`, with
+  `cover.available(&snapshot)` exposing resident support in semantic
+  coordinates and `collection.read(&snapshot)` as the convenience path.
 
 - Replace the unpublished commit-bearing `CollectionTicket`, `store.ticket`,
   and `exact_ticket_additions` surfaces with one opaque PATCH-backed `Cover`
@@ -1201,8 +1208,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ordinary collections now consume coherent store snapshots.**
   `store.snapshot()` freezes every read surface at one prefix;
   `collection.admitted(&snapshot)` discovers the authority-approved semantic
-  cover, `cover.resolve(&snapshot)` selects a resident physical cover, and
-  `TryFromCover` constructs the logical value without crossing observations.
+  cover, and `cover.materialize(&snapshot)` privately selects resident physical
+  support before constructing the logical value without crossing observations.
   Later physically visible blobs cannot alter that authority frontier.
 - **New pile writes use a generic, length-delimited record envelope.** The
   envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` was minted with

@@ -5,9 +5,7 @@ use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, UnionA
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
-use triblespace_core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, TryFromCover,
-};
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::SnapshotSource;
@@ -83,7 +81,9 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
 
     let snapshot = store.snapshot().unwrap();
-    let materialized = UnionArchive::<OrderedUniverse>::try_from_cover(&cover, &snapshot).unwrap();
+    let materialized = cover
+        .materialize::<UnionArchive<OrderedUniverse>, _>(&snapshot)
+        .unwrap();
     assert_eq!(materialized.segment_count(), 1);
     assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
 }

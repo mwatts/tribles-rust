@@ -36,8 +36,9 @@ use crate::repo::{CapabilityProofStore, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
-    discover_collection_claims_for_cover, discover_collection_equations_for_cover, ExactCoverError,
+    discover_collection_claims_for_cover, discover_collection_equations_for_cover,
 };
+use super::encoding::{collection_member_availability, CollectionMemberAvailability};
 use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
@@ -45,9 +46,9 @@ use super::{
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
     CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
     CollectionFunctionalConflict, CollectionHandle, CollectionOperationError, CollectionRead,
-    CollectionResolutionError, CollectionStore, CollectionTypeError, CollectionValidationRequest,
-    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ,
-    ACTION_WRITE,
+    CollectionResolutionError, CollectionSemantics, CollectionStore, CollectionTypeError,
+    CollectionValidationRequest, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover,
+    TryFromCoverError, ACTION_READ, ACTION_WRITE,
 };
 use super::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
 
@@ -458,6 +459,49 @@ impl<L: CollectionEncoding> Cover<L> {
         self.members.is_empty()
     }
 
+    fn ensure_same_collection(&self, other: &Self) -> Result<(), CoverAlgebraError> {
+        if self.collection == other.collection {
+            Ok(())
+        } else {
+            Err(CoverAlgebraError::DifferentCollection {
+                left: self.collection.handle(),
+                right: other.collection.handle(),
+            })
+        }
+    }
+
+    /// Return the set union of two points in the same collection lattice.
+    pub fn union(&self, other: &Self) -> Result<Self, CoverAlgebraError> {
+        self.ensure_same_collection(other)?;
+        let mut members = self.members.clone();
+        members.union(other.members.clone());
+        Ok(Self::from_patch(self.collection, members))
+    }
+
+    /// Return the set intersection of two points in the same collection lattice.
+    pub fn intersection(&self, other: &Self) -> Result<Self, CoverAlgebraError> {
+        self.ensure_same_collection(other)?;
+        Ok(Self::from_patch(
+            self.collection,
+            self.members.intersect(&other.members),
+        ))
+    }
+
+    /// Return the members of `self` absent from `other`.
+    pub fn difference(&self, other: &Self) -> Result<Self, CoverAlgebraError> {
+        self.ensure_same_collection(other)?;
+        Ok(Self::from_patch(
+            self.collection,
+            self.members.difference(&other.members),
+        ))
+    }
+
+    /// Whether every member of `self` is present in `other`.
+    pub fn is_subset(&self, other: &Self) -> Result<bool, CoverAlgebraError> {
+        self.ensure_same_collection(other)?;
+        Ok(self.members.difference(&other.members).is_empty())
+    }
+
     /// Return the members added since an earlier observation.
     ///
     /// This is PATCH set difference over payload identities. A new signature
@@ -513,6 +557,85 @@ impl<L: CollectionEncoding> Eq for Cover<L> {}
 
 /// Typed exact cover of the canonical fact collection.
 pub type FactCover = Cover<SimpleArchive>;
+
+/// Failure to combine covers from distinct collection lattices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoverAlgebraError {
+    /// The operands carry different canonical collection descriptors.
+    DifferentCollection {
+        /// Descriptor carried by the left operand.
+        left: CollectionHandle,
+        /// Descriptor carried by the right operand.
+        right: CollectionHandle,
+    },
+}
+
+impl fmt::Display for CoverAlgebraError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DifferentCollection { left, right } => write!(
+                formatter,
+                "cover collection {} differs from {}",
+                hex::encode_upper(left.raw),
+                hex::encode_upper(right.raw),
+            ),
+        }
+    }
+}
+
+impl Error for CoverAlgebraError {}
+
+/// Failure to determine the greatest resident subset of a semantic cover.
+///
+/// An absent or representation-incomplete blob is ordinary unavailability,
+/// not an error. These variants mean the immutable snapshot itself could not
+/// be observed coherently or its stored equations were contradictory.
+#[derive(Debug)]
+pub enum CoverAvailabilityError<RecordsError, MetaError> {
+    /// Native collection-record discovery did not complete.
+    Discovery(CollectionDiscoveryError<RecordsError>),
+    /// Blob residency could not be observed for one semantic member.
+    Metadata {
+        /// Exact member whose residency was being inspected.
+        member: CollectionData,
+        /// Backend metadata failure.
+        source: MetaError,
+    },
+    /// Stored equations contradicted operation functionality.
+    ResolutionConflict(Box<CollectionFunctionalConflict>),
+}
+
+impl<RecordsError, MetaError> fmt::Display for CoverAvailabilityError<RecordsError, MetaError>
+where
+    RecordsError: fmt::Display,
+    MetaError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(source) => source.fmt(formatter),
+            Self::Metadata { member, source } => write!(
+                formatter,
+                "failed to inspect residency of collection member {}: {source}",
+                hex::encode_upper(member.raw),
+            ),
+            Self::ResolutionConflict(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<RecordsError, MetaError> Error for CoverAvailabilityError<RecordsError, MetaError>
+where
+    RecordsError: Error + 'static,
+    MetaError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Discovery(source) => Some(source),
+            Self::Metadata { source, .. } => Some(source),
+            Self::ResolutionConflict(source) => Some(source),
+        }
+    }
+}
 
 /// Failure to treat two covers as one additions-only continuation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -651,8 +774,6 @@ pub enum CollectionMaterializationError<
     Evidence(EvidenceError),
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
-    /// A supplied exact cover names the wrong collection descriptor.
-    ExactCover(ExactCoverError),
     /// The cover's canonical descriptor blob could not be fetched.
     DescriptorGet {
         /// Canonical collection-descriptor handle.
@@ -687,7 +808,7 @@ pub enum CollectionMaterializationError<
     ResolutionConflict(Box<CollectionFunctionalConflict>),
     /// No resident physical cover spans every semantic obligation.
     Missing {
-        /// Uncovered members of the collection's semantic frontier.
+        /// Requested semantic members lacking a complete resident realization.
         obligations: BTreeSet<CollectionData>,
         /// Named immutable representation dependencies which would make an
         /// otherwise useful resident member complete.
@@ -768,7 +889,6 @@ where
         match self {
             Self::Evidence(source) => source.fmt(f),
             Self::Discovery(source) => source.fmt(f),
-            Self::ExactCover(source) => write!(f, "invalid exact cover: {source}"),
             Self::DescriptorGet { collection, source } => write!(
                 f,
                 "failed to fetch collection descriptor {}: {source}",
@@ -796,7 +916,7 @@ where
             } => {
                 write!(
                     f,
-                    "{} semantic frontier obligation(s) have no complete resident physical cover",
+                    "{} requested semantic member(s) have no complete resident realization",
                     obligations.len(),
                 )?;
                 if !dependencies.is_empty() {
@@ -825,7 +945,6 @@ where
         match self {
             Self::Evidence(source) => Some(source),
             Self::Discovery(source) => Some(source),
-            Self::ExactCover(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
             Self::InvalidDescriptor { source, .. } => Some(source),
             Self::MemberGet { source, .. } => Some(source),
@@ -1356,8 +1475,9 @@ impl<L: CollectionEncoding> Collection<L> {
     /// Discover the exact payload cover admitted at `instant`.
     ///
     /// The result is the semantic COMMIT frontier. It deliberately does not
-    /// substitute resident MERGE results; call [`Cover::resolve`] when a
-    /// physical cover is needed.
+    /// expose a replaceable physical decomposition. Use [`Cover::available`]
+    /// to inspect resident semantic support or [`Cover::materialize`] to
+    /// construct a logical value through this same snapshot.
     pub fn admitted_at<S>(
         self,
         snapshot: &S,
@@ -1434,9 +1554,7 @@ impl<L: CollectionEncoding> Collection<L> {
         let (_descriptor, discovered, admitted) =
             discover_admitted_cover_at(snapshot, self, instant)
                 .map_err(CollectionMaterializationError::from)?;
-        let resolved =
-            resolve_cover_from_observation::<S, L, V::Error, _>(snapshot, discovered, admitted)?;
-        V::try_from_cover(&resolved, snapshot).map_err(CollectionMaterializationError::from)
+        materialize_cover_from_observation::<S, L, V, _>(snapshot, discovered, admitted)
     }
 
     /// Read one logical value, sampling the clock exactly once.
@@ -1456,19 +1574,21 @@ impl<L: CollectionEncoding> Collection<L> {
 }
 
 impl<L: CollectionEncoding> Cover<L> {
-    /// Resolve this exact semantic cover to one resident physical cover.
+    /// Return the greatest subset with a complete resident realization.
     ///
-    /// The returned `Cover` names the members actually selected from the same
-    /// snapshot. Support-equivalent compaction may therefore make it differ
-    /// from `self`; additions-only deltas belong on admitted covers, not on
-    /// these replaceable physical decompositions.
-    pub fn resolve<S>(
+    /// The result remains in this cover's semantic coordinates. A compacted
+    /// resident member may therefore make several requested members available
+    /// without appearing in the returned value itself. Consequently
+    /// `cover.available(snapshot)? == cover` means a complete physical
+    /// realization is resident in that same immutable snapshot, while
+    /// `cover.difference(&available)?` names its missing semantic support.
+    ///
+    /// This method performs no fetch and records no demand. Network acquisition
+    /// belongs to a store-level workflow which produces a later snapshot.
+    pub fn available<S>(
         &self,
         snapshot: &S,
-    ) -> Result<
-        Cover<L>,
-        CollectionMaterializationError<S::RecordsError, S::GetError<Infallible>, Infallible>,
-    >
+    ) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::MetaError>>
     where
         S: BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
@@ -1476,9 +1596,35 @@ impl<L: CollectionEncoding> Cover<L> {
             DiscoveredCollectionRecords::default()
         } else {
             discover_collection_equations_for_cover(snapshot, self)
+                .map_err(CoverAvailabilityError::Discovery)?
+        };
+        let semantics = resolve_cover_semantics(&discovered, self)
+            .map_err(CoverAvailabilityError::ResolutionConflict)?;
+        available_cover_from_semantics(snapshot, &semantics, self)
+    }
+
+    /// Materialize this semantic cover through one immutable snapshot.
+    ///
+    /// Physical LSM decomposition is deliberately private and is recomputed
+    /// from the supplied snapshot for every call. Passing a later or otherwise
+    /// different snapshot which lacks the necessary realization therefore
+    /// reports [`CollectionMaterializationError::Missing`] instead of pairing
+    /// semantic coordinates with stale physical assumptions.
+    pub fn materialize<V, S>(
+        &self,
+        snapshot: &S,
+    ) -> Result<V, CollectionMaterializationError<S::RecordsError, S::GetError<Infallible>, V::Error>>
+    where
+        S: BlobStoreGet + BlobStoreMeta + CollectionRead,
+        V: TryFromCover<L>,
+    {
+        let discovered = if self.is_empty() {
+            DiscoveredCollectionRecords::default()
+        } else {
+            discover_collection_equations_for_cover(snapshot, self)
                 .map_err(CollectionMaterializationError::Discovery)?
         };
-        resolve_cover_from_observation::<S, L, Infallible, Infallible>(
+        materialize_cover_from_observation::<S, L, V, Infallible>(
             snapshot,
             discovered,
             self.clone(),
@@ -1610,14 +1756,89 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 
 impl<S> CollectionStoreExt for S where S: BlobStorePut + CollectionStore {}
 
-/// Resolve one already-discovered exact payload cover.
+/// Resolve the semantic closure of one already-discovered exact payload cover.
+fn resolve_cover_semantics<L>(
+    discovered: &DiscoveredCollectionRecords,
+    cover: &Cover<L>,
+) -> Result<CollectionSemantics, Box<CollectionFunctionalConflict>>
+where
+    L: CollectionEncoding,
+{
+    let collection = cover.collection().handle();
+    let explicit_roots: BTreeSet<_> = cover
+        .data_members()
+        .map(|data| (collection, data))
+        .collect();
+
+    // MERGE records are materialized LSM equations. They are operational
+    // evidence, not algebra which needs to be replayed during a read.
+    let resolution = resolve_collection_semantics_from_roots(
+        discovered,
+        &BTreeMap::new(),
+        &explicit_roots,
+        |request| {
+            Ok::<CollectionClaimValidation<()>, Infallible>(match request {
+                CollectionValidationRequest::Merge { claim }
+                    if claim.collection() == collection =>
+                {
+                    CollectionClaimValidation::Accepted
+                }
+                CollectionValidationRequest::Commit { .. }
+                | CollectionValidationRequest::Merge { .. }
+                | CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
+            })
+        },
+    );
+
+    match resolution {
+        Ok(resolution) => Ok(resolution.into_semantics()),
+        Err(CollectionResolutionError::Validation { source, .. }) => match source {},
+        Err(CollectionResolutionError::Conflict(source)) => Err(source),
+    }
+}
+
+/// Project complete resident realizations back into requested coordinates.
+fn available_cover_from_semantics<S, L>(
+    snapshot: &S,
+    semantics: &CollectionSemantics,
+    cover: &Cover<L>,
+) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::MetaError>>
+where
+    S: BlobStoreGet + BlobStoreMeta + CollectionRead,
+    L: CollectionEncoding,
+{
+    let collection = cover.collection().handle();
+    let mut complete = Vec::new();
+    for member in semantics.members(collection).into_iter().flatten().copied() {
+        match collection_member_availability::<L, _>(member, snapshot) {
+            Ok(CollectionMemberAvailability::Complete) => complete.push((collection, member)),
+            Ok(CollectionMemberAvailability::Absent)
+            | Ok(CollectionMemberAvailability::Incomplete)
+            | Ok(CollectionMemberAvailability::Unusable) => {}
+            Err(source) => {
+                return Err(CoverAvailabilityError::Metadata { member, source });
+            }
+        }
+    }
+
+    let supporting = semantics.supporting_data_for(complete);
+    Ok(Cover::from_data(
+        cover.collection(),
+        cover
+            .data_members()
+            .filter(|member| supporting.contains(member)),
+    ))
+}
+
+/// Resolve one already-discovered exact payload cover to a private physical
+/// decomposition.
 ///
 /// Stored equations describe support; blob metadata describes residency. This
 /// lookup performs no collection algebra and never reads a payload merely to
 /// prove work which was already materialized. The eventual [`TryFromCover`]
 /// implementation interprets exactly the physical members selected here;
 /// eager views may decode them, while lazy views may retain their shards.
-pub(crate) fn resolve_cover_from_observation<S, L, ViewError, EvidenceError>(
+fn resolve_physical_cover_from_observation<S, L, ViewError, EvidenceError>(
     snapshot: &S,
     discovered: DiscoveredCollectionRecords,
     cover: Cover<L>,
@@ -1641,50 +1862,14 @@ where
         return Ok(cover);
     }
 
-    let roots: BTreeSet<_> = cover.data_members().collect();
-    let explicit_roots: BTreeSet<_> = roots
-        .iter()
-        .copied()
-        .map(|data| (collection, data))
-        .collect();
-
-    // MERGE records are already materialized LSM equations. Resolution uses
-    // them as stored operational evidence; it never re-executes a join merely
-    // to prove work which was performed before the record was published.
-    // Trust admission for equations is a storage/synchronization concern, not
-    // hidden algebra in the read path.
-    let resolution = resolve_collection_semantics_from_roots(
-        &discovered,
-        &BTreeMap::new(),
-        &explicit_roots,
-        |request| {
-            Ok::<CollectionClaimValidation<()>, Infallible>(match request {
-                CollectionValidationRequest::Merge { claim }
-                    if claim.collection() == collection =>
-                {
-                    CollectionClaimValidation::Accepted
-                }
-                CollectionValidationRequest::Commit { .. }
-                | CollectionValidationRequest::Merge { .. }
-                | CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
-            })
-        },
-    );
-
-    let resolution = match resolution {
-        Ok(resolution) => resolution,
-        Err(CollectionResolutionError::Validation { source, .. }) => match source {},
-        Err(CollectionResolutionError::Conflict(source)) => {
-            return Err(CollectionMaterializationError::ResolutionConflict(source));
-        }
-    };
+    let semantics = resolve_cover_semantics(&discovered, &cover)
+        .map_err(CollectionMaterializationError::ResolutionConflict)?;
 
     // Equation semantics and blob residency are orthogonal. Select from every
     // currently complete resident semantic member. Absent roots and incomplete
     // Merkle closures remain uncovered obligations, allowing the physical
     // cover algorithm to fall back to finer support-equivalent members. Exact
     // semantic validation still belongs to the eventual view.
-    let semantics = resolution.semantics();
     let mut resident_roots = BTreeSet::new();
     for data in semantics.members(collection).into_iter().flatten().copied() {
         if matches!(reader.metadata(Handle::<L>::from_hash(data)), Ok(Some(_))) {
@@ -1693,7 +1878,7 @@ where
     }
 
     let selected =
-        collection_complete_physical_cover::<L, _>(semantics, collection, &resident_roots, reader);
+        collection_complete_physical_cover::<L, _>(&semantics, collection, &resident_roots, reader);
     if selected.physical.missing.is_empty() {
         return Ok(Cover::from_data(
             cover.collection(),
@@ -1704,8 +1889,56 @@ where
         return Err(CollectionMaterializationError::InvalidMember { member, source });
     }
 
+    // Report missing support in the caller's semantic coordinates, never in
+    // the private physical frontier selected while searching. Metadata errors
+    // retain the historical materialization behavior of counting as absent;
+    // callers that need the distinction use `available`, which propagates it.
+    let complete = semantics
+        .members(collection)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|member| {
+            matches!(
+                collection_member_availability::<L, _>(*member, reader),
+                Ok(CollectionMemberAvailability::Complete)
+            )
+        })
+        .map(|member| (collection, member));
+    let supporting = semantics.supporting_data_for(complete);
+    let obligations = cover
+        .data_members()
+        .filter(|member| !supporting.contains(member))
+        .collect();
+
     Err(CollectionMaterializationError::Missing {
-        obligations: selected.physical.missing,
+        obligations,
         dependencies: selected.dependencies,
     })
+}
+
+/// Materialize through the private physical decomposition selected from the
+/// same immutable snapshot.
+fn materialize_cover_from_observation<S, L, V, EvidenceError>(
+    snapshot: &S,
+    discovered: DiscoveredCollectionRecords,
+    cover: Cover<L>,
+) -> Result<
+    V,
+    CollectionMaterializationError<
+        S::RecordsError,
+        S::GetError<Infallible>,
+        V::Error,
+        EvidenceError,
+    >,
+>
+where
+    S: BlobStoreGet + BlobStoreMeta + CollectionRead,
+    L: CollectionEncoding,
+    V: TryFromCover<L>,
+{
+    let physical = resolve_physical_cover_from_observation::<S, L, V::Error, EvidenceError>(
+        snapshot, discovered, cover,
+    )?;
+    V::try_from_cover(&physical, snapshot).map_err(CollectionMaterializationError::from)
 }

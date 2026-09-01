@@ -441,13 +441,31 @@ impl CollectionSemantics {
         collection: CollectionHandle,
         data: CollectionData,
     ) -> BTreeSet<CollectionData> {
-        if !self.contains(collection, data) {
+        self.supporting_data_for([(collection, data)])
+    }
+
+    /// Canonical root payloads supporting several members through every
+    /// known active construction path.
+    ///
+    /// The shared traversal visits an overlapping lineage only once. Roots
+    /// from every encountered collection are returned; callers interested in
+    /// one lattice can intersect the result with that lattice's explicit
+    /// roots.
+    pub(crate) fn supporting_data_for(
+        &self,
+        members: impl IntoIterator<Item = (CollectionHandle, CollectionData)>,
+    ) -> BTreeSet<CollectionData> {
+        let members: Vec<_> = members
+            .into_iter()
+            .filter(|(collection, data)| self.contains(*collection, *data))
+            .collect();
+        if members.is_empty() {
             return BTreeSet::new();
         }
 
         let mut supporting = BTreeSet::new();
         let mut visited = BTreeSet::new();
-        let mut pending = vec![(collection, data)];
+        let mut pending = members;
         while let Some(member) = pending.pop() {
             if !visited.insert(member) {
                 continue;

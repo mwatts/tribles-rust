@@ -12,9 +12,7 @@ use ed25519_dalek::SigningKey;
 use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
-use triblespace_core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, TryFromCover,
-};
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -240,7 +238,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let attach_start = Instant::now();
-    let index = NvFp4CosineIndex::<Embedding>::try_from_cover(&target_cover, &snapshot)?;
+    let index = target_cover.materialize::<NvFp4CosineIndex<Embedding>, _>(&snapshot)?;
     let attach = attach_start.elapsed();
 
     let mut latencies_us = Vec::with_capacity(query_count);

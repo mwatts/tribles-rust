@@ -10,7 +10,7 @@ use triblespace_core::collection::exact_derived::{
 };
 use triblespace_core::collection::{
     Collection, CollectionPolicy, CollectionRead, CollectionRegistrationError, CollectionStore,
-    CollectionStoreExt, Cover, TryFromCover,
+    CollectionStoreExt, Cover,
 };
 use triblespace_core::repo::{BlobStore, BlobStoreMeta, BlobStorePut};
 
@@ -166,9 +166,10 @@ impl PathSummaryCollection {
         snapshot: &R,
     ) -> Result<PathIndex, PathSummaryCollectionError>
     where
-        R: triblespace_core::repo::BlobStoreGet + BlobStoreMeta,
+        R: triblespace_core::repo::BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
-        let cover = PathSummaryView::try_from_cover(cover, snapshot)
+        let cover = cover
+            .materialize::<PathSummaryView, _>(snapshot)
             .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
         let mut joined = PathSummaryBlob::empty(&self.automaton);
         for segment in cover.into_blobs() {

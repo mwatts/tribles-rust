@@ -1,8 +1,9 @@
 //! Logical values over exact typed collection covers.
 //!
-//! A [`Cover`](super::Cover) names the physical members of one exact lattice
-//! point. [`TryFromCover`] reconstructs a logical value from those identities
-//! through the same immutable store snapshot which resolved the cover.
+//! A [`Cover`](super::Cover) names semantic members of one exact lattice
+//! point. [`Cover::materialize`](super::Cover::materialize) privately selects a
+//! support-equivalent resident decomposition and invokes [`TryFromCover`] to
+//! reconstruct a logical value through that same immutable store snapshot.
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -57,7 +58,7 @@ where
     }
 }
 
-/// A logical value reconstructed from one exact typed physical cover.
+/// Low-level reconstruction hook for one selected typed physical cover.
 ///
 /// This is deliberately cover-aware rather than a blanket blob conversion:
 /// some values eagerly join members, while others retain mmap-backed shards
@@ -68,9 +69,10 @@ pub trait TryFromCover<L: CollectionEncoding>: Sized {
 
     /// Reconstruct the logical value named by `cover` through `snapshot`.
     ///
-    /// `cover` is the actual physical cover selected by
-    /// [`Cover::resolve`](super::Cover::resolve), never an admitted semantic
-    /// cover paired with bytes from another support-equivalent decomposition.
+    /// Normal callers use [`Cover::materialize`](super::Cover::materialize).
+    /// Its private resolver passes the actual physical decomposition selected
+    /// from `snapshot`, never semantic coordinates paired with bytes from a
+    /// different support-equivalent realization.
     fn try_from_cover<R>(
         cover: &Cover<L>,
         snapshot: &R,

@@ -40,9 +40,7 @@ use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
     SuccinctArchiveView,
 };
-use triblespace::core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, Cover, TryFromCover,
-};
+use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt, Cover};
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
 
@@ -224,8 +222,9 @@ impl IncrementalState {
             .advance(&mut self.store, cover)
             .expect("advance incremental full view");
         let snapshot = self.store.snapshot().expect("freeze delta snapshot");
-        let changed =
-            TribleSet::try_from_cover(&added, &snapshot).expect("attach exact support delta");
+        let changed = added
+            .materialize::<TribleSet, _>(&snapshot)
+            .expect("materialize exact support delta");
 
         let mut raw_rows = 0usize;
         let mut batch = BTreeSet::new();

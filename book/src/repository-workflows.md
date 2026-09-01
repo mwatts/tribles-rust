@@ -24,9 +24,10 @@ merge or derivation equations preserve reusable physical work.
 - **`Cover<E>`** — one typed collection identity plus a PATCH of distinct
   `Handle<E>` members selected for one read or derivation.
   Signatures, authors, and metadata remain queryable provenance, but are not
-  coordinates of the value.
-- **`TryFromCover<E>`** — reconstruction of one logical view from selected
-  physical members. This is the payload-decoding boundary: a view may join
+  coordinates of the value. Checked union, intersection, difference, and
+  subset operations reject covers from another collection.
+- **`TryFromCover<E>`** — the encoding-specific reconstruction hook invoked by
+  `Cover::materialize` after private physical selection. A view may join
   eagerly or retain mmap-backed shards and query their union lazily.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
@@ -202,18 +203,21 @@ prefix. A collection then performs admission against that observation:
 ```rust,ignore
 let snapshot = store.snapshot()?;
 let admitted = collection.admitted(&snapshot)?;
-let physical = admitted.resolve(&snapshot)?;
-let value = V::try_from_cover(&physical, &snapshot)?;
+let available = admitted.available(&snapshot)?;
+let missing = admitted.difference(&available)?;
+let value = admitted.materialize::<V, _>(&snapshot)?;
 ```
 
 `admitted` is the semantic COMMIT frontier: it verifies the descriptor's exact
 WRITE policy and forms a
 `Cover<E>` from distinct payload handles signed by the admitted subjects.
-`resolve` may select a resident support-equivalent decomposition using stored
-`MERGE` and `DERIVE` evidence. `TryFromCover<E>` then constructs the logical
-value solely from that selected physical cover and the same frozen store
-snapshot. `collection.read::<V, _>(&snapshot)` is the convenience form of these
-three steps. For a `SimpleArchive`, `V = TribleSet`; for a
+`available` returns a subset in those same semantic coordinates: a compacted
+resident blob may make several requested members available without becoming a
+member of the returned cover. `materialize` privately selects a
+support-equivalent decomposition using stored equations and invokes the
+`TryFromCover<E>` hook solely through the same frozen store snapshot.
+`collection.read::<V, _>(&snapshot)` is the convenience form. For a
+`SimpleArchive`, `V = TribleSet`; for a
 `SuccinctArchiveBlob`, `V` may be an mmap-backed union retaining selected
 shards.
 
@@ -234,8 +238,7 @@ when another component will select or build a representation:
 ```rust,ignore
 let snapshot = storage.snapshot()?;
 let cover = models.admitted(&snapshot)?;
-let physical = cover.resolve(&snapshot)?;
-let facts = TribleSet::try_from_cover(&physical, &snapshot)?;
+let facts = cover.materialize::<TribleSet, _>(&snapshot)?;
 ```
 
 Exact replay does not need a publishing key, re-run admission, or retain any
@@ -366,10 +369,10 @@ before that accelerated result is published. If it is absent, the generic
 storage executor first publishes the ordinary source `MERGE(a,b,c)`, then
 retries and publishes `MERGE(A(a),A(b),A(c))`. Each operation emits one blob.
 The commuting-square law implies `DERIVE(c,A(c))`, so that redundant edge need
-not be stored explicitly. Physical-cover resolution excludes an accelerated
+not be stored explicitly. Private physical resolution excludes an accelerated
 member whose named raw child is unavailable and retries a finer
-support-equivalent route; the typed view repeats the raw/index check only as a
-defensive boundary for callers that construct a physical cover directly.
+support-equivalent route; the typed view repeats the raw/index check at its
+decoding boundary.
 
 ## WANT missing content or computation
 
@@ -448,9 +451,9 @@ branch. New code publishes directly to collections.
 ## Operational invariants
 
 - Persist dependencies before the record that makes them meaningful.
-- Treat a cover's payload identities as semantic ground truth. Select a
-  complete resident support-equivalent physical cover, then let the requested
-  typed view decode exactly those members. Signed commits and metadata remain
+- Treat a cover's payload identities as semantic ground truth. Availability is
+  expressed as a subset in those coordinates; physical decomposition stays
+  private to same-snapshot materialization. Signed commits and metadata remain
   lazy provenance queried separately.
 - Treat stored unsigned equations as reusable materialized LSM work. Never
   replay algebra merely to trust a local equation; apply future trust/quorum

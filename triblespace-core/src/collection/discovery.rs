@@ -22,33 +22,6 @@ use super::{
     CollectionRead, CollectionRecord, CollectionRecordSelector, CommitVerificationError, Cover,
 };
 
-/// Failure to use one opaque payload cover with its exact collection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExactCoverError {
-    /// The cover belongs to another collection descriptor.
-    WrongCollection {
-        /// Descriptor required by the operation.
-        expected: CollectionHandle,
-        /// Descriptor carried by the cover.
-        actual: CollectionHandle,
-    },
-}
-
-impl fmt::Display for ExactCoverError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongCollection { expected, actual } => write!(
-                formatter,
-                "cover names collection {} instead of {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-        }
-    }
-}
-
-impl Error for ExactCoverError {}
-
 /// One collection record with a discovery-time validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionRecordDiagnostic {
@@ -594,6 +567,46 @@ mod tests {
                 current: collection(2).handle(),
             })
         );
+    }
+
+    #[test]
+    fn cover_algebra_is_checked_and_patch_backed() {
+        let target = collection(1);
+        let left = FactCover::from_members(target, [member(1), member(2)]);
+        let right = FactCover::from_members(target, [member(2), member(3)]);
+
+        assert_eq!(
+            left.union(&right).unwrap().members().collect::<Vec<_>>(),
+            vec![member(1), member(2), member(3)],
+        );
+        assert_eq!(
+            left.intersection(&right)
+                .unwrap()
+                .members()
+                .collect::<Vec<_>>(),
+            vec![member(2)],
+        );
+        assert_eq!(
+            left.difference(&right)
+                .unwrap()
+                .members()
+                .collect::<Vec<_>>(),
+            vec![member(1)],
+        );
+        assert!(left.intersection(&right).unwrap().is_subset(&left).unwrap());
+        assert!(!left.is_subset(&right).unwrap());
+
+        let foreign = FactCover::from_members(collection(2), [member(1)]);
+        assert_eq!(
+            left.union(&foreign),
+            Err(crate::collection::CoverAlgebraError::DifferentCollection {
+                left: collection(1).handle(),
+                right: collection(2).handle(),
+            }),
+        );
+        assert!(left.intersection(&foreign).is_err());
+        assert!(left.difference(&foreign).is_err());
+        assert!(left.is_subset(&foreign).is_err());
     }
 
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {

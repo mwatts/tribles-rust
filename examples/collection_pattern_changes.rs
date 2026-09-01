@@ -14,7 +14,7 @@ use triblespace::core::collection::succinctarchive_union::{
     SuccinctArchiveView,
 };
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt, Cover, TryFromCover,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt, Cover,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -39,7 +39,7 @@ fn observe(
     // admits only new support. The small SimpleArchive delta stays independent
     // because it drives the change query and advances only after consumption.
     let full = full_view.advance(store, &current)?;
-    let changed = TribleSet::try_from_cover(&added, &snapshot)?;
+    let changed = added.materialize::<TribleSet, _>(&snapshot)?;
 
     let mut titles = Vec::new();
     for title in find!(

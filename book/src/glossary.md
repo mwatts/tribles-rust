@@ -144,9 +144,10 @@ One immutable, coherent known-prefix observation produced by
 `SnapshotSource::snapshot`. A snapshot owns all blob, collection-record,
 capability-proof, and peer-evidence reads for that prefix and implements
 `StoreSnapshot::changes_since` for conservative local invalidation. Collection
-admission produces a semantic `Cover<E>` from it; `Cover::resolve` selects a
-resident physical cover; and `TryFromCover<E>` reconstructs either an eager
-value or a lazy sharded view through the same snapshot.
+admission produces a semantic `Cover<E>` from it; `Cover::available` returns
+the greatest semantic subset with a complete resident realization; and
+`Cover::materialize` privately selects physical members before reconstructing
+either an eager value or a lazy sharded view through the same snapshot.
 
 ### Collection READ
 The exact `ACTION_READ` capability over one collection descriptor handle.

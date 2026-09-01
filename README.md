@@ -106,8 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = storage.snapshot()?;
     let admitted = library.admitted(&snapshot)?;
-    let physical = admitted.resolve(&snapshot)?;
-    let facts = TribleSet::try_from_cover(&physical, &snapshot)?;
+    let facts = admitted.materialize::<TribleSet, _>(&snapshot)?;
     let title = "Dune";
     for (first, last, quote) in find!(
         (first: String, last: String, quote),
@@ -138,7 +137,8 @@ Other strictly verified signers become visible only when
 `library.admitted(&snapshot)` observes sufficient root support for exact
 `ACTION_WRITE` on this descriptor handle in the same immutable store snapshot.
 Identical retries deduplicate by intrinsic record identity, distinct commits
-coexist, and `TryFromCover` materializes every admitted author's union. Call
+coexist, and `Cover::materialize` reconstructs every admitted author's union
+through the same snapshot. Call
 the store's `flush` operation when an application needs an explicit durability
 barrier.
 

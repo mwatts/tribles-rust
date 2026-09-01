@@ -545,7 +545,7 @@ mod tests {
     use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
-    use crate::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
+    use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     use super::super::RawToRank9AcceleratedMapping;
     use super::*;
@@ -767,14 +767,10 @@ mod tests {
 
         let snapshot = store.snapshot().unwrap();
         let semantic = Cover::from_data(facade.collection(), [fa_data, fb_data]);
-        let physical = semantic.resolve(&snapshot).unwrap();
-
+        assert_eq!(semantic.available(&snapshot).unwrap(), semantic);
         assert_eq!(
-            physical.data_members().collect::<Vec<_>>(),
-            vec![fa_data, fb_data],
-        );
-        assert_eq!(
-            super::accelerated_view(&snapshot, &physical)
+            semantic
+                .materialize::<UnionArchive<OrderedUniverse>, _>(&snapshot)
                 .unwrap()
                 .iter()
                 .count(),
@@ -792,10 +788,10 @@ mod tests {
             .unwrap();
         assert_eq!(attached.data_members().collect::<Vec<_>>(), vec![fc_data]);
         let snapshot = store.snapshot().unwrap();
-        let physical = semantic.resolve(&snapshot).unwrap();
-        assert_eq!(physical.data_members().collect::<Vec<_>>(), vec![fc_data]);
+        assert_eq!(semantic.available(&snapshot).unwrap(), semantic);
         assert_eq!(
-            super::accelerated_view(&snapshot, &physical)
+            semantic
+                .materialize::<UnionArchive<OrderedUniverse>, _>(&snapshot)
                 .unwrap()
                 .iter()
                 .count(),
@@ -818,7 +814,11 @@ mod tests {
 
         let snapshot = store.snapshot().unwrap();
         let semantic = Cover::from_data(facade.collection(), [accelerated_data]);
-        let error = semantic.resolve(&snapshot).unwrap_err();
+        assert!(semantic.available(&snapshot).unwrap().is_empty());
+        let error = match semantic.materialize::<UnionArchive<OrderedUniverse>, _>(&snapshot) {
+            Ok(_) => panic!("incomplete representation unexpectedly materialized"),
+            Err(error) => error,
+        };
         assert!(matches!(
             error,
             crate::collection::CollectionMaterializationError::Missing {
@@ -826,6 +826,114 @@ mod tests {
                 dependencies,
             } if obligations == [accelerated_data].into_iter().collect()
                 && dependencies == [raw_data].into_iter().collect()
+        ));
+    }
+
+    #[test]
+    fn availability_projects_compacted_bytes_into_requested_coordinates() {
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
+        let a = raw([row(1, 2, 3)]);
+        let b = raw([row(4, 5, 6)]);
+        let c = super::super::join(&a, &b).unwrap();
+        let fa = accelerated(&a);
+        let fb = accelerated(&b);
+        let fa_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fa.get_handle());
+        let fb_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fb.get_handle());
+        let fc = accelerated(&c);
+        let fc_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fc.get_handle());
+
+        // Only the compacted representation and its raw dependency are
+        // resident. Its MERGE lineage nevertheless realizes both requested
+        // semantic roots.
+        store.put::<SuccinctArchiveBlob, _>(c).unwrap();
+        store
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fc)
+            .unwrap();
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                facade.collection().handle(),
+                fa_data,
+                fb_data,
+                fc_data,
+            )))
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let full = Cover::from_data(facade.collection(), [fa_data, fb_data]);
+        assert_eq!(full.available(&snapshot).unwrap(), full);
+        assert_eq!(
+            full.materialize::<UnionArchive<OrderedUniverse>, _>(&snapshot)
+                .unwrap()
+                .iter()
+                .count(),
+            2,
+        );
+
+        // The same stored upper member cannot realize a singleton request:
+        // its sibling is not a semantic root, so that MERGE is inactive.
+        let singleton = Cover::from_data(facade.collection(), [fa_data]);
+        assert!(singleton.available(&snapshot).unwrap().is_empty());
+        drop(snapshot);
+
+        // With only the first fine member resident, the maximal answer is the
+        // first requested coordinate and difference names the other one.
+        let mut partial = MemoryRepo::default();
+        partial.put::<SuccinctArchiveBlob, _>(a).unwrap();
+        partial
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fa)
+            .unwrap();
+        partial
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                facade.collection().handle(),
+                fa_data,
+                fb_data,
+                fc_data,
+            )))
+            .unwrap();
+        let partial = partial.snapshot().unwrap();
+        let available = full.available(&partial).unwrap();
+        assert_eq!(available, singleton);
+        assert_eq!(
+            full.difference(&available)
+                .unwrap()
+                .data_members()
+                .collect::<Vec<_>>(),
+            vec![fb_data],
+        );
+        assert!(matches!(
+            full.materialize::<UnionArchive<OrderedUniverse>, _>(&partial),
+            Err(crate::collection::CollectionMaterializationError::Missing {
+                obligations,
+                ..
+            }) if obligations == [fb_data].into_iter().collect()
+        ));
+    }
+
+    #[test]
+    fn materialization_re_resolves_against_the_supplied_snapshot() {
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
+        let raw = raw([row(1, 2, 3)]);
+        let accelerated = accelerated(&raw);
+        let data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(accelerated.get_handle());
+        store.put::<SuccinctArchiveBlob, _>(raw).unwrap();
+        store
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(accelerated)
+            .unwrap();
+        let cover = Cover::from_data(facade.collection(), [data]);
+        let resident = store.snapshot().unwrap();
+        assert_eq!(cover.available(&resident).unwrap(), cover);
+        cover
+            .materialize::<UnionArchive<OrderedUniverse>, _>(&resident)
+            .unwrap();
+
+        let mut empty = MemoryRepo::default();
+        let absent = empty.snapshot().unwrap();
+        assert!(cover.available(&absent).unwrap().is_empty());
+        assert!(matches!(
+            cover.materialize::<UnionArchive<OrderedUniverse>, _>(&absent),
+            Err(crate::collection::CollectionMaterializationError::Missing { .. })
         ));
     }
 

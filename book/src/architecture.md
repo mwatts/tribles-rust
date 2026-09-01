@@ -173,11 +173,12 @@ Reads are exact about what they observed, not magical about global time:
 - `collection.admitted(&snapshot)` applies the descriptor WRITE policy and
   resident capability evidence to obtain one semantic `Cover<E>` without
   fetching member data;
-- `cover.resolve(&snapshot)` selects a resident support-equivalent physical
-  decomposition; and
-- `V::try_from_cover(&physical, &snapshot)` reconstructs the logical value
+- `cover.available(&snapshot)` projects complete resident realizations back
+  into the cover's semantic coordinates; and
+- `cover.materialize::<V, _>(&snapshot)` privately selects a resident
+  support-equivalent physical decomposition and reconstructs the logical value
   through that same immutable observation. `collection.read(&snapshot)` is the
-  convenience form of the final three steps.
+  convenience form of admission and materialization.
 
 Cover identity is the collection descriptor plus distinct payload handles.
 Signer, signature, and metadata claims currently known to the store remain
