@@ -417,6 +417,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
     use super::*;
 
     fn id(n: u16) -> PeerId {
@@ -451,6 +454,167 @@ mod tests {
             }
         }
         (routes, contacted)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ProbeTopology {
+        Full,
+        Ring,
+        XorBuckets,
+    }
+
+    impl ProbeTopology {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Full => "full",
+                Self::Ring => "ring",
+                Self::XorBuckets => "xor-buckets",
+            }
+        }
+    }
+
+    enum ProbeNetwork {
+        Full(Vec<PeerId>),
+        Links(BTreeMap<PeerId, Vec<PeerId>>),
+    }
+
+    impl ProbeNetwork {
+        fn new(topology: ProbeTopology, peers: &[PeerId]) -> Self {
+            match topology {
+                ProbeTopology::Full => Self::Full(peers.to_vec()),
+                ProbeTopology::Ring => {
+                    let mut ordered = peers.to_vec();
+                    ordered.sort_unstable();
+                    let mut links = BTreeMap::new();
+                    for (index, peer) in ordered.iter().copied().enumerate() {
+                        let mut neighbors = BTreeSet::new();
+                        for step in 1..ordered.len() {
+                            neighbors.insert(ordered[(index + step) % ordered.len()]);
+                            if neighbors.len() == K {
+                                break;
+                            }
+                            neighbors
+                                .insert(ordered[(index + ordered.len() - step) % ordered.len()]);
+                            if neighbors.len() == K {
+                                break;
+                            }
+                        }
+                        links.insert(peer, neighbors.into_iter().collect());
+                    }
+                    Self::Links(links)
+                }
+                ProbeTopology::XorBuckets => {
+                    let mut links = BTreeMap::new();
+                    for peer in peers.iter().copied() {
+                        let mut routes = RoutingTable::new(peer, []);
+                        for candidate in peers.iter().copied() {
+                            routes.note_candidate(candidate);
+                        }
+                        links.insert(peer, routes.all());
+                    }
+                    Self::Links(links)
+                }
+            }
+        }
+
+        fn reply(&self, peer: PeerId, target: RoutingKey) -> Vec<PeerId> {
+            let candidates: &[PeerId] = match self {
+                Self::Full(peers) => peers,
+                Self::Links(links) => links
+                    .get(&peer)
+                    .expect("every synthetic peer has a routing view"),
+            };
+            bounded_closest(target, peer, candidates.iter().copied())
+        }
+    }
+
+    struct ProbeLookup {
+        requests: usize,
+        rounds: usize,
+        contacted: BTreeSet<PeerId>,
+        first_batch: BTreeSet<PeerId>,
+    }
+
+    fn probe_lookup(network: &ProbeNetwork, local: PeerId, target: RoutingKey) -> ProbeLookup {
+        let seeds = network.reply(local, target);
+        let mut routes = RoutingTable::new(local, seeds.iter().copied());
+        let mut lookup = IterativeLookup::new(local, target, seeds);
+        let mut contacted = BTreeSet::new();
+        let mut first_batch = BTreeSet::new();
+        let mut requests = 0;
+        let mut rounds = 0;
+        while !lookup.is_finished() {
+            let batch = lookup.next_batch();
+            assert!(!batch.is_empty(), "probe has no abandoned in-flight work");
+            if rounds == 0 {
+                first_batch.extend(batch.iter().copied());
+            }
+            rounds += 1;
+            requests += batch.len();
+            for peer in batch {
+                contacted.insert(peer);
+                assert!(lookup.record_authenticated_response(
+                    peer,
+                    network.reply(peer, target),
+                    &mut routes,
+                ));
+            }
+        }
+        black_box(lookup.closest_authenticated_responders());
+        ProbeLookup {
+            requests,
+            rounds,
+            contacted,
+            first_batch,
+        }
+    }
+
+    fn probe_bytes(domain: &'static str, index: usize) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(domain);
+        hasher.update(&(index as u64).to_be_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    fn probe_targets(count: usize, shared_prefix_bits: usize) -> Vec<RoutingKey> {
+        assert!(shared_prefix_bits <= 240 && shared_prefix_bits.is_multiple_of(8));
+        let base = probe_bytes("triblespace.net/lookup-probe-target-base/v1", 0);
+        let prefix_bytes = shared_prefix_bits / 8;
+        let suffix_bytes = 32 - prefix_bytes;
+        if suffix_bytes < std::mem::size_of::<usize>() {
+            assert!(count <= 1_usize << (suffix_bytes * 8));
+        }
+        (0..count)
+            .map(|index| {
+                let mut target = probe_bytes("triblespace.net/lookup-probe-target/v1", index);
+                target[..prefix_bytes].copy_from_slice(&base[..prefix_bytes]);
+                let index = (index as u64).to_be_bytes();
+                let copied = suffix_bytes.min(index.len());
+                target[32 - copied..].copy_from_slice(&index[index.len() - copied..]);
+                target
+            })
+            .collect()
+    }
+
+    fn adjacent_jaccard(sets: &[BTreeSet<PeerId>]) -> f64 {
+        if sets.len() < 2 {
+            return 0.0;
+        }
+        sets.windows(2)
+            .map(|pair| {
+                let intersection = pair[0].intersection(&pair[1]).count();
+                let union = pair[0].union(&pair[1]).count();
+                intersection as f64 / union as f64
+            })
+            .sum::<f64>()
+            / (sets.len() - 1) as f64
+    }
+
+    fn scale_parameter(name: &str, default: usize) -> usize {
+        std::env::var(name).map_or(default, |value| {
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("{name} must be a positive integer: {error}"))
+        })
     }
 
     #[test]
@@ -742,5 +906,116 @@ mod tests {
         assert_eq!(lookup.next_batch(), vec![seed]);
         assert!(lookup.record_authenticated_response(seed, [stranger], &mut routes));
         assert!(!lookup.record_authenticated_response(seed, [], &mut routes));
+    }
+
+    #[test]
+    fn lookup_probe_topologies_terminate_with_bounded_unique_requests() {
+        let peers = (0..64)
+            .map(|index| probe_bytes("triblespace.net/lookup-probe-peer/v1", index))
+            .collect::<Vec<_>>();
+        let local = peers[0];
+        let target = probe_targets(1, 0)[0];
+        for topology in [
+            ProbeTopology::Full,
+            ProbeTopology::Ring,
+            ProbeTopology::XorBuckets,
+        ] {
+            let network = ProbeNetwork::new(topology, &peers);
+            let observed = probe_lookup(&network, local, target);
+            assert_eq!(observed.requests, observed.contacted.len());
+            assert!(observed.requests <= peers.len() - 1);
+            assert!(observed.rounds <= observed.requests);
+            assert!(observed.first_batch.len() <= ALPHA);
+        }
+    }
+
+    /// Deterministic, opt-in capacity probe for the private iterative XOR
+    /// lookup. All work is in-process: elapsed time measures local lookup plus
+    /// synthetic FIND_NODE reply selection, never transport latency.
+    ///
+    /// Run with `cargo test -p triblespace-net --release
+    /// iterative_lookup_scale_probe -- --ignored --nocapture`.
+    /// `TRIBLESPACE_LOOKUP_SCALE_NODES` and `TRIBLESPACE_LOOKUP_SCALE_KEYS`
+    /// default to 1,024 and 64. The overlap metrics are observational upper
+    /// bounds only; this probe deliberately defines no batching protocol.
+    #[test]
+    #[ignore = "manual deterministic iterative-lookup scale measurement"]
+    fn iterative_lookup_scale_probe() {
+        let node_count = scale_parameter("TRIBLESPACE_LOOKUP_SCALE_NODES", 1_024);
+        let key_count = scale_parameter("TRIBLESPACE_LOOKUP_SCALE_KEYS", 64);
+        assert!(node_count > K);
+        assert!(key_count > 0 && key_count <= u16::MAX as usize);
+        let peers = (0..node_count)
+            .map(|index| probe_bytes("triblespace.net/lookup-probe-peer/v1", index))
+            .collect::<Vec<_>>();
+        let local = peers[0];
+
+        for topology in [
+            ProbeTopology::Full,
+            ProbeTopology::Ring,
+            ProbeTopology::XorBuckets,
+        ] {
+            let build_started = Instant::now();
+            let network = ProbeNetwork::new(topology, &peers);
+            let build_elapsed = build_started.elapsed();
+            for shared_prefix_bits in [0, 8, 16, 32, 240] {
+                let targets = probe_targets(key_count, shared_prefix_bits);
+                let started = Instant::now();
+                let observations = targets
+                    .into_iter()
+                    .map(|target| (target, probe_lookup(&network, local, target)))
+                    .collect::<Vec<_>>();
+                let elapsed = started.elapsed();
+                let requests = observations
+                    .iter()
+                    .map(|(_, observation)| observation.requests)
+                    .sum::<usize>();
+                let rounds = observations
+                    .iter()
+                    .map(|(_, observation)| observation.rounds)
+                    .sum::<usize>();
+                let contacted = observations
+                    .iter()
+                    .map(|(_, observation)| observation.contacted.clone())
+                    .collect::<Vec<_>>();
+                let first_batches = observations
+                    .iter()
+                    .map(|(_, observation)| observation.first_batch.clone())
+                    .collect::<Vec<_>>();
+                let mut prefix_sorted = observations.iter().collect::<Vec<_>>();
+                prefix_sorted.sort_unstable_by_key(|(target, _)| *target);
+                let prefix_sorted_contacted = prefix_sorted
+                    .iter()
+                    .map(|(_, observation)| observation.contacted.clone())
+                    .collect::<Vec<_>>();
+                let prefix_sorted_first_batches = prefix_sorted
+                    .iter()
+                    .map(|(_, observation)| observation.first_batch.clone())
+                    .collect::<Vec<_>>();
+                let mut contact_union = BTreeSet::new();
+                for set in &contacted {
+                    contact_union.extend(set.iter().copied());
+                }
+                let peer_contact_reuse_upper_bound =
+                    1.0 - contact_union.len() as f64 / requests as f64;
+                println!(
+                    "iterative_lookup topology={} nodes={node_count} keys={key_count} shared_prefix_bits={shared_prefix_bits} topology_build_seconds={:.6} local_seconds={:.6} lookups_per_second={:.2} find_node_requests={} find_node_requests_per_second={:.2} requests_per_lookup={:.3} rounds={} rounds_per_lookup={:.3} contacted_peer_union={} peer_contact_reuse_upper_bound={peer_contact_reuse_upper_bound:.6} adjacent_contact_jaccard={:.6} adjacent_first_batch_jaccard={:.6} prefix_sorted_adjacent_contact_jaccard={:.6} prefix_sorted_adjacent_first_batch_jaccard={:.6}",
+                    topology.name(),
+                    build_elapsed.as_secs_f64(),
+                    elapsed.as_secs_f64(),
+                    key_count as f64 / elapsed.as_secs_f64(),
+                    requests,
+                    requests as f64 / elapsed.as_secs_f64(),
+                    requests as f64 / key_count as f64,
+                    rounds,
+                    rounds as f64 / key_count as f64,
+                    contact_union.len(),
+                    adjacent_jaccard(&contacted),
+                    adjacent_jaccard(&first_batches),
+                    adjacent_jaccard(&prefix_sorted_contacted),
+                    adjacent_jaccard(&prefix_sorted_first_batches),
+                );
+            }
+        }
     }
 }
