@@ -396,6 +396,97 @@ const MAX_COLLECTION_PARTICIPANTS: usize = 128;
 const COLLECTION_PARTICIPANT_LEASE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const PERIODIC_REPAIR_SAMPLE: usize = 8;
 
+/// Recovery state for one collection-provider rendezvous.
+///
+/// DHT discovery is a way into a collection, not its heartbeat. Once a leased
+/// repair candidate exists, signed wakes and periodic exact repair keep that
+/// lease alive without repeating the lookup traversal.
+#[derive(Clone, Copy, Debug)]
+struct DiscoveryState {
+    in_flight: bool,
+    attempts: u32,
+    retry_at: crate::clock::Mono,
+}
+
+impl DiscoveryState {
+    fn new(now: crate::clock::Mono) -> Self {
+        Self {
+            in_flight: false,
+            attempts: 0,
+            retry_at: now,
+        }
+    }
+
+    fn start_if_due(&mut self, now: crate::clock::Mono, has_candidate: bool) -> bool {
+        if self.in_flight || has_candidate || now < self.retry_at {
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+
+    fn finish_attempt(&mut self, now: crate::clock::Mono) {
+        self.in_flight = false;
+        let shift = self.attempts.min(6);
+        self.attempts = self.attempts.saturating_add(1);
+        self.retry_at = now
+            + crate::RETRY_BACKOFF_BASE
+                .saturating_mul(1u32 << shift)
+                .min(crate::RETRY_BACKOFF_CAP);
+    }
+
+    fn observe_success(&mut self, now: crate::clock::Mono) {
+        self.attempts = 0;
+        self.retry_at = now;
+    }
+}
+
+/// Configured peers remain permanent bootstrap routes. Recently learned DHT
+/// participants are a bounded, recency-ordered supplement which survives a
+/// stock-gossip topic resubscription.
+struct WakeBootstrapPeers {
+    configured: Vec<EndpointId>,
+    learned: VecDeque<EndpointId>,
+}
+
+impl WakeBootstrapPeers {
+    fn new(configured: Vec<EndpointId>) -> Self {
+        let mut unique = Vec::with_capacity(configured.len());
+        for peer in configured {
+            if !unique.contains(&peer) {
+                unique.push(peer);
+            }
+        }
+        Self {
+            configured: unique,
+            learned: VecDeque::new(),
+        }
+    }
+
+    fn remember(&mut self, peers: impl IntoIterator<Item = EndpointId>) {
+        for peer in peers {
+            if self.configured.contains(&peer) {
+                continue;
+            }
+            if let Some(position) = self.learned.iter().position(|known| *known == peer) {
+                self.learned.remove(position);
+            }
+            self.learned.push_back(peer);
+            if self.learned.len() > MAX_COLLECTION_PARTICIPANTS {
+                self.learned.pop_front();
+            }
+        }
+    }
+
+    fn current(&self) -> Vec<EndpointId> {
+        self.configured
+            .iter()
+            .chain(self.learned.iter())
+            .copied()
+            .collect()
+    }
+}
+
 fn observe_participant(
     participants: &mut HashMap<[u8; 32], HashMap<PeerId, crate::clock::Mono>>,
     collection: [u8; 32],
@@ -428,6 +519,20 @@ fn live_participants(
     let mut live = peers.keys().copied().collect::<Vec<_>>();
     live.sort_unstable();
     live
+}
+
+fn forget_participant(
+    participants: &mut HashMap<[u8; 32], HashMap<PeerId, crate::clock::Mono>>,
+    collection: [u8; 32],
+    peer: PeerId,
+) {
+    let empty = participants.get_mut(&collection).is_some_and(|peers| {
+        peers.remove(&peer);
+        peers.is_empty()
+    });
+    if empty {
+        participants.remove(&collection);
+    }
 }
 
 struct PoolEntry<C> {
@@ -831,6 +936,25 @@ fn enqueue_repair(
     }
 }
 
+fn has_repair_candidate(
+    collection: CollectionHandle,
+    peers: &[PeerId],
+    failures: &HashMap<RepairTarget, (u32, crate::clock::Mono)>,
+    local_peer: PeerId,
+) -> bool {
+    peers.iter().any(|peer| {
+        *peer != local_peer
+            && !failures.contains_key(&RepairTarget {
+                collection,
+                peer: *peer,
+            })
+    })
+}
+
+fn retain_active_repair_state<T>(state: &mut HashMap<RepairTarget, T>, active: &HashSet<[u8; 32]>) {
+    state.retain(|target, _| active.contains(&target.collection.raw));
+}
+
 enum WakeCommand {
     Observe(CollectionWakeRoot),
     Join(Vec<EndpointId>),
@@ -842,7 +966,9 @@ enum WakeNotice {
         collection: CollectionHandle,
         received: ReceivedCollectionWake,
     },
-    Lagged,
+    Lagged {
+        collection: CollectionHandle,
+    },
 }
 
 fn spawn_wake_topic<P: CollectionWakeNetwork>(
@@ -854,16 +980,20 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut current_root = None;
+        let mut bootstrap = WakeBootstrapPeers::new(bootstrap);
         loop {
             let mut topic = loop {
-                match plane.subscribe_network(collection, bootstrap.clone()).await {
+                match plane
+                    .subscribe_network(collection, bootstrap.current())
+                    .await
+                {
                     Ok(topic) => break topic,
                     Err(error) => {
                         debug!(%error, "collection gossip subscription failed; retrying");
                         tokio::select! {
                             command = command_rx.recv() => match command {
                                 Some(WakeCommand::Observe(root)) => current_root = Some(root),
-                                Some(WakeCommand::Join(_)) => {}
+                                Some(WakeCommand::Join(peers)) => bootstrap.remember(peers),
                                 Some(WakeCommand::Shutdown) | None => return,
                             },
                             () = tokio::time::sleep(crate::RETRY_BACKOFF_BASE) => {}
@@ -886,6 +1016,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                             }
                         }
                         Some(WakeCommand::Join(peers)) => {
+                            bootstrap.remember(peers.iter().copied());
                             if let Err(error) = topic.join_wake_peers(peers).await {
                                 debug!(%error, "joining DHT-discovered collection wake peers failed");
                             }
@@ -894,13 +1025,14 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                     },
                     event = topic.next_wake_event() => match event {
                         Ok(Some(CollectionWakeEvent::Received(received))) => {
+                        bootstrap.remember([received.wake.origin()]);
                         // Wakes are repeatable hints. Dropping one under load
                         // preserves correctness while keeping a nonce flood
                         // behind a hard process-wide memory bound.
                         let _ = notices.try_send(WakeNotice::Received { collection, received });
                         }
                         Ok(Some(CollectionWakeEvent::Lagged)) => {
-                            let _ = notices.try_send(WakeNotice::Lagged);
+                            let _ = notices.try_send(WakeNotice::Lagged { collection });
                             if let Some(root) = current_root {
                                 let _ = topic.broadcast_wake(root).await;
                             }
@@ -1002,9 +1134,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut pending = HashSet::new();
     let mut in_flight = HashSet::new();
     let mut failures: HashMap<RepairTarget, (u32, crate::clock::Mono)> = HashMap::new();
+    let mut discovery: HashMap<[u8; 32], DiscoveryState> = HashMap::new();
     let mut full_cursors: HashMap<RepairTarget, FullReplicaCursor> = HashMap::new();
     let mut current_roots: HashMap<[u8; 32], ([u8; 32], [u8; 32])> = HashMap::new();
     let mut next_period = crate::clock::mono_now();
+    let mut next_discovery = crate::clock::mono_now();
     let mut publisher = ProviderPublisher::new(crate::clock::mono_now());
     let publication_limit = config.provider_publication_budget;
     let mut publication_budget = ProviderPublicationBudget::new(publication_limit);
@@ -1027,9 +1161,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     if !notice.installed {
                         current_roots.clear();
                         participants.lock().unwrap().clear();
+                        discovery.clear();
                         immediate.clear();
                         pending.clear();
                         failures.clear();
+                        full_cursors.clear();
                         for (_, topic) in wake_topics.drain() {
                             let _ = topic.send(WakeCommand::Shutdown);
                         }
@@ -1038,6 +1174,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     let mut observed = HashSet::new();
                     for (collection, semantic_root, payload_root) in notice.collections {
                         observed.insert(collection.raw);
+                        if !current_roots.contains_key(&collection.raw) {
+                            let now = crate::clock::mono_now();
+                            discovery.insert(collection.raw, DiscoveryState::new(now));
+                            next_discovery = next_discovery.min(now);
+                        }
                         let roots = (semantic_root, payload_root);
                         let changed = current_roots.insert(collection.raw, roots) != Some(roots);
                         let topic = wake_topics.entry(collection.raw).or_insert_with(|| {
@@ -1055,6 +1196,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         }
                     }
                     current_roots.retain(|collection, _| observed.contains(collection));
+                    discovery.retain(|collection, _| observed.contains(collection));
+                    retain_active_repair_state(&mut failures, &observed);
+                    retain_active_repair_state(&mut full_cursors, &observed);
                     participants
                         .lock()
                         .unwrap()
@@ -1086,13 +1230,19 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         while let Ok(notice) = wake_rx.try_recv() {
-            let WakeNotice::Received {
-                collection,
-                received,
-            } = notice
-            else {
-                next_period = crate::clock::mono_now();
-                continue;
+            let (collection, received) = match notice {
+                WakeNotice::Received {
+                    collection,
+                    received,
+                } => (collection, received),
+                WakeNotice::Lagged { collection } => {
+                    if current_roots.contains_key(&collection.raw) {
+                        let now = crate::clock::mono_now();
+                        next_period = next_period.min(now);
+                        next_discovery = next_discovery.min(now);
+                    }
+                    continue;
+                }
             };
             let wake = received.wake;
             if wake.origin().as_bytes() == &my_id {
@@ -1128,8 +1278,29 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
         while let Ok(outcome) = repair_rx.try_recv() {
             in_flight.remove(&outcome.target);
+            if !current_roots.contains_key(&outcome.target.collection.raw) {
+                failures.remove(&outcome.target);
+                full_cursors.remove(&outcome.target);
+                continue;
+            }
+            if outcome.target.peer == my_id {
+                failures.remove(&outcome.target);
+                full_cursors.remove(&outcome.target);
+                continue;
+            }
             if outcome.success {
                 failures.remove(&outcome.target);
+                let now = crate::clock::mono_now();
+                observe_participant(
+                    &mut participants.lock().unwrap(),
+                    outcome.target.collection.raw,
+                    outcome.target.peer,
+                    now,
+                );
+                discovery
+                    .entry(outcome.target.collection.raw)
+                    .or_insert_with(|| DiscoveryState::new(now))
+                    .observe_success(now);
                 if outcome.more {
                     if let Some(cursor) = outcome.full_cursor {
                         full_cursors.insert(outcome.target, cursor);
@@ -1141,6 +1312,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     enqueue_repair(&mut immediate, &mut pending, outcome.target);
                 }
             } else {
+                forget_participant(
+                    &mut participants.lock().unwrap(),
+                    outcome.target.collection.raw,
+                    outcome.target.peer,
+                );
                 let attempts = failures
                     .get(&outcome.target)
                     .map_or(1, |(attempts, _)| attempts.saturating_add(1));
@@ -1155,6 +1331,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         ),
                     );
                 }
+                next_discovery = next_discovery.min(crate::clock::mono_now());
             }
         }
         while let Ok(outcome) = publication_rx.try_recv() {
@@ -1167,6 +1344,19 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
         }
         while let Ok((collection, peers)) = discovery_rx.try_recv() {
+            let now = crate::clock::mono_now();
+            let Some(state) = discovery.get_mut(&collection.raw) else {
+                continue;
+            };
+            state.finish_attempt(now);
+            next_discovery = next_discovery.min(state.retry_at);
+            if !current_roots.contains_key(&collection.raw) {
+                continue;
+            }
+            let peers = peers
+                .into_iter()
+                .filter(|peer| *peer != my_id)
+                .collect::<Vec<_>>();
             if let Some(topic) = wake_topics.get(&collection.raw) {
                 let joined = peers
                     .iter()
@@ -1175,12 +1365,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 let _ = topic.send(WakeCommand::Join(joined));
             }
             for peer in peers {
-                observe_participant(
-                    &mut participants.lock().unwrap(),
-                    collection.raw,
-                    peer,
-                    crate::clock::mono_now(),
-                );
+                observe_participant(&mut participants.lock().unwrap(), collection.raw, peer, now);
                 enqueue_repair(
                     &mut immediate,
                     &mut pending,
@@ -1192,6 +1377,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         let now = crate::clock::mono_now();
         if now >= next_period {
             next_period = now + REPAIR_PERIOD;
+            // The anti-entropy tick also notices expired participant leases,
+            // but DHT recovery keeps its own backoff and in-flight state.
+            next_discovery = next_discovery.min(now);
             for raw in current_roots.keys() {
                 if config.qos.direction.pulls() {
                     let collection = CollectionHandle::new(*raw);
@@ -1215,18 +1403,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                             }
                         });
                     }
-                    let client = provider_client.clone();
-                    let discovery_tx = discovery_tx.clone();
-                    tokio::spawn(async move {
-                        let peers = client
-                            .find_key(
-                                collection_provider_key(collection),
-                                collection_provider_token,
-                                collection.raw,
-                            )
-                            .await;
-                        let _ = discovery_tx.try_send((collection, peers));
-                    });
                     let mut peers = live_participants(&mut participants.lock().unwrap(), *raw, now);
                     if !peers.is_empty() {
                         let rotation = (now.as_nanos() as usize
@@ -1245,6 +1421,34 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                             },
                         );
                     }
+                }
+            }
+        }
+
+        if config.qos.direction.pulls() && now >= next_discovery {
+            next_discovery = now + REPAIR_PERIOD;
+            for raw in current_roots.keys() {
+                let collection = CollectionHandle::new(*raw);
+                let peers = live_participants(&mut participants.lock().unwrap(), *raw, now);
+                let has_candidate = has_repair_candidate(collection, &peers, &failures, my_id);
+                let state = discovery
+                    .entry(*raw)
+                    .or_insert_with(|| DiscoveryState::new(now));
+                if state.start_if_due(now, has_candidate) {
+                    let client = provider_client.clone();
+                    let discovery_tx = discovery_tx.clone();
+                    tokio::spawn(async move {
+                        let peers = client
+                            .find_key(
+                                collection_provider_key(collection),
+                                collection_provider_token,
+                                collection.raw,
+                            )
+                            .await;
+                        let _ = discovery_tx.send((collection, peers)).await;
+                    });
+                } else if !has_candidate && !state.in_flight {
+                    next_discovery = next_discovery.min(state.retry_at);
                 }
             }
         }
@@ -1889,7 +2093,7 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::collection::{
-        AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+        AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionStoreExt,
     };
     use triblespace_core::id::{ExclusiveId, Id};
     use triblespace_core::inline::Inline;
@@ -1909,10 +2113,21 @@ mod tests {
     use crate::transport::PeerId;
 
     use super::{
-        ActiveCollections, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
-        ProviderPublicationBudget, RepairTarget, StoreSnapshot, canonical_provider_subset,
-        enqueue_repair, live_participants, observe_participant, remote_lease_accepted,
+        ActiveCollections, COLLECTION_PARTICIPANT_LEASE, DiscoveryState, FullReplicaState,
+        MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProviderPublicationBudget, RepairTarget,
+        StoreSnapshot, WakeBootstrapPeers, canonical_provider_subset, enqueue_repair,
+        forget_participant, has_repair_candidate, live_participants, observe_participant,
+        remote_lease_accepted, retain_active_repair_state,
     };
+
+    fn endpoint(byte: u8) -> EndpointId {
+        EndpointId::from_bytes(
+            SigningKey::from_bytes(&[byte; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap()
+    }
 
     fn fragment(seed: u8, value: Inline<Handle<UnknownBlob>>) -> Fragment {
         let entity = Id::new([seed; 16]).unwrap();
@@ -2419,6 +2634,224 @@ mod tests {
                 .copy_from_slice(&((MAX_COLLECTION_PARTICIPANTS * 2 - 1) as u64).to_be_bytes());
             newest
         }));
+    }
+
+    #[test]
+    fn healthy_collection_performs_only_its_initial_discovery() {
+        let started = crate::clock::mono_now();
+        let mut discovery = DiscoveryState::new(started);
+        let mut lookups = 0;
+
+        assert!(discovery.start_if_due(started, false));
+        lookups += 1;
+        discovery.finish_attempt(started);
+
+        for period in 1..=100 {
+            let now = started + super::REPAIR_PERIOD.saturating_mul(period);
+            if discovery.start_if_due(now, true) {
+                lookups += 1;
+            }
+        }
+        assert_eq!(lookups, 1, "a leased repair candidate replaces DHT polling");
+    }
+
+    #[test]
+    fn expired_or_all_failed_candidates_reenter_bounded_discovery() {
+        let started = crate::clock::mono_now();
+        let mut discovery = DiscoveryState::new(started);
+        assert!(discovery.start_if_due(started, false));
+        discovery.finish_attempt(started);
+        assert!(!discovery.start_if_due(started, false));
+
+        let first_retry = started + crate::RETRY_BACKOFF_BASE;
+        assert!(discovery.start_if_due(first_retry, false));
+        discovery.finish_attempt(first_retry);
+        assert_eq!(
+            discovery.retry_at.duration_since(first_retry),
+            crate::RETRY_BACKOFF_BASE.saturating_mul(2)
+        );
+
+        for _ in 0..10 {
+            let retry = discovery.retry_at;
+            assert!(discovery.start_if_due(retry, false));
+            discovery.finish_attempt(retry);
+            assert!(
+                discovery.retry_at.duration_since(retry) <= crate::RETRY_BACKOFF_CAP,
+                "recovery attempts must remain live without becoming a tight loop"
+            );
+        }
+
+        let collection = CollectionHandle::new([0x31; 32]);
+        let first = [0x32; 32];
+        let second = [0x33; 32];
+        let mut participants = HashMap::new();
+        observe_participant(&mut participants, collection.raw, first, started);
+        assert!(
+            live_participants(
+                &mut participants,
+                collection.raw,
+                started + COLLECTION_PARTICIPANT_LEASE + std::time::Duration::from_nanos(1)
+            )
+            .is_empty(),
+            "an exhausted lease leaves no repair candidate"
+        );
+        let mut exhausted = DiscoveryState::new(started);
+        exhausted.observe_success(started);
+        assert!(exhausted.start_if_due(
+            started + COLLECTION_PARTICIPANT_LEASE + std::time::Duration::from_nanos(1),
+            false
+        ));
+
+        let peers = vec![first, second];
+        let mut failures = HashMap::from([(
+            RepairTarget {
+                collection,
+                peer: first,
+            },
+            (1, started),
+        )]);
+        assert!(has_repair_candidate(
+            collection, &peers, &failures, [0x34; 32]
+        ));
+        failures.insert(
+            RepairTarget {
+                collection,
+                peer: second,
+            },
+            (1, started),
+        );
+        assert!(!has_repair_candidate(
+            collection, &peers, &failures, [0x34; 32]
+        ));
+        let mut failed = DiscoveryState::new(started);
+        failed.observe_success(started);
+        assert!(failed.start_if_due(started, false));
+    }
+
+    #[test]
+    fn local_provider_is_never_a_collection_repair_candidate() {
+        let collection = CollectionHandle::new([0x35; 32]);
+        let local = [0x36; 32];
+        assert!(!has_repair_candidate(
+            collection,
+            &[local],
+            &HashMap::new(),
+            local
+        ));
+    }
+
+    #[test]
+    fn an_untracked_failure_cannot_retain_a_healthy_participant_lease() {
+        let collection = CollectionHandle::new([0x3b; 32]);
+        let peer = [0x3c; 32];
+        let now = crate::clock::mono_now();
+        let mut participants = HashMap::new();
+        observe_participant(&mut participants, collection.raw, peer, now);
+
+        let failures = (0..MAX_PENDING_REPAIRS)
+            .map(|index| {
+                let mut failed_peer = [0u8; 32];
+                failed_peer[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                (
+                    RepairTarget {
+                        collection: CollectionHandle::new([0x3d; 32]),
+                        peer: failed_peer,
+                    },
+                    (1, now),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(failures.len(), MAX_PENDING_REPAIRS);
+
+        forget_participant(&mut participants, collection.raw, peer);
+
+        let live = live_participants(&mut participants, collection.raw, now);
+        assert!(live.is_empty());
+        assert!(!has_repair_candidate(
+            collection, &live, &failures, [0x3e; 32]
+        ));
+    }
+
+    #[test]
+    fn repair_success_does_not_forge_discovery_task_completion() {
+        let started = crate::clock::mono_now();
+        let mut discovery = DiscoveryState::new(started);
+        assert!(discovery.start_if_due(started, false));
+
+        discovery.observe_success(started + std::time::Duration::from_secs(1));
+
+        assert!(discovery.in_flight);
+        assert!(!discovery.start_if_due(started + std::time::Duration::from_secs(2), false));
+        discovery.finish_attempt(started + std::time::Duration::from_secs(3));
+        assert!(!discovery.in_flight);
+    }
+
+    #[test]
+    fn removed_collections_release_their_repair_state() {
+        let retained = RepairTarget {
+            collection: CollectionHandle::new([0x37; 32]),
+            peer: [0x38; 32],
+        };
+        let removed = RepairTarget {
+            collection: CollectionHandle::new([0x39; 32]),
+            peer: [0x3a; 32],
+        };
+        let mut state = HashMap::from([(retained, 1u8), (removed, 2u8)]);
+        let active = std::collections::HashSet::from([retained.collection.raw]);
+
+        retain_active_repair_state(&mut state, &active);
+
+        assert_eq!(state, HashMap::from([(retained, 1u8)]));
+    }
+
+    #[test]
+    fn successful_repair_refreshes_the_participant_lease() {
+        let collection = [0x42; 32];
+        let peer = [0x43; 32];
+        let started = crate::clock::mono_now();
+        let refreshed = started + std::time::Duration::from_secs(4 * 60);
+        let after_original_expiry =
+            started + COLLECTION_PARTICIPANT_LEASE + std::time::Duration::from_secs(1);
+        let mut participants = HashMap::new();
+        let mut discovery = DiscoveryState::new(started);
+
+        observe_participant(&mut participants, collection, peer, started);
+        observe_participant(&mut participants, collection, peer, refreshed);
+        discovery.observe_success(refreshed);
+
+        assert_eq!(
+            live_participants(&mut participants, collection, after_original_expiry),
+            vec![peer],
+            "a healthy identical repair keeps the origin live past its first observation"
+        );
+        assert!(!discovery.start_if_due(after_original_expiry, true));
+        assert!(
+            live_participants(
+                &mut participants,
+                collection,
+                refreshed + COLLECTION_PARTICIPANT_LEASE + std::time::Duration::from_nanos(1)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn learned_wake_peers_survive_resubscription_with_a_bounded_recent_set() {
+        let configured = endpoint(0x51);
+        let mut bootstrap = WakeBootstrapPeers::new(vec![configured]);
+        let learned = (0..=MAX_COLLECTION_PARTICIPANTS)
+            .map(|index| endpoint((index as u8).wrapping_add(0x60)))
+            .collect::<Vec<_>>();
+        bootstrap.remember(learned.iter().copied());
+
+        let resubscribe = bootstrap.current();
+        assert_eq!(resubscribe.first(), Some(&configured));
+        assert_eq!(resubscribe.len(), 1 + MAX_COLLECTION_PARTICIPANTS);
+        assert!(!resubscribe.contains(&learned[0]));
+        assert!(resubscribe.contains(learned.last().unwrap()));
+
+        bootstrap.remember([learned[1]]);
+        assert_eq!(bootstrap.current().last(), Some(&learned[1]));
     }
 
     #[test]

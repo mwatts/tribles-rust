@@ -97,6 +97,13 @@ Stock gossip supplies bounded duplicate suppression and an efficient
 dissemination tree; bounded leased wake-origin sampling supplies eventual
 anti-entropy when a wake is delayed or missed.
 
+Neighbor churn stays inside stock gossip: its active and passive views repair a
+`NeighborDown`, and a reported `Lagged` event does not end the subscription.
+The host treats lag as a reason to advance exact repair, not as a second mesh
+algorithm. If the topic stream itself ends, configured endpoints plus a bounded
+recent set of signed and DHT-discovered origins seed the replacement
+subscription.
+
 ## READ(C)-authorized exact repair
 
 After observing a changed wake root—or when periodically sampling live signed
@@ -114,6 +121,15 @@ bodies:
 
 - canonical, currently WRITE-accountable `COMMIT` records;
 - complete relevant WRITE proof bundles.
+
+The exact-repair scheduler samples at a 30-second cadence. Participant leases
+last five minutes and every successful repair, including an identical result,
+renews the selected peer. KDF(C) lookup is recovery-only: initial activation or
+restart, exhaustion of every participant lease, or failure of every leased
+candidate. Each collection permits one lookup in flight and retries an empty or
+unsuccessful recovery with exponential backoff from one to 60 seconds. This
+makes healthy steady-state DHT lookup load zero while preserving bounded
+recovery after restarts and partitions.
 
 The disclosure forest uses unit-valued 80-byte keys
 `depth || parent_H || aligned_index || child_H`. Roots are authenticated
@@ -177,11 +193,14 @@ may disappear without changing semantic data or local retention.
 
 ## Routing is process state
 
-Initial peers come from `PeerConfig` or the CLI. A verified wake origin and DHT
-referrals may become live routing candidates, but there is no synchronized
-PEER roster and no durable peer record in the current protocol. Liveness,
-backoff, connection pooling, DHT buckets, and provider leases are operational
-soft state; restarting may forget them without losing semantic data.
+Initial endpoint identities come from `PeerConfig` or the CLI. Configured relay
+URLs only provide iroh transport paths; they are not collection participants or
+KDF(C) rendezvous identities. A verified wake origin and DHT referrals may
+become live routing candidates, but there is no synchronized PEER roster and no
+durable peer record in the current protocol. Liveness, backoff, connection
+pooling, DHT buckets, and provider leases are operational soft state;
+restarting may forget them without losing semantic data and deliberately
+re-enters KDF(C) discovery for each active collection.
 
 One connection pool is shared by collection repair and bearer/DHT operations.
 Iroh's transport authentication binds each connection to its endpoint ID.

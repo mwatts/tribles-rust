@@ -200,7 +200,7 @@ impl CollectionWake {
     /// Exact stock Plumtree message identity for this envelope.
     ///
     /// `iroh-gossip` 0.101 identifies messages by the BLAKE3 hash of their
-    /// complete content. A fresh signed nonce makes periodic rebroadcasts
+    /// complete content. A fresh signed nonce makes repeated rebroadcasts
     /// distinct even when the semantic root is unchanged, so late subscribers
     /// do not depend on upstream's bounded duplicate-retention window. The
     /// nonce has no ordering or authority semantics.

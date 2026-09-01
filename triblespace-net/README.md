@@ -93,6 +93,23 @@ READ-authorized repair from that signed origin; the wake itself carries no
 authority or collection state. Missed or lagged wakes are harmless because
 bounded sampled anti-entropy through leased signed wake origins remains active.
 
+The host samples exact PATCH repair every 30 seconds. Signed wake origins and
+KDF(C)-discovered endpoints receive five-minute participant leases, and every
+successful repair—including an already-identical repair—renews the lease.
+KDF(C) discovery is therefore a bootstrap and recovery path, not a heartbeat:
+one lookup runs on initial activation or process restart, after every candidate
+lease expires, or after every still-leased candidate has failed repair. Failed
+discovery retries use one in-flight lookup per collection and exponential
+backoff from one to 60 seconds. A healthy collection performs no periodic DHT
+traversal.
+
+Stock `iroh-gossip` owns neighbor-loss healing and reports lag without closing
+the subscription. The host responds to lag by advancing ordinary exact repair,
+not by replacing the mesh protocol. Configured endpoints and bounded recent
+signed or DHT-discovered origins remain bootstrap candidates if a topic stream
+does end and must be subscribed again. Configured iroh relays are transport
+paths, not collection participants or rendezvous identities.
+
 Direction is local policy:
 
 - `Bidirectional` pulls active collections and serves admitted readers.
@@ -100,10 +117,10 @@ Direction is local policy:
 - `WriteOnly` serves admitted readers and bearer data but does not initiate
   repair or service local WANTs.
 
-Configured endpoint addresses bootstrap gossip and DHT only. Repair targets
-come from signed wake origins or endpoint-bound KDF(C) leases. Exact-content
-targets come from KDF(H) leases. Unrelated configured peers never receive C or
-its proofs.
+Configured endpoint addresses bootstrap gossip and DHT routing only. Repair
+targets come from signed wake origins or endpoint-bound KDF(C) leases.
+Exact-content targets come from KDF(H) leases. Unrelated configured peers never
+receive C or its proofs.
 
 ## Exact content
 

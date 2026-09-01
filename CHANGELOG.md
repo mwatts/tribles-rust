@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semantic reframe, reclaim, and compaction deliberately drop them while still
   refusing genuinely unknown records.
 
+- Keep the 30-second collection PATCH-repair cadence while making KDF(C)
+  provider discovery bootstrap- and recovery-only. Healthy signed origins stay
+  live through five-minute leases renewed by successful repair, each
+  collection has one exponentially backed-off lookup in flight only after
+  activation, lease exhaustion, or failure of every candidate, and bounded
+  learned gossip peers survive topic resubscription.
+
 - Keep `Cover<E>` as the sole public collection-lattice value and add checked
   PATCH-backed union, intersection, difference, and subset operations. Replace
   public physical `resolve` with `available`, which returns the greatest subset
