@@ -47,6 +47,7 @@ async fn bring_up(
     let config = PeerConfig {
         peers,
         qos: ReconcileQos::default(),
+        provider_publication_budget: None,
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint, &config).await;
     let (sender, receiver, wiring) = host::wire(id);

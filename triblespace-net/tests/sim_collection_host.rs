@@ -130,6 +130,7 @@ fn bring_up_with_payload(
                 })
                 .collect(),
             qos,
+            provider_publication_budget: None,
         },
         wiring,
     ));

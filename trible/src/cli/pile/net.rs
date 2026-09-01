@@ -109,6 +109,12 @@ pub enum Command {
         /// Whether to fetch blobs on demand or mirror admitted resident closure.
         #[arg(long, value_enum, default_value = "demand")]
         payload: PayloadArg,
+        /// Maximum DHT provider-announcement attempts for this process.
+        ///
+        /// Zero disables announcements without disabling exact-blob serving.
+        /// Retries and renewals consume the same budget as first publication.
+        #[arg(long, value_name = "ATTEMPTS")]
+        provider_publication_budget: Option<u64>,
         /// Stop after at most N seconds.
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
@@ -128,6 +134,7 @@ pub fn run(command: Command) -> Result<()> {
             collections,
             direction,
             payload,
+            provider_publication_budget,
             duration,
             quiescent_for,
         } => run_sync(
@@ -139,6 +146,7 @@ pub fn run(command: Command) -> Result<()> {
                 direction: direction.into(),
                 blobs: payload.into(),
             },
+            provider_publication_budget,
             duration,
             quiescent_for,
         ),
@@ -163,6 +171,7 @@ fn run_sync(
     key_path: Option<PathBuf>,
     collection_values: Vec<String>,
     qos: ReconcileQos,
+    provider_publication_budget: Option<u64>,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
 ) -> Result<()> {
@@ -173,7 +182,15 @@ fn run_sync(
         .map(|value| parse_collection(value))
         .collect::<Result<Vec<_>>>()?;
     let pile = open_pile(&pile_path)?;
-    let mut peer = Peer::new(pile, key, PeerConfig { peers, qos })?;
+    let mut peer = Peer::new(
+        pile,
+        key,
+        PeerConfig {
+            peers,
+            qos,
+            provider_publication_budget,
+        },
+    )?;
     peer.activate_collections(collections.iter().copied());
 
     eprintln!("node: {}", peer.id());
@@ -186,6 +203,13 @@ fn run_sync(
             ReconcileDirection::WriteOnly => "write-only (no pull)",
         }
     );
+    match provider_publication_budget {
+        None => eprintln!("provider publication budget: unlimited"),
+        Some(0) => eprintln!(
+            "provider publication budget: 0 (DHT announcements disabled; exact serving enabled)"
+        ),
+        Some(attempts) => eprintln!("provider publication budget: {attempts} attempts"),
+    }
     if let Some(seconds) = duration {
         eprintln!("stop after: {seconds}s");
     }
@@ -272,5 +296,28 @@ mod tests {
         let raw = [0xAB; 32];
         assert_eq!(parse_collection(&hex::encode(raw)).unwrap().raw, raw);
         assert!(parse_collection("not-a-handle").is_err());
+    }
+
+    #[test]
+    fn provider_publication_budget_defaults_unlimited_and_accepts_zero_or_n() {
+        let handle = hex::encode([0xCD; 32]);
+        let parse = |budget: Option<&str>| {
+            let mut args = vec!["net", "sync", "test.pile", "--collection", handle.as_str()];
+            if let Some(budget) = budget {
+                args.extend(["--provider-publication-budget", budget]);
+            }
+            let Command::Sync {
+                provider_publication_budget,
+                ..
+            } = Command::try_parse_from(args).unwrap()
+            else {
+                panic!("parsed sync command")
+            };
+            provider_publication_budget
+        };
+
+        assert_eq!(parse(None), None);
+        assert_eq!(parse(Some("0")), Some(0));
+        assert_eq!(parse(Some("256")), Some(256));
     }
 }

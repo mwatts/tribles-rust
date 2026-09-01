@@ -71,6 +71,12 @@ pub struct PeerConfig {
     pub peers: Vec<EndpointAddr>,
     /// Local pull/serve scheduling choices. Never sent as authority.
     pub qos: ReconcileQos,
+    /// Maximum DHT provider-announcement attempts during this process.
+    ///
+    /// `None` preserves the ordinary unlimited scheduler. `Some(0)` disables
+    /// announcements without disabling exact H-authorized serving. Retries and
+    /// renewals consume the same budget as first publication.
+    pub provider_publication_budget: Option<u64>,
 }
 
 trait BlobSnapshotReader: Send + Sync + 'static {
@@ -786,6 +792,35 @@ struct PublicationOutcome {
     success: bool,
 }
 
+/// Process-lifetime admission gate for DHT provider announcements.
+///
+/// This sits outside [`ProviderPublisher`], so installing a newer resident
+/// snapshot cannot refill a canary's network budget.
+struct ProviderPublicationBudget {
+    remaining: Option<u64>,
+}
+
+impl ProviderPublicationBudget {
+    fn new(limit: Option<u64>) -> Self {
+        Self { remaining: limit }
+    }
+
+    fn permits_attempt(&self) -> bool {
+        self.remaining != Some(0)
+    }
+
+    fn consume_attempt(&mut self) {
+        if let Some(remaining) = &mut self.remaining {
+            debug_assert!(*remaining > 0);
+            *remaining -= 1;
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.remaining == Some(0)
+    }
+}
+
 fn enqueue_repair(
     queue: &mut VecDeque<RepairTarget>,
     pending: &mut HashSet<RepairTarget>,
@@ -971,6 +1006,15 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut current_roots: HashMap<[u8; 32], ([u8; 32], [u8; 32])> = HashMap::new();
     let mut next_period = crate::clock::mono_now();
     let mut publisher = ProviderPublisher::new(crate::clock::mono_now());
+    let publication_limit = config.provider_publication_budget;
+    let mut publication_budget = ProviderPublicationBudget::new(publication_limit);
+    let mut publication_budget_reported = false;
+    if publication_budget.is_exhausted() && config.qos.direction.serves() {
+        warn!(
+            "provider publication disabled by zero process budget; exact H-authorized serving remains enabled"
+        );
+        publication_budget_reported = true;
+    }
     let (publication_tx, mut publication_rx) =
         tokio::sync::mpsc::unbounded_channel::<PublicationOutcome>();
     let mut publications_in_flight = HashSet::new();
@@ -1268,13 +1312,21 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
         }
 
-        while publications_in_flight.len() < ALPHA {
+        while publications_in_flight.len() < ALPHA && publication_budget.permits_attempt() {
             let Some((key, identity)) = publisher.next(now) else {
                 break;
             };
             if !publications_in_flight.insert(key) {
                 let _ = publisher.retry(key, now);
                 break;
+            }
+            publication_budget.consume_attempt();
+            if publication_budget.is_exhausted() && !publication_budget_reported {
+                warn!(
+                    limit = publication_limit.expect("a finite budget can be exhausted"),
+                    "provider publication budget reached; this is the final permitted announcement attempt, and later additions, retries, and renewals remain suppressed"
+                );
+                publication_budget_reported = true;
             }
             let client = provider_client.clone();
             let publication_tx = publication_tx.clone();
@@ -1832,11 +1884,12 @@ mod tests {
     use crate::channel::{NetEvent, NetEventBatch};
     use crate::inventory::{BlobReplication, ReconcileQos};
     use crate::peer::Peer;
+    use crate::provider::{ProviderObservation, ProviderPublisher};
 
     use super::{
         ActiveCollections, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
-        RepairTarget, StoreSnapshot, enqueue_repair, live_participants, observe_participant,
-        remote_lease_accepted,
+        ProviderPublicationBudget, RepairTarget, StoreSnapshot, enqueue_repair, live_participants,
+        observe_participant, remote_lease_accepted,
     };
 
     fn fragment(seed: u8, value: Inline<Handle<UnknownBlob>>) -> Fragment {
@@ -1884,6 +1937,59 @@ mod tests {
         assert!(!remote_lease_accepted(local, local, true));
         assert!(!remote_lease_accepted(local, [2; 32], false));
         assert!(remote_lease_accepted(local, [2; 32], true));
+    }
+
+    #[test]
+    fn zero_provider_publication_budget_permits_no_attempts() {
+        let budget = ProviderPublicationBudget::new(Some(0));
+        assert!(!budget.permits_attempt());
+        assert!(budget.is_exhausted());
+    }
+
+    #[test]
+    fn finite_provider_publication_budget_survives_resident_snapshot_updates() {
+        let now = crate::clock::mono_now();
+        let first = triblespace_core::collection::CollectionHandle::new([0x61; 32]);
+        let second = triblespace_core::collection::CollectionHandle::new([0x62; 32]);
+        let third = triblespace_core::collection::CollectionHandle::new([0x63; 32]);
+        let mut publisher = ProviderPublisher::new(now);
+        let mut budget = ProviderPublicationBudget::new(Some(2));
+
+        publisher.install(
+            ProviderObservation::from_collections([first], true).into_set(),
+            now,
+        );
+        assert!(budget.permits_attempt());
+        assert!(publisher.next(now).is_some());
+        budget.consume_attempt();
+
+        publisher.install(
+            ProviderObservation::from_collections([first, second], true).into_set(),
+            now,
+        );
+        assert!(budget.permits_attempt());
+        assert!(publisher.next(now).is_some());
+        budget.consume_attempt();
+        assert!(budget.is_exhausted());
+
+        publisher.install(
+            ProviderObservation::from_collections([first, second, third], true).into_set(),
+            now,
+        );
+        assert!(
+            !budget.permits_attempt(),
+            "installing a later resident snapshot must not refill a process budget"
+        );
+    }
+
+    #[test]
+    fn absent_provider_publication_budget_remains_unlimited() {
+        let mut budget = ProviderPublicationBudget::new(None);
+        for _ in 0..10_000 {
+            assert!(budget.permits_attempt());
+            budget.consume_attempt();
+        }
+        assert!(!budget.is_exhausted());
     }
 
     #[test]
