@@ -581,11 +581,16 @@ fn encode_e4m3(value: f64) -> u8 {
 fn decode_e4m3(raw: u8) -> f64 {
     let exponent = (raw >> 3) & 0x0f;
     let mantissa = raw & 0x07;
-    if exponent == 0 {
-        f64::from(mantissa) * 2f64.powi(-9)
+    let (significand, power) = if exponent == 0 {
+        (mantissa, -9)
     } else {
-        (1.0 + f64::from(mantissa) / 8.0) * 2f64.powi(i32::from(exponent) - 7)
-    }
+        (8 + mantissa, i32::from(exponent) - 10)
+    };
+    // Every finite nonnegative E4M3 value is a small integer times an exact
+    // binary power. Constructing that power directly avoids a runtime `powi`
+    // call in every scanned block while producing the identical f64 bits.
+    let scale = f64::from_bits(((power + 1023) as u64) << (f64::MANTISSA_DIGITS - 1));
+    f64::from(significand) * scale
 }
 
 fn encode_e2m1(value: f64) -> u8 {
@@ -1779,6 +1784,24 @@ mod tests {
             facts.insert(&Trible::force(&entity, &attribute, &embedding));
         }
         facts
+    }
+
+    #[test]
+    fn e4m3_dyadic_decode_matches_reference_for_every_canonical_byte() {
+        for raw in 0..=0x7e {
+            let exponent = (raw >> 3) & 0x0f;
+            let mantissa = raw & 0x07;
+            let reference = if exponent == 0 {
+                f64::from(mantissa) * 2f64.powi(-9)
+            } else {
+                (1.0 + f64::from(mantissa) / 8.0) * 2f64.powi(i32::from(exponent) - 7)
+            };
+            assert_eq!(
+                decode_e4m3(raw).to_bits(),
+                reference.to_bits(),
+                "E4M3 byte {raw:#04x}",
+            );
+        }
     }
 
     #[test]
