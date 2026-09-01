@@ -297,7 +297,7 @@ fn compute_validation_state(
 
 /// Sparse validation state shared by a pile and all store snapshots derived
 /// from it. Replay itself leaves this empty; entries appear only when a blob is
-/// read or an on-disk duplicate challenges an earlier candidate.
+/// read.
 ///
 /// Hashing happens outside the mutex. Concurrent first misses may duplicate
 /// deterministic work, then converge through `or_insert` without blocking the
@@ -346,6 +346,39 @@ impl IndexEntry {
     }
 }
 
+/// One additional physical occurrence of a blob handle.
+///
+/// The primary blob index remains one machine word per distinct handle. Only
+/// handles which actually repeat acquire this sparse persistent chain, so
+/// preserving corrupt-candidate recovery does not tax the overwhelmingly
+/// common singleton case. Newest alternatives are tried first after the
+/// primary occurrence fails validation.
+#[derive(Debug)]
+struct DuplicateBlobCandidate {
+    entry: IndexEntry,
+    previous: Option<Arc<Self>>,
+}
+
+impl Drop for DuplicateBlobCandidate {
+    fn drop(&mut self) {
+        // An append-only pile permits arbitrarily many physical occurrences
+        // of one handle. Letting Arc recursively drop a uniquely owned linked
+        // suffix would therefore turn valid input into an unbounded call stack.
+        // Peel every uniquely owned node iteratively; a shared suffix belongs
+        // to another persistent snapshot and stops this drop naturally.
+        let mut previous = self.previous.take();
+        while let Some(candidate) = previous {
+            match Arc::try_unwrap(candidate) {
+                Ok(mut candidate) => previous = candidate.previous.take(),
+                Err(shared) => {
+                    drop(shared);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CapabilityProofIndexEntry {
     data_offset: usize,
@@ -353,6 +386,7 @@ struct CapabilityProofIndexEntry {
 }
 
 type PileBlobIndex = PATCH<32, IdentitySchema, IndexEntry, XorSip128>;
+type DuplicateBlobIndex = PATCH<32, IdentitySchema, Arc<DuplicateBlobCandidate>, XorSip128>;
 type CollectionRecordIndex = PATCH<16, IdentitySchema, CollectionRecord, XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
 type PeerEvidenceIndex = PATCH<PEER_EVIDENCE_BYTES_LEN, IdentitySchema, (), XorSip128>;
@@ -2320,6 +2354,11 @@ pub struct Pile {
     /// handle does not make this handle responsible for flushing them.
     dirty: bool,
     blobs: PileBlobIndex,
+    /// Sparse alternative occurrences for handles repeated on disk. The
+    /// primary index retains its compact one-word value; this index exists
+    /// only for duplicate keys and is consulted lazily after validation of
+    /// the primary occurrence fails.
+    duplicate_blobs: DuplicateBlobIndex,
     validations: ValidationCache,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     /// Immutable collection records keyed by their intrinsic entity id.
@@ -2370,6 +2409,7 @@ pub struct PileSnapshot {
     covered_len: usize,
     opaque_records: usize,
     blobs: PileBlobIndex,
+    duplicate_blobs: DuplicateBlobIndex,
     validations: ValidationCache,
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
@@ -2382,6 +2422,7 @@ impl PileSnapshot {
         covered_len: usize,
         opaque_records: usize,
         blobs: PileBlobIndex,
+        duplicate_blobs: DuplicateBlobIndex,
         validations: ValidationCache,
         collection_records: CollectionRecordIndex,
         capability_proofs: CapabilityProofIndex,
@@ -2392,6 +2433,7 @@ impl PileSnapshot {
             covered_len,
             opaque_records,
             blobs,
+            duplicate_blobs,
             validations,
             collection_records,
             capability_proofs,
@@ -2407,14 +2449,10 @@ impl PileSnapshot {
         // PATCH is persistent, so these clones capture one immutable point in
         // time while later pile refreshes continue independently.
         let for_iter = self.blobs.clone();
-        let lookup = for_iter.clone();
         let inner = for_iter.into_iter();
         PileBlobStoreIter {
-            mmap: self.mmap.clone(),
-            covered_len: self.covered_len,
+            snapshot: self.clone(),
             inner,
-            lookup,
-            validations: self.validations.clone(),
         }
     }
 
@@ -2440,6 +2478,52 @@ impl PileSnapshot {
         })
     }
 
+    /// Resolve one handle to any physical occurrence whose payload validates.
+    ///
+    /// The first occurrence remains the compact primary index entry. Duplicate
+    /// occurrences are a sparse fallback chain consulted only if validation of
+    /// that primary fails. Validation results are cached by record offset, so a
+    /// corrupt candidate is hashed at most once for the lifetime of this pile
+    /// and all snapshots derived from it.
+    fn validated_blob_record<E: Error>(
+        &self,
+        hash: &Inline<Hash<Blake3>>,
+        strategy: ValidationStrategy,
+    ) -> Result<IndexedBlobRecord, GetBlobError<E>> {
+        let Some(primary) = self.blobs.get(&hash.raw).copied() else {
+            return Err(GetBlobError::BlobNotFound);
+        };
+
+        let mut first_invalid = None;
+        let mut validate = |entry: IndexEntry| {
+            let record = indexed_blob_record(&self.mmap, self.covered_len, entry, hash);
+            match self
+                .validations
+                .state(entry.record_offset, &record.bytes, hash, strategy)
+            {
+                ValidationState::Validated => Some(record),
+                ValidationState::Invalid => {
+                    first_invalid.get_or_insert_with(|| record.bytes.clone());
+                    None
+                }
+            }
+        };
+
+        if let Some(record) = validate(primary) {
+            return Ok(record);
+        }
+        let mut alternative = self.duplicate_blobs.get(&hash.raw).cloned();
+        while let Some(candidate) = alternative {
+            if let Some(record) = validate(candidate.entry) {
+                return Ok(record);
+            }
+            alternative = candidate.previous.clone();
+        }
+        Err(GetBlobError::ValidationError(first_invalid.expect(
+            "a present primary candidate was validated and rejected",
+        )))
+    }
+
     // metadata moved into BlobStoreMeta impl below
 }
 
@@ -2456,28 +2540,13 @@ impl BlobStoreGet for PileSnapshot {
         Handle<S>: InlineEncoding,
     {
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
-        let Some(entry) = self.blobs.get(&hash.raw) else {
-            return Err(GetBlobError::BlobNotFound);
-        };
-        let entry = *entry;
-        let record = indexed_blob_record(&self.mmap, self.covered_len, entry, hash);
-        let state = self.validations.state(
-            entry.record_offset,
-            &record.bytes,
-            hash,
-            ValidationStrategy::ParallelIfLarge,
-        );
-        match state {
-            ValidationState::Validated => {
-                // The handle is what we just validated against — reuse
-                // it to skip Blake3 recomputation in Blob::new.
-                let blob: Blob<S> = Blob::with_handle(record.bytes.clone(), handle);
-                match blob.try_from_blob() {
-                    Ok(value) => Ok(value),
-                    Err(e) => Err(GetBlobError::ConversionError(e)),
-                }
-            }
-            ValidationState::Invalid => Err(GetBlobError::ValidationError(record.bytes)),
+        let record = self.validated_blob_record(hash, ValidationStrategy::ParallelIfLarge)?;
+        // The handle is what we just validated against — reuse it to skip
+        // Blake3 recomputation in Blob::new.
+        let blob: Blob<S> = Blob::with_handle(record.bytes, handle);
+        match blob.try_from_blob() {
+            Ok(value) => Ok(value),
+            Err(e) => Err(GetBlobError::ConversionError(e)),
         }
     }
 }
@@ -2488,9 +2557,11 @@ impl super::StoreSnapshot for PileSnapshot {
     fn changes_since(&self, previous: &Self) -> super::StoreChanges {
         let mut changes = super::StoreChanges::NONE;
         // PATCH equality intentionally ignores attached values. Root sharing
-        // additionally notices same-handle candidate healing, where a corrupt
-        // record offset is replaced without changing blob membership.
-        if !previous.blobs.shares_root(&self.blobs) {
+        // on the sparse duplicate index additionally notices a new physical
+        // fallback for an existing handle without changing blob membership.
+        if !previous.blobs.shares_root(&self.blobs)
+            || !previous.duplicate_blobs.shares_root(&self.duplicate_blobs)
+        {
             changes = changes.union(super::StoreChanges::BLOBS);
         }
         if previous.collection_records != self.collection_records {
@@ -2517,6 +2588,7 @@ impl super::SnapshotSource for Pile {
             self.applied_length,
             self.opaque_records,
             self.blobs.clone(),
+            self.duplicate_blobs.clone(),
             self.validations.clone(),
             self.collection_records.clone(),
             self.capability_proofs.clone(),
@@ -2886,6 +2958,7 @@ impl Pile {
             mmap,
             dirty: false,
             blobs: PileBlobIndex::new(),
+            duplicate_blobs: DuplicateBlobIndex::new(),
             validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: CollectionRecordIndex::new(),
@@ -2989,20 +3062,25 @@ impl Pile {
                     None => {
                         self.blobs.insert(&Entry::with_value(&hash.raw, candidate));
                     }
-                    Some(existing) => {
-                        // Duplicate hash: keep the existing record unless it
-                        // turns out to be corrupt, in which case the fresh
-                        // copy replaces it.
-                        let record =
-                            indexed_blob_record(&self.mmap, self.applied_length, existing, &hash);
-                        let state = self.validations.state(
-                            existing.record_offset,
-                            &record.bytes,
-                            &hash,
-                            ValidationStrategy::Serial,
-                        );
-                        if let ValidationState::Invalid = state {
-                            self.blobs.replace(&Entry::with_value(&hash.raw, candidate));
+                    Some(_) => {
+                        // Replay is an index construction path, not a payload
+                        // validation pass. Retain every physical alternative
+                        // in a sparse persistent chain and let `get` validate
+                        // candidates lazily until one succeeds. This preserves
+                        // recovery from either corrupt-first or corrupt-later
+                        // concatenations without hashing duplicate payloads on
+                        // every cold open.
+                        let previous = self.duplicate_blobs.get(&hash.raw).cloned();
+                        let replace = previous.is_some();
+                        let alternatives = Arc::new(DuplicateBlobCandidate {
+                            entry: candidate,
+                            previous,
+                        });
+                        let entry = Entry::with_value(&hash.raw, alternatives);
+                        if replace {
+                            self.duplicate_blobs.replace(&entry);
+                        } else {
+                            self.duplicate_blobs.insert(&entry);
                         }
                     }
                 }
@@ -3238,6 +3316,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.mmap);
             std::ptr::drop_in_place(&mut this.file);
             std::ptr::drop_in_place(&mut this.blobs);
+            std::ptr::drop_in_place(&mut this.duplicate_blobs);
             std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.collection_records);
@@ -3292,11 +3371,8 @@ use super::WantStore;
 /// a snapshot of keys/indices at iterator creation so the iterator does not
 /// borrow the underlying [`PATCH`] and can live independently of the [`Pile`].
 pub struct PileBlobStoreIter {
-    mmap: Arc<MmapRaw>,
-    covered_len: usize,
+    snapshot: PileSnapshot,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry, XorSip128>,
-    lookup: PileBlobIndex,
-    validations: ValidationCache,
 }
 
 impl Iterator for PileBlobStoreIter {
@@ -3305,23 +3381,16 @@ impl Iterator for PileBlobStoreIter {
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?;
         let hash = Inline::<Hash<Blake3>>::new(key);
-        let Some(entry) = self.lookup.get(&key) else {
-            return Some(Err(GetBlobError::BlobNotFound));
-        };
-        let entry = *entry;
-        let record = indexed_blob_record(&self.mmap, self.covered_len, entry, &hash);
-        match self.validations.state(
-            entry.record_offset,
-            &record.bytes,
-            &hash,
-            ValidationStrategy::ParallelIfLarge,
-        ) {
-            ValidationState::Validated => {
+        match self
+            .snapshot
+            .validated_blob_record(&hash, ValidationStrategy::ParallelIfLarge)
+        {
+            Ok(record) => {
                 let handle: Inline<Handle<UnknownBlob>> = hash.into();
                 let blob = Blob::with_handle(record.bytes, handle);
                 Some(Ok((handle, blob)))
             }
-            ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(record.bytes))),
+            Err(error) => Some(Err(error)),
         }
     }
 }
@@ -4253,23 +4322,13 @@ impl crate::repo::BlobStoreMeta for PileSnapshot {
         Handle<S>: InlineEncoding,
     {
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
-        let Some(entry) = self.blobs.get(&hash.raw) else {
-            return Ok(None);
-        };
-        let entry = *entry;
-        let record = indexed_blob_record(&self.mmap, self.covered_len, entry, hash);
-        let state = self.validations.state(
-            entry.record_offset,
-            &record.bytes,
-            hash,
-            ValidationStrategy::ParallelIfLarge,
-        );
-        match state {
-            ValidationState::Validated => Ok(Some(crate::repo::BlobMetadata {
+        match self.validated_blob_record::<Infallible>(hash, ValidationStrategy::ParallelIfLarge) {
+            Ok(record) => Ok(Some(crate::repo::BlobMetadata {
                 timestamp: record.timestamp,
                 length: record.bytes.len() as u64,
             })),
-            ValidationState::Invalid => Ok(None),
+            Err(GetBlobError::BlobNotFound | GetBlobError::ValidationError(_)) => Ok(None),
+            Err(GetBlobError::ConversionError(error)) => match error {},
         }
     }
 }
@@ -6982,6 +7041,34 @@ mod tests {
             std::mem::size_of::<IndexEntry>(),
             std::mem::size_of::<usize>()
         );
+        assert_eq!(
+            std::mem::size_of::<Arc<DuplicateBlobCandidate>>(),
+            std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<DuplicateBlobCandidate>(),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn duplicate_candidate_chain_drops_without_recursion() {
+        std::thread::Builder::new()
+            .name("deep-duplicate-drop".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut chain = None;
+                for offset in 0..100_000 {
+                    chain = Some(Arc::new(DuplicateBlobCandidate {
+                        entry: IndexEntry::new(offset),
+                        previous: chain,
+                    }));
+                }
+                drop(chain);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -7080,38 +7167,81 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_validation_is_isolated_by_record_offset() {
+    fn duplicate_replay_keeps_payload_validation_lazy() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "offset-validation.pile");
         let payload = b"target";
         let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
         let hash: Inline<Hash<Blake3>> = handle.into();
 
-        let first = append_v3_blob_candidate(&path, hash, b"bad-01", 1);
-        let second = append_v3_blob_candidate(&path, hash, payload, 2);
-        let _third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
+        let first = append_v3_blob_candidate(&path, hash, payload, 1);
+        let second = append_v3_blob_candidate(&path, hash, b"bad-02", 2);
+        let third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
 
         let mut pile = Pile::open(&path).unwrap();
         pile.refresh().unwrap();
-        assert_eq!(pile.blobs.get(&hash.raw).unwrap().record_offset, second);
-        let states = pile.validations.states.lock().unwrap();
-        assert!(matches!(states.get(&first), Some(ValidationState::Invalid)));
-        assert!(matches!(
-            states.get(&second),
-            Some(ValidationState::Validated)
-        ));
-        assert_eq!(states.len(), 2);
-        drop(states);
+        assert_eq!(pile.blobs.get(&hash.raw).unwrap().record_offset, first);
+        assert!(pile.validations.states.lock().unwrap().is_empty());
 
         let reader = pile.snapshot().unwrap();
         let blob: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(blob.bytes.as_ref(), payload);
+        assert!(matches!(
+            pile.validations.states.lock().unwrap().get(&first),
+            Some(ValidationState::Validated)
+        ));
+        assert!(!pile
+            .validations
+            .states
+            .lock()
+            .unwrap()
+            .contains_key(&second));
+        assert!(!pile.validations.states.lock().unwrap().contains_key(&third));
         drop(reader);
         pile.close().unwrap();
     }
 
     #[test]
-    fn all_invalid_duplicates_leave_the_last_candidate_lazy() {
+    fn cold_replay_recovers_from_corrupt_primary_with_valid_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "all-invalid.pile");
+        let payload = b"target";
+        let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
+        let hash: Inline<Hash<Blake3>> = handle.into();
+
+        let first = append_v3_blob_candidate(&path, hash, b"bad-01", 1);
+        let second = append_v3_blob_candidate(&path, hash, payload, 2);
+        let third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        assert!(pile.validations.states.lock().unwrap().is_empty());
+        let reader = pile.snapshot().unwrap();
+        let blob: Blob<UnknownBlob> = reader.get(handle).unwrap();
+        assert_eq!(blob.bytes.as_ref(), payload);
+        let metadata = reader
+            .metadata(handle)
+            .unwrap()
+            .expect("valid fallback metadata");
+        assert_eq!(metadata.timestamp, 2);
+        assert_eq!(metadata.length, payload.len() as u64);
+        assert!(matches!(
+            pile.validations.states.lock().unwrap().get(&first),
+            Some(ValidationState::Invalid)
+        ));
+        assert!(matches!(
+            pile.validations.states.lock().unwrap().get(&second),
+            Some(ValidationState::Validated)
+        ));
+        assert!(matches!(
+            pile.validations.states.lock().unwrap().get(&third),
+            Some(ValidationState::Invalid)
+        ));
+        drop(reader);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn all_invalid_duplicates_fail_after_lazy_exhaustion() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "all-invalid.pile");
         let expected = b"target";
@@ -7121,28 +7251,22 @@ mod tests {
         let first = append_v3_blob_candidate(&path, hash, b"bad-01", 1);
         let second = append_v3_blob_candidate(&path, hash, b"bad-02", 2);
         let third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
-
         let mut pile = Pile::open(&path).unwrap();
         pile.refresh().unwrap();
-        assert_eq!(pile.blobs.get(&hash.raw).unwrap().record_offset, third);
-        let states = pile.validations.states.lock().unwrap();
-        assert!(matches!(states.get(&first), Some(ValidationState::Invalid)));
-        assert!(matches!(
-            states.get(&second),
-            Some(ValidationState::Invalid)
-        ));
-        assert!(!states.contains_key(&third));
-        drop(states);
+        assert!(pile.validations.states.lock().unwrap().is_empty());
 
         let reader = pile.snapshot().unwrap();
         assert!(matches!(
             reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
             Err(GetBlobError::ValidationError(_))
         ));
-        assert!(matches!(
-            pile.validations.states.lock().unwrap().get(&third),
-            Some(ValidationState::Invalid)
-        ));
+        assert!(reader.metadata(handle).unwrap().is_none());
+        for offset in [first, second, third] {
+            assert!(matches!(
+                pile.validations.states.lock().unwrap().get(&offset),
+                Some(ValidationState::Invalid)
+            ));
+        }
         drop(reader);
         pile.close().unwrap();
     }
