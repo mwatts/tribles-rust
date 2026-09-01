@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `trible pile compact <SOURCE> --into <DESTINATION>` for out-of-place,
+  non-GC pile repacking. It retains every distinct valid blob, collapses exact
+  duplicate native set records, preserves all distinct COMMIT/MERGE/DERIVE and
+  capability evidence, and projects active local WANT/pin state plus the unique
+  store scope once. Blob records receive fresh timestamps; corrupt duplicate
+  occurrences and known semantically inert retired records are omitted. It
+  refuses opaque records, attempts to remove an incomplete fresh destination
+  after failure, and reports cleanup failure. On Unix the destination is
+  created no broader than mode 0600 before source permissions are applied
+  through its retained file handle after rewriting. Quiesce writers when the
+  result must cover the exact whole file rather than a valid observed prefix.
+
 - Add an optional resident CUDA scanner for canonical two-stage NVFP4 search.
   Mary receives validated compact stage and certificate planes and returns
   conservative raw-dot uppers; cover deduplication, exact source fetches,

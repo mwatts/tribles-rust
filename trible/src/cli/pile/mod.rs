@@ -7,6 +7,7 @@ use triblespace_core::repo::pile::{Pile, ReadError};
 
 pub mod blob;
 pub mod collection;
+mod compact;
 mod diagnose;
 mod migrate;
 pub mod net;
@@ -43,6 +44,28 @@ pub enum PileCommand {
     Create {
         /// Path to the pile file to create
         path: PathBuf,
+    },
+    /// Repack one pile into a fresh file without garbage-collecting blobs.
+    ///
+    /// Every distinct valid blob is retained. Exact duplicate blob,
+    /// collection, proof, and peer records collapse through their native set
+    /// identities; active WANTs, legacy pin state, and the unique store scope
+    /// are projected once. All distinct current native COMMIT/MERGE/DERIVE
+    /// records remain.
+    /// The source is never modified, the destination must not exist, and
+    /// opaque record kinds make the operation fail rather than guess at their
+    /// semantics. Quiesce writers when the output must cover the exact whole
+    /// file: a sufficiently late append may remain outside the valid observed
+    /// prefix. On Unix the fresh destination starts no broader than mode 0600;
+    /// source permissions are applied through its open file handle only after
+    /// the rewrite closes. Post-create failures trigger a destination-removal
+    /// attempt, and cleanup failures are reported.
+    Compact {
+        /// Source pile to read without modifying.
+        source: PathBuf,
+        /// Fresh destination pile to create.
+        #[arg(long = "into")]
+        into: PathBuf,
     },
     /// Diagnostic helpers for inspecting and repairing piles.
     Diagnose {
@@ -147,6 +170,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             pile.close().map_err(|e| anyhow::anyhow!("{e:?}"))?;
             Ok(())
         }
+        PileCommand::Compact { source, into } => compact::run(source, into),
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
         PileCommand::Amputate { path, truncate_to } => {

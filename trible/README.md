@@ -64,6 +64,17 @@ Run `trible <COMMAND>` to invoke a subcommand.
 - `pile create <PATH>` — initialize an empty pile, creating parent directories as needed.
 - `pile diagnose check <PILE>` — verify pile integrity.
 - `pile diagnose locate-hash <PILE> <HANDLE>` — scan raw pile bytes and report where a handle appears (blob header vs payload references).
+- `pile compact <SOURCE> --into <DESTINATION>` — conservatively repack into a
+  fresh pile. Every distinct valid blob and every distinct native collection,
+  proof, and peer record remains; active WANTs, legacy pins, and the unique
+  store scope are projected once. Blob records receive fresh timestamps,
+  corrupt physical occurrences disappear when another occurrence validates,
+  and known semantically inert retired records are dropped. Opaque kinds are
+  refused. Quiesce writers for an exact whole-file result because a late append
+  may remain outside the valid observed prefix. On Unix the destination starts
+  no broader than mode 0600, then receives the source permissions through its
+  open handle after rewriting. On post-create failure the command attempts to
+  remove the destination and reports cleanup failure.
 - `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
 - `pile migrate <PILE> run [MIGRATION]` — run migrations (all by default). Pass `--dry-run` to preview changes.
 

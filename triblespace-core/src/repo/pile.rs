@@ -4744,9 +4744,10 @@ impl Pile {
     /// collection resolution. This byte-copy boundary deliberately knows
     /// nothing about collection authorization and does not persist the policy;
     /// callers must recompute and supply its roots on every later rewrite. It
-    /// additionally treats every active legacy strong-pin head as a recursive
-    /// ownership root and recreates the exact pin mapping, allowing collection
-    /// and branch models to coexist during migration.
+    /// additionally treats every resident active legacy strong-pin head as a
+    /// recursive ownership root and recreates the exact pin mapping even when
+    /// its head is absent, allowing collection and branch models to coexist
+    /// during migration.
     ///
     /// The source is refreshed once; blobs, strong pins, collection records,
     /// complete proofs, positive peer evidence, inert legacy collection
@@ -4775,6 +4776,7 @@ impl Pile {
         wants: WantRewritePolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
         let reader = self.snapshot().map_err(PileRewriteError::Source)?;
+        let strong_pins = self.branches.clone();
         // Scope is checked after the source observation. `store_scope`
         // refreshes once more and fails closed if a conflicting assertion was
         // appended while the snapshot was being frozen; checking it first
@@ -4790,7 +4792,6 @@ impl Pile {
                 .bind_store_scope(team)
                 .map_err(PileRewriteError::StoreScope)?;
         }
-        let strong_pins = self.branches.clone();
         let collection_records = reader.collection_records.clone();
         let capability_proofs = reader
             .proofs()
@@ -4806,7 +4807,12 @@ impl Pile {
             let head = *strong_pins
                 .get(raw)
                 .expect("pin key from snapshot must retain its value");
-            roots.retain_recursive(head);
+            if reader
+                .contains_blob(head)
+                .expect("PileSnapshot residency lookup is infallible")
+            {
+                roots.retain_recursive(head);
+            }
         }
         for key in collection_records.iter() {
             let record = collection_records
@@ -6929,6 +6935,43 @@ mod tests {
             .unwrap());
         assert!(!reader.contains_blob(missing_metadata).unwrap());
         assert!(!reader.contains_blob(missing_descriptor).unwrap());
+
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn retained_rewrite_preserves_dangling_legacy_pin_without_demanding_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "dangling-pin-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "dangling-pin-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        let pin_id = Id::new([31; 16]).unwrap();
+        let missing_head = Inline::<Handle<SimpleArchive>>::new([32; 32]);
+        source
+            .append_legacy_pin_for_test(pin_id, None, Some(missing_head))
+            .unwrap();
+        source.flush().unwrap();
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.retained_blobs, 0);
+        assert_eq!(stats.strong_pins, 1);
+        assert_eq!(
+            destination.legacy_pin_head_for_test(pin_id).unwrap(),
+            Some(missing_head)
+        );
+
+        let reader = destination.snapshot().unwrap();
+        assert!(!reader.contains_blob(missing_head).unwrap());
 
         drop(reader);
         destination.close().unwrap();

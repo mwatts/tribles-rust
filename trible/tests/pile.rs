@@ -5,6 +5,7 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStoreList;
+use triblespace::prelude::BlobStorePut;
 use triblespace::prelude::SnapshotSource;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
@@ -12,11 +13,12 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::{
-    descriptor, AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionStoreExt,
+    descriptor, AdmissionPolicy, Collection, CollectionMerge, CollectionPolicy, CollectionRead,
+    CollectionRecord, CollectionStore, CollectionStoreExt,
 };
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
 use triblespace_core::repo::{CapabilityProofRead, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 
@@ -93,6 +95,204 @@ fn create_creates_parent_directories() {
 
     assert!(path.exists());
     assert!(path.parent().unwrap().exists());
+}
+
+#[test]
+fn compact_uses_valid_blob_occurrence_without_collecting_blobs_or_equations() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("duplicate-source.pile");
+    let destination_path = dir.path().join("compacted.pile");
+    std::fs::File::create(&source_path).unwrap();
+
+    let mut source = Pile::open(&source_path).unwrap();
+    let blob = source
+        .put::<UTF8String, _>("keep every resident blob")
+        .unwrap();
+    let equation = CollectionRecord::Merge(CollectionMerge::new(
+        Inline::new([1; 32]),
+        Inline::new([2; 32]),
+        Inline::new([3; 32]),
+        Inline::new([4; 32]),
+    ));
+    source.insert(equation).unwrap();
+    source.close().unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let payload_offset = PileRecords::open(&source_path)
+        .unwrap()
+        .find_map(|record| match record.unwrap().content {
+            PileRecordContent::Blob { data_offset, .. } => Some(data_offset),
+            _ => None,
+        })
+        .unwrap();
+
+    // Pile concatenation is the ordinary way physical duplicates arise. The
+    // semantic indexes already collapse them on replay; compaction must also
+    // remove the repeated bytes from the new file.
+    let one_copy = std::fs::read(&source_path).unwrap();
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&source_path)
+        .unwrap()
+        .write_all(&one_copy)
+        .unwrap();
+    // Leave the duplicate valid but corrupt the first occurrence's payload.
+    // The segmented occurrence index projects one semantic handle while blob
+    // transfer must still walk its physical offsets until validation succeeds.
+    let mut source_before = std::fs::read(&source_path).unwrap();
+    source_before[payload_offset] ^= 0xFF;
+    std::fs::write(&source_path, &source_before).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("blob records: 2 -> 1")
+                .and(predicate::str::contains("collection records: 2 -> 1"))
+                .and(predicate::str::contains("store scope: none")),
+        );
+
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+    assert!(std::fs::metadata(&destination_path).unwrap().len() < source_before.len() as u64);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&destination_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let records = PileRecords::open(&destination_path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.content, PileRecordContent::Blob { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.content, PileRecordContent::Collection { .. }))
+            .count(),
+        1
+    );
+
+    let mut compacted = Pile::open(&destination_path).unwrap();
+    let snapshot = compacted.snapshot().unwrap();
+    let fetched: Blob<UTF8String> = snapshot.get(blob).unwrap();
+    assert_eq!(fetched.bytes.as_ref(), b"keep every resident blob");
+    assert_eq!(
+        snapshot
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![equation]
+    );
+    drop(snapshot);
+    compacted.close().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn compact_copies_source_permissions_after_rewrite() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("permission-source.pile");
+    let destination_path = dir.path().join("permission-destination.pile");
+    std::fs::File::create(&source_path).unwrap();
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::metadata(&destination_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+}
+
+#[test]
+fn compact_refuses_opaque_records_before_creating_destination() {
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("opaque-source.pile");
+    let destination_path = dir.path().join("must-not-survive.pile");
+    let source_bytes = opaque_envelope(None);
+    std::fs::write(&source_path, &source_bytes).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("opaque record"));
+
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+    assert!(!destination_path.exists());
+}
+
+#[test]
+fn compact_removes_destination_after_post_create_failure() {
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("corrupt-source.pile");
+    let destination_path = dir.path().join("must-not-survive.pile");
+    std::fs::File::create(&source_path).unwrap();
+
+    let mut source = Pile::open(&source_path).unwrap();
+    source.put::<UTF8String, _>("only occurrence").unwrap();
+    source.close().unwrap();
+    let payload_offset = PileRecords::open(&source_path)
+        .unwrap()
+        .find_map(|record| match record.unwrap().content {
+            PileRecordContent::Blob { data_offset, .. } => Some(data_offset),
+            _ => None,
+        })
+        .unwrap();
+    let mut source_bytes = std::fs::read(&source_path).unwrap();
+    source_bytes[payload_offset] ^= 0xFF;
+    std::fs::write(&source_path, &source_bytes).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("compact pile"));
+
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+    assert!(!destination_path.exists());
 }
 
 #[test]

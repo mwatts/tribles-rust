@@ -82,8 +82,11 @@ their existing backend semantics; in particular, a retained Pile rewrite still
 fails loud when an explicitly selected blob is absent.
 
 For migration safety, a retained Pile rewrite also recreates the exact immutable
-legacy pin snapshot it observed. That is physical preservation, not a current
-publication or retention API. Legacy V3 collection records are different: their
+legacy pin snapshot it observed. A resident pin head is a recursive root; a
+dangling pin remains dangling and its mapping is still recreated without
+manufacturing or demanding the absent blob. That is physical preservation, not
+a current publication or retention API. Legacy V3 collection records are
+different: their
 16-byte definition identities predate descriptor handles, so they are
 preserved byte-for-byte as
 inert physical evidence but grant no current collection authority and own no

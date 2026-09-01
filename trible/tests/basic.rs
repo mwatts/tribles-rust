@@ -32,7 +32,7 @@ fn legacy_mutation_commands_are_absent() {
             "removed pile command {removed:?} remains in help:\n{pile}"
         );
     }
-    for retained in ["blob", "collection", "migrate", "net"] {
+    for retained in ["blob", "collection", "compact", "migrate", "net"] {
         assert!(
             has_command(&pile, retained),
             "retained pile command {retained:?} is missing from help:\n{pile}"
