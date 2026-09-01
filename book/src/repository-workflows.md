@@ -377,7 +377,8 @@ decoding boundary.
 ## WANT missing content or computation
 
 Sparse evidence discovery deliberately does not fetch commit dependencies.
-`WantStore` records operational interest with three request shapes:
+`WantStore` adds operational interest to one idempotent grow-only set with
+three request shapes:
 
 - `Blob(handle)` — obtain those exact bytes;
 - `Merge(collection, low, high)` — discover an existing matching merge result;
@@ -392,7 +393,9 @@ with both proofs bound to the authenticated endpoints; H itself is never sent,
 and landed bytes must hash to H. The answer to an operation WANT is the
 ordinary native equation; obtaining its result bytes is a separate blob WANT.
 A WANT grants no collection authority and does not change the value of any
-collection.
+collection. There is no `unwant` operation: cache eviction belongs to Yard's
+physical rewrite policy, which re-records only surviving blob demand, while
+merge and derive requests remain durable.
 
 ## Migrate a legacy branch explicitly
 

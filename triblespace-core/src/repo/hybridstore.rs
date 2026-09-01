@@ -382,10 +382,6 @@ where
         self.blobs.want(request)
     }
 
-    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
-        self.blobs.unwant(request)
-    }
-
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         self.blobs.wants()
     }

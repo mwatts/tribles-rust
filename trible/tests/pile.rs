@@ -75,6 +75,23 @@ fn retired_team_record(kind: &str, seeds: &[u8]) -> Vec<u8> {
     record
 }
 
+fn retired_blob_want_record(handle: Inline<Handle<UnknownBlob>>, asserted: bool) -> Vec<u8> {
+    let mut record = vec![0u8; 256];
+    record[..28].copy_from_slice(
+        &hex::decode("0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B")
+            .expect("envelope marker"),
+    );
+    record[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let kind = if asserted {
+        "EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346"
+    } else {
+        "ACCB531FC7489357C40FCEF0DDE8BD9088F2AC1924A652EA211ADD5C30B95B46"
+    };
+    record[32..64].copy_from_slice(&hex::decode(kind).expect("retired WANT kind"));
+    record[64..96].copy_from_slice(&handle.raw);
+    record
+}
+
 #[test]
 fn create_initializes_empty_pile() {
     let dir = tempdir().unwrap();
@@ -255,6 +272,116 @@ fn compact_drops_retired_team_records() {
 
     assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
     assert_eq!(std::fs::metadata(&destination_path).unwrap().len(), 0);
+}
+
+#[test]
+fn monotone_want_migration_is_explicit_additive_and_idempotent() {
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("retired-wants.pile");
+    let destination_path = dir.path().join("compacted.pile");
+    let active = Inline::<Handle<UnknownBlob>>::new([0x81; 32]);
+    let inactive = Inline::<Handle<UnknownBlob>>::new([0x82; 32]);
+
+    let mut bytes = retired_blob_want_record(active, true);
+    bytes.extend_from_slice(&retired_blob_want_record(inactive, true));
+    bytes.extend_from_slice(&retired_blob_want_record(inactive, false));
+    std::fs::write(&source_path, &bytes).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "diagnose", "check"])
+        .arg(&source_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Recognized 3 retired WANT log record(s)",
+        ));
+
+    let mut before = Pile::open(&source_path).unwrap();
+    assert!(before.wants().unwrap().next().is_none());
+    before.close().unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate"])
+        .arg(&source_path)
+        .args(["run", "monotone-wants", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Would append 1 monotone WANT marker(s)",
+        ));
+    assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate"])
+        .arg(&source_path)
+        .args(["run", "monotone-wants"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Appended 1 monotone WANT marker(s)",
+        ));
+    let migrated_len = std::fs::metadata(&source_path).unwrap().len();
+    assert_eq!(migrated_len, bytes.len() as u64 + 256);
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate"])
+        .arg(&source_path)
+        .args(["run", "monotone-wants"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing to do"));
+    assert_eq!(std::fs::metadata(&source_path).unwrap().len(), migrated_len);
+
+    // Retired history concatenated after cutover stays inert in ordinary
+    // replay and compaction; only another explicit migration could promote it.
+    let stale = Inline::<Handle<UnknownBlob>>::new([0x83; 32]);
+    let mut appended = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&source_path)
+        .unwrap();
+    use std::io::Write as _;
+    appended
+        .write_all(&retired_blob_want_record(stale, true))
+        .unwrap();
+    appended.sync_all().unwrap();
+    drop(appended);
+
+    let mut reopened = Pile::open(&source_path).unwrap();
+    assert_eq!(
+        reopened
+            .wants()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![WantRequest::blob(active)]
+    );
+    reopened.close().unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "retired WANT log records: 4 -> 0 (dropped)",
+        ));
+    let mut compacted = Pile::open(&destination_path).unwrap();
+    assert_eq!(
+        compacted
+            .wants()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![WantRequest::blob(active)]
+    );
+    compacted.close().unwrap();
 }
 
 #[cfg(unix)]
@@ -778,8 +905,9 @@ fn diagnose_decodes_and_locates_bearer_blob_wants() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "classification: want-assertion (legacy weak-pin encoding)",
+            "classification: want (current grow-only set)",
         ))
+        .stdout(predicate::str::contains("request_kind: blob"))
         .stdout(predicate::str::contains(format!("handle: {handle_hex}")));
 
     Command::cargo_bin("trible")
@@ -794,7 +922,7 @@ fn diagnose_decodes_and_locates_bearer_blob_wants() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "want marker match at byte 0 (legacy weak-pin encoding)",
+            "typed want reference at byte 0 (request field handle)",
         ))
         .stdout(predicate::str::contains("want markers:   1"));
 }

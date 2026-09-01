@@ -37,12 +37,10 @@ type CapabilityProofIndex = PATCH<INLINE_LEN, IdentitySchema, CapabilityProof, X
 pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
-    /// LWW-resolved typed requests (see [`WantStore`]). In memory the
-    /// last-writer-wins resolution is just insert/remove of the complete
-    /// request identity. Wants here are exactly as ephemeral as the blobs
-    /// themselves — the trait is a capability, durability is the store's own
-    /// property.
-    pub wants: HashSet<WantRequest>,
+    /// Grow-only typed requests (see [`WantStore`]). Wants here are exactly as
+    /// ephemeral as the blobs themselves — the trait is a capability,
+    /// durability is the store's own property.
+    wants: HashSet<WantRequest>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: CollectionRecordIndex,
     /// Canonical complete capability proofs keyed by exact-body content id.
@@ -404,11 +402,6 @@ impl WantStore for MemoryRepo {
         Ok(())
     }
 
-    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
-        self.wants.remove(&request);
-        Ok(())
-    }
-
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         // Want enumeration feeds sync-daemon fetch order, and HashSet's
         // per-instance seed would break deterministic simulation replay.
@@ -533,11 +526,10 @@ mod tests {
             .is_err());
     }
 
-    /// Wants resolve last-writer-wins: want → listed, unwant →
-    /// gone, re-want → listed again. Enumeration is sorted (stable
+    /// Wants form an idempotent grow-only set. Enumeration is sorted (stable
     /// across runs despite HashSet backing).
     #[test]
-    fn wants_lww_roundtrip() {
+    fn wants_are_grow_only_and_idempotent() {
         let mut repo = MemoryRepo::default();
         assert_eq!(repo.wants().unwrap().count(), 0);
 
@@ -550,11 +542,6 @@ mod tests {
         let wants: Vec<_> = repo.wants().unwrap().map(Result::unwrap).collect();
         assert_eq!(wants, vec![first, second], "sorted enumeration");
 
-        repo.unwant(first).unwrap();
-        let wants: Vec<_> = repo.wants().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![second]);
-
-        // A later want wins over the earlier retraction.
         repo.want(first).unwrap();
         assert_eq!(repo.wants().unwrap().count(), 2);
     }

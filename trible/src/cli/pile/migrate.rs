@@ -10,6 +10,8 @@ mod branch_to_collection;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
+    #[value(name = "monotone-wants")]
+    MonotoneWants,
     #[value(name = "record-kind-descriptions")]
     RecordKindDescriptions,
 }
@@ -20,10 +22,10 @@ pub enum Command {
     List,
     /// Re-encode a whole pile into the current record framing.
     ///
-    /// Only the markers released in v0.46.4 are a compatibility commitment.
-    /// Anything written between that release and the current framing is read
-    /// once, here, and rewritten; a reframed pile needs none of those decoders
-    /// again.
+    /// Only the markers released in v0.46.4 are a writable compatibility
+    /// commitment. Exact retired boundaries remain structurally recognized so
+    /// later stale concatenation stays harmless; reframe projects their final
+    /// supported semantics once and drops the retired frames.
     Reframe {
         /// Destination pile. Must not already exist.
         #[arg(long = "into")]
@@ -52,11 +54,13 @@ pub enum Command {
         #[arg(long)]
         signing_key: PathBuf,
     },
-    /// Run migrations (all by default, or a single named migration).
+    /// Run one explicitly named migration.
     Run {
-        /// Optional migration name. If omitted, run all migrations in order.
+        /// Migration name. `monotone-wants` is deliberately never implicit:
+        /// it is the one cutover that promotes retired history into live
+        /// demand.
         #[arg(value_enum)]
-        migration: Option<Migration>,
+        migration: Migration,
         /// Show what would change without mutating the pile.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -75,7 +79,8 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
         } => branch_to_collection::run(pile_path, branch, collection_name, authority, signing_key),
         Command::Run { migration, dry_run } => {
             match migration {
-                None | Some(Migration::RecordKindDescriptions) => {
+                Migration::MonotoneWants => migrate_monotone_wants(&pile_path, dry_run)?,
+                Migration::RecordKindDescriptions => {
                     migrate_record_kind_descriptions(&pile_path, dry_run)?
                 }
             }
@@ -87,11 +92,25 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
 fn list_migrations(pile_path: &PathBuf) -> Result<()> {
     let mut pile = super::open_refreshed(pile_path)?;
     let res = (|| -> Result<(), anyhow::Error> {
+        let wants = pile
+            .want_cutover_status()
+            .context("inspect monotone WANT cutover")?;
         let snapshot = pile.snapshot().context("pile snapshot")?;
         let (present, missing) = record_kind_description_census(&snapshot)?;
         let total = present + missing;
 
         println!("Known migrations:");
+        if wants.missing_current == 0 {
+            println!(
+                "- monotone-wants: ok ({} retired record(s), {} resolved active request(s), all current)",
+                wants.retired_records, wants.resolved_active,
+            );
+        } else {
+            println!(
+                "- monotone-wants: needed ({} of {} resolved active request(s) missing current markers; {} retired record(s))",
+                wants.missing_current, wants.resolved_active, wants.retired_records,
+            );
+        }
         if missing == 0 {
             println!("- record-kind-descriptions: ok ({total} blob(s) resident)");
         } else {
@@ -100,6 +119,70 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
                  blob(s) missing)"
             );
         }
+        Ok(())
+    })();
+
+    let close_res = pile.close().map_err(|e| anyhow::anyhow!("{e:?}"));
+    res.and(close_res)?;
+    Ok(())
+}
+
+/// Project the retired LWW WANT log into the fresh grow-only set in place.
+///
+/// New replay deliberately ignores the old records, so this migration must be
+/// run before a pre-cutover pile is served. The pile-level operation holds one
+/// exclusive lock across its raw scan and append phase; reruns are idempotent.
+fn migrate_monotone_wants(pile_path: &PathBuf, dry_run: bool) -> Result<()> {
+    // The mutating pile operation performs its own locked refresh. Opening an
+    // unindexed Pile here avoids scanning a multi-gigabyte file once before
+    // the authoritative scan. Dry-run has no locked operation, so it uses the
+    // ordinary fail-loud refreshed open.
+    let mut pile = if dry_run {
+        super::open_refreshed(pile_path)?
+    } else {
+        Pile::open(pile_path)
+            .map_err(|err| anyhow!("open pile {}: {err:?}", pile_path.display()))?
+    };
+    let res = (|| -> Result<(), anyhow::Error> {
+        if dry_run {
+            let status = pile
+                .want_cutover_status()
+                .context("inspect monotone WANT cutover")?;
+            if status.missing_current == 0 {
+                println!(
+                    "monotone-wants: nothing to do ({} retired record(s), {} resolved active request(s), all current).",
+                    status.retired_records, status.resolved_active,
+                );
+                return Ok(());
+            }
+            println!(
+                "Would append {} monotone WANT marker(s) after resolving {} retired record(s) to {} active request(s) ({} already current).",
+                status.missing_current,
+                status.retired_records,
+                status.resolved_active,
+                status.already_current,
+            );
+            return Ok(());
+        }
+
+        let migrated = pile
+            .migrate_retired_wants()
+            .context("append monotone WANT markers")?;
+        pile.flush().context("flush monotone WANT migration")?;
+        if migrated.missing_current == 0 {
+            println!(
+                "monotone-wants: nothing to do ({} retired record(s), {} resolved active request(s), all current).",
+                migrated.retired_records, migrated.resolved_active,
+            );
+            return Ok(());
+        }
+        println!(
+            "Appended {} monotone WANT marker(s); resolved {} retired record(s) to {} active request(s) ({} were already current).",
+            migrated.missing_current,
+            migrated.retired_records,
+            migrated.resolved_active,
+            migrated.already_current,
+        );
         Ok(())
     })();
 
@@ -202,11 +285,12 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
             .map_err(|e| anyhow!("reframe: {e}"))?;
         println!(
             "Reframed into {}:\n  blobs: {}\n  pin updates: {}\n  wants: {}\n  \
-             capability proofs: {}\n  collection records: {}\n  dropped inert records: {}",
+             retired WANT records projected: {}\n  capability proofs: {}\n  collection records: {}\n  dropped inert records: {}",
             destination.display(),
             stats.blobs,
             stats.pin_updates,
             stats.wants,
+            stats.retired_want_records,
             stats.capability_proofs,
             stats.collection_records,
             stats.dropped_inert,

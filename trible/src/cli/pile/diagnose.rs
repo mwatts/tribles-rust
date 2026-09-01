@@ -1,6 +1,30 @@
 use anyhow::Result;
 use clap::Parser;
 use std::path::{Path, PathBuf};
+use triblespace_core::repo::{WantRequest, WANT_REQUEST_BYTES_LEN};
+
+// Raw-diagnostic knowledge of the short-lived retired typed-WANT format. This
+// is intentionally not part of WantRequest's current public encoding surface.
+const RETIRED_WANT_DERIVE_V1_TAG: u8 = 3;
+
+fn retired_derive_v1_source(
+    request: WantRequest,
+    identity: &[u8; WANT_REQUEST_BYTES_LEN],
+) -> Option<[u8; 32]> {
+    if identity[0] != RETIRED_WANT_DERIVE_V1_TAG {
+        return None;
+    }
+    let WantRequest::Derive { target, input } = request else {
+        return None;
+    };
+    let historical_target: [u8; 32] = identity[33..65].try_into().ok()?;
+    let historical_input: [u8; 32] = identity[65..97].try_into().ok()?;
+    (historical_target == target.raw && historical_input == input.raw).then(|| {
+        identity[1..33]
+            .try_into()
+            .expect("fixed historical WANT field")
+    })
+}
 
 #[derive(Parser)]
 pub enum Command {
@@ -57,6 +81,9 @@ struct RecordEvidence {
     retired_team_count: usize,
     retired_team_first: Option<usize>,
     retired_team_last: Option<usize>,
+    retired_want_count: usize,
+    retired_want_first: Option<usize>,
+    retired_want_last: Option<usize>,
     legacy_collection_count: usize,
     legacy_collection_first: Option<usize>,
     legacy_collection_last: Option<usize>,
@@ -108,6 +135,13 @@ fn scan_record_evidence(pile_path: &Path) -> Result<RecordEvidence> {
                     record.offset,
                 )
             }
+            PileRecordContent::RetiredWantAssert { .. }
+            | PileRecordContent::RetiredWantRetract { .. } => observe_offset(
+                &mut evidence.retired_want_count,
+                &mut evidence.retired_want_first,
+                &mut evidence.retired_want_last,
+                record.offset,
+            ),
             _ => {}
         }
     }
@@ -207,6 +241,18 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                             .expect("nonzero evidence has a first offset"),
                         evidence
                             .retired_team_last
+                            .expect("nonzero evidence has a last offset"),
+                    );
+                }
+                if evidence.retired_want_count != 0 {
+                    println!(
+                        "Recognized {} retired WANT log record(s) (first byte {}, last byte {}); omitted from current demand and available to explicit monotone-wants migration or reframe projection",
+                        evidence.retired_want_count,
+                        evidence
+                            .retired_want_first
+                            .expect("nonzero evidence has a first offset"),
+                        evidence
+                            .retired_want_last
                             .expect("nonzero evidence has a last offset"),
                     );
                 }
@@ -490,8 +536,6 @@ fn record_at(pile_path: &Path, offset: usize) -> Result<()> {
 fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::pile::PileRecord) {
     use triblespace_core::collection::CollectionRecord;
     use triblespace_core::repo::pile::{LegacyCollectionRecordKindV3, PileRecordContent};
-    use triblespace_core::repo::WantRequest;
-
     fn print_want_request(request: WantRequest) {
         match request {
             WantRequest::Blob { handle } => {
@@ -551,21 +595,23 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
             println!("  classification: branch-tombstone");
             println!("  branch_id: {branch_id:X}");
         }
-        PileRecordContent::WeakPin { handle } => {
-            println!("  classification: want-assertion (legacy weak-pin encoding)");
-            println!("  handle: {}", hex::encode_upper(handle.raw));
-        }
-        PileRecordContent::WeakUnpin { handle } => {
-            println!("  classification: want-retraction (legacy weak-unpin encoding)");
-            println!("  handle: {}", hex::encode_upper(handle.raw));
-        }
-        PileRecordContent::WantAssert { request } => {
-            println!("  classification: want-assertion");
+        PileRecordContent::Want { request } => {
+            println!("  classification: want (current grow-only set)");
             print_want_request(request);
         }
-        PileRecordContent::WantRetract { request } => {
-            println!("  classification: want-retraction");
+        PileRecordContent::RetiredWantAssert { request, identity } => {
+            println!("  classification: retired want assertion (migration input)");
             print_want_request(request);
+            if let Some(source) = retired_derive_v1_source(request, &identity) {
+                println!("  historical_source: {}", hex::encode_upper(source));
+            }
+        }
+        PileRecordContent::RetiredWantRetract { request, identity } => {
+            println!("  classification: retired want retraction (migration input)");
+            print_want_request(request);
+            if let Some(source) = retired_derive_v1_source(request, &identity) {
+                println!("  historical_source: {}", hex::encode_upper(source));
+            }
         }
         PileRecordContent::Collection { record } => match record {
             CollectionRecord::Commit(commit) => {
@@ -636,8 +682,6 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     use triblespace_core::inline::encodings::hash::Hash;
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
-    use triblespace_core::repo::WantRequest;
-
     fn matching_want_fields(request: WantRequest, needle: &[u8; 32]) -> Vec<&'static str> {
         match request {
             WantRequest::Blob { handle } => (handle.raw == *needle)
@@ -729,21 +773,28 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                 }
             }
             PileRecordContent::BranchTombstone { .. } => {}
-            PileRecordContent::WeakPin { handle } | PileRecordContent::WeakUnpin { handle } => {
-                if handle.raw == needle {
-                    want_marker_matches += 1;
-                    println!(
-                        "want marker match at byte {} (legacy weak-pin encoding)",
-                        record.offset
-                    );
-                }
-            }
-            PileRecordContent::WantAssert { request }
-            | PileRecordContent::WantRetract { request } => {
+            PileRecordContent::Want { request } => {
                 for field in matching_want_fields(request, &needle) {
                     want_marker_matches += 1;
                     println!(
                         "typed want reference at byte {} (request field {field})",
+                        record.offset
+                    );
+                }
+            }
+            PileRecordContent::RetiredWantAssert { request, identity }
+            | PileRecordContent::RetiredWantRetract { request, identity } => {
+                for field in matching_want_fields(request, &needle) {
+                    want_marker_matches += 1;
+                    println!(
+                        "typed want reference at byte {} (request field {field})",
+                        record.offset
+                    );
+                }
+                if retired_derive_v1_source(request, &identity) == Some(needle) {
+                    want_marker_matches += 1;
+                    println!(
+                        "typed want reference at byte {} (request field historical_source)",
                         record.offset
                     );
                 }

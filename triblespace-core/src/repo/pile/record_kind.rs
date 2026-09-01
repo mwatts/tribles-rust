@@ -53,6 +53,26 @@ pub const KIND_PEER_EVIDENCE: RawInline =
 pub const KIND_STORE_SCOPE: RawInline =
     hex_literal::hex!("97C69C746D01741C8012A56F08D2C424E0291B5424EB9CD7637FD4A655C93DFB");
 
+/// Historical blob-WANT assertion kind. Current replay treats it as inert;
+/// only explicit WANT cutover and semantic reframe consume it.
+pub const KIND_BLOB_WANT_ASSERT: RawInline =
+    hex_literal::hex!("EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346");
+
+/// Historical blob-WANT retraction kind. Current replay treats it as inert;
+/// only explicit WANT cutover and semantic reframe consume it.
+pub const KIND_BLOB_WANT_RETRACT: RawInline =
+    hex_literal::hex!("ACCB531FC7489357C40FCEF0DDE8BD9088F2AC1924A652EA211ADD5C30B95B46");
+
+/// Historical typed-WANT assertion kind. Current replay treats it as inert;
+/// only explicit WANT cutover and semantic reframe consume it.
+pub const KIND_WANT_ASSERT: RawInline =
+    hex_literal::hex!("65EE9E4279FFE01D263E75A8E2DF6289B6DE403CB4468098A0EAB925F81C28ED");
+
+/// Historical typed-WANT retraction kind. Current replay treats it as inert;
+/// only explicit WANT cutover and semantic reframe consume it.
+pub const KIND_WANT_RETRACT: RawInline =
+    hex_literal::hex!("A57C866A83A90635090A947D92464B19D9F898C0C961AB7A91C79A979F9F1483");
+
 /// Archive one description fragment and take its content identity.
 ///
 /// Only the fragment's facts are archived, exactly as a collection descriptor
@@ -125,29 +145,13 @@ record_kinds! {
         "pile-pin-tombstone-v1",
         "Retraction of a pin (branch) head assignment, resolved last-writer-wins against pile-pin-head-v1 records for the same identifier. Envelope bytes 64..80 hold the 16-byte pin identifier and 80..256 are zeros. The record spans exactly one 256-byte block and has no payload.";
 
-    /// A blob want assertion, in the historical weak-pin encoding.
-    BlobWantAssertRecordV1 = KIND_ID_BLOB_WANT_ASSERT "8F3EEFEDECD491F63F6EAAA5FD6F3D5E",
-        KIND_BLOB_WANT_ASSERT "EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346",
-        "pile-blob-want-assert-v1",
-        "Durable local demand for one blob, keyed by its handle and resolved last-writer-wins against pile-blob-want-retract-v1. Envelope bytes 64..96 hold the wanted BLAKE3 blob handle and 96..256 are zeros. Blob wants deliberately keep this kind rather than moving to pile-want-assert-v2, so a reader that skips the typed operation wants still observes the complete blob demand history.";
-
-    /// A blob want retraction, in the historical weak-unpin encoding.
-    BlobWantRetractRecordV1 = KIND_ID_BLOB_WANT_RETRACT "2D76662DFF0187EC36A8C90B12BB8B0D",
-        KIND_BLOB_WANT_RETRACT "ACCB531FC7489357C40FCEF0DDE8BD9088F2AC1924A652EA211ADD5C30B95B46",
-        "pile-blob-want-retract-v1",
-        "Retraction of durable local demand for one blob. Envelope bytes 64..96 hold the BLAKE3 blob handle and 96..256 are zeros.";
-
-    /// A typed operation-want assertion.
-    WantAssertRecordV2 = KIND_ID_WANT_ASSERT "9A06797600FA90B8A8259B0ED029EC21",
-        KIND_WANT_ASSERT "65EE9E4279FFE01D263E75A8E2DF6289B6DE403CB4468098A0EAB925F81C28ED",
-        "pile-want-assert-v2",
-        "Durable local demand for one reproducible collection operation, keyed by a canonical 97-byte request. Envelope byte 64 holds the versioned request tag, 65..96 are zeros, 96..128 hold field A, 128..160 field B, 160..192 field C, and 192..256 are zeros. Tag 2 is a merge request (A the collection descriptor handle, B and C the two input digests in lexicographic order); tag 3 is a derive request (A the source descriptor handle, B the target descriptor handle, C the input digest). Tag 1, a blob request, is not valid here: blob wants use pile-blob-want-assert-v1.";
-
-    /// A typed operation-want retraction.
-    WantRetractRecordV2 = KIND_ID_WANT_RETRACT "2D957A780A52E474F58A06D44D6FE46C",
-        KIND_WANT_RETRACT "A57C866A83A90635090A947D92464B19D9F898C0C961AB7A91C79A979F9F1483",
-        "pile-want-retract-v2",
-        "Retraction of durable local demand for one reproducible collection operation. The request layout is identical to pile-want-assert-v2, and the two resolve last-writer-wins per exact request key.";
+    /// One element of the current grow-only durable WANT set.
+    ///
+    /// Kind id minted with `trible genid` on 2026-09-02.
+    WantRecordV3 = KIND_ID_WANT "E6CEE6F8578E3B8DB4C081486A8CBD28",
+        KIND_WANT "82EE8C72E252AB403C431AA98C9E77C0EA89796A8111DFF8C252ABCDE6F87D6F",
+        "pile-want-v3",
+        "One element of the grow-only durable local WANT set, keyed by a canonical 97-byte WantRequest. Envelope byte 64 holds the versioned request tag, 65..96 are zeros, 96..128 hold field A, 128..160 field B, 160..192 field C, and 192..256 are zeros. Tag 1 is a blob request (A the BLAKE3 blob handle; B and C zero); tag 2 is a merge request (A the collection descriptor handle; B and C the input digests in lexicographic order); tag 4 is a derive request (A the target collection descriptor handle; B the input digest; C zero). The record spans exactly one 256-byte block and has no payload. Repeating an exact request is idempotent. There is no retraction kind; forgetting is a policy rewrite such as Yard reclaim.";
 
     /// A signed collection commit.
     CollectionCommitRecordV4 = KIND_ID_COLLECTION_COMMIT "CBF2CF97D52A3486E16C12D70D397C66",
@@ -233,12 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn retired_team_kinds_are_not_published_as_writable_formats() {
+    fn retired_kinds_are_not_published_as_writable_formats() {
         let writable = described_kinds()
             .into_iter()
             .map(|(kind, _)| kind)
             .collect::<BTreeSet<_>>();
         assert!(!writable.contains(&KIND_PEER_EVIDENCE));
         assert!(!writable.contains(&KIND_STORE_SCOPE));
+        assert!(!writable.contains(&KIND_BLOB_WANT_ASSERT));
+        assert!(!writable.contains(&KIND_BLOB_WANT_RETRACT));
+        assert!(!writable.contains(&KIND_WANT_ASSERT));
+        assert!(!writable.contains(&KIND_WANT_RETRACT));
     }
 }

@@ -56,7 +56,7 @@ change that fails loudly with the new value rather than silently reframing the
 pile.
 
 `Pile::publish_record_kind_descriptions` (exposed as
-`trible pile migrate run record-kind-descriptions`) stores those description
+`trible pile migrate <PILE> run record-kind-descriptions`) stores those description
 archives for every kind the current binary writes, which makes those kinds
 resolvable *there*. Content addressing makes the call idempotent, and the
 migration's census distinguishes "already resident" from "left to store" so a
@@ -70,8 +70,9 @@ proof also ends at byte 256. Longer proofs use more blocks without changing
 their canonical body.
 
 A collection descriptor and every capability claim remain ordinary blobs.
-Typed WANT assertions and retractions have their own kinds; historical pin
-records remain readable for explicit migration and conservative retention.
+One typed WANT kind stores a grow-only request set; retired assertion,
+retraction, and pin records remain structurally readable as explicit migration
+input but have no current replay effect.
 
 The span includes the header. Zero is invalid; decoders perform checked
 `span * 256` arithmetic and require that the complete record fit in the
@@ -109,11 +110,11 @@ otherwise-valid append, or make an existing record depend on a companion
 record of the new kind. Such an extension—or any other extension whose absence
 cannot conservatively mean “no effect”—requires a new frame magic instead.
 
-Concatenation is associative ordered composition, not universally commutative:
-WANT assertions/retractions and decoded legacy pins are right-biased logs.
-Opaque filtering is sound because it leaves the relative order of every known
-record unchanged; native collection and capability-proof records additionally collapse to
-order-independent set union.
+Concatenation is associative ordered physical composition. Current WANT,
+collection, and capability-proof records collapse to order-independent set
+union. Decoded legacy pins remain a right-biased log; retired WANT frames and
+bounded unknown kinds are inert, so concatenating stale history cannot change
+current demand.
 
 ### Compatibility surface: v0.46.4, and a reframe for everything else
 
@@ -124,20 +125,29 @@ hold. They are read forever.
 
 Everything introduced between that release and the current framing never
 shipped: the V3 record family, the three generations of collection records,
-the typed wants, retired team state, retired local cells, and the 36-byte
-legacy envelope. None of it is a compatibility commitment. It is read **once**, by
-`trible pile migrate <pile> reframe --into <dest>`, which re-encodes the whole
-pile into the current framing; a reframed pile never needs those decoders
-again, and they can be deleted once the local development piles have been
-reframed.
+the retired WANT logs, retired team state, retired local cells, and the 36-byte
+legacy envelope. None of it is a writable compatibility commitment. The
+current reader still recognizes each exact historical boundary so old piles
+can be inspected or migrated without guessing. `trible pile migrate <pile>
+reframe --into <dest>` re-encodes the whole pile into the current framing and
+drops known inert records; genuinely unknown frames are never reinterpreted.
+
+WANT has a cheaper in-place cutover when a whole-file reframe is unnecessary:
+before first starting a current binary on a pre-cutover pile, explicitly run
+`trible pile migrate <pile> run monotone-wants`. It scans the retired log,
+resolves its final active set once, and appends only missing current positives.
+The operation is additive and idempotent. It is deliberately excluded from any
+implicit migration run because it promotes retired history into live demand;
+after cutover, old frames stay inert even if a stale pile is concatenated.
 
 The re-encode is semantic and in source order, which is what makes it faithful:
 
 - Blob payloads are content-addressed, so copying changes no identity, and
-  their original insertion timestamps are carried across — the wall clock at
-  the moment of a rewrite is not a fact about when a blob arrived.
-- Legacy pins and WANT state are replayed in order, so the result's immutable
-  compatibility snapshot and operational request projection equal the source's.
+  their insertion timestamps are stamped afresh — the old timestamp was a
+  local fact about one physical file, not part of the blob identity.
+- Legacy pins are replayed in order. Retired WANT state is resolved in order
+  once and emitted only as current positive markers; already-current markers
+  union with that projection.
 - Collection records and capability proofs are grow-only sets, so order is
   irrelevant and re-insertion is idempotent.
 - Records that never carried live state are dropped and counted: inert legacy
@@ -513,9 +523,10 @@ Pile replay keeps the records in record-ID order. Re-inserting an identical
 record is an idempotent success; a different record reconstructing to the same
 ID is reported as a collision. Concatenating piles therefore gives set-union
 semantics for collection records: append order and duplicate copies do not
-change the discovered collection calculus. This order-independent behavior is
-specific to collection records; it does not reinterpret historical pin or
-operational WANT logs as sets.
+change the discovered collection calculus. Current operational WANTs are
+likewise a grow-only set. Historical pins remain ordered evidence; retired
+WANT logs are only explicit migration input and do not participate in ordinary
+replay.
 
 ## Native Capability Proof Records
 
@@ -687,13 +698,13 @@ rewrite while any such record remains.
 
 | Kind | Record kind (rooted at) | Kind-specific body after the common prefix |
 |---|---|---|
-| Assert | `65EE9E4279FFE01D263E75A8E2DF6289B6DE403CB4468098A0EAB925F81C28ED` (`9A06797600FA90B8A8259B0ED029EC21`) | `64` request kind, `65..96` reserved zeros, `96..128` field A, `128..160` field B, `160..192` field C, `192..256` reserved zeros |
-| Retract | `A57C866A83A90635090A947D92464B19D9F898C0C961AB7A91C79A979F9F1483` (`2D957A780A52E474F58A06D44D6FE46C`) | same request layout |
+| WANT | `82EE8C72E252AB403C431AA98C9E77C0EA89796A8111DFF8C252ABCDE6F87D6F` (`E6CEE6F8578E3B8DB4C081486A8CBD28`) | `64` request kind, `65..96` reserved zeros, `96..128` field A, `128..160` field B, `160..192` field C, `192..256` reserved zeros |
 
-Both kind IDs were minted with `trible genid` on 2026-08-13 and encode every
-non-bare request. An assertion and its retraction are keyed by the exact
-canonical 97-byte `WantRequest` below. They resolve last-writer-wins per exact
-request; reopening a pile reconstructs the asserted set.
+The root id was minted with `trible genid` on 2026-09-02. One frame is one
+element of a grow-only set keyed by the exact canonical 97-byte `WantRequest`
+below. Repeating a request is idempotent. There is no timestamp and no
+retraction kind: concatenation is set union. Retired frames are inert, so stale
+pre-cutover history can neither remove nor resurrect current demand.
 
 | Request | Tag | Field A | Field B | Field C |
 |---|---:|---|---|---|
@@ -715,17 +726,27 @@ the corresponding native `MERGE` or `DERIVE` receipt already defined by
 persists those questions independently of whether a local or remote worker
 eventually supplies the receipt.
 
-Blob assertions continue to be written under the historical weak-pin kind
-(`EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346`, rooted at
-`8F3EEFEDECD491F63F6EAAA5FD6F3D5E`), and Blob retractions under the historical
-weak-unpin kind
-(`ACCB531FC7489357C40FCEF0DDE8BD9088F2AC1924A652EA211ADD5C30B95B46`, rooted at
-`2D76662DFF0187EC36A8C90B12BB8B0D`). Their body is `64..96` the blob handle and
-`96..256` reserved zeros, and the single handle decodes as the equivalent
-canonical `Blob` request. Keeping bare Blob writes on these kinds is essential
-to the envelope's forgetful-projection rule: an older reader sees the complete
-bare-Blob LWW history and may safely ignore the new independent typed request
-kinds.
+Forgetting is a physical storage-policy operation. Yard may trim cache demand
+from its in-memory budget and then rewrite only surviving requests during
+reclaim; it never appends a negative fact. Operation wants are not cache
+entries and remain durable until a deliberate rewrite omits them.
+
+Four former current-frame kinds—the blob assertion/retraction pair
+`EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346` /
+`ACCB531FC7489357C40FCEF0DDE8BD9088F2AC1924A652EA211ADD5C30B95B46`
+and typed assertion/retraction pair
+`65EE9E4279FFE01D263E75A8E2DF6289B6DE403CB4468098A0EAB925F81C28ED` /
+`A57C866A83A90635090A947D92464B19D9F898C0C961AB7A91C79A979F9F1483`—plus
+their legacy-envelope and unenveloped weak-pin forms are now
+retired. Ordinary replay recognizes their exact framing but treats them as
+inert. The explicit `monotone-wants` migration and whole-pile reframe are the
+only operations that interpret their file order: both resolve the former
+per-request LWW log; migration appends missing positive members under the
+current kind, while reframe emits that final projection into its destination.
+Historical typed tag 3 encoded a derive as `(source, target, input)`; resolution
+keeps all three fields in its historical identity, then projects each active
+key to current `Derive(target, input)`. The current kind accepts only canonical
+tag 4.
 
 ## Legacy unenveloped records
 
@@ -733,11 +754,12 @@ The legacy envelope's bodies all began at byte 36, four bytes short of a 32-byte
 boundary; the tables above give the current offsets, and the legacy ones are
 each exactly 28 lower.
 
-Unenveloped V3 blob, branch, and legacy blob-want records place their kind ID directly in
+Unenveloped V3 blob, branch, and retired blob-WANT records place their kind ID directly in
 `0..16`. Their semantic bodies begin at byte 16 rather than byte 36: a V3 blob
 stores timestamp at `16..24`, byte length at `24..32`, and hash at `32..64`;
-branch IDs occupy `16..32`; branch values occupy `32..64`; and want handles
-occupy `16..48`. All have a 256-byte header and remain readable byte-for-byte.
+branch IDs occupy `16..32`; branch values occupy `32..64`; and retired WANT
+handles occupy `16..48`. All have a 256-byte header and remain structurally
+readable byte-for-byte; retired WANT records have no ordinary replay effect.
 The two retired local-cell markers are the one deliberate exception to the
 unknown-unenveloped rule: their historical 256-byte boundary is known, so the
 reader crosses them and exposes them as opaque migration evidence. Their former

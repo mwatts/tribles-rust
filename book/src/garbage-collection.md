@@ -98,9 +98,12 @@ contents are deliberately not scanned for child handles. Missing claims remain
 missing, and an invalidly signed proof roots nothing. This signature check
 establishes only a safe local lifetime edge: semantic authority still requires
 an external trust root, expected leaf, instant, and exact request.
-Blob WANT records are an explicit rewrite choice. Preserving them copies each
-exact demand marker but does not promote the requested blob to an ownership
-root; dropping them omits the markers entirely.
+WANT records are an explicit rewrite choice. Preserving them copies each exact
+grow-only request but does not promote a requested blob to an ownership root;
+dropping them omits the markers entirely. Yard collection may trim evictable
+blob demand from its in-memory budget, and reclaim then records only the
+surviving set. No negative record is appended, so operation wants remain
+durable and stale pile concatenation cannot retract demand.
 
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
 collection registry. A caller selecting one semantic view must rediscover its

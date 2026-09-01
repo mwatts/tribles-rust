@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace WANT's per-request LWW assertion/retraction log with one grow-only
+  canonical request set. `WantStore::unwant`, every adapter, and direct
+  mutation of `MemoryRepo`'s backing set are removed; Blob, Merge, and Derive
+  requests share the freshly minted
+  `pile-want-v3` kind rooted at `E6CEE6F8578E3B8DB4C081486A8CBD28`
+  (`82EE8C72E252AB403C431AA98C9E77C0EA89796A8111DFF8C252ABCDE6F87D6F`).
+  Former blob/typed assert/retract and weak-pin/unpin records remain
+  structurally readable but inert. The deliberately explicit, additive
+  `trible pile migrate <pile> run monotone-wants` resolves their old log once
+  and appends only missing current positives; semantic reframe does the same,
+  while ordinary compaction drops retired frames. Yard unions wants across all
+  generations, trims only evictable cache demand in memory, and makes that
+  forgetting physical by re-recording survivors during reclaim. Operation
+  wants remain durable.
+
 - Retire the obsolete team-era repository state. `Store` snapshots no longer
   require `PeerRead`, mutable stores no longer require `PeerStore`, and Pile,
   Yard, Hybrid, Lazy, and MemoryRepo carry no PEER or STORE_SCOPE indexes.

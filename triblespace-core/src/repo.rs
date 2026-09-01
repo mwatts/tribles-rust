@@ -610,8 +610,11 @@ pub const WANT_REQUEST_BYTES_LEN: usize = 1 + 3 * INLINE_LEN;
 pub const WANT_REQUEST_KIND_BLOB_V1: u8 = 1;
 /// Versioned tag of a merge request in the canonical [`WantRequest`] codec.
 pub const WANT_REQUEST_KIND_MERGE_V1: u8 = 2;
-/// Versioned tag of a derive request in the canonical [`WantRequest`] codec.
-pub const WANT_REQUEST_KIND_DERIVE_V1: u8 = 3;
+/// Retired derive tag used only while projecting historical pile WANT logs.
+///
+/// It encoded `(source, target, input)`; current canonical requests use tag 4
+/// and omit the source already named by the target descriptor.
+pub(crate) const WANT_REQUEST_KIND_DERIVE_V1: u8 = 3;
 /// Derive request naming only its target and input.
 ///
 /// The source is what the target's descriptor says it is, so a want that
@@ -813,30 +816,30 @@ fn read_want_field(bytes: &[u8; WANT_REQUEST_BYTES_LEN], index: usize) -> [u8; I
 
 /// Storage backend for durable typed wants.
 ///
-/// Wants are independent of legacy named-pin evidence and native collection
-/// records. A backend may support either capability without
-/// supporting the other. Repeated [`want`](Self::want) and
-/// [`unwant`](Self::unwant) operations resolve last-writer-wins per exact
-/// request; [`wants`](Self::wants) enumerates the currently asserted set.
-/// Exact-content requests are identified solely by their bearer handle.
+/// Wants are an idempotent grow-only set, independent of legacy named-pin
+/// evidence and native collection records. A backend may support either
+/// capability without supporting the other. Repeated [`want`](Self::want)
+/// calls for one exact request have no additional effect, and
+/// [`wants`](Self::wants) enumerates the set. Exact-content requests are
+/// identified solely by their bearer handle.
+///
+/// Forgetting is deliberately not a record operation. A storage policy such
+/// as [`crate::repo::yard::Yard`] may omit cache demand while physically
+/// rewriting its store, but it cannot append a counter-record whose later
+/// concatenation would retract another replica's demand.
 pub trait WantStore {
     /// Error type for want operations.
     type WantError: Error + Debug + Send + Sync + 'static;
 
-    /// Iterator over the LWW-resolved requests.
+    /// Iterator over the current grow-only request set.
     type WantIter<'a>: Iterator<Item = Result<WantRequest, Self::WantError>>
     where
         Self: 'a;
 
-    /// Assert durable interest in `request`.
-    ///
-    /// A later `want` after an `unwant` asserts the want again.
+    /// Add durable interest in `request` idempotently.
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError>;
 
-    /// Retract durable interest in `request`.
-    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError>;
-
-    /// List the LWW-resolved requests.
+    /// List the current request set.
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError>;
 }
 

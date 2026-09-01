@@ -154,7 +154,7 @@ pub enum WantGetError<E, W> {
     /// The bytes were present locally but didn't convert to the
     /// requested type.
     Conversion(E),
-    /// Local miss. The want is **durably on record** (asserted and flushed)
+    /// Local miss. The want is **durably on record** (added and flushed)
     /// — a sync daemon (`Peer` + `Reconciler`) services it. This is the
     /// probe's "recorded, not present" outcome, never "definitely
     /// absent"; to *wait* for the blob instead, use the async
@@ -455,11 +455,6 @@ where
         self.store.lock().expect("store mutex").want(request)
     }
 
-    /// Passthrough: retract a want / retention marker.
-    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
-        self.store.lock().expect("store mutex").unwant(request)
-    }
-
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         let mut store = self.store.lock().expect("store mutex");
         let requests: Vec<Result<WantRequest, S::WantError>> = store.wants()?.collect();
@@ -553,7 +548,7 @@ where
 /// The suspension behind the async waiting read. Every poll takes a
 /// fresh reader from the live store — which refreshes it, so records
 /// appended by other processes become visible — and does a local get.
-/// The first miss records the durable want (assert + flush, exactly like
+/// The first miss records the durable want (add + flush, exactly like
 /// the sync probe), then the future parks until woken: by an in-process
 /// `put` through the owning [`Lazy`], or by the cadence ticker.
 ///
@@ -1034,9 +1029,6 @@ mod tests {
         type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, WantRefused>>;
 
         fn want(&mut self, _request: WantRequest) -> Result<(), WantRefused> {
-            Err(WantRefused)
-        }
-        fn unwant(&mut self, _request: WantRequest) -> Result<(), WantRefused> {
             Err(WantRefused)
         }
         fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, WantRefused> {

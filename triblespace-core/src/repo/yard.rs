@@ -73,10 +73,6 @@ impl WantState {
             .replace(&Entry::with_value(&request.to_bytes(), value));
     }
 
-    fn unwant(&mut self, request: WantRequest) {
-        self.requests.remove(&request.to_bytes());
-    }
-
     fn requests(&self) -> Vec<WantRequest> {
         self.requests
             .iter_ordered()
@@ -263,10 +259,10 @@ impl Yard {
     /// truncated**. Repair is an explicit opt-in via [`Yard::amputate`]
     /// (mirroring [`Pile::refresh`] vs [`Pile::amputate`]).
     ///
-    /// The wanted set is rebuilt from the durable markers in the single young
-    /// operational log. Wants found in an older generation are rejected: each
-    /// pile exposes only its locally collapsed LWW set, so cross-file ordering
-    /// cannot be reconstructed soundly.
+    /// The wanted set is the union of the grow-only markers in every
+    /// generation. Retired assertion/retraction frames are inert; deployments
+    /// preserving their final active projection run the explicit one-time
+    /// `monotone-wants` pile migration before switching binaries.
     pub fn open<P>(
         paths: impl IntoIterator<Item = P>,
         config: YardConfig,
@@ -330,16 +326,12 @@ impl Yard {
         if generations.is_empty() {
             return Err(YardOpenError::NoGenerations);
         }
-        // Wants are a single young-generation operational log. Combining the
-        // already-collapsed sets of several generations would falsely revive
-        // an old assertion after a young retraction, so reject that ambiguous
-        // state instead of inventing cross-pile append order.
+        // WANT is a grow-only set, so generation order is irrelevant to
+        // membership and every generation may contribute safely. Visit old to
+        // young only so a duplicate young blob request receives the newest
+        // in-memory cache-recency value.
         let mut want_state = WantState::default();
-        for (level, generation) in generations.iter_mut().enumerate() {
-            // Generation::one is the only constructor today. If multi-segment
-            // tiers land, wants must remain in one ordered active-segment log
-            // rather than unioning several locally collapsed LWW sets.
-            debug_assert_eq!(generation.segments.len(), 1);
+        for generation in generations.iter_mut().rev() {
             for segment in &mut generation.segments {
                 let requests = segment
                     .pile_mut()
@@ -347,9 +339,6 @@ impl Yard {
                     .map_err(update_err_io)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(update_err_io)?;
-                if level != 0 && !requests.is_empty() {
-                    return Err(YardOpenError::WantsOutsideYoungGeneration { level });
-                }
                 for request in requests {
                     want_state.want(request);
                 }
@@ -384,13 +373,10 @@ impl Yard {
             .is_some_and(|g| g.segments.iter().any(|s| s.live.get(&handle.raw).is_some()))
     }
 
-    /// Re-append the surviving want markers to the young generation's
-    /// pile. A pile rewrite ([`reclaim_generation`]) transfers only live
-    /// blobs, so it drops the want marker records along with the dead
-    /// bytes; whenever the young pile is rewritten the current wanted set must
-    /// be re-recorded (surviving wants re-recorded, evicted ones dropped —
-    /// eviction already removed them from the in-memory set).
-    fn rerecord_want_markers(&mut self) -> Result<(), std::io::Error> {
+    /// Anchor the complete surviving WANT union in the young pile before an
+    /// old-only rewrite can destroy its last older marker. A young rewrite
+    /// instead writes this union into its replacement before atomic rename.
+    fn anchor_wants_in_young(&mut self) -> Result<(), std::io::Error> {
         let wants: Vec<WantRequest> = {
             let want_state = self.want_state.lock().expect("want mutex poisoned");
             want_state.requests()
@@ -508,16 +494,16 @@ impl Yard {
 
         // Fold reclamation into the merge: each dumped tier is now empty, so
         // recycle its segment in place (crash-safe write-empty + atomic rename)
-        // rather than leaving dead bytes for a separate reclaim() pass.
+        // rather than leaving dead bytes for a separate reclaim() pass. If the
+        // young tier itself stays put, first anchor the full surviving WANT
+        // union there; an older tier may hold its only durable copy.
+        if !dumped.is_empty() && !dumped.contains(&0) {
+            self.anchor_wants_in_young()
+                .map_err(YardCollectError::WantMarkers)?;
+        }
         for level in dumped {
             self.reclaim_segment(level, 0)
                 .map_err(YardCollectError::Reclaim)?;
-            // The rewrite dropped the young pile's want markers along
-            // with its dead bytes; re-record the surviving wanted set.
-            if level == 0 {
-                self.rerecord_want_markers()
-                    .map_err(YardCollectError::WantMarkers)?;
-            }
         }
 
         self.collect(retention)
@@ -530,10 +516,11 @@ impl Yard {
     /// Yard readers, but they do not mutate the underlying append-only pile
     /// files. `reclaim` is the explicit physical step. For each generation it
     /// writes the current live handles, every native collection record, and
-    /// every canonical complete proof to a sibling temporary pile, closes both
-    /// piles, atomically renames the temporary file over the original on the
-    /// same filesystem, and reopens the generation. Recognized retired PEER
-    /// and STORE_SCOPE records are deliberately omitted.
+    /// every canonical complete proof to a sibling temporary pile. The active
+    /// young replacement also receives the complete surviving WANT union. It
+    /// then closes both piles, atomically renames the temporary file over the
+    /// original on the same filesystem, and reopens the generation. Recognized
+    /// retired PEER and STORE_SCOPE records are deliberately omitted.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         let opaque_records = self.opaque_record_count().map_err(YardReclaimError::Pile)?;
         if opaque_records != 0 {
@@ -544,13 +531,6 @@ impl Yard {
         for level in 0..self.generations.len() {
             for index in 0..self.generations[level].segments.len() {
                 self.reclaim_segment(level, index)?;
-            }
-            // The rewrite dropped the young pile's want markers along
-            // with its dead bytes; re-record the surviving wanted set so the
-            // wants stay durable (evicted ones are simply not re-recorded).
-            if level == 0 {
-                self.rerecord_want_markers()
-                    .map_err(YardReclaimError::WantMarkers)?;
             }
         }
         Ok(())
@@ -564,6 +544,17 @@ impl Yard {
     /// propagate together via [`YardReclaimError::Reopen`] and the segment
     /// is left closed.
     fn reclaim_segment(&mut self, level: usize, index: usize) -> Result<(), YardReclaimError> {
+        // Put the complete surviving WANT union in the active young segment's
+        // replacement *before* its atomic rename. A post-rename append would
+        // leave a crash window in which the only durable marker was lost.
+        let wants = if level == 0 && index + 1 == self.generations[level].segments.len() {
+            self.want_state
+                .lock()
+                .expect("want mutex poisoned")
+                .requests()
+        } else {
+            Vec::new()
+        };
         let segment = &mut self.generations[level].segments[index];
         let path = segment.path.clone();
         let temp_path = reclaim_temp_path(&path, level);
@@ -573,7 +564,7 @@ impl Yard {
             .take()
             .expect("yard segment pile already closed");
 
-        match reclaim_generation(&path, &temp_path, &live, pile) {
+        match reclaim_generation(&path, &temp_path, &live, &wants, pile) {
             Ok(pile) => {
                 self.generations[level].segments[index].pile = Some(pile);
                 Ok(())
@@ -962,21 +953,6 @@ impl WantStore for Yard {
         Ok(())
     }
 
-    /// Retract a want: remove it from the in-memory want state and
-    /// persist a want-retraction marker to the young generation's pile
-    /// (last-writer-wins against any earlier want marker).
-    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
-        self.generations[0]
-            .active_mut()
-            .pile_mut()
-            .unwant(request)?;
-        self.want_state
-            .lock()
-            .expect("want mutex poisoned")
-            .unwant(request);
-        Ok(())
-    }
-
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         let items: Vec<Result<WantRequest, PileWriteError>> = {
             let want_state = self.want_state.lock().expect("want mutex poisoned");
@@ -1319,20 +1295,24 @@ fn reclaim_generation(
     path: &Path,
     temp_path: &Path,
     live: &HandleSet,
+    wants: &[WantRequest],
     old_pile: Pile,
 ) -> Result<Pile, YardReclaimError> {
-    reclaim_generation_with_final_guard_hook(path, temp_path, live, old_pile, || {})
+    reclaim_generation_with_hooks(path, temp_path, live, wants, old_pile, || {}, || {})
 }
 
-fn reclaim_generation_with_final_guard_hook<F>(
+fn reclaim_generation_with_hooks<F, G>(
     path: &Path,
     temp_path: &Path,
     live: &HandleSet,
+    wants: &[WantRequest],
     mut old_pile: Pile,
     before_final_guard: F,
+    after_rename: G,
 ) -> Result<Pile, YardReclaimError>
 where
     F: FnOnce(),
+    G: FnOnce(),
 {
     let reader = old_pile.snapshot().map_err(YardReclaimError::Pile)?;
     let opaque_records = reader.opaque_record_count();
@@ -1402,10 +1382,16 @@ where
             .insert_proof(proof)
             .map_err(YardReclaimError::CapabilityProof)?;
     }
+    for request in wants {
+        new_pile.want(*request).map_err(|err| match err {
+            PileWriteError::IoError(io) => YardReclaimError::WantMarkers(io),
+        })?;
+    }
     new_pile.close().map_err(YardReclaimError::Close)?;
     drop(reader);
     old_pile.close().map_err(YardReclaimError::Close)?;
     fs::rename(temp_path, path).map_err(YardReclaimError::Io)?;
+    after_rename();
 
     let mut reopened = Pile::open(path).map_err(YardReclaimError::Pile)?;
     // The rewritten pile was just written and closed by us; fail loud on
@@ -1428,11 +1414,6 @@ fn reclaim_temp_path(path: &Path, level: usize) -> PathBuf {
 #[derive(Debug)]
 pub enum YardOpenError {
     NoGenerations,
-    /// Durable wants must live only in the young operational generation;
-    /// collapsed per-generation sets cannot reconstruct cross-file LWW order.
-    WantsOutsideYoungGeneration {
-        level: usize,
-    },
     Io(std::io::Error),
     /// A generation pile failed to open or validate. A
     /// [`ReadError::CorruptPile`] here means the named generation file has
@@ -1451,10 +1432,6 @@ impl fmt::Display for YardOpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoGenerations => write!(f, "yard requires at least one generation"),
-            Self::WantsOutsideYoungGeneration { level } => write!(
-                f,
-                "yard generation {level} contains wants; wants must live only in generation 0"
-            ),
             Self::Io(err) => write!(f, "failed to create yard pile file: {err}"),
             Self::Pile { path, err } => {
                 write!(
@@ -1526,7 +1503,7 @@ impl fmt::Display for YardCollectError {
                 write!(f, "failed to recycle compacted yard generation: {err}")
             }
             Self::WantMarkers(err) => {
-                write!(f, "failed to re-record want markers: {err}")
+                write!(f, "failed to preserve want markers: {err}")
             }
         }
     }
@@ -1596,7 +1573,7 @@ impl fmt::Display for YardReclaimError {
             }
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WantMarkers(err) => {
-                write!(f, "failed to re-record want markers: {err}")
+                write!(f, "failed to preserve want markers: {err}")
             }
             Self::Reopen { path, primary, err } => write!(
                 f,
@@ -1622,6 +1599,7 @@ mod tests {
     use crate::collection::{
         empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionMerge,
     };
+    use crate::repo::pile::{PileRecordContent, PileRecords};
     use crate::trible::TribleSet;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
@@ -1737,9 +1715,6 @@ mod tests {
         assert!(actual
             .windows(2)
             .all(|pair| pair[0].to_bytes() < pair[1].to_bytes()));
-
-        state.unwant(merge_low);
-        assert!(!state.requests().contains(&merge_low));
     }
 
     fn pin_id(byte: u8) -> Id {
@@ -2334,6 +2309,53 @@ mod tests {
     }
 
     #[test]
+    fn compact_reanchors_old_only_wants_before_reclaiming_an_old_tier() {
+        let config = YardConfig {
+            want_budget: 10,
+            strong_level_budget: 1,
+            fanout: 1,
+        };
+        let (_dir, paths, mut yard) = yard_with_paths(3, config);
+        let operation =
+            WantRequest::derive(Inline::new([81; INLINE_LEN]), Inline::new([82; INLINE_LEN]));
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .want(operation)
+            .unwrap();
+        drop(yard);
+
+        let mut yard = Yard::open(paths.clone(), config).unwrap();
+        let first = yard
+            .put_in_generation::<RawBytes, _>(1, raw_blob(b"old-tier strong one"))
+            .unwrap();
+        let second = yard
+            .put_in_generation::<RawBytes, _>(1, raw_blob(b"old-tier strong two"))
+            .unwrap();
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(first);
+        roots.retain_recursive(second);
+
+        // Level 0 stays in place while level 1 exceeds its budget and is
+        // recycled. The old-only operation marker must be anchored in level 0
+        // before that rewrite removes its original bytes.
+        yard.compact(&roots).unwrap();
+        assert!(yard.contains_in_generation(2, first));
+        assert!(yard.contains_in_generation(2, second));
+        drop(yard);
+
+        let mut reopened = Yard::open(paths, config).unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![operation]
+        );
+    }
+
+    #[test]
     fn reclaim_rewrites_generation_to_live_blobs_only() {
         let (_dir, paths, mut yard) = yard_with_paths(
             1,
@@ -2420,12 +2442,19 @@ mod tests {
         opaque[28..32].copy_from_slice(&1u32.to_le_bytes());
         opaque[32..64].fill(0xA5);
 
-        let result =
-            reclaim_generation_with_final_guard_hook(&path, &temp_path, &live, pile, || {
+        let result = reclaim_generation_with_hooks(
+            &path,
+            &temp_path,
+            &live,
+            &[],
+            pile,
+            || {
                 let mut external = OpenOptions::new().append(true).open(&path).unwrap();
                 external.write_all(&opaque).unwrap();
                 external.sync_all().unwrap();
-            });
+            },
+            || {},
+        );
 
         assert!(matches!(
             result,
@@ -2437,6 +2466,45 @@ mod tests {
         assert_eq!(reopened.opaque_record_count().unwrap(), 1);
         let stored: Bytes = reopened.snapshot().unwrap().get(handle).unwrap();
         assert_eq!(stored.as_ref(), b"still owned");
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn young_rewrite_contains_wants_at_the_atomic_rename_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic-wants.pile");
+        File::create(&path).unwrap();
+        let temp_path = reclaim_temp_path(&path, 0);
+        let pile = Pile::open(&path).unwrap();
+        let request =
+            WantRequest::derive(Inline::new([91; INLINE_LEN]), Inline::new([92; INLINE_LEN]));
+
+        // Panic exactly after the replacement became visible but before Yard
+        // can reopen it. This models process death at the old post-rename
+        // re-recording window: the replacement itself must already carry the
+        // complete wanted set.
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = reclaim_generation_with_hooks(
+                &path,
+                &temp_path,
+                &HandleSet::new(),
+                &[request],
+                pile,
+                || {},
+                || panic!("simulated crash after atomic rename"),
+            );
+        }));
+        assert!(crashed.is_err());
+
+        let mut reopened = Pile::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![request]
+        );
         reopened.close().unwrap();
     }
 
@@ -2453,11 +2521,6 @@ mod tests {
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached")).get_handle();
         yard.want(WantRequest::blob(cached)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cached")).unwrap();
-        // A retracted want must stay retracted across restart (LWW).
-        let retracted = Blob::<RawBytes>::new(raw_blob(b"changed my mind")).get_handle();
-        yard.want(WantRequest::blob(retracted)).unwrap();
-        yard.unwant(WantRequest::blob(retracted)).unwrap();
-
         drop(yard); // closes (and flushes) the generation piles
 
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
@@ -2477,11 +2540,6 @@ mod tests {
             wanted.contains(&cached.raw),
             "wanted cache-retention marker lost across restart"
         );
-        assert!(
-            !wanted.contains(&retracted.raw),
-            "want retraction did not stick across restart"
-        );
-
         // The reloaded want still works as a retention marker: the
         // cached blob survives collection under the default budget.
         reopened.collect(&RetentionRoots::new()).unwrap();
@@ -2563,20 +2621,128 @@ mod tests {
     }
 
     #[test]
-    fn yard_rejects_wants_stranded_in_an_old_generation() {
+    fn collect_then_reclaim_forgets_evicted_blob_demand_without_a_counter_record() {
+        let config = YardConfig {
+            want_budget: 0,
+            ..YardConfig::default()
+        };
+        let (_dir, paths, mut yard) = yard_with_paths(1, config);
+        let cached = Blob::<RawBytes>::new(raw_blob(b"evict this cached value")).get_handle();
+        yard.want(WantRequest::blob(cached)).unwrap();
+        yard.put::<RawBytes, _>(raw_blob(b"evict this cached value"))
+            .unwrap();
+        let operation = WantRequest::derive(Inline::new([59; INLINE_LEN]), Inline::new([60; 32]));
+        yard.want(operation).unwrap();
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        assert_eq!(
+            yard.wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![operation]
+        );
+
+        // Collection only changed policy state; reclaim is the physical
+        // forgetting boundary that rewrites exactly the surviving request set.
+        yard.reclaim().unwrap();
+        drop(yard);
+        let mut reopened = Yard::open(paths.clone(), config).unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![operation]
+        );
+        assert!(!reopened.contains_in_generation(0, cached));
+        drop(reopened);
+
+        let records = PileRecords::open(&paths[0])
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.content, PileRecordContent::Want { .. }))
+                .count(),
+            1
+        );
+        assert!(!records.iter().any(|record| matches!(
+            record.content,
+            PileRecordContent::RetiredWantAssert { .. }
+                | PileRecordContent::RetiredWantRetract { .. }
+        )));
+    }
+
+    #[test]
+    fn yard_open_unions_wants_from_every_generation() {
         let (_dir, paths, yard) = yard_with_paths(2, YardConfig::default());
         drop(yard);
 
-        let request =
+        let young_request =
             WantRequest::derive(Inline::new([62; INLINE_LEN]), Inline::new([63; INLINE_LEN]));
+        let old_request = WantRequest::merge(
+            Inline::new([64; INLINE_LEN]),
+            Inline::new([65; INLINE_LEN]),
+            Inline::new([66; INLINE_LEN]),
+        );
+        let mut young = Pile::open(&paths[0]).unwrap();
+        young.want(young_request).unwrap();
+        young.close().unwrap();
         let mut old = Pile::open(&paths[1]).unwrap();
-        old.want(request).unwrap();
+        old.want(old_request).unwrap();
+        old.want(young_request).unwrap();
         old.close().unwrap();
 
-        assert!(matches!(
-            Yard::open(paths, YardConfig::default()),
-            Err(YardOpenError::WantsOutsideYoungGeneration { level: 1 })
-        ));
+        let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![old_request, young_request]
+        );
+    }
+
+    #[test]
+    fn yard_ignores_stale_retired_wants_appended_after_cutover() {
+        let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
+        let current_handle = Inline::<Handle<UnknownBlob>>::new([73; INLINE_LEN]);
+        let current = WantRequest::blob(current_handle);
+        yard.want(current).unwrap();
+        drop(yard);
+
+        for (marker, request) in [
+            (
+                hex_literal::hex!("8F3EEFEDECD491F63F6EAAA5FD6F3D5E"),
+                Inline::<Handle<UnknownBlob>>::new([74; INLINE_LEN]),
+            ),
+            (
+                hex_literal::hex!("2D76662DFF0187EC36A8C90B12BB8B0D"),
+                current_handle,
+            ),
+        ] {
+            let mut retired = [0u8; 256];
+            retired[..16].copy_from_slice(&marker);
+            retired[16..48].copy_from_slice(&request.raw);
+            let mut file = OpenOptions::new().append(true).open(&paths[0]).unwrap();
+            file.write_all(&retired).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![current]
+        );
     }
 
     /// The fail-loud posture: opening a yard whose generation pile has a

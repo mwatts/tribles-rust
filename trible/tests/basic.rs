@@ -54,8 +54,17 @@ fn legacy_mutation_commands_are_absent() {
     assert!(!branch_to_collection.contains("--proof"));
     assert!(!branch_to_collection.contains("--team-root"));
     let run = help(&["pile", "migrate", "unused.pile", "run"]);
+    assert!(run.contains("monotone-wants"));
+    assert!(run.contains("record-kind-descriptions"));
     assert!(!run.contains("branch-metadata-name"));
     assert!(!run.contains("no-rename-duplicates"));
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate", "unused.pile", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<MIGRATION>"));
 }
 
 #[test]

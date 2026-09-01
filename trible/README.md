@@ -76,7 +76,10 @@ Run `trible <COMMAND>` to invoke a subcommand.
   permissions through its open handle after rewriting. On post-create failure
   the command attempts to remove the destination and reports cleanup failure.
 - `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
-- `pile migrate <PILE> run [MIGRATION]` — run migrations (all by default). Pass `--dry-run` to preview changes.
+- `pile migrate <PILE> run <MIGRATION>` — run one explicitly named migration.
+  Pass `--dry-run` to preview changes. In particular, `monotone-wants` is a
+  deliberate one-time projection of retired demand history and is never part
+  of an implicit run-all operation.
 
 Legacy piles can be migrated directly into native collections:
 

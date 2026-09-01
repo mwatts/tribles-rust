@@ -2,13 +2,13 @@
 //!
 //! This is deliberately not garbage collection. Every distinct resident blob
 //! is an explicit direct root; the retained-rewrite machinery then projects
-//! the supported record families through their native set/LWW semantics. The
+//! current native sets and legacy pin state through their own semantics. The
 //! rewrite drops physical duplicates, superseded log entries, corrupt blob
 //! occurrences when another occurrence validates, and known semantically inert
 //! retired records such as `RetiredCollectionDeriveV4`, historical PEER
-//! evidence, and STORE_SCOPE assertions. Repacked blob records receive fresh
-//! insertion timestamps. Distinct collection equations and commits are never
-//! inferred to be redundant.
+//! evidence, STORE_SCOPE assertions, and retired WANT logs. Repacked blob
+//! records receive fresh insertion timestamps. Distinct collection equations
+//! and commits are never inferred to be redundant.
 //!
 //! Length checks reject ordinary concurrent appends observed during the work,
 //! but callers requiring an exact whole-file result must still quiesce writers:
@@ -29,6 +29,8 @@ struct RecordCensus {
     blobs: usize,
     collection_records: usize,
     capability_proofs: usize,
+    current_wants: usize,
+    retired_want_records: usize,
     retired_team_records: usize,
     opaque: usize,
 }
@@ -47,6 +49,9 @@ fn census(path: &Path) -> Result<RecordCensus> {
             PileRecordContent::Blob { .. } => census.blobs += 1,
             PileRecordContent::Collection { .. } => census.collection_records += 1,
             PileRecordContent::CapabilityProof { .. } => census.capability_proofs += 1,
+            PileRecordContent::Want { .. } => census.current_wants += 1,
+            PileRecordContent::RetiredWantAssert { .. }
+            | PileRecordContent::RetiredWantRetract { .. } => census.retired_want_records += 1,
             PileRecordContent::RetiredPeerEvidenceV1 | PileRecordContent::RetiredStoreScopeV1 => {
                 census.retired_team_records += 1
             }
@@ -203,7 +208,7 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
     drop(destination_file);
 
     println!(
-        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  retired team records: {} -> {} (dropped)\n  active wants: {}\n  active legacy pins: {}",
+        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  active wants: {}\n  active legacy pins: {}",
         source_path.display(),
         destination_path.display(),
         source_census.bytes,
@@ -214,6 +219,10 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
         destination_census.collection_records,
         source_census.capability_proofs,
         destination_census.capability_proofs,
+        source_census.current_wants,
+        destination_census.current_wants,
+        source_census.retired_want_records,
+        destination_census.retired_want_records,
         source_census.retired_team_records,
         destination_census.retired_team_records,
         stats.wants,
