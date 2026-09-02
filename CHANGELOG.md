@@ -68,7 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change. Exact H-only arrivals carry no collection provenance, so this
   conservative invalidation lets a newly resident Merkle child advance every
   affected payload root without reintroducing collection-coupled transfer.
-  Full repair page checkpoints remain scoped per collection.
+  Full repair page checkpoints remain scoped per collection. Within one
+  immutable refresh, overlapping forests now share aligned child discovery
+  while retaining independent reachability and authenticated forest entries.
 
 ### Added
 

@@ -24,7 +24,7 @@ use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
-use triblespace_core::repo::{BlobChildren, BlobStoreGet, StoreChanges, StoreRead};
+use triblespace_core::repo::{BlobChildren, BlobStoreGet, BlobStoreList, StoreChanges, StoreRead};
 
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetCommand, NetEvent, NetEventBatch, SnapshotNotice};
@@ -119,12 +119,74 @@ impl CollectionSnapshot {
 
 type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionSnapshot>>;
 
+type ResidentChildEdge = (u64, RawHash);
+
+#[derive(Default)]
+struct FullReplicaChildCache {
+    edges: HashMap<RawHash, Vec<ResidentChildEdge>>,
+    #[cfg(test)]
+    scans: usize,
+    #[cfg(test)]
+    membership_probes: usize,
+}
+
+impl FullReplicaChildCache {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Discover the resident aligned child handles of one blob once per immutable
+/// store observation.
+///
+/// Reachability remains collection-local: callers still apply their own
+/// `visited` set and choose the canonical parent edge for their forest. This
+/// cache shares only the expensive, collection-independent fact that a given
+/// parent byte string contains a resident handle at a given aligned offset.
+fn resident_child_edges<'a, R>(
+    snapshot: &R,
+    parent: RawHash,
+    known_resident: &HashSet<RawHash>,
+    cache: &'a mut FullReplicaChildCache,
+) -> &'a [ResidentChildEdge]
+where
+    R: BlobStoreGet + BlobStoreList,
+{
+    if !cache.edges.contains_key(&parent) {
+        #[cfg(test)]
+        {
+            cache.scans += 1;
+        }
+        let mut edges = Vec::new();
+        if let Ok(bytes) = snapshot.get::<Bytes, UnknownBlob>(Inline::new(parent)) {
+            for (index, chunk) in bytes.chunks_exact(32).enumerate() {
+                let child: RawHash = chunk.try_into().expect("fixed-width chunk");
+                let resident = known_resident.contains(&child) || {
+                    #[cfg(test)]
+                    {
+                        cache.membership_probes += 1;
+                    }
+                    snapshot
+                        .contains_blob(Inline::<Handle<UnknownBlob>>::new(child))
+                        .unwrap_or(false)
+                };
+                if resident {
+                    edges.push((index as u64, child));
+                }
+            }
+        }
+        cache.edges.insert(parent, edges);
+    }
+    cache.edges.get(&parent).unwrap()
+}
+
 fn build_full_replica_state<R>(
     snapshot: &R,
     activation: &CollectionActivationOverlay,
+    child_cache: &mut FullReplicaChildCache,
 ) -> FullReplicaState
 where
-    R: StoreRead,
+    R: BlobStoreGet + BlobStoreList,
 {
     let mut direct_roots = HashSet::new();
     direct_roots.insert(activation.collection().raw);
@@ -156,19 +218,14 @@ where
     while !level.is_empty() {
         let mut next = BTreeMap::<[u8; 32], ([u8; 32], u64)>::new();
         for parent in &level {
-            let Ok(bytes) = snapshot.get::<Bytes, UnknownBlob>(Inline::new(*parent)) else {
-                continue;
-            };
-            for (index, chunk) in bytes.chunks_exact(32).enumerate() {
-                let child: [u8; 32] = chunk.try_into().expect("fixed-width chunk");
-                if visited.contains(&child)
-                    || !snapshot
-                        .contains_blob(Inline::<Handle<UnknownBlob>>::new(child))
-                        .unwrap_or(false)
-                {
+            for (index, child) in resident_child_edges(snapshot, *parent, &visited, child_cache)
+                .iter()
+                .copied()
+            {
+                if visited.contains(&child) {
                     continue;
                 }
-                next.entry(child).or_insert((*parent, index as u64));
+                next.entry(child).or_insert((*parent, index));
             }
         }
         let Some(next_depth) = depth.checked_add(1) else {
@@ -241,6 +298,7 @@ impl StoreSnapshot {
             || changes.contains(StoreChanges::COLLECTION_RECORDS)
             || changes.contains(StoreChanges::CAPABILITY_PROOFS)
             || authorization_changed;
+        let mut full_child_cache = FullReplicaChildCache::new();
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             if snapshot
@@ -316,7 +374,11 @@ impl StoreSnapshot {
             }) {
                 prior.full.clone()
             } else {
-                Arc::new(build_full_replica_state(&snapshot, &activation))
+                Arc::new(build_full_replica_state(
+                    &snapshot,
+                    &activation,
+                    &mut full_child_cache,
+                ))
             };
             let value = Arc::new(CollectionSnapshot {
                 activation,
@@ -2097,7 +2159,7 @@ fn op_name(op: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::sync::Arc;
 
     use anybytes::Bytes;
@@ -2130,11 +2192,12 @@ mod tests {
     use crate::transport::PeerId;
 
     use super::{
-        ActiveCollections, COLLECTION_PARTICIPANT_LEASE, DiscoveryState, FullReplicaState,
-        MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProviderPublicationBudget, RepairTarget,
-        StoreSnapshot, WakeBootstrapPeers, canonical_provider_subset, enqueue_repair,
-        forget_participant, has_repair_candidate, live_participants, observe_participant,
-        retain_active_repair_state,
+        ActiveCollections, COLLECTION_PARTICIPANT_LEASE, DiscoveryState, FullReplicaChildCache,
+        FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
+        ProviderPublicationBudget, RepairTarget, StoreSnapshot, WakeBootstrapPeers,
+        build_full_replica_state, canonical_provider_subset, collection_activation_overlay_at,
+        enqueue_repair, forget_participant, has_repair_candidate, live_participants,
+        observe_participant, resident_child_edges, retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2183,6 +2246,100 @@ mod tests {
 
     fn observed_at() -> hifitime::Epoch {
         hifitime::Epoch::from_gregorian_utc_at_midnight(2026, 1, 1)
+    }
+
+    #[test]
+    fn resident_child_cache_reuses_schema_agnostic_aligned_discovery() {
+        let mut store = MemoryRepo::default();
+        let child = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"resident child".to_vec()))
+            .unwrap();
+        let mut parent_bytes = vec![0xA5; 96];
+        parent_bytes[32..64].copy_from_slice(&child.raw);
+        let parent = store
+            .put::<UnknownBlob, _>(Bytes::from_source(parent_bytes))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let mut cache = FullReplicaChildCache::new();
+
+        let known_resident = HashSet::new();
+        let first = resident_child_edges(&snapshot, parent.raw, &known_resident, &mut cache);
+        let first_ptr = first.as_ptr();
+        assert_eq!(first, &[(1, child.raw)]);
+        let second = resident_child_edges(&snapshot, parent.raw, &known_resident, &mut cache);
+
+        assert_eq!(first_ptr, second.as_ptr());
+        assert_eq!(cache.scans, 1);
+        assert_eq!(cache.membership_probes, 3);
+    }
+
+    #[test]
+    fn full_forests_share_discovery_but_keep_collection_local_reachability() {
+        let key = SigningKey::from_bytes(&[0x37; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = MemoryRepo::default();
+        let child = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"shared collection child".to_vec()))
+            .unwrap();
+        let first = store
+            .collection("shared-scan-first", policy.clone())
+            .unwrap();
+        let second = store.collection("shared-scan-second", policy).unwrap();
+        let first_commit = store.commit(first, &key, fragment(9, child)).unwrap();
+        let second_commit = store.commit(second, &key, fragment(9, child)).unwrap();
+        assert_eq!(first_commit.data(), second_commit.data());
+
+        let snapshot = store.snapshot().unwrap();
+        let first_activation =
+            collection_activation_overlay_at(&snapshot, first.handle(), observed_at()).unwrap();
+        let second_activation =
+            collection_activation_overlay_at(&snapshot, second.handle(), observed_at()).unwrap();
+        let mut baseline_first_cache = FullReplicaChildCache::new();
+        let baseline_first =
+            build_full_replica_state(&snapshot, &first_activation, &mut baseline_first_cache);
+        let mut baseline_second_cache = FullReplicaChildCache::new();
+        let baseline_second =
+            build_full_replica_state(&snapshot, &second_activation, &mut baseline_second_cache);
+        let baseline_scans = baseline_first_cache.scans + baseline_second_cache.scans;
+        let baseline_probes =
+            baseline_first_cache.membership_probes + baseline_second_cache.membership_probes;
+
+        let mut shared_cache = FullReplicaChildCache::new();
+        let first_full = build_full_replica_state(&snapshot, &first_activation, &mut shared_cache);
+        let second_full =
+            build_full_replica_state(&snapshot, &second_activation, &mut shared_cache);
+        let forest_entries = first_full.forest.len() + second_full.forest.len();
+
+        eprintln!(
+            "full replica fixture: discovery scans {baseline_scans} -> {}, membership probes {baseline_probes} -> {}, forest entries {forest_entries} -> {forest_entries}",
+            shared_cache.scans, shared_cache.membership_probes,
+        );
+
+        assert!(shared_cache.scans < baseline_scans);
+        assert!(shared_cache.membership_probes < baseline_probes);
+        assert_eq!(first_full.forest, baseline_first.forest);
+        assert_eq!(second_full.forest, baseline_second.forest);
+        assert_eq!(
+            forest_entries,
+            baseline_first.forest.len() + baseline_second.forest.len(),
+            "sharing discovery must not share or suppress collection-local forest entries"
+        );
+        assert!(first_full.direct_roots.contains(&first.handle().raw));
+        assert!(!first_full.direct_roots.contains(&second.handle().raw));
+        assert!(second_full.direct_roots.contains(&second.handle().raw));
+        assert!(!second_full.direct_roots.contains(&first.handle().raw));
+        assert!(
+            first_full
+                .forest
+                .iter_ordered()
+                .any(|entry| entry[48..] == child.raw)
+        );
+        assert!(
+            second_full
+                .forest
+                .iter_ordered()
+                .any(|entry| entry[48..] == child.raw)
+        );
     }
 
     #[test]
