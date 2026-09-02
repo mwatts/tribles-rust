@@ -11,9 +11,8 @@
 //!                 iteration first publishes the input chunks as independent
 //!                 native `SimpleArchive` collection commits and freezes that
 //!                 collection's exact payload cover OUTSIDE the timer. The
-//!                 timer then covers `SuccinctArchiveCollection::maintain_exact`:
-//!                 exact
-//!                 source validation/derivation, canonical raw blob puts,
+//!                 timer then covers the two direct `maintain_exact` stages:
+//!                 exact source validation/derivation, canonical raw blob puts,
 //!                 deterministic dyadic target maintenance, ordinary
 //!                 raw-to-Rank9 derivation, equation publication, and final
 //!                 attachment. Source serialization, signing, and publication
@@ -73,11 +72,12 @@ use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::encodings::utf8string::UTF8String;
-use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
-use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace_core::collection::{
+    AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt, Support,
+};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
@@ -770,21 +770,27 @@ fn main() {
             let accelerated = store
                 .derive(raw, RawToRank9AcceleratedMapping, policy.clone())
                 .expect("register accelerated Succinct projection");
-            let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
             for chunk in &chunks {
                 store
                     .commit(source, &signing_key, Fragment::from(chunk.content.clone()))
                     .expect("publish source chunk");
             }
             let snapshot = store.snapshot().expect("freeze source snapshot");
-            let cover = source
+            let support: Support = source
                 .admitted(&snapshot)
-                .expect("freeze exact source cover");
+                .expect("freeze exact source support");
+            drop(snapshot);
 
             let t = Instant::now();
-            let attached = succinct
-                .maintain_exact(&mut store, &cover)
-                .expect("maintain exact Succinct cover");
+            store
+                .maintain_exact::<SimpleToSuccinctMapping>(raw, &support)
+                .expect("maintain exact raw Succinct cover");
+            let snapshot = store
+                .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
+                .expect("maintain exact accelerated Succinct cover");
+            let attached = snapshot
+                .collection_exact(accelerated, &support)
+                .expect("observe exact accelerated Succinct cover");
             let union: UnionArchive<OrderedUniverse> =
                 attached.view().expect("materialize exact Succinct cover");
             if recording {
@@ -794,16 +800,16 @@ fn main() {
             // Inspect the resident raw physical cover outside the timer. This
             // reports construction shape through a lookup-only attachment
             // which executes no collection algebra.
-            let exact = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw)
-                .expect("bind exact raw Succinct projection");
-            let raw_cover = exact
-                .attach(attached.snapshot(), &cover)
-                .expect("reattach exact raw cover for metrics");
+            let raw_cover = attached
+                .snapshot()
+                .collection_exact(raw, &support)
+                .expect("observe exact raw cover for metrics");
             let shape = BuildShape {
-                source_cover_members: cover.len(),
-                raw_cover_members: raw_cover.len(),
+                source_cover_members: support.len(),
+                raw_cover_members: raw_cover.cover().len(),
                 query_shards: union.segment_count(),
                 raw_bytes: raw_cover
+                    .cover()
                     .members()
                     .map(|handle| {
                         attached

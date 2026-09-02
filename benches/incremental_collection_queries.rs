@@ -35,13 +35,16 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
-    SuccinctArchiveSnapshot, SuccinctArchiveSnapshotAdvance,
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
-use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt, Cover};
+use triblespace::core::collection::succinctarchive_union::{
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
+};
+use triblespace::core::collection::{
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
+    CollectionStoreExt, Support,
+};
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::MemoryRepoSnapshot;
 use triblespace::prelude::*;
@@ -53,10 +56,11 @@ type Row = (Entity, Entity, Title);
 #[derive(Clone)]
 struct Fixture {
     store: MemoryRepo,
-    seed_cover: Cover<SimpleArchive>,
-    covers: Vec<Cover<SimpleArchive>>,
+    seed_cover: Support,
+    covers: Vec<Support>,
     expected_batches: Vec<Vec<Row>>,
-    succinct: SuccinctArchiveCollection,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
 }
 
 fn benchmark_name() -> &'static str {
@@ -129,30 +133,49 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     let accelerated = store
         .derive(raw, RawToRank9AcceleratedMapping, policy)
         .expect("register accelerated Succinct projection");
-    let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
-
     Fixture {
         store,
         seed_cover,
         covers,
         expected_batches,
-        succinct,
+        raw,
+        accelerated,
     }
+}
+
+fn maintain_succinct(
+    store: &mut MemoryRepo,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    support: &Support,
+) -> MemoryRepoSnapshot {
+    store
+        .maintain_exact::<SimpleToSuccinctMapping>(raw, support)
+        .expect("maintain exact raw Succinct cover");
+    store
+        .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, support)
+        .expect("maintain exact accelerated Succinct cover")
 }
 
 struct FullState {
     store: MemoryRepo,
-    succinct: SuccinctArchiveCollection,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     results: BTreeSet<Row>,
 }
 
 impl FullState {
     fn seeded(fixture: &Fixture) -> Self {
         let mut store = fixture.store.clone();
-        let seed = fixture
-            .succinct
-            .maintain_exact(&mut store, &fixture.seed_cover)
-            .expect("admit seed view");
+        let snapshot = maintain_succinct(
+            &mut store,
+            fixture.raw,
+            fixture.accelerated,
+            &fixture.seed_cover,
+        );
+        let seed = snapshot
+            .collection_exact(fixture.accelerated, &fixture.seed_cover)
+            .expect("observe seed view");
         let seed_view: UnionArchive<OrderedUniverse> = seed.view().expect("materialize seed view");
         assert_eq!(
             seed_view.iter().count(),
@@ -161,17 +184,18 @@ impl FullState {
         );
         Self {
             store,
-            succinct: fixture.succinct.clone(),
+            raw: fixture.raw,
+            accelerated: fixture.accelerated,
             results: BTreeSet::new(),
         }
     }
 
-    fn observe(&mut self, cover: &Cover<SimpleArchive>) -> Step {
+    fn observe(&mut self, cover: &Support) -> Step {
         let start = Instant::now();
-        let full = self
-            .succinct
-            .maintain_exact(&mut self.store, cover)
-            .expect("advance full-query view");
+        let snapshot = maintain_succinct(&mut self.store, self.raw, self.accelerated, cover);
+        let full = snapshot
+            .collection_exact(self.accelerated, cover)
+            .expect("observe full-query view");
         assert_eq!(full.support(), cover);
         let full_view: UnionArchive<OrderedUniverse> =
             full.view().expect("materialize full-query view");
@@ -200,18 +224,24 @@ impl FullState {
 
 struct IncrementalState {
     store: MemoryRepo,
-    succinct: SuccinctArchiveCollection,
-    snapshot: SuccinctArchiveSnapshot<MemoryRepoSnapshot>,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    snapshot: CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     results: BTreeSet<Row>,
 }
 
 impl IncrementalState {
     fn seeded(fixture: &Fixture) -> Self {
         let mut store = fixture.store.clone();
-        let seed = fixture
-            .succinct
-            .maintain_exact(&mut store, &fixture.seed_cover)
-            .expect("admit seed view");
+        let snapshot = maintain_succinct(
+            &mut store,
+            fixture.raw,
+            fixture.accelerated,
+            &fixture.seed_cover,
+        );
+        let seed = snapshot
+            .collection_exact(fixture.accelerated, &fixture.seed_cover)
+            .expect("observe seed view");
         let seed_view: UnionArchive<OrderedUniverse> = seed.view().expect("materialize seed view");
         assert_eq!(
             seed_view.iter().count(),
@@ -220,25 +250,32 @@ impl IncrementalState {
         );
         Self {
             store,
-            succinct: fixture.succinct.clone(),
+            raw: fixture.raw,
+            accelerated: fixture.accelerated,
             snapshot: seed,
             results: BTreeSet::new(),
         }
     }
 
-    fn observe(&mut self, cover: &Cover<SimpleArchive>) -> Step {
+    fn observe(&mut self, cover: &Support) -> Step {
         let start = Instant::now();
-        let advance = self
-            .succinct
-            .advance(&mut self.store, &self.snapshot, cover)
-            .expect("advance incremental full view");
-        let (next, changed) = match advance {
-            SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => (next, changed),
-            SuccinctArchiveSnapshotAdvance::Unchanged => panic!("benchmark cover did not grow"),
-            SuccinctArchiveSnapshotAdvance::Reset { .. } => {
-                panic!("benchmark cover did not grow monotonically")
-            }
-        };
+        let changed_support = cover
+            .additions_since(self.snapshot.support())
+            .expect("benchmark cover grows monotonically");
+        assert!(!changed_support.is_empty(), "benchmark cover did not grow");
+        maintain_succinct(
+            &mut self.store,
+            self.raw,
+            self.accelerated,
+            &changed_support,
+        );
+        let snapshot = maintain_succinct(&mut self.store, self.raw, self.accelerated, cover);
+        let next = snapshot
+            .collection_exact(self.accelerated, cover)
+            .expect("observe incremental full view");
+        let changed = snapshot
+            .collection_exact(self.accelerated, &changed_support)
+            .expect("observe incremental changed view");
         assert_eq!(
             changed.support().len(),
             1,

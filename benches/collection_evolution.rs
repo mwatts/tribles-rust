@@ -40,17 +40,16 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::Blob;
-use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
-    SuccinctArchiveSnapshot, SuccinctArchiveSnapshotAdvance,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionStoreExt, Cover,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionRecord,
+    CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt, Cover, CoverAdvanceError,
+    Support,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
@@ -97,10 +96,11 @@ impl StoreShape {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Collections {
-    source: CollectionHandle,
-    raw: CollectionHandle,
-    accelerated: CollectionHandle,
+    source: Collection<SimpleArchive>,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
 }
 
 fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape {
@@ -108,22 +108,28 @@ fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape 
     let snapshot = store.snapshot().expect("freeze MemoryRepo snapshot");
     for record in snapshot.records().expect("enumerate collection records") {
         match record.expect("MemoryRepo collection records are infallible") {
-            CollectionRecord::Commit(commit) if commit.collection() == collections.source => {
+            CollectionRecord::Commit(commit)
+                if commit.collection() == collections.source.handle() =>
+            {
                 shape.commits += 1;
             }
-            CollectionRecord::Merge(merge) if merge.collection() == collections.source => {
+            CollectionRecord::Merge(merge) if merge.collection() == collections.source.handle() => {
                 shape.source_merges += 1;
             }
-            CollectionRecord::Derive(derive) if derive.collection() == collections.raw => {
+            CollectionRecord::Derive(derive) if derive.collection() == collections.raw.handle() => {
                 shape.raw_derives += 1;
             }
-            CollectionRecord::Merge(merge) if merge.collection() == collections.raw => {
+            CollectionRecord::Merge(merge) if merge.collection() == collections.raw.handle() => {
                 shape.raw_merges += 1;
             }
-            CollectionRecord::Derive(derive) if derive.collection() == collections.accelerated => {
+            CollectionRecord::Derive(derive)
+                if derive.collection() == collections.accelerated.handle() =>
+            {
                 shape.accelerated_records += 1;
             }
-            CollectionRecord::Merge(merge) if merge.collection() == collections.accelerated => {
+            CollectionRecord::Merge(merge)
+                if merge.collection() == collections.accelerated.handle() =>
+            {
                 shape.accelerated_records += 1;
             }
             _ => shape.other_records += 1,
@@ -238,24 +244,36 @@ struct TimedOperation {
 }
 
 struct RunContext<'a> {
-    cover: &'a Cover<SimpleArchive>,
+    cover: &'a Support,
     total_rows: u64,
     newly_supported_rows: u64,
     expected: RelationIdentity,
-    succinct: &'a SuccinctArchiveCollection,
-    exact: &'a ExactDerivedCollection<SimpleToSuccinctMapping>,
     collections: &'a Collections,
+}
+
+fn maintain_succinct_exact(
+    store: &mut MemoryRepo,
+    support: &Support,
+    collections: &Collections,
+) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
+    store
+        .maintain_exact::<SimpleToSuccinctMapping>(collections.raw, support)
+        .expect("maintain exact raw Succinct collection");
+    let snapshot = store
+        .maintain_exact::<RawToRank9AcceleratedMapping>(collections.accelerated, support)
+        .expect("maintain exact accelerated Succinct collection");
+    snapshot
+        .collection_exact(collections.accelerated, support)
+        .expect("observe exact accelerated Succinct collection")
 }
 
 fn time_ensure(
     store: &mut MemoryRepo,
-    cover: &Cover<SimpleArchive>,
-    succinct: &SuccinctArchiveCollection,
+    cover: &Support,
+    collections: &Collections,
 ) -> TimedOperation {
     let start = Instant::now();
-    let attached = succinct
-        .maintain_exact(store, cover)
-        .expect("maintain exact Succinct collection");
+    let attached = maintain_succinct_exact(store, cover, collections);
     let elapsed = start.elapsed();
     let union: UnionArchive<OrderedUniverse> =
         attached.view().expect("materialize exact Succinct view");
@@ -265,8 +283,8 @@ fn time_ensure(
 
 fn observe_raw_cover(
     store: &mut MemoryRepo,
-    cover: &Cover<SimpleArchive>,
-    exact: &ExactDerivedCollection<SimpleToSuccinctMapping>,
+    cover: &Support,
+    raw: Collection<SuccinctArchiveBlob>,
 ) -> CoverIdentity {
     // This is outside the timer and must be a zero-write, zero-algebra lookup.
     // The public accelerated phase remains represented by timing and its
@@ -274,13 +292,13 @@ fn observe_raw_cover(
     let diagnostic_before = store
         .snapshot()
         .expect("freeze pre-diagnostic store snapshot");
-    let raw_cover = exact
-        .attach(&diagnostic_before, cover)
+    let raw_cover = diagnostic_before
+        .collection_exact(raw, cover)
         .expect("observe complete resident raw exact cover");
     let diagnostic_after = store
         .snapshot()
         .expect("freeze post-diagnostic store snapshot");
-    let cover = cover_identity(&diagnostic_after, &raw_cover);
+    let cover = cover_identity(&diagnostic_after, raw_cover.cover());
     assert!(
         diagnostic_after
             .changes_since(&diagnostic_before)
@@ -318,14 +336,14 @@ fn run_ensure_warm_pair(
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
-    let timed_warm = time_ensure(store, context.cover, context.succinct);
+    let timed_warm = time_ensure(store, context.cover, context.collections);
     let snapshot_after_warm = store
         .snapshot()
         .expect("freeze snapshot between warm and no-op calls");
 
     // Keep these public calls adjacent. In particular, do not materialize the
     // first result or inspect its raw cover before timing the unchanged call.
-    let timed_noop = time_ensure(store, context.cover, context.succinct);
+    let timed_noop = time_ensure(store, context.cover, context.collections);
     let snapshot_after_noop = store.snapshot().expect("freeze snapshot after no-op call");
     assert!(
         snapshot_after_noop
@@ -336,7 +354,7 @@ fn run_ensure_warm_pair(
 
     let after = store_shape(store, context.collections);
     let warm_work = after.difference(before);
-    let raw_cover = observe_raw_cover(store, context.cover, context.exact);
+    let raw_cover = observe_raw_cover(store, context.cover, context.collections.raw);
     let warm = finish_sample(
         Arm::EnsureWarm,
         context,
@@ -360,9 +378,9 @@ fn run_ensure_warm_pair(
 }
 
 fn run_ensure_cold(store: &mut MemoryRepo, context: &RunContext<'_>, before: StoreShape) -> Sample {
-    let timed = time_ensure(store, context.cover, context.succinct);
+    let timed = time_ensure(store, context.cover, context.collections);
     let after = store_shape(store, context.collections);
-    let raw_cover = observe_raw_cover(store, context.cover, context.exact);
+    let raw_cover = observe_raw_cover(store, context.cover, context.collections.raw);
     let cold = finish_sample(
         Arm::EnsureCold,
         context,
@@ -396,42 +414,41 @@ fn run_ensure_family(
 }
 
 fn time_snapshot(
-    state: &mut Option<SuccinctArchiveSnapshot<MemoryRepoSnapshot>>,
+    state: &mut Option<CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>>,
     store: &mut MemoryRepo,
-    cover: &Cover<SimpleArchive>,
-    succinct: &SuccinctArchiveCollection,
+    cover: &Support,
+    collections: &Collections,
 ) -> (TimedOperation, SnapshotSupport) {
     let start = Instant::now();
     let (candidate, changed_members, reused_members) = match state.as_ref() {
         None => (
-            {
-                succinct
-                    .maintain_exact(store, cover)
-                    .expect("construct initial exact Succinct snapshot")
-            },
+            maintain_succinct_exact(store, cover, collections),
             cover.len(),
             0,
         ),
-        Some(previous) => match succinct
-            .advance(store, previous, cover)
-            .expect("advance maintained exact Succinct snapshot")
-        {
-            SuccinctArchiveSnapshotAdvance::Unchanged => {
-                let elapsed = start.elapsed();
-                let union: UnionArchive<OrderedUniverse> = previous
-                    .view()
-                    .expect("materialize unchanged Succinct snapshot");
-                black_box(union.segment_count());
-                return (
-                    TimedOperation { elapsed, union },
-                    SnapshotSupport {
-                        cover_members: cover.len(),
-                        changed_members: 0,
-                        reused_members: cover.len(),
-                    },
-                );
-            }
-            SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => {
+        Some(previous) if cover == previous.support() => {
+            let elapsed = start.elapsed();
+            let union: UnionArchive<OrderedUniverse> = previous
+                .view()
+                .expect("materialize unchanged Succinct snapshot");
+            black_box(union.segment_count());
+            return (
+                TimedOperation { elapsed, union },
+                SnapshotSupport {
+                    cover_members: cover.len(),
+                    changed_members: 0,
+                    reused_members: cover.len(),
+                },
+            );
+        }
+        Some(previous) => match cover.additions_since(previous.support()) {
+            Ok(additions) => {
+                maintain_succinct_exact(store, &additions, collections);
+                let next = maintain_succinct_exact(store, cover, collections);
+                let changed = next
+                    .snapshot()
+                    .collection_exact(collections.accelerated, &additions)
+                    .expect("observe changed exact Succinct snapshot");
                 let changed_members = changed.support().len();
                 let changed_view: UnionArchive<OrderedUniverse> = changed
                     .view()
@@ -439,7 +456,14 @@ fn time_snapshot(
                 black_box(changed_view.segment_count());
                 (next, changed_members, previous.support().len())
             }
-            SuccinctArchiveSnapshotAdvance::Reset { next } => (next, cover.len(), 0),
+            Err(CoverAdvanceError::ResetRequired { .. }) => (
+                maintain_succinct_exact(store, cover, collections),
+                cover.len(),
+                0,
+            ),
+            Err(error) => {
+                panic!("advance maintained exact Succinct snapshot: {error}")
+            }
         },
     };
     let elapsed = start.elapsed();
@@ -459,13 +483,13 @@ fn time_snapshot(
 }
 
 fn run_snapshot_pair(
-    state: &mut Option<SuccinctArchiveSnapshot<MemoryRepoSnapshot>>,
+    state: &mut Option<CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>>,
     store: &mut MemoryRepo,
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
     let (timed_advance, advance_work) =
-        time_snapshot(state, store, context.cover, context.succinct);
+        time_snapshot(state, store, context.cover, context.collections);
     assert_eq!(advance_work.cover_members, context.cover.len());
     assert_eq!(
         advance_work.changed_members + advance_work.reused_members,
@@ -476,7 +500,7 @@ fn run_snapshot_pair(
         .snapshot()
         .expect("freeze store between snapshot advance and no-op");
 
-    let (timed_noop, noop_work) = time_snapshot(state, store, context.cover, context.succinct);
+    let (timed_noop, noop_work) = time_snapshot(state, store, context.cover, context.collections);
     assert_eq!(
         noop_work,
         SnapshotSupport {
@@ -564,7 +588,7 @@ fn benchmark_policy() -> CollectionPolicy {
     )
 }
 
-fn register_collections(store: &mut MemoryRepo) -> SuccinctArchiveCollection {
+fn register_collections(store: &mut MemoryRepo) -> Collections {
     let policy = benchmark_policy();
     let source = store
         .collection(benchmark_name(), policy.clone())
@@ -575,10 +599,14 @@ fn register_collections(store: &mut MemoryRepo) -> SuccinctArchiveCollection {
     let accelerated = store
         .derive(raw, RawToRank9AcceleratedMapping, policy)
         .expect("register accelerated Succinct projection");
-    SuccinctArchiveCollection::new(source, raw, accelerated)
+    Collections {
+        source,
+        raw,
+        accelerated,
+    }
 }
 
-fn new_source_store(expected: &SuccinctArchiveCollection) -> MemoryRepo {
+fn new_source_store(expected: &Collections) -> MemoryRepo {
     let mut store = MemoryRepo::default();
     assert_eq!(&register_collections(&mut store), expected);
     store
@@ -611,25 +639,15 @@ fn run_iteration(
     iteration: usize,
     chunks: &[TribleSet],
     checkpoints: &[usize],
-    succinct: &SuccinctArchiveCollection,
+    collections: &Collections,
 ) -> Vec<Sample> {
     let mut maintained_snapshot = None;
-    let exact = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(
-        succinct.source_collection(),
-        succinct.raw_collection(),
-    )
-    .expect("bind measured raw Succinct projection");
-    let source = exact.source_collection();
-    let collections = Collections {
-        source: source.handle(),
-        raw: succinct.raw_collection().handle(),
-        accelerated: succinct.collection().handle(),
-    };
+    let source = collections.source;
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
-    let mut source_accounting = new_source_store(succinct);
-    let mut cold_ensure_source = new_source_store(succinct);
-    let mut warm_ensure = new_source_store(succinct);
-    let mut snapshot_source = new_source_store(succinct);
+    let mut source_accounting = new_source_store(collections);
+    let mut cold_ensure_source = new_source_store(collections);
+    let mut warm_ensure = new_source_store(collections);
+    let mut snapshot_source = new_source_store(collections);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;
@@ -661,7 +679,7 @@ fn run_iteration(
             .admitted(&source_snapshot)
             .expect("freeze accounting source cover");
         assert_eq!(cover.len(), checkpoint);
-        let source_shape = store_shape(&mut source_accounting, &collections);
+        let source_shape = store_shape(&mut source_accounting, collections);
 
         let total_rows = expected.len() as u64;
         let newly_supported_rows = total_rows - previous_rows;
@@ -672,9 +690,7 @@ fn run_iteration(
             total_rows,
             newly_supported_rows,
             expected: expected_identity,
-            succinct,
-            exact: &exact,
-            collections: &collections,
+            collections,
         };
 
         let mut cold_ensure = cold_ensure_source.clone();
@@ -827,7 +843,7 @@ fn main() {
         .map(|commit| make_chunk(commit, rows_per_commit))
         .collect();
     let mut descriptor_store = MemoryRepo::default();
-    let succinct = register_collections(&mut descriptor_store);
+    let collections = register_collections(&mut descriptor_store);
     println!(
         "config   : commits={commits} rows/commit={rows_per_commit} warmup={warmup} iters={iterations} checkpoints={checkpoints:?}"
     );
@@ -839,12 +855,17 @@ fn main() {
     );
 
     for iteration in 0..warmup {
-        black_box(run_iteration(iteration, &chunks, &checkpoints, &succinct));
+        black_box(run_iteration(
+            iteration,
+            &chunks,
+            &checkpoints,
+            &collections,
+        ));
     }
 
     let mut aggregates = BTreeMap::<(usize, Arm), Aggregate>::new();
     for iteration in 0..iterations {
-        for sample in run_iteration(iteration, &chunks, &checkpoints, &succinct) {
+        for sample in run_iteration(iteration, &chunks, &checkpoints, &collections) {
             aggregates
                 .entry((sample.commits, sample.arm))
                 .or_default()
