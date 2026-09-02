@@ -36,19 +36,23 @@
 //! values produced by their own explicit recipe.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Range;
 
 use anybytes::Bytes;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
-use triblespace_core::collection::{CollectionEncoding, CollectionOperationError};
+use triblespace_core::collection::{
+    CollectionEncoding, CollectionOperationError, Cover, TryFromCover, TryFromCoverError,
+};
 use triblespace_core::id::{id_hex, ExclusiveId};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Encodes, Inline, InlineEncoding, RawInline};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::trible::Fragment;
 
 const RAW_INLINE_LEN: usize = 32;
@@ -802,6 +806,34 @@ impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<PortableBM25Blob>
 
     fn try_from_blob(blob: Blob<PortableBM25Blob>) -> Result<Self, Self::Error> {
         Self::from_bytes(blob.bytes)
+    }
+}
+
+impl<D: InlineEncoding, T: InlineEncoding> TryFromCover<PortableBM25Blob>
+    for PortableBM25Index<D, T>
+{
+    type Error = PortableBM25Error;
+
+    fn try_from_cover<R>(
+        cover: &Cover<PortableBM25Blob>,
+        _descriptor: &Fragment,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
+    where
+        R: BlobStoreGet,
+    {
+        let mut segments = Vec::with_capacity(cover.len());
+        for handle in cover.members() {
+            let member = Handle::<PortableBM25Blob>::to_hash(handle);
+            let blob: Blob<PortableBM25Blob> = snapshot
+                .get(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            segments.push(Self::try_from_blob(blob).map_err(TryFromCoverError::View)?);
+        }
+        match segments.len() {
+            1 => Ok(segments.pop().expect("one portable BM25 cover member")),
+            _ => Self::merge(segments.iter()).map_err(TryFromCoverError::View),
+        }
     }
 }
 
