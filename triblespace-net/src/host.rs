@@ -120,6 +120,25 @@ impl CollectionSnapshot {
 type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionSnapshot>>;
 
 type ResidentChildEdge = (u64, RawHash);
+type ResidentBlobSet = HashSet<RawHash>;
+
+/// Freeze the exact resident-handle relation once for one immutable store
+/// observation.
+///
+/// Full-replica discovery is a hash semijoin between the aligned 32-byte words
+/// of reachable blobs and this set. Building the set once avoids asking the
+/// store's persistent occurrence trie the same negative membership question
+/// for every arbitrary word in a large blob.
+fn resident_blob_set<R>(snapshot: &R) -> Result<ResidentBlobSet, R::Err>
+where
+    R: BlobStoreList,
+{
+    let mut resident = ResidentBlobSet::new();
+    for info in snapshot.blobs() {
+        resident.insert(info?.handle.raw);
+    }
+    Ok(resident)
+}
 
 #[derive(Default)]
 struct FullReplicaChildCache {
@@ -146,11 +165,11 @@ impl FullReplicaChildCache {
 fn resident_child_edges<'a, R>(
     snapshot: &R,
     parent: RawHash,
-    known_resident: &HashSet<RawHash>,
+    resident: &ResidentBlobSet,
     cache: &'a mut FullReplicaChildCache,
 ) -> &'a [ResidentChildEdge]
 where
-    R: BlobStoreGet + BlobStoreList,
+    R: BlobStoreGet,
 {
     if !cache.edges.contains_key(&parent) {
         #[cfg(test)]
@@ -161,16 +180,11 @@ where
         if let Ok(bytes) = snapshot.get::<Bytes, UnknownBlob>(Inline::new(parent)) {
             for (index, chunk) in bytes.chunks_exact(32).enumerate() {
                 let child: RawHash = chunk.try_into().expect("fixed-width chunk");
-                let resident = known_resident.contains(&child) || {
-                    #[cfg(test)]
-                    {
-                        cache.membership_probes += 1;
-                    }
-                    snapshot
-                        .contains_blob(Inline::<Handle<UnknownBlob>>::new(child))
-                        .unwrap_or(false)
-                };
-                if resident {
+                #[cfg(test)]
+                {
+                    cache.membership_probes += 1;
+                }
+                if resident.contains(&child) {
                     edges.push((index as u64, child));
                 }
             }
@@ -183,10 +197,11 @@ where
 fn build_full_replica_state<R>(
     snapshot: &R,
     activation: &CollectionActivationOverlay,
+    resident: &ResidentBlobSet,
     child_cache: &mut FullReplicaChildCache,
 ) -> FullReplicaState
 where
-    R: BlobStoreGet + BlobStoreList,
+    R: BlobStoreGet,
 {
     let mut direct_roots = HashSet::new();
     direct_roots.insert(activation.collection().raw);
@@ -201,11 +216,7 @@ where
     let mut visited = HashSet::new();
     let mut level = direct_roots.iter().copied().collect::<Vec<_>>();
     level.sort_unstable();
-    level.retain(|handle| {
-        snapshot
-            .contains_blob(Inline::<Handle<UnknownBlob>>::new(*handle))
-            .unwrap_or(false)
-    });
+    level.retain(|handle| resident.contains(handle));
     for handle in &level {
         let mut key = [0; 80];
         key[8..40].copy_from_slice(handle);
@@ -218,7 +229,7 @@ where
     while !level.is_empty() {
         let mut next = BTreeMap::<[u8; 32], ([u8; 32], u64)>::new();
         for parent in &level {
-            for (index, child) in resident_child_edges(snapshot, *parent, &visited, child_cache)
+            for (index, child) in resident_child_edges(snapshot, *parent, resident, child_cache)
                 .iter()
                 .copied()
             {
@@ -299,6 +310,7 @@ impl StoreSnapshot {
             || changes.contains(StoreChanges::CAPABILITY_PROOFS)
             || authorization_changed;
         let mut full_child_cache = FullReplicaChildCache::new();
+        let mut resident_blobs = None;
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             if snapshot
@@ -374,9 +386,15 @@ impl StoreSnapshot {
             }) {
                 prior.full.clone()
             } else {
+                if resident_blobs.is_none() {
+                    resident_blobs = Some(resident_blob_set(&snapshot)?);
+                }
                 Arc::new(build_full_replica_state(
                     &snapshot,
                     &activation,
+                    resident_blobs
+                        .as_ref()
+                        .expect("resident set was frozen before Full discovery"),
                     &mut full_child_cache,
                 ))
             };
@@ -2159,7 +2177,7 @@ fn op_name(op: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
     use anybytes::Bytes;
@@ -2177,7 +2195,8 @@ mod tests {
     use triblespace_core::patch::{Entry as PatchEntry, PATCH};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{
-        BlobStorePut, SnapshotSource, StoreChanges, StoreSnapshot as CoreStoreSnapshot,
+        BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource, StoreChanges,
+        StoreSnapshot as CoreStoreSnapshot,
     };
     use triblespace_core::trible::{Fragment, Trible, TribleSet};
 
@@ -2197,7 +2216,7 @@ mod tests {
         ProviderPublicationBudget, RepairTarget, StoreSnapshot, WakeBootstrapPeers,
         build_full_replica_state, canonical_provider_subset, collection_activation_overlay_at,
         enqueue_repair, forget_participant, has_repair_candidate, live_participants,
-        observe_participant, resident_child_edges, retain_active_repair_state,
+        observe_participant, resident_blob_set, resident_child_edges, retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2260,13 +2279,27 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(parent_bytes))
             .unwrap();
         let snapshot = store.snapshot().unwrap();
+        let resident = resident_blob_set(&snapshot).unwrap();
         let mut cache = FullReplicaChildCache::new();
 
-        let known_resident = HashSet::new();
-        let first = resident_child_edges(&snapshot, parent.raw, &known_resident, &mut cache);
+        let expected = snapshot
+            .get::<Bytes, UnknownBlob>(parent)
+            .unwrap()
+            .chunks_exact(32)
+            .enumerate()
+            .filter_map(|(index, chunk)| {
+                let child = <[u8; 32]>::try_from(chunk).unwrap();
+                snapshot
+                    .contains_blob(Inline::<Handle<UnknownBlob>>::new(child))
+                    .unwrap()
+                    .then_some((index as u64, child))
+            })
+            .collect::<Vec<_>>();
+        let first = resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
         let first_ptr = first.as_ptr();
+        assert_eq!(first, expected);
         assert_eq!(first, &[(1, child.raw)]);
-        let second = resident_child_edges(&snapshot, parent.raw, &known_resident, &mut cache);
+        let second = resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
 
         assert_eq!(first_ptr, second.as_ptr());
         assert_eq!(cache.scans, 1);
@@ -2290,24 +2323,34 @@ mod tests {
         assert_eq!(first_commit.data(), second_commit.data());
 
         let snapshot = store.snapshot().unwrap();
+        let resident = resident_blob_set(&snapshot).unwrap();
         let first_activation =
             collection_activation_overlay_at(&snapshot, first.handle(), observed_at()).unwrap();
         let second_activation =
             collection_activation_overlay_at(&snapshot, second.handle(), observed_at()).unwrap();
         let mut baseline_first_cache = FullReplicaChildCache::new();
-        let baseline_first =
-            build_full_replica_state(&snapshot, &first_activation, &mut baseline_first_cache);
+        let baseline_first = build_full_replica_state(
+            &snapshot,
+            &first_activation,
+            &resident,
+            &mut baseline_first_cache,
+        );
         let mut baseline_second_cache = FullReplicaChildCache::new();
-        let baseline_second =
-            build_full_replica_state(&snapshot, &second_activation, &mut baseline_second_cache);
+        let baseline_second = build_full_replica_state(
+            &snapshot,
+            &second_activation,
+            &resident,
+            &mut baseline_second_cache,
+        );
         let baseline_scans = baseline_first_cache.scans + baseline_second_cache.scans;
         let baseline_probes =
             baseline_first_cache.membership_probes + baseline_second_cache.membership_probes;
 
         let mut shared_cache = FullReplicaChildCache::new();
-        let first_full = build_full_replica_state(&snapshot, &first_activation, &mut shared_cache);
+        let first_full =
+            build_full_replica_state(&snapshot, &first_activation, &resident, &mut shared_cache);
         let second_full =
-            build_full_replica_state(&snapshot, &second_activation, &mut shared_cache);
+            build_full_replica_state(&snapshot, &second_activation, &resident, &mut shared_cache);
         let forest_entries = first_full.forest.len() + second_full.forest.len();
 
         eprintln!(

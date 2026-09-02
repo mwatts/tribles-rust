@@ -71,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Full repair page checkpoints remain scoped per collection. Within one
   immutable refresh, overlapping forests now share aligned child discovery
   while retaining independent reachability and authenticated forest entries.
+  Full discovery freezes that snapshot's resident-handle set once and
+  hash-semijoins aligned candidates against it instead of probing the
+  persistent occurrence PATCH for every arbitrary 32-byte word.
 
 ### Added
 
