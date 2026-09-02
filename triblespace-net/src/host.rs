@@ -135,7 +135,7 @@ where
         direct_roots.insert(commit.data().raw);
         direct_roots.insert(commit.metadata().raw);
     }
-    let mut forest = DisclosureForestPatch::new();
+    let mut forest_keys = Vec::new();
     let mut visited = HashSet::new();
     let mut level = direct_roots.iter().copied().collect::<Vec<_>>();
     level.sort_unstable();
@@ -149,7 +149,7 @@ where
         key[8..40].copy_from_slice(handle);
         key[40..48].copy_from_slice(&u64::MAX.to_be_bytes());
         key[48..].copy_from_slice(handle);
-        forest.insert(&PatchEntry::new(&key));
+        forest_keys.push(key);
         visited.insert(*handle);
     }
     let mut depth = 0_u64;
@@ -182,13 +182,13 @@ where
             key[8..40].copy_from_slice(&parent);
             key[40..48].copy_from_slice(&index.to_be_bytes());
             key[48..].copy_from_slice(&child);
-            forest.insert(&PatchEntry::new(&key));
+            forest_keys.push(key);
             visited.insert(child);
             level.push(child);
         }
     }
     FullReplicaState {
-        forest,
+        forest: DisclosureForestPatch::from_keys(forest_keys),
         direct_roots,
     }
 }
