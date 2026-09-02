@@ -1,8 +1,8 @@
 //! Deterministic size-tiered maintenance for derived target collections.
 //!
-//! This is the horizontal half of [`ExactDerivedCollection::ensure`]. It starts
-//! from a completed cover and publishes one deterministic batch of pairwise-
-//! disjoint canonical target carries before re-entering the per-point planner.
+//! This is the horizontal half of [`ExactDerivedCollection::maintain_exact`]. It starts
+//! from a completed cover and publishes deterministic pairwise-disjoint
+//! canonical target carries before re-entering the per-point planner.
 //! A later failed or capacity-limited join does not erase earlier useful work.
 //! The source cover remains the value boundary, and yard/GC policy alone decides
 //! the lifetime of materialized nodes.
@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::exact_derived::{
     data_identity, ExactDerivedCollection, ExactDerivedCollectionError, ExactPlannerBlocks,
-    TargetMergePair,
 };
 use super::{
     CollectionData, CollectionEncoding, CollectionMapping, CollectionMerge,
@@ -44,7 +43,7 @@ use super::{
 /// is chosen. Freshly selected covers are carried again when concurrent or
 /// older evidence exposes another collision. Repetition of any non-stable
 /// canonical cover returns [`ExactDerivedCollectionError::Stalled`].
-pub(super) fn ensure_target<S, H>(
+pub(super) fn maintain_target<S, H>(
     exact: &ExactDerivedCollection<H>,
     store: &mut S,
     source_cover: &Cover<H::Source>,
@@ -57,19 +56,26 @@ where
     Handle<H::Target>: InlineEncoding,
 {
     let mut blocks = ExactPlannerBlocks::default();
-    let mut cover = exact.complete(store, source_cover, &mut blocks)?;
+    let mut blocked_target_merges = BTreeSet::new();
+    let mut cover = exact.ensure_exact_with_blocks(store, source_cover, &mut blocks)?;
     let mut seen = BTreeSet::new();
     seen.insert(cover_identity(&cover));
 
     loop {
-        match publish_round::<S, H>(exact, store, source_cover, cover, &mut blocks.target_merges)? {
+        match publish_round::<S, H>(
+            exact,
+            store,
+            source_cover,
+            cover,
+            &mut blocked_target_merges,
+        )? {
             RoundOutcome::TargetPublished => {}
             RoundOutcome::Stable(cover) => return Ok(cover),
         }
         // Every successful carry can create an exact child image for a known
         // source-lattice point. Re-enter vertical planning before choosing the
         // next global size-tiered pair.
-        cover = exact.complete(store, source_cover, &mut blocks)?;
+        cover = exact.ensure_exact_with_blocks(store, source_cover, &mut blocks)?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
             return Err(ExactDerivedCollectionError::Stalled { cover: identity });
@@ -95,7 +101,7 @@ fn publish_round<S, Mapping>(
     store: &mut S,
     source_cover: &Cover<Mapping::Source>,
     cover: Cover<Mapping::Target>,
-    blocked_target_merges: &mut BTreeSet<TargetMergePair>,
+    blocked_target_merges: &mut BTreeSet<(CollectionData, CollectionData)>,
 ) -> Result<RoundOutcome<Mapping::Target>, ExactDerivedCollectionError>
 where
     S: BlobStore + CollectionStore,
@@ -141,7 +147,7 @@ where
         let mut bin = tiers.remove(&tier).expect("selected tier exists");
         let mut published = false;
 
-        while bin.len() >= 2 {
+        'pairs: while bin.len() >= 2 {
             let (low_data, low) = bin.pop_first().expect("colliding tier has a low input");
             let (high_data, high) = bin.pop_first().expect("colliding tier has a high input");
             if blocked_target_merges.contains(&(low_data, high_data)) {
@@ -149,46 +155,52 @@ where
                 continue;
             }
 
-            let reader = store.snapshot().map_err(|source| {
-                ExactDerivedCollectionError::storage("open target-merge snapshot", source)
-            })?;
-            let constructed = <Mapping::Target as CollectionEncoding>::join_members(
-                &descriptor,
-                &low,
-                &high,
-                &reader,
-            );
-            drop(reader);
-            let constructed = match constructed {
-                Ok(constructed) => constructed,
-                Err(CollectionOperationError::Fatal(reason)) => {
-                    return Err(ExactDerivedCollectionError::Merge {
-                        low: low_data,
-                        high: high_data,
-                        reason,
-                    });
-                }
-                Err(CollectionOperationError::Capacity(_)) => {
-                    // Retire only the lower input for this round. The higher
-                    // input remains eligible for the next deterministic pair,
-                    // exactly as in the scalar planner.
-                    bin.insert(high_data, high);
-                    continue;
-                }
-                Err(CollectionOperationError::MissingDependency(member)) => {
-                    if exact.materialize_target_join_dependency(
-                        store,
-                        source_cover,
-                        low_data,
-                        high_data,
-                        member,
-                    )? {
-                        // The dependency is itself a freshly published source
-                        // equation. Re-enter exact planning before selecting
-                        // another target pair, just as for a target batch.
-                        return Ok(RoundOutcome::TargetPublished);
+            let mut attempted_dependencies = BTreeSet::new();
+            let constructed = loop {
+                let reader = store.snapshot().map_err(|source| {
+                    ExactDerivedCollectionError::storage("open target-merge snapshot", source)
+                })?;
+                let constructed = <Mapping::Target as CollectionEncoding>::join_members(
+                    &descriptor,
+                    &low,
+                    &high,
+                    &reader,
+                );
+                drop(reader);
+                match constructed {
+                    Ok(constructed) => break constructed,
+                    Err(CollectionOperationError::Fatal(reason)) => {
+                        return Err(ExactDerivedCollectionError::Merge {
+                            low: low_data,
+                            high: high_data,
+                            reason,
+                        });
                     }
-                    return Err(ExactDerivedCollectionError::MissingDependency { member });
+                    Err(CollectionOperationError::Capacity(_)) => {
+                        blocked_target_merges.insert((low_data, high_data));
+                        // Retire only the lower input for this round. The higher
+                        // input remains eligible for the next deterministic pair,
+                        // exactly as in the scalar planner.
+                        bin.insert(high_data, high);
+                        continue 'pairs;
+                    }
+                    Err(CollectionOperationError::MissingDependency(member)) => {
+                        if !attempted_dependencies.insert(member)
+                            || !exact.materialize_target_join_dependency(
+                                store,
+                                source_cover,
+                                low_data,
+                                high_data,
+                                member,
+                            )?
+                        {
+                            return Err(ExactDerivedCollectionError::MissingDependency { member });
+                        }
+                        // Source dependency publication does not change the
+                        // target cover. Retry this exact pair through a fresh
+                        // snapshot rather than mistaking unchanged support for
+                        // a stalled target carry.
+                    }
                 }
             };
             let result_data = data_identity::<Mapping::Target>(&constructed);

@@ -18,7 +18,7 @@ use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
 };
 use triblespace::core::examples::literature;
-use triblespace::core::repo::memoryrepo::MemoryRepo;
+use triblespace::core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use triblespace::prelude::*;
 
 fn rebuild(
@@ -69,7 +69,7 @@ fn observe(
     store: &mut MemoryRepo,
     collection: Collection<SimpleArchive>,
     succinct: &SuccinctArchiveCollection,
-    checkpoint: &mut Option<SuccinctArchiveSnapshot>,
+    checkpoint: &mut Option<SuccinctArchiveSnapshot<MemoryRepoSnapshot>>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let snapshot = store.snapshot()?;
@@ -77,18 +77,21 @@ fn observe(
     let advance = match checkpoint.as_ref() {
         Some(previous) => succinct.advance(store, previous, &current)?,
         None => SuccinctArchiveSnapshotAdvance::Reset {
-            next: succinct.ensure(store, &current)?,
+            next: succinct.maintain_exact(store, &current)?,
         },
     };
 
     let (next, titles) = match advance {
         SuccinctArchiveSnapshotAdvance::Unchanged => return Ok(Vec::new()),
         SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => {
-            let titles = changes(next.view(), changed.view(), &mut consume)?;
+            let full: UnionArchive<OrderedUniverse> = next.view()?;
+            let delta: UnionArchive<OrderedUniverse> = changed.view()?;
+            let titles = changes(&full, &delta, &mut consume)?;
             (next, titles)
         }
         SuccinctArchiveSnapshotAdvance::Reset { next } => {
-            let titles = rebuild(next.view(), &mut consume)?;
+            let full: UnionArchive<OrderedUniverse> = next.view()?;
+            let titles = rebuild(&full, &mut consume)?;
             (next, titles)
         }
     };
@@ -148,7 +151,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let before_failure = checkpoint
         .as_ref()
-        .map(|snapshot| snapshot.source().clone());
+        .map(|snapshot| snapshot.support().clone());
     let failed = observe(&mut store, collection, &succinct, &mut checkpoint, |_| {
         Err(io::Error::other("simulated consumer failure").into())
     });
@@ -156,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         checkpoint
             .as_ref()
-            .map(|snapshot| snapshot.source().clone()),
+            .map(|snapshot| snapshot.support().clone()),
         before_failure,
     );
 

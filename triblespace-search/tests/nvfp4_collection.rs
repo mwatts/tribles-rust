@@ -7,7 +7,9 @@ use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 
 use triblespace_core::and;
 use triblespace_core::attribute::Attribute;
-use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace_core::collection::{
+    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, ExactDerivedCollection,
+};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
@@ -61,9 +63,11 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
 
     let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
-    let target_cover = store
-        .ensure::<EmbeddingAttributeToNvFp4<Embedding>>(target, &source_cover)
-        .unwrap();
+    let target_cover =
+        ExactDerivedCollection::<EmbeddingAttributeToNvFp4<Embedding>>::new(source, target)
+            .unwrap()
+            .maintain_exact(&mut store, &source_cover)
+            .unwrap();
     let snapshot = store.snapshot().unwrap();
     let index = target_cover
         .materialize::<NvFp4CosineIndex<Embedding>, _>(&snapshot)

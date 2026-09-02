@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Split exact derived construction from physical maintenance. `ensure` and
+  `ensure_exact` now publish missing `DERIVE` work only; `maintain` and
+  `maintain_exact` additionally perform deterministic dyadic size-tiered LSM
+  `MERGE` work. The store-level operations return a
+  `CollectionSnapshot<R, S, T>` which owns the fresh immutable store
+  observation together with frozen source support and the realized target
+  cover, then reconstructs caller-chosen views on demand.
+
 - Add a derived segmented pile index over `collection handle || record id` so
   collection-only selector unions visit only the named descriptors' records
   while preserving the intrinsic-ID index as canonical storage and ordering.
@@ -226,9 +234,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed conflicting coordinate fails a documented single-coordinate
   contract instead of depending on iteration order.
 
-- Add immutable `CollectionSnapshot<S, V>` values which pair one exact source
-  cover with its logical view. `SuccinctArchiveCollection::ensure` and
-  `attach` now preserve that continuation value, while functional `advance`
+- Add immutable `CollectionSnapshot<R, S, T>` values which pair one store
+  snapshot with exact source support and its realized target cover. Logical
+  projections are reconstructed on demand through `view`.
+  `SuccinctArchiveCollection::attach` preserves that continuation value, while
+  functional `advance`
   leaves the previous snapshot untouched and returns `Unchanged`,
   `Advanced { next, changed }`, or `Reset { next }`. Strict growth maintains
   exact changed and complete Succinct covers through persisted `DERIVE` and
@@ -909,10 +919,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovery, payload validation, deterministic resident covers, residual
   lowering, source-before-target-before-`DERIVE` publication, and
   read-side attachment without `PinStore` or an implicit flush. Regular paths
-  and both Succinct stages use this kernel. `SuccinctArchiveCollection` returns
-  the accelerated target cover as an owned sharded `UnionArchive`, preserving
-  its physical shape while reconstructing each validated query runtime from
-  the accelerated root and its named raw child.
+  and both Succinct stages use this kernel. `SuccinctArchiveCollection`
+  operations return a typed collection snapshot which owns the fresh store
+  observation, frozen admitted support, and accelerated target cover,
+  preserving its physical shape until a caller reconstructs a sharded
+  `UnionArchive` through `view`.
 
   `Rank9AcceleratedSuccinctArchiveBlob` is an ordinary ABI-qualified
   `CollectionEncoding` and a Merkle root: its first 32 bytes name the exact
@@ -929,45 +940,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The typed view rejects an accelerated root whose named raw child is absent;
   normal construction prevents that state by publishing source before target.
 
-  Exact attachment no longer requires unsigned intermediate blobs to survive
-  garbage collection. Descriptor-typed lattice methods validate fixed
-  descriptors and terminal blobs while the evaluator walks backwards from
-  resident source and target results, then reconstructs every candidate path
-  forwards from explicit source-cover leaves. Computed
-  intermediates have use-counted scratch lifetimes and are never persisted.
-  Invalid or incomplete cache paths are ignored and the deterministic physical
-  cover is recomputed. This adds neither receipts nor authority/retention
-  records, and `attach` remains write-free even after a retained Pile
-  rewrite collects intermediate cache blobs; `ensure` repairs only the
-  missing canonical closure and is write-free again once it is resident.
+  Exact attachment no longer requires every previously computed intermediate
+  blob to remain resident. Descriptor-typed lattice methods validate fixed
+  descriptors and terminal blobs while resolution follows durable equations
+  from explicit source-cover leaves to resident target results. Invalid or
+  incomplete paths are ignored and another support-equivalent physical cover
+  may be selected. This adds neither receipts nor authority/retention records,
+  and `attach` remains write-free even after a retained Pile rewrite collects
+  intermediate artifacts; `ensure` repairs missing cross-lattice `DERIVE`
+  work, while `maintain` additionally rebuilds the deterministic target LSM
+  cover.
 
   Lattice operations return `CollectionOperationError::{Fatal, Capacity,
   MissingDependency}`. `Capacity` is reserved for
   deterministic fixed-representation geometry, never transient allocation,
   I/O, or malformed persisted bytes. `MissingDependency` names exact immutable
   content which generic storage may materialize or fetch before retrying the
-  otherwise pure operation. When a selected source upper exceeds that
-  geometry, completion excludes it and globally replans the physical cover
-  under the same read/resolution snapshot, caching successful images but
-  publishing only the final feasible plan. An indispensable source-cover member
-  reports an explicit unrepresentable cover with zero writes. Succinct raw
+  otherwise pure operation. A capacity-terminal source mapping leaves that
+  support represented by a finer physical decomposition; a capacity-terminal
+  target merge leaves a stable tier collision. Every successful mapping or
+  merge is published immediately before planning continues. Succinct raw
   construction and merge preserve typed input-versus-union-growth phases.
   Paths remains fatal on all algebra failures, including fixed summary limits:
   its public operation currently rejoins every shard before closure, so a
   finer cover cannot make an oversized result representable. `Capacity` is
   reserved there until fragmented closure/materialization exists.
 
-  Exact derived collections now expose one constructive `ensure` operation,
-  rather than separate completion and compaction strategies. It reuses
-  an exact target image first, then joins the exact resident target-child pair,
-  then crosses the mapping through the corresponding resident source node, and
-  only then descends through source children. A capacity-terminal target pair
-  or corresponding source node falls through to the next route; the planner
-  never constructs a source merge merely to derive its image. After reaching a local
-  fixpoint, it carries one lowest-handle pair in the lowest colliding dyadic
-  serialized-byte tier and re-enters exact planning before choosing another.
-  Every computed target artifact is stored before its unsigned `MERGE` or
-  `DERIVE` record. A
+  Exact derived collections separate construction from maintenance. `ensure`
+  and `ensure_exact` reuse resident target images and support-equivalent stored
+  equations, cross the mapping for missing work, and publish `DERIVE` records
+  but never `MERGE`. `maintain` and `maintain_exact` carry the disjoint
+  lowest-handle pairs in the lowest colliding dyadic serialized-byte tier,
+  then re-enter exact planning before choosing another tier. Every computed
+  target artifact is stored before its unsigned `DERIVE` or `MERGE` record. A
   capacity failure retires only the lower input for that planning round, so the
   higher input remains eligible for another deterministic pair and every
   attempt shrinks the active set. A no-claim round returns a capacity-stable
@@ -979,16 +984,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record is introduced. Each raw shard retains the explicit `u32::MAX`
   row/domain boundary.
 - **Regular paths now use one exact native collection path.**
-  `PathSummaryCollection::{attach, ensure}` validates a frozen
-  source `Cover`, reuses canonical source merges, target
-  merges, and derives, and closes the exact resident summary cover once into a
-  `PathIndex`. Ensuring lowers only capacity-limited distinct source elements,
-  publishes blobs before unsigned records without an implicit flush, and
-  reattaches through a fresh store snapshot. The empty cover is a no-write
-  local bottom. `PathRollup`, its range attribute, range-manifest attachment,
-  repository hooks, commit ranges, and manifest-specific path tests are
-  removed; the new API requires only `BlobStore + CollectionStore` and works
-  without `PinStore`.
+  `PathSummaryCollection::{attach, ensure}` validates a frozen source `Cover`
+  and closes the exact resident summary cover once into a `PathIndex`.
+  `ensure` remains a view-returning domain convenience which delegates
+  to the low-level `maintain_exact` cover executor before materialization; the
+  generic `CollectionStoreExt` API provides the preferred DERIVE-only ensure
+  versus tiered maintenance split and returns typed collection snapshots. The empty
+  cover is a no-write local bottom. `PathRollup`, its range attribute,
+  range-manifest attachment, repository hooks, commit ranges, and
+  manifest-specific path tests are removed; the facade requires only
+  `BlobStore + CollectionStore` and works without `PinStore`.
 - **Read-only pin snapshots are now an explicit storage capability.**
   `PinStore::pin_snapshot` and its partial-on-error default are removed;
   callers request the strict `PinSnapshotSource::snapshot_pin_heads`

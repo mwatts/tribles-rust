@@ -3,12 +3,12 @@
 //! This benchmark compares the two public maintenance paths on
 //! geometrically growing exact covers:
 //!
-//! - `ensure`: deterministic size-tiered raw-target maintenance followed by
+//! - `maintain_exact`: deterministic size-tiered raw-target maintenance followed by
 //!   the exact Rank9-accelerated derivation.
 //! - functional snapshot advancement: maintain exact changed and full
 //!   Succinct covers, then return immutable candidates to the caller.
 //!
-//! Stateless `ensure` gets an independent warm store, a source-identical cold
+//! Stateless `maintain_exact` gets an independent warm store, a source-identical cold
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
@@ -54,6 +54,7 @@ use triblespace_core::collection::{
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
+use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
 use triblespace_core::repo::{BlobStoreGet, BlobStoreList};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -252,11 +253,12 @@ fn time_ensure(
     succinct: &SuccinctArchiveCollection,
 ) -> TimedOperation {
     let start = Instant::now();
-    let snapshot = succinct
-        .ensure(store, cover)
-        .expect("ensure exact Succinct collection");
+    let attached = succinct
+        .maintain_exact(store, cover)
+        .expect("maintain exact Succinct collection");
     let elapsed = start.elapsed();
-    let (_, union) = snapshot.into_parts();
+    let union: UnionArchive<OrderedUniverse> =
+        attached.view().expect("materialize exact Succinct view");
     black_box(union.segment_count());
     TimedOperation { elapsed, union }
 }
@@ -273,7 +275,7 @@ fn observe_raw_cover(
         .snapshot()
         .expect("freeze pre-diagnostic store snapshot");
     let raw_cover = exact
-        .attach(store, cover)
+        .attach(&diagnostic_before, cover)
         .expect("observe complete resident raw exact cover");
     let diagnostic_after = store
         .snapshot()
@@ -394,7 +396,7 @@ fn run_ensure_family(
 }
 
 fn time_snapshot(
-    state: &mut Option<SuccinctArchiveSnapshot>,
+    state: &mut Option<SuccinctArchiveSnapshot<MemoryRepoSnapshot>>,
     store: &mut MemoryRepo,
     cover: &Cover<SimpleArchive>,
     succinct: &SuccinctArchiveCollection,
@@ -402,9 +404,11 @@ fn time_snapshot(
     let start = Instant::now();
     let (candidate, changed_members, reused_members) = match state.as_ref() {
         None => (
-            succinct
-                .ensure(store, cover)
-                .expect("construct initial exact Succinct snapshot"),
+            {
+                succinct
+                    .maintain_exact(store, cover)
+                    .expect("construct initial exact Succinct snapshot")
+            },
             cover.len(),
             0,
         ),
@@ -414,7 +418,9 @@ fn time_snapshot(
         {
             SuccinctArchiveSnapshotAdvance::Unchanged => {
                 let elapsed = start.elapsed();
-                let union = previous.view().clone();
+                let union: UnionArchive<OrderedUniverse> = previous
+                    .view()
+                    .expect("materialize unchanged Succinct snapshot");
                 black_box(union.segment_count());
                 return (
                     TimedOperation { elapsed, union },
@@ -426,15 +432,20 @@ fn time_snapshot(
                 );
             }
             SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => {
-                let changed_members = changed.source().len();
-                black_box(changed.view().segment_count());
-                (next, changed_members, previous.source().len())
+                let changed_members = changed.support().len();
+                let changed_view: UnionArchive<OrderedUniverse> = changed
+                    .view()
+                    .expect("materialize changed Succinct snapshot");
+                black_box(changed_view.segment_count());
+                (next, changed_members, previous.support().len())
             }
             SuccinctArchiveSnapshotAdvance::Reset { next } => (next, cover.len(), 0),
         },
     };
     let elapsed = start.elapsed();
-    let union = candidate.view().clone();
+    let union: UnionArchive<OrderedUniverse> = candidate
+        .view()
+        .expect("materialize candidate Succinct snapshot");
     black_box(union.segment_count());
     *state = Some(candidate);
     (
@@ -448,7 +459,7 @@ fn time_snapshot(
 }
 
 fn run_snapshot_pair(
-    state: &mut Option<SuccinctArchiveSnapshot>,
+    state: &mut Option<SuccinctArchiveSnapshot<MemoryRepoSnapshot>>,
     store: &mut MemoryRepo,
     context: &RunContext<'_>,
     before: StoreShape,

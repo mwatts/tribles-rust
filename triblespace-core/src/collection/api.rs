@@ -31,10 +31,8 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
-use crate::repo::{
-    BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead,
-};
-use crate::repo::{CapabilityProofStore, SnapshotSource};
+use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
+use crate::repo::{CapabilityProofStore, SnapshotSource, Store, StoreRead};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
@@ -51,9 +49,9 @@ use super::{
     resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
     CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
     CollectionFunctionalConflict, CollectionHandle, CollectionOperationError, CollectionRead,
-    CollectionResolutionError, CollectionSemantics, CollectionStore, CollectionTypeError,
-    CollectionValidationRequest, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover,
-    TryFromCoverError, ACTION_READ, ACTION_WRITE,
+    CollectionResolutionError, CollectionSemantics, CollectionSnapshot, CollectionStore,
+    CollectionTypeError, CollectionValidationRequest, DiscoveredCollectionRecords,
+    RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ, ACTION_WRITE,
 };
 use super::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
 
@@ -1671,6 +1669,51 @@ impl<L: CollectionEncoding> Cover<L> {
     }
 }
 
+/// Immutable collection observations implemented by every complete store snapshot.
+///
+/// A snapshot is the temporal boundary. The returned [`CollectionSnapshot`]
+/// therefore owns this exact store observation together with frozen source
+/// support and the physical target cover selected inside it.
+pub trait CollectionSnapshotExt: StoreRead + Sized {
+    /// Observe the target realization for an authored source's support admitted
+    /// in this snapshot.
+    fn collection<M>(
+        &self,
+        target: &ExactDerivedCollection<M>,
+    ) -> Result<CollectionSnapshot<Self, M::Source, M::Target>, ExactDerivedCollectionError>
+    where
+        M: CollectionMapping<Source = SimpleArchive>,
+        Handle<M::Source>: InlineEncoding,
+        Handle<M::Target>: InlineEncoding,
+    {
+        let support = target.source_collection().admitted(self).map_err(|error| {
+            ExactDerivedCollectionError::storage("admit source collection", error)
+        })?;
+        self.collection_exact(target, &support)
+    }
+
+    /// Observe the target realization for one explicit foundational support cover.
+    fn collection_exact<M>(
+        &self,
+        target: &ExactDerivedCollection<M>,
+        support: &Cover<M::Source>,
+    ) -> Result<CollectionSnapshot<Self, M::Source, M::Target>, ExactDerivedCollectionError>
+    where
+        M: CollectionMapping,
+        Handle<M::Source>: InlineEncoding,
+        Handle<M::Target>: InlineEncoding,
+    {
+        let cover = target.attach(self, support)?;
+        Ok(CollectionSnapshot::new(
+            self.clone(),
+            support.clone(),
+            cover,
+        ))
+    }
+}
+
+impl<R> CollectionSnapshotExt for R where R: StoreRead {}
+
 /// Ergonomic collection operations implemented directly by the backing store.
 ///
 /// The trait carries no state and is blanket-implemented. Its purpose is only
@@ -1734,25 +1777,110 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         ))
     }
 
-    /// Ensure one derived lattice point through its canonical mapping.
+    /// Ensure the currently admitted support in a derived collection whose
+    /// source is an authored `SimpleArchive` collection.
     ///
-    /// The source collection is carried by `source`; the target descriptor
-    /// carries the mapping parameters and policy. Storage owns the singular
-    /// deterministic merge/derive schedule, while the encoding and mapping
-    /// traits own only their algebra.
+    /// Admission is frozen through one pre-work snapshot, so concurrent
+    /// commits cannot extend the requested support indefinitely. Only missing
+    /// cross-lattice `DERIVE` work is published. The returned collection
+    /// snapshot keeps that frozen support inseparable from the post-work store
+    /// observation and the best target realization visible there.
     fn ensure<M>(
         &mut self,
-        target: Collection<M::Target>,
-        source: &Cover<M::Source>,
-    ) -> Result<Cover<M::Target>, ExactDerivedCollectionError>
+        target: &ExactDerivedCollection<M>,
+    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
     where
-        M: CollectionMapping,
-        Self: BlobStore,
-        Self::Snapshot: BlobStoreMeta + CollectionRead,
+        M: CollectionMapping<Source = SimpleArchive>,
+        Self: Store,
         Handle<M::Source>: InlineEncoding,
         Handle<M::Target>: InlineEncoding,
     {
-        ExactDerivedCollection::<M>::new(source.collection(), target)?.ensure(self, source)
+        let before = self.snapshot().map_err(|error| {
+            ExactDerivedCollectionError::storage("freeze pre-ensure snapshot", error)
+        })?;
+        let support = target
+            .source_collection()
+            .admitted(&before)
+            .map_err(|error| {
+                ExactDerivedCollectionError::storage("admit source collection", error)
+            })?;
+        drop(before);
+        self.ensure_exact(target, &support)
+    }
+
+    /// Ensure one explicit source support in a derived collection.
+    ///
+    /// The source collection is carried by `source`; the target descriptor
+    /// carries the mapping parameters and policy. Existing merge equations may
+    /// be reused, but this operation only publishes missing `DERIVE` work.
+    fn ensure_exact<M>(
+        &mut self,
+        target: &ExactDerivedCollection<M>,
+        support: &Cover<M::Source>,
+    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
+    where
+        M: CollectionMapping,
+        Self: Store,
+        Handle<M::Source>: InlineEncoding,
+        Handle<M::Target>: InlineEncoding,
+    {
+        target.ensure_exact(self, support)?;
+        let snapshot = self.snapshot().map_err(|error| {
+            ExactDerivedCollectionError::storage("freeze post-ensure snapshot", error)
+        })?;
+        snapshot.collection_exact(target, support)
+    }
+
+    /// Ensure and maintain the currently admitted support in a derived
+    /// collection whose source is an authored `SimpleArchive` collection.
+    ///
+    /// The admitted support is frozen once before work begins. Maintenance has
+    /// no caller-visible budget or tuning knob: the encoding's deterministic
+    /// size-tier rule runs to its stable LSM fixed point, publishing each
+    /// useful carry independently on the way.
+    fn maintain<M>(
+        &mut self,
+        target: &ExactDerivedCollection<M>,
+    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
+    where
+        M: CollectionMapping<Source = SimpleArchive>,
+        Self: Store,
+        Handle<M::Source>: InlineEncoding,
+        Handle<M::Target>: InlineEncoding,
+    {
+        let before = self.snapshot().map_err(|error| {
+            ExactDerivedCollectionError::storage("freeze pre-maintenance snapshot", error)
+        })?;
+        let support = target
+            .source_collection()
+            .admitted(&before)
+            .map_err(|error| {
+                ExactDerivedCollectionError::storage("admit source collection", error)
+            })?;
+        drop(before);
+        self.maintain_exact(target, &support)
+    }
+
+    /// Ensure one explicit source support, then maintain its target LSM cover.
+    ///
+    /// This is the explicit-support counterpart of [`Self::maintain`] and uses
+    /// the same deterministic fixed-point policy.
+    fn maintain_exact<M>(
+        &mut self,
+        target: &ExactDerivedCollection<M>,
+        support: &Cover<M::Source>,
+    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
+    where
+        M: CollectionMapping,
+        Self: Store,
+        Handle<M::Source>: InlineEncoding,
+        Handle<M::Target>: InlineEncoding,
+    {
+        target.maintain_exact(self, support)?;
+        let snapshot = self.snapshot().map_err(|error| {
+            ExactDerivedCollectionError::storage("freeze post-maintenance snapshot", error)
+        })?;
+        snapshot.collection_exact(target, support)
     }
 
     /// Publish one signed fragment into an already registered collection.

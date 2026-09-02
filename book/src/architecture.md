@@ -201,20 +201,28 @@ summary is connected to its source by a mapping which is a join homomorphism:
 f(a ⊔ b) = f(a) ⊔ f(b)
 ```
 
-That law makes equations on either side of the mapping reusable evidence. The
-public `ExactDerivedCollection::ensure` owns one deterministic maintenance
-policy: reuse a resident target node; otherwise join both resident target
-children before crossing the mapping; otherwise derive the corresponding
-resident source node; and only then descend when that source node is missing
-or capacity-terminal. A capacity-terminal target join likewise falls through
-to the corresponding source node. When a target join explicitly names a
-missing immutable representation dependency, storage may materialize that
-exact dependency in the source lattice and retry; it never constructs source
-merges merely as a planning preference. An opaque source cover fixes the
-logical value while the resolver chooses a target cover with equal support.
-Different target covers may denote the same join, and every lattice position
-uses the same `Cover<E>` shape while retaining its own typed member handles.
-Missing derived artifacts are cache misses, not missing facts.
+That law makes equations on either side of the mapping reusable evidence.
+Construction and representation maintenance are separate operations.
+`ensure` and `ensure_exact` reuse resident target nodes and stored equations,
+but publish only missing cross-lattice `DERIVE` work; they never create a
+`MERGE`. `maintain` and `maintain_exact` first ensure the requested support and
+then repeatedly join the two lowest content handles in the lowest colliding
+dyadic serialized-size tier. When one of those target joins names a missing
+immutable representation dependency, maintenance may materialize that exact
+dependency in the source lattice and retry; it never constructs source merges
+merely as a planning preference. An opaque source cover fixes the logical
+value while the resolver chooses a target cover with equal support. Different
+target covers may denote the same join, and every lattice position uses the
+same `Cover<E>` shape while retaining its own typed member handles. Missing
+derived artifacts are cache misses, not missing facts.
+
+Every store-level ensure or maintain operation returns a fresh
+`CollectionSnapshot`. The result is a temporal boundary, not a cover detached
+from the store observation that made it valid: it owns the post-operation
+store snapshot, the exact frozen source support, and the realized target
+cover. Read-only `CollectionSnapshotExt::{collection, collection_exact}`
+construct the same shape from an existing store snapshot. A caller chooses the
+logical projection later with `CollectionSnapshot::view`.
 
 `Cover` carries no route mode. The resolver checks its explicit members first
 and, only when needed, widens through stored `MERGE` equations to a resident

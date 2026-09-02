@@ -183,6 +183,7 @@ let path_collection = PathSummaryCollection::create(
 )?;
 
 // `cover` is the admitted PATCH set of distinct source payload handles.
+// This domain convenience maintains and materializes a PathIndex.
 let paths = path_collection.ensure(&mut store, &cover)?;
 
 // Read-only consumers can require an already resident exact cover.
@@ -219,24 +220,23 @@ both:
 
 Only then are selected summaries joined and closed once into `PathIndex`.
 
-`ensure` performs the same lookup and plans deterministically at each source-
-lattice point. It reuses an exact resident target image, otherwise joins exact
-resident target-child images, otherwise maps the resident corresponding source
-node, and only then descends through the first fully actionable canonical
-source decomposition. It never constructs a source merge merely as a planning
-preference. A target encoding may explicitly request one exact immutable
-representation dependency; storage materializes that dependency and retries.
-Once every exact point is represented, it performs at most one global
-size-tiered target carry before re-entering the pointwise planner.
+`PathSummaryCollection::ensure` is a view-returning domain convenience
+whose name predates the split collection API. It calls the low-level
+`ExactDerivedCollection::maintain_exact` cover executor, takes a fresh store
+snapshot, then joins and closes the realized summary cover into a `PathIndex`.
+It therefore performs deterministic size-tiered target `MERGE` work as well as
+missing `DERIVE` work. Every successful artifact is persisted before its
+unsigned equation, no implicit durability flush is performed, and an unchanged
+warm call executes no maps or joins.
 
-Every successfully computed source, output, `MERGE`, and unsigned `DERIVE`
-record is persisted, even if a later capacity or fatal result changes the
-selected route, and no implicit durability flush is performed. The old store
-snapshot is dropped before those writes. Concurrent and repeated ensures are
-content-addressed and record-idempotent. An unchanged warm call whose stored
-target cover already satisfies both pointwise and global maintenance executes
-no maps or joins; capacity decisions are call-local and may be retried by a
-later call.
+Code which needs the split operation boundary should use
+`CollectionStoreExt`: `ensure` and `ensure_exact` publish missing `DERIVE` work
+only, while `maintain` and `maintain_exact` additionally perform deterministic
+tiered `MERGE` work. Those preferred generic operations return a typed
+`CollectionSnapshot` containing the fresh store observation and the frozen
+support/realization pair; their low-level exact executors return covers so
+domain adapters such as this one can compose construction with immediate
+materialization.
 
 An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.

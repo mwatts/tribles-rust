@@ -78,7 +78,7 @@ use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use super::CollectionPolicy;
 use super::{
     Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
-    CollectionStore, CollectionStoreExt, FactCover, TryFromCover, TryFromCoverError,
+    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 
@@ -493,10 +493,10 @@ impl ObservedSetCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.attach(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;
+        let cover = self.kernel()?.attach(&reader, source_cover)?;
         ObservedIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
             TryFromCoverError::MemberGet { source, .. } => {
                 ObservedSetCollectionError::Snapshot(source.to_string())
@@ -505,7 +505,11 @@ impl ObservedSetCollection {
         })
     }
 
-    /// Ensure and attach the observed set for `source_cover`.
+    /// Domain convenience which maintains and materializes the observed set.
+    ///
+    /// This view-returning facade predates the split snapshot API. It delegates
+    /// to the low-level `maintain_exact` cover executor, takes a fresh snapshot,
+    /// and materializes the `ObservedIndex` through that observation.
     pub fn ensure<S>(
         &self,
         store: &mut S,
@@ -515,7 +519,7 @@ impl ObservedSetCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = store.ensure::<ObserveStatesMapping>(self.target, source_cover)?;
+        let cover = self.kernel()?.maintain_exact(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;

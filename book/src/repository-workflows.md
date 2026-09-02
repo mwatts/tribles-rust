@@ -29,6 +29,11 @@ merge or derivation equations preserve reusable physical work.
 - **`TryFromCover<E>`** — the encoding-specific reconstruction hook invoked by
   `Cover::materialize` after private physical selection. A view may join
   eagerly or retain mmap-backed shards and query their union lazily.
+- **`CollectionSnapshot<R, S, T>`** — one immutable store snapshot together
+  with a frozen `Cover<S>` support and the realized `Cover<T>` selected in
+  that observation. The ordinary path freezes admitted support; an explicit
+  path preserves its caller-supplied support. It reconstructs a caller-chosen
+  logical value later with `view`.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
 
@@ -302,39 +307,49 @@ use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
     SuccinctArchiveCollection,
 };
+use triblespace::core::collection::{
+    CollectionStoreExt, ExactDerivedCollection,
+};
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, UnionArchive,
+};
 
 let source = storage.collection("models", source_policy)?;
 let raw = storage.derive(source, SimpleToSuccinctMapping, raw_policy)?;
 let accelerated = storage.derive(raw, RawToRank9AcceleratedMapping, accelerated_policy)?;
 let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
 
-let archive = succinct.ensure(&mut storage, &cover)?;
-let same_archive = succinct.attach(&mut storage, &cover)?;
-let facts = archive.view();
+let archive = succinct.maintain_exact(&mut storage, &cover)?;
+let facts: UnionArchive<OrderedUniverse> = archive.view()?;
 
 // The same algebra edges are available directly on storage.
-let raw_cover = storage.ensure::<SimpleToSuccinctMapping>(raw, &cover)?;
-let accelerated_cover =
-    storage.ensure::<RawToRank9AcceleratedMapping>(accelerated, &raw_cover)?;
+let raw_route = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw)?;
+let raw_observation = storage.maintain_exact(&raw_route, &cover)?;
+
+let accelerated_route =
+    ExactDerivedCollection::<RawToRank9AcceleratedMapping>::new(raw, accelerated)?;
+let accelerated_observation =
+    storage.maintain_exact(&accelerated_route, raw_observation.cover())?;
 ```
 
-- `attach` is read-only, performs no collection algebra, and requires a
-  complete resident physical cover.
-- `ensure` is the singular construction and maintenance path. It completes the
-  raw projection, deterministically carries colliding raw target members by
-  serialized-size tier, then ensures a support-equivalent accelerated cover and
-  returns its query view together with the exact source cover it represents.
+- `attach` is read-only, performs no collection algebra, and binds a complete
+  resident physical cover to the immutable snapshot which validated it.
+- `ensure` freezes the currently admitted support, while `ensure_exact` accepts
+  an explicit support. Both publish only missing `DERIVE` work and return a
+  typed collection snapshot which keeps that support with the fresh post-work
+  store observation and realized target cover.
+- `maintain` and `maintain_exact` additionally carry colliding target members
+  by serialized-size tier. They return the same collection-snapshot shape.
 
-At each target lattice node, `ensure` reuses the resident result first. If the
-result is absent, it joins the two corresponding target children when both are
-resident. A capacity-terminal target join falls through to the corresponding
-resident source node. If that source node is absent, or its
-mapping reports a capacity boundary, planning reuses any already complete lower
-target cover and otherwise descends to the source children. It never creates a
-source merge merely as a planning shortcut. A source join is materialized only
-when the selected target join names its exact result as an immutable
-representation dependency. Every source or target `MERGE` and cross-lattice
-`DERIVE` it actually computes is stored with its equation, including useful
+An ensure may follow existing `MERGE` equations to reuse a resident
+support-equivalent target decomposition, but newly executed work crosses only
+the mapping. It stores each target artifact before its unsigned `DERIVE`
+record. It never creates a source or target `MERGE`.
+
+Maintenance starts from that derive-complete target cover. A target join may
+explicitly request one immutable representation dependency; storage
+materializes that exact source `MERGE` and retries. Every source or target
+`MERGE` completed by maintenance is stored with its equation, including useful
 work completed before a later capacity or fatal result.
 
 The maintenance policy has no knob: a raw target member belongs to

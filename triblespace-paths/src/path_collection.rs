@@ -125,19 +125,22 @@ impl PathSummaryCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.attach(store, source_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
+        let cover = self.kernel()?.attach(&snapshot, source_cover)?;
         self.index_from_cover(&cover, &snapshot).map(Arc::new)
     }
 
-    /// Ensure and attach the exact endpoint relation for `source_cover`.
+    /// Domain convenience which maintains and materializes the endpoint relation.
     ///
-    /// Existing source merges, target merges, and derivations are reused
-    /// without algebra replay. Every newly computed target blob precedes its
-    /// unsigned record, no flush is implied, and path closure runs once over
-    /// the selected resident cover.
+    /// This view-returning facade predates the split snapshot API. Despite its
+    /// name, it delegates to the low-level `maintain_exact` cover executor,
+    /// takes a fresh snapshot, and closes the selected resident cover once into
+    /// a `PathIndex`. Generic collection callers should use `CollectionStoreExt`
+    /// when they need distinct DERIVE-only `ensure` and tiered `maintain`
+    /// operations whose public result keeps the frozen support and realized
+    /// target cover with the fresh store snapshot.
     pub fn ensure<S>(
         &self,
         store: &mut S,
@@ -147,7 +150,7 @@ impl PathSummaryCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = store.ensure::<RegularPathMapping>(self.target, source_cover)?;
+        let cover = self.kernel()?.maintain_exact(store, source_cover)?;
         let snapshot = store
             .snapshot()
             .map_err(|source| PathSummaryCollectionError::Snapshot(source.to_string()))?;
@@ -715,10 +718,11 @@ mod tests {
             )))
             .unwrap();
         let source_cover = source_cover(&mut store, &paths, [first, second]);
+        let snapshot = store.snapshot().unwrap();
         let cover = paths
             .kernel()
             .unwrap()
-            .attach(&mut store, &source_cover)
+            .attach(&snapshot, &source_cover)
             .unwrap();
         assert_eq!(cover.len(), 1);
         assert_eq!(cover.members().next().unwrap(), joined.get_handle());

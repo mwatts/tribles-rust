@@ -94,14 +94,15 @@ does, to make a failed fold retry the same support.
 
 The two pattern inputs need not share a representation. The runnable example
 (`cargo run --example collection_pattern_changes`) uses immutable
-`CollectionSnapshot` values whose source cover is the continuation token and
-whose view is a shard-preserving Succinct query value. The initial `ensure`
-maintains the two persisted derivation lattices and returns the first snapshot.
-For a strict extension, `advance` first ensures an exact Succinct snapshot for
-the added source members, then ensures the complete current snapshot. The
-second step reuses the first through ordinary persisted `DERIVE` and `MERGE`
-equations and retains the compact target LSM cover; it does not union two
-temporary views or reconstruct a `TribleSet`.
+`CollectionSnapshot` values which own the store observation, source support,
+and realized Succinct target cover. Their shard-preserving query values are
+materialized later with `view`. The initial `maintain_exact` directly returns
+the first collection snapshot. For a strict extension, `advance` first
+maintains the exact added support, then
+the complete current support. The second step reuses the first through
+ordinary persisted `DERIVE` and `MERGE` equations and retains the compact
+target LSM cover; it does not union two temporary views or reconstruct a
+`TribleSet`.
 
 `advance` is functional. It leaves the previous snapshot untouched and returns
 `Advanced { next, changed }`, `Unchanged`, or `Reset { next }` when the source

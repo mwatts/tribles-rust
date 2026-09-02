@@ -1,13 +1,14 @@
 //! Generic exact-cover maintenance across two collection lattices.
 //!
-//! A [`CollectionMapping`] supplies only the join-homomorphic conversion;
-//! storage owns the singular schedule that combines source joins, target joins,
-//! and mappings. Domain facades merely bind typed descriptors and choose a
-//! final logical view. Stored `MERGE` and `DERIVE` equations are materialized
-//! LSM work: resolution consumes them without replaying their algebra. When
-//! completion performs new work, it persists the member and equation before
-//! returning. Yard/GC policy alone decides when reusable artifacts leave local
-//! storage.
+//! A [`CollectionMapping`] supplies only the join-homomorphic conversion.
+//! Exact completion crosses that mapping for missing support and never creates
+//! a `MERGE`; target maintenance is the separate operation which carries a
+//! completed target cover toward its deterministic LSM normal form. Domain
+//! facades merely bind typed descriptors and sequence mappings. Stored `MERGE`
+//! and `DERIVE` equations are materialized work which resolution can reuse
+//! without replaying its algebra. Every newly computed member is persisted
+//! before its equation, and yard/GC policy alone decides when reusable
+//! artifacts leave local storage.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -16,7 +17,7 @@ use std::fmt;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, StoreSnapshot};
 use crate::trible::Fragment;
 
 use super::discovery::discover_collection_records_for_derived_cover;
@@ -39,12 +40,9 @@ enum ProbeScope {
     SupportEquivalent,
 }
 
-pub(super) type TargetMergePair = (CollectionData, CollectionData);
-
 #[derive(Default)]
 pub(super) struct ExactPlannerBlocks {
     pub(super) sources: BTreeMap<CollectionData, String>,
-    pub(super) target_merges: BTreeSet<TargetMergePair>,
 }
 
 /// Failure to attach or maintain one exact derived cover.
@@ -307,45 +305,39 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
     /// Stored equations are followed as materialized LSM evidence. Attachment
     /// performs no joins, mappings, or payload validation; it only selects
     /// resident members. The eventual typed view owns payload decoding.
-    pub fn attach<S>(
+    pub fn attach<R>(
         &self,
-        store: &mut S,
+        snapshot: &R,
         source_cover: &Cover<MappingSource<Mapping>>,
     ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
+        R: StoreSnapshot + BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
         self.require_source_cover(source_cover)?;
         if source_cover.is_empty() {
             return Ok(Cover::from_members(self.target_collection, []));
         }
-        let blocked_target_merges = BTreeSet::new();
-        let blocked_sources = BTreeMap::new();
-        let probe = self.probe(
-            store,
-            source_cover,
-            false,
-            &blocked_sources,
-            &blocked_target_merges,
-        )?;
+        let probe = self.probe(snapshot.clone(), source_cover, false)?;
         if !probe.is_complete() {
             return Err(probe.incomplete_error());
         }
         Ok(probe.into_target_cover())
     }
 
-    /// Ensure the deterministic maintained target cover.
+    /// Low-level DERIVE-only executor returning one support-equivalent target cover.
     ///
-    /// At each source-lattice point, an exact resident target image is reused;
-    /// otherwise two exact resident target children take precedence over the
-    /// corresponding resident source node, and only then does planning
-    /// descend to source children. Source work is never synthesized merely for
-    /// target compaction policy; it is materialized only when the selected
-    /// target join explicitly names its exact source-lattice result as a
-    /// missing representation dependency. Every join or mapping actually
-    /// executed is persisted before this method returns.
-    pub fn ensure<S>(
+    /// Existing `MERGE` equations may be followed to reuse any resident
+    /// physical decomposition with the requested support. New work crosses
+    /// the mapping only: this method publishes `DERIVE` records but never a
+    /// `MERGE`. Consequently it performs the minimum algebra needed to make
+    /// the requested support available in the target lattice.
+    ///
+    /// Most callers should use [`super::CollectionStoreExt::ensure`] or
+    /// [`super::CollectionStoreExt::ensure_exact`], whose public operation
+    /// boundary returns a fresh typed collection snapshot. This cover-returning executor
+    /// exists for domain adapters which compose several derived stages before
+    /// taking that final snapshot.
+    pub fn ensure_exact<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
@@ -354,26 +346,28 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        super::exact_target_compaction::ensure_target(self, store, source_cover)
+        self.ensure_exact_with_blocks(store, source_cover, &mut ExactPlannerBlocks::default())
     }
 
-    /// Complete the per-point target choices before global size-tiered maintenance.
+    /// Low-level executor returning a deterministically maintained target cover.
     ///
-    /// This internal phase executes exact target-child carries and source
-    /// mappings, re-probing after each independently planned batch. Global LSM
-    /// carries alternate with it through the singular public [`Self::ensure`]
-    /// path.
-    pub(super) fn complete<S>(
+    /// Maintenance repeatedly joins the two lowest content handles in the
+    /// lowest colliding dyadic byte-size tier until the selected cover reaches
+    /// the fixed LSM normal form. Every completed merge remains independently
+    /// useful if a later operation fails or the caller interrupts the work.
+    /// Most callers should use [`super::CollectionStoreExt::maintain`] or
+    /// [`super::CollectionStoreExt::maintain_exact`] to receive the fresh
+    /// post-operation collection snapshot.
+    pub fn maintain_exact<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
-        blocks: &mut ExactPlannerBlocks,
     ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        self.ensure_with_blocks(store, source_cover, blocks)
+        super::exact_target_compaction::maintain_target(self, store, source_cover)
     }
 
     /// Materialize the exact source join requested by one target join.
@@ -396,15 +390,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let blocked_sources = BTreeMap::new();
-        let blocked_target_merges = BTreeSet::new();
-        let probe = self.probe(
-            store,
-            source_cover,
-            false,
-            &blocked_sources,
-            &blocked_target_merges,
-        )?;
+        let probe = self.probe_store(store, source_cover, false)?;
         let source = self.source_collection.handle();
         let target = self.target_collection.handle();
         let low_preimages = probe.semantics.derive_preimages(source, target, target_low);
@@ -493,7 +479,8 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         Ok(true)
     }
 
-    fn ensure_with_blocks<S>(
+    /// Internal DERIVE-only completion with retained capacity observations.
+    pub(super) fn ensure_exact_with_blocks<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
@@ -508,117 +495,12 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             return Ok(Cover::from_members(self.target_collection, []));
         }
 
-        let mut published_target_merges = BTreeSet::<(CollectionData, CollectionData)>::new();
         let mut published_source_derives = BTreeSet::<CollectionData>::new();
 
         loop {
-            let probe = self.probe(
-                store,
-                source_cover,
-                true,
-                &blocks.sources,
-                &blocks.target_merges,
-            )?;
+            let probe = self.probe_store(store, source_cover, true)?;
             if probe.is_complete() {
                 return Ok(probe.into_target_cover());
-            }
-
-            // Exact resident target children are the first constructive route
-            // at their source-lattice point. Preserve those precise pairs;
-            // global size-tiered maintenance must not substitute an unrelated
-            // pair or skip a cross-tier carry.
-            if !probe.preferred_target_merges.is_empty() {
-                let stalled_cover = probe
-                    .target_cover
-                    .members()
-                    .map(Handle::<MappingTarget<Mapping>>::to_hash)
-                    .collect();
-                let (low_data, high_data) = *probe
-                    .preferred_target_merges
-                    .first()
-                    .expect("non-empty preferred target-merge set has a first pair");
-                if published_target_merges.contains(&(low_data, high_data)) {
-                    return Err(ExactDerivedCollectionError::Stalled {
-                        cover: stalled_cover,
-                    });
-                }
-                let low = probe
-                    .reader
-                    .get(Handle::<MappingTarget<Mapping>>::from_hash(low_data))
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage(
-                            "load preferred target-merge input",
-                            error,
-                        )
-                    })?;
-                let high = probe
-                    .reader
-                    .get(Handle::<MappingTarget<Mapping>>::from_hash(high_data))
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage(
-                            "load preferred target-merge input",
-                            error,
-                        )
-                    })?;
-                let output = match MappingTarget::<Mapping>::join_members(
-                    &probe.target_descriptor,
-                    &low,
-                    &high,
-                    &probe.reader,
-                ) {
-                    Ok(output) => output,
-                    Err(CollectionOperationError::Capacity(_)) => {
-                        blocks.target_merges.insert((low_data, high_data));
-                        continue;
-                    }
-                    Err(CollectionOperationError::Fatal(reason)) => {
-                        return Err(ExactDerivedCollectionError::Merge {
-                            low: low_data,
-                            high: high_data,
-                            reason,
-                        });
-                    }
-                    Err(CollectionOperationError::MissingDependency(member)) => {
-                        drop(probe);
-                        if self.materialize_target_join_dependency(
-                            store,
-                            source_cover,
-                            low_data,
-                            high_data,
-                            member,
-                        )? {
-                            continue;
-                        }
-                        return Err(ExactDerivedCollectionError::MissingDependency { member });
-                    }
-                };
-                let output_data = data_identity::<MappingTarget<Mapping>>(&output);
-                let claim = CollectionMerge::new(
-                    self.target_collection.handle(),
-                    low_data,
-                    high_data,
-                    output_data,
-                );
-
-                // Publish one carry, then re-enter the per-point planner. The
-                // new result may itself be an exact child which changes the
-                // next preferred route.
-                drop(probe);
-                store
-                    .put::<MappingTarget<Mapping>, _>(output)
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage("store preferred target merge", error)
-                    })?;
-                store
-                    .insert(CollectionRecord::Merge(claim))
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage(
-                            "publish preferred target MERGE",
-                            error,
-                        )
-                    })?;
-                published_target_merges.insert(claim.inputs());
-                continue;
             }
 
             let bound_mapping = Mapping::bind(&probe.source_descriptor, &probe.target_descriptor)
@@ -639,7 +521,13 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             if residual.is_empty() {
                 if probe.semantically_complete() {
                     drop(probe);
-                    return self.attach(store, source_cover);
+                    let snapshot = store.snapshot().map_err(|error| {
+                        ExactDerivedCollectionError::storage(
+                            "open final exact-cover snapshot",
+                            error,
+                        )
+                    })?;
+                    return self.attach(&snapshot, source_cover);
                 }
                 return Err(probe.incomplete_error());
             }
@@ -682,11 +570,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                 let claim =
                     CollectionDerive::new(self.target_collection.handle(), input_data, output_data);
                 store
-                    .put::<MappingSource<Mapping>, _>(input)
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage("store derived source", error)
-                    })?;
-                store
                     .put::<MappingTarget<Mapping>, _>(output)
                     .map_err(|error| {
                         ExactDerivedCollectionError::storage("store derived target", error)
@@ -705,61 +588,64 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
         }
     }
 
-    fn probe<S>(
+    fn probe_store<S>(
         &self,
         store: &mut S,
         source_cover: &Cover<MappingSource<Mapping>>,
         plan_source_residual: bool,
-        blocked_sources: &BTreeMap<CollectionData, String>,
-        blocked_target_merges: &BTreeSet<TargetMergePair>,
     ) -> Result<ExactProbe<S::Snapshot, MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
+    {
+        let reader = store.snapshot().map_err(|error| {
+            ExactDerivedCollectionError::storage("open exact-cover snapshot", error)
+        })?;
+        self.probe(reader, source_cover, plan_source_residual)
+    }
+
+    fn probe<R>(
+        &self,
+        reader: R,
+        source_cover: &Cover<MappingSource<Mapping>>,
+        plan_source_residual: bool,
+    ) -> Result<ExactProbe<R, MappingTarget<Mapping>>, ExactDerivedCollectionError>
+    where
+        R: StoreSnapshot + BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
         // Preserve the low-latency direct path. Reverse decomposition may fan
         // out over many unsigned MERGE observations, so consult it only when
         // explicit Cover members and their ordinary resident images cannot
         // already answer the request.
         let direct = self.probe_once(
-            store,
+            reader.clone(),
             source_cover,
             plan_source_residual,
             ProbeScope::Direct,
-            blocked_sources,
-            blocked_target_merges,
         )?;
         if direct.is_complete() {
             return Ok(direct);
         }
         drop(direct);
         self.probe_once(
-            store,
+            reader,
             source_cover,
             plan_source_residual,
             ProbeScope::SupportEquivalent,
-            blocked_sources,
-            blocked_target_merges,
         )
     }
 
-    fn probe_once<S>(
+    fn probe_once<R>(
         &self,
-        store: &mut S,
+        reader: R,
         source_cover: &Cover<MappingSource<Mapping>>,
         plan_source_residual: bool,
         scope: ProbeScope,
-        blocked_sources: &BTreeMap<CollectionData, String>,
-        blocked_target_merges: &BTreeSet<TargetMergePair>,
-    ) -> Result<ExactProbe<S::Snapshot, MappingTarget<Mapping>>, ExactDerivedCollectionError>
+    ) -> Result<ExactProbe<R, MappingTarget<Mapping>>, ExactDerivedCollectionError>
     where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
+        R: StoreSnapshot + BlobStoreGet + BlobStoreMeta + CollectionRead,
     {
         self.require_source_cover(source_cover)?;
-        let reader = store.snapshot().map_err(|error| {
-            ExactDerivedCollectionError::storage("open exact-cover snapshot", error)
-        })?;
         let (source_descriptor, target_descriptor) = self.load_descriptors(&reader)?;
         Mapping::bind(&source_descriptor, &target_descriptor).map_err(|error| {
             ExactDerivedCollectionError::Resolution(format!(
@@ -943,50 +829,30 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
 
         let semantically_complete =
             target_physical.missing.is_empty() && unsupported_members.is_empty();
-        let plan_preferences =
-            plan_source_residual && !(semantically_complete && target_physical.cover.len() <= 1);
-        let source_resident =
-            if plan_source_residual && (!semantically_complete || plan_preferences) {
-                let mut source_resident = BTreeSet::new();
-                for data in semantics.members(source).into_iter().flatten().copied() {
-                    match collection_member_availability::<MappingSource<Mapping>, _>(data, &reader)
-                        .map_err(|error| {
-                            ExactDerivedCollectionError::storage(
-                                "inspect exact source residency",
-                                error,
-                            )
-                        })? {
-                        CollectionMemberAvailability::Complete => {
-                            source_resident.insert(data);
-                        }
-                        CollectionMemberAvailability::Absent
-                        | CollectionMemberAvailability::Incomplete
-                        | CollectionMemberAvailability::Unusable => {}
+        let source_resident = if plan_source_residual && !semantically_complete {
+            let mut source_resident = BTreeSet::new();
+            for data in semantics.members(source).into_iter().flatten().copied() {
+                match collection_member_availability::<MappingSource<Mapping>, _>(data, &reader)
+                    .map_err(|error| {
+                        ExactDerivedCollectionError::storage(
+                            "inspect exact source residency",
+                            error,
+                        )
+                    })? {
+                    CollectionMemberAvailability::Complete => {
+                        source_resident.insert(data);
                     }
+                    CollectionMemberAvailability::Absent
+                    | CollectionMemberAvailability::Incomplete
+                    | CollectionMemberAvailability::Unusable => {}
                 }
-                source_resident
-            } else {
-                BTreeSet::new()
-            };
-        let preferred = if plan_preferences {
-            preferred_routes(
-                &semantics,
-                source,
-                target,
-                &source_resident,
-                &target_resident,
-                &represented_source,
-                blocked_sources,
-                blocked_target_merges,
-            )
+            }
+            source_resident
         } else {
-            PreferredRoutes::default()
+            BTreeSet::new()
         };
 
-        let complete = semantically_complete
-            && preferred.source_members.is_empty()
-            && preferred.target_merges.is_empty();
-        let source_plan_parts = if !plan_source_residual || complete {
+        let source_plan_parts = if !plan_source_residual || semantically_complete {
             None
         } else {
             // A logically supported target may have lost its bytes. Its
@@ -995,8 +861,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             for data in &target_physical.missing {
                 required.extend(semantics.supporting_data(target, *data));
             }
-            required.extend(preferred.source_members.iter().copied());
-
             Some((source, source_resident, required))
         };
         let source_plan =
@@ -1017,191 +881,10 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
             ),
             missing: target_physical.missing,
             unsupported_members,
-            preferred_source_members: preferred.source_members,
-            preferred_target_merges: preferred.target_merges,
             semantics,
             source_plan,
         })
     }
-}
-
-#[derive(Clone, Default)]
-struct PreferredRoutes {
-    source_members: BTreeSet<CollectionData>,
-    target_merges: BTreeSet<(CollectionData, CollectionData)>,
-}
-
-/// Select exact target carries and corresponding resident source nodes before recursively
-/// constructing lower target members.
-///
-/// For each maximal source point the choice is local and deterministic:
-/// reuse its exact resident target image; otherwise prefer a target join when
-/// one canonical source decomposition already has both exact target images;
-/// otherwise cross the mapping if the source point itself is resident; only
-/// then descend through the first fully actionable canonical source
-/// decomposition. Route selection never requests a source join. Execution may
-/// materialize one later only when the selected target join names its exact
-/// result as an immutable representation dependency.
-fn preferred_routes(
-    semantics: &CollectionSemantics,
-    source: CollectionHandle,
-    target: CollectionHandle,
-    source_resident: &BTreeSet<CollectionData>,
-    target_resident: &BTreeSet<CollectionData>,
-    represented_source: &BTreeSet<CollectionData>,
-    blocked_sources: &BTreeMap<CollectionData, String>,
-    blocked_target_merges: &BTreeSet<TargetMergePair>,
-) -> PreferredRoutes {
-    fn target_image_is_resident(
-        semantics: &CollectionSemantics,
-        source: CollectionHandle,
-        target: CollectionHandle,
-        input: CollectionData,
-        target_resident: &BTreeSet<CollectionData>,
-    ) -> bool {
-        semantics
-            .derive_output(source, target, input)
-            .is_some_and(|output| target_resident.contains(&output))
-    }
-
-    fn target_pair(
-        semantics: &CollectionSemantics,
-        source: CollectionHandle,
-        target: CollectionHandle,
-        low: CollectionData,
-        high: CollectionData,
-        target_resident: &BTreeSet<CollectionData>,
-    ) -> Option<(CollectionData, CollectionData)> {
-        let mut low = semantics.derive_output(source, target, low)?;
-        let mut high = semantics.derive_output(source, target, high)?;
-        if !target_resident.contains(&low) || !target_resident.contains(&high) {
-            return None;
-        }
-        if high < low {
-            std::mem::swap(&mut low, &mut high);
-        }
-        Some((low, high))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn visit(
-        semantics: &CollectionSemantics,
-        source: CollectionHandle,
-        target: CollectionHandle,
-        member: CollectionData,
-        source_resident: &BTreeSet<CollectionData>,
-        target_resident: &BTreeSet<CollectionData>,
-        represented_source: &BTreeSet<CollectionData>,
-        blocked_sources: &BTreeMap<CollectionData, String>,
-        blocked_target_merges: &BTreeSet<TargetMergePair>,
-        allow_equivalent_cover: bool,
-        visiting: &mut BTreeSet<CollectionData>,
-        selected: &mut PreferredRoutes,
-    ) -> bool {
-        if !visiting.insert(member) {
-            return false;
-        }
-        if target_image_is_resident(semantics, source, target, member, target_resident) {
-            visiting.remove(&member);
-            return true;
-        }
-
-        let producers = semantics.merge_producers(source, member);
-        if let Some(pair) = producers
-            .iter()
-            .filter_map(|(low, high)| {
-                target_pair(semantics, source, target, *low, *high, target_resident)
-            })
-            .find(|pair| !blocked_target_merges.contains(pair))
-        {
-            selected.target_merges.insert(pair);
-            visiting.remove(&member);
-            return true;
-        }
-
-        let allow_equivalent_cover =
-            allow_equivalent_cover || blocked_sources.contains_key(&member);
-        if allow_equivalent_cover {
-            let obligation = BTreeSet::from([member]);
-            if collection_physical_cover_for(semantics, source, &obligation, represented_source)
-                .missing
-                .is_empty()
-            {
-                visiting.remove(&member);
-                return true;
-            }
-        }
-
-        if source_resident.contains(&member) && !blocked_sources.contains_key(&member) {
-            selected.source_members.insert(member);
-            visiting.remove(&member);
-            return true;
-        }
-
-        // Follow the first canonical producer whose entire subtree is
-        // physically actionable. This is the same backtracking shape as
-        // physical-cover selection: an unavailable earlier decomposition must
-        // not hide exact preferences in a later one.
-        for (low, high) in producers {
-            let mut candidate = selected.clone();
-            let low_is_actionable = visit(
-                semantics,
-                source,
-                target,
-                low,
-                source_resident,
-                target_resident,
-                represented_source,
-                blocked_sources,
-                blocked_target_merges,
-                allow_equivalent_cover,
-                visiting,
-                &mut candidate,
-            );
-            let high_is_actionable = low_is_actionable
-                && visit(
-                    semantics,
-                    source,
-                    target,
-                    high,
-                    source_resident,
-                    target_resident,
-                    represented_source,
-                    blocked_sources,
-                    blocked_target_merges,
-                    allow_equivalent_cover,
-                    visiting,
-                    &mut candidate,
-                );
-            if high_is_actionable {
-                *selected = candidate;
-                visiting.remove(&member);
-                return true;
-            }
-        }
-        visiting.remove(&member);
-        false
-    }
-
-    let mut selected = PreferredRoutes::default();
-    let mut visiting = BTreeSet::new();
-    for member in semantics.frontier(source).into_iter().flatten().copied() {
-        let _ = visit(
-            semantics,
-            source,
-            target,
-            member,
-            source_resident,
-            target_resident,
-            represented_source,
-            blocked_sources,
-            blocked_target_merges,
-            false,
-            &mut visiting,
-            &mut selected,
-        );
-    }
-    selected
 }
 
 struct SourcePlan {
@@ -1218,8 +901,6 @@ struct ExactProbe<R, Target: CollectionEncoding> {
     target_cover: Cover<Target>,
     missing: BTreeSet<CollectionData>,
     unsupported_members: BTreeSet<CollectionData>,
-    preferred_source_members: BTreeSet<CollectionData>,
-    preferred_target_merges: BTreeSet<(CollectionData, CollectionData)>,
     semantics: CollectionSemantics,
     source_plan: Option<SourcePlan>,
 }
@@ -1227,8 +908,6 @@ struct ExactProbe<R, Target: CollectionEncoding> {
 impl<R, Target: CollectionEncoding> ExactProbe<R, Target> {
     fn is_complete(&self) -> bool {
         self.semantically_complete()
-            && self.preferred_source_members.is_empty()
-            && self.preferred_target_merges.is_empty()
     }
 
     fn semantically_complete(&self) -> bool {
@@ -1260,30 +939,6 @@ where
             return Ok(Vec::new());
         };
         let blocked_set: BTreeSet<_> = blocked.keys().copied().collect();
-
-        // Preferred corresponding source nodes are route optimizations over an already
-        // complete lower target cover. Treat capacity independently at each
-        // point: skip only blocked nodes and keep trying the others. Their
-        // bytes are known resident in this immutable snapshot, so no source
-        // reconstruction is necessary for the fallback path.
-        if self.semantically_complete() {
-            return self
-                .preferred_source_members
-                .difference(&blocked_set)
-                .copied()
-                .map(|data| {
-                    self.reader
-                        .get(Handle::<Source>::from_hash(data))
-                        .map(|blob| (data, blob))
-                        .map_err(|error| {
-                            ExactDerivedCollectionError::storage(
-                                "load preferred corresponding source node",
-                                error,
-                            )
-                        })
-                })
-                .collect();
-        }
 
         let resident = plan.resident.difference(&blocked_set).copied().collect();
         let physical: LoadedPhysicalCover<Source> =
@@ -1320,9 +975,6 @@ where
             .into_iter()
             .filter(|data| required_physical.cover.contains(data))
             .filter(|data| {
-                if self.preferred_source_members.contains(data) {
-                    return true;
-                }
                 let obligation = BTreeSet::from([*data]);
                 !collection_physical_cover_for(
                     &self.semantics,

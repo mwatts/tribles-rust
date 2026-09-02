@@ -63,10 +63,11 @@ Cover resolution checks the encoding's required representation closure before
 selecting a root, so an accelerated root with a missing raw child is unavailable
 and a complete finer cover may replace it. The cover-aware view still loads the
 embedded raw child through the same snapshot and validates the exact raw/index
-pair before constructing a transient query runtime. Normal `ensure` publication
-stores every dependency before the member that names it and publishes the
-corresponding ordinary `MERGE` or `DERIVE` last. No accelerator-specific
-retention relation or hidden root is involved.
+pair before constructing a transient query runtime. Normal `ensure`
+publication stores each mapped target before its `DERIVE`. `maintain`
+additionally stores every exact dependency and merge output before publishing
+the corresponding `MERGE`. No accelerator-specific retention relation or
+hidden root is involved.
 
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` accept explicit policy roots in addition to the native collection

@@ -81,7 +81,7 @@ use super::simplearchive_union;
 use super::CollectionPolicy;
 use super::{
     Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
-    CollectionStore, CollectionStoreExt, FactCover, TryFromCover, TryFromCoverError,
+    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
 };
 
 const ID_LEN: usize = 16;
@@ -670,10 +670,10 @@ impl LwwRegisterCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = self.kernel()?.attach(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;
+        let cover = self.kernel()?.attach(&reader, source_cover)?;
         LwwIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
             TryFromCoverError::MemberGet { source, .. } => {
                 LwwRegisterCollectionError::Snapshot(source.to_string())
@@ -682,7 +682,11 @@ impl LwwRegisterCollection {
         })
     }
 
-    /// Ensure and attach the exact projection for `source_cover`.
+    /// Domain convenience which maintains and materializes the exact projection.
+    ///
+    /// This view-returning facade predates the split snapshot API. It delegates
+    /// to the low-level `maintain_exact` cover executor, takes a fresh snapshot,
+    /// and materializes the `LwwIndex` through that observation.
     pub fn ensure<S>(
         &self,
         store: &mut S,
@@ -692,7 +696,7 @@ impl LwwRegisterCollection {
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + CollectionRead,
     {
-        let cover = store.ensure::<RegisterCoordinatesMapping>(self.target, source_cover)?;
+        let cover = self.kernel()?.maintain_exact(store, source_cover)?;
         let reader = store
             .snapshot()
             .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;

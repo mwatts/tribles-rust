@@ -36,12 +36,14 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
     SuccinctArchiveSnapshot, SuccinctArchiveSnapshotAdvance,
 };
 use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt, Cover};
 use triblespace::core::examples::literature;
+use triblespace::core::repo::memoryrepo::MemoryRepoSnapshot;
 use triblespace::prelude::*;
 
 type Entity = Inline<inlineencodings::GenId>;
@@ -149,10 +151,11 @@ impl FullState {
         let mut store = fixture.store.clone();
         let seed = fixture
             .succinct
-            .ensure(&mut store, &fixture.seed_cover)
+            .maintain_exact(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
+        let seed_view: UnionArchive<OrderedUniverse> = seed.view().expect("materialize seed view");
         assert_eq!(
-            seed.view().iter().count(),
+            seed_view.iter().count(),
             2,
             "seed contains the author facts"
         );
@@ -167,14 +170,16 @@ impl FullState {
         let start = Instant::now();
         let full = self
             .succinct
-            .ensure(&mut self.store, cover)
+            .maintain_exact(&mut self.store, cover)
             .expect("advance full-query view");
-        assert_eq!(full.source(), cover);
+        assert_eq!(full.support(), cover);
+        let full_view: UnionArchive<OrderedUniverse> =
+            full.view().expect("materialize full-query view");
         let mut raw_rows = 0usize;
         let mut next = BTreeSet::new();
         for row in find!(
             (author: Entity, book: Entity, title: Title),
-            pattern!(full.view(), [
+            pattern!(&full_view, [
                 { ?author @ literature::firstname: "Frank" },
                 { ?book @ literature::author: ?author, literature::title: ?title }
             ])
@@ -196,7 +201,7 @@ impl FullState {
 struct IncrementalState {
     store: MemoryRepo,
     succinct: SuccinctArchiveCollection,
-    snapshot: SuccinctArchiveSnapshot,
+    snapshot: SuccinctArchiveSnapshot<MemoryRepoSnapshot>,
     results: BTreeSet<Row>,
 }
 
@@ -205,10 +210,11 @@ impl IncrementalState {
         let mut store = fixture.store.clone();
         let seed = fixture
             .succinct
-            .ensure(&mut store, &fixture.seed_cover)
+            .maintain_exact(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
+        let seed_view: UnionArchive<OrderedUniverse> = seed.view().expect("materialize seed view");
         assert_eq!(
-            seed.view().iter().count(),
+            seed_view.iter().count(),
             2,
             "seed contains the author facts"
         );
@@ -234,16 +240,21 @@ impl IncrementalState {
             }
         };
         assert_eq!(
-            changed.source().len(),
+            changed.support().len(),
             1,
             "one payload is observed per step"
         );
+        let next_view: UnionArchive<OrderedUniverse> =
+            next.view().expect("materialize complete incremental view");
+        let changed_view: UnionArchive<OrderedUniverse> = changed
+            .view()
+            .expect("materialize changed incremental view");
 
         let mut raw_rows = 0usize;
         let mut batch = BTreeSet::new();
         for row in find!(
             (author: Entity, book: Entity, title: Title),
-            pattern_changes!(next.view(), changed.view(), [
+            pattern_changes!(&next_view, &changed_view, [
                 { ?author @ literature::firstname: "Frank" },
                 { ?book @ literature::author: ?author, literature::title: ?title }
             ])
@@ -346,7 +357,7 @@ fn run_incremental(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
         assert_eq!(step.raw_rows, batch.len());
         assert_eq!(step.distinct_rows, batch.len());
         assert_eq!(state.results, expected);
-        assert_eq!(state.snapshot.source(), cover);
+        assert_eq!(state.snapshot.support(), cover);
         let commits = index + 1;
         if checkpoints.contains(&commits) {
             samples.push(Sample {

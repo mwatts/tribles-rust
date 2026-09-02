@@ -309,51 +309,6 @@ impl CollectionSemantics {
         self.frontier.get(&collection)
     }
 
-    /// Canonical exact merge decompositions known for one result.
-    ///
-    /// Claim ids participate in the internal ordering, while callers only
-    /// need the unique input pairs. Implied commuting-square equations appear
-    /// here exactly like stored equations.
-    pub(crate) fn merge_producers(
-        &self,
-        collection: CollectionHandle,
-        result: CollectionData,
-    ) -> Vec<(CollectionData, CollectionData)> {
-        let mut previous = None;
-        self.merge_inputs_by_result
-            .get(&(collection, result))
-            .into_iter()
-            .flatten()
-            .filter_map(|(low, high, _)| {
-                let pair = (*low, *high);
-                if previous == Some(pair) {
-                    None
-                } else {
-                    previous = Some(pair);
-                    Some(pair)
-                }
-            })
-            .collect()
-    }
-
-    /// Canonical target image currently known for one exact source member.
-    ///
-    /// Functional resolution guarantees that distinct accepted or implied
-    /// equations cannot assign different outputs to this mapping input.
-    pub(crate) fn derive_output(
-        &self,
-        source: CollectionHandle,
-        target: CollectionHandle,
-        input: CollectionData,
-    ) -> Option<CollectionData> {
-        self.derive_outputs_by_input
-            .get(&(source, target))?
-            .get(&input)?
-            .iter()
-            .next()
-            .map(|(output, _)| *output)
-    }
-
     /// Canonical source members currently known to map to one exact target
     /// member.
     ///

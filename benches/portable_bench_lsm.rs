@@ -11,7 +11,7 @@
 //!                 iteration first publishes the input chunks as independent
 //!                 native `SimpleArchive` collection commits and freezes that
 //!                 collection's exact payload cover OUTSIDE the timer. The
-//!                 timer then covers `SuccinctArchiveCollection::ensure`:
+//!                 timer then covers `SuccinctArchiveCollection::maintain_exact`:
 //!                 exact
 //!                 source validation/derivation, canonical raw blob puts,
 //!                 deterministic dyadic target maintenance, ordinary
@@ -69,7 +69,9 @@ use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+use triblespace_core::blob::encodings::succinctarchive::{
+    OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
+};
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::{
@@ -780,9 +782,11 @@ fn main() {
                 .expect("freeze exact source cover");
 
             let t = Instant::now();
-            let union = succinct
-                .ensure(&mut store, &cover)
-                .expect("ensure exact Succinct cover");
+            let attached = succinct
+                .maintain_exact(&mut store, &cover)
+                .expect("maintain exact Succinct cover");
+            let union: UnionArchive<OrderedUniverse> =
+                attached.view().expect("materialize exact Succinct cover");
             if recording {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }
@@ -793,17 +797,17 @@ fn main() {
             let exact = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw)
                 .expect("bind exact raw Succinct projection");
             let raw_cover = exact
-                .attach(&mut store, &cover)
+                .attach(attached.snapshot(), &cover)
                 .expect("reattach exact raw cover for metrics");
-            let snapshot = store.snapshot().expect("freeze raw target snapshot");
             let shape = BuildShape {
                 source_cover_members: cover.len(),
                 raw_cover_members: raw_cover.len(),
-                query_shards: union.view().segment_count(),
+                query_shards: union.segment_count(),
                 raw_bytes: raw_cover
                     .members()
                     .map(|handle| {
-                        snapshot
+                        attached
+                            .snapshot()
                             .get::<Blob<SuccinctArchiveBlob>, _>(handle)
                             .expect("load raw target member")
                             .bytes
@@ -857,7 +861,7 @@ fn main() {
             );
 
             let (union_outcomes, counts) =
-                measure_queries(union.view(), "union", &qa, range_min, iters, warmup);
+                measure_queries(&union, "union", &qa, range_min, iters, warmup);
             union_counts = counts;
             all.extend(union_outcomes);
 

@@ -1313,7 +1313,9 @@ mod tests {
     use std::error::Error;
     use triblespace_core::attribute::Attribute;
     use triblespace_core::blob::IntoBlob;
-    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+    use triblespace_core::collection::{
+        AdmissionPolicy, CollectionPolicy, CollectionStoreExt, ExactDerivedCollection,
+    };
     use triblespace_core::inline::InlineEncoding;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{BlobStorePut, SnapshotSource};
@@ -1509,9 +1511,11 @@ mod tests {
             .unwrap();
         let source_snapshot = source_store.snapshot().unwrap();
         let source_cover = source.admitted(&source_snapshot).unwrap();
-        let target_cover = source_store
-            .ensure::<EmbeddingAttributeToNvFp4<Embedding>>(target, &source_cover)
-            .unwrap();
+        let target_cover =
+            ExactDerivedCollection::<EmbeddingAttributeToNvFp4<Embedding>>::new(source, target)
+                .unwrap()
+                .maintain_exact(&mut source_store, &source_cover)
+                .unwrap();
         let source_snapshot = source_store.snapshot().unwrap();
 
         // Copy only the target descriptor and compact member into a fresh

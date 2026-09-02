@@ -12,7 +12,9 @@ use ed25519_dalek::SigningKey;
 use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
-use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace_core::collection::{
+    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, ExactDerivedCollection,
+};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -197,7 +199,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let construction_start = Instant::now();
     let target_cover =
-        store.ensure::<EmbeddingAttributeToNvFp4<Embedding>>(target, &source_cover)?;
+        ExactDerivedCollection::<EmbeddingAttributeToNvFp4<Embedding>>::new(source, target)?
+            .maintain_exact(&mut store, &source_cover)?;
     let construction = construction_start.elapsed();
     let snapshot = store.snapshot()?;
     let members = target_cover

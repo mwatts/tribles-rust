@@ -5,6 +5,7 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
 };
@@ -62,11 +63,12 @@ fn main() {
         .expect("register Rank9-accelerated projection");
     let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
     let archive = succinct
-        .ensure(&mut pile, &cover)
-        .expect("ensure exact Succinct projection");
+        .maintain_exact(&mut pile, &cover)
+        .expect("maintain exact Succinct projection");
+    let view: UnionArchive<OrderedUniverse> = archive.view().expect("materialize Succinct view");
     let mut names: Vec<String> = find!(
         name: Inline<_>,
-        pattern!(archive.view(), [{ _?person @ literature::firstname: ?name }])
+        pattern!(&view, [{ _?person @ literature::firstname: ?name }])
     )
     .map(|name| name.try_from_inline::<String>().expect("short string"))
     .collect();

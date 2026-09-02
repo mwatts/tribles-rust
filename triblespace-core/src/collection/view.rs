@@ -1,56 +1,94 @@
-//! Logical values over exact typed collection covers.
+//! Immutable collection observations and logical views over their realized
+//! covers.
 //!
-//! A [`Cover`](super::Cover) names semantic members of one exact lattice
-//! point. [`Cover::materialize`](super::Cover::materialize) privately selects a
-//! support-equivalent resident decomposition and invokes [`TryFromCover`] to
-//! reconstruct a logical value through that same immutable store snapshot.
+//! A [`CollectionSnapshot`] owns the store observation against which its
+//! frozen support and realized target cover are valid. Logical values remain
+//! caller-chosen projections reconstructed through [`TryFromCover`].
 
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use crate::repo::BlobStoreGet;
+use crate::repo::{BlobStoreGet, StoreSnapshot};
 
 use super::{CollectionData, CollectionEncoding, Cover};
 
-/// One immutable logical view paired with the exact source cover it represents.
+/// One immutable collection observation and its exact realized target cover.
 ///
-/// The source cover is the continuation value. The view may retain a distinct,
-/// support-equivalent physical decomposition, such as mmap-backed Succinct
-/// shards, without exposing that storage choice to callers.
-pub struct CollectionSnapshot<S: CollectionEncoding, V> {
-    source: Cover<S>,
-    view: V,
+/// `support` is the snapshot-valid source support represented by `cover`. It
+/// is admitted support for the ordinary collection path and caller-requested
+/// support for the explicit path. Keeping both covers with the store
+/// observation prevents a caller from accidentally interpreting a physical
+/// realization through a different snapshot. Logical views are reconstructed
+/// on demand with [`Self::view`].
+pub struct CollectionSnapshot<R, S, T>
+where
+    R: StoreSnapshot,
+    S: CollectionEncoding,
+    T: CollectionEncoding,
+{
+    snapshot: R,
+    support: Cover<S>,
+    cover: Cover<T>,
 }
 
-impl<S: CollectionEncoding, V: Clone> Clone for CollectionSnapshot<S, V> {
+impl<R, S, T> Clone for CollectionSnapshot<R, S, T>
+where
+    R: StoreSnapshot,
+    S: CollectionEncoding,
+    T: CollectionEncoding,
+{
     fn clone(&self) -> Self {
         Self {
-            source: self.source.clone(),
-            view: self.view.clone(),
+            snapshot: self.snapshot.clone(),
+            support: self.support.clone(),
+            cover: self.cover.clone(),
         }
     }
 }
 
-impl<S: CollectionEncoding, V> CollectionSnapshot<S, V> {
-    /// Pair one exact source cover with its logical view.
-    pub(crate) fn new(source: Cover<S>, view: V) -> Self {
-        Self { source, view }
+impl<R, S, T> CollectionSnapshot<R, S, T>
+where
+    R: StoreSnapshot,
+    S: CollectionEncoding,
+    T: CollectionEncoding,
+{
+    /// Pair one store observation with frozen support and its realization.
+    pub(crate) fn new(snapshot: R, support: Cover<S>, cover: Cover<T>) -> Self {
+        Self {
+            snapshot,
+            support,
+            cover,
+        }
     }
 
-    /// Exact source cover represented by this view.
-    pub fn source(&self) -> &Cover<S> {
-        &self.source
+    /// Immutable store observation against which both covers are valid.
+    pub fn snapshot(&self) -> &R {
+        &self.snapshot
     }
 
-    /// Logical value reconstructed from the source cover.
-    pub fn view(&self) -> &V {
-        &self.view
+    /// Snapshot-valid source support represented by this snapshot.
+    pub fn support(&self) -> &Cover<S> {
+        &self.support
     }
 
-    /// Consume this snapshot into its source cover and logical view.
-    pub fn into_parts(self) -> (Cover<S>, V) {
-        (self.source, self.view)
+    /// Exact target cover realized for [`Self::support`].
+    pub fn cover(&self) -> &Cover<T> {
+        &self.cover
+    }
+
+    /// Reconstruct one caller-chosen logical value from the realized cover.
+    pub fn view<V>(&self) -> Result<V, TryFromCoverError<R::GetError<Infallible>, V::Error>>
+    where
+        R: BlobStoreGet,
+        V: TryFromCover<T>,
+    {
+        V::try_from_cover(&self.cover, &self.snapshot)
+    }
+
+    /// Consume this snapshot into its store observation and exact covers.
+    pub fn into_parts(self) -> (R, Cover<S>, Cover<T>) {
+        (self.snapshot, self.support, self.cover)
     }
 }
 
@@ -58,21 +96,26 @@ impl<S: CollectionEncoding, V> CollectionSnapshot<S, V> {
 ///
 /// The caller retains its previous snapshot and adopts `next` only after
 /// downstream consumption succeeds. A reset carries a complete replacement;
-/// strict growth additionally carries the exact newly added source support.
-pub enum CollectionSnapshotAdvance<S: CollectionEncoding, V> {
-    /// The source cover is unchanged, so the caller keeps its previous value.
+/// strict growth additionally carries the exact newly added support.
+pub enum CollectionSnapshotAdvance<R, S, T>
+where
+    R: StoreSnapshot,
+    S: CollectionEncoding,
+    T: CollectionEncoding,
+{
+    /// The support is unchanged, so the caller keeps its previous value.
     Unchanged,
-    /// The source cover grew monotonically.
+    /// The support grew monotonically.
     Advanced {
-        /// Candidate complete snapshot for the new source cover.
-        next: CollectionSnapshot<S, V>,
-        /// Exact logical view of only the newly added source members.
-        changed: CollectionSnapshot<S, V>,
+        /// Candidate complete snapshot for the new support.
+        next: CollectionSnapshot<R, S, T>,
+        /// Snapshot realizing exactly the newly added support.
+        changed: CollectionSnapshot<R, S, T>,
     },
     /// Additions-only processing is unsound; replace state with this snapshot.
     Reset {
-        /// Candidate complete snapshot for the current source cover.
-        next: CollectionSnapshot<S, V>,
+        /// Candidate complete snapshot for the current support.
+        next: CollectionSnapshot<R, S, T>,
     },
 }
 
@@ -132,10 +175,9 @@ pub trait TryFromCover<L: CollectionEncoding>: Sized {
 
     /// Reconstruct the logical value named by `cover` through `snapshot`.
     ///
-    /// Normal callers use [`Cover::materialize`](super::Cover::materialize).
-    /// Its private resolver passes the actual physical decomposition selected
-    /// from `snapshot`, never semantic coordinates paired with bytes from a
-    /// different support-equivalent realization.
+    /// Normal callers use [`CollectionSnapshot::view`], which passes the exact
+    /// realized cover together with the immutable store observation that
+    /// validated it.
     fn try_from_cover<R>(
         cover: &Cover<L>,
         snapshot: &R,

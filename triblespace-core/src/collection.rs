@@ -64,6 +64,7 @@ pub use api::*;
 pub use authorization_clock::next_authorization_change_at;
 pub use discovery::*;
 pub use encoding::*;
+pub use exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 pub use policy::*;
 pub use records::*;
 pub use resolution::*;

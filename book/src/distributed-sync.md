@@ -222,10 +222,12 @@ DERIVE(D, c, d)
 
 A node can repair the small activation overlay and use its resident exact merge
 and derivation results while planning a cover. Missing derived results are
-computed by the ordinary local `ensure` path: unsigned MERGE/DERIVE outputs are
-not remote publication authority and are not reused over the network in this
-release. Evidence and computation still converge by union; no central
-scheduler or query planner is required.
+computed by the ordinary local `ensure` path, which publishes missing
+`DERIVE` work only. Local `maintain` additionally publishes deterministic
+size-tiered `MERGE` work. Those unsigned equations are not remote publication
+authority and are not reused over the network in this release. Evidence and
+computation still converge by union; no central scheduler or query planner is
+required.
 
 Durable WANT remains orthogonal operational policy.
 `WantRequest::Blob(H)` is the sole exact-content request. The reconciler
