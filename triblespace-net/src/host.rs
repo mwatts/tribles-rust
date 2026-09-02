@@ -155,11 +155,18 @@ impl AddedBlobMatcher {
         self.handles.binary_search(handle).is_ok()
     }
 
+    #[inline(always)]
     fn contains_chunk(&self, chunk: &[u8]) -> bool {
         let prefix = usize::from(u16::from_be_bytes([chunk[0], chunk[1]]));
         if self.prefixes[prefix / u64::BITS as usize] & (1 << (prefix % u64::BITS as usize)) == 0 {
             return false;
         }
+        self.contains_prefixed_chunk(chunk)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn contains_prefixed_chunk(&self, chunk: &[u8]) -> bool {
         self.handles
             .binary_search_by(|handle| handle.as_slice().cmp(chunk))
             .is_ok()
