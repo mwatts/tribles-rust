@@ -3645,24 +3645,30 @@ impl CollectionRead for PileSnapshot {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
-        if selectors.len() == 1 {
-            if let Some(&CollectionRecordSelector::Collection(collection)) = selectors.first() {
-                let mut ids = Vec::new();
+        if selectors
+            .iter()
+            .all(|selector| matches!(selector, CollectionRecordSelector::Collection(_)))
+        {
+            let mut ids = Vec::new();
+            for selector in selectors {
+                let CollectionRecordSelector::Collection(collection) = selector else {
+                    unreachable!("selector kinds were checked above");
+                };
                 self.collection_records_by_collection
                     .infixes(&collection.raw, |id: &[u8; 16]| ids.push(*id));
-                // Infix traversal follows PATCH's structural tree order, while
-                // CollectionRead promises deterministic intrinsic-id order.
-                ids.sort_unstable();
-                return Ok(ids
-                    .into_iter()
-                    .map(|id| {
-                        *self
-                            .collection_records
-                            .get(&id)
-                            .expect("collection selector index must reference the primary index")
-                    })
-                    .collect());
             }
+            // Infix traversal follows PATCH's structural tree order, while
+            // CollectionRead promises deterministic intrinsic-id order.
+            ids.sort_unstable();
+            return Ok(ids
+                .into_iter()
+                .map(|id| {
+                    *self
+                        .collection_records
+                        .get(&id)
+                        .expect("collection selector index must reference the primary index")
+                })
+                .collect());
         }
         Ok(self
             .collection_records
@@ -6647,6 +6653,15 @@ mod tests {
             after.select_records(&selector).unwrap(),
             sorted_collection_records(records.clone())
         );
+
+        let collection_union = BTreeSet::from([
+            CollectionRecordSelector::Collection(collection),
+            CollectionRecordSelector::Collection(unrelated_collection),
+        ]);
+        let mut expected_union = records.clone();
+        expected_union.push(unrelated);
+        let selected_union = after.select_records(&collection_union).unwrap();
+        assert_eq!(selected_union, sorted_collection_records(expected_union));
 
         let mixed = BTreeSet::from([
             CollectionRecordSelector::Collection(collection),
