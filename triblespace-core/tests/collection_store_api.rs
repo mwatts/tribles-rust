@@ -29,7 +29,7 @@ use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreEvent {
     Put([u8; 32]),
-    Insert(triblespace_core::id::Id),
+    Insert(triblespace_core::collection::CollectionRecordFingerprint),
     Proof([u8; 32]),
 }
 
@@ -70,7 +70,7 @@ impl CollectionStore for CountingRepo {
     type InsertError = <MemoryRepo as CollectionStore>::InsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        self.events.push(StoreEvent::Insert(record.id()));
+        self.events.push(StoreEvent::Insert(record.fingerprint()));
         self.inner.insert(record)
     }
 }
@@ -488,7 +488,12 @@ fn commit_is_local_and_correct_by_construction() {
     );
     assert_eq!(descriptor_puts, 1);
     assert_eq!(store.puts_for(collection.handle()), descriptor_puts);
-    assert_eq!(store.events.last(), Some(&StoreEvent::Insert(commit.id())));
+    assert_eq!(
+        store.events.last(),
+        Some(&StoreEvent::Insert(
+            CollectionRecord::Commit(commit).fingerprint()
+        ))
+    );
 }
 
 #[test]
@@ -524,7 +529,9 @@ fn prepared_fragment_preserves_data_and_metadata_identity_until_commit_last() {
     assert_eq!(committed, withheld);
     assert_eq!(
         store.events.last(),
-        Some(&StoreEvent::Insert(withheld.id()))
+        Some(&StoreEvent::Insert(
+            CollectionRecord::Commit(withheld).fingerprint()
+        ))
     );
 }
 

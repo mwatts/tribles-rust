@@ -778,7 +778,9 @@ mod tests {
         assert_eq!(before.wake_root(), after.wake_root());
         assert_eq!(after.records().len(), 1);
         assert_eq!(
-            after.records().get(commit.id()),
+            after
+                .records()
+                .get(CollectionRecord::Commit(commit).fingerprint()),
             Some(CollectionRecord::Commit(commit))
         );
     }

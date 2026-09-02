@@ -148,7 +148,7 @@ pub trait AsyncCollectionRead {
     /// Failure while enumerating stored records.
     type RecordsError: Error + Debug + Send + Sync + 'static;
 
-    /// Return every record in deterministic intrinsic-id order.
+    /// Return every record in deterministic fingerprint order.
     fn records(
         &self,
     ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send;
@@ -688,7 +688,7 @@ mod tests {
         let snapshot = block_on(store.snapshot()).unwrap();
         let actual = block_on(AsyncCollectionRead::records(&snapshot)).unwrap();
         let mut expected = vec![first, second];
-        expected.sort_unstable_by_key(CollectionRecord::id);
+        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         assert_eq!(actual, expected);
     }
 

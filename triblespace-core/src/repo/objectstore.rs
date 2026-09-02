@@ -26,9 +26,9 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
-use crate::collection::{CollectionRecord, RecordDecodeError};
+use crate::collection::{CollectionRecord, CollectionRecordFingerprint, RecordDecodeError};
+#[cfg(test)]
 use crate::id::Id;
-use crate::id::RawId;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
@@ -202,7 +202,7 @@ impl AsyncSnapshotSource for ObjectStoreRemote {
                 let meta = item.map_err(ListCollectionRecordsErr::List)?;
                 let record =
                     read_collection_record(&*self.store, &record_prefix, meta.location).await?;
-                collection_records.insert(record.id(), record);
+                collection_records.insert(record.fingerprint(), record);
             }
             let collection_records = collection_records.into_values().collect();
 
@@ -239,11 +239,11 @@ impl AsyncCollectionStore for ObjectStoreRemote {
         &mut self,
         record: CollectionRecord,
     ) -> impl Future<Output = Result<(), Self::InsertError>> + Send {
-        let id = record.id();
+        let fingerprint = record.fingerprint();
         let path = self
             .prefix
             .child(COLLECTION_RECORD_INFIX)
-            .child(hex::encode(id));
+            .child(hex::encode(fingerprint.raw()));
         let expected: bytes::Bytes = record.to_bytes().into();
 
         async move {
@@ -269,7 +269,7 @@ impl AsyncCollectionStore for ObjectStoreRemote {
                     if actual == expected {
                         Ok(())
                     } else {
-                        Err(InsertCollectionRecordErr::ExistingMismatch { id })
+                        Err(InsertCollectionRecordErr::ExistingMismatch { fingerprint })
                     }
                 }
                 Err(error) => Err(InsertCollectionRecordErr::Store(error)),
@@ -409,10 +409,10 @@ fn blob_handle_from_path(prefix: &Path, location: &Path) -> Result<RawInline, Li
     RawInline::from_hex(name).map_err(ListBlobsErr::BadNameHex)
 }
 
-fn collection_record_id_from_path(
+fn collection_record_fingerprint_from_path(
     prefix: &Path,
     location: &Path,
-) -> Result<Id, ListCollectionRecordsErr> {
+) -> Result<CollectionRecordFingerprint, ListCollectionRecordsErr> {
     let name = location
         .filename()
         .ok_or(ListCollectionRecordsErr::NotAFile("no filename"))?;
@@ -421,8 +421,8 @@ fn collection_record_id_from_path(
             location.to_string(),
         ));
     }
-    let raw = RawId::from_hex(name).map_err(ListCollectionRecordsErr::BadNameHex)?;
-    Id::new(raw).ok_or(ListCollectionRecordsErr::BadId)
+    let raw = RawInline::from_hex(name).map_err(ListCollectionRecordsErr::BadFingerprintHex)?;
+    Ok(CollectionRecordFingerprint::from_raw(raw))
 }
 
 async fn read_collection_record(
@@ -430,7 +430,7 @@ async fn read_collection_record(
     prefix: &Path,
     location: Path,
 ) -> Result<CollectionRecord, ListCollectionRecordsErr> {
-    let path_id = collection_record_id_from_path(prefix, &location)?;
+    let path_fingerprint = collection_record_fingerprint_from_path(prefix, &location)?;
     let object = store
         .get(&location)
         .await
@@ -440,11 +440,11 @@ async fn read_collection_record(
         .await
         .map_err(ListCollectionRecordsErr::Get)?;
     let record = CollectionRecord::from_bytes(&bytes).map_err(ListCollectionRecordsErr::Decode)?;
-    let record_id = record.id();
-    if record_id != path_id {
-        return Err(ListCollectionRecordsErr::IdMismatch {
-            path: path_id,
-            record: record_id,
+    let record_fingerprint = record.fingerprint();
+    if record_fingerprint != path_fingerprint {
+        return Err(ListCollectionRecordsErr::FingerprintMismatch {
+            path: path_fingerprint,
+            record: record_fingerprint,
         });
     }
     Ok(record)
@@ -502,18 +502,19 @@ pub enum ListCollectionRecordsErr {
     List(object_store::Error),
     /// A listed object had no filename component.
     NotAFile(&'static str),
-    /// A listed object was nested below the one-id-per-object namespace.
+    /// A listed object was nested below the one-fingerprint-per-object namespace.
     NotDirectChild(String),
-    /// A listed filename was not a hexadecimal intrinsic id.
-    BadNameHex(<RawId as FromHex>::Error),
-    /// The decoded filename represented the nil id.
-    BadId,
+    /// A listed filename was not a hexadecimal full-width fingerprint.
+    BadFingerprintHex(<RawInline as FromHex>::Error),
     /// A listed record object could not be fetched.
     Get(object_store::Error),
     /// The stored bytes were not a canonical dense collection record.
     Decode(RecordDecodeError),
-    /// The record's intrinsic id did not match its object path.
-    IdMismatch { path: Id, record: Id },
+    /// The record's canonical-byte fingerprint did not match its object path.
+    FingerprintMismatch {
+        path: CollectionRecordFingerprint,
+        record: CollectionRecordFingerprint,
+    },
 }
 
 impl fmt::Display for ListCollectionRecordsErr {
@@ -524,15 +525,14 @@ impl fmt::Display for ListCollectionRecordsErr {
             Self::NotDirectChild(path) => {
                 write!(f, "collection-record object is not a direct child: {path}")
             }
-            Self::BadNameHex(error) => {
+            Self::BadFingerprintHex(error) => {
                 write!(f, "collection-record filename is not hexadecimal: {error}")
             }
-            Self::BadId => write!(f, "collection-record filename is the nil id"),
             Self::Get(error) => write!(f, "collection-record fetch failed: {error}"),
             Self::Decode(error) => write!(f, "collection-record decode failed: {error}"),
-            Self::IdMismatch { path, record } => write!(
+            Self::FingerprintMismatch { path, record } => write!(
                 f,
-                "collection-record path id {path:X} does not match decoded id {record:X}"
+                "collection-record path fingerprint {path:X} does not match decoded fingerprint {record:X}"
             ),
         }
     }
@@ -542,11 +542,9 @@ impl Error for ListCollectionRecordsErr {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::List(error) | Self::Get(error) => Some(error),
-            Self::BadNameHex(error) => Some(error),
+            Self::BadFingerprintHex(error) => Some(error),
             Self::Decode(error) => Some(error),
-            Self::NotAFile(_) | Self::NotDirectChild(_) | Self::BadId | Self::IdMismatch { .. } => {
-                None
-            }
+            Self::NotAFile(_) | Self::NotDirectChild(_) | Self::FingerprintMismatch { .. } => None,
         }
     }
 }
@@ -558,8 +556,10 @@ pub enum InsertCollectionRecordErr {
     Store(object_store::Error),
     /// An existing object could not be fetched for idempotency validation.
     ReadExisting(object_store::Error),
-    /// The intrinsic-id path already contained different bytes.
-    ExistingMismatch { id: Id },
+    /// The fingerprint path already contained different bytes.
+    ExistingMismatch {
+        fingerprint: CollectionRecordFingerprint,
+    },
 }
 
 impl fmt::Display for InsertCollectionRecordErr {
@@ -569,9 +569,9 @@ impl fmt::Display for InsertCollectionRecordErr {
             Self::ReadExisting(error) => {
                 write!(f, "failed to validate existing collection record: {error}")
             }
-            Self::ExistingMismatch { id } => write!(
+            Self::ExistingMismatch { fingerprint } => write!(
                 f,
-                "collection-record id {id:X} already contains different bytes"
+                "collection-record fingerprint {fingerprint:X} already contains different bytes"
             ),
         }
     }
@@ -768,7 +768,7 @@ mod tests {
             let first_path = store
                 .prefix
                 .child(COLLECTION_RECORD_INFIX)
-                .child(hex::encode(first.id()));
+                .child(hex::encode(first.fingerprint().raw()));
             let stored = store
                 .store
                 .get(&first_path)
@@ -787,7 +787,7 @@ mod tests {
                 .is_empty());
             let actual = AsyncCollectionRead::records(&snapshot).await.unwrap();
             let mut expected = vec![first, second];
-            expected.sort_unstable_by_key(CollectionRecord::id);
+            expected.sort_unstable_by_key(CollectionRecord::fingerprint);
             assert_eq!(actual, expected);
             let changes = snapshot.changes_since(&before);
             assert!(changes.contains(StoreChanges::COLLECTION_RECORDS));
@@ -796,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_record_path_must_match_decoded_intrinsic_id() {
+    fn collection_record_path_must_match_decoded_fingerprint() {
         block_on(async {
             let mut store = remote();
             let path_record = record(1);
@@ -804,20 +804,22 @@ mod tests {
             let path = store
                 .prefix
                 .child(COLLECTION_RECORD_INFIX)
-                .child(hex::encode(path_record.id()));
+                .child(hex::encode(path_record.fingerprint().raw()));
             let bytes: bytes::Bytes = stored_record.to_bytes().into();
             store.store.put(&path, bytes.into()).await.unwrap();
 
             assert!(matches!(
                 AsyncCollectionStore::insert(&mut store, path_record).await,
-                Err(InsertCollectionRecordErr::ExistingMismatch { id }) if id == path_record.id()
+                Err(InsertCollectionRecordErr::ExistingMismatch { fingerprint })
+                    if fingerprint == path_record.fingerprint()
             ));
 
             assert!(matches!(
                 AsyncSnapshotSource::snapshot(&mut store).await,
                 Err(ObjectStoreSnapshotError::CollectionRecords(
-                    ListCollectionRecordsErr::IdMismatch { path, record }
-                )) if path == path_record.id() && record == stored_record.id()
+                    ListCollectionRecordsErr::FingerprintMismatch { path, record }
+                )) if path == path_record.fingerprint()
+                    && record == stored_record.fingerprint()
             ));
         });
     }

@@ -61,7 +61,7 @@ pub(crate) enum CollectionRepairComponent {
 impl CollectionRepairComponent {
     pub(crate) const fn key_len(self) -> usize {
         match self {
-            Self::Record => 16,
+            Self::Record => 32,
             Self::WriteEvidence => 32,
             Self::Resident => 80,
         }
@@ -595,11 +595,13 @@ mod tests {
     async fn node_commands_and_leaf_values_roundtrip() {
         let component = CollectionRepairComponent::Record;
         let summary = PatchSummary::new(Some([7; 32]), 1).unwrap();
-        let request = PatchRepairRequest::new(component, summary, 16, vec![], [7; 32]).unwrap();
+        let request =
+            PatchRepairRequest::new(component, summary, component.key_len(), vec![], [7; 32])
+                .unwrap();
         let response = PatchNodeResponse::Found(PatchNode::Leaf {
             digest: [7; 32],
             leaf: PatchLeaf {
-                key: vec![8; 16],
+                key: vec![8; 32],
                 value: vec![9; 192],
             },
         });

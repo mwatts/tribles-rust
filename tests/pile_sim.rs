@@ -3,7 +3,7 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::collection::{
-    CollectionMerge, CollectionRead, CollectionRecord, CollectionStore,
+    CollectionMerge, CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionStore,
 };
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -98,12 +98,12 @@ fn observed_records(pile: &mut Pile) -> Vec<CollectionRecord> {
 
 fn assert_known_records(
     pile: &mut Pile,
-    expected: &HashMap<Id, CollectionRecord>,
+    expected: &HashMap<CollectionRecordFingerprint, CollectionRecord>,
 ) -> Result<(), TestCaseError> {
     let found = observed_records(pile);
     prop_assert_eq!(found.len(), expected.len());
     for record in found {
-        prop_assert_eq!(expected.get(&record.id()), Some(&record));
+        prop_assert_eq!(expected.get(&record.fingerprint()), Some(&record));
     }
     Ok(())
 }
@@ -118,7 +118,7 @@ proptest! {
             (0..scenario.actors).map(|_| Pile::open(&path).unwrap()).collect();
         let mut expected_blobs: HashMap<Inline<Handle<UnknownBlob>>, Vec<u8>> = HashMap::new();
         let mut handles: Vec<Inline<Handle<UnknownBlob>>> = Vec::new();
-        let mut expected_records: HashMap<Id, CollectionRecord> = HashMap::new();
+        let mut expected_records: HashMap<CollectionRecordFingerprint, CollectionRecord> = HashMap::new();
 
         for actor_op in scenario.ops {
             match actor_op {
@@ -162,7 +162,7 @@ proptest! {
                                 at(result).into(),
                             ));
                             piles[actor].insert(record).unwrap();
-                            expected_records.insert(record.id(), record);
+                            expected_records.insert(record.fingerprint(), record);
                         }
                     }
                     Op::CollectionList => {

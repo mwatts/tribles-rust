@@ -431,8 +431,9 @@ Their pile record-kind markers retain the V4 values. They are
 **not blob records**, have no following payload, and carry no insertion
 timestamp. They are also distinct from operational wants and historical pins:
 collection records have no head, tombstone, or
-last-writer-wins update. Their logical key is a content-derived 16-byte record
-ID; a collection record is not a trible entity.
+last-writer-wins update. Their exact canonical value is the semantic record; a
+collection record is not a trible entity. Physical indexes use a full-width
+BLAKE3 fingerprint only as a fixed-width lookup and deduplication key.
 
 The collection itself is identified by a canonical `SimpleArchive` descriptor.
 Its 32-byte blob handle is the sole `CollectionHandle`. Records carry this
@@ -479,7 +480,7 @@ collection it has never seen — that most needs the answer.
 
 The magic markers below identify the compact pile representation. They are
 storage-envelope markers, distinct both from the stable semantic kind IDs used
-in record-ID/signature domains and from the one-byte versioned tags used by
+in fingerprints/signature domains and from the one-byte versioned tags used by
 generic dense record stores. There is no equivalent `SimpleArchive` form for
 these algebra records.
 
@@ -510,18 +511,18 @@ inputs are stored in lexicographic digest order (`low <= high`), so swapping
 the two operands cannot create a second representation of the same
 commutative equation.
 
-The record ID is deliberately absent from these headers. On replay, the
+No record ID exists in these headers or in the semantic model. On replay, the
 decoder reconstructs the record's exact dense typed payload: 192 bytes for a
-commit, 128 bytes for a merge, and 96 bytes for a derive. It hashes a domain separator,
-record-ID version, stable semantic kind ID, and every payload byte with BLAKE3,
-then uses the digest's final 16 bytes as the record ID. For a commit the payload
-includes the public key and both signature components. Consequently the pile
-header and the typed dense codec identify the same semantic record without
-trusting a separately stored key.
+commit, 128 bytes for a merge, and 96 bytes for a derive. Where a fixed-width
+physical key is required, the store hashes the stable semantic kind ID followed
+by every canonical payload byte with BLAKE3 and retains the full 32-byte digest
+as a `CollectionRecordFingerprint`. For a commit the payload includes the
+public key and both signature components. The fingerprint is an index key, not
+a materialized entity or a substitute for the exact record value.
 
-Pile replay keeps the records in record-ID order. Re-inserting an identical
-record is an idempotent success; a different record reconstructing to the same
-ID is reported as a collision. Concatenating piles therefore gives set-union
+Pile replay keeps the records in fingerprint order. Re-inserting an identical
+record is an idempotent success; a different record producing the same
+full-width fingerprint is reported as a collision. Concatenating piles therefore gives set-union
 semantics for collection records: append order and duplicate copies do not
 change the discovered collection calculus. Current operational WANTs are
 likewise a grow-only set. Historical pins remain ordered evidence; retired

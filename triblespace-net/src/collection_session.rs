@@ -195,8 +195,8 @@ fn node_response(
     match component {
         CollectionRepairComponent::Record => {
             patch_node_response(overlay.records().patch(), &[], prefix, |key, record| {
-                if record.id().raw() != key {
-                    bail!("collection record id does not match its PATCH leaf key");
+                if record.fingerprint().raw() != key {
+                    bail!("collection record fingerprint does not match its PATCH leaf key");
                 }
                 encode_record(overlay.collection(), *record).map_err(anyhow::Error::new)
             })
@@ -490,16 +490,19 @@ where
         *response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
         validate_response(&request, component, &response, |key, bytes| {
             let record = decode_record(local.collection(), bytes)?;
-            if record.id().raw().as_slice() != key {
+            if record.fingerprint().raw().as_slice() != key {
                 bail!("collection record body does not match its PATCH leaf key");
             }
             Ok(())
         })?;
         if let Some(leaf) = walker.accept(&request, response, |_, key| {
-            let Ok(key) = <[u8; 16]>::try_from(key) else {
+            let Ok(key) = <[u8; 32]>::try_from(key) else {
                 return false;
             };
-            triblespace_core::id::Id::new(key).is_some_and(|id| local.records().get(id).is_some())
+            local
+                .records()
+                .get(triblespace_core::collection::CollectionRecordFingerprint::from_raw(key))
+                .is_some()
         })? {
             let record = decode_record(local.collection(), &leaf.value)?;
             let CollectionRecord::Commit(commit) = record else {

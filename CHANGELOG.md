@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observation together with frozen source support and the realized target
   cover, then reconstructs caller-chosen views on demand.
 
-- Add a derived segmented pile index over `collection handle || record id` so
+- Add a derived segmented pile index over `collection handle || record fingerprint` so
   collection-only selector unions visit only the named descriptors' records
-  while preserving the intrinsic-ID index as canonical storage and ordering.
+  while preserving the full-width fingerprint index as physical storage and
+  ordering. Collection records themselves have no synthetic semantic identity.
 
 - Replace WANT's per-request LWW assertion/retraction log with one grow-only
   canonical request set. `WantStore::unwant`, every adapter, and direct
@@ -1255,9 +1256,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SimpleArchive` entities: their exact payloads are fixed at 192, 128, and 96
   bytes, respectively, with structural `to_bytes`/`from_bytes` codecs.
   Generic record stores use one stable versioned variant tag around those
-  payloads. Record IDs are derived directly from a domain, semantic kind,
-  codec version, and every dense payload byte; merge decoding rejects
-  noncanonical input order. Collection descriptors remain self-describing
+  payloads. Records have no synthetic semantic ID; fixed-width physical stores
+  and network PATCHes key them by the full BLAKE3 digest of their semantic kind
+  and every dense payload byte. Merge decoding rejects noncanonical input
+  order. Collection descriptors remain self-describing
   `SimpleArchive` blobs whose handles are the collection identity.
 - **Pile diagnostics can decode one exact physical record boundary.**
   `trible pile diagnose record-at <pile> <offset>` walks the canonical replay
@@ -1387,15 +1389,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrooted staged dependencies remain undiscoverable as membership and produce
   no retention roots.
 - **Collection algebra records now have a native grow-only storage surface.**
-  `CollectionStore` admits intrinsically identified signed `COMMIT` and
+  `CollectionStore` admits exact canonical signed `COMMIT` and
   unsigned `MERGE` and `DERIVE` records without a mutable head, CAS, tombstone,
   or branch cell. A canonical `SimpleArchive` descriptor carries
   `(scope, representation, recipe)` and its 32-byte content handle is the sole
   `CollectionId`; every record names descriptor handles directly, so there is
   no definition record or registry. Pile stores each equation as one fixed
-  256-byte V4 record and replays their set union in intrinsic-id order;
-  object-store remotes use immutable `collection-records/<id>` objects and
-  validate both canonical bytes and path identity. Memory, hybrid, lazy,
+  256-byte V4 record and replays their set union in record-fingerprint order;
+  object-store remotes use immutable
+  `collection-records/<full-width-fingerprint>` objects and validate both
+  canonical bytes and path fingerprint. Memory, hybrid, lazy,
   blocking-async, and generational Yard adapters preserve the same idempotent
   algebra, including across cat/reopen/reclaim boundaries. Legacy V3
   definition/16-byte-ID records remain recognizable for safe replay and
@@ -1494,7 +1497,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Typed collection records can be discovered without a catalog.** The
   top-level `triblespace_core::collection` module enumerates structurally
   canonical `COMMIT`, `MERGE`, and `DERIVE` values from `CollectionStore` and
-  returns them in intrinsic-id order. Signed commits are included only after
+  returns them in record-fingerprint order. Signed commits are included only after
   strict Ed25519 self-signature verification, leaving key authorization to
   caller policy; invalid signatures remain diagnostics and structural storage
   failures remain hard errors. Descriptor bytes resolve through the ordinary

@@ -310,8 +310,11 @@ where
         self.records.records()
     }
 
-    fn record(&self, id: crate::id::Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.records.record(id)
+    fn record(
+        &self,
+        fingerprint: crate::collection::CollectionRecordFingerprint,
+    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        self.records.record(fingerprint)
     }
 
     fn select_records(

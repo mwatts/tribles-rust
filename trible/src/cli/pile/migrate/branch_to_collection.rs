@@ -17,7 +17,8 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionStoreExt,
+    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRecord,
+    CollectionStoreExt,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -132,7 +133,7 @@ fn migrate(
 
     let unique_targets = mappings
         .iter()
-        .map(|(_, target)| target.id())
+        .map(|(_, target)| *target)
         .collect::<BTreeSet<_>>()
         .len();
     let report = MigrationReport {
@@ -418,9 +419,13 @@ fn print_report(
         hex::encode(collection.handle().raw)
     );
     println!("target signer: {}", hex::encode_upper(signer.to_bytes()));
-    println!("SOURCE COMMIT                                                     TARGET COMMIT");
+    println!("SOURCE COMMIT                                                     TARGET RECORD FINGERPRINT");
     for (source, target) in mappings {
-        println!("{}  {:X}", handle_hex(*source), target.id());
+        println!(
+            "{}  {:X}",
+            handle_hex(*source),
+            CollectionRecord::Commit(*target).fingerprint()
+        );
     }
     println!(
         "validated {} reachable node(s): {} authored, {} canonical contentless merge(s) skipped",
@@ -523,12 +528,12 @@ mod tests {
         let c1_target = first_map
             .iter()
             .find(|(source, _)| *source == c1)
-            .map(|(_, target)| target.id())
+            .map(|(_, target)| *target)
             .expect("C1 mapping");
         let c2_target = first_map
             .iter()
             .find(|(source, _)| *source == c2)
-            .map(|(_, target)| target.id())
+            .map(|(_, target)| *target)
             .expect("C2 mapping");
         assert_eq!(c1_target, c2_target);
 
@@ -556,11 +561,11 @@ mod tests {
         assert_eq!(
             first_map
                 .iter()
-                .map(|(source, target)| (source.raw, target.id()))
+                .map(|(source, target)| (source.raw, *target))
                 .collect::<Vec<_>>(),
             second_map
                 .iter()
-                .map(|(source, target)| (source.raw, target.id()))
+                .map(|(source, target)| (source.raw, *target))
                 .collect::<Vec<_>>()
         );
         assert_eq!(fs::metadata(&path)?.len(), first_len);

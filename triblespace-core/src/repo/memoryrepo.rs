@@ -11,9 +11,9 @@ use crate::blob::{MemoryBlobStore, MemoryBlobStoreSnapshot, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::selectors_match_record;
 use crate::collection::{
-    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionStore,
 };
-use crate::id::ID_LEN;
 use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::prelude::*;
@@ -26,7 +26,7 @@ use crate::repo::{
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 
-type CollectionRecordIndex = PATCH<ID_LEN, IdentitySchema, CollectionRecord, XorSip128>;
+type CollectionRecordIndex = PATCH<INLINE_LEN, IdentitySchema, CollectionRecord, XorSip128>;
 type CapabilityProofIndex = PATCH<INLINE_LEN, IdentitySchema, CapabilityProof, XorSip128>;
 
 /// Simple in-memory implementation of the repository storage traits.
@@ -41,7 +41,7 @@ pub struct MemoryRepo {
     /// ephemeral as the blobs themselves — the trait is a capability,
     /// durability is the store's own property.
     wants: HashSet<WantRequest>,
-    /// Canonical collection records keyed by intrinsic record id.
+    /// Canonical collection records keyed by full-width record fingerprint.
     collection_records: CollectionRecordIndex,
     /// Canonical complete capability proofs keyed by exact-body content id.
     capability_proofs: CapabilityProofIndex,
@@ -91,8 +91,12 @@ impl SnapshotSource for MemoryRepo {
 
 /// Deterministic persistent snapshot of in-memory collection records.
 pub struct MemoryCollectionRecordIter {
-    keys:
-        crate::patch::PATCHIntoOrderedIterator<ID_LEN, IdentitySchema, CollectionRecord, XorSip128>,
+    keys: crate::patch::PATCHIntoOrderedIterator<
+        INLINE_LEN,
+        IdentitySchema,
+        CollectionRecord,
+        XorSip128,
+    >,
     lookup: CollectionRecordIndex,
 }
 
@@ -105,7 +109,7 @@ impl Iterator for MemoryCollectionRecordIter {
             .lookup
             .get(&key)
             .expect("collection key from PATCH snapshot must retain its value");
-        debug_assert_eq!(record.id().raw(), key);
+        debug_assert_eq!(record.fingerprint().raw(), key);
         Some(Ok(record))
     }
 }
@@ -157,15 +161,20 @@ impl Error for MemoryProofInsertError {}
 /// Failure while inserting a collection record into [`MemoryRepo`].
 #[derive(Debug)]
 pub enum MemoryCollectionInsertError {
-    /// An infeasible intrinsic-id collision named different canonical bytes.
-    IdCollision { id: Id },
+    /// An infeasible full-width fingerprint collision named different records.
+    FingerprintCollision {
+        fingerprint: CollectionRecordFingerprint,
+    },
 }
 
 impl fmt::Display for MemoryCollectionInsertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IdCollision { id } => {
-                write!(f, "collection record id {id} names different bytes")
+            Self::FingerprintCollision { fingerprint } => {
+                write!(
+                    f,
+                    "collection record fingerprint {fingerprint} names different records"
+                )
             }
         }
     }
@@ -220,8 +229,11 @@ impl CollectionRead for MemoryRepoSnapshot {
         })
     }
 
-    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        Ok(self.collection_records.get(&id.raw()).copied())
+    fn record(
+        &self,
+        fingerprint: CollectionRecordFingerprint,
+    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        Ok(self.collection_records.get(&fingerprint.raw()).copied())
     }
 
     fn select_records(
@@ -249,16 +261,16 @@ impl CollectionStore for MemoryRepo {
     type InsertError = MemoryCollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        let id = record.id();
-        if let Some(existing) = self.collection_records.get(&id.raw()) {
+        let fingerprint = record.fingerprint();
+        if let Some(existing) = self.collection_records.get(&fingerprint.raw()) {
             return if existing == &record {
                 Ok(())
             } else {
-                Err(MemoryCollectionInsertError::IdCollision { id })
+                Err(MemoryCollectionInsertError::FingerprintCollision { fingerprint })
             };
         }
         self.collection_records
-            .insert(&Entry::with_value(&id.raw(), record));
+            .insert(&Entry::with_value(&fingerprint.raw(), record));
         Ok(())
     }
 }
@@ -547,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_records_are_idempotent_and_intrinsically_ordered() {
+    fn collection_records_are_idempotent_and_fingerprint_ordered() {
         let descriptor = named_for_tests("merged", Id::new([2; 16]).unwrap());
         let target = named_for_tests("derived", Id::new([8; 16]).unwrap());
         let merge = CollectionRecord::Merge(CollectionMerge::new(
@@ -562,7 +574,7 @@ mod tests {
             Inline::new([11; 32]),
         ));
         let mut expected = vec![derive, merge];
-        expected.sort_unstable_by_key(CollectionRecord::id);
+        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
 
         let mut repo = MemoryRepo::default();
         CollectionStore::insert(&mut repo, merge).unwrap();
@@ -576,8 +588,13 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
-        assert_eq!(snapshot.record(merge.id()).unwrap(), Some(merge));
-        assert_eq!(snapshot.record(Id::new([0xff; 16]).unwrap()).unwrap(), None);
+        assert_eq!(snapshot.record(merge.fingerprint()).unwrap(), Some(merge));
+        assert_eq!(
+            snapshot
+                .record(CollectionRecordFingerprint::from_raw([0xff; 32]))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -593,17 +610,21 @@ mod tests {
             Inline::new([16; 32]),
             Inline::new([17; 32]),
         ));
-        let id = expected.id();
+        let fingerprint = expected.fingerprint();
 
         let mut repo = MemoryRepo::default();
         repo.collection_records
-            .insert(&Entry::with_value(&id.raw(), mismatched));
+            .insert(&Entry::with_value(&fingerprint.raw(), mismatched));
 
         assert!(matches!(
             repo.insert(expected),
-            Err(MemoryCollectionInsertError::IdCollision { id: found }) if found == id
+            Err(MemoryCollectionInsertError::FingerprintCollision { fingerprint: found })
+                if found == fingerprint
         ));
-        assert_eq!(repo.collection_records.get(&id.raw()), Some(&mismatched));
+        assert_eq!(
+            repo.collection_records.get(&fingerprint.raw()),
+            Some(&mismatched)
+        );
     }
 
     #[test]
@@ -640,7 +661,7 @@ mod tests {
         .into_iter()
         .collect();
         let mut expected = vec![first, conflicting];
-        expected.sort_unstable_by_key(CollectionRecord::id);
+        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         let snapshot = repo.snapshot().unwrap();
         assert_eq!(snapshot.select_records(&exact).unwrap(), expected);
 
@@ -651,7 +672,7 @@ mod tests {
         .into_iter()
         .collect();
         let mut expected = vec![merge, first, conflicting, sibling];
-        expected.sort_unstable_by_key(CollectionRecord::id);
+        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         assert_eq!(snapshot.select_records(&grouped).unwrap(), expected);
         assert!(!snapshot
             .select_records(&grouped)
@@ -781,9 +802,9 @@ mod tests {
         let after = repo.snapshot().unwrap();
 
         assert!(!before.contains_blob(blob).unwrap());
-        assert_eq!(before.record(record.id()).unwrap(), None);
+        assert_eq!(before.record(record.fingerprint()).unwrap(), None);
 
         assert!(after.contains_blob(blob).unwrap());
-        assert_eq!(after.record(record.id()).unwrap(), Some(record));
+        assert_eq!(after.record(record.fingerprint()).unwrap(), Some(record));
     }
 }

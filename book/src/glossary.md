@@ -63,8 +63,9 @@ it does not make the proof authorized.
 ### Commit
 A signed native collection membership assertion. A `CollectionCommit` names
 the exact collection descriptor, data element, mandatory metadata archive, and
-author. Its intrinsic record ID is derived from the canonical 192-byte payload.
-Commits are independent leaves rather than snapshots in a parent chain.
+author. Its exact canonical 192-byte value is the assertion; it has no
+synthetic entity ID. Commits are independent leaves rather than snapshots in a
+parent chain.
 
 ### Capability Presentation
 One owned `CapabilityProofBundle` paired with the exact leaf key the caller
@@ -137,7 +138,8 @@ mathematical contract is a join homomorphism over their logical values:
 
 ### Collection Store
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
-idempotent by intrinsic record ID; combining two stores is set union.
+idempotent by exact canonical record value; combining two stores is set union.
+Physical fixed-width indexes may key that value by its full-width fingerprint.
 
 ### Store Snapshot
 One immutable, coherent known-prefix observation produced by

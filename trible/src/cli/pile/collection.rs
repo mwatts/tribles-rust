@@ -111,7 +111,7 @@ pub enum Command {
     /// List the commit, merge, and derive records that name one collection.
     ///
     /// This is the record stream itself, in the store's deterministic
-    /// intrinsic-id order — not a commit chain, because a collection has no
+    /// fingerprint order — not a commit chain, because a collection has no
     /// head to walk back from. Signatures are verified as they are printed.
     Log {
         /// Path to the pile file to read.
@@ -1146,6 +1146,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                 continue;
             }
             printed += 1;
+            let fingerprint = record.fingerprint();
             match record {
                 CollectionRecord::Commit(commit) => {
                     let signature = match commit.verify_strict() {
@@ -1154,7 +1155,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                     };
                     println!(
                         "commit  {:X}  data={}  meta={}  signer={}  signature={signature}",
-                        commit.id(),
+                        fingerprint,
                         short(commit.data().raw),
                         short(commit.metadata().raw),
                         abbrev(&hex::encode_upper(commit.public_key().raw), long),
@@ -1164,7 +1165,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                     let (low, high) = merge.inputs();
                     println!(
                         "merge   {:X}  low={}  high={}  result={}",
-                        merge.id(),
+                        fingerprint,
                         short(low.raw),
                         short(high.raw),
                         short(merge.result().raw),
@@ -1174,7 +1175,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                     let (input, output) = (derive.input(), derive.output());
                     println!(
                         "derive  {:X}  input={}  output={}",
-                        derive.id(),
+                        fingerprint,
                         short(input.raw),
                         short(output.raw),
                     );

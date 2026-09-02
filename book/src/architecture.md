@@ -143,11 +143,13 @@ interpretable without a separate registry entry.
 | `MERGE(C, a, b, c)` | Under `C`'s join law, `a ⊔ b = c`. | 128 bytes |
 | `DERIVE(T, a, b)` | The mapping named by target `T` maps source element `a` to target element `b`. | 96 bytes |
 
-All three have intrinsic IDs derived from their exact canonical payload. A
-repeat insert is a no-op. `COMMIT` is signed because its assertion cannot be
-recomputed; `MERGE` and `DERIVE` are unsigned because correctness comes from
-the encoding or mapping plus exact bytes, not the identity of the machine that
-performed the work.
+The exact canonical record value is the semantic object; none of the three has
+a synthetic entity ID. A repeat insert is a no-op. Fixed-width physical indexes
+and the network PATCH use a full-width BLAKE3 fingerprint of the kind and
+canonical payload, but that key is not collection semantics. `COMMIT` is signed
+because its assertion cannot be recomputed; `MERGE` and `DERIVE` are unsigned
+because correctness comes from the encoding or mapping plus exact bytes, not
+the identity of the machine that performed the work.
 
 The algebra has no distinguished head. Several commits coexist, and the value
 of a selected collection view is the join of its admitted members. This makes a

@@ -56,10 +56,10 @@ For one collection, exactly two grow-only sets can change admission:
   roots.
 
 Each set is represented by an immutable BLAKE3-Merkle PATCH. Admitted COMMITs
-are keyed by their 16-byte intrinsic record ID; proof bundles are keyed by
-their 32-byte proof ID and carry their exact ordered claim closure as the leaf
-value. The opaque activation root commits to C, both PATCH roots, and both leaf
-counts under a versioned domain.
+are keyed physically by the full 32-byte fingerprint of their exact canonical
+record value; proof bundles are keyed by their 32-byte proof ID and carry their
+exact ordered claim closure as the leaf value. The opaque activation root
+commits to C, both PATCH roots, and both leaf counts under a versioned domain.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
@@ -268,7 +268,9 @@ collection identity and cannot change which evidence is semantically valid.
 ## Convergence and failure model
 
 - Concatenation, local insertion, and remote repair all perform set union.
-- Duplicate records and proof bundles collapse by intrinsic identity.
+- Duplicate records collapse by their complete canonical value; fixed-width
+  indexes and the wire use a full-width BLAKE3 fingerprint of that value.
+  Proof bundles continue to collapse by their cryptographic identity.
 - A missed wake only adds latency; periodic repair still converges connected
   readers.
 - An invalid wake, record, proof, PATCH node, or blob fails that input and

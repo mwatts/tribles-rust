@@ -50,7 +50,7 @@ use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::{selectors_match_record, CollectionRead};
 use crate::collection::{
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
-    CollectionRecordSelector, CollectionStore,
+    CollectionRecordFingerprint, CollectionRecordSelector, CollectionStore,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -385,14 +385,14 @@ mod blob_occurrence_key {
 }
 
 mod collection_record_collection_key {
-    crate::key_segmentation!(Segments, 48, [32, 16]);
-    crate::key_schema!(Schema, Segments, 48, [0, 1]);
+    crate::key_segmentation!(Segments, 64, [32, 32]);
+    crate::key_schema!(Schema, Segments, 64, [0, 1]);
 }
 
 type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, XorSip128>;
-type CollectionRecordIndex = PATCH<16, IdentitySchema, CollectionRecord, XorSip128>;
+type CollectionRecordIndex = PATCH<32, IdentitySchema, CollectionRecord, XorSip128>;
 type CollectionRecordCollectionIndex =
-    PATCH<48, collection_record_collection_key::Schema, (), XorSip128>;
+    PATCH<64, collection_record_collection_key::Schema, (), XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
@@ -404,10 +404,10 @@ fn collection_record_collection(record: CollectionRecord) -> CollectionHandle {
     }
 }
 
-fn collection_record_collection_key(record: CollectionRecord) -> [u8; 48] {
-    let mut key = [0; 48];
+fn collection_record_collection_key(record: CollectionRecord) -> [u8; 64] {
+    let mut key = [0; 64];
     key[..32].copy_from_slice(&collection_record_collection(record).raw);
-    key[32..].copy_from_slice(&record.id().raw());
+    key[32..].copy_from_slice(&record.fingerprint().raw());
     key
 }
 
@@ -2357,13 +2357,26 @@ impl Iterator for PileRecords {
 
 #[derive(Debug)]
 enum Applied {
-    Blob { hash: Inline<Hash<Blake3>> },
-    Branch { id: Id, hash: Inline<Hash<Blake3>> },
-    BranchTombstone { id: Id },
-    Want { request: WantRequest },
+    Blob {
+        hash: Inline<Hash<Blake3>>,
+    },
+    Branch {
+        id: Id,
+        hash: Inline<Hash<Blake3>>,
+    },
+    BranchTombstone {
+        id: Id,
+    },
+    Want {
+        request: WantRequest,
+    },
     RetiredWantState,
-    Collection { id: Id },
-    CapabilityProof { id: CapabilityProofId },
+    Collection {
+        fingerprint: CollectionRecordFingerprint,
+    },
+    CapabilityProof {
+        id: CapabilityProofId,
+    },
     RetiredTeamState,
     LegacyCollectionV3,
     RetiredCollectionDeriveV4,
@@ -2394,9 +2407,9 @@ pub struct Pile {
     /// carries its own lazy validation byte inline.
     blobs: PileBlobIndex,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-    /// Immutable collection records keyed by their intrinsic entity id.
+    /// Immutable collection records keyed by full-width canonical-byte fingerprint.
     collection_records: CollectionRecordIndex,
-    /// Derived selector index keyed by `collection_handle || record_id`.
+    /// Derived selector index keyed by `collection_handle || record_fingerprint`.
     collection_records_by_collection: CollectionRecordCollectionIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     capability_proofs: CapabilityProofIndex,
@@ -2805,8 +2818,10 @@ pub enum CollectionInsertError {
     Read(ReadError),
     /// The fixed record could not be appended or the file lock released.
     Io(std::io::Error),
-    /// The intrinsic id already names different canonical fields.
-    IdCollision { id: Id },
+    /// A full-width fingerprint already names different canonical fields.
+    FingerprintCollision {
+        fingerprint: CollectionRecordFingerprint,
+    },
     /// Readback observed a record other than the exclusively appended one.
     UnexpectedReadback,
 }
@@ -2816,8 +2831,11 @@ impl std::fmt::Display for CollectionInsertError {
         match self {
             Self::Read(error) => write!(f, "failed to refresh collection records: {error}"),
             Self::Io(error) => write!(f, "failed to append collection record: {error}"),
-            Self::IdCollision { id } => {
-                write!(f, "collection record id {id:X} names different fields")
+            Self::FingerprintCollision { fingerprint } => {
+                write!(
+                    f,
+                    "collection record fingerprint {fingerprint:X} names different fields"
+                )
             }
             Self::UnexpectedReadback => {
                 f.write_str("collection append read back an unexpected pile record")
@@ -2831,7 +2849,7 @@ impl Error for CollectionInsertError {
         match self {
             Self::Read(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::IdCollision { .. } | Self::UnexpectedReadback => None,
+            Self::FingerprintCollision { .. } | Self::UnexpectedReadback => None,
         }
     }
 }
@@ -3117,8 +3135,8 @@ impl Pile {
             PileRecordContent::RetiredWantAssert { .. }
             | PileRecordContent::RetiredWantRetract { .. } => Applied::RetiredWantState,
             PileRecordContent::Collection { record } => {
-                let id = record.id();
-                if let Some(existing) = self.collection_records.get(&id.raw()) {
+                let fingerprint = record.fingerprint();
+                if let Some(existing) = self.collection_records.get(&fingerprint.raw()) {
                     if existing != &record {
                         return Err(ReadError::CorruptPile {
                             valid_length: start_offset,
@@ -3126,11 +3144,11 @@ impl Pile {
                     }
                 } else {
                     self.collection_records
-                        .insert(&Entry::with_value(&id.raw(), record));
+                        .insert(&Entry::with_value(&fingerprint.raw(), record));
                     self.collection_records_by_collection
                         .insert(&Entry::new(&collection_record_collection_key(record)));
                 }
-                Applied::Collection { id }
+                Applied::Collection { fingerprint }
             }
             PileRecordContent::CapabilityProof {
                 id,
@@ -3472,7 +3490,7 @@ impl BlobStoreList for PileSnapshot {
 
 /// Deterministic owned snapshot of the pile's native collection records.
 pub struct PileCollectionRecordIter {
-    keys: crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, CollectionRecord, XorSip128>,
+    keys: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, CollectionRecord, XorSip128>,
     lookup: CollectionRecordIndex,
 }
 
@@ -3521,7 +3539,7 @@ impl Iterator for PileCollectionRecordIter {
             .lookup
             .get(&key)
             .expect("collection key from PATCH snapshot must retain its value");
-        debug_assert_eq!(record.id().raw(), key);
+        debug_assert_eq!(record.fingerprint().raw(), key);
         Some(Ok(record))
     }
 }
@@ -3634,8 +3652,11 @@ impl CollectionRead for PileSnapshot {
         })
     }
 
-    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        Ok(self.collection_records.get(&id.raw()).copied())
+    fn record(
+        &self,
+        fingerprint: CollectionRecordFingerprint,
+    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        Ok(self.collection_records.get(&fingerprint.raw()).copied())
     }
 
     fn select_records(
@@ -3655,10 +3676,12 @@ impl CollectionRead for PileSnapshot {
                     unreachable!("selector kinds were checked above");
                 };
                 self.collection_records_by_collection
-                    .infixes(&collection.raw, |id: &[u8; 16]| ids.push(*id));
+                    .infixes(&collection.raw, |fingerprint: &[u8; 32]| {
+                        ids.push(*fingerprint)
+                    });
             }
             // Infix traversal follows PATCH's structural tree order, while
-            // CollectionRead promises deterministic intrinsic-id order.
+            // CollectionRead promises deterministic fingerprint order.
             ids.sort_unstable();
             return Ok(ids
                 .into_iter()
@@ -3688,18 +3711,18 @@ impl CollectionStore for Pile {
     type InsertError = CollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        let id = record.id();
+        let fingerprint = record.fingerprint();
         let header = collection_record_header(&record);
 
         self.file.lock()?;
         let result = (|| {
             self.refresh_locked()?;
 
-            if let Some(existing) = self.collection_records.get(&id.raw()) {
+            if let Some(existing) = self.collection_records.get(&fingerprint.raw()) {
                 return if existing == &record {
                     Ok(())
                 } else {
-                    Err(CollectionInsertError::IdCollision { id })
+                    Err(CollectionInsertError::FingerprintCollision { fingerprint })
                 };
             }
 
@@ -3713,7 +3736,9 @@ impl CollectionStore for Pile {
             }
 
             match self.apply_next()? {
-                Some(Applied::Collection { id: applied }) if applied == id => Ok(()),
+                Some(Applied::Collection {
+                    fingerprint: applied,
+                }) if applied == fingerprint => Ok(()),
                 Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
             }
         })();
@@ -5393,7 +5418,7 @@ mod tests {
     }
 
     fn sorted_collection_records(mut records: Vec<CollectionRecord>) -> Vec<CollectionRecord> {
-        records.sort_by_key(CollectionRecord::id);
+        records.sort_by_key(CollectionRecord::fingerprint);
         records
     }
 
@@ -6560,7 +6585,7 @@ mod tests {
     }
 
     #[test]
-    fn native_collection_records_replay_in_intrinsic_id_order_after_reopen() {
+    fn native_collection_records_replay_in_fingerprint_order_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "collections.pile");
         let records = collection_test_records();
@@ -6581,10 +6606,15 @@ mod tests {
             .unwrap();
         assert_eq!(actual, expected);
         assert_eq!(
-            snapshot.record(expected[1].id()).unwrap(),
+            snapshot.record(expected[1].fingerprint()).unwrap(),
             Some(expected[1])
         );
-        assert_eq!(snapshot.record(collection_test_id(0xff)).unwrap(), None);
+        assert_eq!(
+            snapshot
+                .record(CollectionRecordFingerprint::from_raw([0xff; 32]))
+                .unwrap(),
+            None
+        );
         reopened.close().unwrap();
     }
 
@@ -6665,7 +6695,7 @@ mod tests {
 
         let mixed = BTreeSet::from([
             CollectionRecordSelector::Collection(collection),
-            CollectionRecordSelector::Id(unrelated.id()),
+            CollectionRecordSelector::Fingerprint(unrelated.fingerprint()),
         ]);
         let mut expected_mixed = records;
         expected_mixed.push(unrelated);
@@ -6808,7 +6838,7 @@ mod tests {
         std::fs::write(&path_ba, ba).unwrap();
 
         let mut expected = vec![first, conflicting];
-        expected.sort_unstable_by_key(CollectionRecord::id);
+        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
             let snapshot = pile.snapshot().unwrap();

@@ -122,7 +122,7 @@ let second = storage.commit(library, &key, entity! {
     &author_id @ literature::alias: "Francis",
 })?;
 
-assert_ne!(first.id(), second.id());
+assert_ne!(first, second);
 ```
 
 Publication loads and structurally validates the registered descriptor, then writes fragment
@@ -131,8 +131,8 @@ It performs no permission check and no implicit flush. The commit is the atomic
 assertion. There is no mutable head to advance: both records remain members and
 the collection value is their union.
 
-Repeating byte-identical input produces the same record ID and is idempotent.
-Distinct input produces another coexisting member. Application-level
+Repeating byte-identical input produces the same exact canonical commit and is
+idempotent. Distinct input produces another coexisting member. Application-level
 supersession or versioning is represented in the facts when a domain needs it;
 append order is never an implicit winner.
 

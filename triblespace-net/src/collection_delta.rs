@@ -2,7 +2,7 @@
 //!
 //! This module owns only the immutable evidence boundary: strict framing,
 //! intrinsic collection matching, COMMIT signature verification, canonical
-//! id ordering, and bounded `current - previous` selection. It deliberately
+//! fingerprint ordering, and bounded `current - previous` selection. It deliberately
 //! does not resolve referenced blobs or decide READ/WRITE policy. A future
 //! authorized overlay can therefore store sparse MERGE/DERIVE equations as
 //! inert evidence and apply semantic validation only when a resolver uses one.
@@ -12,10 +12,9 @@ use std::error::Error;
 use std::fmt;
 
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordSelector,
-    CommitVerificationError, RecordDecodeError,
+    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
+    CollectionRecordSelector, CommitVerificationError, RecordDecodeError,
 };
-use triblespace_core::id::Id;
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 
 use crate::patch_repair::PatchSummary;
@@ -24,7 +23,7 @@ use crate::patch_repair::PatchSummary;
 #[derive(Clone, Debug)]
 pub struct CollectionRecordPatch {
     collection: CollectionHandle,
-    records: PATCH<16, IdentitySchema, CollectionRecord, Blake3Merkle>,
+    records: PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
 }
 
 impl CollectionRecordPatch {
@@ -68,12 +67,12 @@ impl CollectionRecordPatch {
         }
     }
 
-    /// Look up one record by intrinsic id.
-    pub fn get(&self, id: Id) -> Option<CollectionRecord> {
-        self.records.get(&id.raw()).copied()
+    /// Look up one record by its full-width physical fingerprint.
+    pub fn get(&self, fingerprint: CollectionRecordFingerprint) -> Option<CollectionRecord> {
+        self.records.get(&fingerprint.raw()).copied()
     }
 
-    /// Enumerate canonical records in intrinsic-id order.
+    /// Enumerate canonical records in fingerprint order.
     pub fn records(&self) -> impl Iterator<Item = CollectionRecord> + '_ {
         self.records.iter_ordered().map(|id| {
             *self
@@ -83,7 +82,7 @@ impl CollectionRecordPatch {
         })
     }
 
-    pub(crate) const fn patch(&self) -> &PATCH<16, IdentitySchema, CollectionRecord, Blake3Merkle> {
+    pub(crate) const fn patch(&self) -> &PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle> {
         &self.records
     }
 }
@@ -122,7 +121,7 @@ pub enum CollectionDeltaError {
     Decode(RecordDecodeError),
     InvalidCommit(CommitVerificationError),
     WrongCollection,
-    IntrinsicIdCollision(Id),
+    FingerprintCollision(CollectionRecordFingerprint),
 }
 
 impl fmt::Display for CollectionDeltaError {
@@ -131,8 +130,11 @@ impl fmt::Display for CollectionDeltaError {
             Self::Decode(error) => write!(f, "decode collection record: {error}"),
             Self::InvalidCommit(error) => write!(f, "verify collection COMMIT: {error}"),
             Self::WrongCollection => write!(f, "record names another collection"),
-            Self::IntrinsicIdCollision(id) => {
-                write!(f, "distinct records share intrinsic id {id}")
+            Self::FingerprintCollision(fingerprint) => {
+                write!(
+                    f,
+                    "distinct records share full-width fingerprint {fingerprint}"
+                )
             }
         }
     }
@@ -227,11 +229,11 @@ fn canonical_records(
     let mut canonical = PATCH::new();
     for record in records {
         validate_record(expected, record)?;
-        let id = record.id();
-        let key = id.raw();
+        let fingerprint = record.fingerprint();
+        let key = fingerprint.raw();
         if let Some(existing) = canonical.get(&key) {
             if existing != &record {
-                return Err(CollectionDeltaError::IntrinsicIdCollision(id));
+                return Err(CollectionDeltaError::FingerprintCollision(fingerprint));
             }
             continue;
         }
@@ -343,7 +345,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(after.public_key(), before.public_key());
-        assert_eq!(after.id(), before.id());
+        assert_eq!(after, before);
     }
 
     struct ExactSelectorStore {
@@ -393,7 +395,7 @@ mod tests {
         assert!(
             selected
                 .iter()
-                .all(|record| { overlay.get(record.id()) == Some(*record) })
+                .all(|record| { overlay.get(record.fingerprint()) == Some(*record) })
         );
         assert_eq!(store.selections.get(), 1);
         assert_eq!(store.global_enumerations.get(), 0);

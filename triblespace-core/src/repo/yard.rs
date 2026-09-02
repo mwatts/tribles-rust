@@ -21,8 +21,10 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::{
-    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionStore,
 };
+#[cfg(test)]
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
@@ -717,7 +719,7 @@ impl Yard {
 /// Deterministic owned snapshot of the native collection records visible
 /// across all yard generations.
 pub struct YardCollectionRecordIter {
-    inner: std::collections::btree_map::IntoValues<Id, CollectionRecord>,
+    inner: std::collections::btree_map::IntoValues<CollectionRecordFingerprint, CollectionRecord>,
 }
 
 impl Iterator for YardCollectionRecordIter {
@@ -734,16 +736,21 @@ pub enum YardCollectionRecordsError {
     /// One generation could not refresh or decode its pile.
     Pile(ReadError),
     /// Two generations presented different canonical records under one
-    /// intrinsic id.
-    IdCollision { id: Id },
+    /// full-width storage fingerprint.
+    FingerprintCollision {
+        fingerprint: CollectionRecordFingerprint,
+    },
 }
 
 impl fmt::Display for YardCollectionRecordsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pile(error) => write!(f, "failed to replay yard collection records: {error}"),
-            Self::IdCollision { id } => {
-                write!(f, "collection record id {id:X} names different fields")
+            Self::FingerprintCollision { fingerprint } => {
+                write!(
+                    f,
+                    "collection record fingerprint {fingerprint:X} names different fields"
+                )
             }
         }
     }
@@ -753,7 +760,7 @@ impl Error for YardCollectionRecordsError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Pile(error) => Some(error),
-            Self::IdCollision { .. } => None,
+            Self::FingerprintCollision { .. } => None,
         }
     }
 }
@@ -877,14 +884,16 @@ impl CollectionRead for YardSnapshot {
                 .map_err(YardCollectionRecordsError::Pile)?;
             for result in replay {
                 let record = result.map_err(YardCollectionRecordsError::Pile)?;
-                let id = record.id();
-                match records.get(&id) {
+                let fingerprint = record.fingerprint();
+                match records.get(&fingerprint) {
                     Some(existing) if existing != &record => {
-                        return Err(YardCollectionRecordsError::IdCollision { id });
+                        return Err(YardCollectionRecordsError::FingerprintCollision {
+                            fingerprint,
+                        });
                     }
                     Some(_) => {}
                     None => {
-                        records.insert(id, record);
+                        records.insert(fingerprint, record);
                     }
                 }
             }
@@ -908,14 +917,16 @@ impl CollectionRead for YardSnapshot {
                 .select_records(selectors)
                 .map_err(YardCollectionRecordsError::Pile)?;
             for record in selected {
-                let id = record.id();
-                match records.get(&id) {
+                let fingerprint = record.fingerprint();
+                match records.get(&fingerprint) {
                     Some(existing) if existing != &record => {
-                        return Err(YardCollectionRecordsError::IdCollision { id });
+                        return Err(YardCollectionRecordsError::FingerprintCollision {
+                            fingerprint,
+                        });
                     }
                     Some(_) => {}
                     None => {
-                        records.insert(id, record);
+                        records.insert(fingerprint, record);
                     }
                 }
             }
@@ -1810,7 +1821,7 @@ mod tests {
         yard.insert(third).unwrap();
 
         let mut expected = vec![first, second, third];
-        expected.sort_by_key(CollectionRecord::id);
+        expected.sort_by_key(CollectionRecord::fingerprint);
         let snapshot = yard.snapshot().unwrap();
         assert_eq!(
             snapshot
@@ -1962,7 +1973,7 @@ mod tests {
         .into_iter()
         .collect();
         let mut expected = vec![first, conflicting];
-        expected.sort_unstable_by_key(CollectionRecord::id);
+        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
 
         assert_eq!(
             yard.snapshot().unwrap().select_records(&selectors).unwrap(),
@@ -2047,7 +2058,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let mut expected = records;
-        expected.sort_by_key(CollectionRecord::id);
+        expected.sort_by_key(CollectionRecord::fingerprint);
         assert_eq!(actual, expected);
     }
 
@@ -2092,9 +2103,9 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        actual.sort_by_key(CollectionRecord::id);
+        actual.sort_by_key(CollectionRecord::fingerprint);
         let mut expected = records;
-        expected.sort_by_key(CollectionRecord::id);
+        expected.sort_by_key(CollectionRecord::fingerprint);
         assert_eq!(actual, expected);
     }
 
@@ -2131,9 +2142,9 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        actual.sort_by_key(CollectionRecord::id);
+        actual.sort_by_key(CollectionRecord::fingerprint);
         let mut expected = records;
-        expected.sort_by_key(CollectionRecord::id);
+        expected.sort_by_key(CollectionRecord::fingerprint);
         assert_eq!(actual, expected);
     }
 
