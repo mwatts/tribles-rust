@@ -13,7 +13,7 @@ use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::{
     AdmissionPolicy, CollectionCommit, CollectionMerge, CollectionPolicy, CollectionRead,
-    CollectionRecordSelector, CollectionStore, CollectionStoreExt,
+    CollectionRecordFingerprint, CollectionRecordSelector, CollectionStore, CollectionStoreExt,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -483,8 +483,11 @@ impl CollectionRead for GuardSnapshot {
         self.inner.records()
     }
 
-    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.inner.record(id)
+    fn record(
+        &self,
+        fingerprint: CollectionRecordFingerprint,
+    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        self.inner.record(fingerprint)
     }
 
     fn select_records(
