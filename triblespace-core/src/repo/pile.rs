@@ -3127,9 +3127,9 @@ impl Pile {
                 } else {
                     self.collection_records
                         .insert(&Entry::with_value(&id.raw(), record));
+                    self.collection_records_by_collection
+                        .insert(&Entry::new(&collection_record_collection_key(record)));
                 }
-                self.collection_records_by_collection
-                    .insert(&Entry::new(&collection_record_collection_key(record)));
                 Applied::Collection { id }
             }
             PileRecordContent::CapabilityProof {
