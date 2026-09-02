@@ -13,7 +13,6 @@ use std::fmt;
 
 use ed25519_dalek::VerifyingKey;
 
-use crate::id::Id;
 use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::Inline;
 
@@ -25,8 +24,8 @@ use super::{
 /// One collection record with a discovery-time validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionRecordDiagnostic {
-    /// Intrinsic id of the record carrying this diagnostic.
-    pub id: Id,
+    /// Exact structurally valid commit carrying this diagnostic.
+    pub record: CollectionCommit,
     /// Cryptographic validation failure.
     pub error: CollectionRecordDiagnosticError,
 }
@@ -56,7 +55,7 @@ impl Error for CollectionRecordDiagnosticError {
 
 /// Structurally canonical records and diagnostics from one store enumeration.
 ///
-/// Every collection is sorted by intrinsic record id, as are diagnostics. The
+/// Every collection is sorted by its exact canonical record value, as are diagnostics. The
 /// result therefore does not expose backend enumeration or append order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveredCollectionRecords {
@@ -67,7 +66,7 @@ pub struct DiscoveredCollectionRecords {
 }
 
 impl DiscoveredCollectionRecords {
-    /// Commits with valid strict self-signatures, ordered by intrinsic id.
+    /// Commits with valid strict self-signatures, ordered canonically.
     ///
     /// Signature validity does not authorize the signing key. Callers apply
     /// local authorization policy before treating a commit as a membership
@@ -76,12 +75,12 @@ impl DiscoveredCollectionRecords {
         &self.commits
     }
 
-    /// Structurally canonical merge claims, ordered by intrinsic id.
+    /// Structurally canonical merge claims, ordered canonically.
     pub fn merges(&self) -> &[CollectionMerge] {
         &self.merges
     }
 
-    /// Structurally canonical derive claims, ordered by intrinsic id.
+    /// Structurally canonical derive claims, ordered canonically.
     pub fn derives(&self) -> &[CollectionDerive] {
         &self.derives
     }
@@ -92,14 +91,14 @@ impl DiscoveredCollectionRecords {
     }
 
     fn canonicalize(&mut self) {
-        self.commits.sort_unstable_by_key(CollectionCommit::id);
-        self.commits.dedup_by_key(|record| record.id());
-        self.merges.sort_unstable_by_key(CollectionMerge::id);
-        self.merges.dedup_by_key(|record| record.id());
-        self.derives.sort_unstable_by_key(CollectionDerive::id);
-        self.derives.dedup_by_key(|record| record.id());
-        self.diagnostics.sort_unstable_by_key(|entry| entry.id);
-        self.diagnostics.dedup_by_key(|entry| entry.id);
+        self.commits.sort_unstable();
+        self.commits.dedup();
+        self.merges.sort_unstable();
+        self.merges.dedup();
+        self.derives.sort_unstable();
+        self.derives.dedup();
+        self.diagnostics.sort_unstable_by_key(|entry| entry.record);
+        self.diagnostics.dedup_by_key(|entry| entry.record);
     }
 }
 
@@ -159,7 +158,7 @@ where
             CollectionRecord::Commit(record) => match record.verify_strict() {
                 Ok(()) => discovered.commits.push(record),
                 Err(error) => discovered.diagnostics.push(CollectionRecordDiagnostic {
-                    id: record.id(),
+                    record,
                     error: CollectionRecordDiagnosticError::InvalidCommit(error),
                 }),
             },
@@ -313,7 +312,7 @@ where
             Ok(()) => true,
             Err(error) => {
                 discovered.diagnostics.push(CollectionRecordDiagnostic {
-                    id: record.id(),
+                    record: *record,
                     error: CollectionRecordDiagnosticError::InvalidCommit(error),
                 });
                 false
@@ -335,7 +334,7 @@ where
 /// diagnostics as [`discover_collection_records`]. With the `parallel`
 /// feature, independent matching signatures are verified concurrently; the
 /// returned records and diagnostics remain canonically ordered by intrinsic
-/// id rather than worker completion order.
+/// canonical-record order rather than worker completion order.
 ///
 /// `MERGE` and `DERIVE` records are retained in full. They are unsigned
 /// equations whose relevance can span collection boundaries, so narrowing
@@ -386,7 +385,7 @@ where
             Ok(()) => true,
             Err(error) => {
                 discovered.diagnostics.push(CollectionRecordDiagnostic {
-                    id: record.id(),
+                    record: *record,
                     error: CollectionRecordDiagnosticError::InvalidCommit(error),
                 });
                 false
@@ -466,7 +465,7 @@ where
             Ok(()) => true,
             Err(error) => {
                 discovered.diagnostics.push(CollectionRecordDiagnostic {
-                    id: record.id(),
+                    record: *record,
                     error: CollectionRecordDiagnosticError::InvalidCommit(error),
                 });
                 false
@@ -707,7 +706,7 @@ mod tests {
             CollectionRecord::Derive(derive),
             CollectionRecord::Merge(source_merge),
         ];
-        physical.sort_unstable_by_key(CollectionRecord::id);
+        physical.sort_unstable();
         let store = ProbeStore {
             records: physical.into_iter().map(Ok).collect(),
             ..ProbeStore::default()
@@ -719,7 +718,7 @@ mod tests {
             discover_collection_records_for_derived_cover(&store, &cover, target.handle()).unwrap();
 
         let mut expected_merges = vec![source_merge, target_merge];
-        expected_merges.sort_unstable_by_key(CollectionMerge::id);
+        expected_merges.sort_unstable();
         assert!(discovered.commits().is_empty());
         assert_eq!(discovered.merges(), expected_merges);
         assert_eq!(discovered.derives(), &[derive]);
@@ -748,7 +747,7 @@ mod tests {
         assert_eq!(
             forward_records.diagnostics(),
             &[CollectionRecordDiagnostic {
-                id: invalid_commit.id(),
+                record: invalid_commit,
                 error: CollectionRecordDiagnosticError::InvalidCommit(
                     CommitVerificationError::InvalidSignature,
                 ),
@@ -814,7 +813,7 @@ mod tests {
         assert_eq!(
             discovered.diagnostics(),
             &[CollectionRecordDiagnostic {
-                id: relevant_invalid.id(),
+                record: relevant_invalid,
                 error: CollectionRecordDiagnosticError::InvalidCommit(
                     CommitVerificationError::InvalidSignature,
                 ),
@@ -860,7 +859,7 @@ mod tests {
         assert_eq!(
             discovered.diagnostics(),
             &[CollectionRecordDiagnostic {
-                id: invalid_key_commit.id(),
+                record: invalid_key_commit,
                 error: CollectionRecordDiagnosticError::InvalidCommit(
                     CommitVerificationError::InvalidPublicKey,
                 ),
@@ -971,7 +970,7 @@ mod tests {
             })
             .collect();
         records.reverse();
-        // Duplicate physical evidence is canonicalized by intrinsic id after
+        // Duplicate physical evidence is canonicalized by exact record after
         // verification, independent of worker completion order.
         records.push(records[7]);
 
@@ -998,11 +997,11 @@ mod tests {
         assert!(parallel_schedule
             .commits()
             .windows(2)
-            .all(|pair| pair[0].id() < pair[1].id()));
+            .all(|pair| pair[0] < pair[1]));
         assert!(parallel_schedule
             .diagnostics()
             .windows(2)
-            .all(|pair| pair[0].id < pair[1].id));
+            .all(|pair| pair[0].record < pair[1].record));
         assert!(parallel_schedule.diagnostics().iter().all(|diagnostic| {
             diagnostic.error
                 == CollectionRecordDiagnosticError::InvalidCommit(

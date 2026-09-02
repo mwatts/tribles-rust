@@ -445,7 +445,7 @@ mod tests {
         }
         let snapshot = records.snapshot().unwrap();
         let discovered = discover_collection_records(&snapshot).unwrap();
-        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let authorized = commits.iter().copied().collect();
         resolve_collection_semantics(
             &discovered,
             // This materializer only reads one root collection's commits.

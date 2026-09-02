@@ -17,12 +17,14 @@ use std::fmt;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
-use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{BlobStoreMeta, RetentionRoots};
 
-use super::{CollectionData, CollectionHandle, CollectionResolution, DiscoveredCollectionRecords};
+use super::{
+    CollectionCommit, CollectionData, CollectionHandle, CollectionRecord, CollectionResolution,
+    DiscoveredCollectionRecords,
+};
 
 /// A collection retention plan could not prove that every required blob stays
 /// available.
@@ -42,15 +44,15 @@ pub enum CollectionRetentionError<MetadataError> {
     },
     /// An admitted commit's signed data is absent.
     MissingCommitData {
-        /// Intrinsic commit-record id.
-        commit: Id,
+        /// Exact admitted commit record.
+        commit: CollectionCommit,
         /// Missing signed data blob.
         data: CollectionData,
     },
     /// An admitted commit's signed metadata is absent.
     MissingCommitMetadata {
-        /// Intrinsic commit-record id.
-        commit: Id,
+        /// Exact admitted commit record.
+        commit: CollectionCommit,
         /// Missing metadata blob.
         metadata: Inline<Handle<SimpleArchive>>,
     },
@@ -73,13 +75,15 @@ impl<MetadataError: fmt::Display> fmt::Display for CollectionRetentionError<Meta
             ),
             Self::MissingCommitData { commit, data } => write!(
                 f,
-                "admitted commit {commit:X} has missing signed data {}",
+                "admitted commit {fingerprint:X} has missing signed data {}",
                 hex::encode_upper(data.raw),
+                fingerprint = CollectionRecord::Commit(*commit).fingerprint(),
             ),
             Self::MissingCommitMetadata { commit, metadata } => write!(
                 f,
-                "admitted commit {commit:X} has missing metadata {}",
+                "admitted commit {fingerprint:X} has missing metadata {}",
                 hex::encode_upper(metadata.raw),
+                fingerprint = CollectionRecord::Commit(*commit).fingerprint(),
             ),
         }
     }
@@ -129,7 +133,7 @@ where
     let mut roots = RetentionRoots::new();
 
     for claim in records.commits() {
-        if !admitted.contains(&claim.id()) {
+        if !admitted.contains(&CollectionRecord::Commit(*claim)) {
             continue;
         }
 
@@ -143,7 +147,7 @@ where
         let data_handle = Handle::<UnknownBlob>::from_hash(claim.data());
         if !require_resident(snapshot, data_handle)? {
             return Err(CollectionRetentionError::MissingCommitData {
-                commit: claim.id(),
+                commit: *claim,
                 data: claim.data(),
             });
         }
@@ -151,7 +155,7 @@ where
 
         if !require_resident(snapshot, claim.metadata())? {
             return Err(CollectionRetentionError::MissingCommitMetadata {
-                commit: claim.id(),
+                commit: *claim,
                 metadata: claim.metadata(),
             });
         }
@@ -272,10 +276,10 @@ mod tests {
 
     fn validate_union<R: BlobStoreGet>(
         reader: &R,
-        durable: &BTreeSet<Id>,
+        durable: &BTreeSet<CollectionRecord>,
         request: CollectionValidationRequest<'_>,
     ) -> Result<CollectionClaimValidation<SimpleArchiveUnionValidationError>, Infallible> {
-        if durable.contains(&request.claim_id()) {
+        if durable.contains(&request.record()) {
             return Ok(CollectionClaimValidation::Accepted);
         }
 
@@ -375,7 +379,7 @@ mod tests {
 
         let snapshot = store.snapshot().unwrap();
         let records = discover_collection_records(&snapshot).unwrap();
-        let authorized = BTreeSet::from([commit.id()]);
+        let authorized = BTreeSet::from([commit]);
         let resolution = resolve_collection_semantics(
             &records,
             &lineage_from_derives(&records),
@@ -509,13 +513,17 @@ mod tests {
             |request| validate_union_and_derives(&snapshot, request),
         )
         .unwrap();
-        assert!(unauthorized.admitted_claims().contains(&active_merge.id()));
-        assert!(unauthorized.admitted_claims().contains(&active_derive.id()));
+        assert!(unauthorized
+            .admitted_claims()
+            .contains(&CollectionRecord::Merge(active_merge)));
+        assert!(unauthorized
+            .admitted_claims()
+            .contains(&CollectionRecord::Derive(active_derive)));
         let empty = plan_collection_retention(&records, &unauthorized, &snapshot).unwrap();
         assert_eq!(empty.direct().len(), 0);
         assert_eq!(empty.recursive().len(), 0);
 
-        let authorized = BTreeSet::from([first.id(), second.id()]);
+        let authorized = BTreeSet::from([first, second]);
         let resolution = resolve_collection_semantics(
             &records,
             &lineage_from_derives(&records),
@@ -523,11 +531,17 @@ mod tests {
             |request| validate_union_and_derives(&snapshot, request),
         )
         .unwrap();
-        for active in [active_merge.id(), active_derive.id()] {
+        for active in [
+            CollectionRecord::Merge(active_merge),
+            CollectionRecord::Derive(active_derive),
+        ] {
             assert!(resolution.admitted_claims().contains(&active));
             assert!(!resolution.activation_pending().contains(&active));
         }
-        for orphan in [orphan_merge.id(), orphan_derive.id()] {
+        for orphan in [
+            CollectionRecord::Merge(orphan_merge),
+            CollectionRecord::Derive(orphan_derive),
+        ] {
             assert!(resolution.admitted_claims().contains(&orphan));
             assert!(resolution.activation_pending().contains(&orphan));
         }
@@ -583,7 +597,7 @@ mod tests {
         let resolution = resolve_collection_semantics(
             &records,
             &lineage_from_derives(&records),
-            &BTreeSet::from([commit.id()]),
+            &BTreeSet::from([commit]),
             |request| validate_union(&complete_snapshot, &BTreeSet::new(), request),
         )
         .unwrap();
@@ -607,8 +621,8 @@ mod tests {
         let snapshot = missing_data.snapshot().unwrap();
         assert!(matches!(
             plan_collection_retention(&records, &resolution, &snapshot),
-            Err(CollectionRetentionError::MissingCommitData { commit: id, data: missing })
-                if id == commit.id() && missing == data(&content)
+            Err(CollectionRetentionError::MissingCommitData { commit: found, data: missing })
+                if found == commit && missing == data(&content)
         ));
 
         let mut missing_metadata = MemoryBlobStore::new();
@@ -620,9 +634,9 @@ mod tests {
         assert!(matches!(
             plan_collection_retention(&records, &resolution, &snapshot),
             Err(CollectionRetentionError::MissingCommitMetadata {
-                commit: id,
+                commit: found,
                 metadata: missing,
-            }) if id == commit.id() && missing == metadata.get_handle()
+            }) if found == commit && missing == metadata.get_handle()
         ));
     }
 }

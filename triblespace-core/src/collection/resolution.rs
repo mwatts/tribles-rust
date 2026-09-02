@@ -16,18 +16,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+#[cfg(test)]
 use crate::id::Id;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
 use super::{
     CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
-    CollectionMerge, CollectionOperationError, DiscoveredCollectionRecords,
+    CollectionMerge, CollectionOperationError, CollectionRecord, DiscoveredCollectionRecords,
 };
 
 type MemberKey = (CollectionHandle, CollectionData);
-type MergeProducer = (CollectionData, CollectionData, Id);
-type DeriveProducer = (CollectionHandle, CollectionData, Id);
-type DeriveOutput = (CollectionData, Id);
+type MergeProducer = (CollectionData, CollectionData, CollectionMerge);
+type DeriveProducer = (CollectionHandle, CollectionData, CollectionDerive);
+type DeriveOutput = (CollectionData, CollectionDerive);
 
 /// One claim presented for concrete semantic validation.
 ///
@@ -69,12 +70,12 @@ pub enum CollectionValidationRequest<'a> {
 }
 
 impl CollectionValidationRequest<'_> {
-    /// Intrinsic id of the claim being validated.
-    pub fn claim_id(&self) -> Id {
+    /// Exact native record being validated.
+    pub fn record(&self) -> CollectionRecord {
         match self {
-            Self::Commit { claim, .. } => claim.id(),
-            Self::Merge { claim, .. } => claim.id(),
-            Self::Derive { claim, .. } => claim.id(),
+            Self::Commit { claim, .. } => CollectionRecord::Commit(**claim),
+            Self::Merge { claim, .. } => CollectionRecord::Merge(**claim),
+            Self::Derive { claim, .. } => CollectionRecord::Derive(**claim),
         }
     }
 }
@@ -102,12 +103,12 @@ pub enum CollectionClaimValidation<D> {
 /// One deterministic output witness in a functional conflict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConflictingCollectionOutput {
-    /// Intrinsic id of the accepted or homomorphically implied equation.
+    /// Exact accepted or homomorphically implied equation.
     ///
-    /// Implied equations use the id of the canonical `MERGE` or `DERIVE`
-    /// record that would state the theorem explicitly; the record need not be
+    /// An implied equation is represented by the canonical `MERGE` or
+    /// `DERIVE` record that would state the theorem explicitly; it need not be
     /// physically present.
-    pub claim: Id,
+    pub record: CollectionRecord,
     /// Output asserted by that claim.
     pub data: CollectionData,
 }
@@ -165,8 +166,8 @@ impl fmt::Display for CollectionFunctionalConflict {
                 f,
                 "collection {collection} has conflicting merge claims {first_claim:X} and {second_claim:X}",
                 collection = hex::encode_upper(collection.raw),
-                first_claim = first.claim,
-                second_claim = second.claim,
+                first_claim = first.record.fingerprint(),
+                second_claim = second.record.fingerprint(),
             ),
             Self::Derive {
                 target,
@@ -177,8 +178,8 @@ impl fmt::Display for CollectionFunctionalConflict {
                 f,
                 "derivation into {target} has conflicting derive claims {first_claim:X} and {second_claim:X}",
                 target = hex::encode_upper(target.raw),
-                first_claim = first.claim,
-                second_claim = second.claim,
+                first_claim = first.record.fingerprint(),
+                second_claim = second.record.fingerprint(),
             ),
         }
     }
@@ -192,8 +193,8 @@ pub enum CollectionResolutionError<E> {
     /// The validation callback failed operationally. No partial snapshot is
     /// returned.
     Validation {
-        /// Intrinsic id of the claim being validated.
-        claim: Id,
+        /// Exact claim being validated.
+        record: CollectionRecord,
         /// Caller-defined operational failure.
         source: E,
     },
@@ -204,8 +205,12 @@ pub enum CollectionResolutionError<E> {
 impl<E: fmt::Display> fmt::Display for CollectionResolutionError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Validation { claim, source } => {
-                write!(f, "collection claim {claim:X} validation failed: {source}")
+            Self::Validation { record, source } => {
+                write!(
+                    f,
+                    "collection claim {fingerprint:X} validation failed: {source}",
+                    fingerprint = record.fingerprint(),
+                )
             }
             Self::Conflict(conflict) => conflict.fmt(f),
         }
@@ -223,15 +228,15 @@ impl<E: Error + 'static> Error for CollectionResolutionError<E> {
 
 /// Result of one stateless resolution pass.
 ///
-/// The status sets are ordered by intrinsic claim id. Unauthorized commits are
+/// The status sets are ordered by exact canonical record. Unauthorized commits are
 /// absent altogether: they are policy-ineligible, not pending validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionResolution<D> {
     semantics: CollectionSemantics,
-    admitted_claims: BTreeSet<Id>,
-    validation_pending: BTreeSet<Id>,
-    activation_pending: BTreeSet<Id>,
-    rejected: BTreeMap<Id, D>,
+    admitted_claims: BTreeSet<CollectionRecord>,
+    validation_pending: BTreeSet<CollectionRecord>,
+    activation_pending: BTreeSet<CollectionRecord>,
+    rejected: BTreeMap<CollectionRecord, D>,
 }
 
 impl<D> CollectionResolution<D> {
@@ -249,25 +254,25 @@ impl<D> CollectionResolution<D> {
     ///
     /// This includes accepted equations whose membership prerequisites are
     /// not active yet. Unauthorized commits are absent, as are pending and
-    /// rejected claims. Strong retention consumes only the commit ids in this
+    /// rejected claims. Strong retention consumes only commit records in this
     /// set; admitted unsigned equations remain collectable cache work.
-    pub fn admitted_claims(&self) -> &BTreeSet<Id> {
+    pub fn admitted_claims(&self) -> &BTreeSet<CollectionRecord> {
         &self.admitted_claims
     }
 
     /// Claims awaiting a positive callback verdict, commonly because a
     /// descriptor or element blob is absent.
-    pub fn validation_pending(&self) -> &BTreeSet<Id> {
+    pub fn validation_pending(&self) -> &BTreeSet<CollectionRecord> {
         &self.validation_pending
     }
 
     /// Accepted equations whose membership prerequisites are not yet known.
-    pub fn activation_pending(&self) -> &BTreeSet<Id> {
+    pub fn activation_pending(&self) -> &BTreeSet<CollectionRecord> {
         &self.activation_pending
     }
 
     /// Semantically invalid claims and their caller-defined diagnostics.
-    pub fn rejected(&self) -> &BTreeMap<Id, D> {
+    pub fn rejected(&self) -> &BTreeMap<CollectionRecord, D> {
         &self.rejected
     }
 }
@@ -283,7 +288,7 @@ pub struct CollectionSemantics {
     members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
     frontier: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
     root_members: BTreeSet<MemberKey>,
-    commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>>,
+    commit_records_by_member: BTreeMap<MemberKey, BTreeSet<CollectionCommit>>,
     merge_inputs_by_result: BTreeMap<MemberKey, BTreeSet<MergeProducer>>,
     order_results_by_input: BTreeMap<MemberKey, BTreeSet<CollectionData>>,
     derive_inputs_by_output: BTreeMap<MemberKey, BTreeSet<DeriveProducer>>,
@@ -339,16 +344,16 @@ impl CollectionSemantics {
             .collect()
     }
 
-    /// Intrinsic ids of the exact authorized commit records supporting one
+    /// Exact authorized commit records supporting one
     /// member through every known active construction path.
     ///
     /// The traversal is computed on demand and follows derives for provenance.
     /// Multiple commits of the same data remain distinct leaves.
-    pub fn supporting_commit_ids(
+    pub fn supporting_commits(
         &self,
         collection: CollectionHandle,
         data: CollectionData,
-    ) -> BTreeSet<Id> {
+    ) -> BTreeSet<CollectionCommit> {
         if !self.contains(collection, data) {
             return BTreeSet::new();
         }
@@ -361,7 +366,7 @@ impl CollectionSemantics {
                 continue;
             }
             supporting.extend(
-                self.commit_ids_by_member
+                self.commit_records_by_member
                     .get(&member)
                     .into_iter()
                     .flatten()
@@ -386,7 +391,7 @@ impl CollectionSemantics {
     /// Canonical root payloads supporting one member through every known
     /// active construction path.
     ///
-    /// Unlike [`Self::supporting_commit_ids`], multiple authorized commits of
+    /// Unlike [`Self::supporting_commits`], multiple authorized commits of
     /// the same payload collapse to one leaf. A member is a root whenever it
     /// was supplied directly, either by an accepted commit or as an explicit
     /// payload root; traversal still follows active merge and derive producers
@@ -757,7 +762,7 @@ pub(crate) fn collection_physical_cover_for(
 pub fn resolve_collection_semantics<D, E, V>(
     records: &DiscoveredCollectionRecords,
     lineage: &BTreeMap<CollectionHandle, CollectionHandle>,
-    authorized_commit_ids: &BTreeSet<Id>,
+    authorized_commits: &BTreeSet<CollectionCommit>,
     validate: V,
 ) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
 where
@@ -767,7 +772,7 @@ where
         records,
         lineage,
         &BTreeSet::new(),
-        authorized_commit_ids,
+        authorized_commits,
         validate,
     )
 }
@@ -776,7 +781,7 @@ where
 ///
 /// The roots are membership facts supplied by the caller rather than signed
 /// `COMMIT` claims. They seed the same merge/derive closure as commits, but do
-/// not acquire synthetic claim ids, admitted-claim status, or commit
+/// do not acquire admitted-claim status or commit
 /// provenance. Stored commit records are deliberately ineligible in this
 /// mode; callers that need signed admission use [`resolve_collection_semantics`].
 pub(crate) fn resolve_collection_semantics_from_roots<D, E, V>(
@@ -801,7 +806,7 @@ fn resolve_collection_semantics_kernel<D, E, V>(
     records: &DiscoveredCollectionRecords,
     lineage: &BTreeMap<CollectionHandle, CollectionHandle>,
     explicit_roots: &BTreeSet<(CollectionHandle, CollectionData)>,
-    authorized_commit_ids: &BTreeSet<Id>,
+    authorized_commits: &BTreeSet<CollectionCommit>,
     mut validate: V,
 ) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
 where
@@ -814,16 +819,16 @@ where
     let mut rejected = BTreeMap::new();
 
     for claim in records.commits() {
-        if !authorized_commit_ids.contains(&claim.id()) {
+        if !authorized_commits.contains(claim) {
             continue;
         }
         match validate_claim(&mut validate, CollectionValidationRequest::Commit { claim })? {
             CollectionClaimValidation::Accepted => accepted_commits.push(claim),
             CollectionClaimValidation::Pending => {
-                validation_pending.insert(claim.id());
+                validation_pending.insert(CollectionRecord::Commit(*claim));
             }
             CollectionClaimValidation::Rejected(diagnostic) => {
-                rejected.insert(claim.id(), diagnostic);
+                rejected.insert(CollectionRecord::Commit(*claim), diagnostic);
             }
         }
     }
@@ -832,10 +837,10 @@ where
         match validate_claim(&mut validate, CollectionValidationRequest::Merge { claim })? {
             CollectionClaimValidation::Accepted => accepted_merges.push(claim),
             CollectionClaimValidation::Pending => {
-                validation_pending.insert(claim.id());
+                validation_pending.insert(CollectionRecord::Merge(*claim));
             }
             CollectionClaimValidation::Rejected(diagnostic) => {
-                rejected.insert(claim.id(), diagnostic);
+                rejected.insert(CollectionRecord::Merge(*claim), diagnostic);
             }
         }
     }
@@ -844,10 +849,10 @@ where
         match validate_claim(&mut validate, CollectionValidationRequest::Derive { claim })? {
             CollectionClaimValidation::Accepted => accepted_derives.push(claim),
             CollectionClaimValidation::Pending => {
-                validation_pending.insert(claim.id());
+                validation_pending.insert(CollectionRecord::Derive(*claim));
             }
             CollectionClaimValidation::Rejected(diagnostic) => {
-                rejected.insert(claim.id(), diagnostic);
+                rejected.insert(CollectionRecord::Derive(*claim), diagnostic);
             }
         }
     }
@@ -857,9 +862,17 @@ where
 
     let admitted_claims = accepted_commits
         .iter()
-        .map(|claim| claim.id())
-        .chain(accepted_merges.iter().map(|claim| claim.id()))
-        .chain(accepted_derives.iter().map(|claim| claim.id()))
+        .map(|claim| CollectionRecord::Commit(**claim))
+        .chain(
+            accepted_merges
+                .iter()
+                .map(|claim| CollectionRecord::Merge(**claim)),
+        )
+        .chain(
+            accepted_derives
+                .iter()
+                .map(|claim| CollectionRecord::Derive(**claim)),
+        )
         .collect();
 
     let mut members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>> = BTreeMap::new();
@@ -867,17 +880,18 @@ where
     for (collection, data) in explicit_roots {
         members.entry(*collection).or_default().insert(*data);
     }
-    let mut commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>> = BTreeMap::new();
+    let mut commit_records_by_member: BTreeMap<MemberKey, BTreeSet<CollectionCommit>> =
+        BTreeMap::new();
     for commit in accepted_commits {
         members
             .entry(commit.collection())
             .or_default()
             .insert(commit.data());
         root_members.insert((commit.collection(), commit.data()));
-        commit_ids_by_member
+        commit_records_by_member
             .entry((commit.collection(), commit.data()))
             .or_default()
-            .insert(commit.id());
+            .insert(*commit);
     }
 
     loop {
@@ -932,10 +946,10 @@ where
         if !contains_member(&members, collection, low)
             || !contains_member(&members, collection, high)
         {
-            activation_pending.insert(claim.id());
+            activation_pending.insert(CollectionRecord::Merge(**claim));
             continue;
         }
-        active_merges.insert(claim.id(), (**claim).clone());
+        active_merges.insert(**claim, **claim);
     }
 
     for claim in &accepted_derives {
@@ -943,15 +957,15 @@ where
         // A derive whose target declares no source has no mapping to be an
         // instance of, so it activates nothing.
         let Some(source) = lineage.get(&claim.collection()).copied() else {
-            activation_pending.insert(claim.id());
+            activation_pending.insert(CollectionRecord::Derive(**claim));
             continue;
         };
         if !contains_member(&members, source, input) {
-            activation_pending.insert(claim.id());
+            activation_pending.insert(CollectionRecord::Derive(**claim));
             continue;
         }
         debug_assert!(contains_member(&members, claim.collection(), output));
-        active_derives.insert(claim.id(), (**claim).clone());
+        active_derives.insert(**claim, **claim);
     }
 
     close_homomorphic_squares(&homomorphisms, &mut active_merges, &mut active_derives)
@@ -961,7 +975,7 @@ where
         frontier: members.clone(),
         members,
         root_members,
-        commit_ids_by_member,
+        commit_records_by_member,
         ..CollectionSemantics::default()
     };
 
@@ -973,7 +987,7 @@ where
             .merge_inputs_by_result
             .entry((collection, result))
             .or_default()
-            .insert((low, high, claim.id()));
+            .insert((low, high, *claim));
         for input in [low, high] {
             if input != result {
                 semantics
@@ -995,14 +1009,14 @@ where
             .derive_inputs_by_output
             .entry((target, output))
             .or_default()
-            .insert((source, input, claim.id()));
+            .insert((source, input, *claim));
         semantics
             .derive_outputs_by_input
             .entry((source, target))
             .or_default()
             .entry(input)
             .or_default()
-            .insert((output, claim.id()));
+            .insert((output, *claim));
     }
 
     close_homomorphic_order(
@@ -1134,12 +1148,13 @@ fn nearest_mapped_order_edges(
 ///
 /// when the other three edges are known. The completed edge is represented by
 /// the ordinary canonical record value, but is not admitted as a stored claim.
-/// Its intrinsic id gives conflict diagnostics a stable name and lets the
-/// normal lineage indexes consume asserted and implied equations uniformly.
+/// The exact value lets conflict diagnostics and lineage indexes consume
+/// asserted and implied equations uniformly without inventing a second
+/// identity layer.
 fn close_homomorphic_squares(
     homomorphisms: &BTreeSet<(CollectionHandle, CollectionHandle)>,
-    active_merges: &mut BTreeMap<Id, CollectionMerge>,
-    active_derives: &mut BTreeMap<Id, CollectionDerive>,
+    active_merges: &mut BTreeMap<CollectionMerge, CollectionMerge>,
+    active_derives: &mut BTreeMap<CollectionDerive, CollectionDerive>,
 ) -> Result<(), Box<CollectionFunctionalConflict>> {
     loop {
         let joins = index_merge_outputs(active_merges.values());
@@ -1170,7 +1185,7 @@ fn close_homomorphic_squares(
                         if let Some(outputs) = joins.get(&(*target, target_low, target_high)) {
                             for output in outputs.keys() {
                                 let theorem = CollectionDerive::new(*target, result, *output);
-                                derive_theorems.insert(theorem.id(), theorem);
+                                derive_theorems.insert(theorem, theorem);
                             }
                         }
 
@@ -1184,7 +1199,7 @@ fn close_homomorphic_squares(
                                     *right_output,
                                     *output,
                                 );
-                                merge_theorems.insert(theorem.id(), theorem);
+                                merge_theorems.insert(theorem, theorem);
                             }
                         }
                     }
@@ -1193,14 +1208,15 @@ fn close_homomorphic_squares(
         }
 
         let mut changed = false;
-        for (id, theorem) in merge_theorems {
-            if let std::collections::btree_map::Entry::Vacant(entry) = active_merges.entry(id) {
+        for (record, theorem) in merge_theorems {
+            if let std::collections::btree_map::Entry::Vacant(entry) = active_merges.entry(record) {
                 entry.insert(theorem);
                 changed = true;
             }
         }
-        for (id, theorem) in derive_theorems {
-            if let std::collections::btree_map::Entry::Vacant(entry) = active_derives.entry(id) {
+        for (record, theorem) in derive_theorems {
+            if let std::collections::btree_map::Entry::Vacant(entry) = active_derives.entry(record)
+            {
                 entry.insert(theorem);
                 changed = true;
             }
@@ -1227,10 +1243,13 @@ fn ordered(
 
 fn index_merge_outputs<'a>(
     merges: impl IntoIterator<Item = &'a CollectionMerge>,
-) -> BTreeMap<(CollectionHandle, CollectionData, CollectionData), BTreeMap<CollectionData, Id>> {
+) -> BTreeMap<
+    (CollectionHandle, CollectionData, CollectionData),
+    BTreeMap<CollectionData, CollectionMerge>,
+> {
     let mut outputs: BTreeMap<
         (CollectionHandle, CollectionData, CollectionData),
-        BTreeMap<CollectionData, Id>,
+        BTreeMap<CollectionData, CollectionMerge>,
     > = BTreeMap::new();
     for claim in merges {
         let (low, high) = claim.inputs();
@@ -1238,27 +1257,29 @@ fn index_merge_outputs<'a>(
             .entry((claim.collection(), low, high))
             .or_default()
             .entry(claim.result())
-            .and_modify(|record| *record = (*record).min(claim.id()))
-            .or_insert_with(|| claim.id());
+            .and_modify(|record| *record = (*record).min(*claim))
+            .or_insert(*claim);
     }
     outputs
 }
 
 fn index_derive_outputs<'a>(
     derives: impl IntoIterator<Item = &'a CollectionDerive>,
-) -> BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, Id>> {
+) -> BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, CollectionDerive>> {
     // Keyed on the target alone: a target has one source, stated by its
     // descriptor, so naming the source here would only repeat it.
-    let mut outputs: BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, Id>> =
-        BTreeMap::new();
+    let mut outputs: BTreeMap<
+        (CollectionHandle, CollectionData),
+        BTreeMap<CollectionData, CollectionDerive>,
+    > = BTreeMap::new();
     for claim in derives {
         let (input, output) = (claim.input(), claim.output());
         outputs
             .entry((claim.collection(), input))
             .or_default()
             .entry(output)
-            .and_modify(|record| *record = (*record).min(claim.id()))
-            .or_insert_with(|| claim.id());
+            .and_modify(|record| *record = (*record).min(*claim))
+            .or_insert(*claim);
     }
     outputs
 }
@@ -1270,8 +1291,8 @@ fn validate_claim<D, E, V>(
 where
     V: for<'a> FnMut(CollectionValidationRequest<'a>) -> Result<CollectionClaimValidation<D>, E>,
 {
-    let claim = request.claim_id();
-    validate(request).map_err(|source| CollectionResolutionError::Validation { claim, source })
+    let record = request.record();
+    validate(request).map_err(|source| CollectionResolutionError::Validation { record, source })
 }
 
 fn contains_member(
@@ -1290,7 +1311,7 @@ fn check_functional(
 ) -> Result<(), Box<CollectionFunctionalConflict>> {
     let mut merge_outputs: BTreeMap<
         (CollectionHandle, CollectionData, CollectionData),
-        BTreeMap<CollectionData, Id>,
+        BTreeMap<CollectionData, CollectionMerge>,
     > = BTreeMap::new();
     for claim in merges {
         let (low, high) = claim.inputs();
@@ -1298,8 +1319,8 @@ fn check_functional(
             .entry((claim.collection(), low, high))
             .or_default()
             .entry(claim.result())
-            .and_modify(|record| *record = (*record).min(claim.id()))
-            .or_insert_with(|| claim.id());
+            .and_modify(|record| *record = (*record).min(**claim))
+            .or_insert(**claim);
     }
     for ((collection, low, high), outputs) in merge_outputs {
         if outputs.len() > 1 {
@@ -1311,11 +1332,11 @@ fn check_functional(
                 low,
                 high,
                 first: ConflictingCollectionOutput {
-                    claim: first_claim,
+                    record: CollectionRecord::Merge(first_claim),
                     data: first_data,
                 },
                 second: ConflictingCollectionOutput {
-                    claim: second_claim,
+                    record: CollectionRecord::Merge(second_claim),
                     data: second_data,
                 },
             }));
@@ -1324,7 +1345,7 @@ fn check_functional(
 
     let mut derive_outputs: BTreeMap<
         (CollectionHandle, CollectionData),
-        BTreeMap<CollectionData, Id>,
+        BTreeMap<CollectionData, CollectionDerive>,
     > = BTreeMap::new();
     for claim in derives {
         let (input, output) = (claim.input(), claim.output());
@@ -1332,8 +1353,8 @@ fn check_functional(
             .entry((claim.collection(), input))
             .or_default()
             .entry(output)
-            .and_modify(|record| *record = (*record).min(claim.id()))
-            .or_insert_with(|| claim.id());
+            .and_modify(|record| *record = (*record).min(**claim))
+            .or_insert(**claim);
     }
     for ((target, input), outputs) in derive_outputs {
         if outputs.len() > 1 {
@@ -1344,11 +1365,11 @@ fn check_functional(
                 target,
                 input,
                 first: ConflictingCollectionOutput {
-                    claim: first_claim,
+                    record: CollectionRecord::Derive(first_claim),
                     data: first_data,
                 },
                 second: ConflictingCollectionOutput {
-                    claim: second_claim,
+                    record: CollectionRecord::Derive(second_claim),
                     data: second_data,
                 },
             }));
@@ -1369,7 +1390,7 @@ mod tests {
     fn resolve_with_derive_lineage<D, E, V>(
         records: &DiscoveredCollectionRecords,
         lineage: &[(CollectionHandle, CollectionHandle)],
-        authorized_commit_ids: &BTreeSet<Id>,
+        authorized_commits: &BTreeSet<CollectionCommit>,
         validate: V,
     ) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
     where
@@ -1379,7 +1400,7 @@ mod tests {
     {
         let lineage: BTreeMap<CollectionHandle, CollectionHandle> =
             lineage.iter().copied().collect();
-        resolve_collection_semantics(records, &lineage, authorized_commit_ids, validate)
+        resolve_collection_semantics(records, &lineage, authorized_commits, validate)
     }
     use super::*;
 
@@ -1435,6 +1456,18 @@ mod tests {
             element,
             super::super::empty_metadata_handle(),
         )
+    }
+
+    fn commit_record(commit: CollectionCommit) -> CollectionRecord {
+        CollectionRecord::Commit(commit)
+    }
+
+    fn merge_record(merge: CollectionMerge) -> CollectionRecord {
+        CollectionRecord::Merge(merge)
+    }
+
+    fn derive_record(derive: CollectionDerive) -> CollectionRecord {
+        CollectionRecord::Derive(derive)
     }
 
     fn discover(
@@ -1595,31 +1628,32 @@ mod tests {
             &[missing_descriptor_derive.clone()],
             false,
         );
-        let authorized_ids = BTreeSet::from([authorized.id(), missing_descriptor_commit.id()]);
+        let authorized_commits = BTreeSet::from([authorized, missing_descriptor_commit]);
         let mut called = Vec::new();
-        let resolution = resolve_with_derive_lineage(&records, &[], &authorized_ids, |request| {
-            let claim = request.claim_id();
-            called.push(claim);
-            let descriptor_available = match request {
-                CollectionValidationRequest::Commit { claim } => {
-                    claim.collection() == identity_for_tests(&definition)
+        let resolution =
+            resolve_with_derive_lineage(&records, &[], &authorized_commits, |request| {
+                let claim = request.record();
+                called.push(claim);
+                let descriptor_available = match request {
+                    CollectionValidationRequest::Commit { claim } => {
+                        claim.collection() == identity_for_tests(&definition)
+                    }
+                    CollectionValidationRequest::Merge { claim } => {
+                        claim.collection() == identity_for_tests(&definition)
+                    }
+                    CollectionValidationRequest::Derive { claim } => {
+                        claim.collection() == identity_for_tests(&definition)
+                    }
+                };
+                if claim == merge_record(rejected_merge) {
+                    Ok::<_, Infallible>(CollectionClaimValidation::Rejected("bad merge"))
+                } else if claim == merge_record(callback_pending_merge) || !descriptor_available {
+                    Ok(CollectionClaimValidation::Pending)
+                } else {
+                    Ok(CollectionClaimValidation::Accepted)
                 }
-                CollectionValidationRequest::Merge { claim } => {
-                    claim.collection() == identity_for_tests(&definition)
-                }
-                CollectionValidationRequest::Derive { claim } => {
-                    claim.collection() == identity_for_tests(&definition)
-                }
-            };
-            if claim == rejected_merge.id() {
-                Ok::<_, Infallible>(CollectionClaimValidation::Rejected("bad merge"))
-            } else if claim == callback_pending_merge.id() || !descriptor_available {
-                Ok(CollectionClaimValidation::Pending)
-            } else {
-                Ok(CollectionClaimValidation::Accepted)
-            }
-        })
-        .unwrap();
+            })
+            .unwrap();
 
         assert_eq!(
             called.len(),
@@ -1630,27 +1664,27 @@ mod tests {
         assert_eq!(
             called,
             BTreeSet::from([
-                authorized.id(),
-                missing_descriptor_commit.id(),
-                rejected_merge.id(),
-                callback_pending_merge.id(),
-                missing_descriptor_merge.id(),
-                missing_descriptor_derive.id(),
+                commit_record(authorized),
+                commit_record(missing_descriptor_commit),
+                merge_record(rejected_merge),
+                merge_record(callback_pending_merge),
+                merge_record(missing_descriptor_merge),
+                derive_record(missing_descriptor_derive),
             ])
         );
-        assert!(!called.contains(&unauthorized.id()));
+        assert!(!called.contains(&commit_record(unauthorized)));
         assert_eq!(
             resolution.validation_pending(),
             &BTreeSet::from([
-                missing_descriptor_commit.id(),
-                callback_pending_merge.id(),
-                missing_descriptor_merge.id(),
-                missing_descriptor_derive.id(),
+                commit_record(missing_descriptor_commit),
+                merge_record(callback_pending_merge),
+                merge_record(missing_descriptor_merge),
+                derive_record(missing_descriptor_derive),
             ])
         );
         assert_eq!(
             resolution.rejected(),
-            &BTreeMap::from([(rejected_merge.id(), "bad merge")])
+            &BTreeMap::from([(merge_record(rejected_merge), "bad merge")])
         );
         assert!(resolution.activation_pending().is_empty());
         assert!(resolution
@@ -1700,11 +1734,11 @@ mod tests {
             BTreeSet::from([data(1), data(2)])
         );
         assert!(semantics
-            .supporting_commit_ids(target_handle, data(4))
+            .supporting_commits(target_handle, data(4))
             .is_empty());
         assert_eq!(
             resolution.admitted_claims(),
-            &BTreeSet::from([merge.id(), derive.id()])
+            &BTreeSet::from([merge_record(merge), derive_record(derive)])
         );
     }
 
@@ -1715,7 +1749,7 @@ mod tests {
         let first = commit(&definition, data(1), 1);
         let duplicate = commit(&definition, data(1), 2);
         let merge = CollectionMerge::new(collection, data(1), data(2), data(3));
-        let merge_id = merge.id();
+        let merge_record = merge_record(merge);
         let roots = BTreeSet::from([(collection, data(1)), (collection, data(2))]);
         let with_duplicates = discover(
             &[definition.clone()],
@@ -1732,7 +1766,7 @@ mod tests {
             &BTreeMap::new(),
             &roots,
             |request| {
-                validated.push(request.claim_id());
+                validated.push(request.record());
                 Ok::<_, Infallible>(CollectionClaimValidation::<()>::Accepted)
             },
         )
@@ -1746,10 +1780,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual, expected);
-        assert_eq!(validated, vec![merge_id]);
+        assert_eq!(validated, vec![merge_record]);
         assert!(actual
             .semantics()
-            .supporting_commit_ids(collection, data(3))
+            .supporting_commits(collection, data(3))
             .is_empty());
     }
 
@@ -1763,17 +1797,20 @@ mod tests {
         let resolution = resolve_collection_semantics(
             &records,
             &BTreeMap::new(),
-            &BTreeSet::from([root.id()]),
+            &BTreeSet::from([root]),
             accepted,
         )
         .unwrap();
 
-        assert_eq!(resolution.admitted_claims(), &BTreeSet::from([root.id()]));
+        assert_eq!(
+            resolution.admitted_claims(),
+            &BTreeSet::from([commit_record(root)])
+        );
         assert_eq!(
             resolution
                 .semantics()
-                .supporting_commit_ids(collection, root.data()),
-            BTreeSet::from([root.id()])
+                .supporting_commits(collection, root.data()),
+            BTreeSet::from([root])
         );
         assert_eq!(
             resolution
@@ -1799,17 +1836,15 @@ mod tests {
         let definition = named_for_tests("c1", id(2));
         let root = commit(&definition, data(1), 1);
         let records = discover(&[definition], &[root.clone()], &[], &[], false);
-        let error = resolve_with_derive_lineage::<(), _, _>(
-            &records,
-            &[],
-            &BTreeSet::from([root.id()]),
-            |_| Err(InjectedFailure),
-        )
-        .unwrap_err();
+        let error =
+            resolve_with_derive_lineage::<(), _, _>(&records, &[], &BTreeSet::from([root]), |_| {
+                Err(InjectedFailure)
+            })
+            .unwrap_err();
         assert_eq!(
             error,
             CollectionResolutionError::Validation {
-                claim: root.id(),
+                record: commit_record(root),
                 source: InjectedFailure,
             }
         );
@@ -1832,7 +1867,7 @@ mod tests {
         let commits = [raw_one.clone(), raw_two.clone(), rollup_four.clone()];
         let merges = [raw_merge, rollup_merge];
         let derives = [derive];
-        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let authorized = commits.iter().copied().collect();
 
         let forward = discover(&definitions, &commits, &merges, &derives, false);
         let reverse = discover(&definitions, &commits, &merges, &derives, true);
@@ -1872,8 +1907,8 @@ mod tests {
             Some(&BTreeSet::from([data(6)]))
         );
         assert_eq!(
-            semantics.supporting_commit_ids(identity_for_tests(&rollup), data(6)),
-            BTreeSet::from([raw_one.id(), raw_two.id(), rollup_four.id()])
+            semantics.supporting_commits(identity_for_tests(&rollup), data(6)),
+            BTreeSet::from([raw_one, raw_two, rollup_four])
         );
     }
 
@@ -1897,7 +1932,7 @@ mod tests {
         let resolution = resolve_with_derive_lineage(
             &records,
             &[(identity_for_tests(&target), identity_for_tests(&source))],
-            &BTreeSet::from([first.id(), second.id()]),
+            &BTreeSet::from([first, second]),
             accepted,
         )
         .unwrap();
@@ -1945,7 +1980,7 @@ mod tests {
             &derives,
             false,
         );
-        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let authorized = commits.iter().copied().collect();
         let resolution = resolve_with_derive_lineage(
             &records,
             &[(identity_for_tests(&target), identity_for_tests(&source))],
@@ -1991,7 +2026,7 @@ mod tests {
             &derives,
             false,
         );
-        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let authorized = commits.iter().copied().collect();
         let resolution = resolve_with_derive_lineage(
             &records,
             &[(identity_for_tests(&target), identity_for_tests(&source))],
@@ -2035,7 +2070,7 @@ mod tests {
             &derives,
             false,
         );
-        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let authorized = commits.iter().copied().collect();
         let resolution = resolve_with_derive_lineage(
             &records,
             &[
@@ -2079,7 +2114,7 @@ mod tests {
         let resolution = resolve_with_derive_lineage(
             &records,
             &[(identity_for_tests(&target), identity_for_tests(&source))],
-            &BTreeSet::from([first.id(), second.id()]),
+            &BTreeSet::from([first, second]),
             accepted,
         )
         .unwrap();
@@ -2125,7 +2160,7 @@ mod tests {
         let resolution = resolve_with_derive_lineage(
             &records,
             &[(identity_for_tests(&target), identity_for_tests(&source))],
-            &BTreeSet::from([first.id(), second.id()]),
+            &BTreeSet::from([first, second]),
             accepted,
         )
         .unwrap();
@@ -2135,7 +2170,7 @@ mod tests {
             .derive_inputs_by_output
             .get(&(identity_for_tests(&target), data(13)))
             .is_some_and(|producers| {
-                producers.contains(&(identity_for_tests(&source), data(3), implied.id()))
+                producers.contains(&(identity_for_tests(&source), data(3), implied))
             }));
     }
 
@@ -2166,7 +2201,7 @@ mod tests {
             resolve_with_derive_lineage(
                 &records,
                 &[(identity_for_tests(&target), identity_for_tests(&source))],
-                &BTreeSet::from([first.id(), second.id()]),
+                &BTreeSet::from([first, second]),
                 accepted,
             ),
             Err(CollectionResolutionError::Conflict(_))
@@ -2197,11 +2232,11 @@ mod tests {
                 low: data(1),
                 high: data(2),
                 first: ConflictingCollectionOutput {
-                    claim: first.id(),
+                    record: merge_record(first),
                     data: data(3),
                 },
                 second: ConflictingCollectionOutput {
-                    claim: second.id(),
+                    record: merge_record(second),
                     data: data(4),
                 },
             }))
@@ -2234,11 +2269,11 @@ mod tests {
                 target: identity_for_tests(&target),
                 input: data(1),
                 first: ConflictingCollectionOutput {
-                    claim: first.id(),
+                    record: derive_record(first),
                     data: data(2),
                 },
                 second: ConflictingCollectionOutput {
-                    claim: second.id(),
+                    record: derive_record(second),
                     data: data(3),
                 },
             }))
@@ -2260,7 +2295,7 @@ mod tests {
             false,
         );
         let resolution = resolve_with_derive_lineage(&records, &[], &BTreeSet::new(), |request| {
-            if request.claim_id() == second.id() {
+            if request.record() == merge_record(second) {
                 Ok::<_, Infallible>(CollectionClaimValidation::Rejected("wrong output"))
             } else {
                 Ok(CollectionClaimValidation::Accepted)
@@ -2269,11 +2304,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolution.activation_pending(),
-            &BTreeSet::from([first.id()])
+            &BTreeSet::from([merge_record(first)])
         );
         assert_eq!(
             resolution.rejected(),
-            &BTreeMap::from([(second.id(), "wrong output")])
+            &BTreeMap::from([(merge_record(second), "wrong output")])
         );
         assert!(resolution.semantics().members(first.collection()).is_none());
     }
@@ -2294,20 +2329,19 @@ mod tests {
         );
 
         let first_pass =
-            resolve_with_derive_lineage(&records, &[], &BTreeSet::from([first.id()]), accepted)
-                .unwrap();
+            resolve_with_derive_lineage(&records, &[], &BTreeSet::from([first]), accepted).unwrap();
         assert!(first_pass.validation_pending().is_empty());
         assert_eq!(
             first_pass.activation_pending(),
-            &BTreeSet::from([merge.id()])
+            &BTreeSet::from([merge_record(merge)])
         );
         assert!(!first_pass
             .semantics()
             .contains(identity_for_tests(&definition), data(3)));
 
-        let authorized = BTreeSet::from([first.id(), second.id()]);
+        let authorized = BTreeSet::from([first, second]);
         let callback_pending = resolve_with_derive_lineage(&records, &[], &authorized, |request| {
-            if request.claim_id() == merge.id() {
+            if request.record() == merge_record(merge) {
                 Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending)
             } else {
                 Ok(CollectionClaimValidation::Accepted)
@@ -2316,7 +2350,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             callback_pending.validation_pending(),
-            &BTreeSet::from([merge.id()])
+            &BTreeSet::from([merge_record(merge)])
         );
         assert!(!callback_pending
             .semantics()
@@ -2362,7 +2396,7 @@ mod tests {
         let resolution = resolve_with_derive_lineage(
             &records,
             &[],
-            &BTreeSet::from([first.id(), same_data_other_commit.id(), second.id()]),
+            &BTreeSet::from([first, same_data_other_commit, second]),
             accepted,
         )
         .unwrap();
@@ -2372,8 +2406,8 @@ mod tests {
             Some(&BTreeSet::from([data(2)]))
         );
         assert_eq!(
-            semantics.supporting_commit_ids(identity_for_tests(&definition), data(2)),
-            BTreeSet::from([first.id(), same_data_other_commit.id(), second.id()])
+            semantics.supporting_commits(identity_for_tests(&definition), data(2)),
+            BTreeSet::from([first, same_data_other_commit, second])
         );
 
         // The decomposition contains its own unavailable result. It must not
@@ -2406,7 +2440,7 @@ mod tests {
         let resolution = resolve_with_derive_lineage(
             &records,
             &[],
-            &BTreeSet::from([first.id(), same_payload_other_commit.id()]),
+            &BTreeSet::from([first, same_payload_other_commit]),
             accepted,
         )
         .unwrap();
@@ -2414,8 +2448,8 @@ mod tests {
         let collection = identity_for_tests(&definition);
 
         assert_eq!(
-            semantics.supporting_commit_ids(collection, data(1)),
-            BTreeSet::from([first.id(), same_payload_other_commit.id()])
+            semantics.supporting_commits(collection, data(1)),
+            BTreeSet::from([first, same_payload_other_commit])
         );
         assert_eq!(
             semantics.supporting_data(collection, data(1)),
@@ -2445,7 +2479,7 @@ mod tests {
         let resolution = resolve_with_derive_lineage(
             &records,
             &[(identity_for_tests(&target), identity_for_tests(&source))],
-            &BTreeSet::from([first.id(), second.id(), target_root.id()]),
+            &BTreeSet::from([first, second, target_root]),
             accepted,
         )
         .unwrap();
@@ -2471,7 +2505,7 @@ mod tests {
             CollectionMerge::new(identity_for_tests(&definition), data(6), data(8), data(14)),
         ];
         let records = discover(&[definition.clone()], &commits, &merges, &[], false);
-        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let authorized = commits.iter().copied().collect();
         let resolution = resolve_with_derive_lineage(&records, &[], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
@@ -2585,14 +2619,14 @@ mod tests {
         let resolution = resolve_with_derive_lineage(
             &records,
             &[(identity_for_tests(&target), identity_for_tests(&source))],
-            &BTreeSet::from([root.id()]),
+            &BTreeSet::from([root]),
             accepted,
         )
         .unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
-            semantics.supporting_commit_ids(identity_for_tests(&target), data(2)),
-            BTreeSet::from([root.id()])
+            semantics.supporting_commits(identity_for_tests(&target), data(2)),
+            BTreeSet::from([root])
         );
         assert_eq!(
             collection_physical_cover(
@@ -2640,7 +2674,7 @@ mod tests {
                 (identity_for_tests(&target), identity_for_tests(&source)),
                 (identity_for_tests(&source), identity_for_tests(&target)),
             ],
-            &BTreeSet::from([first.id(), second.id()]),
+            &BTreeSet::from([first, second]),
             accepted,
         )
         .unwrap();
@@ -2648,8 +2682,8 @@ mod tests {
         assert_eq!(
             resolution
                 .semantics()
-                .supporting_commit_ids(identity_for_tests(&target), data(4)),
-            BTreeSet::from([first.id(), second.id()])
+                .supporting_commits(identity_for_tests(&target), data(4)),
+            BTreeSet::from([first, second])
         );
     }
 
@@ -2751,7 +2785,7 @@ mod tests {
             archive_data(&right),
             archive_data(&result),
         );
-        let authorized = BTreeSet::from([first.id(), second.id()]);
+        let authorized = BTreeSet::from([first, second]);
 
         let mut store = MemoryRepo::default();
         store.blobs.insert(IntoBlob::<SimpleArchive>::to_blob(
@@ -2773,7 +2807,10 @@ mod tests {
             validate_union(&snapshot, request)
         })
         .unwrap();
-        assert_eq!(pending.validation_pending(), &BTreeSet::from([merge.id()]));
+        assert_eq!(
+            pending.validation_pending(),
+            &BTreeSet::from([merge_record(merge)])
+        );
         assert!(!pending
             .semantics()
             .contains(identity_for_tests(&definition), merge.result()));
@@ -2796,7 +2833,7 @@ mod tests {
         assert_eq!(
             resolved
                 .semantics()
-                .supporting_commit_ids(identity_for_tests(&definition), merge.result()),
+                .supporting_commits(identity_for_tests(&definition), merge.result()),
             authorized
         );
     }

@@ -1155,14 +1155,14 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum ProbeEvent {
         Put([u8; 32]),
-        Insert(Id),
+        Insert(CollectionRecord),
     }
 
     #[derive(Default)]
     struct ProbeStore {
         events: Vec<ProbeEvent>,
         known: BTreeSet<[u8; 32]>,
-        records: BTreeMap<Id, CollectionRecord>,
+        records: BTreeMap<CollectionRecord, CollectionRecord>,
         fail_at: Option<usize>,
         // The probe records the *sequence* of store operations; the bytes are
         // delegated so it can also be read from. A merge takes its inputs by
@@ -1239,8 +1239,8 @@ mod tests {
         type InsertError = ProbeFailure;
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-            self.attempt(ProbeEvent::Insert(record.id()))?;
-            self.records.entry(record.id()).or_insert(record);
+            self.attempt(ProbeEvent::Insert(record))?;
+            self.records.entry(record).or_insert(record);
             CollectionStore::insert(&mut self.repo, record)
                 .expect("MemoryRepo insertion is infallible");
             Ok(())
@@ -1294,7 +1294,7 @@ mod tests {
     }
 
     fn insert_event(record: CollectionRecord) -> ProbeEvent {
-        ProbeEvent::Insert(record.id())
+        ProbeEvent::Insert(record)
     }
 
     fn fragment_fixture() -> (
@@ -1403,14 +1403,18 @@ mod tests {
             staged.store_mut().insert(derive_record).unwrap();
             assert_eq!(staged.finalize().unwrap(), expected);
         }
-        assert_eq!(signed[0].id(), signed[1].id());
+        assert_eq!(signed[0], signed[1]);
         assert_eq!(signed[0].to_bytes(), signed[1].to_bytes());
 
         let mut expected_events = sequence.clone();
         expected_events.extend(sequence);
         assert_eq!(store.events, expected_events);
-        assert!(store.records.contains_key(&derive.id()));
-        assert!(store.records.contains_key(&expected.id()));
+        assert!(store
+            .records
+            .contains_key(&CollectionRecord::Derive(derive)));
+        assert!(store
+            .records
+            .contains_key(&CollectionRecord::Commit(expected)));
         validate_commit(&source_descriptor, &expected, &content_archive).unwrap();
     }
 
@@ -1489,7 +1493,7 @@ mod tests {
         assert!(!discovered
             .commits()
             .iter()
-            .any(|commit| commit.id() == withheld.id()));
+            .any(|commit| *commit == withheld));
         let descriptor_blob: Blob<SimpleArchive> =
             reader.get(identity_for_tests(&descriptor)).unwrap();
         assert_eq!(
@@ -1613,7 +1617,9 @@ mod tests {
             staged.finalize(),
             Err(CollectionCommitError::RecordInsert(ProbeFailure(at))) if at == insert_at
         ));
-        assert!(!store.records.contains_key(&commit.id()));
+        assert!(!store
+            .records
+            .contains_key(&CollectionRecord::Commit(commit)));
     }
 
     #[test]
@@ -1656,7 +1662,7 @@ mod tests {
         assert_eq!(store.known, expected_handles);
         assert_eq!(
             store.records.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([expected.id()])
+            BTreeSet::from([CollectionRecord::Commit(expected)])
         );
     }
 
@@ -1714,7 +1720,7 @@ mod tests {
         assert_eq!(store.known, expected_handles);
         assert_eq!(
             store.records.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([expected.id()])
+            BTreeSet::from([CollectionRecord::Commit(expected)])
         );
     }
 
@@ -1774,7 +1780,7 @@ mod tests {
         assert_eq!(store.known, expected_handles);
         assert_eq!(
             store.records.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([expected_merge.id()])
+            BTreeSet::from([CollectionRecord::Merge(expected_merge)])
         );
     }
 
@@ -1799,9 +1805,13 @@ mod tests {
                 (_, error) => panic!("unexpected publication error: {error}"),
             }
 
-            assert!(!store.records.contains_key(&expected.id()));
+            assert!(!store
+                .records
+                .contains_key(&CollectionRecord::Commit(expected)));
             if fail_at < insert_at {
-                assert!(!store.events.contains(&ProbeEvent::Insert(expected.id())));
+                assert!(!store
+                    .events
+                    .contains(&ProbeEvent::Insert(CollectionRecord::Commit(expected))));
             }
 
             store.recover();
@@ -1809,7 +1819,9 @@ mod tests {
                 publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key)
                     .unwrap();
             assert_eq!(retried, expected);
-            assert!(store.records.contains_key(&expected.id()));
+            assert!(store
+                .records
+                .contains_key(&CollectionRecord::Commit(expected)));
         }
     }
 
@@ -1844,9 +1856,13 @@ mod tests {
                 (_, error) => panic!("unexpected publication error: {error}"),
             }
 
-            assert!(!store.records.contains_key(&expected.id()));
+            assert!(!store
+                .records
+                .contains_key(&CollectionRecord::Merge(expected)));
             if fail_at < 3 {
-                assert!(!store.events.contains(&ProbeEvent::Insert(expected.id())));
+                assert!(!store
+                    .events
+                    .contains(&ProbeEvent::Insert(CollectionRecord::Merge(expected))));
             }
 
             store.recover();
@@ -1855,7 +1871,9 @@ mod tests {
             let retried =
                 publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap();
             assert_eq!(retried, (expected.clone(), result.clone()));
-            assert!(store.records.contains_key(&expected.id()));
+            assert!(store
+                .records
+                .contains_key(&CollectionRecord::Merge(expected)));
         }
     }
 
@@ -1948,7 +1966,7 @@ mod tests {
         // Both sides are commits now: a merge is an equation between states,
         // and each side became a state by being committed.
         let mut expected_commits = vec![commit.clone(), right_commit.clone()];
-        expected_commits.sort_by_key(CollectionCommit::id);
+        expected_commits.sort_unstable();
         assert_eq!(discovered.commits(), expected_commits.as_slice());
         assert_eq!(discovered.merges(), &[merge.clone()]);
         assert!(discovered.derives().is_empty());

@@ -1,6 +1,7 @@
 //! Native storage for collection-calculus records.
 //!
-//! A collection store is a grow-only set keyed by each record's intrinsic id.
+//! A collection store is a grow-only set keyed by a full-width fingerprint of
+//! each record's canonical bytes.
 //! It deliberately exposes no mutable head, deletion, compare-and-swap, or
 //! read-through-writer path. A [`CollectionRead`] implementation belongs to an
 //! immutable store snapshot, while [`CollectionStore`] only admits new records.
@@ -9,10 +10,9 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
 
-use crate::id::Id;
 use crate::repo::WantRequest;
 
-use super::{CollectionData, CollectionHandle, CollectionRecord};
+use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordFingerprint};
 
 /// One semantic route into the grow-only collection-record set.
 ///
@@ -21,8 +21,8 @@ use super::{CollectionData, CollectionHandle, CollectionRecord};
 /// visible to callers as conflicting evidence.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectionRecordSelector {
-    /// Select one record by its intrinsic content-derived id.
-    Id(Id),
+    /// Select one record by its non-semantic canonical-byte fingerprint.
+    Fingerprint(CollectionRecordFingerprint),
     /// Select every record whose intrinsic collection is exactly `C`.
     ///
     /// This is the canonical construction route for one collection's sparse
@@ -66,7 +66,7 @@ pub(crate) fn selectors_match_record(
     selectors: &BTreeSet<CollectionRecordSelector>,
     record: CollectionRecord,
 ) -> bool {
-    if selectors.contains(&CollectionRecordSelector::Id(record.id())) {
+    if selectors.contains(&CollectionRecordSelector::Fingerprint(record.fingerprint())) {
         return true;
     }
     let collection = match record {
@@ -100,7 +100,7 @@ pub(crate) fn selectors_match_record(
 /// Immutable read surface for canonical collection-calculus records.
 ///
 /// Implementations enumerate one coherent store snapshot in deterministic
-/// intrinsic-id order. Mutation lives on [`CollectionStore`], so admission and
+/// fingerprint order. Mutation lives on [`CollectionStore`], so admission and
 /// physical-cover resolution cannot accidentally observe different prefixes.
 pub trait CollectionRead {
     /// Failure while enumerating stored records.
@@ -110,18 +110,21 @@ pub trait CollectionRead {
     where
         Self: 'a;
 
-    /// Enumerate currently known records in deterministic intrinsic-id order.
+    /// Enumerate currently known records in deterministic fingerprint order.
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError>;
 
-    /// Look up one record by its intrinsic content-derived id.
+    /// Look up one record by its canonical-byte fingerprint.
     ///
     /// The default implementation scans the deterministic record view once
-    /// and stops as soon as it reaches or passes `id`. Backends with a keyed
+    /// and stops as soon as it reaches or passes `fingerprint`. Backends with a keyed
     /// primary index should override this method.
-    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+    fn record(
+        &self,
+        fingerprint: CollectionRecordFingerprint,
+    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
         for record in self.records()? {
             let record = record?;
-            match record.id().cmp(&id) {
+            match record.fingerprint().cmp(&fingerprint) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => return Ok(Some(record)),
                 std::cmp::Ordering::Greater => break,
@@ -135,7 +138,7 @@ pub trait CollectionRead {
     /// The default implementation performs exactly one ordinary enumeration
     /// and filters it. Backends with primary or secondary indexes may override
     /// this method without changing the grow-only set contract. Returned
-    /// records remain deduplicated and sorted by intrinsic id. An empty union
+    /// records remain deduplicated and sorted by fingerprint. An empty union
     /// returns immediately without asking the backend for a view.
     fn select_records(
         &self,
@@ -170,8 +173,11 @@ where
         (**self).records()
     }
 
-    fn record(&self, id: Id) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        (**self).record(id)
+    fn record(
+        &self,
+        fingerprint: CollectionRecordFingerprint,
+    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
+        (**self).record(fingerprint)
     }
 
     fn select_records(
@@ -184,7 +190,7 @@ where
 
 /// Grow-only write surface for canonical collection-calculus records.
 ///
-/// Inserting the same intrinsic record id more than once is an idempotent
+/// Inserting the same canonical record more than once is an idempotent
 /// success. Records are never replaced through this interface. Read access is
 /// deliberately obtained from the store's immutable snapshot instead.
 pub trait CollectionStore {
@@ -193,7 +199,7 @@ pub trait CollectionStore {
 
     /// Insert one canonical record.
     ///
-    /// Re-inserting a record with the same intrinsic id is success and does not
+    /// Re-inserting a record with the same canonical bytes is success and does not
     /// add another logical set member.
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError>;
 }
@@ -249,7 +255,7 @@ mod tests {
             CollectionRecord::Derive(CollectionDerive::new(target, data(13), data(14))),
             CollectionRecord::Derive(CollectionDerive::new(other, input, data(15))),
         ];
-        records.sort_unstable_by_key(CollectionRecord::id);
+        records.sort_unstable_by_key(CollectionRecord::fingerprint);
         records
     }
 
@@ -280,8 +286,9 @@ mod tests {
 
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.records.push(record);
-            self.records.sort_unstable_by_key(CollectionRecord::id);
-            self.records.dedup_by_key(|record| record.id());
+            self.records
+                .sort_unstable_by_key(CollectionRecord::fingerprint);
+            self.records.dedup_by_key(|record| record.fingerprint());
             Ok(())
         }
     }
@@ -297,7 +304,7 @@ mod tests {
         let source = collection(1);
         let target = collection(2);
         let exact_derive = WantRequest::derive(target, data(10));
-        let overlapping_id = records
+        let overlapping_fingerprint = records
             .iter()
             .find(|record| match record {
                 CollectionRecord::Derive(derive) => {
@@ -306,10 +313,10 @@ mod tests {
                 _ => false,
             })
             .unwrap()
-            .id();
+            .fingerprint();
         let selectors = [
-            CollectionRecordSelector::Id(commit.id()),
-            CollectionRecordSelector::Id(overlapping_id),
+            CollectionRecordSelector::Fingerprint(commit.fingerprint()),
+            CollectionRecordSelector::Fingerprint(overlapping_fingerprint),
             CollectionRecordSelector::MergeCollection(source),
             CollectionRecordSelector::Operation(exact_derive),
         ]
@@ -325,14 +332,14 @@ mod tests {
         let mut expected: Vec<_> = records
             .into_iter()
             .filter(|record| match record {
-                CollectionRecord::Commit(_) => record.id() == commit.id(),
+                CollectionRecord::Commit(_) => record.fingerprint() == commit.fingerprint(),
                 CollectionRecord::Merge(merge) => merge.collection() == source,
                 CollectionRecord::Derive(derive) => {
                     derive.collection() == target && derive.input() == data(10)
                 }
             })
             .collect();
-        expected.sort_unstable_by_key(CollectionRecord::id);
+        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         assert_eq!(selected, expected);
         assert_eq!(store.enumerations.get(), 1);
         assert_eq!(
@@ -354,9 +361,17 @@ mod tests {
             ..FallbackStore::default()
         };
 
-        assert_eq!(store.record(expected.id()).unwrap(), Some(expected));
+        assert_eq!(
+            store.record(expected.fingerprint()).unwrap(),
+            Some(expected)
+        );
         assert_eq!(store.enumerations.get(), 1);
-        assert_eq!(store.record(Id::new([0xff; 16]).unwrap()).unwrap(), None);
+        assert_eq!(
+            store
+                .record(CollectionRecordFingerprint::from_raw([0xff; 32]))
+                .unwrap(),
+            None
+        );
         assert_eq!(store.enumerations.get(), 2);
     }
 
@@ -404,7 +419,7 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::new(other, data(1), data(2), data(3))),
             CollectionRecord::Derive(CollectionDerive::new(other, data(3), data(4))),
         ];
-        records.sort_unstable_by_key(CollectionRecord::id);
+        records.sort_unstable_by_key(CollectionRecord::fingerprint);
         let store = FallbackStore {
             records,
             ..FallbackStore::default()
@@ -478,9 +493,11 @@ mod tests {
     fn shared_reference_forwards_selection_override() {
         let store = OverrideStore::default();
         let borrowed = &store;
-        let selectors = [CollectionRecordSelector::Id(Id::new([1; 16]).unwrap())]
-            .into_iter()
-            .collect();
+        let selectors = [CollectionRecordSelector::Fingerprint(
+            CollectionRecordFingerprint::from_raw([1; 32]),
+        )]
+        .into_iter()
+        .collect();
         CollectionRead::select_records(&borrowed, &selectors).unwrap();
         assert_eq!(store.selection_calls.get(), 1);
         assert_eq!(store.records_calls.get(), 0);

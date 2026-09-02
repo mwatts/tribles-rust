@@ -96,12 +96,6 @@ pub const COLLECTION_MERGE_BYTES_LEN: usize = 4 * 32;
 /// Byte length of a dense derive equation.
 pub const COLLECTION_DERIVE_BYTES_LEN: usize = 3 * 32;
 
-/// Version of collection-record identity derivation.
-pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
-
-/// Domain prefix of collection-record identity derivation.
-pub const COLLECTION_RECORD_ID_DOMAIN: &[u8] = b"triblespace.collection.record.id";
-
 attributes! {
     /// The human-readable name of a root collection.
     ///
@@ -188,6 +182,52 @@ pub type CollectionData = Inline<Hash<Blake3>>;
 /// handle directly so their collection semantics can be recovered through
 /// ordinary blob resolution without a separate definition-record namespace.
 pub type CollectionHandle = Inline<Handle<SimpleArchive>>;
+
+/// Non-semantic full-width fingerprint of one canonical collection record.
+///
+/// A fingerprint is an implementation key for indexes, deduplication,
+/// transport deltas, and diagnostics. It is not an entity id and does not
+/// participate in the collection algebra. The fingerprint is the full BLAKE3
+/// digest of the record's stable semantic kind followed by its canonical dense
+/// payload, and is recomputed from those bytes rather than stored in the
+/// record value.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CollectionRecordFingerprint([u8; 32]);
+
+impl CollectionRecordFingerprint {
+    /// Construct a fingerprint from its raw digest bytes.
+    pub const fn from_raw(raw: [u8; 32]) -> Self {
+        Self(raw)
+    }
+
+    /// Return the raw full-width digest.
+    pub const fn raw(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Borrow the raw full-width digest.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for CollectionRecordFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::UpperHex for CollectionRecordFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02X}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Version of the signed collection-commit transcript.
 pub const COMMIT_TRANSCRIPT_VERSION: u32 = 2;
@@ -302,9 +342,8 @@ impl fmt::Display for CommitVerificationError {
 impl Error for CommitVerificationError {}
 
 /// Signed exogenous membership assertion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CollectionCommit {
-    id: Id,
     collection: CollectionHandle,
     data: CollectionData,
     metadata: Inline<Handle<SimpleArchive>>,
@@ -342,17 +381,7 @@ impl CollectionCommit {
         r_component: Inline<ED25519RComponent>,
         s_component: Inline<ED25519SComponent>,
     ) -> Self {
-        let bytes = commit_bytes(
-            collection,
-            data_hash,
-            metadata,
-            public_key,
-            r_component,
-            s_component,
-        );
-        let id = collection_record_id(KIND_COLLECTION_COMMIT, &bytes);
         Self {
-            id,
             collection,
             data: data_hash,
             metadata,
@@ -419,11 +448,6 @@ impl CollectionCommit {
         commit_transcript(self.public_key, self.collection, self.data, self.metadata).to_vec()
     }
 
-    /// Intrinsic record id.
-    pub fn id(&self) -> Id {
-        self.id
-    }
-
     /// Collection receiving the asserted member.
     pub fn collection(&self) -> CollectionHandle {
         self.collection
@@ -463,9 +487,8 @@ impl CollectionCommit {
 }
 
 /// Unsigned exact join equation inside one collection lattice.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CollectionMerge {
-    id: Id,
     collection: CollectionHandle,
     low: CollectionData,
     high: CollectionData,
@@ -492,10 +515,7 @@ impl CollectionMerge {
         high: CollectionData,
         result: CollectionData,
     ) -> Self {
-        let bytes = merge_bytes(collection, low, high, result);
-        let id = collection_record_id(KIND_COLLECTION_MERGE, &bytes);
         Self {
-            id,
             collection,
             low,
             high,
@@ -517,11 +537,6 @@ impl CollectionMerge {
             high,
             Inline::new(field(&bytes, 3)),
         ))
-    }
-
-    /// Intrinsic record id.
-    pub fn id(&self) -> Id {
-        self.id
     }
 
     /// Collection whose join law is asserted.
@@ -547,9 +562,8 @@ impl CollectionMerge {
 
 /// One unsigned exact observation of the canonical mapping from a source
 /// collection member to a target collection member.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CollectionDerive {
-    id: Id,
     collection: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
@@ -568,10 +582,7 @@ impl CollectionDerive {
         input: CollectionData,
         output: CollectionData,
     ) -> Self {
-        let bytes = derive_bytes(collection, input, output);
-        let id = collection_record_id(KIND_COLLECTION_DERIVE, &bytes);
         Self {
-            id,
             collection,
             input,
             output,
@@ -585,11 +596,6 @@ impl CollectionDerive {
             Inline::new(field(&bytes, 1)),
             Inline::new(field(&bytes, 2)),
         )
-    }
-
-    /// Intrinsic record id.
-    pub fn id(&self) -> Id {
-        self.id
     }
 
     /// Collection containing the output member.
@@ -614,7 +620,7 @@ impl CollectionDerive {
 }
 
 /// A structurally canonical native collection record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectionRecord {
     /// Signed membership assertion whose embedded signature can be verified.
     Commit(CollectionCommit),
@@ -654,12 +660,18 @@ impl CollectionRecord {
         }
     }
 
-    /// Intrinsic id of the decoded record entity.
-    pub fn id(&self) -> Id {
+    /// Recompute the non-semantic fingerprint of this canonical record.
+    pub fn fingerprint(&self) -> CollectionRecordFingerprint {
         match self {
-            Self::Commit(record) => record.id(),
-            Self::Merge(record) => record.id(),
-            Self::Derive(record) => record.id(),
+            Self::Commit(record) => {
+                collection_record_fingerprint(KIND_COLLECTION_COMMIT, &record.to_bytes())
+            }
+            Self::Merge(record) => {
+                collection_record_fingerprint(KIND_COLLECTION_MERGE, &record.to_bytes())
+            }
+            Self::Derive(record) => {
+                collection_record_fingerprint(KIND_COLLECTION_DERIVE, &record.to_bytes())
+            }
         }
     }
 
@@ -724,16 +736,11 @@ fn derive_bytes(
     concat_fields([target.raw, input.raw, output.raw])
 }
 
-fn collection_record_id(kind: Id, payload: &[u8]) -> Id {
+fn collection_record_fingerprint(kind: Id, payload: &[u8]) -> CollectionRecordFingerprint {
     let mut hasher = Blake3::new();
-    hasher.update(COLLECTION_RECORD_ID_DOMAIN);
-    hasher.update(&COLLECTION_RECORD_ID_VERSION.to_be_bytes());
     hasher.update(&kind.raw());
     hasher.update(payload);
-    let digest = hasher.finalize();
-    let mut raw = [0u8; 16];
-    raw.copy_from_slice(&digest[digest.len() - 16..]);
-    Id::new(raw).expect("BLAKE3-derived collection record ids must be non-nil")
+    CollectionRecordFingerprint::from_raw(hasher.finalize())
 }
 
 fn concat_fields<const N: usize, const OUT: usize>(fields: [[u8; 32]; N]) -> [u8; OUT] {
@@ -1041,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_and_record_roots_are_golden() {
+    fn transcript_and_record_fingerprints_are_golden() {
         let collection_name_anchor = id_hex!("A2EEF06D4E1AA4B17B745AA2E8C37867");
         assert_eq!(
             collection_name.raw(),
@@ -1063,7 +1070,10 @@ mod tests {
         assert_eq!(derive.to_bytes().len(), COLLECTION_DERIVE_BYTES_LEN);
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
-        assert_eq!(commit.id(), id_hex!("21FE95F313A7AADD236286EE83B5AA39"));
+        assert_eq!(
+            CollectionRecord::Commit(commit).fingerprint().raw(),
+            hex!("B1740DE9C272B4552B97EDDF77C796D72688A2B9325D815C302236882657E608")
+        );
         assert_eq!(
             commit.signature_r.raw,
             hex!("F89FCF5C72BC7EC3E376C6AB6BDEFC6ECEA3ADBBCA7A36DBF1729413A7820564")
@@ -1072,11 +1082,14 @@ mod tests {
             commit.signature_s.raw,
             hex!("F684108AF3E8E3898904D20EA458DCAE68F0F97F4E5C06DAFA0FAE0691F68D0B")
         );
-        assert_eq!(merge.id(), id_hex!("032390A36A86A2F5A44604B78EF6FA8C"));
-        // The derive id moved once, when the record stopped naming its source
-        // and gained a new kind: the id is a digest over the kind and payload,
-        // and both changed. Commit and merge ids are untouched.
-        assert_eq!(derive.id(), id_hex!("5F7EF9C1C56832B2F098486612592ACD"));
+        assert_eq!(
+            CollectionRecord::Merge(merge).fingerprint().raw(),
+            hex!("92A19C12DAF4046397A43C607051ECCB1DD1EFB74D8B977B8A19AE7846521170")
+        );
+        assert_eq!(
+            CollectionRecord::Derive(derive).fingerprint().raw(),
+            hex!("2CF7BBFA3A8567AECED029BC0A0A74925501AC0E60D51CC5AAA32E5225F54B4B")
+        );
         assert_eq!(
             commit.signing_transcript(),
             hex!(
