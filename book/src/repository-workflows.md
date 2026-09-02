@@ -26,13 +26,16 @@ merge or derivation equations preserve reusable physical work.
   Signatures, authors, and metadata remain queryable provenance, but are not
   coordinates of the value. Checked union, intersection, difference, and
   subset operations reject covers from another collection.
-- **`TryFromCover<E>`** — the encoding-specific reconstruction hook invoked by
-  `Cover::materialize` after private physical selection. A view may join
-  eagerly or retain mmap-backed shards and query their union lazily.
-- **`CollectionSnapshot<R, S, T>`** — one immutable store snapshot together
-  with a frozen `Cover<S>` support and the realized `Cover<T>` selected in
-  that observation. The ordinary path freezes admitted support; an explicit
-  path preserves its caller-supplied support. It reconstructs a caller-chosen
+- **`Support`** — exactly `Cover<SimpleArchive>`: the distinct admitted
+  `COMMIT.data` handles at the foundational fact collection. It is the
+  denotational coordinate shared by every representation. `MERGE` and
+  `DERIVE` replace physical work without changing it.
+- **`TryFromCover<E>`** — the encoding-specific reconstruction hook used by a
+  collection snapshot. A view may join eagerly or retain mmap-backed shards
+  and query their union lazily.
+- **`CollectionSnapshot<R, E>`** — one immutable store snapshot together with
+  the foundational `Support` and the resident `Cover<E>` which realizes
+  exactly that support in this observation. It reconstructs a caller-chosen
   logical value later with `view`.
 - **WANT** — an orthogonal local request for content or existing computation;
   it is neither collection membership nor authority.
@@ -140,8 +143,8 @@ One `store.commit(collection, signer, fragment)` performs these semantic steps:
 Dependencies precede the record which gives them authority. Publication does
 not flush implicitly. Call `flush()` at the application's chosen durability
 boundary or explicitly close the backend. Repeating the same fragment with the
-same identity produces the same intrinsic record and is a no-op; different
-commits coexist.
+same signer produces the same exact signed record and is a set no-op; distinct
+attestations coexist.
 
 `COMMIT` is deliberately a source operation over authored `Fragment` values.
 Other collection encodings enter the lattice through reproducible `DERIVE` and
@@ -182,9 +185,12 @@ one collection. `DERIVE` is one observation of the mapping linked by its
 target descriptor; that descriptor already names its source, mapping
 algorithm, and concrete mapping parameters.
 
-Merge inputs are canonically ordered and every record has an intrinsic ID over
-its kind and exact payload. `CollectionStore::insert` therefore implements set
-insertion rather than an update. Concatenating stores unions evidence.
+Merge inputs are canonically ordered and the exact native record is the set
+element. `CollectionStore::insert` therefore implements set insertion rather
+than an update. Concatenating stores unions evidence. Collection records have
+no synthetic entity identity; a backend may compute a full-width fingerprint
+as a nonsemantic lookup key, but support, provenance, authorization, and
+deduplication are defined over the exact records and payload handles.
 
 Unsigned equations are materialized computation, not authority. Publishing a
 `MERGE` or `DERIVE` records work which has already been performed; warm
@@ -202,57 +208,47 @@ collection commits or publishing anything.
 ## Known-prefix snapshots and covers
 
 `store.snapshot()` freezes one immutable observation containing blob bytes,
-collection records, and capability proofs from the same known prefix. A
-collection then performs admission against that observation:
+collection records, and capability proofs from the same known prefix. The
+snapshot, rather than a source frontier or a later materialization, is the
+watermark. Ask it what representation is actually readable at that instant:
 
 ```rust,ignore
 let snapshot = store.snapshot()?;
-let admitted = collection.admitted(&snapshot)?;
-let available = admitted.available(&snapshot)?;
-let missing = admitted.difference(&available)?;
-let value = admitted.materialize::<V, _>(&snapshot)?;
+let observed = snapshot.collection(collection)?;
+let support = observed.support();
+let cover = observed.cover();
+let value: V = observed.view()?;
 ```
 
-`admitted` is the semantic COMMIT frontier: it verifies the descriptor's exact
-WRITE policy and forms a
-`Cover<E>` from distinct payload handles signed by the admitted subjects.
-`available` returns a subset in those same semantic coordinates: a compacted
-resident blob may make several requested members available without becoming a
-member of the returned cover. `materialize` privately selects a
-support-equivalent decomposition using stored equations and invokes the
-`TryFromCover<E>` hook solely through the same frozen store snapshot.
-`collection.read::<V, _>(&snapshot)` is the convenience form. For a
-`SimpleArchive`, `V = TribleSet`; for a
+`snapshot.collection(target)` admits the foundational commits, selects the
+maximal complete resident target antichain, and returns only the part of the
+foundational support represented by that antichain. Admitted but not yet
+derived data is absent: an immutable snapshot never promises work which will
+happen later. `snapshot.collection_exact(target, &support)` is the assertion
+form and fails unless that exact foundational support is completely realized.
+
+Both forms keep the chosen target cover inseparable from the store snapshot
+which established its residency. `view` invokes `TryFromCover<E>` solely
+through that frozen observation. For a `SimpleArchive`, `V = TribleSet`; for a
 `SuccinctArchiveBlob`, `V` may be an mmap-backed union retaining selected
-shards.
+shards. `collection.read::<V, _>(&snapshot)` remains a concise root-collection
+read when the intermediate support and physical cover are irrelevant.
 
 Consumers which need the exact strictly verified COMMIT roots selected during
 admission use `collection.admitted_with_commits(&snapshot)`; later claims over
 the same payload remain broader provenance rather than retroactive roots.
 
 This is a coherent **known-prefix** observation, not a global latest
-transaction. A concurrent immutable insert may appear on this call or a later
-call. Every cover member nevertheless has an admitted signed assertion in that
-snapshot. Admission does not fetch payload bytes; physical resolution selects a
-resident support-equivalent cover, and the requested typed view decodes its
-members.
-
-Admission does not fetch or materialize member blobs. Keep the returned cover
-when another component will select or build a representation:
-
-```rust,ignore
-let snapshot = storage.snapshot()?;
-let cover = models.admitted(&snapshot)?;
-let facts = cover.materialize::<TribleSet, _>(&snapshot)?;
-```
+transaction. A concurrent immutable insert may appear in this call or a later
+one. A mutating `ensure` or `maintain` operation returns a new store snapshot;
+the caller may then ask that snapshot for the collection it actually contains.
 
 Exact replay does not need a publishing key, re-run admission, or retain any
-signed commit or metadata. The opaque cover itself names the exact descriptor
-and payload identities. Use `cover.commits(&snapshot)` when currently
-resident authorship and metadata provenance matters; zero commits is a valid
-answer and does not invalidate replay. Commits whose data handles are absent
-from the cover remain inert. Replaying an opaque payload frontier still uses a
-single store snapshot for resolution and member reads.
+signed commit or metadata. The typed cover names the exact descriptor and
+payload identities. Use `cover.commits(&snapshot)` when currently resident
+authorship and metadata provenance matters; zero commits is a valid answer and
+does not invalidate replay. Several admitted commits over the same payload are
+distinct provenance fibers but one member of `Support`.
 
 ## Reuse merge work without changing meaning
 
@@ -295,7 +291,7 @@ equations. Canonical joins, mappings, and logical cover views receive one
 frozen store snapshot and may resolve immutable dependencies named by their
 inputs; unrelated resident blobs are never ambient semantic input.
 
-The SuccinctArchive facade applies this model as two ordinary derivations:
+Succinct storage applies this model as two ordinary derivations:
 
 ```text
 SimpleArchive --DERIVE--> SuccinctArchiveBlob --DERIVE-->
@@ -305,11 +301,8 @@ SimpleArchive --DERIVE--> SuccinctArchiveBlob --DERIVE-->
 ```rust,ignore
 use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-    SuccinctArchiveCollection,
 };
-use triblespace::core::collection::{
-    CollectionStoreExt, ExactDerivedCollection,
-};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, UnionArchive,
 };
@@ -317,40 +310,41 @@ use triblespace::core::blob::encodings::succinctarchive::{
 let source = storage.collection("models", source_policy)?;
 let raw = storage.derive(source, SimpleToSuccinctMapping, raw_policy)?;
 let accelerated = storage.derive(raw, RawToRank9AcceleratedMapping, accelerated_policy)?;
-let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
 
-let archive = succinct.maintain_exact(&mut storage, &cover)?;
-let facts: UnionArchive<OrderedUniverse> = archive.view()?;
+let before = storage.snapshot()?;
+let support = source.admitted(&before)?;
+drop(before);
 
-// The same algebra edges are available directly on storage.
-let raw_route = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw)?;
-let raw_observation = storage.maintain_exact(&raw_route, &cover)?;
+// Each edge receives the same foundational Support. Work never flows upward.
+storage.maintain_exact::<SimpleToSuccinctMapping>(raw, &support)?;
+let after = storage.maintain_exact::<RawToRank9AcceleratedMapping>(
+    accelerated,
+    &support,
+)?;
 
-let accelerated_route =
-    ExactDerivedCollection::<RawToRank9AcceleratedMapping>::new(raw, accelerated)?;
-let accelerated_observation =
-    storage.maintain_exact(&accelerated_route, raw_observation.cover())?;
+let observed = after.collection_exact(accelerated, &support)?;
+let facts: UnionArchive<OrderedUniverse> = observed.view()?;
 ```
 
-- `attach` is read-only, performs no collection algebra, and binds a complete
-  resident physical cover to the immutable snapshot which validated it.
-- `ensure` freezes the currently admitted support, while `ensure_exact` accepts
-  an explicit support. Both publish only missing `DERIVE` work and return a
-  typed collection snapshot which keeps that support with the fresh post-work
-  store observation and realized target cover.
+- `snapshot.collection` is read-only, performs no collection algebra, and binds
+  the maximal resident target cover to the immutable snapshot which observed
+  it. `collection_exact` requires a complete realization for explicit support.
+- `ensure` freezes the currently admitted foundational support, while
+  `ensure_exact` accepts explicit support. Both publish only missing `DERIVE`
+  work and return a fresh store snapshot.
 - `maintain` and `maintain_exact` additionally carry colliding target members
-  by serialized-size tier. They return the same collection-snapshot shape.
+  by serialized-size tier. They also return a fresh store snapshot.
 
 An ensure may follow existing `MERGE` equations to reuse a resident
 support-equivalent target decomposition, but newly executed work crosses only
 the mapping. It stores each target artifact before its unsigned `DERIVE`
 record. It never creates a source or target `MERGE`.
 
-Maintenance starts from that derive-complete target cover. A target join may
-explicitly request one immutable representation dependency; storage
-materializes that exact source `MERGE` and retries. Every source or target
-`MERGE` completed by maintenance is stored with its equation, including useful
-work completed before a later capacity or fatal result.
+Maintenance starts from that derive-complete target cover and publishes only
+horizontal target `MERGE` work. If a target join cannot run because an optional
+immutable dependency is absent or the encoding has reached a capacity limit,
+the finer exact target cover remains the answer. A downstream operation never
+constructs an upstream member as a side effect.
 
 The maintenance policy has no knob: a raw target member belongs to
 `floor(log2(max(1, serialized_len)))`, and the lowest two content handles in
@@ -369,8 +363,8 @@ mixed across representations. `Cover<SimpleArchive>` contains only
 `Handle<Rank9AcceleratedSuccinctArchiveBlob>`. Stored `MERGE` equations define
 support-equivalent routes; `Cover` carries no route-mode bit. Ordinary raw
 Succinct derivation follows the resident-node priority above while preserving
-support equal to the source cover. The accelerated stage resolves the ordinary
-derived lattice over the raw cover selected upstream. Its cover-aware view
+foundational support. The accelerated stage resolves the ordinary derived
+lattice over that same support. Its cover-aware view
 reads each embedded raw handle through the store snapshot and validates the
 exact raw/index pair before constructing the query runtime. There is no
 separate member-image mode.
@@ -380,12 +374,11 @@ adds a special manifest. [Regular-path summaries](regular-path-indexes.md) and
 Rank9 acceleration both use the same collection algebra. The accelerated
 encoding is a Merkle root whose first 32 bytes name its exact portable raw
 child. It is also a full lattice: resident accelerated children `A(a)` and
-`A(b)` join canonically to `A(a ⊔ b)`. The named raw result must be resident
-before that accelerated result is published. If it is absent, the generic
-storage executor first publishes the ordinary source `MERGE(a,b,c)`, then
-retries and publishes `MERGE(A(a),A(b),A(c))`. Each operation emits one blob.
-The commuting-square law implies `DERIVE(c,A(c))`, so that redundant edge need
-not be stored explicitly. Private physical resolution excludes an accelerated
+`A(b)` join canonically to `A(a ⊔ b)` when their exact raw union is already
+resident. If that dependency is absent, maintenance keeps `{A(a), A(b)}`; a
+separate upstream maintenance call may later publish the raw union, after which
+a retry can carry the accelerated lattice. Each mapping or join emits exactly
+one blob and then its equation. Physical resolution excludes an accelerated
 member whose named raw child is unavailable and retries a finer
 support-equivalent route; the typed view repeats the raw/index check at its
 decoding boundary.

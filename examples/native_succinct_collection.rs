@@ -7,9 +7,11 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
-use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace::core::collection::{
+    AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+};
 use triblespace::core::examples::literature;
 use triblespace::prelude::*;
 
@@ -48,10 +50,11 @@ fn main() {
     // Freeze one coherent store observation, then discover its exact admitted
     // target frontier without reading the commits' data or metadata blobs.
     let snapshot = pile.snapshot().expect("freeze pile snapshot");
-    let cover = collection
+    let support = collection
         .admitted(&snapshot)
-        .expect("discover exact cover");
-    assert_eq!(cover.len(), 3);
+        .expect("discover exact support");
+    assert_eq!(support.len(), 3);
+    drop(snapshot);
 
     // Build any missing canonical raw Succinct shards and their exact Rank9
     // fibers, then query the admitted physical cover directly.
@@ -61,11 +64,15 @@ fn main() {
     let accelerated = pile
         .derive(raw, RawToRank9AcceleratedMapping, policy)
         .expect("register Rank9-accelerated projection");
-    let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
-    let archive = succinct
-        .maintain_exact(&mut pile, &cover)
-        .expect("maintain exact Succinct projection");
-    let view: UnionArchive<OrderedUniverse> = archive.view().expect("materialize Succinct view");
+    pile.maintain_exact::<SimpleToSuccinctMapping>(raw, &support)
+        .expect("maintain exact raw Succinct collection");
+    let snapshot = pile
+        .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
+        .expect("maintain exact Rank9-accelerated collection");
+    let archive = snapshot
+        .collection_exact(accelerated, &support)
+        .expect("observe exact Rank9-accelerated collection");
+    let view: UnionArchive<OrderedUniverse> = archive.view().expect("reconstruct Succinct view");
     let mut names: Vec<String> = find!(
         name: Inline<_>,
         pattern!(&view, [{ _?person @ literature::firstname: ?name }])

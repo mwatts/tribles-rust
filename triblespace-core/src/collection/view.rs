@@ -10,33 +10,36 @@ use std::error::Error;
 use std::fmt;
 
 use crate::repo::{BlobStoreGet, StoreSnapshot};
+use crate::trible::Fragment;
 
-use super::{CollectionData, CollectionEncoding, Cover};
+use super::{
+    CollectionData, CollectionDescriptorError, CollectionEncoding, CollectionHandle, Cover,
+    RecordDecodeError, Support,
+};
 
 /// One immutable collection observation and its exact realized target cover.
 ///
-/// `support` is the snapshot-valid source support represented by `cover`. It
-/// is admitted support for the ordinary collection path and caller-requested
-/// support for the explicit path. Keeping both covers with the store
+/// `support` is the snapshot-valid foundational support represented by
+/// `cover`, invariant across every intervening `DERIVE` and `MERGE`. It is
+/// admitted support for the ordinary collection path and caller-requested
+/// support for the explicit path. Keeping both values with the store
 /// observation prevents a caller from accidentally interpreting a physical
 /// realization through a different snapshot. Logical views are reconstructed
 /// on demand with [`Self::view`].
-pub struct CollectionSnapshot<R, S, T>
+pub struct CollectionSnapshot<R, E>
 where
     R: StoreSnapshot,
-    S: CollectionEncoding,
-    T: CollectionEncoding,
+    E: CollectionEncoding,
 {
     snapshot: R,
-    support: Cover<S>,
-    cover: Cover<T>,
+    support: Support,
+    cover: Cover<E>,
 }
 
-impl<R, S, T> Clone for CollectionSnapshot<R, S, T>
+impl<R, E> Clone for CollectionSnapshot<R, E>
 where
     R: StoreSnapshot,
-    S: CollectionEncoding,
-    T: CollectionEncoding,
+    E: CollectionEncoding,
 {
     fn clone(&self) -> Self {
         Self {
@@ -47,14 +50,13 @@ where
     }
 }
 
-impl<R, S, T> CollectionSnapshot<R, S, T>
+impl<R, E> CollectionSnapshot<R, E>
 where
     R: StoreSnapshot,
-    S: CollectionEncoding,
-    T: CollectionEncoding,
+    E: CollectionEncoding,
 {
     /// Pair one store observation with frozen support and its realization.
-    pub(crate) fn new(snapshot: R, support: Cover<S>, cover: Cover<T>) -> Self {
+    pub(crate) fn new(snapshot: R, support: Support, cover: Cover<E>) -> Self {
         Self {
             snapshot,
             support,
@@ -67,13 +69,13 @@ where
         &self.snapshot
     }
 
-    /// Snapshot-valid source support represented by this snapshot.
-    pub fn support(&self) -> &Cover<S> {
+    /// Snapshot-valid foundational support represented by this snapshot.
+    pub fn support(&self) -> &Support {
         &self.support
     }
 
     /// Exact target cover realized for [`Self::support`].
-    pub fn cover(&self) -> &Cover<T> {
+    pub fn cover(&self) -> &Cover<E> {
         &self.cover
     }
 
@@ -81,48 +83,40 @@ where
     pub fn view<V>(&self) -> Result<V, TryFromCoverError<R::GetError<Infallible>, V::Error>>
     where
         R: BlobStoreGet,
-        V: TryFromCover<T>,
+        V: TryFromCover<E>,
     {
-        V::try_from_cover(&self.cover, &self.snapshot)
+        let descriptor = super::api::load_collection_descriptor(
+            &self.snapshot,
+            self.cover.collection().handle(),
+        )
+        .map_err(TryFromCoverError::from)?;
+        V::try_from_cover(&self.cover, &descriptor.fragment, &self.snapshot)
     }
 
     /// Consume this snapshot into its store observation and exact covers.
-    pub fn into_parts(self) -> (R, Cover<S>, Cover<T>) {
+    pub fn into_parts(self) -> (R, Support, Cover<E>) {
         (self.snapshot, self.support, self.cover)
     }
-}
-
-/// Functional transition between two immutable collection snapshots.
-///
-/// The caller retains its previous snapshot and adopts `next` only after
-/// downstream consumption succeeds. A reset carries a complete replacement;
-/// strict growth additionally carries the exact newly added support.
-pub enum CollectionSnapshotAdvance<R, S, T>
-where
-    R: StoreSnapshot,
-    S: CollectionEncoding,
-    T: CollectionEncoding,
-{
-    /// The support is unchanged, so the caller keeps its previous value.
-    Unchanged,
-    /// The support grew monotonically.
-    Advanced {
-        /// Candidate complete snapshot for the new support.
-        next: CollectionSnapshot<R, S, T>,
-        /// Snapshot realizing exactly the newly added support.
-        changed: CollectionSnapshot<R, S, T>,
-    },
-    /// Additions-only processing is unsound; replace state with this snapshot.
-    Reset {
-        /// Candidate complete snapshot for the current support.
-        next: CollectionSnapshot<R, S, T>,
-    },
 }
 
 /// Failure at the generic boundary between a physical cover and its logical
 /// interpretation.
 #[derive(Debug)]
 pub enum TryFromCoverError<GetError, ViewError> {
+    /// The cover's canonical collection descriptor could not be fetched.
+    DescriptorGet {
+        /// Canonical collection identity.
+        collection: CollectionHandle,
+        /// Backend fetch failure.
+        source: GetError,
+    },
+    /// The fetched descriptor was not a canonical collection descriptor.
+    InvalidDescriptor {
+        /// Canonical collection identity.
+        collection: CollectionHandle,
+        /// Structural descriptor decoding failure.
+        source: RecordDecodeError,
+    },
     /// One exact physical member could not be fetched from the snapshot.
     MemberGet {
         /// Selected physical member.
@@ -141,6 +135,16 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DescriptorGet { collection, source } => write!(
+                formatter,
+                "failed to fetch collection descriptor {}: {source}",
+                hex::encode_upper(collection.raw),
+            ),
+            Self::InvalidDescriptor { collection, source } => write!(
+                formatter,
+                "collection descriptor {} is invalid: {source}",
+                hex::encode_upper(collection.raw),
+            ),
             Self::MemberGet { member, source } => write!(
                 formatter,
                 "failed to fetch cover member {}: {source}",
@@ -158,8 +162,25 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::DescriptorGet { source, .. } => Some(source),
+            Self::InvalidDescriptor { source, .. } => Some(source),
             Self::MemberGet { source, .. } => Some(source),
             Self::View(source) => Some(source),
+        }
+    }
+}
+
+impl<GetError, ViewError> From<CollectionDescriptorError<GetError>>
+    for TryFromCoverError<GetError, ViewError>
+{
+    fn from(source: CollectionDescriptorError<GetError>) -> Self {
+        match source {
+            CollectionDescriptorError::Get { collection, source } => {
+                Self::DescriptorGet { collection, source }
+            }
+            CollectionDescriptorError::Invalid { collection, source } => {
+                Self::InvalidDescriptor { collection, source }
+            }
         }
     }
 }
@@ -176,12 +197,46 @@ pub trait TryFromCover<L: CollectionEncoding>: Sized {
     /// Reconstruct the logical value named by `cover` through `snapshot`.
     ///
     /// Normal callers use [`CollectionSnapshot::view`], which passes the exact
-    /// realized cover together with the immutable store observation that
-    /// validated it.
+    /// realized cover, its canonical descriptor, and the immutable store
+    /// observation that validated it. Encoding-specific parameters belong in
+    /// the descriptor rather than in a lifecycle facade around the collection.
     fn try_from_cover<R>(
         cover: &Cover<L>,
+        descriptor: &Fragment,
         snapshot: &R,
     ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
         R: BlobStoreGet;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::blob::encodings::simplearchive::SimpleArchive;
+    use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+    use crate::collection::{Collection, CollectionData, CollectionHandle};
+    use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::SnapshotSource;
+
+    use super::{CollectionSnapshot, Cover, Support};
+
+    #[test]
+    fn snapshot_keeps_foundational_support_separate_from_target_cover() {
+        let foundation = Collection::<SimpleArchive>::from_handle(CollectionHandle::new([1; 32]));
+        let target = Collection::<SuccinctArchiveBlob>::from_handle(CollectionHandle::new([2; 32]));
+        let support = Support::from_data(foundation, [CollectionData::new([3; 32])]);
+        let cover = Cover::from_data(target, [CollectionData::new([4; 32])]);
+        let mut store = MemoryRepo::default();
+        let store_snapshot = store.snapshot().unwrap();
+
+        let snapshot =
+            CollectionSnapshot::new(store_snapshot.clone(), support.clone(), cover.clone());
+        assert!(snapshot.snapshot() == &store_snapshot);
+        assert_eq!(snapshot.support(), &support);
+        assert_eq!(snapshot.cover(), &cover);
+
+        let (actual_store, actual_support, actual_cover) = snapshot.into_parts();
+        assert!(actual_store == store_snapshot);
+        assert_eq!(actual_support, support);
+        assert_eq!(actual_cover, cover);
+    }
 }

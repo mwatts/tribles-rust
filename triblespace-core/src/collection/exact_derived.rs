@@ -1,53 +1,34 @@
-//! Generic exact-cover maintenance across two collection lattices.
+//! Exact collection realization from invariant foundational support.
 //!
-//! A [`CollectionMapping`] supplies only the join-homomorphic conversion.
-//! Exact completion crosses that mapping for missing support and never creates
-//! a `MERGE`; target maintenance is the separate operation which carries a
-//! completed target cover toward its deterministic LSM normal form. Domain
-//! facades merely bind typed descriptors and sequence mappings. Stored `MERGE`
-//! and `DERIVE` equations are materialized work which resolution can reuse
-//! without replaying its algebra. Every newly computed member is persisted
-//! before its equation, and yard/GC policy alone decides when reusable
-//! artifacts leave local storage.
+//! A [`Support`] is always a cover of the ultimate `SimpleArchive` root.
+//! Stored `MERGE` and `DERIVE` equations close the complete descriptor lineage
+//! from those roots. Crossing one mapping publishes only `DERIVE`; horizontal
+//! LSM carries are the separate `maintain` operation. Neither operation ever
+//! manufactures an upstream dependency as a side effect of downstream work.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::InlineEncoding;
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, StoreSnapshot};
+use crate::repo::{BlobStoreGet, BlobStoreMeta, Store, StoreRead};
 use crate::trible::Fragment;
 
-use super::discovery::discover_collection_records_for_derived_cover;
-use super::encoding::{collection_member_availability, CollectionMemberAvailability};
+use super::discovery::discover_collection_equations_for_lineage;
 use super::{
-    collection_complete_physical_cover, collection_physical_cover, collection_physical_cover_for,
-    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation, CollectionData,
-    CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping, CollectionMerge,
-    CollectionOperationError, CollectionRead, CollectionRecord, CollectionSemantics,
-    CollectionStore, CollectionValidationRequest, Cover,
+    collection_complete_physical_cover, descriptor, resolve_collection_semantics_from_roots,
+    Collection, CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
+    CollectionHandle, CollectionMapping, CollectionOperationError, CollectionRead,
+    CollectionRecord, CollectionResolutionError, CollectionSemantics, Cover, Support,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
-type MappingSource<M> = <M as CollectionMapping>::Source;
-type MappingTarget<M> = <M as CollectionMapping>::Target;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ProbeScope {
-    Direct,
-    SupportEquivalent,
-}
-
-#[derive(Default)]
-pub(super) struct ExactPlannerBlocks {
-    pub(super) sources: BTreeMap<CollectionData, String>,
-}
-
-/// Failure to attach or maintain one exact derived cover.
+/// Failure to observe, ensure, or maintain one collection realization.
 #[derive(Debug)]
-pub enum ExactDerivedCollectionError {
+pub enum CollectionRealizationError {
     /// A storage operation failed.
     Storage {
         /// Operation that failed.
@@ -55,56 +36,56 @@ pub enum ExactDerivedCollectionError {
         /// Backend failure.
         source: BoxError,
     },
-    /// The supplied value is not an exact resident source cover.
+    /// The supplied support belongs to another foundation or cannot describe
+    /// the requested target.
     InvalidCover(String),
-    /// Resolution, identity, or freshly constructed evidence was invalid.
+    /// Descriptor ancestry or stored equations are contradictory.
     Resolution(String),
-    /// The target does not yet physically and logically cover the source.
+    /// The target does not have a complete resident realization.
     IncompleteCover {
-        /// Missing target-frontier bytes.
+        /// Target-frontier obligations without a resident realization.
         missing: Vec<CollectionData>,
-        /// Source-cover members absent from logical target support.
+        /// Foundational members not represented by the selected target cover.
         unsupported_members: Vec<CollectionData>,
     },
     /// Canonical source-to-target construction failed.
     Derive {
-        /// Source member being lowered.
+        /// Immediate source member being mapped.
         input: CollectionData,
         /// Concrete construction failure.
         reason: String,
     },
     /// The target encoding could not join one deterministic LSM pair.
     Merge {
-        /// Canonically lower input content identity.
+        /// Canonically lower input identity.
         low: CollectionData,
-        /// Canonically higher input content identity.
+        /// Canonically higher input identity.
         high: CollectionData,
         /// Concrete construction failure.
         reason: String,
     },
-    /// A canonical operation needs one immutable blob which is absent from the
+    /// A required mapping input names an immutable blob absent from the
     /// current store snapshot.
     MissingDependency {
         /// Exact missing content identity.
         member: CollectionData,
     },
-    /// No physical source cover can represent every required member after
-    /// capacity-terminal source members are excluded.
+    /// No resident physical source cover remains after deterministic capacity
+    /// failures exclude members which cannot be represented downstream.
     UnrepresentableCover {
-        /// Source members whose canonical target images exceeded the fixed
-        /// representation geometry.
+        /// Capacity-terminal source members and their reasons.
         blocked: Vec<(CollectionData, String)>,
-        /// Source frontier obligations no longer covered by any usable member.
+        /// Foundational obligations left uncovered by usable source members.
         missing: Vec<CollectionData>,
     },
-    /// Fresh attachment repeated an unstable physical target cover.
+    /// Publication made no observable progress.
     Stalled {
-        /// Repeated cover in canonical content-handle order.
+        /// Repeated target cover in canonical content order.
         cover: Vec<CollectionData>,
     },
 }
 
-impl ExactDerivedCollectionError {
+impl CollectionRealizationError {
     pub(super) fn storage(
         operation: &'static str,
         source: impl Error + Send + Sync + 'static,
@@ -116,53 +97,53 @@ impl ExactDerivedCollectionError {
     }
 }
 
-impl fmt::Display for ExactDerivedCollectionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl fmt::Display for CollectionRealizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Storage { operation, source } => write!(f, "{operation}: {source}"),
-            Self::InvalidCover(reason) => write!(f, "invalid exact cover: {reason}"),
-            Self::Resolution(reason) => write!(f, "resolve derived collection: {reason}"),
+            Self::Storage { operation, source } => write!(formatter, "{operation}: {source}"),
+            Self::InvalidCover(reason) => write!(formatter, "invalid exact support: {reason}"),
+            Self::Resolution(reason) => write!(formatter, "resolve collection: {reason}"),
             Self::IncompleteCover {
                 missing,
                 unsupported_members,
             } => write!(
-                f,
-                "derived collection is incomplete ({} missing target element(s), {} unsupported source member(s))",
+                formatter,
+                "collection realization is incomplete ({} missing target element(s), {} unsupported foundational member(s))",
                 missing.len(),
                 unsupported_members.len(),
             ),
             Self::Derive { input, reason } => write!(
-                f,
+                formatter,
                 "derive source element {}: {reason}",
                 hex::encode_upper(input.raw),
             ),
             Self::Merge { low, high, reason } => write!(
-                f,
+                formatter,
                 "merge target elements {} and {}: {reason}",
                 hex::encode_upper(low.raw),
                 hex::encode_upper(high.raw),
             ),
             Self::MissingDependency { member } => write!(
-                f,
-                "derived collection requires resident blob {}",
+                formatter,
+                "mapping requires resident blob {}",
                 hex::encode_upper(member.raw),
             ),
             Self::UnrepresentableCover { blocked, missing } => write!(
-                f,
-                "exact source cover is unrepresentable ({} capacity-terminal member(s), {} uncovered source obligation(s))",
+                formatter,
+                "source support is unrepresentable ({} capacity-terminal member(s), {} uncovered foundational member(s))",
                 blocked.len(),
                 missing.len(),
             ),
             Self::Stalled { cover } => write!(
-                f,
-                "target maintenance repeated an unstable {}-member cover",
+                formatter,
+                "collection operation repeated an unchanged {}-member cover",
                 cover.len(),
             ),
         }
     }
 }
 
-impl Error for ExactDerivedCollectionError {
+impl Error for CollectionRealizationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Storage { source, .. } => Some(source.as_ref()),
@@ -171,862 +152,501 @@ impl Error for ExactDerivedCollectionError {
     }
 }
 
-/// Exact-cover lifecycle for one fixed source-to-target mapping.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExactDerivedCollection<Mapping: CollectionMapping> {
-    source_collection: Collection<MappingSource<Mapping>>,
-    target_collection: Collection<MappingTarget<Mapping>>,
-    mapping_override: Option<Mapping>,
+/// Runtime descriptor ancestry from one `SimpleArchive` foundation to a
+/// typed target.
+struct Lineage {
+    foundation: Collection<SimpleArchive>,
+    descriptors: BTreeMap<CollectionHandle, Fragment>,
+    source_by_target: BTreeMap<CollectionHandle, CollectionHandle>,
+    collections: BTreeSet<CollectionHandle>,
 }
 
-impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
-    /// Bind exact maintenance to two collections returned by store lifecycle APIs.
-    ///
-    /// Descriptor bytes and mapping parameters are loaded and validated from
-    /// the operation's immutable store snapshot. This constructor never hashes
-    /// or reconstructs a descriptor from caller-supplied facts.
-    pub fn new(
-        source_collection: Collection<MappingSource<Mapping>>,
-        target_collection: Collection<MappingTarget<Mapping>>,
-    ) -> Result<Self, ExactDerivedCollectionError> {
-        Self::construct(source_collection, target_collection, None)
-    }
-
-    /// Bind an already constructed observational mapping implementation.
-    /// Kept crate-private so public callers cannot swap semantic behavior
-    /// between operations on one typed lifecycle.
-    #[cfg(test)]
-    pub(crate) fn with_mapping(
-        source_collection: Collection<MappingSource<Mapping>>,
-        target_collection: Collection<MappingTarget<Mapping>>,
-        mapping: Mapping,
-    ) -> Result<Self, ExactDerivedCollectionError> {
-        Self::construct(source_collection, target_collection, Some(mapping))
-    }
-
-    fn construct(
-        source_collection: Collection<MappingSource<Mapping>>,
-        target_collection: Collection<MappingTarget<Mapping>>,
-        mapping_override: Option<Mapping>,
-    ) -> Result<Self, ExactDerivedCollectionError> {
-        if source_collection.handle() == target_collection.handle() {
-            return Err(ExactDerivedCollectionError::Resolution(
-                "exact derived collection requires distinct source and target descriptors"
-                    .to_owned(),
-            ));
-        }
-        Ok(Self {
-            source_collection,
-            target_collection,
-            mapping_override,
-        })
-    }
-
-    fn load_descriptors<R>(
-        &self,
-        reader: &R,
-    ) -> Result<(Fragment, Fragment), ExactDerivedCollectionError>
-    where
-        R: BlobStoreGet,
-    {
-        let source =
-            super::api::load_collection_descriptor(reader, self.source_collection.handle())
-                .map_err(|error| {
-                    ExactDerivedCollectionError::Resolution(format!(
-                        "load exact source descriptor: {error}"
-                    ))
-                })?
-                .fragment;
-        super::encoding::validate_descriptor_type::<MappingSource<Mapping>>(&source).map_err(
-            |error| {
-                ExactDerivedCollectionError::Resolution(format!(
-                    "invalid exact source descriptor: {error}"
-                ))
-            },
-        )?;
-
-        let target =
-            super::api::load_collection_descriptor(reader, self.target_collection.handle())
-                .map_err(|error| {
-                    ExactDerivedCollectionError::Resolution(format!(
-                        "load exact target descriptor: {error}"
-                    ))
-                })?
-                .fragment;
-        super::encoding::validate_descriptor_type::<MappingTarget<Mapping>>(&target).map_err(
-            |error| {
-                ExactDerivedCollectionError::Resolution(format!(
-                    "invalid exact target descriptor: {error}"
-                ))
-            },
-        )?;
-
-        let declared_source = super::descriptor::source(target.facts()).map_err(|error| {
-            ExactDerivedCollectionError::Resolution(format!(
-                "invalid target collection_source: {error}"
-            ))
-        })?;
-        if declared_source != Some(self.source_collection.handle()) {
-            return Err(ExactDerivedCollectionError::Resolution(format!(
-                "target collection_source {:?} does not match source descriptor {}",
-                declared_source.map(|handle| hex::encode_upper(handle.raw)),
-                hex::encode_upper(self.source_collection.handle().raw),
-            )));
-        }
-        Ok((source, target))
-    }
-
-    /// Identity of the source collection.
-    pub fn source_collection(&self) -> Collection<MappingSource<Mapping>> {
-        self.source_collection
-    }
-
-    /// Identity of the target collection.
-    pub fn target_collection(&self) -> Collection<MappingTarget<Mapping>> {
-        self.target_collection
-    }
-
-    fn require_source_cover(
-        &self,
-        source_cover: &Cover<MappingSource<Mapping>>,
-    ) -> Result<(), ExactDerivedCollectionError> {
-        if source_cover.collection() == self.source_collection {
-            return Ok(());
-        }
-        Err(ExactDerivedCollectionError::InvalidCover(format!(
-            "source descriptor {} differs from {}",
-            hex::encode_upper(source_cover.collection().handle().raw),
-            hex::encode_upper(self.source_collection.handle().raw),
-        )))
-    }
-
-    /// Attach an already complete exact cover without writing.
-    ///
-    /// Stored equations are followed as materialized LSM evidence. Attachment
-    /// performs no joins, mappings, or payload validation; it only selects
-    /// resident members. The eventual typed view owns payload decoding.
-    pub fn attach<R>(
-        &self,
-        snapshot: &R,
-        source_cover: &Cover<MappingSource<Mapping>>,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        R: StoreSnapshot + BlobStoreGet + BlobStoreMeta + CollectionRead,
-    {
-        self.require_source_cover(source_cover)?;
-        if source_cover.is_empty() {
-            return Ok(Cover::from_members(self.target_collection, []));
-        }
-        let probe = self.probe(snapshot.clone(), source_cover, false)?;
-        if !probe.is_complete() {
-            return Err(probe.incomplete_error());
-        }
-        Ok(probe.into_target_cover())
-    }
-
-    /// Low-level DERIVE-only executor returning one support-equivalent target cover.
-    ///
-    /// Existing `MERGE` equations may be followed to reuse any resident
-    /// physical decomposition with the requested support. New work crosses
-    /// the mapping only: this method publishes `DERIVE` records but never a
-    /// `MERGE`. Consequently it performs the minimum algebra needed to make
-    /// the requested support available in the target lattice.
-    ///
-    /// Most callers should use [`super::CollectionStoreExt::ensure`] or
-    /// [`super::CollectionStoreExt::ensure_exact`], whose public operation
-    /// boundary returns a fresh typed collection snapshot. This cover-returning executor
-    /// exists for domain adapters which compose several derived stages before
-    /// taking that final snapshot.
-    pub fn ensure_exact<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        self.ensure_exact_with_blocks(store, source_cover, &mut ExactPlannerBlocks::default())
-    }
-
-    /// Low-level executor returning a deterministically maintained target cover.
-    ///
-    /// Maintenance repeatedly joins the two lowest content handles in the
-    /// lowest colliding dyadic byte-size tier until the selected cover reaches
-    /// the fixed LSM normal form. Every completed merge remains independently
-    /// useful if a later operation fails or the caller interrupts the work.
-    /// Most callers should use [`super::CollectionStoreExt::maintain`] or
-    /// [`super::CollectionStoreExt::maintain_exact`] to receive the fresh
-    /// post-operation collection snapshot.
-    pub fn maintain_exact<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        super::exact_target_compaction::maintain_target(self, store, source_cover)
-    }
-
-    /// Materialize the exact source join requested by one target join.
-    ///
-    /// This is the only inverse-looking step in collection maintenance, and it
-    /// is still ordinary forward lattice work. The resolved mapping relation
-    /// supplies every canonical preimage of the two target inputs. A candidate
-    /// source join is published only when its content identity is exactly the
-    /// dependency named by the target encoding; non-injective mappings cannot
-    /// make the executor guess.
-    pub(super) fn materialize_target_join_dependency<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        target_low: CollectionData,
-        target_high: CollectionData,
-        dependency: CollectionData,
-    ) -> Result<bool, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let probe = self.probe_store(store, source_cover, false)?;
-        let source = self.source_collection.handle();
-        let target = self.target_collection.handle();
-        let low_preimages = probe.semantics.derive_preimages(source, target, target_low);
-        let high_preimages = probe
-            .semantics
-            .derive_preimages(source, target, target_high);
-        let mut candidates = BTreeSet::new();
-        for low in low_preimages {
-            for high in high_preimages.iter().copied() {
-                let pair = if low <= high {
-                    (low, high)
-                } else {
-                    (high, low)
-                };
-                candidates.insert(pair);
-            }
-        }
-
-        let mut prepared = None;
-        let mut nested_dependencies = BTreeSet::new();
-        for (low_data, high_data) in candidates {
-            let low_handle = Handle::<MappingSource<Mapping>>::from_hash(low_data);
-            let high_handle = Handle::<MappingSource<Mapping>>::from_hash(high_data);
-            let low_resident = probe.reader.metadata(low_handle).map_err(|error| {
-                ExactDerivedCollectionError::storage("inspect source dependency-merge input", error)
-            })?;
-            let high_resident = probe.reader.metadata(high_handle).map_err(|error| {
-                ExactDerivedCollectionError::storage("inspect source dependency-merge input", error)
-            })?;
-            if low_resident.is_none() || high_resident.is_none() {
-                continue;
-            }
-            let low = probe.reader.get(low_handle).map_err(|error| {
-                ExactDerivedCollectionError::storage("load source dependency-merge input", error)
-            })?;
-            let high = probe.reader.get(high_handle).map_err(|error| {
-                ExactDerivedCollectionError::storage("load source dependency-merge input", error)
-            })?;
-            let output = match MappingSource::<Mapping>::join_members(
-                &probe.source_descriptor,
-                &low,
-                &high,
-                &probe.reader,
-            ) {
-                Ok(output) => output,
-                Err(CollectionOperationError::Capacity(_)) => continue,
-                Err(CollectionOperationError::MissingDependency(member)) => {
-                    nested_dependencies.insert(member);
-                    continue;
-                }
-                Err(CollectionOperationError::Fatal(reason)) => {
-                    return Err(ExactDerivedCollectionError::Merge {
-                        low: low_data,
-                        high: high_data,
-                        reason,
-                    });
-                }
-            };
-            if data_identity::<MappingSource<Mapping>>(&output) != dependency {
-                continue;
-            }
-            prepared = Some((
-                output,
-                CollectionMerge::new(source, low_data, high_data, dependency),
-            ));
-            break;
-        }
-
-        drop(probe);
-        let Some((output, claim)) = prepared else {
-            if let Some(member) = nested_dependencies.into_iter().next() {
-                return Err(ExactDerivedCollectionError::MissingDependency { member });
-            }
-            return Ok(false);
-        };
-        store
-            .put::<MappingSource<Mapping>, _>(output)
-            .map_err(|error| {
-                ExactDerivedCollectionError::storage("store source dependency merge", error)
-            })?;
-        store
-            .insert(CollectionRecord::Merge(claim))
-            .map_err(|error| {
-                ExactDerivedCollectionError::storage("publish source dependency MERGE", error)
-            })?;
-        Ok(true)
-    }
-
-    /// Internal DERIVE-only completion with retained capacity observations.
-    pub(super) fn ensure_exact_with_blocks<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        blocks: &mut ExactPlannerBlocks,
-    ) -> Result<Cover<MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        self.require_source_cover(source_cover)?;
-        if source_cover.is_empty() {
-            return Ok(Cover::from_members(self.target_collection, []));
-        }
-
-        let mut published_source_derives = BTreeSet::<CollectionData>::new();
-
-        loop {
-            let probe = self.probe_store(store, source_cover, true)?;
-            if probe.is_complete() {
-                return Ok(probe.into_target_cover());
-            }
-
-            let bound_mapping = Mapping::bind(&probe.source_descriptor, &probe.target_descriptor)
-                .map_err(|error| {
-                ExactDerivedCollectionError::Resolution(format!(
-                    "invalid exact collection mapping: {error}"
-                ))
-            })?;
-            let mapping = self.mapping_override.as_ref().unwrap_or(&bound_mapping);
-
-            // Select the whole deterministic residual cover from one semantic
-            // probe, but do not retain all newly mapped outputs. Each member is
-            // mapped against a cheap fresh storage snapshot, that snapshot is
-            // dropped, and the result is published immediately. Publication
-            // is monotone, so later candidates remain valid and concurrent
-            // readers may safely observe any successful prefix.
-            let residual = probe.source_residual_cover(&blocks.sources)?;
-            if residual.is_empty() {
-                if probe.semantically_complete() {
-                    drop(probe);
-                    let snapshot = store.snapshot().map_err(|error| {
-                        ExactDerivedCollectionError::storage(
-                            "open final exact-cover snapshot",
-                            error,
-                        )
-                    })?;
-                    return self.attach(&snapshot, source_cover);
-                }
-                return Err(probe.incomplete_error());
-            }
-            let stalled_cover = probe
-                .target_cover
-                .members()
-                .map(Handle::<MappingTarget<Mapping>>::to_hash)
-                .collect();
-            drop(probe);
-
-            for (input_data, input) in residual {
-                if published_source_derives.contains(&input_data) {
-                    return Err(ExactDerivedCollectionError::Stalled {
-                        cover: stalled_cover,
-                    });
-                }
-
-                let reader = store.snapshot().map_err(|source| {
-                    ExactDerivedCollectionError::storage("open mapping snapshot", source)
-                })?;
-                let output = mapping.map(&input, &reader);
-                drop(reader);
-                let output = match output {
-                    Ok(output) => output,
-                    Err(CollectionOperationError::Fatal(reason)) => {
-                        return Err(ExactDerivedCollectionError::Derive {
-                            input: input_data,
-                            reason,
-                        });
-                    }
-                    Err(CollectionOperationError::Capacity(reason)) => {
-                        blocks.sources.insert(input_data, reason);
-                        break;
-                    }
-                    Err(CollectionOperationError::MissingDependency(member)) => {
-                        return Err(ExactDerivedCollectionError::MissingDependency { member });
-                    }
-                };
-                let output_data = data_identity::<MappingTarget<Mapping>>(&output);
-                let claim =
-                    CollectionDerive::new(self.target_collection.handle(), input_data, output_data);
-                store
-                    .put::<MappingTarget<Mapping>, _>(output)
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage("store derived target", error)
-                    })?;
-                store
-                    .insert(CollectionRecord::Derive(claim))
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage("publish DERIVE", error)
-                    })?;
-                published_source_derives.insert(input_data);
-            }
-
-            // Capacity can expose a different overlap-aware residual cover;
-            // successful prefixes need no recomputation and remain useful.
-            continue;
-        }
-    }
-
-    fn probe_store<S>(
-        &self,
-        store: &mut S,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        plan_source_residual: bool,
-    ) -> Result<ExactProbe<S::Snapshot, MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let reader = store.snapshot().map_err(|error| {
-            ExactDerivedCollectionError::storage("open exact-cover snapshot", error)
-        })?;
-        self.probe(reader, source_cover, plan_source_residual)
-    }
-
-    fn probe<R>(
-        &self,
-        reader: R,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        plan_source_residual: bool,
-    ) -> Result<ExactProbe<R, MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        R: StoreSnapshot + BlobStoreGet + BlobStoreMeta + CollectionRead,
-    {
-        // Preserve the low-latency direct path. Reverse decomposition may fan
-        // out over many unsigned MERGE observations, so consult it only when
-        // explicit Cover members and their ordinary resident images cannot
-        // already answer the request.
-        let direct = self.probe_once(
-            reader.clone(),
-            source_cover,
-            plan_source_residual,
-            ProbeScope::Direct,
-        )?;
-        if direct.is_complete() {
-            return Ok(direct);
-        }
-        drop(direct);
-        self.probe_once(
-            reader,
-            source_cover,
-            plan_source_residual,
-            ProbeScope::SupportEquivalent,
-        )
-    }
-
-    fn probe_once<R>(
-        &self,
-        reader: R,
-        source_cover: &Cover<MappingSource<Mapping>>,
-        plan_source_residual: bool,
-        scope: ProbeScope,
-    ) -> Result<ExactProbe<R, MappingTarget<Mapping>>, ExactDerivedCollectionError>
-    where
-        R: StoreSnapshot + BlobStoreGet + BlobStoreMeta + CollectionRead,
-    {
-        self.require_source_cover(source_cover)?;
-        let (source_descriptor, target_descriptor) = self.load_descriptors(&reader)?;
-        Mapping::bind(&source_descriptor, &target_descriptor).map_err(|error| {
-            ExactDerivedCollectionError::Resolution(format!(
-                "invalid exact collection mapping: {error}"
-            ))
-        })?;
-        let discovered = discover_collection_records_for_derived_cover(
-            &reader,
-            source_cover,
-            self.target_collection.handle(),
-        )
-        .map_err(|error| ExactDerivedCollectionError::storage("discover exact cover", error))?;
-
-        // Cover identities are sufficient for lookup. Warm attachment never
-        // reads source payloads; an incomplete ensure loads only the physical
-        // residual members it actually maps.
-        let roots: BTreeSet<_> = source_cover.data_members().collect();
-
-        // A Cover may name a compacted source member `c` while stored LSM
-        // evidence says `a join b = c`. Support-equivalent derivation may walk
-        // that exact reverse lineage. No bytes are reconstructed here: every
-        // equation is already a materialized store record.
-        let mut semantic_roots = roots.clone();
-        if scope == ProbeScope::SupportEquivalent {
-            let mut producers = BTreeMap::<CollectionData, Vec<CollectionMerge>>::new();
-            for claim in discovered
-                .merges()
-                .iter()
-                .filter(|claim| claim.collection() == self.source_collection.handle())
-                .copied()
-            {
-                producers.entry(claim.result()).or_default().push(claim);
-            }
-            let mut decomposition_queue: VecDeque<_> = roots.iter().copied().collect();
-            while let Some(result) = decomposition_queue.pop_front() {
-                for claim in producers.get(&result).into_iter().flatten() {
-                    let (low, high) = claim.inputs();
-                    for input in [low, high] {
-                        if semantic_roots.insert(input) {
-                            decomposition_queue.push_back(input);
-                        }
-                    }
-                }
-            }
-        }
-
-        // This kernel holds both descriptors, so it can state the lineage the
-        // derive records observe.
-        let lineage = BTreeMap::from([(
-            self.target_collection.handle(),
-            self.source_collection.handle(),
-        )]);
-        let explicit_roots: BTreeSet<_> = semantic_roots
-            .iter()
-            .map(|member| (self.source_collection.handle(), *member))
-            .collect();
-        let resolution = resolve_collection_semantics_from_roots(
-            &discovered,
-            &lineage,
-            &explicit_roots,
-            |request| {
-                let verdict = match request {
-                    CollectionValidationRequest::Merge { claim }
-                        if claim.collection() == self.source_collection.handle()
-                            || claim.collection() == self.target_collection.handle() =>
-                    {
-                        CollectionClaimValidation::Accepted
-                    }
-                    CollectionValidationRequest::Derive { claim }
-                        if claim.collection() == self.target_collection.handle() =>
-                    {
-                        CollectionClaimValidation::Accepted
-                    }
-                    CollectionValidationRequest::Commit { .. }
-                    | CollectionValidationRequest::Merge { .. }
-                    | CollectionValidationRequest::Derive { .. } => {
-                        CollectionClaimValidation::Pending
-                    }
-                };
-                Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(verdict)
-            },
-        );
-        let resolution = match resolution {
-            Ok(resolution) => resolution,
-            Err(super::CollectionResolutionError::Validation { source, .. }) => match source {},
-            Err(super::CollectionResolutionError::Conflict(conflict)) => {
-                return Err(ExactDerivedCollectionError::Resolution(
-                    conflict.to_string(),
-                ));
-            }
-        };
-
-        let semantics = resolution.into_semantics();
-        let target = self.target_collection.handle();
-        let logically_supported: BTreeSet<_> = semantics
-            .frontier(target)
-            .into_iter()
-            .flatten()
-            .flat_map(|data| semantics.supporting_data(target, *data))
-            .collect();
-        let source_members: BTreeSet<_> = source_cover.data_members().collect();
-        let source = self.source_collection.handle();
-
-        // Compare supports in the source lattice, not as raw handle sets. A
-        // stored `a join b = c` makes Covers `{a, b}` and `{c}` distinct
-        // physical representations of the same support. Both directions are
-        // required: target support must not escape the supplied Cover, and it
-        // must jointly discharge every supplied Cover member.
-        let escaped = collection_physical_cover_for(
-            &semantics,
-            source,
-            &logically_supported,
-            &source_members,
-        );
-        if let Some(member) = escaped.missing.first() {
-            return Err(ExactDerivedCollectionError::InvalidCover(format!(
-                "target frontier escaped the source cover through member {}",
-                hex::encode_upper(member.raw),
-            )));
-        }
-        let unsupported_members = collection_physical_cover_for(
-            &semantics,
-            source,
-            &source_members,
-            &logically_supported,
-        )
-        .missing;
-
-        // Root metadata is the cheap common path. First ask the ordinary
-        // closure-aware resolver whether the frontier already has one complete
-        // physical representative. A warm compacted target therefore reads
-        // only the selected root's representation metadata, rather than every
-        // historical target member. Planning alternatives needs the full
-        // complete resident set only when the selected cover is incomplete or
-        // still contains more than one member.
-        let mut target_roots = BTreeSet::new();
-        for data in semantics.members(target).into_iter().flatten().copied() {
-            if reader
-                .metadata(Handle::<MappingTarget<Mapping>>::from_hash(data))
-                .map_err(|error| {
-                    ExactDerivedCollectionError::storage("inspect exact target residency", error)
-                })?
-                .is_some()
-            {
-                target_roots.insert(data);
-            }
-        }
-        let selected_target = collection_complete_physical_cover::<MappingTarget<Mapping>, _>(
-            &semantics,
-            target,
-            &target_roots,
-            &reader,
-        );
-        let mut target_resident = selected_target.physical.cover.clone();
-        let mut target_physical = selected_target.physical;
-        if !target_physical.missing.is_empty() || target_physical.cover.len() > 1 {
-            target_resident.clear();
-            for data in target_roots {
-                match collection_member_availability::<MappingTarget<Mapping>, _>(data, &reader)
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage(
-                            "inspect exact target representation closure",
-                            error,
-                        )
-                    })? {
-                    CollectionMemberAvailability::Complete => {
-                        target_resident.insert(data);
-                    }
-                    CollectionMemberAvailability::Absent
-                    | CollectionMemberAvailability::Incomplete
-                    | CollectionMemberAvailability::Unusable => {}
-                }
-            }
-            target_physical = collection_physical_cover(&semantics, target, &target_resident);
-        }
-        let represented_source: BTreeSet<_> = target_physical
-            .cover
-            .iter()
-            .flat_map(|data| semantics.supporting_data(target, *data))
-            .collect();
-
-        let semantically_complete =
-            target_physical.missing.is_empty() && unsupported_members.is_empty();
-        let source_resident = if plan_source_residual && !semantically_complete {
-            let mut source_resident = BTreeSet::new();
-            for data in semantics.members(source).into_iter().flatten().copied() {
-                match collection_member_availability::<MappingSource<Mapping>, _>(data, &reader)
-                    .map_err(|error| {
-                        ExactDerivedCollectionError::storage(
-                            "inspect exact source residency",
-                            error,
-                        )
-                    })? {
-                    CollectionMemberAvailability::Complete => {
-                        source_resident.insert(data);
-                    }
-                    CollectionMemberAvailability::Absent
-                    | CollectionMemberAvailability::Incomplete
-                    | CollectionMemberAvailability::Unusable => {}
-                }
-            }
-            source_resident
-        } else {
-            BTreeSet::new()
-        };
-
-        let source_plan_parts = if !plan_source_residual || semantically_complete {
-            None
-        } else {
-            // A logically supported target may have lost its bytes. Its
-            // support is required work just like a root missing logically.
-            let mut required = unsupported_members.clone();
-            for data in &target_physical.missing {
-                required.extend(semantics.supporting_data(target, *data));
-            }
-            Some((source, source_resident, required))
-        };
-        let source_plan =
-            source_plan_parts.map(|(collection, resident, required_members)| SourcePlan {
-                collection,
-                resident,
-                represented_source,
-                required_members,
-            });
-
-        Ok(ExactProbe {
-            reader,
-            source_descriptor,
-            target_descriptor,
-            target_cover: Cover::from_data(
-                self.target_collection,
-                target_physical.cover.iter().copied(),
-            ),
-            missing: target_physical.missing,
-            unsupported_members,
-            semantics,
-            source_plan,
-        })
+impl Lineage {
+    fn descriptor(&self, collection: CollectionHandle) -> &Fragment {
+        self.descriptors
+            .get(&collection)
+            .expect("loaded lineage contains every descriptor")
     }
 }
 
-struct SourcePlan {
-    collection: CollectionHandle,
-    resident: BTreeSet<CollectionData>,
-    represented_source: BTreeSet<CollectionData>,
-    required_members: BTreeSet<CollectionData>,
-}
-
-struct ExactProbe<R, Target: CollectionEncoding> {
-    reader: R,
-    source_descriptor: Fragment,
-    target_descriptor: Fragment,
-    target_cover: Cover<Target>,
-    missing: BTreeSet<CollectionData>,
-    unsupported_members: BTreeSet<CollectionData>,
-    semantics: CollectionSemantics,
-    source_plan: Option<SourcePlan>,
-}
-
-impl<R, Target: CollectionEncoding> ExactProbe<R, Target> {
-    fn is_complete(&self) -> bool {
-        self.semantically_complete()
-    }
-
-    fn semantically_complete(&self) -> bool {
-        self.missing.is_empty() && self.unsupported_members.is_empty()
-    }
-
-    fn incomplete_error(&self) -> ExactDerivedCollectionError {
-        ExactDerivedCollectionError::IncompleteCover {
-            missing: self.missing.iter().copied().collect(),
-            unsupported_members: self.unsupported_members.iter().copied().collect(),
-        }
-    }
-
-    fn into_target_cover(self) -> Cover<Target> {
-        self.target_cover
-    }
-}
-
-impl<R, Target> ExactProbe<R, Target>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-    Target: CollectionEncoding,
-{
-    fn source_residual_cover<Source: CollectionEncoding>(
-        &self,
-        blocked: &BTreeMap<CollectionData, String>,
-    ) -> Result<Vec<(CollectionData, Blob<Source>)>, ExactDerivedCollectionError> {
-        let Some(plan) = &self.source_plan else {
-            return Ok(Vec::new());
-        };
-        let blocked_set: BTreeSet<_> = blocked.keys().copied().collect();
-
-        let resident = plan.resident.difference(&blocked_set).copied().collect();
-        let physical: LoadedPhysicalCover<Source> =
-            loaded_physical_cover(&self.reader, &self.semantics, plan.collection, resident)?;
-        if !physical.missing.is_empty() {
-            if blocked.is_empty() {
-                return Err(ExactDerivedCollectionError::Resolution(format!(
-                    "source lacks a resident cover for {} frontier element(s)",
-                    physical.missing.len(),
-                )));
-            }
-            return Err(ExactDerivedCollectionError::UnrepresentableCover {
-                blocked: blocked
-                    .iter()
-                    .map(|(data, reason)| (*data, reason.clone()))
-                    .collect(),
-                missing: physical.missing.into_iter().collect(),
-            });
-        }
-        let required_physical = collection_physical_cover_for(
-            &self.semantics,
-            plan.collection,
-            &plan.required_members,
-            &physical.cover,
-        );
-        if !required_physical.missing.is_empty() {
-            return Err(ExactDerivedCollectionError::Resolution(format!(
-                "selected source cover does not discharge {} required support element(s)",
-                required_physical.missing.len(),
-            )));
-        }
-        Ok(physical
-            .cover
-            .into_iter()
-            .filter(|data| required_physical.cover.contains(data))
-            .filter(|data| {
-                let obligation = BTreeSet::from([*data]);
-                !collection_physical_cover_for(
-                    &self.semantics,
-                    plan.collection,
-                    &obligation,
-                    &plan.represented_source,
-                )
-                .missing
-                .is_empty()
-            })
-            .map(|data| {
-                let blob = physical
-                    .blobs
-                    .get(&data)
-                    .expect("loaded source cover retains selected bytes")
-                    .clone();
-                (data, blob)
-            })
-            .collect())
-    }
-}
-
-struct LoadedPhysicalCover<E: CollectionEncoding> {
-    cover: BTreeSet<CollectionData>,
-    missing: BTreeSet<CollectionData>,
-    blobs: BTreeMap<CollectionData, Blob<E>>,
-}
-
-fn loaded_physical_cover<R, E>(
-    reader: &R,
-    semantics: &CollectionSemantics,
-    collection: CollectionHandle,
-    resident: BTreeSet<CollectionData>,
-) -> Result<LoadedPhysicalCover<E>, ExactDerivedCollectionError>
+fn load_lineage<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+) -> Result<Lineage, CollectionRealizationError>
 where
     R: BlobStoreGet,
     E: CollectionEncoding,
-    Handle<E>: InlineEncoding,
 {
-    let physical = collection_physical_cover(semantics, collection, &resident);
-    let mut blobs = BTreeMap::new();
-    for data in physical.cover.iter().copied() {
-        let root = reader.get(Handle::<E>::from_hash(data)).map_err(|error| {
-            ExactDerivedCollectionError::storage("load exact source member", error)
+    let mut descriptors = BTreeMap::new();
+    let mut source_by_target = BTreeMap::new();
+    let mut collections = BTreeSet::new();
+    let mut cursor = target.handle();
+    let mut target_descriptor = true;
+
+    loop {
+        if !collections.insert(cursor) {
+            return Err(CollectionRealizationError::Resolution(format!(
+                "collection descriptor ancestry contains a cycle at {}",
+                hex::encode_upper(cursor.raw),
+            )));
+        }
+
+        let loaded = super::api::load_collection_descriptor(snapshot, cursor).map_err(|error| {
+            CollectionRealizationError::Resolution(format!(
+                "load collection descriptor {}: {error}",
+                hex::encode_upper(cursor.raw),
+            ))
         })?;
-        blobs.insert(data, root);
+        if target_descriptor {
+            super::encoding::validate_descriptor_type::<E>(&loaded.fragment).map_err(|error| {
+                CollectionRealizationError::Resolution(format!(
+                    "target descriptor has the wrong representation: {error}"
+                ))
+            })?;
+            target_descriptor = false;
+        }
+
+        let source = descriptor::source(loaded.fragment.facts()).map_err(|error| {
+            CollectionRealizationError::Resolution(format!(
+                "decode collection source for {}: {error}",
+                hex::encode_upper(cursor.raw),
+            ))
+        })?;
+        descriptors.insert(cursor, loaded.fragment);
+
+        match source {
+            Some(source) => {
+                source_by_target.insert(cursor, source);
+                cursor = source;
+            }
+            None => {
+                let root = descriptors
+                    .get(&cursor)
+                    .expect("root descriptor was inserted before inspection");
+                super::encoding::validate_descriptor_type::<SimpleArchive>(root).map_err(
+                    |error| {
+                        CollectionRealizationError::Resolution(format!(
+                            "collection ancestry terminates in a non-SimpleArchive root: {error}"
+                        ))
+                    },
+                )?;
+                return Ok(Lineage {
+                    foundation: Collection::from_handle(cursor),
+                    descriptors,
+                    source_by_target,
+                    collections,
+                });
+            }
+        }
     }
-    Ok(LoadedPhysicalCover {
-        cover: physical.cover,
-        missing: physical.missing,
-        blobs,
+}
+
+/// Find the ultimate canonical fact collection beneath a typed target.
+pub(crate) fn foundation<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+) -> Result<Collection<SimpleArchive>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    Ok(load_lineage(snapshot, target)?.foundation)
+}
+
+fn require_support(lineage: &Lineage, support: &Support) -> Result<(), CollectionRealizationError> {
+    if support.collection() == lineage.foundation {
+        return Ok(());
+    }
+    Err(CollectionRealizationError::InvalidCover(format!(
+        "support foundation {} differs from target foundation {}",
+        hex::encode_upper(support.collection().handle().raw),
+        hex::encode_upper(lineage.foundation.handle().raw),
+    )))
+}
+
+fn resolve_lineage<R>(
+    snapshot: &R,
+    lineage: &Lineage,
+    support: &Support,
+) -> Result<CollectionSemantics, CollectionRealizationError>
+where
+    R: CollectionRead,
+{
+    require_support(lineage, support)?;
+    let discovered = discover_collection_equations_for_lineage(snapshot, &lineage.collections)
+        .map_err(|error| {
+            CollectionRealizationError::storage("discover collection lineage", error)
+        })?;
+    let roots: BTreeSet<_> = support
+        .data_members()
+        .map(|member| (lineage.foundation.handle(), member))
+        .collect();
+
+    let resolution = resolve_collection_semantics_from_roots(
+        &discovered,
+        &lineage.source_by_target,
+        &roots,
+        |request| {
+            let accepted = match request {
+                super::CollectionValidationRequest::Merge { claim } => {
+                    lineage.collections.contains(&claim.collection())
+                }
+                super::CollectionValidationRequest::Derive { claim } => {
+                    lineage.source_by_target.contains_key(&claim.collection())
+                }
+                super::CollectionValidationRequest::Commit { .. } => false,
+            };
+            Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(if accepted {
+                CollectionClaimValidation::Accepted
+            } else {
+                CollectionClaimValidation::Pending
+            })
+        },
+    );
+
+    match resolution {
+        Ok(resolution) => Ok(resolution.into_semantics()),
+        Err(CollectionResolutionError::Validation { source, .. }) => match source {},
+        Err(CollectionResolutionError::Conflict(conflict)) => {
+            Err(CollectionRealizationError::Resolution(conflict.to_string()))
+        }
+    }
+}
+
+struct TargetResolution<E: CollectionEncoding> {
+    semantics: CollectionSemantics,
+    support: Support,
+    cover: Cover<E>,
+    missing: BTreeSet<CollectionData>,
+}
+
+impl<E: CollectionEncoding> TargetResolution<E> {
+    fn is_exact_for(&self, requested: &Support) -> bool {
+        self.missing.is_empty() && self.support == *requested
+    }
+
+    fn incomplete_error(&self, requested: &Support) -> CollectionRealizationError {
+        let represented: BTreeSet<_> = self.support.data_members().collect();
+        CollectionRealizationError::IncompleteCover {
+            missing: self.missing.iter().copied().collect(),
+            unsupported_members: requested
+                .data_members()
+                .filter(|member| !represented.contains(member))
+                .collect(),
+        }
+    }
+}
+
+fn resolve_target<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    lineage: &Lineage,
+    requested: &Support,
+) -> Result<TargetResolution<E>, CollectionRealizationError>
+where
+    R: BlobStoreGet + BlobStoreMeta + CollectionRead,
+    E: CollectionEncoding,
+{
+    let semantics = resolve_lineage(snapshot, lineage, requested)?;
+    let target_handle = target.handle();
+    let mut resident = BTreeSet::new();
+    for member in semantics
+        .members(target_handle)
+        .into_iter()
+        .flatten()
+        .copied()
+    {
+        if snapshot
+            .metadata(Handle::<E>::from_hash(member))
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect target member residency", error)
+            })?
+            .is_some()
+        {
+            resident.insert(member);
+        }
+    }
+
+    let selected =
+        collection_complete_physical_cover::<E, _>(&semantics, target_handle, &resident, snapshot);
+    let represented: BTreeSet<_> = semantics.supporting_data_for(
+        selected
+            .physical
+            .cover
+            .iter()
+            .copied()
+            .map(|member| (target_handle, member)),
+    );
+
+    Ok(TargetResolution {
+        support: Cover::from_data(
+            lineage.foundation,
+            requested
+                .data_members()
+                .filter(|member| represented.contains(member)),
+        ),
+        cover: Cover::from_data(target, selected.physical.cover.iter().copied()),
+        missing: selected.physical.missing,
+        semantics,
     })
+}
+
+/// Attach one target collection to the immutable state actually visible in a
+/// snapshot.
+///
+/// With `Some(support)`, attachment is exact and fails unless all requested
+/// support is resident in the target. With `None`, the foundation's admitted
+/// support is used as the search boundary, but the result contains only the
+/// maximal resident target antichain and exactly the foundational support it
+/// represents. A static snapshot never promises a future derivation.
+pub(crate) fn attach_collection<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    requested: Option<&Support>,
+) -> Result<(Support, Cover<E>), CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let exact = requested.is_some();
+    let lineage = load_lineage(snapshot, target)?;
+    let admitted;
+    let requested = match requested {
+        Some(requested) => requested,
+        None => {
+            admitted = lineage.foundation.admitted(snapshot).map_err(|error| {
+                CollectionRealizationError::storage("admit foundational support", error)
+            })?;
+            &admitted
+        }
+    };
+    let resolved = resolve_target(snapshot, target, &lineage, requested)?;
+    if exact && !resolved.is_exact_for(requested) {
+        return Err(resolved.incomplete_error(requested));
+    }
+    Ok((resolved.support, resolved.cover))
+}
+
+struct MappingProbe<M: CollectionMapping> {
+    source: Collection<M::Source>,
+    mapping: M,
+    target_resolution: TargetResolution<M::Target>,
+}
+
+fn probe_mapping<R, M>(
+    snapshot: &R,
+    target: Collection<M::Target>,
+    support: &Support,
+) -> Result<MappingProbe<M>, CollectionRealizationError>
+where
+    R: StoreRead,
+    M: CollectionMapping,
+{
+    let lineage = load_lineage(snapshot, target)?;
+    require_support(&lineage, support)?;
+    let source_handle = lineage
+        .source_by_target
+        .get(&target.handle())
+        .copied()
+        .ok_or_else(|| {
+            CollectionRealizationError::Resolution(
+                "ensure requires a derived target descriptor".to_owned(),
+            )
+        })?;
+    let source_descriptor = lineage.descriptor(source_handle);
+    let target_descriptor = lineage.descriptor(target.handle());
+    super::encoding::validate_descriptor_type::<M::Source>(source_descriptor).map_err(|error| {
+        CollectionRealizationError::Resolution(format!(
+            "mapping source descriptor has the wrong representation: {error}"
+        ))
+    })?;
+    let mapping = M::bind(source_descriptor, target_descriptor).map_err(|error| {
+        CollectionRealizationError::Resolution(format!(
+            "target descriptor does not bind the requested mapping: {error}"
+        ))
+    })?;
+    let target_resolution = resolve_target(snapshot, target, &lineage, support)?;
+    Ok(MappingProbe {
+        source: Collection::from_handle(source_handle),
+        mapping,
+        target_resolution,
+    })
+}
+
+fn source_residual<R, M>(
+    snapshot: &R,
+    probe: &MappingProbe<M>,
+    requested: &Support,
+    blocked: &BTreeMap<CollectionData, String>,
+) -> Result<Vec<(CollectionData, Blob<M::Source>)>, CollectionRealizationError>
+where
+    R: BlobStoreGet + BlobStoreMeta,
+    M: CollectionMapping,
+{
+    let semantics = &probe.target_resolution.semantics;
+    let source = probe.source.handle();
+    let mut resident = BTreeSet::new();
+    for member in semantics.members(source).into_iter().flatten().copied() {
+        if blocked.contains_key(&member) {
+            continue;
+        }
+        if snapshot
+            .metadata(Handle::<M::Source>::from_hash(member))
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect source member residency", error)
+            })?
+            .is_some()
+        {
+            resident.insert(member);
+        }
+    }
+
+    let selected =
+        collection_complete_physical_cover::<M::Source, _>(semantics, source, &resident, snapshot);
+    let source_support = semantics.supporting_data_for(
+        selected
+            .physical
+            .cover
+            .iter()
+            .copied()
+            .map(|member| (source, member)),
+    );
+    let missing: Vec<_> = requested
+        .data_members()
+        .filter(|member| !source_support.contains(member))
+        .collect();
+    if !selected.physical.missing.is_empty() || !missing.is_empty() {
+        if blocked.is_empty() {
+            return Err(CollectionRealizationError::IncompleteCover {
+                missing: selected.physical.missing.iter().copied().collect(),
+                unsupported_members: missing,
+            });
+        }
+        return Err(CollectionRealizationError::UnrepresentableCover {
+            blocked: blocked
+                .iter()
+                .map(|(member, reason)| (*member, reason.clone()))
+                .collect(),
+            missing,
+        });
+    }
+
+    let represented: BTreeSet<_> = probe.target_resolution.support.data_members().collect();
+    let mut residual = Vec::new();
+    for member in selected.physical.cover.iter().copied() {
+        let member_support = semantics.supporting_data(source, member);
+        if member_support.is_subset(&represented) {
+            continue;
+        }
+        let blob = snapshot
+            .get(Handle::<M::Source>::from_hash(member))
+            .map_err(|error| {
+                CollectionRealizationError::storage("load source member for mapping", error)
+            })?;
+        residual.push((member, blob));
+    }
+    Ok(residual)
+}
+
+/// Ensure one immediate mapping for invariant foundational support.
+///
+/// Existing equations throughout the ancestry are reused, but new work only
+/// maps resident immediate-source members and publishes target `DERIVE`
+/// records. A missing immediate-source cover is an error: downstream ensure
+/// never constructs upstream blobs.
+pub(crate) fn ensure_exact<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    M: CollectionMapping,
+{
+    let mut blocked = BTreeMap::<CollectionData, String>::new();
+    let mut published = BTreeSet::<CollectionData>::new();
+
+    loop {
+        let snapshot = store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("open exact mapping snapshot", error)
+        })?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support)?;
+        if probe.target_resolution.is_exact_for(support) {
+            return Ok(());
+        }
+        let repeated_cover = probe.target_resolution.cover.data_members().collect();
+        let residual = source_residual(&snapshot, &probe, support, &blocked)?;
+        let mapping = probe.mapping;
+        let incomplete = probe.target_resolution.incomplete_error(support);
+        drop(snapshot);
+
+        if residual.is_empty() {
+            return Err(incomplete);
+        }
+
+        let mut replan = false;
+        for (input_data, input) in residual {
+            if published.contains(&input_data) {
+                return Err(CollectionRealizationError::Stalled {
+                    cover: repeated_cover,
+                });
+            }
+            let snapshot = store.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("open mapping dependency snapshot", error)
+            })?;
+            let output = mapping.map(&input, &snapshot);
+            drop(snapshot);
+            let output = match output {
+                Ok(output) => output,
+                Err(CollectionOperationError::Fatal(reason)) => {
+                    return Err(CollectionRealizationError::Derive {
+                        input: input_data,
+                        reason,
+                    });
+                }
+                Err(CollectionOperationError::Capacity(reason)) => {
+                    blocked.insert(input_data, reason);
+                    replan = true;
+                    break;
+                }
+                Err(CollectionOperationError::MissingDependency(member)) => {
+                    return Err(CollectionRealizationError::MissingDependency { member });
+                }
+            };
+            let output_data = data_identity::<M::Target>(&output);
+            store.put::<M::Target, _>(output).map_err(|error| {
+                CollectionRealizationError::storage("store derived target member", error)
+            })?;
+            store
+                .insert(CollectionRecord::Derive(CollectionDerive::new(
+                    target.handle(),
+                    input_data,
+                    output_data,
+                )))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("publish target DERIVE", error)
+                })?;
+            published.insert(input_data);
+        }
+        if replan {
+            continue;
+        }
+    }
+}
+
+/// Ensure one mapping and then carry its target lattice to the deterministic
+/// LSM fixed point.
+pub(crate) fn maintain_exact<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    M: CollectionMapping,
+{
+    ensure_exact::<S, M>(store, target, support)?;
+    super::exact_target_compaction::maintain_target(store, target, support)
 }
 
 pub(super) fn data_identity<E: CollectionEncoding>(blob: &Blob<E>) -> CollectionData {

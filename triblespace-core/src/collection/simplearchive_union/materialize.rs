@@ -48,6 +48,7 @@ impl TryFromCover<SimpleArchive> for TribleSet {
 
     fn try_from_cover<R>(
         cover: &Cover<SimpleArchive>,
+        _descriptor: &Fragment,
         snapshot: &R,
     ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where

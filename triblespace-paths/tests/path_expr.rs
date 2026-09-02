@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace_core::collection::{
+    AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
@@ -13,7 +16,7 @@ use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
 use triblespace_paths::{
-    automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathSummaryCollection, Step,
+    automaton_fingerprint, GraphEdge, PathExpr, PathIndex, RegularPathMapping, Step,
 };
 
 fn vertex(byte: u8) -> RawInline {
@@ -93,27 +96,30 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
         AdmissionPolicy::direct(authority),
     );
     let mut store = MemoryRepo::default();
-    let paths = PathSummaryCollection::create(
-        &mut store,
-        name,
-        policy.clone(),
-        expression.compile(),
-        policy,
-    )
-    .unwrap();
+    let source = store.collection(name, policy.clone()).unwrap();
+    let target = store
+        .derive(
+            source,
+            RegularPathMapping::new(expression.compile()),
+            policy,
+        )
+        .unwrap();
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
     store
-        .commit(
-            paths.source_collection(),
-            &signing_key,
-            Fragment::from(graph),
-        )
+        .commit(source, &signing_key, Fragment::from(graph))
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let cover = paths.source_collection().admitted(&snapshot).unwrap();
-    let index = paths.ensure(&mut store, &cover).unwrap();
+    let support = source.admitted(&snapshot).unwrap();
+    let snapshot = store
+        .maintain_exact::<RegularPathMapping>(target, &support)
+        .unwrap();
+    let index: Arc<PathIndex> = snapshot
+        .collection_exact(target, &support)
+        .unwrap()
+        .view()
+        .unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));
     let reachable = Query::new(index.constraint(start, end), |binding: &Binding| {

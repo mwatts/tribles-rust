@@ -163,8 +163,11 @@ A durable path index is identified by the exact source descriptor, one
 automaton, and the independent READ/WRITE policies of its derived descriptor:
 
 ```rust,ignore
-use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
-use triblespace_paths::PathSummaryCollection;
+use std::sync::Arc;
+use triblespace::core::collection::{
+    AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+};
+use triblespace_paths::{PathIndex, RegularPathMapping};
 
 let source_policy = CollectionPolicy::new(
     AdmissionPolicy::direct(source_reader),
@@ -174,30 +177,29 @@ let index_policy = CollectionPolicy::new(
     AdmissionPolicy::direct(index_reader),
     AdmissionPolicy::direct(index_writer),
 );
-let path_collection = PathSummaryCollection::create(
-    &mut store,
-    "social",
-    source_policy,
-    friend_automaton.clone(),
+let source = store.collection("social", source_policy)?;
+let paths = store.derive(
+    source,
+    RegularPathMapping::new(friend_automaton),
     index_policy,
 )?;
 
-// `cover` is the admitted PATCH set of distinct source payload handles.
-// This domain convenience maintains and materializes a PathIndex.
-let paths = path_collection.ensure(&mut store, &cover)?;
+let before = store.snapshot()?;
+let support = source.admitted(&before)?;
+drop(before);
 
-// Read-only consumers can require an already resident exact cover.
-let same_paths = path_collection.attach(&mut store, &cover)?;
+let after = store.maintain_exact::<RegularPathMapping>(paths, &support)?;
+let observed = after.collection_exact(paths, &support)?;
+let index: Arc<PathIndex> = observed.view()?;
 ```
 
-Both methods require only `BlobStore + CollectionStore`. The exact source
-cover replaces ambient heads, commit-chain traversal, manifests, registered
-hooks, and range planning.
+The foundational support replaces ambient heads, commit-chain traversal,
+manifests, registered hooks, and range planning.
 
-The derivation selects a target `Cover` whose support equals the source cover;
-the same value type represents both lattice positions. The path mapping permits
-any stored combination of source merges, target merges, and derivations
-with that support, so route choice is not encoded as a cover mode.
+The derivation selects a target `Cover<PathSummaryBlob>` whose support is the
+same `Cover<SimpleArchive>` at the root. The path mapping permits any stored
+combination of source merges, target merges, and derivations with that support,
+so route choice is not encoded as a cover mode.
 
 The opaque cover is the value boundary. It must name the canonical
 policy-bearing `SimpleArchive` source descriptor, and every member names one
@@ -209,34 +211,28 @@ and one unit of derivation work. Their authorship, signatures, and metadata are
 queryable, possibly absent provenance through `cover.commits(&snapshot)` and are
 intentionally unnecessary for replay or path semantics.
 
-`attach` never writes or executes collection algebra. It follows existing
-source `MERGE`, path-summary `MERGE`, and source-to-target `DERIVE` equations,
-then requires
-both:
+`snapshot.collection(paths)` never writes or executes collection algebra. It
+follows existing source `MERGE`, path-summary `MERGE`, and source-to-target
+`DERIVE` equations and returns the maximal complete resident target cover plus
+exactly the foundational support represented by it.
+
+`snapshot.collection_exact(paths, &support)` additionally requires both:
 
 1. the union of support on the logical target frontier is exactly the supplied
    payload set; and
 2. the target frontier has a complete resident target `Cover`.
 
-Only then are selected summaries joined and closed once into `PathIndex`.
+Only then does `view::<Arc<PathIndex>>()` use the target descriptor's embedded
+automaton, join the selected summaries, and close them once into the endpoint
+relation. The automaton is descriptor context, not mutable state retained in a
+lifecycle facade.
 
-`PathSummaryCollection::ensure` is a view-returning domain convenience
-whose name predates the split collection API. It calls the low-level
-`ExactDerivedCollection::maintain_exact` cover executor, takes a fresh store
-snapshot, then joins and closes the realized summary cover into a `PathIndex`.
-It therefore performs deterministic size-tiered target `MERGE` work as well as
-missing `DERIVE` work. Every successful artifact is persisted before its
-unsigned equation, no implicit durability flush is performed, and an unchanged
-warm call executes no maps or joins.
-
-Code which needs the split operation boundary should use
-`CollectionStoreExt`: `ensure` and `ensure_exact` publish missing `DERIVE` work
-only, while `maintain` and `maintain_exact` additionally perform deterministic
-tiered `MERGE` work. Those preferred generic operations return a typed
-`CollectionSnapshot` containing the fresh store observation and the frozen
-support/realization pair; their low-level exact executors return covers so
-domain adapters such as this one can compose construction with immediate
-materialization.
+`CollectionStoreExt::ensure{_exact}` publishes missing `DERIVE` work only;
+`maintain{_exact}` additionally performs deterministic size-tiered target
+`MERGE` work. Both return a fresh store snapshot rather than pretending that
+mutation itself selected one final physical cover. Every successful artifact
+is persisted before its unsigned equation, no implicit durability flush is
+performed, and an unchanged warm call executes no maps or joins.
 
 An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.

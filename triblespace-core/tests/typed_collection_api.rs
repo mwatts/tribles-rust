@@ -9,7 +9,6 @@ use triblespace_core::collection::succinctarchive_union::{
 };
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
-    ExactDerivedCollection,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -79,8 +78,8 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
         .unwrap();
     let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
-    let route = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, target).unwrap();
-    let collection = store.ensure(&route).unwrap();
+    let ensured = store.ensure::<SimpleToSuccinctMapping>(target).unwrap();
+    let collection = ensured.collection_exact(target, &source_cover).unwrap();
 
     // Later source growth cannot silently change the support paired with the
     // completed target realization.
@@ -98,9 +97,14 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
 
     // The explicit-support ensure and admitted-support maintenance paths share
     // the same immutable snapshot result shape.
-    store.ensure_exact(&route, &source_cover).unwrap();
-    store.maintain(&route).unwrap();
-    let collection = store.maintain_exact(&route, &source_cover).unwrap();
+    store
+        .ensure_exact::<SimpleToSuccinctMapping>(target, &source_cover)
+        .unwrap();
+    store.maintain::<SimpleToSuccinctMapping>(target).unwrap();
+    let maintained = store
+        .maintain_exact::<SimpleToSuccinctMapping>(target, &source_cover)
+        .unwrap();
+    let collection = maintained.collection_exact(target, &source_cover).unwrap();
     assert_eq!(collection.support(), &source_cover);
     assert_eq!(
         collection.cover().members().collect::<Vec<_>>(),
@@ -131,28 +135,24 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
 
-    let source_support = source.admitted(&store.snapshot().unwrap()).unwrap();
-    let raw_route = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(source, raw).unwrap();
-    let raw_observation = store.ensure_exact(&raw_route, &source_support).unwrap();
-    let raw_support = raw_observation.cover().clone();
-    let accelerated_route =
-        ExactDerivedCollection::<RawToRank9AcceleratedMapping>::new(raw, accelerated).unwrap();
-
+    let support = source.admitted(&store.snapshot().unwrap()).unwrap();
+    store
+        .ensure_exact::<SimpleToSuccinctMapping>(raw, &support)
+        .unwrap();
     let ensured = store
-        .ensure_exact(&accelerated_route, &raw_support)
+        .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
         .unwrap();
-    assert_eq!(ensured.support(), &raw_support);
-    assert_eq!(ensured.cover().len(), 1);
-
-    let snapshot = store.snapshot().unwrap();
-    let observed = snapshot
-        .collection_exact(&accelerated_route, &raw_support)
-        .unwrap();
-    assert_eq!(observed.cover(), ensured.cover());
+    let observed = ensured.collection_exact(accelerated, &support).unwrap();
+    assert_eq!(observed.support(), &support);
+    assert_eq!(observed.cover().len(), 1);
 
     let maintained = store
-        .maintain_exact(&accelerated_route, &raw_support)
+        .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
         .unwrap();
-    let materialized = maintained.view::<UnionArchive<OrderedUniverse>>().unwrap();
+    let materialized = maintained
+        .collection_exact(accelerated, &support)
+        .unwrap()
+        .view::<UnionArchive<OrderedUniverse>>()
+        .unwrap();
     assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
 }

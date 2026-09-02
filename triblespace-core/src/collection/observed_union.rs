@@ -70,17 +70,16 @@ use crate::metadata::MetaDescribe;
 use crate::query::register::RegisterOrder;
 use crate::trible::{Fragment, Trible, A_START, TRIBLE_LEN, V_START};
 
-use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 #[cfg(test)]
 use super::records::CollectionHandle;
 use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 #[cfg(test)]
 use super::CollectionPolicy;
 use super::{
-    Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
-    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    CollectionEncoding, CollectionMapping, CollectionOperationError, TryFromCover,
+    TryFromCoverError,
 };
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::repo::BlobStoreGet;
 
 /// Width of one stored id.
 const ID_LEN: usize = 16;
@@ -442,6 +441,7 @@ impl TryFromCover<ObservedSetBlob> for ObservedIndex {
 
     fn try_from_cover<R>(
         cover: &super::Cover<ObservedSetBlob>,
+        _descriptor: &Fragment,
         reader: &R,
     ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
@@ -456,124 +456,6 @@ impl TryFromCover<ObservedSetBlob> for ObservedIndex {
             joined = join(&joined, &segment).map_err(TryFromCoverError::View)?;
         }
         Self::decode(&joined).map_err(TryFromCoverError::View)
-    }
-}
-
-/// Canonical observed-set projection of one source `SimpleArchive`
-/// collection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObservedSetCollection {
-    source: Collection<SimpleArchive>,
-    target: Collection<ObservedSetBlob>,
-}
-
-impl ObservedSetCollection {
-    /// Bind the observed-set facade to store-created source and target values.
-    pub fn new(source: Collection<SimpleArchive>, target: Collection<ObservedSetBlob>) -> Self {
-        Self { source, target }
-    }
-
-    /// Store-issued source collection.
-    pub fn source_collection(&self) -> Collection<SimpleArchive> {
-        self.source
-    }
-
-    /// Store-issued target collection.
-    pub fn target_collection(&self) -> Collection<ObservedSetBlob> {
-        self.target
-    }
-
-    /// Attach the observed set already resident for `source_cover`.
-    pub fn attach<S>(
-        &self,
-        store: &mut S,
-        source_cover: &FactCover,
-    ) -> Result<ObservedIndex, ObservedSetCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let reader = store
-            .snapshot()
-            .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;
-        let cover = self.kernel()?.attach(&reader, source_cover)?;
-        ObservedIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
-            TryFromCoverError::MemberGet { source, .. } => {
-                ObservedSetCollectionError::Snapshot(source.to_string())
-            }
-            TryFromCoverError::View(source) => ObservedSetCollectionError::Algebra(source),
-        })
-    }
-
-    /// Domain convenience which maintains and materializes the observed set.
-    ///
-    /// This view-returning facade predates the split snapshot API. It delegates
-    /// to the low-level `maintain_exact` cover executor, takes a fresh snapshot,
-    /// and materializes the `ObservedIndex` through that observation.
-    pub fn ensure<S>(
-        &self,
-        store: &mut S,
-        source_cover: &FactCover,
-    ) -> Result<ObservedIndex, ObservedSetCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let cover = self.kernel()?.maintain_exact(store, source_cover)?;
-        let reader = store
-            .snapshot()
-            .map_err(|source| ObservedSetCollectionError::Snapshot(source.to_string()))?;
-        ObservedIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
-            TryFromCoverError::MemberGet { source, .. } => {
-                ObservedSetCollectionError::Snapshot(source.to_string())
-            }
-            TryFromCoverError::View(source) => ObservedSetCollectionError::Algebra(source),
-        })
-    }
-
-    fn kernel(
-        &self,
-    ) -> Result<ExactDerivedCollection<ObserveStatesMapping>, ExactDerivedCollectionError> {
-        ExactDerivedCollection::new(self.source, self.target)
-    }
-}
-
-/// Failure to validate, complete, or materialize one observed-set cover.
-#[derive(Debug)]
-pub enum ObservedSetCollectionError {
-    /// Exact-cover resolution, construction, or storage failed.
-    Collection(ExactDerivedCollectionError),
-    /// Canonical observed-set construction failed.
-    Algebra(ObservedSetError),
-    /// A store snapshot for the cover could not be frozen.
-    Snapshot(String),
-}
-
-impl fmt::Display for ObservedSetCollectionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Collection(source) => source.fmt(formatter),
-            Self::Algebra(source) => source.fmt(formatter),
-            Self::Snapshot(source) => {
-                write!(formatter, "freeze observed-set cover snapshot: {source}")
-            }
-        }
-    }
-}
-
-impl Error for ObservedSetCollectionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Collection(source) => Some(source),
-            Self::Algebra(source) => Some(source),
-            Self::Snapshot(_) => None,
-        }
-    }
-}
-
-impl From<ExactDerivedCollectionError> for ObservedSetCollectionError {
-    fn from(source: ExactDerivedCollectionError) -> Self {
-        Self::Collection(source)
     }
 }
 
@@ -773,20 +655,15 @@ mod tests {
                 target_policy.clone(),
             )
             .unwrap();
-        let collection = ObservedSetCollection::new(source, target);
         let snapshot = store.snapshot().unwrap();
-        let source_descriptor = crate::collection::api::load_collection_descriptor(
-            &snapshot,
-            collection.source_collection().handle(),
-        )
-        .unwrap()
-        .fragment;
-        let target_descriptor = crate::collection::api::load_collection_descriptor(
-            &snapshot,
-            collection.target_collection().handle(),
-        )
-        .unwrap()
-        .fragment;
+        let source_descriptor =
+            crate::collection::api::load_collection_descriptor(&snapshot, source.handle())
+                .unwrap()
+                .fragment;
+        let target_descriptor =
+            crate::collection::api::load_collection_descriptor(&snapshot, target.handle())
+                .unwrap()
+                .fragment;
 
         assert_eq!(
             descriptor_facts::policy(source_descriptor.facts()),

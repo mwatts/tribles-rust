@@ -9,13 +9,15 @@ use std::io;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+};
 use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
-    SuccinctArchiveSnapshot, SuccinctArchiveSnapshotAdvance,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
+    CollectionStoreExt,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
@@ -68,31 +70,43 @@ fn changes(
 fn observe(
     store: &mut MemoryRepo,
     collection: Collection<SimpleArchive>,
-    succinct: &SuccinctArchiveCollection,
-    checkpoint: &mut Option<SuccinctArchiveSnapshot<MemoryRepoSnapshot>>,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    checkpoint: &mut Option<
+        CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    >,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let snapshot = store.snapshot()?;
-    let current = collection.admitted(&snapshot)?;
-    let advance = match checkpoint.as_ref() {
-        Some(previous) => succinct.advance(store, previous, &current)?,
-        None => SuccinctArchiveSnapshotAdvance::Reset {
-            next: succinct.maintain_exact(store, &current)?,
-        },
+    let current_support = collection.admitted(&snapshot)?;
+    let changed_support = match checkpoint.as_ref() {
+        Some(previous) if previous.support() == &current_support => return Ok(Vec::new()),
+        Some(previous) => current_support.additions_since(previous.support()).ok(),
+        None => None,
     };
+    drop(snapshot);
 
-    let (next, titles) = match advance {
-        SuccinctArchiveSnapshotAdvance::Unchanged => return Ok(Vec::new()),
-        SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => {
+    // Every mapping edge receives the same foundational support. Maintaining
+    // the delta first lets complete maintenance reuse all persisted work.
+    if let Some(changed) = changed_support.as_ref() {
+        store.maintain_exact::<SimpleToSuccinctMapping>(raw, changed)?;
+        store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, changed)?;
+    }
+    store.maintain_exact::<SimpleToSuccinctMapping>(raw, &current_support)?;
+    let snapshot =
+        store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &current_support)?;
+    let next = snapshot.collection_exact(accelerated, &current_support)?;
+
+    let titles = match changed_support {
+        Some(changed_support) => {
+            let changed = snapshot.collection_exact(accelerated, &changed_support)?;
             let full: UnionArchive<OrderedUniverse> = next.view()?;
             let delta: UnionArchive<OrderedUniverse> = changed.view()?;
-            let titles = changes(&full, &delta, &mut consume)?;
-            (next, titles)
+            changes(&full, &delta, &mut consume)?
         }
-        SuccinctArchiveSnapshotAdvance::Reset { next } => {
+        None => {
             let full: UnionArchive<OrderedUniverse> = next.view()?;
-            let titles = rebuild(&full, &mut consume)?;
-            (next, titles)
+            rebuild(&full, &mut consume)?
         }
     };
 
@@ -132,12 +146,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let raw = store.derive(collection, SimpleToSuccinctMapping, policy.clone())?;
     let accelerated = store.derive(raw, RawToRank9AcceleratedMapping, policy)?;
-    let succinct = SuccinctArchiveCollection::new(collection, raw, accelerated);
     let mut checkpoint = None;
 
-    let first = observe(&mut store, collection, &succinct, &mut checkpoint, |_| {
-        Ok(())
-    })?;
+    let first = observe(
+        &mut store,
+        collection,
+        raw,
+        accelerated,
+        &mut checkpoint,
+        |_| Ok(()),
+    )?;
     assert_eq!(first, ["Dune"]);
 
     store.commit(
@@ -152,9 +170,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let before_failure = checkpoint
         .as_ref()
         .map(|snapshot| snapshot.support().clone());
-    let failed = observe(&mut store, collection, &succinct, &mut checkpoint, |_| {
-        Err(io::Error::other("simulated consumer failure").into())
-    });
+    let failed = observe(
+        &mut store,
+        collection,
+        raw,
+        accelerated,
+        &mut checkpoint,
+        |_| Err(io::Error::other("simulated consumer failure").into()),
+    );
     assert!(failed.is_err());
     assert_eq!(
         checkpoint
@@ -163,14 +186,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         before_failure,
     );
 
-    let retry = observe(&mut store, collection, &succinct, &mut checkpoint, |_| {
-        Ok(())
-    })?;
+    let retry = observe(
+        &mut store,
+        collection,
+        raw,
+        accelerated,
+        &mut checkpoint,
+        |_| Ok(()),
+    )?;
     assert_eq!(retry, ["Dune Messiah"]);
 
-    let unchanged = observe(&mut store, collection, &succinct, &mut checkpoint, |_| {
-        Ok(())
-    })?;
+    let unchanged = observe(
+        &mut store,
+        collection,
+        raw,
+        accelerated,
+        &mut checkpoint,
+        |_| Ok(()),
+    )?;
     assert!(unchanged.is_empty());
 
     println!("incremental titles: {first:?}, then {retry:?}");

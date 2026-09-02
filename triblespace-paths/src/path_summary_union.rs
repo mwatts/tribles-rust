@@ -17,6 +17,7 @@
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 use triblespace_core::prelude::entity;
 
 use triblespace_core::attribute::Attribute;
@@ -44,7 +45,8 @@ use crate::persistence::{
     path_transition_from, path_transition_kind, path_transition_label, path_transition_to,
 };
 use crate::{
-    Automaton, GraphEdge, PathSummary, PathSummaryBlob, PathSummaryBlobError, Step, Transition,
+    Automaton, GraphEdge, PathError, PathIndex, PathSummary, PathSummaryBlob, PathSummaryBlobError,
+    Step, Transition,
 };
 
 /// Failure to lower one canonical source member through the regular-path mapping.
@@ -295,6 +297,7 @@ impl TryFromCover<PathSummaryBlob> for PathSummaryView {
 
     fn try_from_cover<R>(
         cover: &Cover<PathSummaryBlob>,
+        _descriptor: &Fragment,
         snapshot: &R,
     ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
@@ -312,6 +315,71 @@ impl TryFromCover<PathSummaryBlob> for PathSummaryView {
             cover: cover.clone(),
             segments,
         })
+    }
+}
+
+/// Failure to close one realized path-summary cover into its endpoint index.
+#[derive(Debug)]
+pub enum PathIndexViewError {
+    /// The target descriptor did not carry one valid regular-path automaton.
+    Descriptor(CollectionOperationError),
+    /// A selected summary did not decode under the descriptor's automaton.
+    Summary(PathSummaryBlobError),
+    /// Closing the joined summary into the accepted endpoint relation failed.
+    Index(PathError),
+}
+
+impl fmt::Display for PathIndexViewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Descriptor(source) => source.fmt(formatter),
+            Self::Summary(source) => source.fmt(formatter),
+            Self::Index(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PathIndexViewError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Descriptor(source) => Some(source),
+            Self::Summary(source) => Some(source),
+            Self::Index(source) => Some(source),
+        }
+    }
+}
+
+impl TryFromCover<PathSummaryBlob> for Arc<PathIndex> {
+    type Error = PathIndexViewError;
+
+    fn try_from_cover<R>(
+        cover: &Cover<PathSummaryBlob>,
+        descriptor: &Fragment,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
+    where
+        R: triblespace_core::repo::BlobStoreGet,
+    {
+        let automaton = automaton_from_descriptor(descriptor)
+            .map_err(PathIndexViewError::Descriptor)
+            .map_err(TryFromCoverError::View)?;
+        let mut joined = PathSummaryBlob::empty(&automaton);
+        for handle in cover.members() {
+            let member = Handle::<PathSummaryBlob>::to_hash(handle);
+            let segment = snapshot
+                .get(handle)
+                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            joined = PathSummaryBlob::join(&joined, &segment, &automaton)
+                .map_err(PathIndexViewError::Summary)
+                .map_err(TryFromCoverError::View)?;
+        }
+        let summary = PathSummaryBlob::decode(joined, &automaton)
+            .map_err(PathIndexViewError::Summary)
+            .map_err(TryFromCoverError::View)?;
+        PathIndex::from_summary(summary)
+            .map(Arc::new)
+            .map_err(PathIndexViewError::Index)
+            .map_err(TryFromCoverError::View)
     }
 }
 

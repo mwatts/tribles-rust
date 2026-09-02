@@ -42,7 +42,7 @@ use super::encoding::{
     collection_member_availability, collection_member_structural_availability,
     CollectionMemberAvailability,
 };
-use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
+use super::exact_derived::CollectionRealizationError;
 use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
     collection_complete_physical_cover, descriptor, discover_collection_records_authorized,
@@ -558,8 +558,13 @@ impl<L: CollectionEncoding> PartialEq for Cover<L> {
 
 impl<L: CollectionEncoding> Eq for Cover<L> {}
 
-/// Typed exact cover of the canonical fact collection.
-pub type FactCover = Cover<SimpleArchive>;
+/// Denotational support shared by every representation of one logical value.
+///
+/// Support is the set of distinct admitted `COMMIT.data` handles in the
+/// foundational [`SimpleArchive`] collection. `MERGE` and `DERIVE` change the
+/// physical cover, never this value. Several authorized commits may attest the
+/// same payload without creating multiple support members.
+pub type Support = Cover<SimpleArchive>;
 
 /// Failure to combine covers from distinct collection lattices.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -875,6 +880,12 @@ impl<RecordsError, GetError, ViewError, EvidenceError> From<TryFromCoverError<Ge
 {
     fn from(source: TryFromCoverError<GetError, ViewError>) -> Self {
         match source {
+            TryFromCoverError::DescriptorGet { collection, source } => {
+                Self::DescriptorGet { collection, source }
+            }
+            TryFromCoverError::InvalidDescriptor { collection, source } => {
+                Self::InvalidDescriptor { collection, source }
+            }
             TryFromCoverError::MemberGet { member, source } => Self::MemberGet { member, source },
             TryFromCoverError::View(source) => Self::View(source),
         }
@@ -1570,10 +1581,15 @@ impl<L: CollectionEncoding> Collection<L> {
         S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
         V: TryFromCover<L>,
     {
-        let (_descriptor, discovered, admitted) =
+        let (descriptor, discovered, admitted) =
             discover_admitted_cover_at(snapshot, self, instant)
                 .map_err(CollectionMaterializationError::from)?;
-        materialize_cover_from_observation::<S, L, V, _>(snapshot, discovered, admitted)
+        materialize_cover_from_observation::<S, L, V, _>(
+            snapshot,
+            &descriptor,
+            discovered,
+            admitted,
+        )
     }
 
     /// Read one logical value, sampling the clock exactly once.
@@ -1642,6 +1658,8 @@ impl<L: CollectionEncoding> Cover<L> {
         S: BlobStoreGet + BlobStoreMeta + CollectionRead,
         V: TryFromCover<L>,
     {
+        let descriptor = load_collection_descriptor(snapshot, self.collection().handle())
+            .map_err(CollectionMaterializationError::from)?;
         let discovered = if self.is_empty() {
             DiscoveredCollectionRecords::default()
         } else {
@@ -1650,6 +1668,7 @@ impl<L: CollectionEncoding> Cover<L> {
         };
         materialize_cover_from_observation::<S, L, V, Infallible>(
             snapshot,
+            &descriptor.fragment,
             discovered,
             self.clone(),
         )
@@ -1672,43 +1691,43 @@ impl<L: CollectionEncoding> Cover<L> {
 /// Immutable collection observations implemented by every complete store snapshot.
 ///
 /// A snapshot is the temporal boundary. The returned [`CollectionSnapshot`]
-/// therefore owns this exact store observation together with frozen source
-/// support and the physical target cover selected inside it.
+/// therefore owns this exact store observation together with invariant
+/// foundational [`Support`] and the physical target cover selected inside it.
 pub trait CollectionSnapshotExt: StoreRead + Sized {
-    /// Observe the target realization for an authored source's support admitted
-    /// in this snapshot.
-    fn collection<M>(
+    /// Observe what one collection actually contains in this snapshot.
+    ///
+    /// The result selects the maximal resident target antichain and pairs it
+    /// with exactly the foundational support represented by that antichain.
+    /// Admitted but not yet derived support is deliberately absent: immutable
+    /// observations never promise work which happened after their boundary.
+    fn collection<E>(
         &self,
-        target: &ExactDerivedCollection<M>,
-    ) -> Result<CollectionSnapshot<Self, M::Source, M::Target>, ExactDerivedCollectionError>
+        target: Collection<E>,
+    ) -> Result<CollectionSnapshot<Self, E>, CollectionRealizationError>
     where
-        M: CollectionMapping<Source = SimpleArchive>,
-        Handle<M::Source>: InlineEncoding,
-        Handle<M::Target>: InlineEncoding,
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
     {
-        let support = target.source_collection().admitted(self).map_err(|error| {
-            ExactDerivedCollectionError::storage("admit source collection", error)
-        })?;
-        self.collection_exact(target, &support)
+        let (support, cover) = super::exact_derived::attach_collection(self, target, None)?;
+        Ok(CollectionSnapshot::new(self.clone(), support, cover))
     }
 
-    /// Observe the target realization for one explicit foundational support cover.
-    fn collection_exact<M>(
+    /// Observe the complete target realization for one explicit support.
+    ///
+    /// Unlike [`Self::collection`], this is an assertion boundary: it fails if
+    /// the exact requested support is not fully realized in this snapshot.
+    fn collection_exact<E>(
         &self,
-        target: &ExactDerivedCollection<M>,
-        support: &Cover<M::Source>,
-    ) -> Result<CollectionSnapshot<Self, M::Source, M::Target>, ExactDerivedCollectionError>
+        target: Collection<E>,
+        support: &Support,
+    ) -> Result<CollectionSnapshot<Self, E>, CollectionRealizationError>
     where
-        M: CollectionMapping,
-        Handle<M::Source>: InlineEncoding,
-        Handle<M::Target>: InlineEncoding,
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
     {
-        let cover = target.attach(self, support)?;
-        Ok(CollectionSnapshot::new(
-            self.clone(),
-            support.clone(),
-            cover,
-        ))
+        let (support, cover) =
+            super::exact_derived::attach_collection(self, target, Some(support))?;
+        Ok(CollectionSnapshot::new(self.clone(), support, cover))
     }
 }
 
@@ -1777,62 +1796,57 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         ))
     }
 
-    /// Ensure the currently admitted support in a derived collection whose
-    /// source is an authored `SimpleArchive` collection.
+    /// Ensure the currently admitted support in one derived collection.
     ///
     /// Admission is frozen through one pre-work snapshot, so concurrent
     /// commits cannot extend the requested support indefinitely. Only missing
-    /// cross-lattice `DERIVE` work is published. The returned collection
-    /// snapshot keeps that frozen support inseparable from the post-work store
-    /// observation and the best target realization visible there.
+    /// cross-lattice `DERIVE` work is published. The returned store snapshot
+    /// observes everything durably published by this work and by any
+    /// concurrent writer. Call [`CollectionSnapshotExt::collection`] on it to
+    /// select the best target realization actually visible at that boundary.
     fn ensure<M>(
         &mut self,
-        target: &ExactDerivedCollection<M>,
-    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
-    where
-        M: CollectionMapping<Source = SimpleArchive>,
-        Self: Store,
-        Handle<M::Source>: InlineEncoding,
-        Handle<M::Target>: InlineEncoding,
-    {
-        let before = self.snapshot().map_err(|error| {
-            ExactDerivedCollectionError::storage("freeze pre-ensure snapshot", error)
-        })?;
-        let support = target
-            .source_collection()
-            .admitted(&before)
-            .map_err(|error| {
-                ExactDerivedCollectionError::storage("admit source collection", error)
-            })?;
-        drop(before);
-        self.ensure_exact(target, &support)
-    }
-
-    /// Ensure one explicit source support in a derived collection.
-    ///
-    /// The source collection is carried by `source`; the target descriptor
-    /// carries the mapping parameters and policy. Existing merge equations may
-    /// be reused, but this operation only publishes missing `DERIVE` work.
-    fn ensure_exact<M>(
-        &mut self,
-        target: &ExactDerivedCollection<M>,
-        support: &Cover<M::Source>,
-    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
+        target: Collection<M::Target>,
+    ) -> Result<Self::Snapshot, CollectionRealizationError>
     where
         M: CollectionMapping,
         Self: Store,
-        Handle<M::Source>: InlineEncoding,
         Handle<M::Target>: InlineEncoding,
     {
-        target.ensure_exact(self, support)?;
-        let snapshot = self.snapshot().map_err(|error| {
-            ExactDerivedCollectionError::storage("freeze post-ensure snapshot", error)
+        let before = self.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("freeze pre-ensure snapshot", error)
         })?;
-        snapshot.collection_exact(target, support)
+        let foundation = super::exact_derived::foundation(&before, target)?;
+        let support = foundation
+            .admitted(&before)
+            .map_err(|error| CollectionRealizationError::storage("admit support", error))?;
+        drop(before);
+        self.ensure_exact::<M>(target, &support)
     }
 
-    /// Ensure and maintain the currently admitted support in a derived
-    /// collection whose source is an authored `SimpleArchive` collection.
+    /// Ensure one explicit foundational support in a derived collection.
+    ///
+    /// The target descriptor carries its immediate source, mapping parameters,
+    /// and policy. Existing equations may be reused, but this operation only
+    /// publishes missing `DERIVE` work.
+    fn ensure_exact<M>(
+        &mut self,
+        target: Collection<M::Target>,
+        support: &Support,
+    ) -> Result<Self::Snapshot, CollectionRealizationError>
+    where
+        M: CollectionMapping,
+        Self: Store,
+        Handle<M::Target>: InlineEncoding,
+    {
+        super::exact_derived::ensure_exact::<Self, M>(self, target, support)?;
+        self.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("freeze post-ensure snapshot", error)
+        })
+    }
+
+    /// Ensure and maintain the currently admitted foundational support in one
+    /// derived collection.
     ///
     /// The admitted support is frozen once before work begins. Maintenance has
     /// no caller-visible budget or tuning knob: the encoding's deterministic
@@ -1840,47 +1854,43 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// useful carry independently on the way.
     fn maintain<M>(
         &mut self,
-        target: &ExactDerivedCollection<M>,
-    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
+        target: Collection<M::Target>,
+    ) -> Result<Self::Snapshot, CollectionRealizationError>
     where
-        M: CollectionMapping<Source = SimpleArchive>,
+        M: CollectionMapping,
         Self: Store,
-        Handle<M::Source>: InlineEncoding,
         Handle<M::Target>: InlineEncoding,
     {
         let before = self.snapshot().map_err(|error| {
-            ExactDerivedCollectionError::storage("freeze pre-maintenance snapshot", error)
+            CollectionRealizationError::storage("freeze pre-maintenance snapshot", error)
         })?;
-        let support = target
-            .source_collection()
+        let foundation = super::exact_derived::foundation(&before, target)?;
+        let support = foundation
             .admitted(&before)
-            .map_err(|error| {
-                ExactDerivedCollectionError::storage("admit source collection", error)
-            })?;
+            .map_err(|error| CollectionRealizationError::storage("admit support", error))?;
         drop(before);
-        self.maintain_exact(target, &support)
+        self.maintain_exact::<M>(target, &support)
     }
 
-    /// Ensure one explicit source support, then maintain its target LSM cover.
+    /// Ensure one explicit foundational support, then maintain its target LSM
+    /// cover.
     ///
     /// This is the explicit-support counterpart of [`Self::maintain`] and uses
     /// the same deterministic fixed-point policy.
     fn maintain_exact<M>(
         &mut self,
-        target: &ExactDerivedCollection<M>,
-        support: &Cover<M::Source>,
-    ) -> Result<CollectionSnapshot<Self::Snapshot, M::Source, M::Target>, ExactDerivedCollectionError>
+        target: Collection<M::Target>,
+        support: &Support,
+    ) -> Result<Self::Snapshot, CollectionRealizationError>
     where
         M: CollectionMapping,
         Self: Store,
-        Handle<M::Source>: InlineEncoding,
         Handle<M::Target>: InlineEncoding,
     {
-        target.maintain_exact(self, support)?;
-        let snapshot = self.snapshot().map_err(|error| {
-            ExactDerivedCollectionError::storage("freeze post-maintenance snapshot", error)
-        })?;
-        snapshot.collection_exact(target, support)
+        super::exact_derived::maintain_exact::<Self, M>(self, target, support)?;
+        self.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("freeze post-maintenance snapshot", error)
+        })
     }
 
     /// Publish one signed fragment into an already registered collection.
@@ -2075,6 +2085,7 @@ where
 /// same immutable snapshot.
 fn materialize_cover_from_observation<S, L, V, EvidenceError>(
     snapshot: &S,
+    descriptor: &Fragment,
     discovered: DiscoveredCollectionRecords,
     cover: Cover<L>,
 ) -> Result<
@@ -2094,5 +2105,5 @@ where
     let physical = resolve_physical_cover_from_observation::<S, L, V::Error, EvidenceError>(
         snapshot, discovered, cover,
     )?;
-    V::try_from_cover(&physical, snapshot).map_err(CollectionMaterializationError::from)
+    V::try_from_cover(&physical, descriptor, snapshot).map_err(CollectionMaterializationError::from)
 }

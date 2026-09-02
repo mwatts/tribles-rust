@@ -71,13 +71,13 @@ seen earlier when a new fact supplies another proof. Applications that require
 global once-only delivery retain the projected tuples they have consumed;
 applications interested in witness events should project the witness identity.
 
-## Use collection covers as continuation tokens
+## Use foundational support as the continuation token
 
-A `Cover` is the exact set of distinct payload handles observed by one
-collection discovery pass. Its PATCH-backed membership makes a natural
-storage-level continuation token. `Cover::additions_since` verifies that the
-earlier payload set remains a subset of the later set and returns a cover
-containing only newly observed members:
+A `Support` is exactly the `Cover<SimpleArchive>` of distinct foundational
+payload handles represented by one immutable collection snapshot. Its
+PATCH-backed membership makes a natural storage-level continuation token.
+`Cover::additions_since` verifies that the earlier support remains a subset of
+the later support and returns only newly observed members:
 
 ```rust,ignore
 {{#include ../../examples/collection_pattern_changes.rs:collection_pattern_changes_observe}}
@@ -94,24 +94,28 @@ does, to make a failed fold retry the same support.
 
 The two pattern inputs need not share a representation. The runnable example
 (`cargo run --example collection_pattern_changes`) uses immutable
-`CollectionSnapshot` values which own the store observation, source support,
-and realized Succinct target cover. Their shard-preserving query values are
-materialized later with `view`. The initial `maintain_exact` directly returns
-the first collection snapshot. For a strict extension, `advance` first
-maintains the exact added support, then
-the complete current support. The second step reuses the first through
-ordinary persisted `DERIVE` and `MERGE` equations and retains the compact
-target LSM cover; it does not union two temporary views or reconstruct a
+`CollectionSnapshot<R, E>` values which own the store observation,
+foundational support, and realized target cover. Their shard-preserving query
+values are reconstructed later with `view`.
+
+For a strict extension, compute `changed_support =
+current_support.additions_since(previous.support())`. Run `ensure_exact` or
+`maintain_exact` for that same foundational support through each desired
+mapping edge, then ask the returned store snapshot for
+`collection_exact(target, &changed_support)`. Do the same for complete
+`current_support` to obtain `full`. Every hop receives the same support; no
+intermediate physical cover becomes a watermark. Persisted `DERIVE` and
+`MERGE` equations make repeated work idempotent and let the complete path reuse
+the delta work without unioning temporary views or reconstructing a
 `TribleSet`.
 
-`advance` is functional. It leaves the previous snapshot untouched and returns
-`Advanced { next, changed }`, `Unchanged`, or `Reset { next }` when the source
-cover shrank. The consumer adopts `next` only after its complete fallible fold
-succeeds. A failed consumer therefore retries the same exact Succinct delta;
-already completed lattice work is merely reattached on that retry. A reset
-replaces accumulated application state from the complete `next` view. Exact
-covers ensure that payloads first observed after `current` cannot leak into
-either input merely because their blobs are already resident.
+Keep the previous collection snapshot until the complete fallible fold
+succeeds. A failed consumer therefore retries the same exact delta, while
+already completed lattice work is merely rediscovered. If the previous support
+is no longer a subset, `CoverAdvanceError::ResetRequired` asks the application
+to rebuild from the complete current snapshot. Exact support prevents payloads
+first observed after the chosen store watermark from leaking into either query
+input merely because their blobs are resident later.
 
 Payload support is deliberately not an exact fact difference. A new payload
 may repeat a fact already present, and that new witness may legitimately make a

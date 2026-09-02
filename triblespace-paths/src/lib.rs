@@ -13,6 +13,7 @@ mod automaton;
 mod constraint;
 mod expr;
 mod index;
+#[cfg(test)]
 mod path_collection;
 pub mod path_summary_union;
 mod persistence;
@@ -22,10 +23,9 @@ pub use automaton::{Automaton, AutomatonError, StateId, Step, Transition};
 pub use constraint::PathConstraint;
 pub use expr::PathExpr;
 pub use index::PathIndex;
-pub use path_collection::{PathSummaryCollection, PathSummaryCollectionError};
 pub use path_summary_union::{
-    PathSummaryView, RegularPathMapping, RegularPathMappingError, RegularPathMappingV1,
-    REGULAR_PATH_MAPPING_V1,
+    PathIndexViewError, PathSummaryView, RegularPathMapping, RegularPathMappingError,
+    RegularPathMappingV1, REGULAR_PATH_MAPPING_V1,
 };
 pub use persistence::{
     automaton_fingerprint, path_automaton_accepting_state, path_automaton_fingerprint,

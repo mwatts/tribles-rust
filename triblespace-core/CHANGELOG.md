@@ -22,7 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `collection(name, policy)`, `derive(source, mapping, policy)`, and the raw
   `register_collection::<E>(descriptor)` boundary. `CollectionMapping` now
   carries associated `Source` and `Target` encodings plus its concrete mapping
-  fragment, and `ExactDerivedCollection` needs only the mapping type.
+  fragment. Store snapshots expose immutable typed collection observations;
+  mutating ensure/maintain operations take only the target and mapping type and
+  return a fresh store snapshot.
+
+- Define foundational `Support` as exactly `Cover<SimpleArchive>` and preserve
+  it unchanged across every mapping hop. `CollectionSnapshot<R, E>` pairs one
+  store watermark with that support and its resident target cover. Remove the
+  lifecycle facades and synthetic collection-record entity IDs; exact native
+  records carry semantics and provenance, while full-width fingerprints remain
+  nonsemantic storage and transport keys.
 
 - Make every collection member an ordinary typed `Blob<E>`.
   `CollectionEncoding` validates that blob and defines one canonical join;

@@ -1,229 +1,140 @@
-//! Deterministic size-tiered maintenance for derived target collections.
+//! Deterministic horizontal LSM maintenance in one collection lattice.
 //!
-//! This is the horizontal half of [`ExactDerivedCollection::maintain_exact`]. It starts
-//! from a completed cover and publishes deterministic pairwise-disjoint
-//! canonical target carries before re-entering the per-point planner.
-//! A later failed or capacity-limited join does not erase earlier useful work.
-//! The source cover remains the value boundary, and yard/GC policy alone decides
-//! the lifetime of materialized nodes.
+//! Vertical realization is complete before this module runs.  Carries only
+//! join target members and publish target `MERGE` equations.  A capacity limit
+//! or a missing optional join dependency keeps the finer cover; it never
+//! triggers construction in an upstream lattice.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::InlineEncoding;
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::repo::{BlobStoreGet, Store};
 
-use super::exact_derived::{
-    data_identity, ExactDerivedCollection, ExactDerivedCollectionError, ExactPlannerBlocks,
-};
+use super::exact_derived::{attach_collection, data_identity, CollectionRealizationError};
 use super::{
-    CollectionData, CollectionEncoding, CollectionMapping, CollectionMerge,
-    CollectionOperationError, CollectionRead, CollectionRecord, CollectionStore, Cover,
+    Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
+    CollectionRecord, Cover, Support,
 };
 
-/// Complete and maintain one canonical target cover.
-///
-/// The fixed policy assigns each canonical target blob to
-/// `floor(log2(max(1, serialized_len)))`, then repeatedly joins the two lowest
-/// content handles in the lowest colliding tier. A stable cover therefore has
-/// at most one physical member per dyadic byte-size tier, except when a fixed
-/// representation cannot encode the join. A capacity-stable cover may retain colliding members:
-/// the lower member is retired for that planning round while the higher member
-/// remains eligible for the next pair. Every capacity-limited attempt shrinks the active set, so a
-/// round attempts at most `n - 1` pairs. No policy knobs, manifest, receipt,
-/// signed record, retention record, or implicit flush are involved.
-///
-/// Each maintenance round takes the lowest actionable colliding tier and pairs
-/// its members in content-handle order. Every selected pair is disjoint, so a
-/// successful publication cannot invalidate a later pair. Each join uses one
-/// cheap immutable store snapshot, drops it, and immediately stores its result
-/// before the `MERGE` record. This retains at most one newly constructed output
-/// while avoiding a full semantic re-probe between independent carries. The
-/// per-point planner then observes the fresh batch before another dyadic tier
-/// is chosen. Freshly selected covers are carried again when concurrent or
-/// older evidence exposes another collision. Repetition of any non-stable
-/// canonical cover returns [`ExactDerivedCollectionError::Stalled`].
-pub(super) fn maintain_target<S, H>(
-    exact: &ExactDerivedCollection<H>,
+/// Carry one exact target realization to its deterministic dyadic LSM fixed
+/// point.
+pub(super) fn maintain_target<S, E>(
     store: &mut S,
-    source_cover: &Cover<H::Source>,
-) -> Result<Cover<H::Target>, ExactDerivedCollectionError>
+    target: Collection<E>,
+    support: &Support,
+) -> Result<(), CollectionRealizationError>
 where
-    S: BlobStore + CollectionStore,
-    S::Snapshot: BlobStoreMeta + CollectionRead,
-    H: CollectionMapping,
-    Handle<H::Source>: InlineEncoding,
-    Handle<H::Target>: InlineEncoding,
+    S: Store,
+    E: CollectionEncoding,
 {
-    let mut blocks = ExactPlannerBlocks::default();
-    let mut blocked_target_merges = BTreeSet::new();
-    let mut cover = exact.ensure_exact_with_blocks(store, source_cover, &mut blocks)?;
+    let mut blocked = BTreeSet::new();
     let mut seen = BTreeSet::new();
-    seen.insert(cover_identity(&cover));
 
     loop {
-        match publish_round::<S, H>(
-            exact,
-            store,
-            source_cover,
-            cover,
-            &mut blocked_target_merges,
-        )? {
-            RoundOutcome::TargetPublished => {}
-            RoundOutcome::Stable(cover) => return Ok(cover),
-        }
-        // Every successful carry can create an exact child image for a known
-        // source-lattice point. Re-enter vertical planning before choosing the
-        // next global size-tiered pair.
-        cover = exact.ensure_exact_with_blocks(store, source_cover, &mut blocks)?;
+        let snapshot = store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("open target-maintenance snapshot", error)
+        })?;
+        let (_, cover) = attach_collection(&snapshot, target, Some(support))?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
-            return Err(ExactDerivedCollectionError::Stalled { cover: identity });
+            return Err(CollectionRealizationError::Stalled { cover: identity });
         }
+        let prepared = prepare_next_carry(&snapshot, target, &cover, &mut blocked)?;
+        drop(snapshot);
+
+        let Some((low, high, output)) = prepared else {
+            return Ok(());
+        };
+        let result = data_identity::<E>(&output);
+        store.put::<E, _>(output).map_err(|error| {
+            CollectionRealizationError::storage("store merged target member", error)
+        })?;
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                target.handle(),
+                low,
+                high,
+                result,
+            )))
+            .map_err(|error| CollectionRealizationError::storage("publish target MERGE", error))?;
     }
 }
 
-fn target_tier<Target: CollectionEncoding>(blob: &Blob<Target>) -> u32 {
+fn tier<E: CollectionEncoding>(blob: &Blob<E>) -> u32 {
     blob.bytes.len().max(1).ilog2()
 }
 
-fn cover_identity<Target: CollectionEncoding>(cover: &Cover<Target>) -> Vec<CollectionData> {
-    cover.members().map(Handle::<Target>::to_hash).collect()
+fn cover_identity<E: CollectionEncoding>(cover: &Cover<E>) -> Vec<CollectionData> {
+    cover.data_members().collect()
 }
 
-enum RoundOutcome<Target: CollectionEncoding> {
-    TargetPublished,
-    Stable(Cover<Target>),
-}
-
-fn publish_round<S, Mapping>(
-    exact: &ExactDerivedCollection<Mapping>,
-    store: &mut S,
-    source_cover: &Cover<Mapping::Source>,
-    cover: Cover<Mapping::Target>,
-    blocked_target_merges: &mut BTreeSet<(CollectionData, CollectionData)>,
-) -> Result<RoundOutcome<Mapping::Target>, ExactDerivedCollectionError>
+fn prepare_next_carry<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    cover: &Cover<E>,
+    blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
+) -> Result<Option<(CollectionData, CollectionData, Blob<E>)>, CollectionRealizationError>
 where
-    S: BlobStore + CollectionStore,
-    S::Snapshot: BlobStoreMeta + CollectionRead,
-    Mapping: CollectionMapping,
-    Handle<Mapping::Source>: InlineEncoding,
-    Handle<Mapping::Target>: InlineEncoding,
+    R: BlobStoreGet + crate::repo::BlobStoreMeta,
+    E: CollectionEncoding,
 {
     if cover.len() < 2 {
-        return Ok(RoundOutcome::Stable(cover));
+        return Ok(None);
     }
-
-    let collection = exact.target_collection();
-    let reader = store.snapshot().map_err(|source| {
-        ExactDerivedCollectionError::storage("open target-maintenance snapshot", source)
-    })?;
-    let descriptor = super::api::load_collection_descriptor(&reader, collection.handle())
+    let descriptor = super::api::load_collection_descriptor(snapshot, target.handle())
         .map_err(|error| {
-            ExactDerivedCollectionError::Resolution(format!("load target descriptor: {error}"))
+            CollectionRealizationError::Resolution(format!(
+                "load target descriptor for maintenance: {error}"
+            ))
         })?
         .fragment;
-    super::encoding::validate_descriptor_type::<Mapping::Target>(&descriptor).map_err(|error| {
-        ExactDerivedCollectionError::Resolution(format!("invalid target descriptor: {error}"))
+    super::encoding::validate_descriptor_type::<E>(&descriptor).map_err(|error| {
+        CollectionRealizationError::Resolution(format!(
+            "invalid target descriptor for maintenance: {error}"
+        ))
     })?;
-    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Mapping::Target>>>::new();
+
+    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<E>>>::new();
     for handle in cover.members() {
-        let data = Handle::<Mapping::Target>::to_hash(handle);
-        let blob = reader.get(handle).map_err(|source| {
-            ExactDerivedCollectionError::storage("load target-maintenance member", source)
+        let data = Handle::<E>::to_hash(handle);
+        let blob = snapshot.get(handle).map_err(|error| {
+            CollectionRealizationError::storage("load target-maintenance member", error)
         })?;
-        let tier = target_tier::<Mapping::Target>(&blob);
-        tiers.entry(tier).or_default().insert(data, blob);
+        tiers.entry(tier(&blob)).or_default().insert(data, blob);
     }
-    drop(reader);
 
-    loop {
-        let Some(tier) = tiers
-            .iter()
-            .find_map(|(tier, bin)| (bin.len() >= 2).then_some(*tier))
-        else {
-            return Ok(RoundOutcome::Stable(cover));
-        };
-        let mut bin = tiers.remove(&tier).expect("selected tier exists");
-        let mut published = false;
-
-        'pairs: while bin.len() >= 2 {
-            let (low_data, low) = bin.pop_first().expect("colliding tier has a low input");
-            let (high_data, high) = bin.pop_first().expect("colliding tier has a high input");
-            if blocked_target_merges.contains(&(low_data, high_data)) {
-                bin.insert(high_data, high);
+    for (_, mut members) in tiers {
+        while members.len() >= 2 {
+            let (low_data, low) = members
+                .pop_first()
+                .expect("colliding target tier contains a lower member");
+            let (high_data, high) = members
+                .pop_first()
+                .expect("colliding target tier contains a higher member");
+            if blocked.contains(&(low_data, high_data)) {
+                members.insert(high_data, high);
                 continue;
             }
-
-            let mut attempted_dependencies = BTreeSet::new();
-            let constructed = loop {
-                let reader = store.snapshot().map_err(|source| {
-                    ExactDerivedCollectionError::storage("open target-merge snapshot", source)
-                })?;
-                let constructed = <Mapping::Target as CollectionEncoding>::join_members(
-                    &descriptor,
-                    &low,
-                    &high,
-                    &reader,
-                );
-                drop(reader);
-                match constructed {
-                    Ok(constructed) => break constructed,
-                    Err(CollectionOperationError::Fatal(reason)) => {
-                        return Err(ExactDerivedCollectionError::Merge {
-                            low: low_data,
-                            high: high_data,
-                            reason,
-                        });
-                    }
-                    Err(CollectionOperationError::Capacity(_)) => {
-                        blocked_target_merges.insert((low_data, high_data));
-                        // Retire only the lower input for this round. The higher
-                        // input remains eligible for the next deterministic pair,
-                        // exactly as in the scalar planner.
-                        bin.insert(high_data, high);
-                        continue 'pairs;
-                    }
-                    Err(CollectionOperationError::MissingDependency(member)) => {
-                        if !attempted_dependencies.insert(member)
-                            || !exact.materialize_target_join_dependency(
-                                store,
-                                source_cover,
-                                low_data,
-                                high_data,
-                                member,
-                            )?
-                        {
-                            return Err(ExactDerivedCollectionError::MissingDependency { member });
-                        }
-                        // Source dependency publication does not change the
-                        // target cover. Retry this exact pair through a fresh
-                        // snapshot rather than mistaking unchanged support for
-                        // a stalled target carry.
-                    }
+            match E::join_members(&descriptor, &low, &high, snapshot) {
+                Ok(output) => return Ok(Some((low_data, high_data, output))),
+                Err(CollectionOperationError::Fatal(reason)) => {
+                    return Err(CollectionRealizationError::Merge {
+                        low: low_data,
+                        high: high_data,
+                        reason,
+                    });
                 }
-            };
-            let result_data = data_identity::<Mapping::Target>(&constructed);
-            let claim = CollectionMerge::new(collection.handle(), low_data, high_data, result_data);
-            store
-                .put::<Mapping::Target, _>(constructed)
-                .map_err(|error| {
-                    ExactDerivedCollectionError::storage("store merged target", error)
-                })?;
-            store
-                .insert(CollectionRecord::Merge(claim))
-                .map_err(|error| {
-                    ExactDerivedCollectionError::storage("publish target MERGE", error)
-                })?;
-            published = true;
+                Err(CollectionOperationError::Capacity(_))
+                | Err(CollectionOperationError::MissingDependency(_)) => {
+                    // Retire the lower input for this planning pass and leave
+                    // the higher one eligible for the next deterministic pair.
+                    // The exact finer cover remains the valid result.
+                    blocked.insert((low_data, high_data));
+                    members.insert(high_data, high);
+                }
+            }
         }
-
-        if published {
-            return Ok(RoundOutcome::TargetPublished);
-        }
-
-        // A capacity-stable lower tier must not hide an actionable higher
-        // tier. Keep scanning the already selected cover until one tier
-        // publishes work or every colliding tier is terminal.
     }
+    Ok(None)
 }

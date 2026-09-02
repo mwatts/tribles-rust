@@ -195,6 +195,50 @@ where
     discover_collection_records_for_cover_selectors(snapshot, cover, &selectors)
 }
 
+/// Discover every stored equation whose collection belongs to one descriptor
+/// lineage.
+///
+/// A foundational [`Cover`] has already crossed admission before this helper
+/// is called, so signed commits are deliberately absent.  `MERGE` equations
+/// are selected for every lattice in the lineage and `DERIVE` equations for
+/// every derived target.  Resolution can then seed only the foundational
+/// support and close the whole chain without treating an intermediate
+/// physical cover as a new denotational root.
+pub(crate) fn discover_collection_equations_for_lineage<S>(
+    snapshot: &S,
+    lineage: &BTreeSet<CollectionHandle>,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionRead,
+{
+    let mut selectors = BTreeSet::new();
+    for collection in lineage {
+        // Whole-collection selection is the pile's indexed path. Selecting
+        // MERGE and DERIVE separately would force a full record scan merely
+        // to discard the same COMMITs below.
+        selectors.insert(CollectionRecordSelector::Collection(*collection));
+    }
+
+    let mut discovered = DiscoveredCollectionRecords::default();
+    for record in snapshot
+        .select_records(&selectors)
+        .map_err(CollectionDiscoveryError::Records)?
+    {
+        match record {
+            CollectionRecord::Commit(_) => {}
+            CollectionRecord::Merge(record) if lineage.contains(&record.collection()) => {
+                discovered.merges.push(record);
+            }
+            CollectionRecord::Derive(record) if lineage.contains(&record.collection()) => {
+                discovered.derives.push(record);
+            }
+            CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => {}
+        }
+    }
+    discovered.canonicalize();
+    Ok(discovered)
+}
+
 /// Discover same-lattice equations that may physically realize one cover.
 ///
 /// The cover is already an opaque constructed value, so this
@@ -477,7 +521,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::collection::{empty_metadata_handle, Collection, CollectionData, FactCover};
+    use crate::collection::{empty_metadata_handle, Collection, CollectionData, Support};
     use crate::inline::encodings::hash::Handle;
     use crate::inline::Inline;
 
@@ -542,8 +586,8 @@ mod tests {
     #[test]
     fn cover_additions_are_payload_set_difference() {
         let target = collection(1);
-        let previous = FactCover::from_members(target, [member(2), member(1), member(1)]);
-        let current = FactCover::from_members(target, [member(3), member(1), member(2), member(3)]);
+        let previous = Support::from_members(target, [member(2), member(1), member(1)]);
+        let current = Support::from_members(target, [member(3), member(1), member(2), member(3)]);
 
         let additions = current.additions_since(&previous).unwrap();
         assert_eq!(additions.members().collect::<Vec<_>>(), vec![member(3)]);
@@ -552,14 +596,14 @@ mod tests {
 
     #[test]
     fn cover_additions_reject_shrink_and_cross_collection() {
-        let first = FactCover::from_members(collection(1), [member(1)]);
-        let empty = FactCover::from_members(collection(1), []);
+        let first = Support::from_members(collection(1), [member(1)]);
+        let empty = Support::from_members(collection(1), []);
         assert_eq!(
             empty.additions_since(&first),
             Err(crate::collection::CoverAdvanceError::ResetRequired { missing: data(1) })
         );
 
-        let foreign = FactCover::from_members(collection(2), [member(1)]);
+        let foreign = Support::from_members(collection(2), [member(1)]);
         assert_eq!(
             foreign.additions_since(&first),
             Err(crate::collection::CoverAdvanceError::DifferentCollection {
@@ -572,8 +616,8 @@ mod tests {
     #[test]
     fn cover_algebra_is_checked_and_patch_backed() {
         let target = collection(1);
-        let left = FactCover::from_members(target, [member(1), member(2)]);
-        let right = FactCover::from_members(target, [member(2), member(3)]);
+        let left = Support::from_members(target, [member(1), member(2)]);
+        let right = Support::from_members(target, [member(2), member(3)]);
 
         assert_eq!(
             left.union(&right).unwrap().members().collect::<Vec<_>>(),
@@ -596,7 +640,7 @@ mod tests {
         assert!(left.intersection(&right).unwrap().is_subset(&left).unwrap());
         assert!(!left.is_subset(&right).unwrap());
 
-        let foreign = FactCover::from_members(collection(2), [member(1)]);
+        let foreign = Support::from_members(collection(2), [member(1)]);
         assert_eq!(
             left.union(&foreign),
             Err(crate::collection::CoverAlgebraError::DifferentCollection {
@@ -670,7 +714,7 @@ mod tests {
         };
 
         let cover =
-            FactCover::from_members(source, [Handle::<SimpleArchive>::from_hash(commit.data())]);
+            Support::from_members(source, [Handle::<SimpleArchive>::from_hash(commit.data())]);
         let discovered =
             discover_collection_records_for_derived_cover(&store, &cover, target.handle()).unwrap();
 

@@ -67,11 +67,10 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::{register_identity, register_orders, RegisterOrder};
-use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use crate::repo::BlobStoreGet;
 use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN, V_START};
 use anybytes::Bytes;
 
-use super::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 #[cfg(test)]
 use super::records::CollectionHandle;
 use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
@@ -80,8 +79,8 @@ use super::simplearchive_union;
 #[cfg(test)]
 use super::CollectionPolicy;
 use super::{
-    Collection, CollectionEncoding, CollectionMapping, CollectionOperationError, CollectionRead,
-    CollectionStore, FactCover, TryFromCover, TryFromCoverError,
+    CollectionEncoding, CollectionMapping, CollectionOperationError, TryFromCover,
+    TryFromCoverError,
 };
 
 const ID_LEN: usize = 16;
@@ -619,6 +618,7 @@ impl TryFromCover<LwwRegisterBlob> for LwwIndex {
 
     fn try_from_cover<R>(
         cover: &super::Cover<LwwRegisterBlob>,
+        _descriptor: &Fragment,
         reader: &R,
     ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
@@ -634,122 +634,6 @@ impl TryFromCover<LwwRegisterBlob> for LwwIndex {
                 combined.union(decode_projection(&segment).map_err(TryFromCoverError::View)?);
         }
         Self::from_projection(combined).map_err(TryFromCoverError::View)
-    }
-}
-
-/// Exact maintained LWW projection of one named root collection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LwwRegisterCollection {
-    source: Collection<SimpleArchive>,
-    target: Collection<LwwRegisterBlob>,
-}
-
-impl LwwRegisterCollection {
-    /// Bind the maintained register facade to store-created source and target values.
-    pub fn new(source: Collection<SimpleArchive>, target: Collection<LwwRegisterBlob>) -> Self {
-        Self { source, target }
-    }
-
-    /// Store-issued source collection.
-    pub fn source_collection(&self) -> Collection<SimpleArchive> {
-        self.source
-    }
-
-    /// Store-issued target collection.
-    pub fn target_collection(&self) -> Collection<LwwRegisterBlob> {
-        self.target
-    }
-
-    /// Attach an already resident exact projection for `source_cover`.
-    pub fn attach<S>(
-        &self,
-        store: &mut S,
-        source_cover: &FactCover,
-    ) -> Result<LwwIndex, LwwRegisterCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let reader = store
-            .snapshot()
-            .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;
-        let cover = self.kernel()?.attach(&reader, source_cover)?;
-        LwwIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
-            TryFromCoverError::MemberGet { source, .. } => {
-                LwwRegisterCollectionError::Snapshot(source.to_string())
-            }
-            TryFromCoverError::View(source) => LwwRegisterCollectionError::Algebra(source),
-        })
-    }
-
-    /// Domain convenience which maintains and materializes the exact projection.
-    ///
-    /// This view-returning facade predates the split snapshot API. It delegates
-    /// to the low-level `maintain_exact` cover executor, takes a fresh snapshot,
-    /// and materializes the `LwwIndex` through that observation.
-    pub fn ensure<S>(
-        &self,
-        store: &mut S,
-        source_cover: &FactCover,
-    ) -> Result<LwwIndex, LwwRegisterCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + CollectionRead,
-    {
-        let cover = self.kernel()?.maintain_exact(store, source_cover)?;
-        let reader = store
-            .snapshot()
-            .map_err(|source| LwwRegisterCollectionError::Snapshot(source.to_string()))?;
-        LwwIndex::try_from_cover(&cover, &reader).map_err(|error| match error {
-            TryFromCoverError::MemberGet { source, .. } => {
-                LwwRegisterCollectionError::Snapshot(source.to_string())
-            }
-            TryFromCoverError::View(source) => LwwRegisterCollectionError::Algebra(source),
-        })
-    }
-
-    fn kernel(
-        &self,
-    ) -> Result<ExactDerivedCollection<RegisterCoordinatesMapping>, ExactDerivedCollectionError>
-    {
-        ExactDerivedCollection::new(self.source, self.target)
-    }
-}
-
-/// Failure to attach or construct one exact maintained LWW cover.
-#[derive(Debug)]
-pub enum LwwRegisterCollectionError {
-    /// Exact-cover resolution, construction, or storage failed.
-    Collection(ExactDerivedCollectionError),
-    /// Canonical projection construction or joining failed.
-    Algebra(LwwRegisterError),
-    /// A store snapshot for the cover could not be frozen.
-    Snapshot(String),
-}
-
-impl fmt::Display for LwwRegisterCollectionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Collection(source) => source.fmt(formatter),
-            Self::Algebra(source) => source.fmt(formatter),
-            Self::Snapshot(source) => write!(formatter, "freeze LWW cover snapshot: {source}"),
-        }
-    }
-}
-
-impl Error for LwwRegisterCollectionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Collection(source) => Some(source),
-            Self::Algebra(source) => Some(source),
-            Self::Snapshot(_) => None,
-        }
-    }
-}
-
-impl From<ExactDerivedCollectionError> for LwwRegisterCollectionError {
-    fn from(source: ExactDerivedCollectionError) -> Self {
-        Self::Collection(source)
     }
 }
 
@@ -1086,20 +970,15 @@ mod tests {
                 target_policy.clone(),
             )
             .unwrap();
-        let collection = LwwRegisterCollection::new(source, target);
         let snapshot = store.snapshot().unwrap();
-        let source_descriptor = crate::collection::api::load_collection_descriptor(
-            &snapshot,
-            collection.source_collection().handle(),
-        )
-        .unwrap()
-        .fragment;
-        let target_descriptor = crate::collection::api::load_collection_descriptor(
-            &snapshot,
-            collection.target_collection().handle(),
-        )
-        .unwrap()
-        .fragment;
+        let source_descriptor =
+            crate::collection::api::load_collection_descriptor(&snapshot, source.handle())
+                .unwrap()
+                .fragment;
+        let target_descriptor =
+            crate::collection::api::load_collection_descriptor(&snapshot, target.handle())
+                .unwrap()
+                .fragment;
 
         assert_eq!(
             descriptor_facts::policy(source_descriptor.facts()),
@@ -1126,7 +1005,6 @@ mod tests {
                 direct_policy(team),
             )
             .unwrap();
-        let collection = LwwRegisterCollection::new(source, target);
         let register = ufoid();
         let state = ufoid();
         let identity_data = archive(&identity(&state, &register));
@@ -1148,20 +1026,25 @@ mod tests {
             &signing_key,
         )
         .unwrap();
-        let source_cover = FactCover::from_data(
-            collection.source_collection(),
-            [identity_commit.data(), order_commit.data()],
-        );
+        let support = Support::from_data(source, [identity_commit.data(), order_commit.data()]);
 
-        let ensured = collection.ensure(&mut store, &source_cover).unwrap();
+        let snapshot = store
+            .maintain_exact::<RegisterCoordinatesMapping>(target, &support)
+            .unwrap();
+        let ensured: LwwIndex = snapshot
+            .collection_exact(target, &support)
+            .unwrap()
+            .view()
+            .unwrap();
         assert_eq!(ensured.winner(*register), Some(*state));
-        assert_eq!(
-            collection
-                .attach(&mut store, &source_cover)
-                .unwrap()
-                .winner(*register),
-            Some(*state)
-        );
+        let attached: LwwIndex = store
+            .snapshot()
+            .unwrap()
+            .collection_exact(target, &support)
+            .unwrap()
+            .view()
+            .unwrap();
+        assert_eq!(attached.winner(*register), Some(*state));
     }
 
     #[test]
