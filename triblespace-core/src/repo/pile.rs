@@ -49,7 +49,7 @@ use crate::blob::TryFromBlob;
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::store::{selectors_match_record, CollectionRead};
 use crate::collection::{
-    CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
+    CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
     CollectionRecordSelector, CollectionStore,
 };
 use crate::id::Id;
@@ -384,10 +384,32 @@ mod blob_occurrence_key {
     crate::key_schema!(Schema, Segments, 40, [0, 1]);
 }
 
+mod collection_record_collection_key {
+    crate::key_segmentation!(Segments, 48, [32, 16]);
+    crate::key_schema!(Schema, Segments, 48, [0, 1]);
+}
+
 type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, XorSip128>;
 type CollectionRecordIndex = PATCH<16, IdentitySchema, CollectionRecord, XorSip128>;
+type CollectionRecordCollectionIndex =
+    PATCH<48, collection_record_collection_key::Schema, (), XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
+
+fn collection_record_collection(record: CollectionRecord) -> CollectionHandle {
+    match record {
+        CollectionRecord::Commit(record) => record.collection(),
+        CollectionRecord::Merge(record) => record.collection(),
+        CollectionRecord::Derive(record) => record.collection(),
+    }
+}
+
+fn collection_record_collection_key(record: CollectionRecord) -> [u8; 48] {
+    let mut key = [0; 48];
+    key[..32].copy_from_slice(&collection_record_collection(record).raw);
+    key[32..].copy_from_slice(&record.id().raw());
+    key
+}
 
 fn first_blob_occurrence(occurrences: &PileBlobIndex, hash: &RawInline) -> Option<IndexEntry> {
     occurrences
@@ -2374,6 +2396,8 @@ pub struct Pile {
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     /// Immutable collection records keyed by their intrinsic entity id.
     collection_records: CollectionRecordIndex,
+    /// Derived selector index keyed by `collection_handle || record_id`.
+    collection_records_by_collection: CollectionRecordCollectionIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     capability_proofs: CapabilityProofIndex,
     /// Exact byte-distinct legacy V3 collection headers accepted during replay.
@@ -2421,6 +2445,7 @@ pub struct PileSnapshot {
     /// validation state inline and is shared across immutable snapshots.
     blobs: PileBlobIndex,
     collection_records: CollectionRecordIndex,
+    collection_records_by_collection: CollectionRecordCollectionIndex,
     capability_proofs: CapabilityProofIndex,
 }
 
@@ -2449,6 +2474,7 @@ impl PileSnapshot {
         opaque_records: usize,
         blobs: PileBlobIndex,
         collection_records: CollectionRecordIndex,
+        collection_records_by_collection: CollectionRecordCollectionIndex,
         capability_proofs: CapabilityProofIndex,
     ) -> Self {
         Self {
@@ -2457,6 +2483,7 @@ impl PileSnapshot {
             opaque_records,
             blobs,
             collection_records,
+            collection_records_by_collection,
             capability_proofs,
         }
     }
@@ -2596,6 +2623,7 @@ impl super::SnapshotSource for Pile {
             self.opaque_records,
             self.blobs.clone(),
             self.collection_records.clone(),
+            self.collection_records_by_collection.clone(),
             self.capability_proofs.clone(),
         ))
     }
@@ -2964,6 +2992,7 @@ impl Pile {
             blobs: PileBlobIndex::new(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: CollectionRecordIndex::new(),
+            collection_records_by_collection: CollectionRecordCollectionIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
@@ -3099,6 +3128,8 @@ impl Pile {
                     self.collection_records
                         .insert(&Entry::with_value(&id.raw(), record));
                 }
+                self.collection_records_by_collection
+                    .insert(&Entry::new(&collection_record_collection_key(record)));
                 Applied::Collection { id }
             }
             PileRecordContent::CapabilityProof {
@@ -3288,6 +3319,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.collection_records);
+            std::ptr::drop_in_place(&mut this.collection_records_by_collection);
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.wants);
@@ -3612,6 +3644,25 @@ impl CollectionRead for PileSnapshot {
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         if selectors.is_empty() {
             return Ok(Vec::new());
+        }
+        if selectors.len() == 1 {
+            if let Some(&CollectionRecordSelector::Collection(collection)) = selectors.first() {
+                let mut ids = Vec::new();
+                self.collection_records_by_collection
+                    .infixes(&collection.raw, |id: &[u8; 16]| ids.push(*id));
+                // Infix traversal follows PATCH's structural tree order, while
+                // CollectionRead promises deterministic intrinsic-id order.
+                ids.sort_unstable();
+                return Ok(ids
+                    .into_iter()
+                    .map(|id| {
+                        *self
+                            .collection_records
+                            .get(&id)
+                            .expect("collection selector index must reference the primary index")
+                    })
+                    .collect());
+            }
         }
         Ok(self
             .collection_records
@@ -6550,6 +6601,82 @@ mod tests {
     }
 
     #[test]
+    fn collection_selector_indexes_variants_and_isolates_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "collection-selector.pile");
+        let collection = collection_test_collection(40);
+        let unrelated_collection = collection_test_collection(41);
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let records = vec![
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                collection,
+                collection_test_hash(43),
+                empty_metadata_handle(),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(
+                collection,
+                collection_test_hash(43),
+                collection_test_hash(44),
+                collection_test_hash(45),
+            )),
+            CollectionRecord::Derive(CollectionDerive::new(
+                collection,
+                collection_test_hash(45),
+                collection_test_hash(46),
+            )),
+        ];
+        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
+            unrelated_collection,
+            collection_test_hash(45),
+            collection_test_hash(47),
+        ));
+        let selector = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.insert(unrelated).unwrap();
+        let before = pile.snapshot().unwrap();
+        for record in records.iter().rev().copied() {
+            pile.insert(record).unwrap();
+        }
+        pile.insert(records[0]).unwrap();
+
+        assert!(before.select_records(&selector).unwrap().is_empty());
+        let after = pile.snapshot().unwrap();
+        assert_eq!(
+            after.select_records(&selector).unwrap(),
+            sorted_collection_records(records.clone())
+        );
+
+        let mixed = BTreeSet::from([
+            CollectionRecordSelector::Collection(collection),
+            CollectionRecordSelector::Id(unrelated.id()),
+        ]);
+        let mut expected_mixed = records;
+        expected_mixed.push(unrelated);
+        assert_eq!(
+            after.select_records(&mixed).unwrap(),
+            sorted_collection_records(expected_mixed)
+        );
+
+        drop(after);
+        drop(before);
+        pile.close().unwrap();
+
+        let mut reopened = Pile::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .unwrap()
+                .select_records(&selector)
+                .unwrap()
+                .len(),
+            3
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn native_collection_records_cat_as_an_order_independent_set_union() {
         let dir = tempfile::tempdir().unwrap();
         let path_a = fresh_empty_pile_path(&dir, "a.pile");
@@ -6576,17 +6703,32 @@ mod tests {
         ba.extend_from_slice(&bytes_a);
         std::fs::write(&path_ba, ba).unwrap();
 
-        let expected = sorted_collection_records(records);
+        let expected = sorted_collection_records(records.clone());
+        let source_expected = sorted_collection_records(records[..2].to_vec());
+        let target_expected = vec![records[2]];
+        let source_selector = BTreeSet::from([CollectionRecordSelector::Collection(
+            collection_test_collection(1),
+        )]);
+        let target_selector = BTreeSet::from([CollectionRecordSelector::Collection(
+            collection_test_collection(2),
+        )]);
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
-            let actual = pile
-                .snapshot()
-                .unwrap()
+            let snapshot = pile.snapshot().unwrap();
+            let actual = snapshot
                 .records()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             assert_eq!(actual, expected);
+            assert_eq!(
+                snapshot.select_records(&source_selector).unwrap(),
+                source_expected
+            );
+            assert_eq!(
+                snapshot.select_records(&target_selector).unwrap(),
+                target_expected
+            );
             pile.close().unwrap();
         }
     }

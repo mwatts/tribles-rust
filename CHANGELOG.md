@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add a derived segmented pile index over `collection handle || record id` so
+  singleton collection-record selection visits only one descriptor's records
+  while preserving the intrinsic-ID index as canonical storage and ordering.
+
 - Replace WANT's per-request LWW assertion/retraction log with one grow-only
   canonical request set. `WantStore::unwant`, every adapter, and direct
   mutation of `MemoryRepo`'s backing set are removed; Blob, Merge, and Derive
