@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crosses TLS, and returned bytes must hash to H. Unsigned remote derived
   artifacts are not mirrored.
 
+### Fixed
+
+- Treat absence of an authenticated remote DHT replica as one topology outage,
+  not as an independent failure of every resident provider key. The publisher
+  preserves the complete pending set behind one exponentially backed-off probe
+  and resumes immediately when a compatible peer appears; authenticated remote
+  `PROVIDER_PUT_FULL` rejections retain their bounded per-key retry semantics,
+  while a responder disappearing after `FIND_NODE` remains a topology outage.
+
 ### Removed
 
 - Remove CONNECT/SYNC_TEAM exchanges, `StoreScope`, durable PEER routing,

@@ -46,8 +46,9 @@ use crate::protocol::{
     recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
 };
 use crate::provider::{
-    ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublisher, ProviderToken,
-    blob_provider_token, collection_provider_key, collection_provider_token, provider_lease_token,
+    ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublisher, ProviderPutResult,
+    ProviderToken, PublicationResult, blob_provider_token, collection_provider_key,
+    collection_provider_token, provider_lease_token,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
@@ -894,7 +895,7 @@ struct RepairOutcome {
 
 struct PublicationOutcome {
     key: ProviderKey,
-    success: bool,
+    result: PublicationResult,
 }
 
 /// Process-lifetime admission gate for DHT provider announcements.
@@ -1336,10 +1337,19 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
         while let Ok(outcome) = publication_rx.try_recv() {
             publications_in_flight.remove(&outcome.key);
-            if !outcome.success && !publisher.retry(outcome.key, crate::clock::mono_now()) {
+            let effect = publisher.complete(outcome.key, outcome.result, crate::clock::mono_now());
+            if effect.topology_outage_started {
+                warn!(
+                    "no authenticated remote DHT replica is reachable; provider publication is paused behind one bounded topology probe"
+                );
+            }
+            if effect.topology_recovered {
+                debug!("authenticated remote DHT replica reached; provider publication resumed");
+            }
+            if effect.retry_budget_full {
                 warn!(
                     key = %hex::encode(&outcome.key[..4]),
-                    "provider retry budget full; exact discovery is degraded until the renewal cursor returns"
+                    "provider retry budget full after an authenticated remote rejected the announcement; exact discovery is degraded until the renewal cursor returns"
                 );
             }
         }
@@ -1536,8 +1546,8 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             let publication_tx = publication_tx.clone();
             let token = provider_lease_token(identity, key, my_id);
             tokio::spawn(async move {
-                let success = client.announce_key(key, token).await;
-                let _ = publication_tx.send(PublicationOutcome { key, success });
+                let result = client.announce_key(key, token).await;
+                let _ = publication_tx.send(PublicationOutcome { key, result });
             });
         }
 
@@ -1711,17 +1721,21 @@ impl<T: Transport> ProviderClient<T> {
         replicas
     }
 
-    async fn put(&self, peer: PeerId, key: ProviderKey, token: ProviderToken) -> bool {
+    async fn put(&self, peer: PeerId, key: ProviderKey, token: ProviderToken) -> ProviderPutResult {
         if peer == self.my_id {
-            return self.providers.lock().unwrap().put(
+            return if self.providers.lock().unwrap().put(
                 key,
                 self.my_id,
                 token,
                 crate::clock::mono_now(),
-            );
+            ) {
+                ProviderPutResult::Accepted
+            } else {
+                ProviderPutResult::ExplicitlyRejected
+            };
         }
         let Ok(connection) = pool_get(&self.transport, &self.pool, peer).await else {
-            return false;
+            return ProviderPutResult::Unavailable;
         };
         match tokio::time::timeout(
             OP_DEADLINE,
@@ -1731,29 +1745,33 @@ impl<T: Transport> ProviderClient<T> {
         {
             Ok(Ok(stored)) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
-                stored
+                if stored {
+                    ProviderPutResult::Accepted
+                } else {
+                    ProviderPutResult::ExplicitlyRejected
+                }
             }
             Ok(Err(_)) | Err(_) => {
                 pool_invalidate(&self.pool, peer, &connection.entry);
-                false
+                ProviderPutResult::Unavailable
             }
         }
     }
 
-    async fn announce_key(&self, key: ProviderKey, token: ProviderToken) -> bool {
+    async fn announce_key(&self, key: ProviderKey, token: ProviderToken) -> PublicationResult {
         let targets = self.lookup_replicas(key).await;
         let mut attempts = futures::stream::iter(targets)
             .map(|peer| async move { (peer, self.put(peer, key, token).await) })
             .buffer_unordered(ALPHA);
-        let mut stored_remotely = false;
-        while let Some((peer, success)) = attempts.next().await {
-            stored_remotely |= remote_lease_accepted(self.my_id, peer, success);
+        let mut publication = PublicationResult::NoAuthenticatedRemoteReplica;
+        while let Some((peer, result)) = attempts.next().await {
+            publication = publication.observe_put(self.my_id, peer, result);
         }
         // A local directory copy is useful for single-node reads but cannot
-        // make this endpoint discoverable after an isolated startup. Keep the
-        // publication in the retry schedule until at least one authenticated
-        // remote replica accepted it.
-        stored_remotely
+        // make this endpoint discoverable after an isolated startup. Preserve
+        // that topology failure separately from a rejection by a remote which
+        // authenticated during this exact lookup.
+        publication
     }
 
     async fn get(&self, peer: PeerId, key: ProviderKey) -> Vec<(PeerId, ProviderToken)> {
@@ -1860,10 +1878,6 @@ fn canonical_provider_subset(
     providers.sort_unstable_by(|left, right| crate::routing::distance_cmp(key, *left, *right));
     providers.truncate(crate::provider::MAX_PROVIDERS_PER_KEY);
     providers
-}
-
-fn remote_lease_accepted(local: PeerId, replica: PeerId, accepted: bool) -> bool {
-    replica != local && accepted
 }
 
 #[derive(Clone)]
@@ -2108,7 +2122,10 @@ mod tests {
     use crate::channel::{NetEvent, NetEventBatch};
     use crate::inventory::{BlobReplication, ReconcileQos};
     use crate::peer::Peer;
-    use crate::provider::{MAX_PROVIDERS_PER_KEY, ProviderObservation, ProviderPublisher};
+    use crate::provider::{
+        MAX_PROVIDERS_PER_KEY, ProviderObservation, ProviderPublisher, ProviderPutResult,
+        PublicationResult,
+    };
     use crate::routing::K;
     use crate::transport::PeerId;
 
@@ -2117,7 +2134,7 @@ mod tests {
         MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProviderPublicationBudget, RepairTarget,
         StoreSnapshot, WakeBootstrapPeers, canonical_provider_subset, enqueue_repair,
         forget_participant, has_repair_candidate, live_participants, observe_participant,
-        remote_lease_accepted, retain_active_repair_state,
+        retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2169,11 +2186,31 @@ mod tests {
     }
 
     #[test]
-    fn local_directory_acceptance_does_not_complete_remote_publication() {
+    fn typed_put_results_separate_topology_loss_from_explicit_rejection() {
         let local = [1; 32];
-        assert!(!remote_lease_accepted(local, local, true));
-        assert!(!remote_lease_accepted(local, [2; 32], false));
-        assert!(remote_lease_accepted(local, [2; 32], true));
+        let remote = [2; 32];
+        assert_eq!(
+            PublicationResult::from_put_results(
+                local,
+                [
+                    (local, ProviderPutResult::Accepted),
+                    (remote, ProviderPutResult::Unavailable),
+                ],
+            ),
+            PublicationResult::NoAuthenticatedRemoteReplica,
+            "local acceptance and a vanished FIND_NODE responder prove no remote publication"
+        );
+        assert_eq!(
+            PublicationResult::from_put_results(
+                local,
+                [(remote, ProviderPutResult::ExplicitlyRejected)],
+            ),
+            PublicationResult::RemoteRejected
+        );
+        assert_eq!(
+            PublicationResult::from_put_results(local, [(remote, ProviderPutResult::Accepted)],),
+            PublicationResult::Published
+        );
     }
 
     #[test]

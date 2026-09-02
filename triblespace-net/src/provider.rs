@@ -152,6 +152,69 @@ struct PublicationCycle {
     next_due: Mono,
 }
 
+struct PublicationTopologyOutage {
+    attempts: u32,
+    retry_at: Mono,
+    probe: Option<ProviderKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationResult {
+    Published,
+    NoAuthenticatedRemoteReplica,
+    RemoteRejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderPutResult {
+    /// The target returned `PROVIDER_PUT_OK`.
+    Accepted,
+    /// The target returned `PROVIDER_PUT_FULL`.
+    ExplicitlyRejected,
+    /// No complete provider-PUT protocol response arrived.
+    Unavailable,
+}
+
+impl PublicationResult {
+    pub(crate) fn observe_put(
+        self,
+        local: PeerId,
+        peer: PeerId,
+        result: ProviderPutResult,
+    ) -> Self {
+        if peer == local {
+            return self;
+        }
+        match (self, result) {
+            (Self::Published, _) | (_, ProviderPutResult::Accepted) => Self::Published,
+            (Self::RemoteRejected, _) | (_, ProviderPutResult::ExplicitlyRejected) => {
+                Self::RemoteRejected
+            }
+            (Self::NoAuthenticatedRemoteReplica, ProviderPutResult::Unavailable) => {
+                Self::NoAuthenticatedRemoteReplica
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_put_results(
+        local: PeerId,
+        results: impl IntoIterator<Item = (PeerId, ProviderPutResult)>,
+    ) -> Self {
+        results.into_iter().fold(
+            Self::NoAuthenticatedRemoteReplica,
+            |publication, (peer, result)| publication.observe_put(local, peer, result),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PublicationEffect {
+    pub(crate) topology_outage_started: bool,
+    pub(crate) topology_recovered: bool,
+    pub(crate) retry_budget_full: bool,
+}
+
 /// Bounded-work publication scheduler for an arbitrarily large resident set.
 ///
 /// Snapshot changes use PATCH difference to queue newly resident keys. One
@@ -167,6 +230,7 @@ pub(crate) struct ProviderPublisher {
     next_renewal: Mono,
     prefer_cycle: bool,
     prefer_retry: bool,
+    topology_outage: Option<PublicationTopologyOutage>,
 }
 
 const MAX_PROVIDER_PUBLICATION_RETRIES: u64 = 1 << 10;
@@ -183,6 +247,7 @@ impl ProviderPublisher {
             next_renewal: now + PROVIDER_RENEWAL_PERIOD,
             prefer_cycle: false,
             prefer_retry: false,
+            topology_outage: None,
         }
     }
 
@@ -220,6 +285,68 @@ impl ProviderPublisher {
             self.retry_at = now + crate::RETRY_BACKOFF_BASE;
         }
         true
+    }
+
+    fn preserve_for_topology_retry(&mut self, key: ProviderKey) {
+        let Some(identity) = self.resident.leases.get(&key).copied() else {
+            return;
+        };
+        self.additions
+            .leases
+            .replace(&PatchEntry::with_value(&key, identity));
+    }
+
+    fn topology_backoff(attempts: u32) -> Duration {
+        let shift = attempts.saturating_sub(1).min(6);
+        crate::RETRY_BACKOFF_BASE
+            .saturating_mul(1u32 << shift)
+            .min(crate::RETRY_BACKOFF_CAP)
+    }
+
+    pub(crate) fn complete(
+        &mut self,
+        key: ProviderKey,
+        result: PublicationResult,
+        now: Mono,
+    ) -> PublicationEffect {
+        match result {
+            PublicationResult::Published => PublicationEffect {
+                topology_recovered: self.topology_outage.take().is_some(),
+                ..PublicationEffect::default()
+            },
+            PublicationResult::RemoteRejected => PublicationEffect {
+                topology_recovered: self.topology_outage.take().is_some(),
+                retry_budget_full: !self.retry(key, now),
+                ..PublicationEffect::default()
+            },
+            PublicationResult::NoAuthenticatedRemoteReplica => {
+                self.preserve_for_topology_retry(key);
+                let topology_outage_started = self.topology_outage.is_none();
+                match &mut self.topology_outage {
+                    Some(outage) if outage.probe == Some(key) => {
+                        outage.probe = None;
+                        outage.attempts = outage.attempts.saturating_add(1);
+                        outage.retry_at = now + Self::topology_backoff(outage.attempts);
+                    }
+                    Some(_) => {
+                        // Other attempts from the bounded pre-outage flight may
+                        // finish after the first one trips the breaker. Preserve
+                        // them, but let only the eventual probe advance backoff.
+                    }
+                    None => {
+                        self.topology_outage = Some(PublicationTopologyOutage {
+                            attempts: 1,
+                            retry_at: now + Self::topology_backoff(1),
+                            probe: None,
+                        });
+                    }
+                }
+                PublicationEffect {
+                    topology_outage_started,
+                    ..PublicationEffect::default()
+                }
+            }
+        }
     }
 
     fn start_cycle_if_due(&mut self, now: Mono) {
@@ -292,7 +419,7 @@ impl ProviderPublisher {
         }
     }
 
-    pub(crate) fn next(&mut self, now: Mono) -> Option<(ProviderKey, ProviderIdentity)> {
+    fn next_ready(&mut self, now: Mono) -> Option<(ProviderKey, ProviderIdentity)> {
         self.start_cycle_if_due(now);
         if self.prefer_cycle
             && let Some(next) = self.pop_cycle(now)
@@ -330,6 +457,25 @@ impl ProviderPublisher {
         let next = self.pop_cycle(now);
         if next.is_some() {
             self.prefer_cycle = false;
+        }
+        next
+    }
+
+    pub(crate) fn next(&mut self, now: Mono) -> Option<(ProviderKey, ProviderIdentity)> {
+        if self
+            .topology_outage
+            .as_ref()
+            .is_some_and(|outage| outage.probe.is_some() || now < outage.retry_at)
+        {
+            return None;
+        }
+        let probing = self.topology_outage.is_some();
+        let next = self.next_ready(now);
+        if probing && let Some((key, _)) = next {
+            self.topology_outage
+                .as_mut()
+                .expect("an active topology outage remains until an outcome")
+                .probe = Some(key);
         }
         next
     }
@@ -941,6 +1087,126 @@ mod tests {
         assert_eq!(
             publisher.next(now + crate::RETRY_BACKOFF_BASE),
             Some((key, token))
+        );
+    }
+
+    #[test]
+    fn find_node_responder_then_put_unavailable_preserves_the_large_pending_sweep() {
+        let now = crate::clock::mono_now();
+        let local = [0x11; 32];
+        let remote = [0x22; 32];
+        let unavailable = PublicationResult::from_put_results(
+            local,
+            [
+                (local, ProviderPutResult::Accepted),
+                (remote, ProviderPutResult::Unavailable),
+            ],
+        );
+        assert_eq!(unavailable, PublicationResult::NoAuthenticatedRemoteReplica);
+        let key_count = MAX_PROVIDER_PUBLICATION_RETRIES as usize + 1025;
+        let mut resident = ProviderSet::default();
+        for index in 0..key_count {
+            let key = deterministic_bytes("triblespace.net/isolated-provider-key/v1", index);
+            resident.leases.replace(&PatchEntry::with_value(&key, key));
+        }
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident, now);
+
+        // These are the only attempts that can have left before the first
+        // no-route outcome closes the global breaker.
+        let initial = (0..crate::routing::ALPHA)
+            .map(|_| publisher.next(now).expect("initial publication attempt").0)
+            .collect::<Vec<_>>();
+        for (index, key) in initial.into_iter().enumerate() {
+            let effect = publisher.complete(key, unavailable, now);
+            assert_eq!(effect.topology_outage_started, index == 0);
+        }
+
+        assert_eq!(publisher.additions.leases.len(), key_count as u64);
+        assert!(publisher.retries.leases.is_empty());
+        assert!(publisher.next(now).is_none());
+
+        let retry_at = publisher.topology_outage.as_ref().unwrap().retry_at;
+        let probe = publisher.next(retry_at).expect("one bounded retry probe").0;
+        assert!(publisher.next(retry_at).is_none());
+        let effect = publisher.complete(probe, unavailable, retry_at);
+        assert!(!effect.topology_outage_started);
+        assert_eq!(publisher.additions.leases.len(), key_count as u64);
+        assert!(publisher.retries.leases.is_empty());
+        assert!(publisher.next(retry_at).is_none());
+    }
+
+    #[test]
+    fn authenticated_peer_appearance_releases_the_complete_pending_sweep() {
+        let now = crate::clock::mono_now();
+        let local = [0x11; 32];
+        let remote = [0x22; 32];
+        let unavailable =
+            PublicationResult::from_put_results(local, [(remote, ProviderPutResult::Unavailable)]);
+        let published =
+            PublicationResult::from_put_results(local, [(remote, ProviderPutResult::Accepted)]);
+        let key_count = MAX_PROVIDER_PUBLICATION_RETRIES as usize + 1025;
+        let mut resident = ProviderSet::default();
+        for index in 0..key_count {
+            let key = deterministic_bytes("triblespace.net/resumed-provider-key/v1", index);
+            resident.leases.replace(&PatchEntry::with_value(&key, key));
+        }
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident, now);
+
+        let first = publisher.next(now).unwrap().0;
+        assert!(
+            publisher
+                .complete(first, unavailable, now)
+                .topology_outage_started
+        );
+        let retry_at = publisher.topology_outage.as_ref().unwrap().retry_at;
+        let probe = publisher.next(retry_at).expect("topology retry probe").0;
+        let effect = publisher.complete(probe, published, retry_at);
+
+        assert!(effect.topology_recovered);
+        assert!(publisher.topology_outage.is_none());
+        assert!(publisher.retries.leases.is_empty());
+        let mut published_count = 1;
+        while let Some((key, _)) = publisher.next(retry_at) {
+            let effect = publisher.complete(key, published, retry_at);
+            assert!(!effect.topology_outage_started);
+            published_count += 1;
+        }
+        assert_eq!(published_count, key_count);
+        assert!(publisher.additions.leases.is_empty());
+        assert!(publisher.retries.leases.is_empty());
+    }
+
+    #[test]
+    fn authenticated_remote_rejection_uses_the_per_key_retry_set() {
+        let now = crate::clock::mono_now();
+        let local = [0x11; 32];
+        let remote = [0x22; 32];
+        let rejected = PublicationResult::from_put_results(
+            local,
+            [(remote, ProviderPutResult::ExplicitlyRejected)],
+        );
+        assert_eq!(rejected, PublicationResult::RemoteRejected);
+        let key = [0xA5; 32];
+        let identity = [0x5A; 32];
+        let mut resident = ProviderSet::default();
+        resident
+            .leases
+            .replace(&PatchEntry::with_value(&key, identity));
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident, now);
+
+        assert_eq!(publisher.next(now), Some((key, identity)));
+        let effect = publisher.complete(key, rejected, now);
+        assert!(!effect.topology_outage_started);
+        assert!(!effect.retry_budget_full);
+        assert!(publisher.topology_outage.is_none());
+        assert_eq!(publisher.retries.leases.len(), 1);
+        assert_eq!(publisher.next(now), None);
+        assert_eq!(
+            publisher.next(now + crate::RETRY_BACKOFF_BASE),
+            Some((key, identity))
         );
     }
 
