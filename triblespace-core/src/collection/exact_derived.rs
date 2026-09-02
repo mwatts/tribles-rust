@@ -197,6 +197,7 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
     /// Bind an already constructed observational mapping implementation.
     /// Kept crate-private so public callers cannot swap semantic behavior
     /// between operations on one typed lifecycle.
+    #[cfg(test)]
     pub(crate) fn with_mapping(
         source_collection: Collection<MappingSource<Mapping>>,
         target_collection: Collection<MappingTarget<Mapping>>,
@@ -285,10 +286,6 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
     /// Identity of the target collection.
     pub fn target_collection(&self) -> Collection<MappingTarget<Mapping>> {
         self.target_collection
-    }
-
-    pub(crate) fn mapping_override(&self) -> Option<&Mapping> {
-        self.mapping_override.as_ref()
     }
 
     fn require_source_cover(
@@ -682,11 +679,8 @@ impl<Mapping: CollectionMapping> ExactDerivedCollection<Mapping> {
                     }
                 };
                 let output_data = data_identity::<MappingTarget<Mapping>>(&output);
-                let claim = CollectionDerive::new(
-                    self.target_collection.handle(),
-                    input_data,
-                    output_data,
-                );
+                let claim =
+                    CollectionDerive::new(self.target_collection.handle(), input_data, output_data);
                 store
                     .put::<MappingSource<Mapping>, _>(input)
                     .map_err(|error| {

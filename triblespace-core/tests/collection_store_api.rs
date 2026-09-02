@@ -163,6 +163,26 @@ fn typed_collection_open_accepts_the_registered_encoding() {
 }
 
 #[test]
+fn typed_collection_reads_its_descriptor_local_policy() {
+    let source_root = key(22);
+    let target_root = key(23);
+    let source_policy = policy(source_root.verifying_key());
+    let target_policy = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(target_root.verifying_key()),
+    );
+    let mut store = MemoryRepo::default();
+    let source = store.collection("policy-source", source_policy).unwrap();
+    let target = store
+        .derive(source, SimpleToSuccinctMapping, target_policy.clone())
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+
+    assert_eq!(target.policy(&snapshot).unwrap(), target_policy);
+}
+
+#[test]
 fn typed_collection_open_rejects_the_wrong_encoding() {
     let root = key(21);
     let mut store = MemoryRepo::default();

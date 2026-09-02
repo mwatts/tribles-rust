@@ -5,19 +5,16 @@
 //!
 //! - `ensure`: deterministic size-tiered raw-target maintenance followed by
 //!   the exact Rank9-accelerated derivation.
-//! - `exact_view().advance`: retain already-admitted immutable shards and run
-//!   ordinary exact admission only over newly signed support.
+//! - functional snapshot advancement: maintain exact changed and full
+//!   Succinct covers, then return immutable candidates to the caller.
 //!
 //! Stateless `ensure` gets an independent warm store, a source-identical cold
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
-//! state; a bench-local mapping wrapper counts canonical projection calls made
-//! by each timed operation. One untimed read-only raw attachment records the
-//! chosen physical cover and asserts that resident lookup performs zero
-//! algebra. The maintained view reports the projection calls made during its
-//! timed observation, so continuation reuse is measured rather than inferred
-//! from durable writes.
+//! state. One untimed read-only raw attachment records the chosen physical
+//! cover and asserts that resident lookup changes no storage. Snapshot support
+//! accounting lives entirely in this benchmark rather than production code.
 //! No scan or diagnostic touches a measured store before its first timed call
 //! at a checkpoint, and the immediate no-op remains adjacent to that call.
 //!
@@ -35,7 +32,6 @@
 //!   [--commits 64] [--rows-per-commit 1024] [--warmup 1] [--iters 4]
 //! ```
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -50,70 +46,15 @@ use triblespace_core::blob::Blob;
 use triblespace_core::collection::exact_derived::ExactDerivedCollection;
 use triblespace_core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
-    SuccinctArchiveView, SuccinctArchiveViewWork,
+    SuccinctArchiveSnapshot, SuccinctArchiveSnapshotAdvance,
 };
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
-    CollectionPolicy, CollectionRead, CollectionRecord, CollectionStoreExt, Cover,
+    AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionRead,
+    CollectionRecord, CollectionStoreExt, Cover,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::{BlobStoreGet, BlobStoreList};
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct MappingCalls {
-    derive: u64,
-    input_bytes: u64,
-}
-
-thread_local! {
-    static MAPPING_CALLS: Cell<MappingCalls> =
-        const { Cell::new(MappingCalls { derive: 0, input_bytes: 0 }) };
-}
-
-fn reset_mapping_calls() {
-    MAPPING_CALLS.set(MappingCalls::default());
-}
-
-fn mapping_calls() -> MappingCalls {
-    MAPPING_CALLS.get()
-}
-
-struct CountingSuccinctMapping {
-    inner: SimpleToSuccinctMapping,
-}
-
-impl CollectionMapping for CountingSuccinctMapping {
-    type Source = SimpleArchive;
-    type Target = SuccinctArchiveBlob;
-
-    fn fragment(&self) -> Fragment {
-        self.inner.fragment()
-    }
-
-    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
-        Ok(Self {
-            inner: SimpleToSuccinctMapping::bind(source, target)?,
-        })
-    }
-
-    fn map<R>(
-        &self,
-        source: &Blob<SimpleArchive>,
-        reader: &R,
-    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError>
-    where
-        R: triblespace::core::repo::BlobStoreGet + triblespace::core::repo::BlobStoreMeta,
-    {
-        MAPPING_CALLS.with(|slot| {
-            let mut calls = slot.get();
-            calls.derive += 1;
-            calls.input_bytes += source.bytes.len() as u64;
-            slot.set(calls);
-        });
-        self.inner.map(source, reader)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StoreShape {
@@ -248,8 +189,8 @@ enum Arm {
     EnsureWarm,
     EnsureCold,
     EnsureNoop,
-    ViewAdvance,
-    ViewNoop,
+    SnapshotAdvance,
+    SnapshotNoop,
 }
 
 impl Arm {
@@ -258,8 +199,8 @@ impl Arm {
             Self::EnsureWarm => "ensure-warm",
             Self::EnsureCold => "ensure-cold",
             Self::EnsureNoop => "ensure-noop",
-            Self::ViewAdvance => "view-advance",
-            Self::ViewNoop => "view-noop",
+            Self::SnapshotAdvance => "snapshot-advance",
+            Self::SnapshotNoop => "snapshot-noop",
         }
     }
 }
@@ -279,17 +220,20 @@ struct Sample {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Diagnostic {
-    StatelessOperation {
-        calls: MappingCalls,
-        cover: CoverIdentity,
-    },
-    ViewActual(SuccinctArchiveViewWork),
+    StatelessOperation { cover: CoverIdentity },
+    Snapshot(SnapshotSupport),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SnapshotSupport {
+    cover_members: usize,
+    changed_members: usize,
+    reused_members: usize,
 }
 
 struct TimedOperation {
     elapsed: Duration,
     union: UnionArchive<OrderedUniverse>,
-    calls: MappingCalls,
 }
 
 struct RunContext<'a> {
@@ -298,7 +242,7 @@ struct RunContext<'a> {
     newly_supported_rows: u64,
     expected: RelationIdentity,
     succinct: &'a SuccinctArchiveCollection,
-    exact: &'a ExactDerivedCollection<CountingSuccinctMapping>,
+    exact: &'a ExactDerivedCollection<SimpleToSuccinctMapping>,
     collections: &'a Collections,
 }
 
@@ -307,25 +251,20 @@ fn time_ensure(
     cover: &Cover<SimpleArchive>,
     succinct: &SuccinctArchiveCollection,
 ) -> TimedOperation {
-    reset_mapping_calls();
     let start = Instant::now();
-    let union = succinct
+    let snapshot = succinct
         .ensure(store, cover)
         .expect("ensure exact Succinct collection");
     let elapsed = start.elapsed();
-    let calls = mapping_calls();
+    let (_, union) = snapshot.into_parts();
     black_box(union.segment_count());
-    TimedOperation {
-        elapsed,
-        union,
-        calls,
-    }
+    TimedOperation { elapsed, union }
 }
 
 fn observe_raw_cover(
     store: &mut MemoryRepo,
     cover: &Cover<SimpleArchive>,
-    exact: &ExactDerivedCollection<CountingSuccinctMapping>,
+    exact: &ExactDerivedCollection<SimpleToSuccinctMapping>,
 ) -> CoverIdentity {
     // This is outside the timer and must be a zero-write, zero-algebra lookup.
     // The public accelerated phase remains represented by timing and its
@@ -333,16 +272,9 @@ fn observe_raw_cover(
     let diagnostic_before = store
         .snapshot()
         .expect("freeze pre-diagnostic store snapshot");
-    reset_mapping_calls();
     let raw_cover = exact
         .attach(store, cover)
         .expect("observe complete resident raw exact cover");
-    let projection_calls = mapping_calls();
-    assert_eq!(
-        projection_calls,
-        MappingCalls::default(),
-        "resident raw attachment executed collection algebra"
-    );
     let diagnostic_after = store
         .snapshot()
         .expect("freeze post-diagnostic store snapshot");
@@ -403,31 +335,23 @@ fn run_ensure_warm_pair(
     let after = store_shape(store, context.collections);
     let warm_work = after.difference(before);
     let raw_cover = observe_raw_cover(store, context.cover, context.exact);
-    let warm_calls = timed_warm.calls;
     let warm = finish_sample(
         Arm::EnsureWarm,
         context,
         context.newly_supported_rows,
         timed_warm,
         warm_work,
-        Diagnostic::StatelessOperation {
-            calls: warm_calls,
-            cover: raw_cover,
-        },
+        Diagnostic::StatelessOperation { cover: raw_cover },
     );
     assert_eq!(warm.relation, context.expected);
 
-    let noop_calls = timed_noop.calls;
     let noop = finish_sample(
         Arm::EnsureNoop,
         context,
         context.total_rows,
         timed_noop,
         StoreShape::default(),
-        Diagnostic::StatelessOperation {
-            calls: noop_calls,
-            cover: raw_cover,
-        },
+        Diagnostic::StatelessOperation { cover: raw_cover },
     );
     assert_eq!(noop.relation, context.expected);
     ([warm, noop], after)
@@ -437,17 +361,13 @@ fn run_ensure_cold(store: &mut MemoryRepo, context: &RunContext<'_>, before: Sto
     let timed = time_ensure(store, context.cover, context.succinct);
     let after = store_shape(store, context.collections);
     let raw_cover = observe_raw_cover(store, context.cover, context.exact);
-    let calls = timed.calls;
     let cold = finish_sample(
         Arm::EnsureCold,
         context,
         context.total_rows,
         timed,
         after.difference(before),
-        Diagnostic::StatelessOperation {
-            calls,
-            cover: raw_cover,
-        },
+        Diagnostic::StatelessOperation { cover: raw_cover },
     );
     assert_eq!(cold.relation, context.expected);
     cold
@@ -473,57 +393,87 @@ fn run_ensure_family(
     (vec![warm_pair[0], cold, warm_pair[1]], warm_after)
 }
 
-fn time_exact_view(
-    view: &mut SuccinctArchiveView,
+fn time_snapshot(
+    state: &mut Option<SuccinctArchiveSnapshot>,
     store: &mut MemoryRepo,
     cover: &Cover<SimpleArchive>,
-) -> TimedOperation {
+    succinct: &SuccinctArchiveCollection,
+) -> (TimedOperation, SnapshotSupport) {
     let start = Instant::now();
-    let union = view
-        .advance(store, cover)
-        .expect("advance maintained exact Succinct view");
+    let (candidate, changed_members, reused_members) = match state.as_ref() {
+        None => (
+            succinct
+                .ensure(store, cover)
+                .expect("construct initial exact Succinct snapshot"),
+            cover.len(),
+            0,
+        ),
+        Some(previous) => match succinct
+            .advance(store, previous, cover)
+            .expect("advance maintained exact Succinct snapshot")
+        {
+            SuccinctArchiveSnapshotAdvance::Unchanged => {
+                let elapsed = start.elapsed();
+                let union = previous.view().clone();
+                black_box(union.segment_count());
+                return (
+                    TimedOperation { elapsed, union },
+                    SnapshotSupport {
+                        cover_members: cover.len(),
+                        changed_members: 0,
+                        reused_members: cover.len(),
+                    },
+                );
+            }
+            SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => {
+                let changed_members = changed.source().len();
+                black_box(changed.view().segment_count());
+                (next, changed_members, previous.source().len())
+            }
+            SuccinctArchiveSnapshotAdvance::Reset { next } => (next, cover.len(), 0),
+        },
+    };
     let elapsed = start.elapsed();
+    let union = candidate.view().clone();
     black_box(union.segment_count());
-    TimedOperation {
-        elapsed,
-        union,
-        calls: MappingCalls::default(),
-    }
+    *state = Some(candidate);
+    (
+        TimedOperation { elapsed, union },
+        SnapshotSupport {
+            cover_members: cover.len(),
+            changed_members,
+            reused_members,
+        },
+    )
 }
 
-fn run_exact_view_pair(
-    view: &mut SuccinctArchiveView,
+fn run_snapshot_pair(
+    state: &mut Option<SuccinctArchiveSnapshot>,
     store: &mut MemoryRepo,
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
-    let timed_advance = time_exact_view(view, store, context.cover);
-    let advance_work = view
-        .last_work()
-        .expect("successful view advance records actual work");
+    let (timed_advance, advance_work) =
+        time_snapshot(state, store, context.cover, context.succinct);
     assert_eq!(advance_work.cover_members, context.cover.len());
     assert_eq!(
-        advance_work.processed_members + advance_work.reused_members,
+        advance_work.changed_members + advance_work.reused_members,
         context.cover.len(),
-        "view support accounting must cover the exact payload set",
+        "snapshot support accounting must cover the exact payload set",
     );
     let snapshot_after_advance = store
         .snapshot()
-        .expect("freeze snapshot between view advance and no-op");
+        .expect("freeze store between snapshot advance and no-op");
 
-    let timed_noop = time_exact_view(view, store, context.cover);
-    let noop_work = view
-        .last_work()
-        .expect("successful view no-op records actual work");
+    let (timed_noop, noop_work) = time_snapshot(state, store, context.cover, context.succinct);
     assert_eq!(
         noop_work,
-        SuccinctArchiveViewWork {
+        SnapshotSupport {
             cover_members: context.cover.len(),
-            processed_members: 0,
+            changed_members: 0,
             reused_members: context.cover.len(),
-            ..SuccinctArchiveViewWork::default()
         },
-        "an identical exact-view cover must not execute projection work",
+        "an identical snapshot cover must not execute projection work",
     );
     assert!(
         store
@@ -531,25 +481,25 @@ fn run_exact_view_pair(
             .expect("freeze snapshot after view no-op")
             .changes_since(&snapshot_after_advance)
             .is_empty(),
-        "an unchanged exact view changed sync-visible storage",
+        "an unchanged snapshot changed sync-visible storage",
     );
 
     let after = store_shape(store, context.collections);
     let advance = finish_sample(
-        Arm::ViewAdvance,
+        Arm::SnapshotAdvance,
         context,
         context.newly_supported_rows,
         timed_advance,
         after.difference(before),
-        Diagnostic::ViewActual(advance_work),
+        Diagnostic::Snapshot(advance_work),
     );
     let noop = finish_sample(
-        Arm::ViewNoop,
+        Arm::SnapshotNoop,
         context,
         context.total_rows,
         timed_noop,
         StoreShape::default(),
-        Diagnostic::ViewActual(noop_work),
+        Diagnostic::Snapshot(noop_work),
     );
     assert_eq!(advance.relation, context.expected);
     assert_eq!(noop.relation, context.expected);
@@ -652,8 +602,8 @@ fn run_iteration(
     checkpoints: &[usize],
     succinct: &SuccinctArchiveCollection,
 ) -> Vec<Sample> {
-    let mut exact_view = succinct.exact_view();
-    let exact = ExactDerivedCollection::<CountingSuccinctMapping>::new(
+    let mut maintained_snapshot = None;
+    let exact = ExactDerivedCollection::<SimpleToSuccinctMapping>::new(
         succinct.source_collection(),
         succinct.raw_collection(),
     )
@@ -668,14 +618,14 @@ fn run_iteration(
     let mut source_accounting = new_source_store(succinct);
     let mut cold_ensure_source = new_source_store(succinct);
     let mut warm_ensure = new_source_store(succinct);
-    let mut exact_view_source = new_source_store(succinct);
+    let mut snapshot_source = new_source_store(succinct);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;
     let mut expected = TribleSet::new();
     let mut samples = Vec::with_capacity(checkpoints.len() * 5);
     let mut ensure_derived_shape = StoreShape::default();
-    let mut view_derived_shape = StoreShape::default();
+    let mut snapshot_derived_shape = StoreShape::default();
     for &checkpoint in checkpoints {
         for chunk in &chunks[published..checkpoint] {
             expected.union(chunk.clone());
@@ -687,7 +637,7 @@ fn run_iteration(
                     &mut source_accounting,
                     &mut cold_ensure_source,
                     &mut warm_ensure,
-                    &mut exact_view_source,
+                    &mut snapshot_source,
                 ],
             );
         }
@@ -718,7 +668,7 @@ fn run_iteration(
 
         let mut cold_ensure = cold_ensure_source.clone();
         let ensure_before = source_shape.plus(ensure_derived_shape);
-        let view_before = source_shape.plus(view_derived_shape);
+        let snapshot_before = source_shape.plus(snapshot_derived_shape);
         if iteration.is_multiple_of(2) {
             let (family, warm_after) = run_ensure_family(
                 iteration,
@@ -730,23 +680,23 @@ fn run_iteration(
             samples.extend(family);
             ensure_derived_shape = warm_after.difference(source_shape);
 
-            let (pair, after) = run_exact_view_pair(
-                &mut exact_view,
-                &mut exact_view_source,
+            let (pair, after) = run_snapshot_pair(
+                &mut maintained_snapshot,
+                &mut snapshot_source,
                 &context,
-                view_before,
+                snapshot_before,
             );
             samples.extend(pair);
-            view_derived_shape = after.difference(source_shape);
+            snapshot_derived_shape = after.difference(source_shape);
         } else {
-            let (pair, after) = run_exact_view_pair(
-                &mut exact_view,
-                &mut exact_view_source,
+            let (pair, after) = run_snapshot_pair(
+                &mut maintained_snapshot,
+                &mut snapshot_source,
                 &context,
-                view_before,
+                snapshot_before,
             );
             samples.extend(pair);
-            view_derived_shape = after.difference(source_shape);
+            snapshot_derived_shape = after.difference(source_shape);
 
             let (family, warm_after) = run_ensure_family(
                 iteration,
@@ -804,7 +754,9 @@ impl Aggregate {
 fn raw_cover(aggregate: &Aggregate) -> CoverIdentity {
     match aggregate.diagnostic.expect("diagnostic observation") {
         Diagnostic::StatelessOperation { cover, .. } => cover,
-        Diagnostic::ViewActual(_) => panic!("view arm has no stateless raw-cover observation"),
+        Diagnostic::Snapshot(_) => {
+            panic!("snapshot arm has no stateless raw-cover observation")
+        }
     }
 }
 
@@ -893,11 +845,11 @@ fn main() {
         Arm::EnsureWarm,
         Arm::EnsureCold,
         Arm::EnsureNoop,
-        Arm::ViewAdvance,
-        Arm::ViewNoop,
+        Arm::SnapshotAdvance,
+        Arm::SnapshotNoop,
     ];
     println!(
-        "\n{:>7} {:>13} {:>11} {:>14} {:>10} {:>8}",
+        "\n{:>7} {:>16} {:>11} {:>14} {:>10} {:>8}",
         "commits", "arm", "median-ms", "ns/basis-row", "basis-rows", "cover",
     );
     for &checkpoint in &checkpoints {
@@ -905,7 +857,7 @@ fn main() {
             let aggregate = &aggregates[&(checkpoint, arm)];
             let elapsed = median(&aggregate.elapsed_ns);
             println!(
-                "{:>7} {:>13} {:>11.3} {:>14.1} {:>10} {:>8}",
+                "{:>7} {:>16} {:>11.3} {:>14.1} {:>10} {:>8}",
                 checkpoint,
                 arm.label(),
                 elapsed as f64 / 1_000_000.0,
@@ -917,31 +869,24 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; maps=canonical source-to-target mapping calls and cumulative input MiB from the timed operation; support=admitted/reused commits for views"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; support=changed/reused commits for snapshots"
     );
     println!(
-        "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
-        "commits", "arm", "+B", "+bytes", "+D", "+M", "+A", "support", "projection maps", "arg-MiB",
+        "{:>7} {:>16} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15}",
+        "commits", "arm", "+B", "+bytes", "+D", "+M", "+A", "support",
     );
     for &checkpoint in &checkpoints {
         for arm in arms {
             let aggregate = &aggregates[&(checkpoint, arm)];
             let work = aggregate.work.expect("store work");
-            let (support, calls, argument_mib) =
-                match aggregate.diagnostic.expect("diagnostic observation") {
-                    Diagnostic::StatelessOperation { calls, .. } => (
-                        "stateless".to_owned(),
-                        calls.derive.to_string(),
-                        format!("{:.2}", calls.input_bytes as f64 / (1024.0 * 1024.0)),
-                    ),
-                    Diagnostic::ViewActual(work) => (
-                        format!("{}/{}", work.processed_members, work.reused_members),
-                        work.derive.to_string(),
-                        format!("{:.2}", work.input_bytes as f64 / (1024.0 * 1024.0)),
-                    ),
-                };
+            let support = match aggregate.diagnostic.expect("diagnostic observation") {
+                Diagnostic::StatelessOperation { .. } => "stateless".to_owned(),
+                Diagnostic::Snapshot(work) => {
+                    format!("{}/{}", work.changed_members, work.reused_members)
+                }
+            };
             println!(
-                "{:>7} {:>13} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15} {:>26} {:>10}",
+                "{:>7} {:>16} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15}",
                 checkpoint,
                 arm.label(),
                 work.blobs,
@@ -950,8 +895,6 @@ fn main() {
                 work.raw_merges,
                 work.accelerated_records,
                 support,
-                calls,
-                argument_mib,
             );
             assert_eq!(work.commits, 0, "measured operation wrote a COMMIT");
             assert_eq!(
@@ -972,9 +915,9 @@ fn main() {
         }
         let ensure_warm = raw_cover(&aggregates[&(checkpoint, Arm::EnsureWarm)]);
         let ensure_cold = raw_cover(&aggregates[&(checkpoint, Arm::EnsureCold)]);
-        let view_members = aggregates[&(checkpoint, Arm::ViewAdvance)].cover_members;
+        let snapshot_members = aggregates[&(checkpoint, Arm::SnapshotAdvance)].cover_members;
         println!(
-            "  commits={checkpoint:<7} rows={:<9} logical={} ensure-physical={} ({}/{}) view-members={}",
+            "  commits={checkpoint:<7} rows={:<9} logical={} ensure-physical={} ({}/{}) snapshot-members={}",
             relation.rows,
             short_hash(&relation.hash),
             if ensure_warm.hash == ensure_cold.hash {
@@ -984,7 +927,7 @@ fn main() {
             },
             ensure_warm.members,
             ensure_cold.members,
-            view_members,
+            snapshot_members,
         );
     }
 }

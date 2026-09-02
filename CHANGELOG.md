@@ -83,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `Collection::policy` for reading a validated descriptor's immutable
+  READ and WRITE policy from one store snapshot without proof discovery.
+
 - Add `trible pile compact <SOURCE> --into <DESTINATION>` for out-of-place,
   non-GC pile repacking. It retains every distinct valid blob, collapses exact
   duplicate native set records, preserves all distinct COMMIT/MERGE/DERIVE and
@@ -223,13 +226,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed conflicting coordinate fails a documented single-coordinate
   contract instead of depending on iteration order.
 
-- Make `SuccinctArchiveView` continuation reuse directly observable through a
-  last-successful-work report. It distinguishes newly admitted from retained
-  payload members and counts the actual source-to-target derivations made by
-  that observation. The evolving-collection benchmark now labels its stateless
-  post-timing proof replay separately from maintained-view work, proving that
-  an identical cover performs zero algebra/storage work and a monotone
-  extension admits only its payload delta.
+- Add immutable `CollectionSnapshot<S, V>` values which pair one exact source
+  cover with its logical view. `SuccinctArchiveCollection::ensure` and
+  `attach` now preserve that continuation value, while functional `advance`
+  leaves the previous snapshot untouched and returns `Unchanged`,
+  `Advanced { next, changed }`, or `Reset { next }`. Strict growth maintains
+  exact changed and complete Succinct covers through persisted `DERIVE` and
+  `MERGE` equations, retaining compact target LSM covers without reconstructing
+  a `TribleSet` or joining temporary views. The evolving-collection benchmark
+  keeps its support accounting outside production code.
 
 - Add an end-to-end incremental collection-query benchmark comparing full
   re-query with `pattern_changes!` maintenance over source-identical exact
@@ -237,20 +242,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   view admission and application result-set maintenance, while checking raw
   rows, accumulated results, covers, and checkpoints at every step.
 
-- Add `SuccinctArchiveCollection::exact_view()` for maintaining one admitted
-  in-process query view across exact cover observations. Unchanged support
-  performs no storage I/O, monotone additions run ordinary exact admission only
-  over the payload delta and union immutable shards, and shrinking observations
-  rebuild. The continuation is ephemeral and advances only after complete
-  success; it creates no receipts, revision tokens, or alternate trust path.
-
 - Add `Cover::additions_since` as the pure continuation boundary between two
   exact collection observations. It compares PATCH sets of payload identities,
   returns newly observed members only when the previous cover remains a
   subset, and reports `ResetRequired` before additions-only incremental
   processing can cross a shrinking admission view. A runnable example combines
-  a maintained Succinct full view, a cheap SimpleArchive support delta,
-  `pattern_changes!`, and checkpoint advancement after successful consumption.
+  exact Succinct full and changed snapshots, `pattern_changes!`, and candidate
+  adoption after successful consumption.
 
 - Make a consumer's own records joinable to `telemetry`'s spans rather than
   merely correlated with them by a string. `telemetry::current_span_entity()`

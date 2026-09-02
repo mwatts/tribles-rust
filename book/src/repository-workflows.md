@@ -310,6 +310,7 @@ let succinct = SuccinctArchiveCollection::new(source, raw, accelerated);
 
 let archive = succinct.ensure(&mut storage, &cover)?;
 let same_archive = succinct.attach(&mut storage, &cover)?;
+let facts = archive.view();
 
 // The same algebra edges are available directly on storage.
 let raw_cover = storage.ensure::<SimpleToSuccinctMapping>(raw, &cover)?;
@@ -322,7 +323,7 @@ let accelerated_cover =
 - `ensure` is the singular construction and maintenance path. It completes the
   raw projection, deterministically carries colliding raw target members by
   serialized-size tier, then ensures a support-equivalent accelerated cover and
-  returns its query view.
+  returns its query view together with the exact source cover it represents.
 
 At each target lattice node, `ensure` reuses the resident result first. If the
 result is absent, it joins the two corresponding target children when both are

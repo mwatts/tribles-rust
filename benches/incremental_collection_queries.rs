@@ -1,8 +1,8 @@
 //! End-to-end incremental-query maintenance over growing exact covers.
 //!
 //! The two arms maintain the same application result set over source-identical
-//! stores. Both retain a `SuccinctArchiveView`; only their query strategy
-//! differs:
+//! stores. The incremental arm retains an immutable Succinct snapshot; their
+//! query strategy differs:
 //!
 //! - `full` re-runs the complete query and replaces the result set.
 //! - `incremental` obtains one exact payload-support delta, runs
@@ -38,7 +38,7 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
-    SuccinctArchiveView,
+    SuccinctArchiveSnapshot, SuccinctArchiveSnapshotAdvance,
 };
 use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt, Cover};
 use triblespace::core::examples::literature;
@@ -140,21 +140,25 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
 
 struct FullState {
     store: MemoryRepo,
-    view: SuccinctArchiveView,
+    succinct: SuccinctArchiveCollection,
     results: BTreeSet<Row>,
 }
 
 impl FullState {
     fn seeded(fixture: &Fixture) -> Self {
         let mut store = fixture.store.clone();
-        let mut view = fixture.succinct.exact_view();
-        let seed = view
-            .advance(&mut store, &fixture.seed_cover)
+        let seed = fixture
+            .succinct
+            .ensure(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
-        assert_eq!(seed.iter().count(), 2, "seed contains the author facts");
+        assert_eq!(
+            seed.view().iter().count(),
+            2,
+            "seed contains the author facts"
+        );
         Self {
             store,
-            view,
+            succinct: fixture.succinct.clone(),
             results: BTreeSet::new(),
         }
     }
@@ -162,14 +166,15 @@ impl FullState {
     fn observe(&mut self, cover: &Cover<SimpleArchive>) -> Step {
         let start = Instant::now();
         let full = self
-            .view
-            .advance(&mut self.store, cover)
+            .succinct
+            .ensure(&mut self.store, cover)
             .expect("advance full-query view");
+        assert_eq!(full.source(), cover);
         let mut raw_rows = 0usize;
         let mut next = BTreeSet::new();
         for row in find!(
             (author: Entity, book: Entity, title: Title),
-            pattern!(&full, [
+            pattern!(full.view(), [
                 { ?author @ literature::firstname: "Frank" },
                 { ?book @ literature::author: ?author, literature::title: ?title }
             ])
@@ -190,47 +195,55 @@ impl FullState {
 
 struct IncrementalState {
     store: MemoryRepo,
-    view: SuccinctArchiveView,
-    checkpoint: Cover<SimpleArchive>,
+    succinct: SuccinctArchiveCollection,
+    snapshot: SuccinctArchiveSnapshot,
     results: BTreeSet<Row>,
 }
 
 impl IncrementalState {
     fn seeded(fixture: &Fixture) -> Self {
         let mut store = fixture.store.clone();
-        let mut view = fixture.succinct.exact_view();
-        let seed = view
-            .advance(&mut store, &fixture.seed_cover)
+        let seed = fixture
+            .succinct
+            .ensure(&mut store, &fixture.seed_cover)
             .expect("admit seed view");
-        assert_eq!(seed.iter().count(), 2, "seed contains the author facts");
+        assert_eq!(
+            seed.view().iter().count(),
+            2,
+            "seed contains the author facts"
+        );
         Self {
             store,
-            view,
-            checkpoint: fixture.seed_cover.clone(),
+            succinct: fixture.succinct.clone(),
+            snapshot: seed,
             results: BTreeSet::new(),
         }
     }
 
     fn observe(&mut self, cover: &Cover<SimpleArchive>) -> Step {
         let start = Instant::now();
-        let added = cover
-            .additions_since(&self.checkpoint)
-            .expect("cover grows monotonically");
-        assert_eq!(added.len(), 1, "one payload is observed per step");
-        let full = self
-            .view
-            .advance(&mut self.store, cover)
+        let advance = self
+            .succinct
+            .advance(&mut self.store, &self.snapshot, cover)
             .expect("advance incremental full view");
-        let snapshot = self.store.snapshot().expect("freeze delta snapshot");
-        let changed = added
-            .materialize::<TribleSet, _>(&snapshot)
-            .expect("materialize exact support delta");
+        let (next, changed) = match advance {
+            SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => (next, changed),
+            SuccinctArchiveSnapshotAdvance::Unchanged => panic!("benchmark cover did not grow"),
+            SuccinctArchiveSnapshotAdvance::Reset { .. } => {
+                panic!("benchmark cover did not grow monotonically")
+            }
+        };
+        assert_eq!(
+            changed.source().len(),
+            1,
+            "one payload is observed per step"
+        );
 
         let mut raw_rows = 0usize;
         let mut batch = BTreeSet::new();
         for row in find!(
             (author: Entity, book: Entity, title: Title),
-            pattern_changes!(&full, &changed, [
+            pattern_changes!(next.view(), changed.view(), [
                 { ?author @ literature::firstname: "Frank" },
                 { ?book @ literature::author: ?author, literature::title: ?title }
             ])
@@ -240,7 +253,7 @@ impl IncrementalState {
         }
         let distinct_rows = batch.len();
         self.results.extend(batch);
-        self.checkpoint = cover.clone();
+        self.snapshot = next;
         black_box(self.results.len());
         Step {
             elapsed: start.elapsed(),
@@ -302,7 +315,6 @@ fn run_full(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
         assert_eq!(step.raw_rows, expected.len());
         assert_eq!(step.distinct_rows, expected.len());
         assert_eq!(state.results, expected);
-        assert_eq!(state.view.cover(), Some(cover));
         let commits = index + 1;
         if checkpoints.contains(&commits) {
             samples.push(Sample {
@@ -334,8 +346,7 @@ fn run_incremental(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
         assert_eq!(step.raw_rows, batch.len());
         assert_eq!(step.distinct_rows, batch.len());
         assert_eq!(state.results, expected);
-        assert_eq!(&state.checkpoint, cover);
-        assert_eq!(state.view.cover(), Some(cover));
+        assert_eq!(state.snapshot.source(), cover);
         let commits = index + 1;
         if checkpoints.contains(&commits) {
             samples.push(Sample {

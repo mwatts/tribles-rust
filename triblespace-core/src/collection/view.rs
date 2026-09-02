@@ -13,6 +13,69 @@ use crate::repo::BlobStoreGet;
 
 use super::{CollectionData, CollectionEncoding, Cover};
 
+/// One immutable logical view paired with the exact source cover it represents.
+///
+/// The source cover is the continuation value. The view may retain a distinct,
+/// support-equivalent physical decomposition, such as mmap-backed Succinct
+/// shards, without exposing that storage choice to callers.
+pub struct CollectionSnapshot<S: CollectionEncoding, V> {
+    source: Cover<S>,
+    view: V,
+}
+
+impl<S: CollectionEncoding, V: Clone> Clone for CollectionSnapshot<S, V> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            view: self.view.clone(),
+        }
+    }
+}
+
+impl<S: CollectionEncoding, V> CollectionSnapshot<S, V> {
+    /// Pair one exact source cover with its logical view.
+    pub(crate) fn new(source: Cover<S>, view: V) -> Self {
+        Self { source, view }
+    }
+
+    /// Exact source cover represented by this view.
+    pub fn source(&self) -> &Cover<S> {
+        &self.source
+    }
+
+    /// Logical value reconstructed from the source cover.
+    pub fn view(&self) -> &V {
+        &self.view
+    }
+
+    /// Consume this snapshot into its source cover and logical view.
+    pub fn into_parts(self) -> (Cover<S>, V) {
+        (self.source, self.view)
+    }
+}
+
+/// Functional transition between two immutable collection snapshots.
+///
+/// The caller retains its previous snapshot and adopts `next` only after
+/// downstream consumption succeeds. A reset carries a complete replacement;
+/// strict growth additionally carries the exact newly added source support.
+pub enum CollectionSnapshotAdvance<S: CollectionEncoding, V> {
+    /// The source cover is unchanged, so the caller keeps its previous value.
+    Unchanged,
+    /// The source cover grew monotonically.
+    Advanced {
+        /// Candidate complete snapshot for the new source cover.
+        next: CollectionSnapshot<S, V>,
+        /// Exact logical view of only the newly added source members.
+        changed: CollectionSnapshot<S, V>,
+    },
+    /// Additions-only processing is unsound; replace state with this snapshot.
+    Reset {
+        /// Candidate complete snapshot for the current source cover.
+        next: CollectionSnapshot<S, V>,
+    },
+}
+
 /// Failure at the generic boundary between a physical cover and its logical
 /// interpretation.
 #[derive(Debug)]

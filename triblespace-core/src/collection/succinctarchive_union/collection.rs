@@ -18,7 +18,6 @@
 //! source and constructs the query runtime without a sidecar record family or
 //! wrapper artifact.
 
-use std::cell::Cell;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -31,12 +30,11 @@ use crate::blob::encodings::succinctarchive::{
 use crate::blob::{Blob, TryFromBlob};
 use crate::collection::exact_derived::{ExactDerivedCollection, ExactDerivedCollectionError};
 use crate::collection::{
-    Collection, CollectionData, CollectionMapping, CollectionOperationError, CollectionStore,
+    Collection, CollectionData, CollectionSnapshot, CollectionSnapshotAdvance, CollectionStore,
     CollectionStoreExt, Cover, CoverAdvanceError, FactCover, TryFromCover, TryFromCoverError,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
-use crate::trible::Fragment;
 
 use super::{RawToRank9AcceleratedMapping, SimpleToSuccinctMapping};
 
@@ -235,211 +233,12 @@ pub struct SuccinctArchiveCollection {
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
 }
 
-/// Exact work performed by one successful [`SuccinctArchiveView::advance`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SuccinctArchiveViewWork {
-    /// Distinct payload members represented after the call.
-    pub cover_members: usize,
-    /// Payload members newly processed by this call.
-    pub processed_members: usize,
-    /// Previously materialized payload members reused without replaying data work.
-    pub reused_members: usize,
-    /// Canonical SimpleArchive-to-raw derivations.
-    pub derive: u64,
-    /// Cumulative bytes supplied to SimpleArchive-to-raw derivations.
-    pub input_bytes: u64,
-}
+/// Immutable accelerated Succinct view and the exact fact cover it represents.
+pub type SuccinctArchiveSnapshot = CollectionSnapshot<SimpleArchive, UnionArchive<OrderedUniverse>>;
 
-impl SuccinctArchiveViewWork {
-    fn with_support(cover_members: usize, processed_members: usize, reused_members: usize) -> Self {
-        Self {
-            cover_members,
-            processed_members,
-            reused_members,
-            ..Self::default()
-        }
-    }
-}
-
-struct MeasuredSuccinctHomomorphism {
-    inner: SimpleToSuccinctMapping,
-    work: Cell<SuccinctArchiveViewWork>,
-}
-
-impl MeasuredSuccinctHomomorphism {
-    fn new(inner: SimpleToSuccinctMapping, work: SuccinctArchiveViewWork) -> Self {
-        Self {
-            inner,
-            work: Cell::new(work),
-        }
-    }
-}
-
-impl CollectionMapping for MeasuredSuccinctHomomorphism {
-    type Source = SimpleArchive;
-    type Target = SuccinctArchiveBlob;
-
-    fn fragment(&self) -> Fragment {
-        self.inner.fragment()
-    }
-
-    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
-        Ok(Self::new(
-            SimpleToSuccinctMapping::bind(source, target)?,
-            SuccinctArchiveViewWork::default(),
-        ))
-    }
-
-    fn map<R>(
-        &self,
-        source: &crate::blob::Blob<SimpleArchive>,
-        reader: &R,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, CollectionOperationError>
-    where
-        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
-    {
-        let mut work = self.work.get();
-        work.derive += 1;
-        work.input_bytes += source.bytes.len() as u64;
-        self.work.set(work);
-        self.inner.map(source, reader)
-    }
-}
-
-/// One in-process accelerated Succinct view maintained across observations.
-#[derive(Clone)]
-pub struct SuccinctArchiveView {
-    collection: SuccinctArchiveCollection,
-    cover: Option<FactCover>,
-    archive: Option<UnionArchive<OrderedUniverse>>,
-    last_work: Option<SuccinctArchiveViewWork>,
-}
-
-impl SuccinctArchiveView {
-    fn new(collection: SuccinctArchiveCollection) -> Self {
-        Self {
-            collection,
-            cover: None,
-            archive: None,
-            last_work: None,
-        }
-    }
-
-    /// Exact payload support represented by the current archive.
-    pub fn cover(&self) -> Option<&FactCover> {
-        self.cover.as_ref()
-    }
-
-    /// Current queryable archive, if the first observation has succeeded.
-    pub fn archive(&self) -> Option<&UnionArchive<OrderedUniverse>> {
-        self.archive.as_ref()
-    }
-
-    /// Work performed by the last successful observation.
-    pub fn last_work(&self) -> Option<SuccinctArchiveViewWork> {
-        self.last_work
-    }
-
-    /// Advance and retain the view for the current source cover.
-    pub fn advance<S>(
-        &mut self,
-        store: &mut S,
-        current: &FactCover,
-    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
-    {
-        if self.cover.as_ref() == Some(current) {
-            if let Some(previous) = &self.archive {
-                let previous = previous.clone();
-                self.last_work = Some(SuccinctArchiveViewWork::with_support(
-                    current.len(),
-                    0,
-                    current.len(),
-                ));
-                return Ok(previous);
-            }
-        }
-
-        let (next, work) = match self.archive.as_ref() {
-            None => self.ensure_measured(
-                store,
-                current,
-                SuccinctArchiveViewWork::with_support(current.len(), current.len(), 0),
-            )?,
-            Some(previous) => match current.additions_since(
-                self.cover
-                    .as_ref()
-                    .expect("an existing archive has a cover checkpoint"),
-            ) {
-                Ok(additions) if additions.is_empty() => (
-                    previous.clone(),
-                    SuccinctArchiveViewWork::with_support(current.len(), 0, current.len()),
-                ),
-                Ok(additions) => {
-                    let work = SuccinctArchiveViewWork::with_support(
-                        current.len(),
-                        additions.len(),
-                        self.cover.as_ref().map_or(0, FactCover::len),
-                    );
-                    let (delta, work) = self.ensure_measured(store, &additions, work)?;
-                    (previous.union(&delta), work)
-                }
-                Err(CoverAdvanceError::ResetRequired { .. }) => self.ensure_measured(
-                    store,
-                    current,
-                    SuccinctArchiveViewWork::with_support(current.len(), current.len(), 0),
-                )?,
-                Err(error) => {
-                    return Err(SuccinctArchiveCollectionError::Exact(
-                        ExactDerivedCollectionError::InvalidCover(error.to_string()),
-                    ));
-                }
-            },
-        };
-
-        self.cover = Some(current.clone());
-        self.archive = Some(next.clone());
-        self.last_work = Some(work);
-        Ok(next)
-    }
-
-    fn ensure_measured<S>(
-        &self,
-        store: &mut S,
-        cover: &FactCover,
-        work: SuccinctArchiveViewWork,
-    ) -> Result<
-        (UnionArchive<OrderedUniverse>, SuccinctArchiveViewWork),
-        SuccinctArchiveCollectionError,
-    >
-    where
-        S: BlobStore + CollectionStore,
-        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
-    {
-        let measured = MeasuredSuccinctHomomorphism::new(SimpleToSuccinctMapping, work);
-        let raw_kernel = ExactDerivedCollection::with_mapping(
-            self.collection.source,
-            self.collection.raw,
-            measured,
-        )?;
-        let raw_cover = raw_kernel.ensure(store, cover)?;
-        let work = raw_kernel
-            .mapping_override()
-            .expect("measured kernel retains its explicit mapping")
-            .work
-            .get();
-        let accelerated = self
-            .collection
-            .rank9_derivation()?
-            .ensure(store, &raw_cover)?;
-        let snapshot = store
-            .snapshot()
-            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
-        Ok((accelerated_view(&snapshot, &accelerated)?, work))
-    }
-}
+/// Functional transition between two accelerated Succinct observations.
+pub type SuccinctArchiveSnapshotAdvance =
+    CollectionSnapshotAdvance<SimpleArchive, UnionArchive<OrderedUniverse>>;
 
 impl SuccinctArchiveCollection {
     /// Bind the facade to its three store-created lifecycle values.
@@ -453,11 +252,6 @@ impl SuccinctArchiveCollection {
             raw,
             accelerated,
         }
-    }
-
-    /// Create an empty in-process continuation for this projection.
-    pub fn exact_view(&self) -> SuccinctArchiveView {
-        SuccinctArchiveView::new(self.clone())
     }
 
     /// Store-issued source collection.
@@ -480,7 +274,7 @@ impl SuccinctArchiveCollection {
         &self,
         store: &mut S,
         source_cover: &FactCover,
-    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
+    ) -> Result<SuccinctArchiveSnapshot, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
@@ -490,26 +284,103 @@ impl SuccinctArchiveCollection {
         let snapshot = store
             .snapshot()
             .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
-        accelerated_view(&snapshot, &accelerated)
+        let view = accelerated_view(&snapshot, &accelerated)?;
+        Ok(CollectionSnapshot::new(source_cover.clone(), view))
     }
 
-    /// Maintain both ordinary derivation stages and attach the exact view.
+    /// Maintain both ordinary derivation stages and attach an immutable snapshot.
     pub fn ensure<S>(
         &self,
         store: &mut S,
         source_cover: &FactCover,
-    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
+    ) -> Result<SuccinctArchiveSnapshot, SuccinctArchiveCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
+    {
+        let accelerated = self.ensure_accelerated_cover(store, source_cover)?;
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
+        let view = accelerated_view(&snapshot, &accelerated)?;
+        Ok(CollectionSnapshot::new(source_cover.clone(), view))
+    }
+
+    /// Functionally advance an immutable accelerated snapshot.
+    ///
+    /// No state is changed in `previous`. On strict growth this first maintains
+    /// the exact delta, then the complete current cover, allowing the latter to
+    /// reuse the former through persisted `DERIVE` and `MERGE` equations. Both
+    /// views are attached through one final immutable store snapshot. The
+    /// caller decides when downstream consumption has succeeded and only then
+    /// replaces `previous` with `next`.
+    pub fn advance<S>(
+        &self,
+        store: &mut S,
+        previous: &SuccinctArchiveSnapshot,
+        current: &FactCover,
+    ) -> Result<SuccinctArchiveSnapshotAdvance, SuccinctArchiveCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
+    {
+        self.require_source_cover(previous.source())?;
+        self.require_source_cover(current)?;
+        if current == previous.source() {
+            return Ok(SuccinctArchiveSnapshotAdvance::Unchanged);
+        }
+        let additions = match current.additions_since(previous.source()) {
+            Ok(additions) => additions,
+            Err(CoverAdvanceError::ResetRequired { .. }) => {
+                return Ok(SuccinctArchiveSnapshotAdvance::Reset {
+                    next: self.ensure(store, current)?,
+                });
+            }
+            Err(error) => {
+                return Err(SuccinctArchiveCollectionError::Exact(
+                    ExactDerivedCollectionError::InvalidCover(error.to_string()),
+                ));
+            }
+        };
+        let changed_cover = self.ensure_accelerated_cover(store, &additions)?;
+        let next_cover = self.ensure_accelerated_cover(store, current)?;
+        let snapshot = store
+            .snapshot()
+            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
+        let changed =
+            CollectionSnapshot::new(additions, accelerated_view(&snapshot, &changed_cover)?);
+        let next =
+            CollectionSnapshot::new(current.clone(), accelerated_view(&snapshot, &next_cover)?);
+        Ok(SuccinctArchiveSnapshotAdvance::Advanced { next, changed })
+    }
+
+    fn ensure_accelerated_cover<S>(
+        &self,
+        store: &mut S,
+        source_cover: &FactCover,
+    ) -> Result<Cover<Rank9AcceleratedSuccinctArchiveBlob>, SuccinctArchiveCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Snapshot: BlobStoreMeta + crate::collection::CollectionRead,
     {
         let raw_cover = store.ensure::<SimpleToSuccinctMapping>(self.raw, source_cover)?;
-        let accelerated =
-            store.ensure::<RawToRank9AcceleratedMapping>(self.accelerated, &raw_cover)?;
-        let snapshot = store
-            .snapshot()
-            .map_err(|source| SuccinctArchiveCollectionError::Snapshot(source.to_string()))?;
-        accelerated_view(&snapshot, &accelerated)
+        Ok(store.ensure::<RawToRank9AcceleratedMapping>(self.accelerated, &raw_cover)?)
+    }
+
+    fn require_source_cover(
+        &self,
+        cover: &FactCover,
+    ) -> Result<(), SuccinctArchiveCollectionError> {
+        if cover.collection() == self.source {
+            return Ok(());
+        }
+        Err(SuccinctArchiveCollectionError::Exact(
+            ExactDerivedCollectionError::InvalidCover(format!(
+                "source descriptor {} differs from {}",
+                hex::encode_upper(cover.collection().handle().raw),
+                hex::encode_upper(self.source.handle().raw),
+            )),
+        ))
     }
 
     fn raw_kernel(
@@ -538,13 +409,14 @@ mod tests {
     use crate::blob::{Blob, IntoBlob};
     use crate::collection::descriptor;
     use crate::collection::{
-        CollectionDerive, CollectionEncoding, CollectionMapping, CollectionMerge, CollectionPolicy,
-        CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, Cover, FactCover,
+        CollectionDerive, CollectionEncoding, CollectionMapping, CollectionMerge,
+        CollectionOperationError, CollectionPolicy, CollectionRead, CollectionRecord,
+        CollectionStore, CollectionStoreExt, Cover, FactCover,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+    use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StoreSnapshot};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     use super::super::RawToRank9AcceleratedMapping;
@@ -586,6 +458,10 @@ mod tests {
         }
         let simple: Blob<SimpleArchive> = set.to_blob();
         super::super::derive_element(&simple).unwrap()
+    }
+
+    fn simple(rows: impl IntoIterator<Item = Trible>) -> Blob<SimpleArchive> {
+        rows.into_iter().collect::<TribleSet>().to_blob()
     }
 
     fn accelerated(raw: &Blob<SuccinctArchiveBlob>) -> Blob<Rank9AcceleratedSuccinctArchiveBlob> {
@@ -1005,8 +881,8 @@ mod tests {
             [Handle::<SimpleArchive>::to_hash(source.get_handle())],
         );
 
-        let archive = facade.ensure(&mut store, &cover).unwrap();
-        assert_eq!(archive.iter().count(), 2);
+        let snapshot = facade.ensure(&mut store, &cover).unwrap();
+        assert_eq!(snapshot.view().iter().count(), 2);
 
         let snapshot = store.snapshot().unwrap();
         let records = snapshot
@@ -1041,6 +917,97 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_advance_returns_exact_succinct_growth_and_is_retryable() {
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
+        let a = simple([row(1, 2, 3)]);
+        let b = simple([row(4, 5, 6)]);
+        let a_data = Handle::<SimpleArchive>::to_hash(a.get_handle());
+        let b_data = Handle::<SimpleArchive>::to_hash(b.get_handle());
+        store.put::<SimpleArchive, _>(a).unwrap();
+        store.put::<SimpleArchive, _>(b).unwrap();
+        let first = FactCover::from_data(facade.source_collection(), [a_data]);
+        let current = FactCover::from_data(facade.source_collection(), [a_data, b_data]);
+        let expected_changed = FactCover::from_data(facade.source_collection(), [b_data]);
+        let previous = facade.ensure(&mut store, &first).unwrap();
+
+        let advanced = facade.advance(&mut store, &previous, &current).unwrap();
+        let (next, changed) = match advanced {
+            SuccinctArchiveSnapshotAdvance::Advanced { next, changed } => (next, changed),
+            SuccinctArchiveSnapshotAdvance::Unchanged => panic!("strict growth was unchanged"),
+            SuccinctArchiveSnapshotAdvance::Reset { .. } => panic!("strict growth reset"),
+        };
+        assert_eq!(next.source(), &current);
+        assert_eq!(changed.source(), &expected_changed);
+        assert_eq!(next.view().iter().count(), 2);
+        assert_eq!(next.view().segment_count(), 1);
+        assert_eq!(changed.view().iter().count(), 1);
+        assert_eq!(changed.view().segment_count(), 1);
+
+        // The candidate has not been adopted yet. Retrying the same transition
+        // reuses its persisted exact DERIVE/MERGE work without changing storage.
+        let before_retry = store.snapshot().unwrap();
+        let retry = facade.advance(&mut store, &previous, &current).unwrap();
+        assert!(matches!(
+            retry,
+            SuccinctArchiveSnapshotAdvance::Advanced { .. }
+        ));
+        let after_retry = store.snapshot().unwrap();
+        assert!(after_retry.changes_since(&before_retry).is_empty());
+
+        assert!(matches!(
+            facade.advance(&mut store, &next, &current).unwrap(),
+            SuccinctArchiveSnapshotAdvance::Unchanged
+        ));
+    }
+
+    #[test]
+    fn snapshot_advance_resets_to_a_complete_candidate_after_shrink() {
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
+        let a = simple([row(1, 2, 3)]);
+        let b = simple([row(4, 5, 6)]);
+        let a_data = Handle::<SimpleArchive>::to_hash(a.get_handle());
+        let b_data = Handle::<SimpleArchive>::to_hash(b.get_handle());
+        store.put::<SimpleArchive, _>(a).unwrap();
+        store.put::<SimpleArchive, _>(b).unwrap();
+        let smaller = FactCover::from_data(facade.source_collection(), [a_data]);
+        let larger = FactCover::from_data(facade.source_collection(), [a_data, b_data]);
+        let previous = facade.ensure(&mut store, &larger).unwrap();
+
+        let reset = facade.advance(&mut store, &previous, &smaller).unwrap();
+        let next = match reset {
+            SuccinctArchiveSnapshotAdvance::Reset { next } => next,
+            SuccinctArchiveSnapshotAdvance::Unchanged => panic!("shrinking cover was unchanged"),
+            SuccinctArchiveSnapshotAdvance::Advanced { .. } => {
+                panic!("shrinking cover advanced incrementally")
+            }
+        };
+        assert_eq!(next.source(), &smaller);
+        assert_eq!(next.view().iter().count(), 1);
+    }
+
+    #[test]
+    fn snapshot_advance_rejects_a_foreign_source_cover() {
+        let mut store = MemoryRepo::default();
+        let facade = facade(&mut store);
+        let a = simple([row(1, 2, 3)]);
+        let a_data = Handle::<SimpleArchive>::to_hash(a.get_handle());
+        store.put::<SimpleArchive, _>(a).unwrap();
+        let local = FactCover::from_data(facade.source_collection(), [a_data]);
+        let previous = facade.ensure(&mut store, &local).unwrap();
+        let foreign = store.collection("foreign-facts", direct_policy()).unwrap();
+        let foreign_cover = FactCover::from_data(foreign, [a_data]);
+
+        assert!(matches!(
+            facade.advance(&mut store, &previous, &foreign_cover),
+            Err(SuccinctArchiveCollectionError::Exact(
+                ExactDerivedCollectionError::InvalidCover(_)
+            ))
+        ));
+    }
+
+    #[test]
     fn ensuring_raw_derives_the_accelerated_union_image() {
         let mut store = MemoryRepo::default();
         let facade = facade(&mut store);
@@ -1067,8 +1034,8 @@ mod tests {
             .ensure(&mut store, &raw)
             .unwrap();
 
-        let archive = facade.ensure(&mut store, &cover).unwrap();
-        assert_eq!(archive.iter().count(), 2);
+        let snapshot = facade.ensure(&mut store, &cover).unwrap();
+        assert_eq!(snapshot.view().iter().count(), 2);
 
         let snapshot = store.snapshot().unwrap();
         let records = snapshot

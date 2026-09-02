@@ -799,7 +799,7 @@ fn main() {
             let shape = BuildShape {
                 source_cover_members: cover.len(),
                 raw_cover_members: raw_cover.len(),
-                query_shards: union.segment_count(),
+                query_shards: union.view().segment_count(),
                 raw_bytes: raw_cover
                     .members()
                     .map(|handle| {
@@ -857,7 +857,7 @@ fn main() {
             );
 
             let (union_outcomes, counts) =
-                measure_queries(&union, "union", &qa, range_min, iters, warmup);
+                measure_queries(union.view(), "union", &qa, range_min, iters, warmup);
             union_counts = counts;
             all.extend(union_outcomes);
 

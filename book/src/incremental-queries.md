@@ -1,6 +1,6 @@
 # Incremental Queries
 
-The query engine normally evaluates a pattern over a complete `TribleSet`.
+The query engine normally evaluates a pattern over one complete relation.
 Continuous ingest pipelines often need only the solutions which involve at
 least one newly added fact. `pattern_changes!` implements that semi-naive delta
 evaluation without tying the query engine to any storage or history model.
@@ -93,25 +93,35 @@ saved cover only after the complete fallible fold succeeds, as the example
 does, to make a failed fold retry the same support.
 
 The two pattern inputs need not share a representation. The runnable example
-(`cargo run --example collection_pattern_changes`) keeps a
-`SuccinctArchiveCollection::exact_view()`. An unchanged cover reuses its
-owned, already-admitted immutable archive without storage access. For a strict
-extension, the view runs ordinary exact admission only over the added members
-and unions those shards with its previous archive; a shrinking observation
-rebuilds. The independent consumption checkpoint still controls the cheap
-`SimpleArchive`-backed change set, so a failed consumer retries the same delta
-even though constructing the full view already succeeded. Exact covers ensure
-that payloads first observed after `current` cannot leak into either input
-merely because their blobs are already resident.
+(`cargo run --example collection_pattern_changes`) uses immutable
+`CollectionSnapshot` values whose source cover is the continuation token and
+whose view is a shard-preserving Succinct query value. The initial `ensure`
+maintains the two persisted derivation lattices and returns the first snapshot.
+For a strict extension, `advance` first ensures an exact Succinct snapshot for
+the added source members, then ensures the complete current snapshot. The
+second step reuses the first through ordinary persisted `DERIVE` and `MERGE`
+equations and retains the compact target LSM cover; it does not union two
+temporary views or reconstruct a `TribleSet`.
+
+`advance` is functional. It leaves the previous snapshot untouched and returns
+`Advanced { next, changed }`, `Unchanged`, or `Reset { next }` when the source
+cover shrank. The consumer adopts `next` only after its complete fallible fold
+succeeds. A failed consumer therefore retries the same exact Succinct delta;
+already completed lattice work is merely reattached on that retry. A reset
+replaces accumulated application state from the complete `next` view. Exact
+covers ensure that payloads first observed after `current` cannot leak into
+either input merely because their blobs are already resident.
 
 Payload support is deliberately not an exact fact difference. A new payload
 may repeat a fact already present, and that new witness may legitimately make a
 projected result recur. Consumers requiring global once-only delivery retain
 their consumed result identities independently.
 
-When an ingestion API already returns its newly produced fragment, using that
-fragment's facts directly is cheaper than rematerializing a cover subset. The
-cover pattern is useful across process boundaries or after reopening storage.
+When an ingestion API already returns its newly produced fragment, querying
+that fragment may still be cheaper than maintaining a changed derived cover.
+The collection snapshot path is useful across process boundaries, after
+reopening storage, and whenever the derived representation is the normal query
+substrate.
 
 The `incremental_collection_queries` benchmark measures this complete
 maintenance loop against a full re-query over the same evolving source data:
@@ -121,11 +131,12 @@ cargo bench --bench incremental_collection_queries -- \
   --commits 64 --books-per-commit 256 --warmup 1 --iters 4
 ```
 
-Each observation includes advancing the exact Succinct view and maintaining
-the application's result set. Publication, cover discovery, and fixture
-construction remain outside the timer. The benchmark checks raw row counts,
-projection-level set equality, consumer checkpoints, and exact view covers at
-every commit; geometric checkpoints affect reporting only, not observation.
+Each observation includes functional Succinct snapshot advancement and
+maintaining the application's result set. Publication, cover discovery, and
+fixture construction remain outside the timer. The benchmark checks raw row
+counts, projection-level set equality, consumer checkpoints, and exact source
+covers at every commit; geometric checkpoints affect reporting only, not
+observation.
 Its fixture projects every query variable and gives every book a unique
 binding, so those equality checks do not imply projected-set semantics for
 arbitrary queries. The between-observation checks deliberately favor strong

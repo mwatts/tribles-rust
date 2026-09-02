@@ -1380,6 +1380,21 @@ impl<L: CollectionEncoding> Collection<L> {
         Ok(Self::from_handle(handle))
     }
 
+    /// Read this collection's immutable admission policy from `snapshot`.
+    ///
+    /// The descriptor is fetched and structurally validated before its local
+    /// READ and WRITE policies are returned. This does not enumerate capability
+    /// proofs or make an admission decision.
+    pub fn policy<S>(
+        self,
+        snapshot: &S,
+    ) -> Result<CollectionPolicy, CollectionDescriptorError<S::GetError<Infallible>>>
+    where
+        S: BlobStoreGet,
+    {
+        load_collection_descriptor(snapshot, self.handle()).map(|descriptor| descriptor.policy)
+    }
+
     /// Decide whether `subject` is admitted as a writer at `instant`.
     ///
     /// Open policy admits every subject. A quorum admits the subject only when

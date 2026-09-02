@@ -66,7 +66,7 @@ fn main() {
         .expect("ensure exact Succinct projection");
     let mut names: Vec<String> = find!(
         name: Inline<_>,
-        pattern!(&archive, [{ _?person @ literature::firstname: ?name }])
+        pattern!(archive.view(), [{ _?person @ literature::firstname: ?name }])
     )
     .map(|name| name.try_from_inline::<String>().expect("short string"))
     .collect();
