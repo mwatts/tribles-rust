@@ -13,7 +13,7 @@ use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, ExactDerivedCollection,
+    AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -195,15 +195,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     store.commit(source, &authority, Fragment::from(facts))?;
     let snapshot = store.snapshot()?;
-    let source_cover = source.admitted(&snapshot)?;
+    let support = source.admitted(&snapshot)?;
+    drop(snapshot);
 
     let construction_start = Instant::now();
-    let target_cover =
-        ExactDerivedCollection::<EmbeddingAttributeToNvFp4<Embedding>>::new(source, target)?
-            .maintain_exact(&mut store, &source_cover)?;
+    let snapshot =
+        store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support)?;
     let construction = construction_start.elapsed();
-    let snapshot = store.snapshot()?;
-    let members = target_cover
+    let collection = snapshot.collection_exact(target, &support)?;
+    let snapshot = collection.snapshot();
+    let members = collection
+        .cover()
         .members()
         .map(|handle| {
             snapshot.get::<triblespace_core::blob::Blob<NvFp4CosineSet<Embedding>>, _>(handle)
@@ -241,7 +243,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let attach_start = Instant::now();
-    let index = target_cover.materialize::<NvFp4CosineIndex<Embedding>, _>(&snapshot)?;
+    let index: NvFp4CosineIndex<Embedding> = collection.view()?;
     let attach = attach_start.elapsed();
 
     let mut latencies_us = Vec::with_capacity(query_count);
@@ -252,7 +254,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     for query_index in 0..query_count {
         let row = query_index * corpus.vectors.len() / query_count;
         let query = &corpus.vectors[row];
-        let counting = Counting::new(&snapshot);
+        let counting = Counting::new(snapshot);
         let start = Instant::now();
         let actual = index.top_k(&counting, query, 10, &scanner)?;
         latencies_us.push(start.elapsed().as_secs_f64() * 1_000_000.0);

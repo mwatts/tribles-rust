@@ -1237,23 +1237,13 @@ where
 
     fn try_from_cover<R>(
         cover: &Cover<NvFp4CosineSet<E>>,
+        descriptor: &Fragment,
         snapshot: &R,
     ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
         R: BlobStoreGet,
     {
-        let descriptor_handle = cover.collection().handle();
-        let descriptor_data = Handle::<SimpleArchive>::to_hash(descriptor_handle);
-        let descriptor: Blob<SimpleArchive> =
-            snapshot
-                .get(descriptor_handle)
-                .map_err(|source| TryFromCoverError::MemberGet {
-                    member: descriptor_data,
-                    source,
-                })?;
-        let facts = TribleSet::try_from_blob(descriptor)
-            .map_err(|source| TryFromCoverError::View(NvFp4Error::new(source.to_string())))?;
-        let dimension = mapping_dimension_facts(&facts)
+        let dimension = mapping_dimension_facts(descriptor.facts())
             .map_err(|source| TryFromCoverError::View(NvFp4Error::new(source.to_string())))?;
 
         let mut members = Vec::with_capacity(cover.len());
@@ -1314,7 +1304,7 @@ mod tests {
     use triblespace_core::attribute::Attribute;
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::collection::{
-        AdmissionPolicy, CollectionPolicy, CollectionStoreExt, ExactDerivedCollection,
+        AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
     };
     use triblespace_core::inline::InlineEncoding;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -1510,17 +1500,20 @@ mod tests {
             )
             .unwrap();
         let source_snapshot = source_store.snapshot().unwrap();
-        let source_cover = source.admitted(&source_snapshot).unwrap();
-        let target_cover =
-            ExactDerivedCollection::<EmbeddingAttributeToNvFp4<Embedding>>::new(source, target)
-                .unwrap()
-                .maintain_exact(&mut source_store, &source_cover)
-                .unwrap();
-        let source_snapshot = source_store.snapshot().unwrap();
+        let support = source.admitted(&source_snapshot).unwrap();
+        drop(source_snapshot);
+        let source_snapshot = source_store
+            .maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support)
+            .unwrap();
+        let collection = source_snapshot.collection_exact(target, &support).unwrap();
+        let target_cover = collection.cover().clone();
+        let source_snapshot = collection.snapshot();
 
         // Copy only the target descriptor and compact member into a fresh
         // store. The exact embedding blob is deliberately absent.
         let descriptor: Blob<SimpleArchive> = source_snapshot.get(target.handle()).unwrap();
+        let descriptor_fragment =
+            Fragment::from(TribleSet::try_from_blob(descriptor.clone()).unwrap());
         let member_handle = target_cover.members().next().unwrap();
         let compact: Blob<NvFp4CosineSet<Embedding>> = source_snapshot.get(member_handle).unwrap();
         let mut sparse = MemoryRepo::default();
@@ -1536,8 +1529,13 @@ mod tests {
         assert!(sparse.metadata(exact).unwrap().is_none());
 
         let counted = Counting::new(&sparse);
-        let index = NvFp4CosineIndex::<Embedding>::try_from_cover(&target_cover, &counted).unwrap();
-        assert_eq!(counted.gets(), 1 + target_cover.len());
+        let index = NvFp4CosineIndex::<Embedding>::try_from_cover(
+            &target_cover,
+            &descriptor_fragment,
+            &counted,
+        )
+        .unwrap();
+        assert_eq!(counted.gets(), target_cover.len());
         let prepared = PreparedQuery::new(&[1.0, 0.0, 0.0], DIMENSION).unwrap();
         assert_eq!(
             index
@@ -1546,7 +1544,7 @@ mod tests {
                 .len(),
             1,
         );
-        assert_eq!(counted.gets(), 1 + target_cover.len());
+        assert_eq!(counted.gets(), target_cover.len());
     }
 
     #[test]

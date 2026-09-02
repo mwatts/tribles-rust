@@ -8,7 +8,7 @@ use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 use triblespace_core::and;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionStoreExt, ExactDerivedCollection,
+    AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -62,22 +62,20 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let source_cover = source.admitted(&snapshot).unwrap();
-    let target_cover =
-        ExactDerivedCollection::<EmbeddingAttributeToNvFp4<Embedding>>::new(source, target)
-            .unwrap()
-            .maintain_exact(&mut store, &source_cover)
-            .unwrap();
-    let snapshot = store.snapshot().unwrap();
-    let index = target_cover
-        .materialize::<NvFp4CosineIndex<Embedding>, _>(&snapshot)
+    let support = source.admitted(&snapshot).unwrap();
+    drop(snapshot);
+    let snapshot = store
+        .maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support)
         .unwrap();
+    let collection = snapshot.collection_exact(target, &support).unwrap();
+    let index: NvFp4CosineIndex<Embedding> = collection.view().unwrap();
+    let snapshot = collection.snapshot();
 
     assert_eq!(index.dimension(), 3);
     assert_eq!(index.segment_count(), 1);
     let scanner = CpuF64UpperScanner;
     let top = index
-        .top_k(&snapshot, &[1.0, 0.0, 0.0], 2, &scanner)
+        .top_k(snapshot, &[1.0, 0.0, 0.0], 2, &scanner)
         .unwrap();
     assert_eq!(top.len(), 2);
     assert_eq!(top[0].embedding, positive);
@@ -89,7 +87,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     {
         let segments = index.scan_segments();
         let cuda = CudaUpperScanner::new(&segments).unwrap();
-        let cuda_top = index.top_k(&snapshot, &[1.0, 0.0, 0.0], 2, &cuda).unwrap();
+        let cuda_top = index.top_k(snapshot, &[1.0, 0.0, 0.0], 2, &cuda).unwrap();
         assert!(
             cuda_top == top,
             "CUDA and proof-oracle exact results differ"
@@ -97,7 +95,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     }
 
     let above = index
-        .above(&snapshot, &[1.0, 0.0, 0.0], 0.7, &scanner)
+        .above(snapshot, &[1.0, 0.0, 0.0], 0.7, &scanner)
         .unwrap();
     assert_eq!(
         above
@@ -111,7 +109,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     let engine_support: HashSet<_> = triblespace_core::find!(
         neighbour: Inline<Handle<Embedding>>,
         index
-            .similar_to(&snapshot, positive, neighbour, 0.7, &scanner)
+            .similar_to(snapshot, positive, neighbour, 0.7, &scanner)
             .unwrap()
     )
     .collect();
@@ -123,7 +121,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
         and!(
             (&allowed).has(neighbour),
             index
-                .similar_to(&snapshot, positive, neighbour, 0.7, &scanner)
+                .similar_to(snapshot, positive, neighbour, 0.7, &scanner)
                 .unwrap(),
         )
     )
@@ -134,6 +132,6 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     let mut variables = triblespace_core::query::VariableContext::new();
     let neighbour = variables.next_variable::<Handle<Embedding>>();
     assert!(index
-        .similar_to(&snapshot, missing_probe, neighbour, 0.7, &scanner)
+        .similar_to(snapshot, missing_probe, neighbour, 0.7, &scanner)
         .is_err());
 }
