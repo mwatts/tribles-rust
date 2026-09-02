@@ -47,6 +47,9 @@ pub(crate) type DisclosureForestPatch = PATCH<80, IdentitySchema, (), Blake3Merk
 pub(crate) struct FullReplicaState {
     pub(crate) forest: DisclosureForestPatch,
     pub(crate) direct_roots: HashSet<[u8; 32]>,
+    /// Reachable parents whose resident occurrence could not be read and
+    /// validated while constructing `forest`.
+    pub(crate) unreadable_parents: HashSet<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -671,6 +674,7 @@ mod tests {
         let empty_full = FullReplicaState {
             forest: DisclosureForestPatch::new(),
             direct_roots: HashSet::new(),
+            unreadable_parents: HashSet::new(),
         };
 
         let (server_io, client_io) = tokio::io::duplex(1 << 20);
@@ -706,6 +710,7 @@ mod tests {
             &FullReplicaState {
                 forest: DisclosureForestPatch::new(),
                 direct_roots: HashSet::new(),
+                unreadable_parents: HashSet::new(),
             },
             None,
             |_| None,

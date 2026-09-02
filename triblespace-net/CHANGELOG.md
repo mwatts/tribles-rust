@@ -26,11 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Share resident aligned-child discovery across all Full-replica forests built
-  from one immutable store snapshot. Each collection still owns its visited set
-  and authenticated disclosure forest; repeated blob reads are cached, and one
-  frozen resident-handle set turns aligned child discovery into a hash semijoin
-  instead of one persistent occurrence-PATCH probe per candidate word.
+- Rebuild only Full-replica forests selected by the exact resident-blob delta.
+  Additions scan each distinct prior reachable parent once against a compact
+  added-handle matcher, removals project reachable handles from the canonical
+  forests, and retained unreadable-parent evidence scopes repaired-duplicate
+  retries to its owning collections. Physical duplicate no-ops reuse unaffected
+  forests. Forests rebuilt from one immutable snapshot still share resident
+  aligned-child discovery while keeping collection-local reachability; one
+  frozen resident-handle set turns that discovery into a hash semijoin instead
+  of one persistent occurrence-PATCH probe per candidate word.
 - Replace team-scoped connection authorization and global inventory with
   immutable per-collection activation overlays. Collection repair discovery
   uses one endpoint-bound KDF(C) lease per active served collection. Exact

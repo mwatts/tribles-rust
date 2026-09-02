@@ -122,6 +122,68 @@ type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionSnapshot>
 type ResidentChildEdge = (u64, RawHash);
 type ResidentBlobSet = HashSet<RawHash>;
 
+const HANDLE_PREFIX_BITMAP_WORDS: usize = (1 << 16) / u64::BITS as usize;
+
+/// Exact membership on the usually small newly-resident side of a refresh.
+///
+/// Every aligned candidate pays only one 16-bit bitmap probe. A full 32-byte
+/// comparison happens only when some newly resident handle shares that prefix;
+/// there is no hash computation and neither false positives nor false
+/// negatives.
+struct AddedBlobMatcher {
+    handles: Vec<RawHash>,
+    prefixes: Vec<u64>,
+}
+
+impl AddedBlobMatcher {
+    fn new(mut handles: Vec<RawHash>) -> Self {
+        handles.sort_unstable();
+        handles.dedup();
+        let mut prefixes = vec![0; HANDLE_PREFIX_BITMAP_WORDS];
+        for handle in &handles {
+            let prefix = usize::from(u16::from_be_bytes([handle[0], handle[1]]));
+            prefixes[prefix / u64::BITS as usize] |= 1 << (prefix % u64::BITS as usize);
+        }
+        Self { handles, prefixes }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    fn contains_handle(&self, handle: &RawHash) -> bool {
+        self.handles.binary_search(handle).is_ok()
+    }
+
+    fn contains_chunk(&self, chunk: &[u8]) -> bool {
+        let prefix = usize::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        if self.prefixes[prefix / u64::BITS as usize] & (1 << (prefix % u64::BITS as usize)) == 0 {
+            return false;
+        }
+        self.handles
+            .binary_search_by(|handle| handle.as_slice().cmp(chunk))
+            .is_ok()
+    }
+}
+
+#[derive(Default)]
+struct BlobDeltaInvalidationStats {
+    #[cfg(test)]
+    added: usize,
+    #[cfg(test)]
+    removed: usize,
+    #[cfg(test)]
+    unique_parents: usize,
+    #[cfg(test)]
+    parent_scans: usize,
+    #[cfg(test)]
+    word_probes: usize,
+    #[cfg(test)]
+    matched_parents: usize,
+    #[cfg(test)]
+    invalidated_collections: usize,
+}
+
 /// Freeze the exact resident-handle relation once for one immutable store
 /// observation.
 ///
@@ -143,6 +205,7 @@ where
 #[derive(Default)]
 struct FullReplicaChildCache {
     edges: HashMap<RawHash, Vec<ResidentChildEdge>>,
+    unreadable: HashSet<RawHash>,
     #[cfg(test)]
     scans: usize,
     #[cfg(test)]
@@ -167,7 +230,7 @@ fn resident_child_edges<'a, R>(
     parent: RawHash,
     resident: &ResidentBlobSet,
     cache: &'a mut FullReplicaChildCache,
-) -> &'a [ResidentChildEdge]
+) -> (&'a [ResidentChildEdge], bool)
 where
     R: BlobStoreGet,
 {
@@ -177,21 +240,29 @@ where
             cache.scans += 1;
         }
         let mut edges = Vec::new();
-        if let Ok(bytes) = snapshot.get::<Bytes, UnknownBlob>(Inline::new(parent)) {
-            for (index, chunk) in bytes.chunks_exact(32).enumerate() {
-                let child: RawHash = chunk.try_into().expect("fixed-width chunk");
-                #[cfg(test)]
-                {
-                    cache.membership_probes += 1;
+        match snapshot.get::<Bytes, UnknownBlob>(Inline::new(parent)) {
+            Ok(bytes) => {
+                for (index, chunk) in bytes.chunks_exact(32).enumerate() {
+                    let child: RawHash = chunk.try_into().expect("fixed-width chunk");
+                    #[cfg(test)]
+                    {
+                        cache.membership_probes += 1;
+                    }
+                    if resident.contains(&child) {
+                        edges.push((index as u64, child));
+                    }
                 }
-                if resident.contains(&child) {
-                    edges.push((index as u64, child));
-                }
+            }
+            Err(_) => {
+                cache.unreadable.insert(parent);
             }
         }
         cache.edges.insert(parent, edges);
     }
-    cache.edges.get(&parent).unwrap()
+    (
+        cache.edges.get(&parent).unwrap(),
+        cache.unreadable.contains(&parent),
+    )
 }
 
 fn build_full_replica_state<R>(
@@ -214,6 +285,7 @@ where
     }
     let mut forest_keys = Vec::new();
     let mut visited = HashSet::new();
+    let mut unreadable_parents = HashSet::new();
     let mut level = direct_roots.iter().copied().collect::<Vec<_>>();
     level.sort_unstable();
     level.retain(|handle| resident.contains(handle));
@@ -229,10 +301,12 @@ where
     while !level.is_empty() {
         let mut next = BTreeMap::<[u8; 32], ([u8; 32], u64)>::new();
         for parent in &level {
-            for (index, child) in resident_child_edges(snapshot, *parent, resident, child_cache)
-                .iter()
-                .copied()
-            {
+            let (edges, unreadable) =
+                resident_child_edges(snapshot, *parent, resident, child_cache);
+            if unreadable {
+                unreadable_parents.insert(*parent);
+            }
+            for (index, child) in edges.iter().copied() {
                 if visited.contains(&child) {
                     continue;
                 }
@@ -258,6 +332,7 @@ where
     FullReplicaState {
         forest: DisclosureForestPatch::from_keys(forest_keys),
         direct_roots,
+        unreadable_parents,
     }
 }
 
@@ -270,8 +345,136 @@ pub(crate) struct StoreSnapshot {
     collections: CollectionSnapshotIndex,
     blobs: Arc<dyn BlobSnapshotReader>,
     bearer_locators: Arc<BearerLocatorIndex>,
+    resident_blobs: Option<Arc<ResidentBlobSet>>,
     observed_at: hifitime::Epoch,
     next_authorization_change: Option<hifitime::Epoch>,
+}
+
+/// Identify exactly which prior Full forests a semantic resident-blob delta
+/// can change without retaining the enormous relation of absent aligned words.
+///
+/// If a new vertex becomes reachable, the first new vertex on its root path is
+/// either a newly resident direct root or is named by an already reachable
+/// parent. Removals can matter only when the removed vertex was reachable.
+/// Consequently the existing forest is complete positive evidence: additions
+/// require one shared streaming semijoin against old reachable parent bytes,
+/// while removals need only a forest projection.
+fn blob_delta_invalidations<R>(
+    snapshot: &R,
+    previous: &StoreSnapshot,
+    previous_resident: &ResidentBlobSet,
+    resident: &ResidentBlobSet,
+) -> (HashSet<RawHash>, BlobDeltaInvalidationStats)
+where
+    R: BlobStoreGet,
+{
+    let added = AddedBlobMatcher::new(resident.difference(previous_resident).copied().collect());
+    let removed = previous_resident
+        .difference(resident)
+        .copied()
+        .collect::<HashSet<_>>();
+    #[cfg(test)]
+    let mut stats = BlobDeltaInvalidationStats::default();
+    #[cfg(not(test))]
+    let stats = BlobDeltaInvalidationStats::default();
+    #[cfg(test)]
+    {
+        stats.added = added.handles.len();
+        stats.removed = removed.len();
+    }
+    let prior = previous
+        .collections
+        .iter_ordered()
+        .filter_map(|key| {
+            previous
+                .collections
+                .get(key)
+                .cloned()
+                .map(|collection| (*key, collection))
+        })
+        .collect::<Vec<_>>();
+    let mut invalidated = HashSet::new();
+    let mut reachable_parents = HashSet::new();
+    for (collection, prior) in &prior {
+        if !prior.full.unreadable_parents.is_empty() {
+            invalidated.insert(*collection);
+        }
+        if prior
+            .full
+            .direct_roots
+            .iter()
+            .any(|root| added.contains_handle(root))
+        {
+            invalidated.insert(*collection);
+        }
+        if added.is_empty() && removed.is_empty() {
+            continue;
+        }
+        for entry in prior.full.forest.iter_ordered() {
+            let reachable: RawHash = entry[48..].try_into().expect("forest child width");
+            if !removed.is_empty() && removed.contains(&reachable) {
+                invalidated.insert(*collection);
+            }
+            if !added.is_empty() {
+                reachable_parents.insert(reachable);
+            }
+        }
+    }
+
+    if added.is_empty() {
+        #[cfg(test)]
+        {
+            stats.invalidated_collections = invalidated.len();
+        }
+        return (invalidated, stats);
+    }
+
+    #[cfg(test)]
+    {
+        stats.unique_parents = reachable_parents.len();
+    }
+    let mut ordered_parents = reachable_parents.into_iter().collect::<Vec<_>>();
+    ordered_parents.sort_unstable();
+    let mut matched_parents = HashSet::new();
+    for parent in ordered_parents {
+        let Ok(bytes) = snapshot.get::<Bytes, UnknownBlob>(Inline::new(parent)) else {
+            continue;
+        };
+        #[cfg(test)]
+        {
+            stats.parent_scans += 1;
+        }
+        for chunk in bytes.chunks_exact(32) {
+            #[cfg(test)]
+            {
+                stats.word_probes += 1;
+            }
+            if added.contains_chunk(chunk) {
+                matched_parents.insert(parent);
+                break;
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        stats.matched_parents = matched_parents.len();
+    }
+
+    if !matched_parents.is_empty() {
+        for (collection, prior) in &prior {
+            if prior.full.forest.iter_ordered().any(|entry| {
+                let reachable: RawHash = entry[48..].try_into().expect("forest child width");
+                matched_parents.contains(&reachable)
+            }) {
+                invalidated.insert(*collection);
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        stats.invalidated_collections = invalidated.len();
+    }
+    (invalidated, stats)
 }
 
 impl StoreSnapshot {
@@ -310,7 +513,31 @@ impl StoreSnapshot {
             || changes.contains(StoreChanges::CAPABILITY_PROOFS)
             || authorization_changed;
         let mut full_child_cache = FullReplicaChildCache::new();
-        let mut resident_blobs = None;
+        let resident_blobs = if !full_replication {
+            None
+        } else if changes.contains(StoreChanges::BLOBS)
+            || previous
+                .and_then(|prior| prior.resident_blobs.as_ref())
+                .is_none()
+        {
+            Some(Arc::new(resident_blob_set(&snapshot)?))
+        } else {
+            previous.and_then(|prior| prior.resident_blobs.clone())
+        };
+        let resident_delta_known = previous
+            .and_then(|prior| prior.resident_blobs.as_ref())
+            .is_some();
+        let blob_invalidated = match (
+            changes.contains(StoreChanges::BLOBS),
+            previous,
+            previous.and_then(|prior| prior.resident_blobs.as_deref()),
+            resident_blobs.as_deref(),
+        ) {
+            (true, Some(previous), Some(previous_resident), Some(resident)) => {
+                blob_delta_invalidations(&snapshot, previous, previous_resident, resident).0
+            }
+            _ => HashSet::new(),
+        };
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             if snapshot
@@ -378,17 +605,17 @@ impl StoreSnapshot {
                 Arc::new(FullReplicaState {
                     forest: DisclosureForestPatch::new(),
                     direct_roots: HashSet::new(),
+                    unreadable_parents: HashSet::new(),
                 })
             } else if let Some(prior) = prior.as_ref().filter(|prior| {
-                Arc::ptr_eq(&activation, &prior.activation)
-                    && !changes.contains(StoreChanges::BLOBS)
+                resident_delta_known
+                    && Arc::ptr_eq(&activation, &prior.activation)
+                    && (!changes.contains(StoreChanges::BLOBS)
+                        || blob_invalidated.get(&collection.raw).is_none())
                     && full_dirty.get(&collection.raw).is_none()
             }) {
                 prior.full.clone()
             } else {
-                if resident_blobs.is_none() {
-                    resident_blobs = Some(resident_blob_set(&snapshot)?);
-                }
                 Arc::new(build_full_replica_state(
                     &snapshot,
                     &activation,
@@ -410,6 +637,7 @@ impl StoreSnapshot {
             collections,
             blobs: blob_reader,
             bearer_locators,
+            resident_blobs,
             observed_at: instant,
             next_authorization_change,
         })
@@ -2177,7 +2405,7 @@ fn op_name(op: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::sync::Arc;
 
     use anybytes::Bytes;
@@ -2193,6 +2421,7 @@ mod tests {
     use triblespace_core::inline::Inline;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::patch::{Entry as PatchEntry, PATCH};
+    use triblespace_core::repo::hybridstore::HybridStore;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{
         BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource, StoreChanges,
@@ -2211,12 +2440,13 @@ mod tests {
     use crate::transport::PeerId;
 
     use super::{
-        ActiveCollections, COLLECTION_PARTICIPANT_LEASE, DiscoveryState, FullReplicaChildCache,
-        FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
+        ActiveCollections, AddedBlobMatcher, COLLECTION_PARTICIPANT_LEASE, DiscoveryState,
+        FullReplicaChildCache, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
         ProviderPublicationBudget, RepairTarget, StoreSnapshot, WakeBootstrapPeers,
-        build_full_replica_state, canonical_provider_subset, collection_activation_overlay_at,
-        enqueue_repair, forget_participant, has_repair_candidate, live_participants,
-        observe_participant, resident_blob_set, resident_child_edges, retain_active_repair_state,
+        blob_delta_invalidations, build_full_replica_state, canonical_provider_subset,
+        collection_activation_overlay_at, enqueue_repair, forget_participant, has_repair_candidate,
+        live_participants, observe_participant, resident_blob_set, resident_child_edges,
+        retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2268,6 +2498,24 @@ mod tests {
     }
 
     #[test]
+    fn added_blob_matcher_is_exact_across_empty_and_shared_prefixes() {
+        let first = [0x11; 32];
+        let mut same_prefix = [0x11; 32];
+        same_prefix[31] = 0x12;
+        let other = [0x22; 32];
+        let matcher = AddedBlobMatcher::new(vec![other, first, same_prefix, first]);
+
+        assert!(matcher.contains_handle(&first));
+        assert!(matcher.contains_chunk(&same_prefix));
+        assert!(matcher.contains_chunk(&other));
+        let mut absent_same_prefix = first;
+        absent_same_prefix[30] = 0x99;
+        assert!(!matcher.contains_chunk(&absent_same_prefix));
+        assert!(!matcher.contains_chunk(&[0x33; 32]));
+        assert!(!AddedBlobMatcher::new(Vec::new()).contains_chunk(&[0; 32]));
+    }
+
+    #[test]
     fn resident_child_cache_reuses_schema_agnostic_aligned_discovery() {
         let mut store = MemoryRepo::default();
         let child = store
@@ -2295,15 +2543,136 @@ mod tests {
                     .then_some((index as u64, child))
             })
             .collect::<Vec<_>>();
-        let first = resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
+        let (first, first_unreadable) =
+            resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
         let first_ptr = first.as_ptr();
+        assert!(!first_unreadable);
         assert_eq!(first, expected);
         assert_eq!(first, &[(1, child.raw)]);
-        let second = resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
+        let (second, second_unreadable) =
+            resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
 
         assert_eq!(first_ptr, second.as_ptr());
+        assert!(!second_unreadable);
         assert_eq!(cache.scans, 1);
         assert_eq!(cache.membership_probes, 3);
+    }
+
+    #[test]
+    fn resident_child_cache_retains_unreadable_parent_evidence() {
+        let mut store = MemoryRepo::default();
+        let snapshot = store.snapshot().unwrap();
+        let parent = [0xE7; 32];
+        let resident = HashSet::from([parent]);
+        let mut cache = FullReplicaChildCache::new();
+
+        let (edges, unreadable) = resident_child_edges(&snapshot, parent, &resident, &mut cache);
+        assert!(edges.is_empty());
+        assert!(unreadable);
+        let (_, unreadable_again) = resident_child_edges(&snapshot, parent, &resident, &mut cache);
+        assert!(unreadable_again);
+        assert_eq!(cache.scans, 1);
+    }
+
+    #[test]
+    fn physical_blob_noop_retries_only_the_owner_of_an_unreadable_parent() {
+        let key = SigningKey::from_bytes(&[0x3A; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = MemoryRepo::default();
+        let affected = store
+            .collection("unreadable-parent-owner", policy.clone())
+            .unwrap();
+        let untouched = store.collection("unreadable-parent-other", policy).unwrap();
+        store
+            .commit(affected, &key, fragment(22, Inline::new([0xB1; 32])))
+            .unwrap();
+        store
+            .commit(untouched, &key, fragment(23, Inline::new([0xB2; 32])))
+            .unwrap();
+        let active = active([affected, untouched]);
+        let clean = ActiveCollections::new();
+        let store_snapshot = store.snapshot().unwrap();
+        let baseline = StoreSnapshot::from_store_changes(
+            store_snapshot.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            None,
+            None,
+            StoreChanges::ALL,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+
+        // Model a prior read failure without constructing a corrupt backend:
+        // the positive repair evidence is the only state relevant to this
+        // invalidation rule.
+        let affected_prior = baseline.collection(affected.handle()).unwrap();
+        let untouched_prior = baseline.collection(untouched.handle()).unwrap();
+        let affected_full = Arc::new(FullReplicaState {
+            forest: affected_prior.full.forest.clone(),
+            direct_roots: affected_prior.full.direct_roots.clone(),
+            unreadable_parents: HashSet::from([[0xE7; 32]]),
+        });
+        let mut collections = super::CollectionSnapshotIndex::new();
+        collections.insert(&PatchEntry::with_value(
+            &affected.handle().raw,
+            Arc::new(super::CollectionSnapshot {
+                activation: affected_prior.activation.clone(),
+                read_evidence: affected_prior.read_evidence.clone(),
+                full: affected_full.clone(),
+                blobs: affected_prior.blobs.clone(),
+            }),
+        ));
+        collections.insert(&PatchEntry::with_value(
+            &untouched.handle().raw,
+            Arc::new(super::CollectionSnapshot {
+                activation: untouched_prior.activation.clone(),
+                read_evidence: untouched_prior.read_evidence.clone(),
+                full: untouched_prior.full.clone(),
+                blobs: untouched_prior.blobs.clone(),
+            }),
+        ));
+        let prior = StoreSnapshot {
+            collections,
+            blobs: baseline.blobs.clone(),
+            bearer_locators: baseline.bearer_locators.clone(),
+            resident_blobs: baseline.resident_blobs.clone(),
+            observed_at: baseline.observed_at,
+            next_authorization_change: baseline.next_authorization_change,
+        };
+        let resident = prior.resident_blobs.as_deref().unwrap();
+        let (invalidated, stats) =
+            blob_delta_invalidations(&store_snapshot, &prior, resident, resident);
+        assert_eq!(stats.added, 0);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.parent_scans, 0);
+        assert_eq!(stats.invalidated_collections, 1);
+        assert!(invalidated.contains(&affected.handle().raw));
+        assert!(!invalidated.contains(&untouched.handle().raw));
+
+        let refreshed = StoreSnapshot::from_store_changes(
+            store_snapshot.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            Some(&store_snapshot),
+            Some(&prior),
+            StoreChanges::BLOBS,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&affected_full, &full(&refreshed, affected)));
+        assert!(Arc::ptr_eq(
+            &untouched_prior.full,
+            &full(&refreshed, untouched)
+        ));
     }
 
     #[test]
@@ -2383,6 +2752,114 @@ mod tests {
                 .iter_ordered()
                 .any(|entry| entry[48..] == child.raw)
         );
+    }
+
+    #[test]
+    fn delta_semijoin_selects_shared_owners_and_rebuild_recovers_a_batch_cascade() {
+        let key = SigningKey::from_bytes(&[0x38; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let leaf_blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"cascade leaf".to_vec()));
+        let leaf = leaf_blob.get_handle();
+        let parent_blob = Blob::<UnknownBlob>::new(Bytes::from_source(leaf.raw.to_vec()));
+        let parent = parent_blob.get_handle();
+        let mut store = MemoryRepo::default();
+        let first = store
+            .collection("delta-shared-first", policy.clone())
+            .unwrap();
+        let second = store
+            .collection("delta-shared-second", policy.clone())
+            .unwrap();
+        let untouched = store.collection("delta-untouched", policy).unwrap();
+        let first_commit = store.commit(first, &key, fragment(19, parent)).unwrap();
+        let second_commit = store.commit(second, &key, fragment(19, parent)).unwrap();
+        store
+            .commit(untouched, &key, fragment(20, Inline::new([0xD0; 32])))
+            .unwrap();
+        assert_eq!(first_commit.data(), second_commit.data());
+
+        let active = active([first, second, untouched]);
+        let clean = ActiveCollections::new();
+        let before_store = store.snapshot().unwrap();
+        let before = StoreSnapshot::from_store_changes(
+            before_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            None,
+            None,
+            StoreChanges::ALL,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        let first_before = full(&before, first);
+        let second_before = full(&before, second);
+        let untouched_before = full(&before, untouched);
+
+        store.put::<UnknownBlob, _>(parent_blob).unwrap();
+        store.put::<UnknownBlob, _>(leaf_blob).unwrap();
+        store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"unrelated delta member".to_vec()))
+            .unwrap();
+        let after_store = store.snapshot().unwrap();
+        let resident = resident_blob_set(&after_store).unwrap();
+        let (invalidated, stats) = blob_delta_invalidations(
+            &after_store,
+            &before,
+            before.resident_blobs.as_deref().unwrap(),
+            &resident,
+        );
+        assert_eq!(stats.added, 3);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.parent_scans, stats.unique_parents);
+        assert_eq!(stats.matched_parents, 1);
+        assert_eq!(stats.invalidated_collections, 2);
+        assert!(invalidated.contains(&first.handle().raw));
+        assert!(invalidated.contains(&second.handle().raw));
+        assert!(!invalidated.contains(&untouched.handle().raw));
+
+        let after = StoreSnapshot::from_store_changes(
+            after_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            Some(&before_store),
+            Some(&before),
+            after_store.changes_since(&before_store),
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&first_before, &full(&after, first)));
+        assert!(!Arc::ptr_eq(&second_before, &full(&after, second)));
+        assert!(Arc::ptr_eq(&untouched_before, &full(&after, untouched)));
+        for collection in [first, second] {
+            let selective = full(&after, collection);
+            assert!(
+                selective
+                    .forest
+                    .iter_ordered()
+                    .any(|entry| entry[48..] == parent.raw)
+            );
+            assert!(
+                selective
+                    .forest
+                    .iter_ordered()
+                    .any(|entry| entry[48..] == leaf.raw)
+            );
+            let activation =
+                collection_activation_overlay_at(&after_store, collection.handle(), observed_at())
+                    .unwrap();
+            let mut oracle_cache = FullReplicaChildCache::new();
+            let oracle =
+                build_full_replica_state(&after_store, &activation, &resident, &mut oracle_cache);
+            assert_eq!(selective.forest, oracle.forest);
+            assert_eq!(selective.direct_roots, oracle.direct_roots);
+        }
     }
 
     #[test]
@@ -2520,7 +2997,7 @@ mod tests {
     }
 
     #[test]
-    fn full_forests_rebuild_on_every_blob_change_or_explicit_dirty_mark() {
+    fn full_forests_rebuild_only_for_semantic_blob_deltas_or_explicit_dirty_marks() {
         let key = SigningKey::from_bytes(&[0x31; 32]);
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
         let mut store = MemoryRepo::default();
@@ -2578,7 +3055,7 @@ mod tests {
         let first_changed = full(&second_serving, first);
         let second_changed = full(&second_serving, second);
         assert!(!Arc::ptr_eq(&first_before, &first_changed));
-        assert!(!Arc::ptr_eq(&second_before, &second_changed));
+        assert!(Arc::ptr_eq(&second_before, &second_changed));
 
         store
             .put::<UnknownBlob, _>(Bytes::from_source(b"another unrelated cache blob".to_vec()))
@@ -2598,8 +3075,8 @@ mod tests {
             observed_at(),
         )
         .unwrap();
-        assert!(!Arc::ptr_eq(&first_changed, &full(&third_serving, first)));
-        assert!(!Arc::ptr_eq(&second_changed, &full(&third_serving, second)));
+        assert!(Arc::ptr_eq(&first_changed, &full(&third_serving, first)));
+        assert!(Arc::ptr_eq(&second_changed, &full(&third_serving, second)));
 
         let mut dirty = ActiveCollections::new();
         dirty.insert(&PatchEntry::new(&second.handle().raw));
@@ -2625,6 +3102,55 @@ mod tests {
             &full(&third_serving, second),
             &full(&dirty_serving, second)
         ));
+    }
+
+    #[test]
+    fn enabling_full_replication_builds_the_previously_absent_forest() {
+        let key = SigningKey::from_bytes(&[0x3B; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = MemoryRepo::default();
+        let collection = store.collection("enable-full", policy).unwrap();
+        store
+            .commit(collection, &key, fragment(24, Inline::new([0xB3; 32])))
+            .unwrap();
+        let active = active([collection]);
+        let clean = ActiveCollections::new();
+        let store_snapshot = store.snapshot().unwrap();
+        let demand = StoreSnapshot::from_store_changes(
+            store_snapshot.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            None,
+            None,
+            StoreChanges::ALL,
+            false,
+            false,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        let demand_full = full(&demand, collection);
+        assert!(demand.resident_blobs.is_none());
+        assert!(demand_full.forest.is_empty());
+
+        let replicated = StoreSnapshot::from_store_changes(
+            store_snapshot.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            Some(&store_snapshot),
+            Some(&demand),
+            StoreChanges::NONE,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        assert!(replicated.resident_blobs.is_some());
+        assert!(!Arc::ptr_eq(&demand_full, &full(&replicated, collection)));
+        assert!(!full(&replicated, collection).forest.is_empty());
     }
 
     #[test]
@@ -2685,6 +3211,95 @@ mod tests {
                 .iter_ordered()
                 .any(|entry| entry[48..] == child.raw)
         );
+    }
+
+    #[test]
+    fn removed_reachable_handle_invalidates_its_owner_and_matches_full_rebuild() {
+        let key = SigningKey::from_bytes(&[0x39; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = HybridStore::new(MemoryBlobStore::new(), MemoryRepo::default());
+        let child = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"removable child".to_vec()))
+            .unwrap();
+        let collection = store.collection("delta-removal", policy).unwrap();
+        store.commit(collection, &key, fragment(21, child)).unwrap();
+        let active = active([collection]);
+        let clean = ActiveCollections::new();
+        let before_store = store.snapshot().unwrap();
+        let before = StoreSnapshot::from_store_changes(
+            before_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            None,
+            None,
+            StoreChanges::ALL,
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        let before_full = full(&before, collection);
+        assert!(
+            before_full
+                .forest
+                .iter_ordered()
+                .any(|entry| entry[48..] == child.raw)
+        );
+
+        let retained = store
+            .blobs
+            .snapshot()
+            .unwrap()
+            .blobs()
+            .map(|info| info.unwrap().handle)
+            .filter(|handle| handle.raw != child.raw)
+            .collect::<Vec<_>>();
+        store.blobs.keep(retained);
+        let after_store = store.snapshot().unwrap();
+        let resident = resident_blob_set(&after_store).unwrap();
+        let (invalidated, stats) = blob_delta_invalidations(
+            &after_store,
+            &before,
+            before.resident_blobs.as_deref().unwrap(),
+            &resident,
+        );
+        assert_eq!(stats.added, 0);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.parent_scans, 0);
+        assert!(invalidated.contains(&collection.handle().raw));
+
+        let after = StoreSnapshot::from_store_changes(
+            after_store.clone(),
+            &active,
+            &clean,
+            key.verifying_key(),
+            Some(&before_store),
+            Some(&before),
+            after_store.changes_since(&before_store),
+            false,
+            true,
+            None,
+            observed_at(),
+        )
+        .unwrap();
+        let selective = full(&after, collection);
+        assert!(!Arc::ptr_eq(&before_full, &selective));
+        assert!(
+            !selective
+                .forest
+                .iter_ordered()
+                .any(|entry| entry[48..] == child.raw)
+        );
+        let activation =
+            collection_activation_overlay_at(&after_store, collection.handle(), observed_at())
+                .unwrap();
+        let mut oracle_cache = FullReplicaChildCache::new();
+        let oracle =
+            build_full_replica_state(&after_store, &activation, &resident, &mut oracle_cache);
+        assert_eq!(selective.forest, oracle.forest);
+        assert_eq!(selective.direct_roots, oracle.direct_roots);
     }
 
     #[tokio::test]
@@ -2750,8 +3365,8 @@ mod tests {
         let after = observer.current_snapshot().unwrap();
         assert!(!Arc::ptr_eq(&before, &after));
         assert!(
-            !Arc::ptr_eq(&untouched_before, &full(&after, untouched)),
-            "H-only blob arrivals conservatively invalidate every active Full forest"
+            Arc::ptr_eq(&untouched_before, &full(&after, untouched)),
+            "a checkpointed arrival must preserve an unrelated Full forest"
         );
         assert!(
             full(&after, collection)
@@ -2762,7 +3377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn any_published_blob_arrival_invalidates_every_active_full_forest() {
+    async fn published_blob_arrival_invalidates_only_its_reachable_full_forest() {
         let key = SigningKey::from_bytes(&[0x34; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
@@ -2794,6 +3409,7 @@ mod tests {
         peer.activate_collections([partial.handle(), completed.handle()]);
         let before = observer.current_snapshot().unwrap();
         let partial_before = full(&before, partial);
+        let completed_before = full(&before, completed);
 
         let (partial_ack, mut partial_acked) = tokio::sync::oneshot::channel();
         let (completed_ack, mut completed_acked) = tokio::sync::oneshot::channel();
@@ -2822,6 +3438,10 @@ mod tests {
         assert!(!Arc::ptr_eq(
             &partial_before,
             &full(&interleaved_snapshot, partial)
+        ));
+        assert!(Arc::ptr_eq(
+            &completed_before,
+            &full(&interleaved_snapshot, completed)
         ));
         assert!(
             full(&interleaved_snapshot, partial)

@@ -64,16 +64,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and one ordinary `MERGE`, while the homomorphism implies the cross-lattice
   `DERIVE`.
 
-- Rebuild every active Full-replica disclosure forest whenever resident blobs
-  change. Exact H-only arrivals carry no collection provenance, so this
-  conservative invalidation lets a newly resident Merkle child advance every
-  affected payload root without reintroducing collection-coupled transfer.
-  Full repair page checkpoints remain scoped per collection. Within one
-  immutable refresh, overlapping forests now share aligned child discovery
-  while retaining independent reachability and authenticated forest entries.
-  Full discovery freezes that snapshot's resident-handle set once and
-  hash-semijoins aligned candidates against it instead of probing the
-  persistent occurrence PATCH for every arbitrary 32-byte word.
+- Rebuild only Full-replica disclosure forests whose semantics can change with
+  a resident-blob delta. A frozen resident-handle set makes additions and
+  removals exact: new direct roots are selected immediately, distinct prior
+  reachable parents are scanned once against the usually small added set, and
+  removed handles are projected directly from the canonical forests. Prior
+  unreadable-parent evidence scopes retry after a repaired duplicate occurrence,
+  while physical duplicate no-ops reuse every unaffected forest. Full repair
+  page checkpoints remain scoped per collection. Within one immutable refresh,
+  overlapping rebuilt forests share aligned child discovery while retaining
+  independent reachability and authenticated forest entries; candidate words
+  are hash-semijoined against the frozen resident set instead of probing the
+  persistent occurrence PATCH individually.
 
 ### Added
 
