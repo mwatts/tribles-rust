@@ -58,7 +58,7 @@ or irrelevant proof in storage grants nothing.
 │ Application                                      │
 │ entity! · Fragment · find! · pattern!            │
 ├──────────────────────────────────────────────────┤
-│ Collection facades                               │
+│ Typed collections and immutable observations     │
 │ publish, select exact covers, materialize views  │
 ├──────────────────────────────────────────────────┤
 │ Collection algebra                              │
@@ -204,27 +204,32 @@ f(a ⊔ b) = f(a) ⊔ f(b)
 ```
 
 That law makes equations on either side of the mapping reusable evidence.
-Construction and representation maintenance are separate operations.
+Construction and representation maintenance are separate operations. The
+foundational support is always `Support = Cover<SimpleArchive>`: the admitted
+committed payloads at the root of the descriptor lineage. That support remains
+unchanged across every mapping hop. A multi-hop derivation therefore invokes
+each mapping explicitly with the same support rather than passing an
+intermediate physical cover downstream.
+
 `ensure` and `ensure_exact` reuse resident target nodes and stored equations,
-but publish only missing cross-lattice `DERIVE` work; they never create a
-`MERGE`. `maintain` and `maintain_exact` first ensure the requested support and
-then repeatedly join the two lowest content handles in the lowest colliding
-dyadic serialized-size tier. When one of those target joins names a missing
-immutable representation dependency, maintenance may materialize that exact
-dependency in the source lattice and retry; it never constructs source merges
-merely as a planning preference. An opaque source cover fixes the logical
-value while the resolver chooses a target cover with equal support. Different
-target covers may denote the same join, and every lattice position uses the
-same `Cover<E>` shape while retaining its own typed member handles. Missing
-derived artifacts are cache misses, not missing facts.
+but publish only missing `DERIVE` work for their one immediate mapping; they
+never create a `MERGE` or manufacture an upstream blob. `maintain` and
+`maintain_exact` first perform that same vertical work and then repeatedly join
+target members in the deterministic dyadic serialized-size tiers. A target
+join which cannot use an already-resident immutable dependency leaves a finer
+target cover in place. Different target covers may denote the same join, and
+every lattice position uses the same `Cover<E>` shape while retaining its own
+typed member handles. Missing derived artifacts are cache misses, not missing
+facts.
 
 Every store-level ensure or maintain operation returns a fresh
-`CollectionSnapshot`. The result is a temporal boundary, not a cover detached
-from the store observation that made it valid: it owns the post-operation
-store snapshot, the exact frozen source support, and the realized target
-cover. Read-only `CollectionSnapshotExt::{collection, collection_exact}`
-construct the same shape from an existing store snapshot. A caller chooses the
-logical projection later with `CollectionSnapshot::view`.
+`StoreSnapshot`. The result is the post-operation temporal boundary, including
+work concurrently published before that snapshot. Read-only
+`CollectionSnapshotExt::{collection, collection_exact}` selects a resident
+target cover from one such store snapshot and returns a `CollectionSnapshot`
+which owns that immutable observation, the invariant foundational support, and
+the realized target cover. A caller chooses the logical projection later with
+`CollectionSnapshot::view`.
 
 `Cover` carries no route mode. The resolver checks its explicit members first
 and, only when needed, widens through stored `MERGE` equations to a resident
@@ -237,15 +242,14 @@ a separate sidecar or runtime artifact.
 
 Both raw Succinct and Rank9-accelerated members own canonical joins. The Rank9
 join computes the same union, but its result names the exact raw Succinct union
-as an immutable child. If that child is absent, the target join reports its
-content identity as a representation dependency. Generic storage maintenance
-then materializes the corresponding raw `MERGE`, retries the Rank9 join, and
-persists the accelerated `MERGE`. The commuting-square law already implies the
-`DERIVE` from the merged raw member to the merged accelerated member, so no
-redundant record is needed. A cover-aware view follows each embedded handle
-through its store snapshot, validates the exact raw/index pair, and only then
-builds the transient query runtime. A root whose raw child is absent is not a
-usable query value.
+as an immutable child. It may consume that raw union when the blob is already
+resident; it never creates the upstream raw blob or its `MERGE` record. If the
+child is absent, target maintenance leaves the exact finer accelerated cover
+in place. A caller which wants both lattices compact invokes their mapping hops
+explicitly, in order, with the same foundational support. A cover-aware view
+follows each embedded handle through its store snapshot, validates the exact
+raw/index pair, and only then builds the transient query runtime. A root whose
+raw child is absent is not a usable query value.
 
 ## WANT is operational, not semantic
 

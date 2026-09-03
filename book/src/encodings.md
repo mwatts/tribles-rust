@@ -164,9 +164,11 @@ The crate also ships with these blob encodings:
   validates the exact raw/index pair, and reconstructs the runtime. The raw and
   accelerated encodings each own a canonical union. An accelerated join
   publishes only the accelerated result, but requires the matching raw union
-  to be resident because its header names that exact child. Generic storage
-  maintenance can therefore publish the raw source `MERGE` first and retry the
-  accelerated `MERGE`; no operation emits both blobs. Ordinary
+  to be resident because its header names that exact child. It may consume an
+  already-resident immutable raw dependency, but downstream maintenance never
+  creates the raw blob or its `MERGE`; callers maintain each mapping hop
+  explicitly with the same foundational `Support`. If the dependency is
+  absent, target maintenance retains a finer accelerated cover. Ordinary
   support-equivalent cover resolution may reuse any already-derived or joined
   accelerated cover with the same foundation. Resolution first excludes an
   image whose named raw child is unavailable and falls back to a complete finer

@@ -23,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `register_collection::<E>(descriptor)` boundary. `CollectionMapping` now
   carries associated `Source` and `Target` encodings plus its concrete mapping
   fragment. Store snapshots expose immutable typed collection observations;
-  mutating ensure/maintain operations take only the target and mapping type and
-  return a fresh store snapshot.
+  mutating ensure/maintain operations take only the target and mapping type,
+  cross one explicit hop over invariant foundational support, and return a
+  fresh store snapshot.
 
 - Define foundational `Support` as exactly `Cover<SimpleArchive>` and preserve
   it unchanged across every mapping hop. `CollectionSnapshot<R, E>` pairs one
@@ -99,9 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CollectionEncoding` whose first 32 bytes name its portable raw
   `SuccinctArchiveBlob` child. `RawToRank9AcceleratedMappingV1` maps raw members
   through ordinary `DERIVE` records. Raw Succinct and accelerated roots both
-  own canonical joins. When the accelerated join's exact raw union is absent,
-  generic collection maintenance materializes that immutable source dependency
-  and retries before publishing the accelerated `MERGE`. Cover-aware
+  own canonical joins. The accelerated join may consume its exact immutable raw
+  union when already resident, but downstream maintenance never creates that
+  upstream blob or `MERGE`. Without the dependency it retains a finer target
+  cover. Cover-aware
   views pull the named child through the immutable store snapshot and validate
   the complete raw/index pair. The former `Rank9MappingV1`/`RANK9_MAPPING_V1`,
   intermediate `Rank9SidecarMappingV1*`, old blob names, and their obsolete id

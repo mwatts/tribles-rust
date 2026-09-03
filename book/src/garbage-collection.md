@@ -53,10 +53,11 @@ Rank9 acceleration uses the same rule through ordinary collection records.
 its portable raw `SuccinctArchiveBlob` child. A raw-to-accelerated `DERIVE` may
 survive a conservative ledger rewrite, but the unsigned equation still
 manufactures no ownership. Raw Succinct and Rank9-accelerated members are both
-directly joinable. A Rank9 join depends on the exact raw union being resident;
-when storage materializes that raw `MERGE`, the accelerated `MERGE` can follow.
-If policy retains the accelerated root, ordinary child traversal also retains
-its named raw child.
+directly joinable. A Rank9 join may consume its exact raw union when that
+immutable dependency is already resident, but it never publishes the raw blob
+or a raw `MERGE`. When the dependency is absent, target maintenance retains the
+finer accelerated cover. If policy retains the accelerated root, ordinary
+child traversal also retains its named raw child.
 
 Read-only materialization accepts only a complete resident source-bound member.
 Cover resolution checks the encoding's required representation closure before
@@ -65,8 +66,10 @@ and a complete finer cover may replace it. The cover-aware view still loads the
 embedded raw child through the same snapshot and validates the exact raw/index
 pair before constructing a transient query runtime. Normal `ensure`
 publication stores each mapped target before its `DERIVE`. `maintain`
-additionally stores every exact dependency and merge output before publishing
-the corresponding `MERGE`. No accelerator-specific retention relation or
+additionally stores each successful target merge output before publishing the
+corresponding target `MERGE`; neither operation manufactures upstream state.
+Every mapping hop is maintained explicitly with the same invariant
+`Support = Cover<SimpleArchive>`. No accelerator-specific retention relation or
 hidden root is involved.
 
 The resulting roots compose with both storage paths. Yard's `collect` and

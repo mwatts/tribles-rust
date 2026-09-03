@@ -12,10 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split exact derived construction from physical maintenance. `ensure` and
   `ensure_exact` now publish missing `DERIVE` work only; `maintain` and
   `maintain_exact` additionally perform deterministic dyadic size-tiered LSM
-  `MERGE` work. The store-level operations return a
-  `CollectionSnapshot<R, E>` which owns the fresh immutable store observation
-  together with invariant foundational `Support = Cover<SimpleArchive>` and
-  the realized target cover, then reconstructs caller-chosen views on demand.
+  `MERGE` work in the target lattice. Every mapping hop is explicit over the
+  same invariant foundational `Support = Cover<SimpleArchive>`; downstream
+  maintenance never creates upstream blobs or merges. The store-level
+  operations return a fresh immutable `StoreSnapshot`, from which callers
+  select a typed `CollectionSnapshot<R, E>` and reconstruct views on demand.
 
 - Add a derived segmented pile index over `collection handle || record fingerprint` so
   collection-only selector unions visit only the named descriptors' records
@@ -71,11 +72,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   planes while row handles and exact sources remain search-owned.
 
 - Make Rank9 acceleration an ordinary full derived lattice. Raw Succinct and
-  Rank9-accelerated members each own a canonical join. When the accelerated
-  join's exact raw union is absent, generic collection maintenance materializes
-  that immutable source dependency and retries; each step still emits one blob
-  and one ordinary `MERGE`, while the homomorphism implies the cross-lattice
-  `DERIVE`.
+  Rank9-accelerated members each own a canonical join. The accelerated join may
+  consume its exact immutable raw union when already resident, but never
+  creates that upstream blob or `MERGE`. Without the dependency, maintenance
+  retains a finer accelerated cover; callers maintain each mapping hop
+  explicitly with the same foundational support.
 
 - Rebuild only Full-replica disclosure forests whose semantics can change with
   a resident-blob delta. A frozen resident-handle set makes additions and
@@ -235,17 +236,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed conflicting coordinate fails a documented single-coordinate
   contract instead of depending on iteration order.
 
-- Add immutable `CollectionSnapshot<R, S, T>` values which pair one store
-  snapshot with exact source support and its realized target cover. Logical
-  projections are reconstructed on demand through `view`.
-  `SuccinctArchiveCollection::attach` preserves that continuation value, while
-  functional `advance`
-  leaves the previous snapshot untouched and returns `Unchanged`,
-  `Advanced { next, changed }`, or `Reset { next }`. Strict growth maintains
-  exact changed and complete Succinct covers through persisted `DERIVE` and
-  `MERGE` equations, retaining compact target LSM covers without reconstructing
-  a `TribleSet` or joining temporary views. The evolving-collection benchmark
-  keeps its support accounting outside production code.
+- Add immutable `CollectionSnapshot<R, E>` values which pair one store
+  snapshot with invariant foundational `Support = Cover<SimpleArchive>` and a
+  resident target `Cover<E>`. Logical projections are reconstructed on demand
+  through `view`; change processing compares the frozen supports without
+  reconstructing a `TribleSet` or joining temporary views. The
+  evolving-collection benchmark keeps its support accounting outside
+  production code.
 
 - Add an end-to-end incremental collection-query benchmark comparing full
   re-query with `pattern_changes!` maintenance over source-identical exact
@@ -319,17 +316,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closure through the DHT, while ambient or WRITE-inactive artifacts remain
   clean misses.
   Wire protocol identity advances to pile-sync ALPN v13.
-
-- Add lattice-aware exact derived-collection reuse over the existing team
-  transport. The core resolver accepts speculative remote target handles,
-  prefers any complete resident cover, selects only an exact physical
-  antichain when local bytes are incomplete, and replans after stale or invalid
-  offers. `triblespace-net::collection_sync::ensure_exact_derived` fetches only
-  those selected handles through authenticated `GET_BLOB`, creates no durable
-  WANT, and falls back to canonical local construction. Remote equations remain
-  unsigned cache evidence and are recomputed from the opaque source
-  cover, so this first slice saves transfer and residency rather than claiming
-  a compute attestation.
 
 - Add a monotone native store-scope assertion binding one physical repository
   to exactly one Ed25519 team trust root. `MemoryRepo`, `Pile`, and `Yard`
@@ -447,12 +433,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data work. Replay and derivation require no resident commit or metadata.
   collection admission, exact derivations, maintained Succinct views,
   paths, and network reuse now share this continuation type. Distinct covers
-  may have equal support through validated merges. Exact derivation can
+  may have equal foundational support through validated merges. Every mapping
+  hop is explicit and receives that same `Support = Cover<SimpleArchive>`.
+  Exact derivation can
   reverse-ground a compacted source member through freshly validated `MERGE`
   inputs, so `{c}` may reuse resident `{f(a), f(b)}` when `a join b = c`, while
   forged equations remain inert and fall back to direct construction. Rank9
-  uses that same ordinary equivalence route: its facade first maintains the raw
-  Succinct cover and then derives the accelerated cover as a separate step.
+  uses that same ordinary equivalence route: callers maintain the raw Succinct
+  mapping hop and the accelerated mapping hop as separate operations over the
+  same support.
   The equivalence route also lets capacity replanning replace a blocked
   compacted member with its resident lower shards. Resolution tries the
   explicit Cover path first and widens into reverse decompositions only when
@@ -468,13 +457,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   descriptor and ordinary collection admission against one store snapshot.
 
 - Replace the stateful `Collection<S>`/`CollectionAdmission` facade with
-  store-centric collection operations. `store.collection(fragment)` validates,
-  stores, and durably offers a descriptor's complete attachment closure;
-  `store.commit(handle, key, fragment)` publishes locally without conflating
-  storage with authorization; and `collection.admitted(&store_snapshot)` admits
-  the descriptor authority plus delegated writers authorized by resident
-  proofs. `Cover` carries one canonical exact payload set for resolution and
-  replay through the same immutable store snapshot.
+  store-centric collection operations. `store.collection(name, policy)` and
+  `store.derive(source, mapping, policy)` construct canonical descriptors;
+  `store.register_collection::<E>(descriptor)` is the raw custom-descriptor
+  boundary; `store.commit(collection, key, fragment)` publishes locally
+  without conflating storage with authorization; and
+  `collection.admitted(&store_snapshot)` applies the descriptor WRITE policy
+  and resident proofs. `Cover` carries one canonical exact payload set for
+  resolution and replay through the same immutable store snapshot.
   Descriptor handles are the collection values,
   publication never flushes implicitly, and repeated commits remain
   idempotent native records.
@@ -487,10 +477,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field to the tagged descriptor entity, reject ambiguous optional fields,
   and reject absent, repeated, malformed, or off-entity authority rows.
 
-- Let maintained observed-set and LWW collection facades state source and
-  derived authority independently. Every descriptor carries its authority
-  locally, so derived collection identity never depends on walking its source
-  or on ambient admission policy.
+- Let maintained observed-set and LWW mappings use independently registered
+  source and derived descriptors. Every descriptor carries its policy locally,
+  so derived collection admission never inherits ambient source policy.
 
 - Bound the unified inventory/DHT outbound pool to 64 fully reciprocal
   CONNECT+SYNC_TEAM-authorized sessions with deterministic LRU residency.
@@ -871,12 +860,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore`, `CollectionStore`, and `StorageFlush` forwarding surfaces and
   allowing a temporary `Repository` view without transferring backend
   ownership or reimplementing the pin trait in downstream crates.
-- **Direct `SimpleArchive` collections now have a keyless exact-cover read
-  facade.** `SimpleArchiveCollection::attach` accepts an opaque `Cover`
-  against one immutable store snapshot and requires only its descriptor and
-  payload bytes; no signed commit or metadata needs to remain resident. It
-  shares ordinary descriptor, member, and merge-cover validation, exposes no
-  write operation, and keeps provenance independently queryable.
+- **Direct `SimpleArchive` collections use the same typed snapshot path as
+  every other encoding.** `snapshot.collection_exact(collection, &support)`
+  selects a resident cover against one immutable store snapshot and requires
+  only its descriptor and payload bytes; no signed commit or metadata needs to
+  remain resident. It shares ordinary descriptor, member, and merge-cover
+  validation, while provenance remains independently queryable.
 - **The unpublished branch-index persistence stack is gone.** Core no longer
   exposes commit-range manifests, `IndexKind`, repository on-commit hooks, or
   their branch-head maintenance path. Search no longer exposes the
@@ -886,17 +875,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the open-fact carry rule, and conservative blob scanning preserves
   any handles they name; no migration or compatibility reader is required for
   the unpublished API.
-- **Succinct archives now have one two-stage native exact-collection
-  lifecycle.** Its former branch-index recipe and branch-bound read wrappers
-  are removed. `SuccinctArchiveCollection` first derives and maintains
-  portable `SuccinctArchiveBlob` members, then derives ordinary
-  `Rank9AcceleratedSuccinctArchiveBlob` members and exposes their sharded
-  `UnionArchive` query view.
+- **Succinct archives now use two explicit native collection mappings.** Their
+  former branch-index recipe and branch-bound read wrappers are removed.
+  Callers derive and maintain portable `SuccinctArchiveBlob` members, then
+  derive ordinary `Rank9AcceleratedSuccinctArchiveBlob` members with the same
+  foundational support and expose their sharded `UnionArchive` query view.
 - **The SuccinctArchive example now follows the native collection lifecycle.**
   `native_succinct_collection` publishes intrinsic fragments as independent
   signed commits, freezes the admitted value as a payload cover, and queries an
-  exact `SuccinctArchiveCollection` projection without branch hooks, manifests,
-  or a checkout. The pile re-id/rename integration test now exercises its real
+  exact typed Succinct collection snapshot without branch hooks, manifests, or
+  a checkout. The pile re-id/rename integration test now exercises its real
   generic contract by carrying unrelated canonical branch annotations instead
   of depending on a Succinct-specific manifest fixture.
 - **The portable Succinct LSM benchmark now measures the native exact
@@ -915,16 +903,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-to-end measurement showed no useful win from that legacy adapter. Native
   GPU execution for the exact raw-Succinct collection would require a separate
   direct-raw adapter rather than restoring a branch-bound lifecycle.
-- **Derived collections now share one qualified exact-cover lifecycle.**
-  `collection::exact_derived::ExactDerivedCollection` supplies strict cover
-  discovery, payload validation, deterministic resident covers, residual
-  lowering, source-before-target-before-`DERIVE` publication, and
+- **Derived collections now share one store-centric exact-cover engine.** The
+  engine supplies strict cover discovery, payload validation, deterministic
+  resident covers, residual lowering, target-before-`DERIVE` publication, and
   read-side attachment without `PinStore` or an implicit flush. Regular paths
-  and both Succinct stages use this kernel. `SuccinctArchiveCollection`
-  operations return a typed collection snapshot which owns the fresh store
-  observation, frozen admitted support, and accelerated target cover,
-  preserving its physical shape until a caller reconstructs a sharded
-  `UnionArchive` through `view`.
+  and both Succinct stages use this kernel. Each mutation returns a fresh
+  `StoreSnapshot`; `snapshot.collection_exact(target, &support)` then returns a
+  typed collection snapshot which owns that store observation, invariant
+  foundational support, and target cover, preserving its physical shape until
+  a caller reconstructs a sharded `UnionArchive` through `view`.
 
   `Rank9AcceleratedSuccinctArchiveBlob` is an ordinary ABI-qualified
   `CollectionEncoding` and a Merkle root: its first 32 bytes name the exact
@@ -934,12 +921,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each. The raw-to-accelerated stage is an ordinary `DERIVE`. Raw
   `SuccinctArchiveBlob` and Rank9-accelerated members each own a canonical
   `MERGE`. The accelerated join names the corresponding raw union as an
-  immutable dependency; generic maintenance materializes that source merge
-  when necessary, then retries the target join. A cover-aware view reads the
-  embedded raw handle through its immutable store snapshot and validates the
-  exact raw/index pair before constructing the query runtime.
-  The typed view rejects an accelerated root whose named raw child is absent;
-  normal construction prevents that state by publishing source before target.
+  immutable dependency and may use it when already resident, but never creates
+  the upstream raw blob or `MERGE`. If that dependency is absent, maintenance
+  leaves a finer accelerated cover. A cover-aware view reads the embedded raw
+  handle through its immutable store snapshot and validates the exact raw/index
+  pair before constructing the query runtime. The typed view rejects an
+  accelerated root whose named raw child is absent.
 
   Exact attachment no longer requires every previously computed intermediate
   blob to remain resident. Descriptor-typed lattice methods validate fixed
@@ -956,8 +943,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MissingDependency}`. `Capacity` is reserved for
   deterministic fixed-representation geometry, never transient allocation,
   I/O, or malformed persisted bytes. `MissingDependency` names exact immutable
-  content which generic storage may materialize or fetch before retrying the
-  otherwise pure operation. A capacity-terminal source mapping leaves that
+  content the operation cannot consume from its immutable snapshot; target
+  maintenance leaves the corresponding finer cover rather than synthesizing
+  upstream state. A capacity-terminal source mapping leaves that
   support represented by a finer physical decomposition; a capacity-terminal
   target merge leaves a stable tier collision. Every successful mapping or
   merge is published immediately before planning continues. Succinct raw
@@ -967,10 +955,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finer cover cannot make an oversized result representable. `Capacity` is
   reserved there until fragmented closure/materialization exists.
 
-  Exact derived collections separate construction from maintenance. `ensure`
-  and `ensure_exact` reuse resident target images and support-equivalent stored
-  equations, cross the mapping for missing work, and publish `DERIVE` records
-  but never `MERGE`. `maintain` and `maintain_exact` carry the disjoint
+  Exact derivation separates construction from maintenance. Every mapping hop
+  receives the same invariant foundational `Support = Cover<SimpleArchive>`.
+  `ensure` and `ensure_exact` reuse resident target images and
+  support-equivalent stored equations, cross one mapping for missing work, and
+  publish `DERIVE` records but never `MERGE` or upstream state. `maintain` and
+  `maintain_exact` additionally carry the disjoint target
   lowest-handle pairs in the lowest colliding dyadic serialized-byte tier,
   then re-enter exact planning before choosing another tier. Every computed
   target artifact is stored before its unsigned `DERIVE` or `MERGE` record. A
@@ -982,19 +972,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MERGE` or `DERIVE` remains absent from a fresh store snapshot, maintenance
   reports a stalled backend instead of repeating it indefinitely. No flush,
   planner, manifest, receipt, retention root, background task, or authority
-  record is introduced. Each raw shard retains the explicit `u32::MAX`
-  row/domain boundary.
-- **Regular paths now use one exact native collection path.**
-  `PathSummaryCollection::{attach, ensure}` validates a frozen source `Cover`
-  and closes the exact resident summary cover once into a `PathIndex`.
-  `ensure` remains a view-returning domain convenience which delegates
-  to the low-level `maintain_exact` cover executor before materialization; the
-  generic `CollectionStoreExt` API provides the preferred DERIVE-only ensure
-  versus tiered maintenance split and returns typed collection snapshots. The empty
-  cover is a no-write local bottom. `PathRollup`, its range attribute,
+  record is introduced. The store-level operations return a fresh
+  `StoreSnapshot`. Each raw shard retains the explicit `u32::MAX` row/domain
+  boundary.
+- **Regular paths now use the direct native collection path.** Their mapping
+  validates one immediate source member and closes it into a `PathIndex`.
+  Generic `CollectionStoreExt` operations provide DERIVE-only ensure versus
+  tiered target maintenance and return fresh store snapshots; immutable
+  collection snapshots select and materialize the view afterward. The empty
+  support is a no-write local bottom. `PathRollup`, its range attribute,
   range-manifest attachment, repository hooks, commit ranges, and
-  manifest-specific path tests are removed; the facade requires only
-  `BlobStore + CollectionStore` and works without `PinStore`.
+  manifest-specific path tests are removed; the direct path works without
+  `PinStore`.
 - **Read-only pin snapshots are now an explicit storage capability.**
   `PinStore::pin_snapshot` and its partial-on-error default are removed;
   callers request the strict `PinSnapshotSource::snapshot_pin_heads`
@@ -1403,31 +1392,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   algebra, including across cat/reopen/reclaim boundaries. Legacy V3
   definition/16-byte-ID records remain recognizable for safe replay and
   conservative rewriting but are semantically inert.
-- **`Collection<S>` is the narrow Fragment-native owned facade.** Pure
-  construction binds one scope and signing key; `commit(fragment)` archives
-  facts as data, metafacts as signed metadata, persists the shared attachment
-  store, and appends one independent signed COMMIT. `materialize()` admits only
-  exact-collection commits strictly signed by that same key, treats invalid
-  signatures as unauthenticated inert diagnostics, and fails loud on every
-  authenticated dependency including the exact signed metadata identity.
-  Merge validation is restricted to the subgraph backwards-reachable from
-  resident results and forwards-reachable from those roots; nonresident
-  intermediates remain usable, while optional result bytes are exact-checked
-  before a tentative cover is accepted. Missing, corrupt, invalid, ungrounded,
-  or irrelevant
-  cache equations cannot hide leaves or manufacture demand-born blob fetches.
-  Materialization explicitly remains downstream of record admission: durable
-  validation receipts or bounded network admission are still required to cap
-  CPU and temporary resource work from arbitrarily many distinct equations.
-  Its documented concurrency contract is one
-  complete known prefix, not global latest. It has no parents, head, conflict
-  retry, message field, planner, or tuning knobs. Optional procedural-macro
-  instrumentation uses the same path and one explicit
-  `TRIBLESPACE_METADATA_COLLECTION_SCOPE`, replacing its Repository/Workspace
-  push protocol. Storage traits delegate through `&mut S`, so several scoped
-  collection facades can safely borrow one already-open backend in sequence;
-  no second open, close/reopen refresh, or special multi-collection session is
-  required.
 - **Collection retention now follows signed ownership rather than a blind hash
   walk.** Native collection records live outside the blob root set.
   Conservative Pile/Yard rewrites preserve every native record and recursively

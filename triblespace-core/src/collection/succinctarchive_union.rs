@@ -349,7 +349,7 @@ impl MetaDescribe for RawToRank9AcceleratedMappingV1 {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "raw-to-rank9-accelerated-succinctarchive-v1",
-                metadata::description: "Canonical join-homomorphic mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Raw and accelerated collections are full lattices; maintenance may derive or join either side and materializes a named raw-union dependency before publishing an accelerated union.",
+                metadata::description: "Canonical join-homomorphic mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Raw and accelerated collections are full lattices. Each mapping hop is explicit over invariant foundational support; accelerated maintenance may consume an already-resident raw-union dependency but never creates upstream raw state.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }

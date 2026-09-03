@@ -901,7 +901,7 @@ fn main() {
     }
 
     println!(
-        "\nwork columns: +B=blobs, +bytes=blob payload, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; support=changed/reused commits for snapshots"
+        "\nwork columns: +B=blobs, +bytes=blob payload, +D=raw derives, +M=raw merges, +A=accelerated DERIVE/MERGE records; support=changed/reused foundational members for snapshots"
     );
     println!(
         "{:>7} {:>16} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15}",

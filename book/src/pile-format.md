@@ -497,8 +497,10 @@ ordinary `DERIVE`. Raw Succinct and Rank9-accelerated collections both own
 canonical joins and use the same `MERGE` record kind. The accelerated root's
 first 32 bytes name the raw child, so
 generic blob traversal can follow the dependency without a special pile index.
-Exact maintenance stores a requested raw union before retrying and publishing
-the accelerated union. Collection resolution treats a member as physically
+An accelerated join may consume the exact raw union when that immutable blob is
+already resident, but it never creates the upstream raw blob or `MERGE` record.
+Without that dependency, target maintenance retains a finer accelerated cover.
+Collection resolution treats a member as physically
 available only when its root and required representation closure are resident;
 an incomplete compacted root is skipped in favor of a finer exact cover. Typed
 materialization then defensively validates the selected raw/index pair.
