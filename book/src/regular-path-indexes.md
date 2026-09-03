@@ -24,7 +24,8 @@ triblespace-paths = "0.47"
 Most callers describe a regular path with `PathExpr`. Each leaf is a graph
 property `Step`; the expression builders add concatenation, alternatives, and
 repetition. `compile` freezes that description into the fixed, epsilon-free
-automaton consumed by `PathIndex` and `PathSummaryCollection`.
+automaton consumed by `PathIndex` and embedded in the descriptor of the
+corresponding `PathSummaryBlob` collection.
 
 For example, `friend+` means one or more forward `friend` edges:
 

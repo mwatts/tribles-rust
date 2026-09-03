@@ -13,9 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ensure_exact` now publish missing `DERIVE` work only; `maintain` and
   `maintain_exact` additionally perform deterministic dyadic size-tiered LSM
   `MERGE` work. The store-level operations return a
-  `CollectionSnapshot<R, S, T>` which owns the fresh immutable store
-  observation together with frozen source support and the realized target
-  cover, then reconstructs caller-chosen views on demand.
+  `CollectionSnapshot<R, E>` which owns the fresh immutable store observation
+  together with invariant foundational `Support = Cover<SimpleArchive>` and
+  the realized target cover, then reconstructs caller-chosen views on demand.
 
 - Add a derived segmented pile index over `collection handle || record fingerprint` so
   collection-only selector unions visit only the named descriptors' records
