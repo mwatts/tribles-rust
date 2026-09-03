@@ -19,9 +19,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
-- Make each repair request carry the local endpoint's portable READ(C)
-  evidence. Transport connections no longer require team-wide CONNECT or
-  SYNC_TEAM proofs.
+- Let each repair request carry bounded native READ(C) proofs only as cold
+  bootstrap input. Same-session admission uses complete collection-scoped
+  evidence pinned locally; new proof claims arrive through ordinary durable
+  `Blob(H)` WANTs before a later retry can succeed. Direction now governs only
+  collection repair, so all modes continue to publish, serve, and acquire exact
+  H-addressed blobs. Signed COMMITs repair independently of WRITE admission;
+  receivers derive activation locally and publishers need not hold their own
+  grant.
 
 ### Removed
 

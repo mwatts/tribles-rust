@@ -104,24 +104,26 @@ impl ProviderObservation {
         self.set
     }
 
-    /// Reuse the serving snapshot's L→H PATCH and COW-insert the tiny set of
-    /// collection-participant keys. Publication tokens are computed only when
-    /// a key is scheduled, so this adds no second per-H trie.
+    /// Reuse the snapshot's L→H PATCH and COW-insert the tiny set of served
+    /// collection-participant keys. Exact H transport is independent of the
+    /// collection-repair direction, so every resident bearer locator remains
+    /// publishable even when this peer does not serve collection repair.
+    /// Publication tokens are computed only when a key is scheduled, so this
+    /// adds no second per-H trie.
     pub(crate) fn from_locators(
         collections: impl IntoIterator<Item = CollectionHandle>,
-        serves: bool,
+        serves_collections: bool,
         locators: &BearerLocatorIndex,
     ) -> Self {
-        if !serves {
-            return Self::default();
-        }
         let mut set = ProviderSet {
             leases: locators.clone(),
         };
-        for collection in collections {
-            let key = collection_provider_key(collection);
-            set.leases
-                .replace(&PatchEntry::with_value(&key, collection.raw));
+        if serves_collections {
+            for collection in collections {
+                let key = collection_provider_key(collection);
+                set.leases
+                    .replace(&PatchEntry::with_value(&key, collection.raw));
+            }
         }
         Self { set }
     }
@@ -914,8 +916,10 @@ mod tests {
         let blob_key = blob_locator(resident.raw);
         let collection_key = collection_provider_key(collection);
 
-        let disabled = ProviderObservation::from_locators([collection], false, &locators);
-        assert_eq!(disabled, ProviderObservation::default());
+        let collection_disabled =
+            ProviderObservation::from_locators([collection], false, &locators).into_set();
+        assert_eq!(collection_disabled.identity(&blob_key), Some(resident.raw));
+        assert!(!collection_disabled.contains(&collection_key));
 
         let enabled = ProviderObservation::from_locators([collection], true, &locators).into_set();
         assert_eq!(enabled.identity(&blob_key), Some(resident.raw));

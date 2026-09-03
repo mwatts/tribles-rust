@@ -73,12 +73,15 @@ const SIGNATURE_LEN: usize = 64;
 const CLAIM_HANDLE_LEN: usize = 32;
 const PROOF_EDGE_LEN: usize = SIGNATURE_LEN + CLAIM_HANDLE_LEN + PUBLIC_KEY_LEN;
 const MIN_PROOF_LEN: usize = PUBLIC_KEY_LEN + PROOF_EDGE_LEN;
+/// Largest canonical native proof body accepted by the bounded proof carrier.
+pub const MAX_CAPABILITY_PROOF_BYTES: usize =
+    PUBLIC_KEY_LEN + MAX_CAPABILITY_PROOF_STEPS * PROOF_EDGE_LEN;
 const CLAIM_REQUIRED_TRIBLES: usize = 4;
 const CLAIM_MAX_TRIBLES: usize = 6;
 /// Largest canonical portable bundle under the 255-step and closed-claim bounds.
 pub const MAX_CAPABILITY_PROOF_BUNDLE_BYTES: usize = 2
-    + PUBLIC_KEY_LEN
-    + MAX_CAPABILITY_PROOF_STEPS * (PROOF_EDGE_LEN + 2 + CLAIM_MAX_TRIBLES * TRIBLE_LEN);
+    + MAX_CAPABILITY_PROOF_BYTES
+    + MAX_CAPABILITY_PROOF_STEPS * (2 + CLAIM_MAX_TRIBLES * TRIBLE_LEN);
 const PROOF_EDGE_DOMAIN: &[u8] = b"triblespace.capability.proof-edge\0";
 const PROOF_EDGE_VERSION: u32 = 1;
 const PROOF_EDGE_TRANSCRIPT_LEN: usize = PROOF_EDGE_DOMAIN.len() + 4 + 3 * PUBLIC_KEY_LEN;
@@ -774,6 +777,17 @@ impl CapabilityProof {
             .expect("CapabilityProof validates every key at construction")
     }
 
+    /// Principals delegated to by each proof edge, in root-to-leaf order.
+    ///
+    /// Together with [`Self::root_key`], this is the finite principal universe
+    /// named directly by the proof. An intermediate principal may be
+    /// authorized by a prefix even when no separately stored prefix proof
+    /// exists, so callers deriving candidate subjects must not inspect only
+    /// [`Self::leaf_key`].
+    pub fn delegated_keys(&self) -> impl ExactSizeIterator<Item = VerifyingKey> + '_ {
+        self.edges().map(|edge| edge.delegate)
+    }
+
     /// Final semantic claim handle.
     pub fn leaf_claim(&self) -> CapabilityClaimHandle {
         self.claim_handles()
@@ -933,9 +947,12 @@ impl Error for CapabilityProofDecodeError {}
 
 /// A canonical proof together with the exact ordered claim blobs it names.
 ///
-/// The bundle is the portable one-round-trip representation used for invites
-/// and authentication. Verification checks every handle from bytes and
-/// persists nothing; callers may store only the accepted closure afterward.
+/// The bundle is a portable one-round-trip application representation for
+/// invitations and explicit operation presentations. Collection repair does
+/// not transport this form: it repairs native proof records and obtains their
+/// claim handles through ordinary H-addressed blob acquisition. Verification
+/// checks every handle from bytes and persists nothing; callers may store only
+/// the accepted closure afterward.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityProofBundle {
     proof: CapabilityProof,
@@ -1318,13 +1335,96 @@ pub fn capability_quorum_authorizes<'a>(
     invoke_threshold: NonZeroUsize,
     delegate_threshold: Option<NonZeroUsize>,
 ) -> bool {
+    let Some((roots, authority)) = capability_quorum_authority(
+        bundles,
+        trust_roots,
+        instant,
+        request,
+        invoke_threshold,
+        delegate_threshold,
+        Some(expected_subject.to_bytes()),
+    ) else {
+        return false;
+    };
+    forest_subject_authorized(
+        &roots,
+        &authority,
+        expected_subject.to_bytes(),
+        request.required(),
+        invoke_threshold,
+        delegate_threshold,
+    )
+}
+
+/// Enumerate every principal admitted by one finite quorum proof forest.
+///
+/// The result is canonical public-key order with duplicates removed. It is
+/// computed from the same least fixed point as [`capability_quorum_authorizes`]
+/// in one pass over the forest, rather than by guessing leaf keys and running
+/// a fixed point for each. Configured roots and every reachable intermediate
+/// or final delegate are considered; malformed, incomplete, wrongly scoped,
+/// or invalid-at-`instant` bundles remain inert.
+///
+/// This represents only a restricted quorum. Callers with an open admission
+/// policy must preserve that non-enumerable case explicitly rather than
+/// interpreting an empty vector as "everyone".
+pub fn capability_quorum_authorized_subjects<'a>(
+    bundles: impl IntoIterator<Item = &'a CapabilityProofBundle>,
+    trust_roots: impl IntoIterator<Item = VerifyingKey>,
+    instant: Epoch,
+    request: CapabilityRequest,
+    invoke_threshold: NonZeroUsize,
+    delegate_threshold: Option<NonZeroUsize>,
+) -> Vec<VerifyingKey> {
+    let Some((roots, authority)) = capability_quorum_authority(
+        bundles,
+        trust_roots,
+        instant,
+        request,
+        invoke_threshold,
+        delegate_threshold,
+        None,
+    ) else {
+        return Vec::new();
+    };
+    authority
+        .keys()
+        .filter(|subject| {
+            forest_subject_authorized(
+                &roots,
+                &authority,
+                **subject,
+                request.required(),
+                invoke_threshold,
+                delegate_threshold,
+            )
+        })
+        .map(|subject| {
+            VerifyingKey::from_bytes(subject)
+                .expect("capability authority contains only parsed proof and policy keys")
+        })
+        .collect()
+}
+
+fn capability_quorum_authority<'a>(
+    bundles: impl IntoIterator<Item = &'a CapabilityProofBundle>,
+    trust_roots: impl IntoIterator<Item = VerifyingKey>,
+    instant: Epoch,
+    request: CapabilityRequest,
+    invoke_threshold: NonZeroUsize,
+    delegate_threshold: Option<NonZeroUsize>,
+    early_subject: Option<[u8; PUBLIC_KEY_LEN]>,
+) -> Option<(
+    BTreeSet<[u8; PUBLIC_KEY_LEN]>,
+    BTreeMap<[u8; PUBLIC_KEY_LEN], BTreeMap<[u8; PUBLIC_KEY_LEN], CapabilityMode>>,
+)> {
     let roots: BTreeSet<[u8; PUBLIC_KEY_LEN]> = trust_roots
         .into_iter()
         .map(|root| root.to_bytes())
         .collect();
     if request.required().satisfies(CapabilityMode::Invoke) && roots.len() < invoke_threshold.get()
     {
-        return false;
+        return None;
     }
 
     let mut paths = bundles
@@ -1337,7 +1437,6 @@ pub fn capability_quorum_authorizes<'a>(
             .then_with(|| left.proof_id.cmp(&right.proof_id))
     });
 
-    let expected_subject = expected_subject.to_bytes();
     let mut authority: BTreeMap<
         [u8; PUBLIC_KEY_LEN],
         BTreeMap<[u8; PUBLIC_KEY_LEN], CapabilityMode>,
@@ -1393,18 +1492,18 @@ pub fn capability_quorum_authorizes<'a>(
             }
         }
 
-        if forest_subject_authorized(
-            &roots,
-            &authority,
-            expected_subject,
-            request.required(),
-            invoke_threshold,
-            delegate_threshold,
-        ) {
-            return true;
-        }
-        if !changed {
-            return false;
+        if early_subject.is_some_and(|subject| {
+            forest_subject_authorized(
+                &roots,
+                &authority,
+                subject,
+                request.required(),
+                invoke_threshold,
+                delegate_threshold,
+            )
+        }) || !changed
+        {
+            return Some((roots, authority));
         }
     }
 }
@@ -2884,5 +2983,56 @@ mod tests {
             CapabilityProof::from_bytes(&too_many),
             Err(CapabilityProofDecodeError::TooManySteps { .. })
         ));
+    }
+
+    #[test]
+    fn authorized_subjects_include_reachable_intermediate_proof_principals() {
+        let root = key(180);
+        let intermediate = key(181);
+        let leaf = key(182);
+        let delegated_atom = atom(183, 184);
+        let parent = root_bundle(
+            &root,
+            &intermediate,
+            delegated_atom,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let verified = parent
+            .verify(
+                root.verifying_key(),
+                epoch(0.0),
+                intermediate.verifying_key(),
+                request(delegated_atom, CapabilityMode::InvokeAndDelegate),
+            )
+            .unwrap();
+        let child = verified
+            .delegate(
+                &intermediate,
+                CapabilityClaim::delegated(
+                    verified.claim_handle(),
+                    delegated_atom,
+                    CapabilityMode::Invoke,
+                    None,
+                ),
+                leaf.verifying_key(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            child.proof().delegated_keys().collect::<Vec<_>>(),
+            [intermediate.verifying_key(), leaf.verifying_key()]
+        );
+        let subjects = capability_quorum_authorized_subjects(
+            [&child],
+            [root.verifying_key()],
+            epoch(0.0),
+            request(delegated_atom, CapabilityMode::Invoke),
+            NonZeroUsize::new(1).unwrap(),
+            Some(NonZeroUsize::new(1).unwrap()),
+        );
+        assert!(subjects.contains(&root.verifying_key()));
+        assert!(subjects.contains(&intermediate.verifying_key()));
+        assert!(subjects.contains(&leaf.verifying_key()));
     }
 }

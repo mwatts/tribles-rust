@@ -136,23 +136,31 @@ with the encoding and mapping-algorithm descriptions.
 Built on `triblespace-net` (authenticated iroh QUIC, collection-scoped PATCH
 anti-entropy, stock-gossip wakeups, and DHT provider lookup). Opening a
 transport connection grants no collection authority. Each repair request names
-one exact collection and carries the caller's portable READ(C) proof bundles;
-the server checks them before disclosing a manifest or PATCH leaf.
+one exact collection and may carry bounded native READ(C) proofs for cold
+bootstrap. The server admits only from complete collection-scoped evidence in
+its pinned local snapshot before disclosing a manifest or PATCH leaf. A new
+proof lands inertly, records ordinary `Blob(H)` WANTs for its claim handles,
+and can authorize a later retry after that closure arrives.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
-- `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve, while `write-only` serves admitted readers but does not pull or service local WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+- `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
-The exact repair state is the product of the collection's native record PATCH
-and its portable WRITE-evidence PATCH. A later WRITE proof can therefore
-activate an older commit without inventing a second synchronization protocol.
+The exact repair state is the product of the collection's native record,
+collection-scoped authorization-evidence, and resident-disclosure PATCHes.
+Authorization repair carries native READ(C)/WRITE(C) proof records only; claim
+blobs stay on the ordinary H path. The record PATCH contains every valid signed
+COMMIT(C), while each receiver derives WRITE admission locally; a later WRITE
+proof can therefore activate an older commit without inventing a second
+synchronization protocol or requiring the publisher to possess its grant.
 Production peers subscribe to stock `iroh-gossip` topics keyed by the
 domain-separated image of the collection handle; signed opaque-root
 mismatches accelerate ordinary repair, while periodic anti-entropy remains
 authoritative.
 
 DHT routing, provider lookup, and direct GET by a known immutable handle are
-collection-independent bearer mechanisms. Every served resident blob may
-publish an opaque KDF(H) lease with an H-bound endpoint token. Direct GET sends
+collection-independent bearer mechanisms. In every repair direction, each
+resident blob may publish an opaque KDF(H) lease with an H-bound endpoint
+token. Direct GET sends
 only that locator: the provider proves H first, the requester second, both
 proofs bind the authenticated endpoints, and returned bytes must hash to H.
 Collection READ(C) remains exclusively the admission boundary for collection

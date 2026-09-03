@@ -1,4 +1,4 @@
-//! READ-authorized, stream-pinned repair of one collection activation overlay.
+//! READ-authorized, stream-pinned repair of one collection overlay.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -7,23 +7,20 @@ use anybytes::Bytes;
 use anyhow::{Result, bail};
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use triblespace_core::capability::{CapabilityProofBundle, CapabilityProofId};
+use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::{
     CollectionHandle, CollectionRecord, collection_reader_is_admitted_by_policy_at,
-    collection_writer_is_admitted_by_policy_at,
 };
 use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 
-use crate::collection_activation::{
-    CollectionActivationOverlay, decode_write_evidence_bundle, encode_write_evidence_bundle,
-};
+use crate::collection_activation::CollectionRepairOverlay;
 use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{
     CollectionRepairAdmission, CollectionRepairCommand, CollectionRepairComponent,
     CollectionRepairManifest, recv_repair_admission, recv_repair_blob_response,
     recv_repair_collection, recv_repair_command, recv_repair_hello, recv_repair_node_response,
-    send_repair_admission, send_repair_blob_request, send_repair_blob_response, send_repair_done,
-    send_repair_evidence, send_repair_node_request, send_repair_node_response,
+    send_repair_admission, send_repair_blob_request, send_repair_blob_response,
+    send_repair_bootstrap, send_repair_done, send_repair_node_request, send_repair_node_response,
 };
 use crate::patch_repair::{
     PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary, patch_node_response,
@@ -35,7 +32,7 @@ use crate::transport::Conn;
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionRepairDelta {
     pub(crate) records: Vec<CollectionRecord>,
-    pub(crate) write_evidence: Vec<CapabilityProofBundle>,
+    pub(crate) authorization_evidence: Vec<CapabilityProof>,
     pub(crate) blobs: Vec<([u8; 32], Bytes)>,
     pub(crate) full_cursor: Option<FullReplicaCursor>,
     pub(crate) more: bool,
@@ -60,7 +57,7 @@ pub(crate) struct FullReplicaCursor {
 }
 
 const MAX_REPAIR_RECORD_ITEMS: usize = 4_096;
-const MAX_REPAIR_WRITE_EVIDENCE_ITEMS: usize = 16;
+const MAX_REPAIR_AUTHORIZATION_EVIDENCE_ITEMS: usize = 16;
 const MAX_REPAIR_NODE_REQUESTS: usize = 16_384;
 const MAX_SERVER_REPAIR_COMMANDS: usize = 512;
 const MAX_SERVER_NODE_RESPONSE_BYTES: usize = 64 << 20;
@@ -70,42 +67,55 @@ const MAX_SERVER_NODE_RESPONSE_BYTES: usize = 64 << 20;
 ///
 /// `lookup` must return an immutable overlay. Its lifetime is the stream's
 /// snapshot lease: every manifest and node response comes from the exact same
-/// two PATCH roots, so no historical-root cache is needed.
+/// semantic and resident PATCH roots, so no historical-root cache is needed.
+/// Returned bootstrap proofs are inert inputs for the ordinary store/WANT
+/// boundary; they never authorize this pinned session.
 pub(crate) async fn serve_collection_repair<R, W>(
     recv: &mut R,
     send: &mut W,
     remote: VerifyingKey,
     lookup: impl FnOnce(
         triblespace_core::collection::CollectionHandle,
-    ) -> Option<(
-        Arc<CollectionActivationOverlay>,
-        Arc<[CapabilityProofBundle]>,
-        Arc<FullReplicaState>,
-    )>,
+    ) -> Option<(Arc<CollectionRepairOverlay>, Arc<FullReplicaState>)>,
     disclosed_blob: impl Fn(CollectionHandle, [u8; 32]) -> Option<Bytes>,
-) -> Result<()>
+) -> Result<Vec<CapabilityProof>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let collection = recv_repair_collection(recv).await?;
-    let Some((overlay, _local_read_evidence, full)) = lookup(collection) else {
+    let Some((overlay, full)) = lookup(collection) else {
         send_repair_admission(send, CollectionRepairAdmission::Unavailable).await?;
         send.shutdown().await?;
-        return Ok(());
+        return Ok(Vec::new());
     };
     let hello = recv_repair_hello(recv).await?;
+    let read_roots = overlay.policy().read().roots();
+    let bootstrap = hello
+        .bootstrap_proofs
+        .into_iter()
+        .filter(|proof| {
+            proof.verify_signatures().is_ok()
+                && proof.leaf_key() == remote
+                && read_roots.is_some_and(|roots| roots.contains(&proof.root_key()))
+        })
+        .collect::<Vec<_>>();
+    let read_evidence = overlay
+        .authorization_evidence()
+        .bundles()
+        .cloned()
+        .collect::<Vec<_>>();
     let admitted = collection_reader_is_admitted_by_policy_at(
         collection,
         overlay.policy(),
         remote,
-        &hello.read_evidence,
+        &read_evidence,
         crate::clock::epoch_now(),
     );
     if !admitted {
         send_repair_admission(send, CollectionRepairAdmission::Rejected).await?;
         send.shutdown().await?;
-        return Ok(());
+        return Ok(bootstrap);
     }
 
     let manifest = manifest(&overlay, &full.forest);
@@ -121,7 +131,7 @@ where
             CollectionRepairCommand::Done => {
                 require_eof(recv).await?;
                 send.shutdown().await?;
-                return Ok(());
+                return Ok(bootstrap);
             }
             CollectionRepairCommand::Node {
                 component,
@@ -175,19 +185,19 @@ fn node_response_wire_len(response: &PatchNodeResponse<Vec<u8>>) -> usize {
 }
 
 fn manifest(
-    overlay: &CollectionActivationOverlay,
+    overlay: &CollectionRepairOverlay,
     forest: &DisclosureForestPatch,
 ) -> CollectionRepairManifest {
     CollectionRepairManifest {
         wake_root: overlay.wake_root(),
         records: overlay.records().summary(),
-        write_evidence: overlay.write_evidence().summary(),
+        authorization_evidence: overlay.authorization_evidence().summary(),
         resident: PatchSummary::from_patch(forest),
     }
 }
 
 fn node_response(
-    overlay: &CollectionActivationOverlay,
+    overlay: &CollectionRepairOverlay,
     forest: &DisclosureForestPatch,
     component: CollectionRepairComponent,
     prefix: &[u8],
@@ -201,16 +211,15 @@ fn node_response(
                 encode_record(overlay.collection(), *record).map_err(anyhow::Error::new)
             })
         }
-        CollectionRepairComponent::WriteEvidence => patch_node_response(
-            overlay.write_evidence().patch(),
+        CollectionRepairComponent::AuthorizationEvidence => patch_node_response(
+            overlay.authorization_evidence().patch(),
             &[],
             prefix,
-            |key, bundle| {
-                if bundle.proof().id().raw != key {
-                    bail!("WRITE proof id does not match its PATCH leaf key");
+            |key, proof| {
+                if proof.id().raw != key {
+                    bail!("authorization proof id does not match its PATCH leaf key");
                 }
-                encode_write_evidence_bundle(overlay.collection(), overlay.policy().write(), bundle)
-                    .map_err(anyhow::Error::new)
+                Ok(proof.as_bytes().to_vec())
             },
         ),
         CollectionRepairComponent::Resident => {
@@ -220,12 +229,13 @@ fn node_response(
 }
 
 /// Pull one exact collection overlay over an already authenticated iroh
-/// connection. TLS binds `conn.remote_id()`; READ(C) binds the local endpoint
-/// through the supplied portable proof forest.
+/// connection. TLS binds `conn.remote_id()`; the supplied native proof forest
+/// can bootstrap a cold server, while same-session READ(C) comes only from its
+/// already pinned local closure.
 pub(crate) async fn pull_collection<C: Conn>(
     conn: &C,
-    local: &CollectionActivationOverlay,
-    read_evidence: Vec<CapabilityProofBundle>,
+    local: &CollectionRepairOverlay,
+    read_bootstrap: Vec<CapabilityProof>,
     full_state: &FullReplicaState,
     prior_cursor: Option<&FullReplicaCursor>,
     parent_blob: impl Fn([u8; 32]) -> Option<Bytes>,
@@ -236,7 +246,7 @@ pub(crate) async fn pull_collection<C: Conn>(
         &mut send,
         &mut recv,
         local,
-        read_evidence,
+        read_bootstrap,
         full_state,
         prior_cursor,
         parent_blob,
@@ -248,8 +258,8 @@ pub(crate) async fn pull_collection<C: Conn>(
 async fn pull_collection_stream<W, R>(
     send: &mut W,
     recv: &mut R,
-    local: &CollectionActivationOverlay,
-    read_evidence: Vec<CapabilityProofBundle>,
+    local: &CollectionRepairOverlay,
+    read_bootstrap: Vec<CapabilityProof>,
     full_state: &FullReplicaState,
     prior_cursor: Option<&FullReplicaCursor>,
     parent_blob: impl Fn([u8; 32]) -> Option<Bytes>,
@@ -261,7 +271,7 @@ where
 {
     crate::protocol::send_u8(send, crate::collection_wire::OP_COLLECTION_REPAIR).await?;
     crate::protocol::send_hash(send, &local.collection().raw).await?;
-    send_repair_evidence(send, &read_evidence).await?;
+    send_repair_bootstrap(send, &read_bootstrap).await?;
     let remote = match recv_repair_admission(recv).await? {
         CollectionRepairAdmission::Admitted(manifest) => manifest,
         CollectionRepairAdmission::Rejected => bail!("remote rejected READ(C) evidence"),
@@ -272,67 +282,61 @@ where
 
     let mut remaining_requests = MAX_SERVER_REPAIR_COMMANDS - 1;
     let mut response_bytes = 0_usize;
-    let (write_evidence, write_more) = pull_write_evidence_patch(
+    let (authorization_evidence, authorization_more) = pull_authorization_evidence_patch(
         send,
         recv,
         local,
-        remote.write_evidence,
+        remote.authorization_evidence,
         &mut remaining_requests,
         &mut response_bytes,
     )
     .await?;
-    let mut complete_write_evidence = local
-        .write_evidence()
-        .bundles()
-        .cloned()
-        .collect::<Vec<_>>();
-    complete_write_evidence.extend(write_evidence.iter().cloned());
     let (records, record_more) = pull_record_patch(
         send,
         recv,
         local,
         remote.records,
-        &complete_write_evidence,
         &mut remaining_requests,
         &mut response_bytes,
     )
     .await?;
-    let semantic_changed = !write_evidence.is_empty() || !records.is_empty();
+    let semantic_changed = !authorization_evidence.is_empty() || !records.is_empty();
     let matching_cursor = prior_cursor.filter(|cursor| {
         cursor.remote_semantic == remote.wake_root && cursor.remote_forest == remote.resident
     });
-    let (blobs, seen, forest_more) = if full && !write_more && !record_more && !semantic_changed {
-        pull_resident_patch(
-            send,
-            recv,
-            full_state,
-            matching_cursor.map(|cursor| &cursor.seen),
-            parent_blob,
-            remote.resident,
-            &mut remaining_requests,
-            &mut response_bytes,
-        )
-        .await?
-    } else {
-        (
-            Vec::new(),
-            DisclosureForestPatch::new(),
-            full && (write_more || record_more || semantic_changed),
-        )
-    };
+    let (blobs, seen, forest_more) =
+        if full && !authorization_more && !record_more && !semantic_changed {
+            pull_resident_patch(
+                send,
+                recv,
+                full_state,
+                matching_cursor.map(|cursor| &cursor.seen),
+                parent_blob,
+                remote.resident,
+                &mut remaining_requests,
+                &mut response_bytes,
+            )
+            .await?
+        } else {
+            (
+                Vec::new(),
+                DisclosureForestPatch::new(),
+                full && (authorization_more || record_more || semantic_changed),
+            )
+        };
     send_repair_done(send).await?;
     send.shutdown().await?;
     require_eof(recv).await?;
     Ok(CollectionRepairDelta {
         records,
-        write_evidence,
+        authorization_evidence,
         blobs,
         full_cursor: full.then(|| FullReplicaCursor {
             remote_semantic: remote.wake_root,
             remote_forest: remote.resident,
             seen,
         }),
-        more: write_more || record_more || forest_more,
+        more: authorization_more || record_more || forest_more,
     })
 }
 
@@ -449,9 +453,8 @@ where
 async fn pull_record_patch<W, R>(
     send: &mut W,
     recv: &mut R,
-    local: &CollectionActivationOverlay,
+    local: &CollectionRepairOverlay,
     remote: PatchSummary,
-    write_evidence: &[CapabilityProofBundle],
     remaining_requests: &mut usize,
     response_bytes: &mut usize,
 ) -> Result<(Vec<CollectionRecord>, bool)>
@@ -462,7 +465,6 @@ where
     let component = CollectionRepairComponent::Record;
     let mut walker = PatchRepairWalker::new(component, remote, component.key_len())?;
     let mut missing = Vec::new();
-    let mut admission_by_writer = HashMap::new();
     let mut requests = 0;
     let mut complete = false;
     loop {
@@ -504,27 +506,7 @@ where
                 .get(triblespace_core::collection::CollectionRecordFingerprint::from_raw(key))
                 .is_some()
         })? {
-            let record = decode_record(local.collection(), &leaf.value)?;
-            let CollectionRecord::Commit(commit) = record else {
-                continue;
-            };
-            let Ok(writer) = VerifyingKey::from_bytes(&commit.public_key().raw) else {
-                continue;
-            };
-            let admitted = *admission_by_writer
-                .entry(writer.to_bytes())
-                .or_insert_with(|| {
-                    collection_writer_is_admitted_by_policy_at(
-                        local.collection(),
-                        local.policy(),
-                        writer,
-                        write_evidence,
-                        crate::clock::epoch_now(),
-                    )
-                });
-            if admitted {
-                missing.push(CollectionRecord::Commit(commit));
-            }
+            missing.push(decode_record(local.collection(), &leaf.value)?);
         }
     }
     if complete {
@@ -533,19 +515,19 @@ where
     Ok((missing, !complete))
 }
 
-async fn pull_write_evidence_patch<W, R>(
+async fn pull_authorization_evidence_patch<W, R>(
     send: &mut W,
     recv: &mut R,
-    local: &CollectionActivationOverlay,
+    local: &CollectionRepairOverlay,
     remote: PatchSummary,
     remaining_requests: &mut usize,
     response_bytes: &mut usize,
-) -> Result<(Vec<CapabilityProofBundle>, bool)>
+) -> Result<(Vec<CapabilityProof>, bool)>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let component = CollectionRepairComponent::WriteEvidence;
+    let component = CollectionRepairComponent::AuthorizationEvidence;
     let mut walker = PatchRepairWalker::new(component, remote, component.key_len())?;
     let mut missing = Vec::new();
     let mut requests = 0;
@@ -554,13 +536,13 @@ where
         if requests >= MAX_REPAIR_NODE_REQUESTS
             || *remaining_requests == 0
             || *response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES
-            || missing.len() >= MAX_REPAIR_WRITE_EVIDENCE_ITEMS
+            || missing.len() >= MAX_REPAIR_AUTHORIZATION_EVIDENCE_ITEMS
         {
             break;
         }
         let request = walker.next_request(|_, prefix| {
             local
-                .write_evidence()
+                .authorization_evidence()
                 .patch()
                 .merkle_node(prefix)
                 .map(|node| {
@@ -578,10 +560,18 @@ where
         let response = recv_repair_node_response(recv, component).await?;
         *response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
         validate_response(&request, component, &response, |key, bytes| {
-            let bundle =
-                decode_write_evidence_bundle(local.collection(), local.policy().write(), bytes)?;
-            if bundle.proof().id().raw.as_slice() != key {
-                bail!("WRITE proof body does not match its PATCH leaf key");
+            let proof = CapabilityProof::from_bytes(bytes)?;
+            proof.verify_signatures()?;
+            if proof.id().raw.as_slice() != key {
+                bail!("authorization proof body does not match its PATCH leaf key");
+            }
+            let relevant = [local.policy().read(), local.policy().write()]
+                .into_iter()
+                .filter_map(|policy| policy.roots())
+                .flatten()
+                .any(|root| *root == proof.root_key());
+            if !relevant {
+                bail!("authorization proof starts outside the collection policy roots");
             }
             Ok(())
         })?;
@@ -590,15 +580,11 @@ where
                 return false;
             };
             local
-                .write_evidence()
+                .authorization_evidence()
                 .get(CapabilityProofId::new(key))
                 .is_some()
         })? {
-            missing.push(decode_write_evidence_bundle(
-                local.collection(),
-                local.policy().write(),
-                &leaf.value,
-            )?);
+            missing.push(CapabilityProof::from_bytes(&leaf.value)?);
         }
     }
     if complete {
@@ -639,17 +625,29 @@ async fn require_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
     use triblespace_core::collection::{
         AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRecord,
         CollectionStore, CollectionStoreExt, empty_metadata_handle,
     };
-    use triblespace_core::repo::SnapshotSource;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
 
-    use crate::collection_activation::collection_activation_overlay;
+    use crate::collection_activation::collection_repair_overlay;
     use crate::protocol::recv_u8;
 
     use super::*;
+
+    fn store_bundle(store: &mut MemoryRepo, bundle: &CapabilityProofBundle) {
+        for claim in bundle.claims().iter().cloned() {
+            store.put::<SimpleArchive, _>(claim).unwrap();
+        }
+        store.insert_proof(bundle.proof().clone()).unwrap();
+    }
 
     #[tokio::test]
     async fn one_stream_repairs_records_without_global_inventory() {
@@ -666,14 +664,14 @@ mod tests {
             .unwrap();
         let server_snapshot = server_store.snapshot().unwrap();
         let server = Arc::new(
-            collection_activation_overlay(&server_snapshot, server_collection.handle()).unwrap(),
+            collection_repair_overlay(&server_snapshot, server_collection.handle()).unwrap(),
         );
         let mut client_store = MemoryRepo::default();
         let client_collection = client_store.collection("shared", policy).unwrap();
         assert_eq!(client_collection.handle(), server_collection.handle());
         let client_snapshot = client_store.snapshot().unwrap();
         let client =
-            collection_activation_overlay(&client_snapshot, client_collection.handle()).unwrap();
+            collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
         let empty_full = FullReplicaState {
             forest: DisclosureForestPatch::new(),
             direct_roots: HashSet::new(),
@@ -688,21 +686,18 @@ mod tests {
                 recv_u8(&mut server_recv).await.unwrap(),
                 crate::collection_wire::OP_COLLECTION_REPAIR
             );
-            serve_collection_repair(
+            let bootstrap = serve_collection_repair(
                 &mut server_recv,
                 &mut server_send,
                 SigningKey::from_bytes(&[8; 32]).verifying_key(),
                 |collection| {
-                    (collection == server.collection()).then_some((
-                        server,
-                        Arc::<[CapabilityProofBundle]>::from([]),
-                        Arc::new(empty_full),
-                    ))
+                    (collection == server.collection()).then_some((server, Arc::new(empty_full)))
                 },
                 |_, _| None,
             )
             .await
             .unwrap();
+            assert!(bootstrap.is_empty());
         });
 
         let delta = pull_collection_stream(
@@ -722,8 +717,187 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(delta.records.len(), 1);
-        assert!(delta.write_evidence.is_empty());
+        assert!(delta.authorization_evidence.is_empty());
         assert!(delta.blobs.is_empty());
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_local_read_evidence_admits_and_repairs_only_native_proof_bytes() {
+        let root = SigningKey::from_bytes(&[10; 32]);
+        let reader = SigningKey::from_bytes(&[11; 32]);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::Open,
+        );
+        let mut server_store = MemoryRepo::default();
+        let server_collection = server_store.collection("private", policy.clone()).unwrap();
+        let bundle = CapabilityProofBundle::issue_root(
+            &root,
+            CapabilityClaim::root(
+                CapabilityAtom::new(
+                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                    CapabilityResource::from(server_collection.handle()),
+                ),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            reader.verifying_key(),
+        )
+        .unwrap();
+        store_bundle(&mut server_store, &bundle);
+        let server_snapshot = server_store.snapshot().unwrap();
+        let server = Arc::new(
+            collection_repair_overlay(&server_snapshot, server_collection.handle()).unwrap(),
+        );
+
+        let mut client_store = MemoryRepo::default();
+        let client_collection = client_store.collection("private", policy).unwrap();
+        let client_snapshot = client_store.snapshot().unwrap();
+        let client =
+            collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
+        let empty_full = FullReplicaState {
+            forest: DisclosureForestPatch::new(),
+            direct_roots: HashSet::new(),
+            unreadable_parents: HashSet::new(),
+        };
+        let (server_io, client_io) = tokio::io::duplex(1 << 20);
+        let (mut server_recv, mut server_send) = tokio::io::split(server_io);
+        let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+        let server_task = tokio::spawn(async move {
+            assert_eq!(
+                recv_u8(&mut server_recv).await.unwrap(),
+                crate::collection_wire::OP_COLLECTION_REPAIR
+            );
+            let bootstrap = serve_collection_repair(
+                &mut server_recv,
+                &mut server_send,
+                reader.verifying_key(),
+                |collection| {
+                    (collection == server.collection()).then_some((server, Arc::new(empty_full)))
+                },
+                |_, _| None,
+            )
+            .await
+            .unwrap();
+            assert!(bootstrap.is_empty());
+        });
+
+        let delta = pull_collection_stream(
+            &mut client_send,
+            &mut client_recv,
+            &client,
+            vec![],
+            &FullReplicaState {
+                forest: DisclosureForestPatch::new(),
+                direct_roots: HashSet::new(),
+                unreadable_parents: HashSet::new(),
+            },
+            None,
+            |_| None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta.authorization_evidence, [bundle.proof().clone()]);
+        assert!(delta.records.is_empty());
+        assert!(delta.blobs.is_empty());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_native_read_proof_is_returned_for_ingest_and_current_session_is_rejected() {
+        let root = SigningKey::from_bytes(&[12; 32]);
+        let reader = SigningKey::from_bytes(&[13; 32]);
+        let other_reader = SigningKey::from_bytes(&[14; 32]);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::Open,
+        );
+        let mut server_store = MemoryRepo::default();
+        let server_collection = server_store.collection("cold", policy.clone()).unwrap();
+        let proof = CapabilityProofBundle::issue_root(
+            &root,
+            CapabilityClaim::root(
+                CapabilityAtom::new(
+                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                    CapabilityResource::from(server_collection.handle()),
+                ),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            reader.verifying_key(),
+        )
+        .unwrap()
+        .proof()
+        .clone();
+        let other_proof = CapabilityProofBundle::issue_root(
+            &root,
+            CapabilityClaim::root(
+                CapabilityAtom::new(
+                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                    CapabilityResource::from(server_collection.handle()),
+                ),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            other_reader.verifying_key(),
+        )
+        .unwrap()
+        .proof()
+        .clone();
+        let server_snapshot = server_store.snapshot().unwrap();
+        let server = Arc::new(
+            collection_repair_overlay(&server_snapshot, server_collection.handle()).unwrap(),
+        );
+        let mut client_store = MemoryRepo::default();
+        let client_collection = client_store.collection("cold", policy).unwrap();
+        let client_snapshot = client_store.snapshot().unwrap();
+        let client =
+            collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
+        let empty_full = FullReplicaState {
+            forest: DisclosureForestPatch::new(),
+            direct_roots: HashSet::new(),
+            unreadable_parents: HashSet::new(),
+        };
+        let (server_io, client_io) = tokio::io::duplex(1 << 20);
+        let (mut server_recv, mut server_send) = tokio::io::split(server_io);
+        let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+        let server_task = tokio::spawn(async move {
+            assert_eq!(
+                recv_u8(&mut server_recv).await.unwrap(),
+                crate::collection_wire::OP_COLLECTION_REPAIR
+            );
+            serve_collection_repair(
+                &mut server_recv,
+                &mut server_send,
+                reader.verifying_key(),
+                |collection| {
+                    (collection == server.collection()).then_some((server, Arc::new(empty_full)))
+                },
+                |_, _| None,
+            )
+            .await
+            .unwrap()
+        });
+
+        let error = pull_collection_stream(
+            &mut client_send,
+            &mut client_recv,
+            &client,
+            vec![proof.clone(), other_proof],
+            &FullReplicaState {
+                forest: DisclosureForestPatch::new(),
+                direct_roots: HashSet::new(),
+                unreadable_parents: HashSet::new(),
+            },
+            None,
+            |_| None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("rejected READ(C)"));
+        assert_eq!(server_task.await.unwrap(), [proof]);
     }
 }

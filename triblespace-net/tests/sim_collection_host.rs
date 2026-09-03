@@ -146,8 +146,27 @@ async fn advance(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>],
     }
 }
 
+async fn reconcile_once(
+    clock: &Arc<VirtualClock>,
+    reconciler: &mut Reconciler,
+    peer: &mut Peer<MemoryRepo>,
+    others: &mut [&mut Peer<MemoryRepo>],
+) -> ReconcileStats {
+    let mut tick = Box::pin(reconciler.tick(peer));
+    loop {
+        tokio::select! {
+            stats = &mut tick => break stats,
+            () = SimNet::step(clock, std::time::Duration::from_millis(100)) => {
+                for other in others.iter_mut() {
+                    other.refresh();
+                }
+            }
+        }
+    }
+}
+
 #[test]
-fn write_proof_later_activates_an_already_repaired_commit() {
+fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -222,20 +241,39 @@ fn write_proof_later_activates_an_already_repaired_commit() {
         assert_eq!(before.records().unwrap().count(), 0);
         assert!(reader_collection.admitted(&before).unwrap().is_empty());
 
-        store_bundle(&mut server.store(), write);
-        server.refresh();
-        // Sim transport has no gossip plane; periodic anti-entropy is the
-        // repair mechanism and must observe a proof-only root change.
+        let bootstrap = reconcile_once(
+            &clock,
+            &mut Reconciler::default(),
+            &mut server,
+            &mut [&mut reader],
+        )
+        .await;
+        assert_eq!(
+            bootstrap.fulfilled, 1,
+            "the server resolves the reader's claim through Blob(H) before retry admission"
+        );
+
         advance(&clock, &mut [&mut server, &mut reader], 32).await;
+        let repaired = reader.snapshot().unwrap();
+        assert_eq!(repaired.records().unwrap().count(), 1);
+        assert!(reader_collection.admitted(&repaired).unwrap().is_empty());
+
+        // The grant can arrive after the record at the receiver. The
+        // WriteOnly publisher never receives or presents it.
+        store_bundle(&mut reader.store(), write);
+        reader.refresh();
         let after = reader.snapshot().unwrap();
         assert_eq!(after.records().unwrap().count(), 1);
         assert_eq!(after.proofs().unwrap().count(), 2);
         assert_eq!(reader_collection.admitted(&after).unwrap().len(), 1);
+        let publisher = server.snapshot().unwrap();
+        assert_eq!(publisher.proofs().unwrap().count(), 1);
+        assert!(collection.admitted(&publisher).unwrap().is_empty());
     }));
 }
 
 #[test]
-fn request_supplied_read_proof_admits_reader_and_rejects_writer_only_peer() {
+fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -317,6 +355,35 @@ fn request_supplied_read_proof_admits_reader_and_rejects_writer_only_peer() {
         }
 
         advance(&clock, &mut [&mut server, &mut reader, &mut writer_only], 4).await;
+        let stats = reconcile_once(
+            &clock,
+            &mut Reconciler::default(),
+            &mut server,
+            &mut [&mut reader, &mut writer_only],
+        )
+        .await;
+        assert_eq!(
+            stats.fulfilled, 1,
+            "the cold server resolves the bootstrapped READ proof's claim through Blob(H)"
+        );
+        advance(
+            &clock,
+            &mut [&mut server, &mut reader, &mut writer_only],
+            32,
+        )
+        .await;
+        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+        let stats = reconcile_once(
+            &clock,
+            &mut Reconciler::default(),
+            &mut reader,
+            &mut [&mut server, &mut writer_only],
+        )
+        .await;
+        assert_eq!(
+            stats.fulfilled, 1,
+            "the repaired WRITE proof's claim also arrives through Blob(H)"
+        );
         let reader_snapshot = reader.snapshot().unwrap();
         assert_eq!(
             reader_collection.admitted(&reader_snapshot).unwrap().len(),
@@ -443,6 +510,24 @@ fn restricted_full_replica_progresses_parent_first_without_orphan_disclosure() {
             &clock,
             &mut [&mut server, &mut reader, &mut unauthorized, &mut unrelated],
             4,
+        )
+        .await;
+
+        let stats = reconcile_once(
+            &clock,
+            &mut Reconciler::default(),
+            &mut server,
+            &mut [&mut reader, &mut unauthorized, &mut unrelated],
+        )
+        .await;
+        assert_eq!(
+            stats.fulfilled, 1,
+            "the WriteOnly server resolves the ReadOnly peer's claim through Blob(H)"
+        );
+        advance(
+            &clock,
+            &mut [&mut server, &mut reader, &mut unauthorized, &mut unrelated],
+            32,
         )
         .await;
 

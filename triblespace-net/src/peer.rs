@@ -1,6 +1,6 @@
 //! A synchronous store wrapped in collection-scoped anti-entropy.
 //!
-//! The host runtime repairs immutable per-collection activation overlays. This
+//! The host runtime repairs immutable per-collection semantic overlays. This
 //! side owns the only mutable store boundary: authenticated leaves are deduplicated,
 //! inserted monotonically, flushed once per drain, and only then exposed in a
 //! replacement serving snapshot. Exact blob reads keep their durable-WANT
@@ -14,7 +14,6 @@ use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::collection::{
     CollectionHandle, CollectionRead, CollectionStore, next_authorization_change_at,
@@ -332,16 +331,12 @@ where
                             tracing::warn!(?error, "admitting collection repair record failed")
                         }
                     },
-                    NetEvent::CapabilityProofBundle(bundle) => {
-                        let (proof, claims) = bundle.into_parts();
-                        for claim in claims {
-                            if let Err(error) = store.put::<SimpleArchive, _>(claim) {
-                                tracing::warn!(
-                                    ?error,
-                                    "landing collection WRITE claim blob failed"
-                                );
+                    NetEvent::CapabilityProof(proof) => {
+                        for claim in proof.claim_handles() {
+                            if let Err(error) = store.want(WantRequest::blob(claim)) {
+                                tracing::warn!(?error, "recording authorization claim WANT failed");
                                 return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                    "landing collection WRITE claim blob failed: {error:?}"
+                                    "recording authorization claim WANT failed: {error:?}"
                                 )));
                             }
                             self.pending_network_flush = true;
@@ -349,9 +344,12 @@ where
                         match store.insert_proof(proof) {
                             Ok(()) => self.pending_network_flush = true,
                             Err(error) => {
-                                tracing::warn!(?error, "admitting collection WRITE proof failed");
+                                tracing::warn!(
+                                    ?error,
+                                    "admitting collection authorization proof failed"
+                                );
                                 return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                    "admitting collection WRITE proof failed: {error:?}"
+                                    "admitting collection authorization proof failed: {error:?}"
                                 )));
                             }
                         }
@@ -472,7 +470,7 @@ where
                         .map_err(PeerSnapshotError::Overlay)?
                 };
             // Even a semantic no-op installs the fresh read lease. Unchanged
-            // activation PATCHes retain their Arc while exact-GET advances to
+            // semantic repair PATCHes retain their Arc while exact-GET advances to
             // the new immutable store observation.
             let serving = StoreSnapshot::from_store_changes(
                 snapshot.clone(),
@@ -489,12 +487,12 @@ where
                 now,
             )
             .map_err(PeerSnapshotError::Overlay)?;
-            let serves = self.qos.direction.serves();
+            let serves_collections = self.qos.direction.serves();
             let provider_observation = ProviderObservation::from_locators(
                 serving
                     .collections()
                     .map(|collection| collection.collection()),
-                serves,
+                serves_collections,
                 serving.bearer_locators(),
             );
             self.sender.update_snapshot(serving, &self.active);
@@ -875,6 +873,10 @@ where
 mod tests {
     use ed25519_dalek::SigningKey;
     use iroh_base::EndpointId;
+    use triblespace_core::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
@@ -978,6 +980,63 @@ mod tests {
             peer.full_checkpointed
                 .get(&collection.handle().raw)
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_authorization_proof_records_ordinary_claim_blob_wants() {
+        let key = SigningKey::from_bytes(&[94; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, wiring) = host::wire(id);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        );
+        let proof = CapabilityProofBundle::issue_root(
+            &key,
+            CapabilityClaim::root(
+                CapabilityAtom::new(
+                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                    CapabilityResource::new([95; 32]),
+                ),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            SigningKey::from_bytes(&[96; 32]).verifying_key(),
+        )
+        .unwrap()
+        .proof()
+        .clone();
+        let expected = proof
+            .claim_handles()
+            .map(WantRequest::blob)
+            .collect::<Vec<_>>();
+        let mut batch = NetEventBatch::default();
+        batch
+            .try_push(NetEvent::CapabilityProof(proof.clone()))
+            .unwrap();
+        wiring.send_admission(batch).await;
+
+        peer.try_refresh().unwrap();
+        let mut store = peer.into_store();
+        assert_eq!(
+            store
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .proofs()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            [proof]
         );
     }
 }

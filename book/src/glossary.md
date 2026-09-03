@@ -50,9 +50,9 @@ proof presence.
 
 ### Capability Proof Bundle
 A complete portable capability proof plus the exact claim blobs it names in
-root-to-leaf order. Collection READ requests and portable WRITE evidence carry
-this bounded self-contained form, so verification needs no pre-auth fetch or
-ambient lookup.
+root-to-leaf order. It is useful as an application-level invitation artifact,
+but collection networking carries only native proofs; their claim handles use
+ordinary exact blob acquisition.
 
 ### Capability Proof Store
 A grow-only native set of canonical capability proofs. It supports
@@ -256,7 +256,7 @@ evidence can activate them without retracting bytes.
 
 ### Collection Wake
 A fixed signed `iroh-gossip` message on the collection-handle topic. It names
-the endpoint origin and one opaque activation root, but contains no records,
+the endpoint origin and one opaque semantic repair root, but contains no records,
 proofs, blob handles, counts, or component roots. A changed wake prompts a
 separate READ(C)-authorized exact PATCH repair; gossip is a latency hint, not
 the source of truth.

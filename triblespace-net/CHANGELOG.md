@@ -10,8 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add collection-scoped anti-entropy over one direct stream. Each request
-  carries portable READ(C) evidence and pins the exact product of the native
-  record PATCH and portable WRITE-evidence PATCH.
+  may carry native READ(C) bootstrap proofs and, once admitted from pinned
+  local closure, pins the exact product of
+  the native record, collection-scoped authorization-evidence, and resident
+  disclosure PATCHes. Authorization repair carries native proof bytes only;
+  missing claim handles become ordinary durable `Blob(H)` requests. The record
+  PATCH contains signature-valid exact-C COMMITs independent of WRITE
+  admission, while Full disclosure roots remain locally WRITE-admitted.
 - Add stock `iroh-gossip` wake subscriptions keyed by a domain-separated image
   of the collection handle. A 177-byte nonce-v3 signed origin wake carries
   separate opaque semantic and payload roots and accelerates the same bounded participant
@@ -26,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make `ReconcileDirection` govern collection repair only. Native `Blob(H)`
+  discovery, provider publication, exact serving, and durable WANT service are
+  orthogonal bearer operations available in every direction; this lets a
+  WriteOnly server acquire a cold ReadOnly requester's proof claims without an
+  authorization-specific transport.
 - Rebuild only Full-replica forests selected by the exact resident-blob delta.
   Additions scan each distinct prior reachable parent once against a compact
   added-handle matcher, removals project reachable handles from the canonical
@@ -36,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frozen resident-handle set turns that discovery into a hash semijoin instead
   of one persistent occurrence-PATCH probe per candidate word.
 - Replace team-scoped connection authorization and global inventory with
-  immutable per-collection activation overlays. Collection repair discovery
+  immutable per-collection repair overlays. Collection repair discovery
   uses one endpoint-bound KDF(C) lease per active served collection. Exact
   content has a separate global KDF(H) directory populated from resident
   blobs; exact GET consults neither collection identity nor READ(C).

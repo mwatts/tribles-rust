@@ -23,8 +23,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::capability::{
-    capability_quorum_authorizes, CapabilityAction, CapabilityAtom, CapabilityMode,
-    CapabilityProof, CapabilityProofBundle, CapabilityRequest, CapabilityResource,
+    capability_quorum_authorized_subjects, capability_quorum_authorizes, CapabilityAction,
+    CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityRequest,
+    CapabilityResource,
 };
 use crate::clock;
 use crate::id::Id;
@@ -310,6 +311,15 @@ pub enum CollectionAdmissionError<ProofsError, GetError> {
     Descriptor(CollectionDescriptorError<GetError>),
     /// The resident capability-proof observation could not be completed.
     Evidence(CollectionEvidenceDiscoveryError<ProofsError>),
+}
+
+/// The READ audience derivable from one collection policy and proof snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionReadAudience {
+    /// Every principal is admitted; no finite principal list is complete.
+    Open,
+    /// Exact finite audience of the restricted policy in public-key order.
+    Restricted(Vec<VerifyingKey>),
 }
 
 impl<ProofsError, GetError> fmt::Display for CollectionAdmissionError<ProofsError, GetError>
@@ -1037,6 +1047,26 @@ impl AdmissionEvidence {
             ),
         }
     }
+
+    fn authorized_subjects(&self, instant: hifitime::Epoch) -> CollectionReadAudience {
+        match self {
+            Self::Open => CollectionReadAudience::Open,
+            Self::Quorum {
+                roots,
+                invoke_threshold,
+                delegate_threshold,
+                request,
+                bundles,
+            } => CollectionReadAudience::Restricted(capability_quorum_authorized_subjects(
+                bundles.iter(),
+                roots.iter().copied(),
+                instant,
+                *request,
+                *invoke_threshold,
+                *delegate_threshold,
+            )),
+        }
+    }
 }
 
 pub(crate) fn load_resident_proof_bundles<R>(
@@ -1327,7 +1357,7 @@ where
 /// Decide READ admission against one already validated collection policy.
 ///
 /// This is the pure seam for a network host which pinned the descriptor policy
-/// while constructing its immutable per-collection activation overlay. It
+/// while constructing its immutable per-collection repair overlay. It
 /// performs no store access, proof discovery, persistence, or clock sampling.
 pub fn collection_reader_is_admitted_by_policy_at(
     collection: CollectionHandle,
@@ -1344,6 +1374,56 @@ pub fn collection_reader_is_admitted_by_policy_at(
         bundles.to_vec().into(),
     );
     evidence.authorizes(subject, instant)
+}
+
+/// Enumerate the READ audience from an already validated collection policy.
+///
+/// Restricted admission is evaluated once as a least fixed point over the
+/// supplied complete proof bundles. Configured roots plus all reachable
+/// intermediate and final delegates participate, so a principal authorized by
+/// a proof prefix is included even when that prefix is not separately stored.
+/// Invalid, incomplete, unrelated, or invalid-at-`instant` bundles are inert.
+/// Open admission remains explicit because it cannot be finitely enumerated.
+pub fn collection_read_audience_by_policy_at(
+    collection: CollectionHandle,
+    policy: &CollectionPolicy,
+    bundles: &[CapabilityProofBundle],
+    instant: hifitime::Epoch,
+) -> CollectionReadAudience {
+    admission_evidence_from_bundles(
+        policy.read(),
+        ACTION_READ,
+        CapabilityMode::Invoke,
+        collection,
+        bundles.to_vec().into(),
+    )
+    .authorized_subjects(instant)
+}
+
+/// Discover and enumerate the READ audience from one coherent store snapshot.
+///
+/// Native proofs whose claim blobs are not resident grant nothing until those
+/// exact handles arrive through ordinary blob acquisition. A failed proof-store
+/// observation is reported rather than confused with an empty audience.
+pub fn collection_read_audience_at<S>(
+    snapshot: &S,
+    collection: CollectionHandle,
+    instant: hifitime::Epoch,
+) -> Result<CollectionReadAudience, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+where
+    S: BlobStoreGet + CapabilityProofRead,
+{
+    let loaded = load_collection_descriptor(snapshot, collection)
+        .map_err(CollectionAdmissionError::Descriptor)?;
+    let evidence = discover_admission_evidence_at(
+        snapshot,
+        loaded.policy.read(),
+        ACTION_READ,
+        CapabilityMode::Invoke,
+        collection,
+    )
+    .map_err(CollectionAdmissionError::Evidence)?;
+    Ok(evidence.authorized_subjects(instant))
 }
 
 /// Decide WRITE admission against one already validated collection policy and

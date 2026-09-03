@@ -1,7 +1,8 @@
 //! Service durable exact-content and collection-operation WANTs.
 //!
-//! Collection repair converges admitted COMMITs and their WRITE evidence, not
-//! unsigned MERGE/DERIVE receipts. This reconciler never claims global absence:
+//! Collection repair converges signed COMMITs and scoped authorization evidence,
+//! not unsigned MERGE/DERIVE receipts. WRITE admission remains a receiver-local
+//! derived check. This reconciler never claims global absence:
 //! an operation WANT is satisfied iff at least one matching local receipt is
 //! visible; otherwise it remains pending while the local store evolves.
 //! `Blob(H)` uses H-derived global provider discovery. No collection,

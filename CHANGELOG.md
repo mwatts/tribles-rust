@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace separate collection WRITE evidence with one collection-scoped
+  authorization-evidence projection containing structurally relevant native
+  READ(C) and WRITE(C) proofs. Repair transports proof records only; every
+  referenced claim stays an ordinary H-addressed blob acquired through the
+  durable bearer WANT path. `ReconcileDirection` now gates only collection
+  repair, so H discovery, publication, serving, and fetching remain available
+  in every direction. The record component contains every signature-valid
+  exact-C COMMIT independent of WRITE admission, so records and grants commute;
+  each receiver derives activation locally, while Full disclosure remains
+  rooted only in locally admitted commits.
 - Restore bounded target-carry batching under invariant foundational support.
   Maintenance resolves collection semantics once per actionable dyadic tier
   round instead of once per individual `MERGE`, while each disjoint result is
@@ -169,15 +179,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separate opaque semantic/payload roots, fresh nonce, and signature. Payload synchronization
   remains separate and capability-gated.
 
-- Add an immutable per-collection activation overlay: exact collection records
-  and every complete, structurally valid WRITE proof bundle relevant to the
-  descriptor policy form two canonical grow-only PATCHes and one opaque,
-  domain-separated wake digest. Portable bundle framing is strict and bounded,
-  evidence inventory is deliberately independent of wall-clock expiry.
-  Request-supplied READ proof forests have pure untyped admission and
-  deterministic, current-instant, bounded selection seams; repair validates the
-  receiver's witness before revealing a manifest, while exact H fetch is an
-  independent mutual bearer-proof protocol which never transmits H.
+- Add an immutable per-collection repair overlay: exact signed COMMIT records and
+  every complete, structurally relevant native READ(C) or WRITE(C) proof form
+  two canonical grow-only PATCHes and one opaque, domain-separated wake digest.
+  Authorization evidence inventory is independent of wall-clock expiry,
+  quorum completeness, and current mode admission. Repair sends native proof
+  bodies only; missing claim handles become ordinary durable `Blob(H)` requests
+  over the existing H-only DHT path. A bounded native READ proof forest may
+  cold-bootstrap a server for a later retry, but never admits the same immutable
+  session or transports claim bytes. Core also exposes deterministic finite
+  READ-audience enumeration while representing open READ as non-enumerable.
 
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies

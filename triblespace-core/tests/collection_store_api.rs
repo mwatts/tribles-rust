@@ -13,10 +13,11 @@ use triblespace_core::capability::{
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
 use triblespace_core::collection::{
-    grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
-    CollectionDescriptorError, CollectionOpenError, CollectionPolicy, CollectionReadGrantError,
-    CollectionRecord, CollectionStore, CollectionStoreExt, CollectionTypeError,
-    CollectionWriteGrantError, PreparedCollectionCommit, ACTION_READ, ACTION_WRITE,
+    collection_read_audience_at, grant_collection_read, grant_collection_write, AdmissionPolicy,
+    Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy,
+    CollectionReadAudience, CollectionReadGrantError, CollectionRecord, CollectionStore,
+    CollectionStoreExt, CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit,
+    ACTION_READ, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -679,6 +680,75 @@ fn read_grants_use_the_distinct_read_action() {
     assert!(!collection
         .writer_is_admitted_at(&snapshot, reader.verifying_key(), instant)
         .unwrap());
+}
+
+#[test]
+fn read_audience_uses_complete_snapshot_closure_and_includes_proof_prefixes() {
+    let root = key(83);
+    let intermediary = key(84);
+    let leaf = key(85);
+    let incomplete = key(86);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection(
+            "read-audience",
+            CollectionPolicy::new(
+                AdmissionPolicy::delegable(root.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let read_atom = atom(ACTION_READ, collection);
+    let parent_bundle = CapabilityProofBundle::issue_root(
+        &root,
+        CapabilityClaim::root(read_atom, CapabilityMode::InvokeAndDelegate, None),
+        intermediary.verifying_key(),
+    )
+    .unwrap();
+    let parent = parent_bundle
+        .verify(
+            root.verifying_key(),
+            Epoch::from_tai_seconds(0.0),
+            intermediary.verifying_key(),
+            CapabilityRequest::new(read_atom, CapabilityMode::InvokeAndDelegate),
+        )
+        .unwrap();
+    let child_bundle = parent
+        .delegate(
+            &intermediary,
+            CapabilityClaim::delegated(
+                parent.claim_handle(),
+                read_atom,
+                CapabilityMode::Invoke,
+                None,
+            ),
+            leaf.verifying_key(),
+        )
+        .unwrap();
+    store_bundle(&mut store, child_bundle);
+
+    let incomplete_proof = CapabilityProofBundle::issue_root(
+        &root,
+        CapabilityClaim::root(read_atom, CapabilityMode::Invoke, None),
+        incomplete.verifying_key(),
+    )
+    .unwrap()
+    .proof()
+    .clone();
+    store.insert_proof(incomplete_proof).unwrap();
+
+    let CollectionReadAudience::Restricted(readers) = collection_read_audience_at(
+        &store.snapshot().unwrap(),
+        collection.handle(),
+        Epoch::from_tai_seconds(0.0),
+    )
+    .unwrap() else {
+        panic!("delegable READ policy must have a finite audience");
+    };
+    assert!(readers.contains(&root.verifying_key()));
+    assert!(readers.contains(&intermediary.verifying_key()));
+    assert!(readers.contains(&leaf.verifying_key()));
+    assert!(!readers.contains(&incomplete.verifying_key()));
 }
 
 #[test]

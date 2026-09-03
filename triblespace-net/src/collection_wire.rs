@@ -1,17 +1,17 @@
 //! Dense wire frames for one READ-authorized collection repair session.
 //!
-//! One bidirectional stream pins one [`CollectionRepairManifest`]. The server
-//! first presents its bounded READ(C) witness; only an admitting client sends
-//! its own witness, then walks the record and WRITE-evidence PATCHes
-//! interactively beneath those exact roots. The same
-//! admitted stream may request an exact handle from that collection's resident
-//! Full-replica disclosure forest. No global inventory, historical-root cache, repeated
+//! One bidirectional stream pins one [`CollectionRepairManifest`]. The client
+//! may send bounded native READ(C) bootstrap proofs before admission, then an
+//! admitted client walks the record and authorization-evidence PATCHes
+//! interactively beneath those exact roots. The same admitted stream may
+//! request an exact handle from that collection's resident Full-replica
+//! disclosure forest. No global inventory, historical-root cache, repeated
 //! authorization exchange, or blob list participates in this protocol.
 
 use anybytes::Bytes;
 use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use triblespace_core::capability::{CapabilityProofBundle, MAX_CAPABILITY_PROOF_BUNDLE_BYTES};
+use triblespace_core::capability::{CapabilityProof, MAX_CAPABILITY_PROOF_BYTES};
 use triblespace_core::collection::CollectionHandle;
 
 use crate::patch_repair::{
@@ -19,8 +19,7 @@ use crate::patch_repair::{
     PatchSummary,
 };
 use crate::protocol::{
-    recv_capability_proof_bundle, recv_hash, recv_u8, recv_u32_be, recv_u64_be,
-    send_capability_proof_bundle, send_hash, send_u8, send_u32_be, send_u64_be,
+    recv_hash, recv_u8, recv_u32_be, recv_u64_be, send_hash, send_u8, send_u32_be, send_u64_be,
 };
 
 /// Direct-RPC operation which opens one collection repair session.
@@ -29,13 +28,13 @@ use crate::protocol::{
 /// deliberately frees the byte for this clean-slate meaning.
 pub(crate) const OP_COLLECTION_REPAIR: u8 = 0x0D;
 
-/// Maximum portable READ proof branches accepted at one session boundary.
-pub(crate) const MAX_COLLECTION_READ_BUNDLES: usize = 16;
+/// Maximum native READ proof branches accepted at one session boundary.
+pub(crate) const MAX_COLLECTION_READ_BOOTSTRAP_PROOFS: usize = 16;
 /// Aggregate bound across the length-prefixed READ proof frames.
-pub(crate) const MAX_COLLECTION_READ_EVIDENCE_BYTES: usize =
-    MAX_COLLECTION_READ_BUNDLES * MAX_CAPABILITY_PROOF_BUNDLE_BYTES;
+pub(crate) const MAX_COLLECTION_READ_BOOTSTRAP_BYTES: usize =
+    MAX_COLLECTION_READ_BOOTSTRAP_PROOFS * MAX_CAPABILITY_PROOF_BYTES;
 /// Largest value transported by one authenticated PATCH leaf.
-pub(crate) const MAX_COLLECTION_LEAF_BYTES: usize = MAX_CAPABILITY_PROOF_BUNDLE_BYTES;
+pub(crate) const MAX_COLLECTION_LEAF_BYTES: usize = MAX_CAPABILITY_PROOF_BYTES;
 
 const REPAIR_ADMITTED: u8 = 0x00;
 const REPAIR_REJECTED: u8 = 0x01;
@@ -50,11 +49,11 @@ const NODE_PREFIX_ABSENT: u8 = 0x01;
 const NODE_LEAF: u8 = 0x00;
 const NODE_BRANCH: u8 = 0x01;
 
-/// One of the two grow-only PATCHes which determine collection activation.
+/// One of the three grow-only PATCHes in collection repair.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum CollectionRepairComponent {
     Record,
-    WriteEvidence,
+    AuthorizationEvidence,
     Resident,
 }
 
@@ -62,7 +61,7 @@ impl CollectionRepairComponent {
     pub(crate) const fn key_len(self) -> usize {
         match self {
             Self::Record => 32,
-            Self::WriteEvidence => 32,
+            Self::AuthorizationEvidence => 32,
             Self::Resident => 80,
         }
     }
@@ -70,7 +69,7 @@ impl CollectionRepairComponent {
     const fn wire(self) -> u8 {
         match self {
             Self::Record => 0,
-            Self::WriteEvidence => 1,
+            Self::AuthorizationEvidence => 1,
             Self::Resident => 2,
         }
     }
@@ -78,25 +77,25 @@ impl CollectionRepairComponent {
     fn from_wire(byte: u8) -> Result<Self> {
         match byte {
             0 => Ok(Self::Record),
-            1 => Ok(Self::WriteEvidence),
+            1 => Ok(Self::AuthorizationEvidence),
             2 => Ok(Self::Resident),
             other => bail!("unknown collection repair component {other:#x}"),
         }
     }
 }
 
-/// Client identity-bearing response after the server has proved READ(C).
+/// Client bootstrap material sent before the server decides READ(C).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CollectionRepairHello {
-    pub(crate) read_evidence: Vec<CapabilityProofBundle>,
+    pub(crate) bootstrap_proofs: Vec<CapabilityProof>,
 }
 
-/// Exact activation state pinned for one accepted stream.
+/// Exact repair state pinned for one accepted stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CollectionRepairManifest {
     pub(crate) wake_root: [u8; 32],
     pub(crate) records: PatchSummary,
-    pub(crate) write_evidence: PatchSummary,
+    pub(crate) authorization_evidence: PatchSummary,
     pub(crate) resident: PatchSummary,
 }
 
@@ -104,7 +103,7 @@ impl CollectionRepairManifest {
     pub(crate) const fn component(self, component: CollectionRepairComponent) -> PatchSummary {
         match component {
             CollectionRepairComponent::Record => self.records,
-            CollectionRepairComponent::WriteEvidence => self.write_evidence,
+            CollectionRepairComponent::AuthorizationEvidence => self.authorization_evidence,
             CollectionRepairComponent::Resident => self.resident,
         }
     }
@@ -130,34 +129,41 @@ pub(crate) enum CollectionRepairCommand {
     Done,
 }
 
-pub(crate) async fn send_repair_evidence<W: AsyncWrite + Unpin>(
+pub(crate) async fn send_repair_bootstrap<W: AsyncWrite + Unpin>(
     send: &mut W,
-    read_evidence: &[CapabilityProofBundle],
+    bootstrap_proofs: &[CapabilityProof],
 ) -> Result<()> {
-    if read_evidence.len() > MAX_COLLECTION_READ_BUNDLES {
+    if bootstrap_proofs.len() > MAX_COLLECTION_READ_BOOTSTRAP_PROOFS {
         bail!(
-            "collection READ proof forest has {} bundles; limit is {}",
-            read_evidence.len(),
-            MAX_COLLECTION_READ_BUNDLES
+            "collection READ proof forest has {} proofs; limit is {}",
+            bootstrap_proofs.len(),
+            MAX_COLLECTION_READ_BOOTSTRAP_PROOFS
         );
     }
     send_u32_be(
         send,
-        u32::try_from(read_evidence.len()).expect("proof count bound fits u32"),
+        u32::try_from(bootstrap_proofs.len()).expect("proof count bound fits u32"),
     )
     .await?;
     let mut aggregate = 0usize;
-    for bundle in read_evidence {
-        let length = bundle.to_bytes()?.len();
+    for proof in bootstrap_proofs {
+        let length = proof.as_bytes().len();
         aggregate = aggregate
             .checked_add(length)
-            .ok_or_else(|| anyhow!("collection READ evidence length overflow"))?;
-        if aggregate > MAX_COLLECTION_READ_EVIDENCE_BYTES {
+            .ok_or_else(|| anyhow!("collection READ bootstrap length overflow"))?;
+        if aggregate > MAX_COLLECTION_READ_BOOTSTRAP_BYTES {
             bail!(
-                "collection READ evidence is {aggregate} bytes; limit is {MAX_COLLECTION_READ_EVIDENCE_BYTES}"
+                "collection READ bootstrap is {aggregate} bytes; limit is {MAX_COLLECTION_READ_BOOTSTRAP_BYTES}"
             );
         }
-        send_capability_proof_bundle(send, bundle).await?;
+        send_u32_be(
+            send,
+            u32::try_from(length).expect("native proof bound fits u32"),
+        )
+        .await?;
+        send.write_all(proof.as_bytes())
+            .await
+            .map_err(|error| anyhow!("send collection READ proof: {error}"))?;
     }
     Ok(())
 }
@@ -168,7 +174,7 @@ pub(crate) async fn recv_repair_hello<R: AsyncRead + Unpin>(
     recv: &mut R,
 ) -> Result<CollectionRepairHello> {
     Ok(CollectionRepairHello {
-        read_evidence: recv_repair_evidence(recv).await?,
+        bootstrap_proofs: recv_repair_bootstrap(recv).await?,
     })
 }
 
@@ -178,34 +184,44 @@ pub(crate) async fn recv_repair_collection<R: AsyncRead + Unpin>(
     Ok(CollectionHandle::new(recv_hash(recv).await?))
 }
 
-pub(crate) async fn recv_repair_evidence<R: AsyncRead + Unpin>(
+pub(crate) async fn recv_repair_bootstrap<R: AsyncRead + Unpin>(
     recv: &mut R,
-) -> Result<Vec<CapabilityProofBundle>> {
+) -> Result<Vec<CapabilityProof>> {
     let count = recv_u32_be(recv).await? as usize;
-    if count > MAX_COLLECTION_READ_BUNDLES {
+    if count > MAX_COLLECTION_READ_BOOTSTRAP_PROOFS {
         bail!(
-            "collection READ proof forest has {count} bundles; limit is {MAX_COLLECTION_READ_BUNDLES}"
+            "collection READ bootstrap has {count} proofs; limit is {MAX_COLLECTION_READ_BOOTSTRAP_PROOFS}"
         );
     }
-    let mut read_evidence = Vec::new();
-    read_evidence
+    let mut bootstrap_proofs = Vec::new();
+    bootstrap_proofs
         .try_reserve_exact(count)
         .map_err(|error| anyhow!("cannot allocate collection READ proof forest: {error}"))?;
     let mut aggregate = 0usize;
     for _ in 0..count {
-        let bundle = recv_capability_proof_bundle(recv).await?;
-        let length = bundle.to_bytes()?.len();
+        let length = recv_u32_be(recv).await? as usize;
+        if length > MAX_CAPABILITY_PROOF_BYTES {
+            bail!("collection READ proof is {length} bytes; limit is {MAX_CAPABILITY_PROOF_BYTES}");
+        }
         aggregate = aggregate
             .checked_add(length)
-            .ok_or_else(|| anyhow!("collection READ evidence length overflow"))?;
-        if aggregate > MAX_COLLECTION_READ_EVIDENCE_BYTES {
+            .ok_or_else(|| anyhow!("collection READ bootstrap length overflow"))?;
+        if aggregate > MAX_COLLECTION_READ_BOOTSTRAP_BYTES {
             bail!(
-                "collection READ evidence is {aggregate} bytes; limit is {MAX_COLLECTION_READ_EVIDENCE_BYTES}"
+                "collection READ bootstrap is {aggregate} bytes; limit is {MAX_COLLECTION_READ_BOOTSTRAP_BYTES}"
             );
         }
-        read_evidence.push(bundle);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|error| anyhow!("cannot allocate collection READ proof: {error}"))?;
+        bytes.resize(length, 0);
+        recv.read_exact(&mut bytes)
+            .await
+            .map_err(|error| anyhow!("receive collection READ proof: {error}"))?;
+        bootstrap_proofs.push(CapabilityProof::from_bytes(&bytes)?);
     }
-    Ok(read_evidence)
+    Ok(bootstrap_proofs)
 }
 
 pub(crate) async fn send_repair_admission<W: AsyncWrite + Unpin>(
@@ -217,7 +233,7 @@ pub(crate) async fn send_repair_admission<W: AsyncWrite + Unpin>(
             send_u8(send, REPAIR_ADMITTED).await?;
             send_hash(send, &manifest.wake_root).await?;
             send_summary(send, manifest.records).await?;
-            send_summary(send, manifest.write_evidence).await?;
+            send_summary(send, manifest.authorization_evidence).await?;
             send_summary(send, manifest.resident).await?;
         }
         CollectionRepairAdmission::Rejected => send_u8(send, REPAIR_REJECTED).await?,
@@ -233,7 +249,7 @@ pub(crate) async fn recv_repair_admission<R: AsyncRead + Unpin>(
         REPAIR_ADMITTED => CollectionRepairAdmission::Admitted(CollectionRepairManifest {
             wake_root: recv_hash(recv).await?,
             records: recv_summary(recv).await?,
-            write_evidence: recv_summary(recv).await?,
+            authorization_evidence: recv_summary(recv).await?,
             resident: recv_summary(recv).await?,
         }),
         REPAIR_REJECTED => CollectionRepairAdmission::Rejected,
@@ -533,7 +549,7 @@ mod tests {
 
     use super::*;
 
-    fn bundle() -> CapabilityProofBundle {
+    fn proof() -> CapabilityProof {
         CapabilityProofBundle::issue_root(
             &SigningKey::from_bytes(&[1; 32]),
             CapabilityClaim::root(
@@ -549,26 +565,28 @@ mod tests {
             SigningKey::from_bytes(&[3; 32]).verifying_key(),
         )
         .unwrap()
+        .proof()
+        .clone()
     }
 
     #[tokio::test]
     async fn hello_and_manifest_roundtrip_without_ending_the_stream() {
         let (mut left, mut right) = tokio::io::duplex(1 << 20);
         let hello = CollectionRepairHello {
-            read_evidence: vec![bundle()],
+            bootstrap_proofs: vec![proof()],
         };
         let collection = CollectionHandle::new([2; 32]);
         let manifest = CollectionRepairManifest {
             wake_root: [4; 32],
             records: PatchSummary::new(Some([5; 32]), 7).unwrap(),
-            write_evidence: PatchSummary::new(None, 0).unwrap(),
+            authorization_evidence: PatchSummary::new(None, 0).unwrap(),
             resident: PatchSummary::new(Some([6; 32]), 9).unwrap(),
         };
         let sent_hello = hello.clone();
         let writer = tokio::spawn(async move {
             send_u8(&mut left, OP_COLLECTION_REPAIR).await.unwrap();
             send_hash(&mut left, &collection.raw).await.unwrap();
-            send_repair_evidence(&mut left, &sent_hello.read_evidence)
+            send_repair_bootstrap(&mut left, &sent_hello.bootstrap_proofs)
                 .await
                 .unwrap();
             assert_eq!(recv_u8(&mut left).await.unwrap(), 0xA5);
@@ -589,6 +607,23 @@ mod tests {
             CollectionRepairAdmission::Admitted(manifest)
         );
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_native_bootstrap_proof_is_rejected_before_body_read() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1_u32.to_be_bytes());
+        frame.extend_from_slice(
+            &u32::try_from(MAX_CAPABILITY_PROOF_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        let mut input = frame.as_slice();
+        let error = recv_repair_bootstrap(&mut input).await.unwrap_err();
+        assert!(
+            error.to_string().contains("collection READ proof is"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

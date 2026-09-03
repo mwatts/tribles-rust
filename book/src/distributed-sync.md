@@ -23,7 +23,7 @@ The boundaries are deliberately small:
 
 ```text
 know C           -> join C's wake topic and learn (origin, opaque state root)
-prove READ(C)    -> receive and repair C's activation evidence
+prove READ(C)    -> receive and repair C's authorization evidence
 know H           -> derive its opaque locator, discover providers, and authorize H
 satisfy WRITE(C) -> make a signed COMMIT active in C
 ```
@@ -46,32 +46,54 @@ whose signer does not currently satisfy WRITE(C), or a proof irrelevant to any
 resident collection. Admission is applied when a snapshot is observed. Later
 proof evidence may activate an old commit without rewriting or retracting it.
 
-## The activation product
+## The collection repair product
 
-For one collection, exactly two grow-only sets can change admission:
+For one collection, semantic repair derives two independent grow-only sets:
 
-- every valid signed `COMMIT` for C whose signer currently satisfies WRITE(C);
-  and
-- every complete portable WRITE proof bundle relevant to C's WRITE-policy
+- every structurally valid signed `COMMIT` naming exact C, independent of its
+  signer's current WRITE(C) admission; and
+- every native proof with complete resident claim closure which is structurally
+  relevant to exact READ(C) or WRITE(C) and begins at that action policy's
   roots.
 
-Each set is represented by an immutable BLAKE3-Merkle PATCH. Admitted COMMITs
+Each set is represented by an immutable BLAKE3-Merkle PATCH. COMMITs
 are keyed physically by the full 32-byte fingerprint of their exact canonical
-record value; proof bundles are keyed by their 32-byte proof ID and carry their
-exact ordered claim closure as the leaf value. The opaque activation root
+record value; authorization evidence is keyed by its 32-byte proof ID and its
+repair leaf is only the canonical native proof body. Claim blobs remain
+ordinary H-addressed content. The opaque semantic repair root
 commits to C, both PATCH roots, and both leaf counts under a versioned domain.
+
+The authorization projection is structural rather than a snapshot of who is
+admitted now. Expired, not-yet-valid, delegate-only, and quorum-incomplete
+branches remain immutable evidence. Time, mode, and quorum are derived checks
+at the operation instant. A proof with incomplete local claim closure is inert
+until ordinary blob acquisition supplies every named H.
+
+The only initial handoff is the delegation itself: a grantor may give the new
+subject an application-level portable proof bundle. That is the existing
+capability invitation boundary, not a Secrets-specific delivery channel. Once
+one collection participant has the native proof with complete claim closure,
+authorization-evidence repair distributes the proof record to READ(C) peers;
+ordinary H-DHT acquisition fills missing claims. A Secrets writer can therefore
+derive a restricted collection's current finite READ audience from the same
+snapshot and materialize recipient envelopes without a separate envelope RPC
+or roster. Open READ remains explicitly non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
-proof store would disclose unrelated capability structure. The overlay is the
-smallest exact state whose union can change C.
+proof store would disclose unrelated capability structure. Adding the optional
+Full-replica resident forest gives the complete repair algebra `Record ×
+AuthorizationEvidence × Resident`, while every component remains scoped to C.
+The receiver always derives its admitted view locally; record and proof arrival
+therefore commute, and a publisher need not possess or present its own WRITE
+grant merely to replicate an inert signed record.
 
 Unsigned MERGE and DERIVE records remain optional local computation evidence.
-They do not participate in the activation root or ordinary collection repair.
+They do not participate in the semantic repair root or ordinary collection repair.
 Once present in a local record store, an equation is reusable materialized LSM
 work; warm readers do not execute its join or mapping again. Remote receipt
 reuse, if introduced, needs an explicit bounded request mechanism rather than
-silently widening every collection's activation surface.
+silently widening every collection's semantic repair surface.
 
 ## Opaque wakes over stock gossip
 
@@ -108,19 +130,30 @@ subscription.
 
 After observing a changed wake root—or when periodically sampling live signed
 wake origins—a node opens one bidirectional collection-repair stream to that
-origin. Its hello names C and carries the client's bounded READ proof forest.
-The server admits the TLS-authenticated client before returning any manifest.
-For `Open` READ the witness is empty. A WRITE-only publisher therefore needs
-no READ authority merely to serve an authorized replica.
+origin. Its hello names C and may carry a bounded native READ proof forest for
+cold bootstrap. The server admits the TLS-authenticated client only from
+complete READ(C) evidence in its pinned local projection before returning any
+manifest. Unknown hello proofs are signature/root checked, stored inertly, and
+their claim handles become ordinary durable `Blob(H)` WANTs. The current
+session remains rejected; after H-only acquisition and a new coherent snapshot,
+an ordinary retry can succeed. For `Open` READ the forest is empty. A
+WRITE-only publisher needs no READ authority merely to serve an authorized
+replica. Cold completion depends only on ordinary H-provider reachability and
+the local durable-WANT reconciler making progress.
 
-The server loads one immutable activation overlay for C and applies the
+The server loads one immutable repair overlay for C and applies the
 descriptor's exact READ policy at one instant. Rejection returns no manifest.
-On admission it returns record, WRITE-evidence, and disclosure-forest PATCH
-summaries plus the same opaque roots. The client may then walk only differing prefixes and receive missing leaf
-bodies:
+On admission it returns record, authorization-evidence, and disclosure-forest
+PATCH summaries plus the same opaque roots. The client may then walk only
+differing prefixes and receive missing leaf bodies:
 
-- canonical, currently WRITE-accountable `COMMIT` records;
-- complete relevant WRITE proof bundles.
+- canonical signature-valid `COMMIT(C)` records, whether active or inert;
+- native structurally relevant READ(C)/WRITE(C) proofs.
+
+Landing a proof schedules each claim handle through the existing H-only DHT
+path. The claim bytes never travel in the collection session. Records may land
+before their WRITE closure and remain harmlessly inactive until a later
+snapshot derives admission.
 
 The exact-repair scheduler samples at a 30-second cadence. Participant leases
 last five minutes and every successful repair, including an identical result,
@@ -220,7 +253,7 @@ COMMIT(C, a)       COMMIT(C, b)
 DERIVE(D, c, d)
 ```
 
-A node can repair the small activation overlay and use its resident exact merge
+A node can repair the small semantic overlay and use its resident exact merge
 and derivation results while planning a cover. Missing derived results are
 computed by the ordinary local `ensure` path, which publishes missing
 `DERIVE` work only. Local `maintain` additionally publishes deterministic
@@ -232,7 +265,7 @@ required.
 Durable WANT remains orthogonal operational policy.
 `WantRequest::Blob(H)` is the sole exact-content request. The reconciler
 performs KDF(H) discovery and the mutual bearer proof directly from its coherent
-store snapshot; no collection descriptor, activation, or proof is involved. A
+store snapshot; no collection descriptor, repair overlay, or proof is involved. A
 successful landing satisfies the request, while a DHT miss or failed proof
 leaves it pending. `Merge(C,a,b)` and `Derive(D,input)` let one process state
 demand while a network or worker process fulfills it. WANT grants no READ,
@@ -262,15 +295,22 @@ trible pile net sync DATA.pile \
     [--payload demand|full]
 ```
 
-Direction and serving choices are local QoS. They do not participate in
-collection identity and cannot change which evidence is semantically valid.
+Direction gates only the collection loop: `ReadOnly` pulls collection repair,
+`WriteOnly` serves it, and `Bidirectional` does both. Every direction may
+announce and serve resident exact blobs under bearer handle H, and may service
+durable `Blob(H)` WANTs through KDF(H). Thus a WriteOnly collection server can
+acquire claim handles exposed by a cold ReadOnly client's native proof without
+joining the collection as a repair client. These QoS choices do not
+participate in collection identity or change which evidence is semantically
+valid.
 
 ## Convergence and failure model
 
 - Concatenation, local insertion, and remote repair all perform set union.
 - Duplicate records collapse by their complete canonical value; fixed-width
   indexes and the wire use a full-width BLAKE3 fingerprint of that value.
-  Proof bundles continue to collapse by their cryptographic identity.
+  Native capability proofs continue to collapse by their cryptographic
+  identity.
 - A missed wake only adds latency; periodic repair still converges connected
   readers.
 - An invalid wake, record, proof, PATCH node, or blob fails that input and

@@ -269,8 +269,8 @@ H. This path does not load a collection descriptor or consult READ(C).
 
 Keeping WANT orthogonal prevents evidence convergence from becoming
 involuntary blob mirroring. A peer can repair a READ-authorized collection's
-activation overlay, then decide which blobs and derived representations are
-useful locally.
+record and authorization-evidence overlay, then decide which blobs and derived
+representations are useful locally.
 
 ## Routing is soft state, not semantic evidence
 
@@ -289,11 +289,13 @@ records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
 content-derived object keys. The network layer uses an opaque collection-topic
 wake and READ(C)-authorized Merkle walks to union that collection's records and
-activation-relevant WRITE proof bundles. Independently, every served resident
-blob may publish an opaque XOR-DHT lease under KDF(H); knowing H is the bearer
-capability for its exact bytes regardless of collection policy. Collection
-READ(C) still gates collection anti-entropy and Full repair, but never exact
-GET. Merge/derive questions are answered from the converged local record index.
+structurally relevant native READ(C)/WRITE(C) proof records. Referenced claim
+blobs remain on the ordinary H path. Independently, every resident blob may
+publish an opaque XOR-DHT lease under KDF(H); knowing H is the bearer capability
+for its exact bytes regardless of collection policy or collection-repair
+direction. Collection READ(C) still gates collection anti-entropy and Full
+repair, but never exact GET. Merge/derive questions are answered from the
+converged local record index.
 In every case convergence means unioning evidence; it does not mean electing a
 winner.
 

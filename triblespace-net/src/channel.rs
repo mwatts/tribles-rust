@@ -6,7 +6,7 @@
 
 use crate::provider::ProviderObservation;
 use anybytes::Bytes;
-use triblespace_core::capability::CapabilityProofBundle;
+use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
     CollectionHandle, CollectionRecord,
@@ -17,7 +17,7 @@ use triblespace_core::collection::{
 /// The snapshot slot is replaced before this command is sent. The host uses
 /// notices update exact-handle wake subscriptions and periodic repair roots.
 pub(crate) struct SnapshotNotice {
-    /// Exact active collection handles and their opaque activation roots.
+    /// Exact active collection handles and their opaque semantic repair roots.
     pub(crate) collections: Vec<(
         triblespace_core::collection::CollectionHandle,
         [u8; 32],
@@ -37,16 +37,16 @@ pub(crate) enum NetCommand {
 
 /// Authenticated, structurally canonical collection items returned by repair.
 ///
-/// These values remain inert evidence. In particular, transferred WRITE
-/// proofs are never reused as ambient READ authority.
+/// These values remain inert evidence until ordinary local derivation admits
+/// them for an exact collection action.
 pub(crate) enum NetEvent {
     Blob {
         expected: [u8; 32],
         bytes: Bytes,
     },
     CollectionRecord(CollectionRecord),
-    /// Complete portable WRITE evidence, including its exact claim closure.
-    CapabilityProofBundle(CapabilityProofBundle),
+    /// One native authorization proof. Named claims travel as ordinary blobs.
+    CapabilityProof(CapabilityProof),
     /// One validated Full-replica page. The store side admits and flushes the
     /// page atomically at the network boundary, refreshes only its operational
     /// blob reader, then acknowledges it. A final page is the sole checkpoint
@@ -66,9 +66,7 @@ impl NetEvent {
             Self::CollectionRecord(CollectionRecord::Commit(_)) => 1 + COLLECTION_COMMIT_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Merge(_)) => 1 + COLLECTION_MERGE_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Derive(_)) => 1 + COLLECTION_DERIVE_BYTES_LEN,
-            Self::CapabilityProofBundle(bundle) => {
-                bundle.to_bytes().map_or(usize::MAX, |bytes| bytes.len())
-            }
+            Self::CapabilityProof(proof) => proof.as_bytes().len(),
             Self::FullPage { blobs, .. } => blobs.iter().fold(0_usize, |total, (_, bytes)| {
                 total.saturating_add(bytes.len())
             }),
@@ -88,9 +86,9 @@ impl std::fmt::Debug for NetEvent {
                 .debug_tuple("CollectionRecord")
                 .field(record)
                 .finish(),
-            Self::CapabilityProofBundle(bundle) => formatter
-                .debug_tuple("CapabilityProofBundle")
-                .field(bundle)
+            Self::CapabilityProof(proof) => formatter
+                .debug_tuple("CapabilityProof")
+                .field(proof)
                 .finish(),
             Self::FullPage {
                 collection,

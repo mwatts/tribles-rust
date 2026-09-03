@@ -26,13 +26,14 @@ pub enum BlobReplication {
 }
 
 impl ReconcileDirection {
-    /// Whether the local scheduler initiates repair pulls.
+    /// Whether the local scheduler initiates collection-repair pulls.
     pub const fn pulls(self) -> bool {
         !matches!(self, Self::WriteOnly)
     }
 
-    /// Whether inbound admitted readers may receive collection state and
-    /// H-authorized bearer reads may be served.
+    /// Whether inbound admitted readers may receive collection state.
+    ///
+    /// Exact H-authorized bearer transport is orthogonal to this policy.
     pub const fn serves(self) -> bool {
         !matches!(self, Self::ReadOnly)
     }

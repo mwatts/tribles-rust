@@ -9,7 +9,6 @@
 use anybytes::{ByteArea, Bytes};
 use anyhow::{Result, anyhow};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use triblespace_core::capability::{CapabilityProofBundle, MAX_CAPABILITY_PROOF_BUNDLE_BYTES};
 
 use crate::bearer::{blob_locator, proof_matches, provider_proof, requester_proof};
 use crate::transport::Conn;
@@ -93,44 +92,6 @@ pub async fn recv_u64_be<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u64> {
         .await
         .map_err(|error| anyhow!("recv: {error}"))?;
     Ok(u64::from_be_bytes(bytes))
-}
-
-/// Write one bounded, canonical, length-prefixed proof bundle.
-pub async fn send_capability_proof_bundle<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    bundle: &CapabilityProofBundle,
-) -> Result<()> {
-    let bytes = bundle.to_bytes()?;
-    debug_assert!(bytes.len() <= MAX_CAPABILITY_PROOF_BUNDLE_BYTES);
-    send_u32_be(
-        send,
-        u32::try_from(bytes.len()).expect("the static bundle bound fits u32"),
-    )
-    .await?;
-    send.write_all(&bytes)
-        .await
-        .map_err(|error| anyhow!("send capability proof bundle: {error}"))
-}
-
-/// Read one bounded, canonical, length-prefixed proof bundle.
-pub async fn recv_capability_proof_bundle<R: AsyncRead + Unpin>(
-    recv: &mut R,
-) -> Result<CapabilityProofBundle> {
-    let frame_len = recv_u32_be(recv).await? as usize;
-    if frame_len > MAX_CAPABILITY_PROOF_BUNDLE_BYTES {
-        return Err(anyhow!(
-            "capability proof bundle frame is {frame_len} bytes; limit is {MAX_CAPABILITY_PROOF_BUNDLE_BYTES}"
-        ));
-    }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(frame_len)
-        .map_err(|error| anyhow!("cannot allocate capability proof bundle: {error}"))?;
-    bytes.resize(frame_len, 0);
-    recv.read_exact(&mut bytes)
-        .await
-        .map_err(|error| anyhow!("recv capability proof bundle: {error}"))?;
-    Ok(CapabilityProofBundle::from_bytes(&bytes)?)
 }
 
 /// Bearer exact GET without revealing the content handle.
@@ -577,16 +538,6 @@ mod tests {
 
         assert!(result.is_err());
         serving.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn proof_frame_bound_is_checked_before_body_allocation() {
-        let bytes = ((MAX_CAPABILITY_PROOF_BUNDLE_BYTES + 1) as u32).to_be_bytes();
-        assert!(
-            recv_capability_proof_bundle(&mut bytes.as_slice())
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]

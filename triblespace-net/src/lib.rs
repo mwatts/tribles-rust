@@ -2,10 +2,11 @@
 //!
 //! [`Peer<S>`](peer::Peer) wraps one store. Periodic per-request authorized
 //! PATCH walks converge one explicitly active collection's records and
-//! portable WRITE evidence. A separate stock-gossip
-//! wake plane carries only a signed endpoint origin and opaque per-collection
-//! anti-entropy root; knowing the collection handle is its discovery
-//! capability, while every useful collection byte remains capability-gated.
+//! collection-scoped native READ/WRITE authorization evidence. A separate
+//! stock-gossip wake plane carries only a signed endpoint origin and opaque
+//! per-collection anti-entropy root; knowing the collection handle is its
+//! discovery capability, while every useful collection byte remains
+//! capability-gated.
 //! Exact content reads are independent: every served resident blob may publish
 //! a full-width opaque locator derived from its bearer handle H. The selected
 //! endpoint proves H before the requester proves H, both proofs bind their

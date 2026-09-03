@@ -205,7 +205,7 @@ available explicit cover member.
 Local publication remains unconditional. A publisher which needs to predict
 whether an authority-aware observation will admit a signer can freeze a store
 snapshot and call `collection.writer_is_admitted(&snapshot, signer)`: it checks
-the descriptor WRITE policy and resident exact WRITE evidence without scanning
+the descriptor WRITE policy and resident exact authorization evidence without scanning
 collection commits or publishing anything.
 
 ## Known-prefix snapshots and covers

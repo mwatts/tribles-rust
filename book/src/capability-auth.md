@@ -154,10 +154,18 @@ not permit issuing another grant.
 
 WRITE(C) decides which signed COMMITs are active when a store snapshot is
 observed. Local insertion remains unconditional: a store may retain an inactive
-claim, and later proof evidence may activate it monotonically. READ(C) is the
-collection-evidence disclosure boundary. A collection repair request carries
-the bounded proof forest needed to admit the TLS-authenticated iroh endpoint;
-the server does not search for or fetch a credential on the caller's behalf.
+commit, and later proof evidence may activate it monotonically. READ(C) is the
+collection-evidence disclosure boundary. A collection repair server evaluates
+the TLS-authenticated endpoint against complete READ(C) paths already in its
+pinned collection-scoped authorization projection. The request may additionally
+carry bounded native proofs for cold bootstrap. They cannot admit the current
+immutable session: the server stores them inertly, demands their claim handles
+through ordinary exact blob acquisition, and evaluates them only from a later
+coherent snapshot.
+Collection repair likewise carries every structurally valid signed COMMIT(C)
+without asking the sender to prove WRITE. The receiver derives activity from
+its own snapshot, so a grant and its commit may arrive in either order and the
+publisher need never receive its own grant.
 Exact blob retrieval is orthogonal to collection admission. Every served
 resident H may publish only its domain-separated locator KDF(H) and an H-bound
 endpoint token; directory nodes never receive H. On the exact stream the
@@ -179,13 +187,15 @@ it names.
 
 ## WANT and synchronization boundaries
 
-Capability proof records are durable local set evidence, but the capability
-layer defines no proof-specific replication or WANT. Collection-scoped repair
-unions the exact WRITE evidence which can change activation for that
-collection; resident proof presence alone still does not make it authority.
-Portable bundles are presented explicitly when they authorize an operation,
-including READ(C) repair. Claim blobs named by the transferred bundles arrive
-inline, avoiding a pre-authorization fetch cycle.
+Capability proof records are durable local set evidence, but there is no global
+proof inventory or claim-specific WANT. Collection-scoped repair
+unions native proof records with complete resident claim closure which are
+structurally relevant to exact READ(C) or WRITE(C). Its PATCH leaves contain
+only canonical proof bytes. A received proof records ordinary durable
+`Blob(H)` WANTs for every missing claim handle; the existing H-only provider
+path acquires those blobs, and a later coherent snapshot can then derive
+authority. Portable bundles remain application-level invitation artifacts,
+not a network representation.
 
 This separation is intentional:
 
@@ -214,6 +224,16 @@ root-only persistence seams for the common direct cases. Each validates the
 exact descriptor and matching action root against one snapshot, creates an
 unbounded Invoke bundle, stores its claim closure, and only then inserts the
 native proof record. Repeating the same inputs reproduces the same identities.
+Under a threshold policy, invoke the helper once for each distinct root whose
+support should participate in the quorum.
+
+`collection_read_audience_at(&snapshot, collection, instant)` evaluates the
+restricted READ forest once and returns every currently admitted root,
+intermediate delegate, and leaf in canonical key order. It returns
+`CollectionReadAudience::Open` for open READ, because no finite principal list
+can represent that audience; incomplete claim closure and invalid-at-instant
+paths remain inert.
+
 The equivalent pile operations are:
 
 ```text

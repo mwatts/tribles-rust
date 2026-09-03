@@ -178,7 +178,7 @@ where
 
 /// Encode one sparse record after checking its intrinsic collection and the
 /// embedded COMMIT signature. WRITE authorization is intentionally absent: it
-/// governs activation, not whether canonical inert evidence may exist.
+/// governs derived admission, not whether canonical inert evidence may exist.
 pub fn encode_record(
     expected: CollectionHandle,
     record: CollectionRecord,

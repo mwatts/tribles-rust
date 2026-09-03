@@ -199,8 +199,8 @@ fn run_sync(
         "direction: {}",
         match qos.direction {
             ReconcileDirection::Bidirectional => "bidirectional",
-            ReconcileDirection::ReadOnly => "read-only (no serve)",
-            ReconcileDirection::WriteOnly => "write-only (no pull)",
+            ReconcileDirection::ReadOnly => "read-only (no collection serve)",
+            ReconcileDirection::WriteOnly => "write-only (no collection pull)",
         }
     );
     match provider_publication_budget {
@@ -221,7 +221,6 @@ fn run_sync(
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
-    let services_wants = qos.direction != ReconcileDirection::WriteOnly;
     let mut reconciler = triblespace_net::reconcile::Reconciler::new();
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
@@ -245,7 +244,7 @@ fn run_sync(
         }
 
         peer.refresh();
-        if services_wants && next_reconcile <= std::time::Instant::now() {
+        if next_reconcile <= std::time::Instant::now() {
             let stats = runtime.block_on(reconciler.tick(&mut peer));
             next_reconcile = std::time::Instant::now() + reconcile_every;
             wants_fulfilled_total += stats.fulfilled as u64;
@@ -264,11 +263,7 @@ fn run_sync(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    if services_wants {
-        eprintln!(
-            "wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending"
-        );
-    }
+    eprintln!("wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending");
     peer.into_store()
         .close()
         .map_err(|error| anyhow!("close pile: {error}"))

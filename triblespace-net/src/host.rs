@@ -2,10 +2,12 @@
 //!
 //! TLS authenticates endpoint identities, but establishing a transport
 //! connection grants no team or collection authority. Each semantic repair is
-//! one stream whose request carries complete READ(C) evidence. DHT routing,
-//! provider-directory operations discover collection participants through an
-//! opaque KDF(C). Exact bytes use a separate H-only DHT rendezvous and mutual
-//! key-confirmation stream; collection identity never participates.
+//! one stream admitted from the server's complete local READ(C) closure. A
+//! client's bounded native-proof bootstrap only seeds later ordinary H
+//! acquisition and retry. DHT routing and provider-directory operations
+//! discover collection participants through an opaque KDF(C). Exact bytes use
+//! a separate H-only DHT rendezvous and mutual key-confirmation stream;
+//! collection identity never participates.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
@@ -19,8 +21,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::{UnknownBlob, simplearchive::SimpleArchive};
-use triblespace_core::capability::CapabilityProofBundle;
-use triblespace_core::collection::{CollectionHandle, CollectionRecord};
+use triblespace_core::capability::CapabilityProof;
+use triblespace_core::collection::{
+    CollectionHandle, CollectionRecord, collection_writer_is_admitted_by_policy_at,
+};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
@@ -29,14 +33,14 @@ use triblespace_core::repo::{BlobChildren, BlobStoreGet, BlobStoreList, StoreCha
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetCommand, NetEvent, NetEventBatch, SnapshotNotice};
 use crate::collection_activation::{
-    CollectionActivationOverlay, CollectionActivationOverlayError, CollectionReadEvidenceError,
-    collection_activation_overlay_at, collection_read_evidence_bundles_at,
+    CollectionReadBootstrapError, CollectionRepairOverlay, CollectionRepairOverlayError,
+    collection_read_bootstrap_proofs_at, collection_repair_overlay,
 };
 use crate::collection_session::{
     DisclosureForestPatch, FullReplicaCursor, FullReplicaState, pull_collection,
     serve_collection_repair,
 };
-use crate::collection_wire::{MAX_COLLECTION_READ_BUNDLES, OP_COLLECTION_REPAIR};
+use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
 use crate::identity::iroh_secret;
 use crate::inventory::{BlobReplication, ReconcileQos};
 use crate::patch_repair::PatchSummary;
@@ -101,19 +105,19 @@ where
 /// One collection's immutable server overlay plus the request evidence this
 /// endpoint will present when it pulls the same collection.
 pub(crate) struct CollectionSnapshot {
-    activation: Arc<CollectionActivationOverlay>,
-    read_evidence: Arc<[CapabilityProofBundle]>,
+    repair: Arc<CollectionRepairOverlay>,
+    read_bootstrap: Arc<[CapabilityProof]>,
     full: Arc<FullReplicaState>,
     blobs: Arc<dyn BlobSnapshotReader>,
 }
 
 impl CollectionSnapshot {
     pub(crate) fn collection(&self) -> CollectionHandle {
-        self.activation.collection()
+        self.repair.collection()
     }
 
     fn wake_root(&self) -> [u8; 32] {
-        self.activation.wake_root()
+        self.repair.wake_root()
     }
 }
 
@@ -274,19 +278,39 @@ where
 
 fn build_full_replica_state<R>(
     snapshot: &R,
-    activation: &CollectionActivationOverlay,
+    repair: &CollectionRepairOverlay,
     resident: &ResidentBlobSet,
     child_cache: &mut FullReplicaChildCache,
+    instant: hifitime::Epoch,
 ) -> FullReplicaState
 where
     R: BlobStoreGet,
 {
     let mut direct_roots = HashSet::new();
-    direct_roots.insert(activation.collection().raw);
-    for record in activation.records().records() {
+    direct_roots.insert(repair.collection().raw);
+    let bundles = repair
+        .authorization_evidence()
+        .bundles()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut admitted = BTreeMap::new();
+    for record in repair.records().records() {
         let CollectionRecord::Commit(commit) = record else {
             continue;
         };
+        if !*admitted.entry(commit.public_key().raw).or_insert_with(|| {
+            VerifyingKey::from_bytes(&commit.public_key().raw).is_ok_and(|writer| {
+                collection_writer_is_admitted_by_policy_at(
+                    repair.collection(),
+                    repair.policy(),
+                    writer,
+                    &bundles,
+                    instant,
+                )
+            })
+        }) {
+            continue;
+        }
         direct_roots.insert(commit.data().raw);
         direct_roots.insert(commit.metadata().raw);
     }
@@ -345,9 +369,9 @@ where
 
 /// Immutable host observation indexed exactly by active collection handle.
 ///
-/// The semantic state of each value is the product constructed by
-/// `CollectionActivationOverlay`: record PATCH × portable WRITE-evidence
-/// PATCH. No global team inventory, proof list, or blob manifest is retained.
+/// Each value pins the repair product: record PATCH × native
+/// authorization-evidence PATCH × optional Full disclosure forest. No global
+/// team inventory, proof list, or blob manifest is retained.
 pub(crate) struct StoreSnapshot {
     collections: CollectionSnapshotIndex,
     blobs: Arc<dyn BlobSnapshotReader>,
@@ -515,7 +539,7 @@ impl StoreSnapshot {
         };
         let blob_reader: Arc<dyn BlobSnapshotReader> =
             Arc::new(CloneableBlobSnapshotReader(Mutex::new(snapshot.clone())));
-        let activation_inputs_changed = changes.contains(StoreChanges::BLOBS)
+        let repair_inputs_changed = changes.contains(StoreChanges::BLOBS)
             || changes.contains(StoreChanges::COLLECTION_RECORDS)
             || changes.contains(StoreChanges::CAPABILITY_PROOFS)
             || authorization_changed;
@@ -555,53 +579,50 @@ impl StoreSnapshot {
                 continue;
             }
             let prior = previous.and_then(|prior| prior.collection(collection));
-            let activation_result = if !activation_inputs_changed {
+            let repair_result = if !repair_inputs_changed {
                 prior
                     .as_ref()
-                    .map(|prior| prior.activation.clone())
+                    .map(|prior| prior.repair.clone())
                     .map_or_else(
-                        || {
-                            collection_activation_overlay_at(&snapshot, collection, instant)
-                                .map(Arc::new)
-                        },
+                        || collection_repair_overlay(&snapshot, collection).map(Arc::new),
                         Ok,
                     )
             } else {
-                collection_activation_overlay_at(&snapshot, collection, instant).map(|fresh| {
+                collection_repair_overlay(&snapshot, collection).map(|fresh| {
                     prior
                         .as_ref()
                         .filter(|prior| prior.wake_root() == fresh.wake_root())
-                        .map_or_else(|| Arc::new(fresh), |prior| prior.activation.clone())
+                        .map_or_else(|| Arc::new(fresh), |prior| prior.repair.clone())
                 })
             };
-            let activation = match activation_result {
-                Ok(activation) => activation,
-                Err(CollectionActivationOverlayError::Descriptor(error)) => {
+            let repair = match repair_result {
+                Ok(repair) => repair,
+                Err(CollectionRepairOverlayError::Descriptor(error)) => {
                     warn!(collection = %hex::encode(&collection.raw[..4]), %error, "active collection descriptor is unavailable or invalid; isolating collection");
                     continue;
                 }
                 Err(error) => return Err(anyhow::Error::new(error)),
             };
-            let read_evidence = if !activation_inputs_changed
+            let read_bootstrap = if !repair_inputs_changed
                 && !authorization_changed
                 && prior.is_some()
             {
-                prior.as_ref().unwrap().read_evidence.clone()
+                prior.as_ref().unwrap().read_bootstrap.clone()
             } else {
-                match collection_read_evidence_bundles_at(
+                match collection_read_bootstrap_proofs_at(
                     &snapshot,
                     collection,
                     local,
-                    MAX_COLLECTION_READ_BUNDLES,
+                    MAX_COLLECTION_READ_BOOTSTRAP_PROOFS,
                     instant,
                 ) {
                     Ok(evidence) => evidence.into(),
-                    Err(CollectionReadEvidenceError::TooMany { count, limit }) => {
+                    Err(CollectionReadBootstrapError::TooMany { count, limit }) => {
                         warn!(
                             collection = %hex::encode(&collection.raw[..4]),
                             count,
                             limit,
-                            "collection READ witness exceeds network bound; collection remains locally active but cannot be presented remotely"
+                            "collection READ bootstrap exceeds network bound; collection remains locally active but cannot bootstrap a cold remote"
                         );
                         Arc::from([])
                     }
@@ -616,7 +637,8 @@ impl StoreSnapshot {
                 })
             } else if let Some(prior) = prior.as_ref().filter(|prior| {
                 resident_delta_known
-                    && Arc::ptr_eq(&activation, &prior.activation)
+                    && !authorization_changed
+                    && Arc::ptr_eq(&repair, &prior.repair)
                     && (!changes.contains(StoreChanges::BLOBS)
                         || blob_invalidated.get(&collection.raw).is_none())
                     && full_dirty.get(&collection.raw).is_none()
@@ -625,16 +647,17 @@ impl StoreSnapshot {
             } else {
                 Arc::new(build_full_replica_state(
                     &snapshot,
-                    &activation,
+                    &repair,
                     resident_blobs
                         .as_ref()
                         .expect("resident set was frozen before Full discovery"),
                     &mut full_child_cache,
+                    instant,
                 ))
             };
             let value = Arc::new(CollectionSnapshot {
-                activation,
-                read_evidence,
+                repair,
+                read_bootstrap,
                 full,
                 blobs: blob_reader.clone(),
             });
@@ -986,19 +1009,12 @@ struct ProviderClient<T: Transport> {
 
 struct NetCap<T: Transport> {
     client: ProviderClient<T>,
-    can_fetch: bool,
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>> {
         let client = self.client.clone();
-        let can_fetch = self.can_fetch;
-        Box::pin(async move {
-            if !can_fetch {
-                return None;
-            }
-            client.fetch_blob(hash).await
-        })
+        Box::pin(async move { client.fetch_blob(hash).await })
     }
 }
 
@@ -1408,7 +1424,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     };
     let cap = Arc::new(NetCap {
         client: provider_client.clone(),
-        can_fetch: config.qos.direction.pulls(),
     });
     let _ = wiring.cap_tx.send(Some(cap as Arc<dyn NetCapability>));
 
@@ -1416,8 +1431,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         snapshot: wiring.snapshot.clone(),
         candidates: candidates.clone(),
         providers: providers.clone(),
-        serve_data: config.qos.direction.serves(),
+        serve_collections: config.qos.direction.serves(),
         local_id: my_id,
+        events: wiring.evt_tx.clone(),
         inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
     };
@@ -1459,7 +1475,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let publication_limit = config.provider_publication_budget;
     let mut publication_budget = ProviderPublicationBudget::new(publication_limit);
     let mut publication_budget_reported = false;
-    if publication_budget.is_exhausted() && config.qos.direction.serves() {
+    if publication_budget.is_exhausted() {
         warn!(
             "provider publication disabled by zero process budget; exact H-authorized serving remains enabled"
         );
@@ -1925,8 +1941,8 @@ async fn reconcile_collection_peer<T: Transport>(
         .unwrap_or_else(|| local.blobs.clone());
     let delta = match pull_collection(
         connection.conn(),
-        &local.activation,
-        local.read_evidence.iter().cloned().collect(),
+        &local.repair,
+        local.read_bootstrap.iter().cloned().collect(),
         &local.full,
         prior_cursor.as_ref(),
         |hash| reader.get_blob(hash),
@@ -1941,10 +1957,8 @@ async fn reconcile_collection_peer<T: Transport>(
         }
     };
     let mut admissions = AdmissionBatcher::new(events);
-    for bundle in delta.write_evidence {
-        admissions
-            .push(NetEvent::CapabilityProofBundle(bundle))
-            .await?;
+    for proof in delta.authorization_evidence {
+        admissions.push(NetEvent::CapabilityProof(proof)).await?;
     }
     for record in delta.records {
         admissions.push(NetEvent::CollectionRecord(record)).await?;
@@ -2170,7 +2184,7 @@ impl<T: Transport> ProviderClient<T> {
             .await
             .into_iter()
             .filter(|peer| *peer != self.my_id)
-            .collect();
+            .collect::<Vec<_>>();
         self.fetch_from_providers(hash, providers).await
     }
 }
@@ -2200,8 +2214,9 @@ struct SnapshotHandler {
     snapshot: SnapshotSlot,
     candidates: RoutingCandidates,
     providers: Arc<Mutex<ProviderDirectory>>,
-    serve_data: bool,
+    serve_collections: bool,
     local_id: PeerId,
+    events: tokio::sync::mpsc::Sender<NetEventBatch>,
     inbound_connections: Arc<tokio::sync::Semaphore>,
     inbound_requests: Arc<tokio::sync::Semaphore>,
 }
@@ -2278,12 +2293,13 @@ impl SnapshotHandler {
         let _entered = span.enter();
         match op {
             OP_COLLECTION_REPAIR => {
-                if !self.serve_data {
-                    serve_collection_repair(recv, send, peer, |_| None, |_, _| None).await?;
+                if !self.serve_collections {
+                    let _ =
+                        serve_collection_repair(recv, send, peer, |_| None, |_, _| None).await?;
                 } else {
                     let snapshot = self.snapshot.lock().unwrap().clone();
                     let blob_snapshot = snapshot.clone();
-                    serve_collection_repair(
+                    let bootstrap = serve_collection_repair(
                         recv,
                         send,
                         peer,
@@ -2292,11 +2308,7 @@ impl SnapshotHandler {
                                 .as_ref()
                                 .and_then(|snapshot| snapshot.collection(collection))
                                 .map(|collection| {
-                                    (
-                                        collection.activation.clone(),
-                                        collection.read_evidence.clone(),
-                                        collection.full.clone(),
-                                    )
+                                    (collection.repair.clone(), collection.full.clone())
                                 })
                         },
                         move |_collection, hash| {
@@ -2306,6 +2318,11 @@ impl SnapshotHandler {
                         },
                     )
                     .await?;
+                    let mut admissions = AdmissionBatcher::new(&self.events);
+                    for proof in bootstrap {
+                        admissions.push(NetEvent::CapabilityProof(proof)).await?;
+                    }
+                    admissions.flush().await?;
                 }
             }
             OP_GET_BLOB => {
@@ -2317,13 +2334,9 @@ impl SnapshotHandler {
                     peer.to_bytes(),
                     self.local_id,
                     move |locator| {
-                        self.serve_data
-                            .then(|| {
-                                snapshot
-                                    .as_ref()
-                                    .and_then(|snapshot| snapshot.bearer_handle(locator))
-                            })
-                            .flatten()
+                        snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.bearer_handle(locator))
                     },
                     move |handle| {
                         blob_snapshot
@@ -2420,9 +2433,15 @@ mod tests {
     use iroh_base::EndpointId;
     use triblespace_core::blob::Blob;
     use triblespace_core::blob::MemoryBlobStore;
-    use triblespace_core::blob::encodings::UnknownBlob;
+    use triblespace_core::blob::encodings::{UnknownBlob, simplearchive::SimpleArchive};
+    use triblespace_core::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
     use triblespace_core::collection::{
-        AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionStoreExt,
+        ACTION_WRITE, AdmissionPolicy, Collection, CollectionCommit, CollectionData,
+        CollectionHandle, CollectionPolicy, CollectionRecord, CollectionStore, CollectionStoreExt,
+        empty_metadata_handle,
     };
     use triblespace_core::id::{ExclusiveId, Id};
     use triblespace_core::inline::Inline;
@@ -2431,8 +2450,8 @@ mod tests {
     use triblespace_core::repo::hybridstore::HybridStore;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{
-        BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource, StoreChanges,
-        StoreSnapshot as CoreStoreSnapshot,
+        BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofStore, SnapshotSource,
+        StoreChanges, StoreSnapshot as CoreStoreSnapshot,
     };
     use triblespace_core::trible::{Fragment, Trible, TribleSet};
 
@@ -2451,7 +2470,7 @@ mod tests {
         FullReplicaChildCache, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
         ProviderPublicationBudget, RepairTarget, StoreSnapshot, WakeBootstrapPeers,
         blob_delta_invalidations, build_full_replica_state, canonical_provider_subset,
-        collection_activation_overlay_at, enqueue_repair, forget_participant, has_repair_candidate,
+        collection_repair_overlay, enqueue_repair, forget_participant, has_repair_candidate,
         live_participants, observe_participant, resident_blob_set, resident_child_edges,
         retain_active_repair_state,
     };
@@ -2628,8 +2647,8 @@ mod tests {
         collections.insert(&PatchEntry::with_value(
             &affected.handle().raw,
             Arc::new(super::CollectionSnapshot {
-                activation: affected_prior.activation.clone(),
-                read_evidence: affected_prior.read_evidence.clone(),
+                repair: affected_prior.repair.clone(),
+                read_bootstrap: affected_prior.read_bootstrap.clone(),
                 full: affected_full.clone(),
                 blobs: affected_prior.blobs.clone(),
             }),
@@ -2637,8 +2656,8 @@ mod tests {
         collections.insert(&PatchEntry::with_value(
             &untouched.handle().raw,
             Arc::new(super::CollectionSnapshot {
-                activation: untouched_prior.activation.clone(),
-                read_evidence: untouched_prior.read_evidence.clone(),
+                repair: untouched_prior.repair.clone(),
+                read_bootstrap: untouched_prior.read_bootstrap.clone(),
                 full: untouched_prior.full.clone(),
                 blobs: untouched_prior.blobs.clone(),
             }),
@@ -2700,33 +2719,43 @@ mod tests {
 
         let snapshot = store.snapshot().unwrap();
         let resident = resident_blob_set(&snapshot).unwrap();
-        let first_activation =
-            collection_activation_overlay_at(&snapshot, first.handle(), observed_at()).unwrap();
-        let second_activation =
-            collection_activation_overlay_at(&snapshot, second.handle(), observed_at()).unwrap();
+        let first_repair = collection_repair_overlay(&snapshot, first.handle()).unwrap();
+        let second_repair = collection_repair_overlay(&snapshot, second.handle()).unwrap();
         let mut baseline_first_cache = FullReplicaChildCache::new();
         let baseline_first = build_full_replica_state(
             &snapshot,
-            &first_activation,
+            &first_repair,
             &resident,
             &mut baseline_first_cache,
+            observed_at(),
         );
         let mut baseline_second_cache = FullReplicaChildCache::new();
         let baseline_second = build_full_replica_state(
             &snapshot,
-            &second_activation,
+            &second_repair,
             &resident,
             &mut baseline_second_cache,
+            observed_at(),
         );
         let baseline_scans = baseline_first_cache.scans + baseline_second_cache.scans;
         let baseline_probes =
             baseline_first_cache.membership_probes + baseline_second_cache.membership_probes;
 
         let mut shared_cache = FullReplicaChildCache::new();
-        let first_full =
-            build_full_replica_state(&snapshot, &first_activation, &resident, &mut shared_cache);
-        let second_full =
-            build_full_replica_state(&snapshot, &second_activation, &resident, &mut shared_cache);
+        let first_full = build_full_replica_state(
+            &snapshot,
+            &first_repair,
+            &resident,
+            &mut shared_cache,
+            observed_at(),
+        );
+        let second_full = build_full_replica_state(
+            &snapshot,
+            &second_repair,
+            &resident,
+            &mut shared_cache,
+            observed_at(),
+        );
         let forest_entries = first_full.forest.len() + second_full.forest.len();
 
         eprintln!(
@@ -2759,6 +2788,79 @@ mod tests {
                 .iter_ordered()
                 .any(|entry| entry[48..] == child.raw)
         );
+    }
+
+    #[test]
+    fn inactive_commit_payload_is_not_a_full_disclosure_root() {
+        let root = SigningKey::from_bytes(&[0x41; 32]);
+        let writer = SigningKey::from_bytes(&[0x42; 32]);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::Open,
+            AdmissionPolicy::direct(root.verifying_key()),
+        );
+        let mut store = MemoryRepo::default();
+        let collection = store.collection("inactive-full-root", policy).unwrap();
+        let payload = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"inactive payload".to_vec()))
+            .unwrap();
+        let commit = CollectionRecord::Commit(CollectionCommit::sign(
+            &writer,
+            collection.handle(),
+            CollectionData::new(payload.raw),
+            empty_metadata_handle(),
+        ));
+        store.insert(commit).unwrap();
+
+        let before_snapshot = store.snapshot().unwrap();
+        let before_resident = resident_blob_set(&before_snapshot).unwrap();
+        let before_repair =
+            collection_repair_overlay(&before_snapshot, collection.handle()).unwrap();
+        let mut before_cache = FullReplicaChildCache::new();
+        let before_full = build_full_replica_state(
+            &before_snapshot,
+            &before_repair,
+            &before_resident,
+            &mut before_cache,
+            observed_at(),
+        );
+        assert_eq!(before_repair.records().len(), 1);
+        assert!(!before_full.direct_roots.contains(&payload.raw));
+
+        let grant = CapabilityProofBundle::issue_root(
+            &root,
+            CapabilityClaim::root(
+                CapabilityAtom::new(
+                    CapabilityAction::new(ACTION_WRITE),
+                    CapabilityResource::from(collection.handle()),
+                ),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            writer.verifying_key(),
+        )
+        .unwrap();
+        let (proof, claims) = grant.into_parts();
+        for claim in claims {
+            store.put::<SimpleArchive, _>(claim).unwrap();
+        }
+        store.insert_proof(proof).unwrap();
+
+        let after_snapshot = store.snapshot().unwrap();
+        let after_resident = resident_blob_set(&after_snapshot).unwrap();
+        let after_repair = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
+        let mut after_cache = FullReplicaChildCache::new();
+        let after_full = build_full_replica_state(
+            &after_snapshot,
+            &after_repair,
+            &after_resident,
+            &mut after_cache,
+            observed_at(),
+        );
+        assert_eq!(
+            before_repair.records().summary(),
+            after_repair.records().summary()
+        );
+        assert!(after_full.direct_roots.contains(&payload.raw));
     }
 
     #[test]
@@ -2858,12 +2960,15 @@ mod tests {
                     .iter_ordered()
                     .any(|entry| entry[48..] == leaf.raw)
             );
-            let activation =
-                collection_activation_overlay_at(&after_store, collection.handle(), observed_at())
-                    .unwrap();
+            let repair = collection_repair_overlay(&after_store, collection.handle()).unwrap();
             let mut oracle_cache = FullReplicaChildCache::new();
-            let oracle =
-                build_full_replica_state(&after_store, &activation, &resident, &mut oracle_cache);
+            let oracle = build_full_replica_state(
+                &after_store,
+                &repair,
+                &resident,
+                &mut oracle_cache,
+                observed_at(),
+            );
             assert_eq!(selective.forest, oracle.forest);
             assert_eq!(selective.direct_roots, oracle.direct_roots);
         }
@@ -3299,12 +3404,15 @@ mod tests {
                 .iter_ordered()
                 .any(|entry| entry[48..] == child.raw)
         );
-        let activation =
-            collection_activation_overlay_at(&after_store, collection.handle(), observed_at())
-                .unwrap();
+        let repair = collection_repair_overlay(&after_store, collection.handle()).unwrap();
         let mut oracle_cache = FullReplicaChildCache::new();
-        let oracle =
-            build_full_replica_state(&after_store, &activation, &resident, &mut oracle_cache);
+        let oracle = build_full_replica_state(
+            &after_store,
+            &repair,
+            &resident,
+            &mut oracle_cache,
+            observed_at(),
+        );
         assert_eq!(selective.forest, oracle.forest);
         assert_eq!(selective.direct_roots, oracle.direct_roots);
     }
