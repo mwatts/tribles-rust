@@ -20,7 +20,6 @@ use super::policy::CollectionPolicy;
 use super::records::RecordDecodeError;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
@@ -39,7 +38,7 @@ use crate::inline::encodings::hash::{Blake3, Hash};
 #[cfg(test)]
 use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
-use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, SnapshotSource};
+use crate::repo::{BlobStorePut, SnapshotSource};
 use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::descriptor as descriptor_facts;
@@ -48,8 +47,8 @@ use super::{
     CollectionHandle, CollectionMerge, CollectionOperationError, CollectionRecord, CollectionStore,
 };
 
-mod materialize;
-pub use materialize::*;
+mod view;
+pub use view::FactViewError;
 
 impl CollectionEncoding for SimpleArchive {
     fn validate_member<R>(
@@ -170,44 +169,6 @@ impl Error for SimpleArchiveUnionValidationError {
         }
     }
 }
-
-/// Failure to publish an ordered collection record.
-///
-/// Dependencies are written before the native record, but publication does
-/// not imply crash durability. Callers that need a durability boundary choose
-/// when to invoke their store's explicit flush operation. Failed I/O may still
-/// require backend-specific recovery before retrying; once the store is usable
-/// again, replaying the same logical publication is content-addressed and
-/// deterministic.
-#[derive(Debug)]
-pub enum PublicationError<PutError, InsertError> {
-    /// The descriptor or collection data is invalid for this concrete kind.
-    Validation(SimpleArchiveUnionValidationError),
-    /// Commit metadata is not a canonical `SimpleArchive`.
-    InvalidMetadata(UnarchiveError),
-    /// An element, result, metadata, or embedded-attachment write failed.
-    DependencyPut(PutError),
-    /// The final commit or merge record could not be admitted to the native record store.
-    RecordInsert(InsertError),
-    /// A merge names an input this store does not hold.
-    ///
-    /// A merge is an equation between two states *of a collection*, and a
-    /// state is resident because the commit that made it one put it there. An
-    /// absent input means the equation is about something that was never
-    /// committed, so the record must not be published.
-    MergeInputAbsent {
-        /// Which side of the merge was missing.
-        role: ElementRole,
-        /// The identity that could not be read.
-        data: CollectionData,
-    },
-}
-
-/// Validation failure while preparing a canonical collection commit in memory.
-///
-/// The uninhabited storage error parameters make it impossible for this phase
-/// to report an I/O failure: preparation does not touch the destination store.
-pub type PreparationError = PublicationError<Infallible, Infallible>;
 
 /// A canonical `SimpleArchive` collection commit whose bytes have not been
 /// published.
@@ -346,49 +307,6 @@ where
             .insert(CollectionRecord::Commit(commit))
             .map_err(CollectionCommitError::RecordInsert)?;
         Ok(commit)
-    }
-}
-
-impl<PutError, InsertError> fmt::Display for PublicationError<PutError, InsertError>
-where
-    PutError: fmt::Display,
-    InsertError: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Validation(error) => write!(f, "invalid collection publication: {error}"),
-            Self::InvalidMetadata(error) => {
-                write!(
-                    f,
-                    "commit metadata is not a canonical SimpleArchive: {error}"
-                )
-            }
-            Self::DependencyPut(error) => {
-                write!(f, "failed to write a collection dependency: {error}")
-            }
-            Self::RecordInsert(error) => write!(f, "failed to insert collection record: {error}"),
-            Self::MergeInputAbsent { role, data } => write!(
-                f,
-                "the {role} is not in this store, so the merge is over a state \
-                 that was never committed: {data:?}"
-            ),
-        }
-    }
-}
-
-impl<PutError, InsertError> Error for PublicationError<PutError, InsertError>
-where
-    PutError: Error + 'static,
-    InsertError: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Validation(error) => Some(error),
-            Self::InvalidMetadata(error) => Some(error),
-            Self::DependencyPut(error) => Some(error),
-            Self::RecordInsert(error) => Some(error),
-            Self::MergeInputAbsent { .. } => None,
-        }
     }
 }
 
@@ -686,251 +604,6 @@ pub fn validate_merge(
     Ok(())
 }
 
-/// Prepare canonical data and metadata blobs as one unpublished membership
-/// root.
-///
-/// Supplied blobs retain their cached content identities and are validated
-/// structurally. No store is touched and no key is needed. The returned value
-/// can be staged against any already typed `SimpleArchive` collection,
-/// abandoned inertly, or finalized later.
-pub fn prepare_commit(
-    data: &Blob<SimpleArchive>,
-    metadata: &Blob<SimpleArchive>,
-) -> Result<PreparedCollectionCommit, PreparationError> {
-    prepare_commit_with_embedded(data, metadata, Vec::new())
-}
-
-fn prepare_commit_with_embedded(
-    data: &Blob<SimpleArchive>,
-    metadata: &Blob<SimpleArchive>,
-    embedded: Vec<Blob<UnknownBlob>>,
-) -> Result<PreparedCollectionCommit, PreparationError> {
-    validate_element(data).map_err(|source| {
-        PublicationError::Validation(SimpleArchiveUnionValidationError::InvalidElement {
-            role: ElementRole::CommitData,
-            source,
-        })
-    })?;
-
-    validate_element(metadata).map_err(PublicationError::InvalidMetadata)?;
-
-    Ok(PreparedCollectionCommit {
-        embedded,
-        data: data.clone(),
-        metadata: metadata.clone(),
-    })
-}
-
-fn widen_preparation_error<PutError, InsertError>(
-    error: PreparationError,
-) -> PublicationError<PutError, InsertError> {
-    match error {
-        PublicationError::Validation(error) => PublicationError::Validation(error),
-        PublicationError::InvalidMetadata(error) => PublicationError::InvalidMetadata(error),
-        PublicationError::DependencyPut(never) => match never {},
-        PublicationError::RecordInsert(never) => match never {},
-        // Preparation touches no store, so it cannot find an input missing
-        // from one. The variant is unreachable here rather than merely unused.
-        PublicationError::MergeInputAbsent { role, data } => {
-            PublicationError::MergeInputAbsent { role, data }
-        }
-    }
-}
-
-fn widen_commit_error<PutError, InsertError>(
-    error: CollectionCommitError<PutError, InsertError>,
-) -> PublicationError<PutError, InsertError> {
-    match error {
-        CollectionCommitError::DependencyPut(source) => PublicationError::DependencyPut(source),
-        CollectionCommitError::RecordInsert(source) => PublicationError::RecordInsert(source),
-    }
-}
-
-/// Publish a signed membership root after writing its dependencies.
-///
-/// Supplied data and metadata retain their trusted cached identities and are
-/// structurally validated before storage. The exact write order is:
-///
-/// 1. data blob and metadata blob;
-/// 2. signed commit record.
-///
-/// A completed prefix before the record write leaves only content-addressed
-/// dependencies. This function deliberately performs no durability flush;
-/// callers may group any number of publications behind one explicit barrier or
-/// rely on store close. Failed backend I/O may require recovery according to
-/// that backend's contract; after recovery, replay with the same arguments is
-/// deterministic and idempotent. Signature authorization remains a reader-side
-/// policy decision.
-pub fn publish_commit<S>(
-    store: &mut S,
-    collection: Collection<SimpleArchive>,
-    data: &Blob<SimpleArchive>,
-    metadata: &Blob<SimpleArchive>,
-    signing_key: &SigningKey,
-) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>>
-where
-    S: BlobStorePut + CollectionStore,
-{
-    let prepared = prepare_commit(data, metadata).map_err(widen_preparation_error)?;
-    prepared
-        .stage_for(store, collection, signing_key)
-        .map_err(widen_commit_error)?
-        .finalize()
-        .map_err(widen_commit_error)
-}
-
-/// Publish a self-contained fact fragment as a signed membership root.
-///
-/// The fragment's facts and metafacts become the signed data and metadata
-/// elements, and its shared blob store backs handles in either set. Embedded
-/// blobs are staged under the identities they already carry.
-///
-/// Fragment exports are not serialized. The two fact sets become canonical
-/// `SimpleArchive` data and metadata elements. The shared prepared-publication
-/// path writes element attachments and both archives before inserting the
-/// signed record last. The typed collection descriptor is already registered.
-/// The same backend-recovery boundary documented by [`PublicationError`]
-/// applies.
-pub fn publish_fragment_commit<S>(
-    store: &mut S,
-    collection: Collection<SimpleArchive>,
-    fragment: Fragment,
-    signing_key: &SigningKey,
-) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>>
-where
-    S: BlobStorePut + CollectionStore,
-{
-    PreparedCollectionCommit::from_fragment(fragment)
-        .stage_for(store, collection, signing_key)
-        .map_err(widen_commit_error)?
-        .finalize()
-        .map_err(widen_commit_error)
-}
-
-/// Read one merge input out of the store.
-///
-/// A merge input is a state of the collection, so it is resident by
-/// construction -- and if it is not, the merge is over something that was
-/// never committed and must fail here rather than be published.
-fn fetch_merge_input<S>(
-    snapshot: &S::Snapshot,
-    role: ElementRole,
-    data: CollectionData,
-) -> Result<Blob<SimpleArchive>, PublicationError<S::PutError, S::InsertError>>
-where
-    S: BlobStore + CollectionStore,
-{
-    snapshot
-        .get::<Blob<SimpleArchive>, _>(Handle::<SimpleArchive>::from_hash(data))
-        .map_err(|_| PublicationError::MergeInputAbsent { role, data })
-}
-
-/// Publish an exact merge from two resident collection states.
-///
-/// The input handles are read and validated but never rewritten. The
-/// collection descriptor and canonical union result are written first, then
-/// the `MERGE` record names them. The returned pair is `(canonical record,
-/// canonical result blob)`.
-///
-/// No durability flush is implied. Failed backend I/O may require recovery
-/// according to that backend's contract; after recovery, replay with the same
-/// arguments is deterministic and idempotent.
-pub fn publish_merge<S>(
-    store: &mut S,
-    descriptor: &Fragment,
-    low: CollectionData,
-    high: CollectionData,
-) -> Result<(CollectionMerge, Blob<SimpleArchive>), PublicationError<S::PutError, S::InsertError>>
-where
-    S: BlobStore + CollectionStore,
-{
-    publish_merge_inner(store, descriptor, low, high)
-}
-
-fn publish_merge_inner<S>(
-    store: &mut S,
-    descriptor: &Fragment,
-    low: CollectionData,
-    high: CollectionData,
-) -> Result<(CollectionMerge, Blob<SimpleArchive>), PublicationError<S::PutError, S::InsertError>>
-where
-    S: BlobStore + CollectionStore,
-{
-    validate_descriptor(descriptor).map_err(PublicationError::Validation)?;
-
-    // A merge names two states OF a collection, so both are already in the
-    // store -- the commits that made them states put them there. Taking them
-    // by handle rather than by value says so: an input that is not resident
-    // cannot be named, because nothing can be computed without reading it.
-    //
-    // Taking them by value could not say that. It let a caller publish a MERGE
-    // over two blobs nobody had ever committed -- a record asserting an
-    // equation between states the collection does not contain. It also wrote
-    // them a second time, and re-normalized bytes that were normalized on the
-    // way in.
-    let reader = store
-        .snapshot()
-        .map_err(|_| PublicationError::MergeInputAbsent {
-            role: ElementRole::MergeLow,
-            data: low,
-        })?;
-    let (low_data, low) = (
-        low,
-        fetch_merge_input::<S>(&reader, ElementRole::MergeLow, low)?,
-    );
-    let (high_data, high) = (
-        high,
-        fetch_merge_input::<S>(&reader, ElementRole::MergeHigh, high)?,
-    );
-    drop(reader);
-
-    let low_rows = canonical_rows(&low).map_err(|source| {
-        PublicationError::Validation(SimpleArchiveUnionValidationError::InvalidElement {
-            role: ElementRole::MergeLow,
-            source,
-        })
-    })?;
-    let high_rows = canonical_rows(&high).map_err(|source| {
-        PublicationError::Validation(SimpleArchiveUnionValidationError::InvalidElement {
-            role: ElementRole::MergeHigh,
-            source,
-        })
-    })?;
-    let result = join_canonical_rows(&low, &high, &low_rows, &high_rows);
-
-    // Write first, then name what was written. The descriptor used to be
-    // serialized and hashed twice -- once to name the collection, once to
-    // store it -- and the record was built from the first while the store
-    // received the second. They cannot disagree, but only because nothing
-    // arranged for them to; taking the handle from `put` makes "this record
-    // names blobs this store holds" true by construction.
-    //
-    // Nothing here needs an identity before its write. This function used to
-    // hash both inputs first and swap them into digest order, which looked
-    // load-bearing and was not: `CollectionMerge::new` sorts its own inputs by
-    // digest, and `join_canonical_rows` is a union over sorted rows whose
-    // early-outs are symmetric, so neither the record nor the result can tell
-    // which argument arrived first.
-    let collection: CollectionHandle = store
-        .put::<SimpleArchive, _>(descriptor.facts().clone())
-        .map_err(PublicationError::DependencyPut)?;
-    let result_data = store
-        .put::<SimpleArchive, _>(result.clone())
-        .map_err(PublicationError::DependencyPut)?;
-
-    let merge = CollectionMerge::new(
-        collection,
-        low_data,
-        high_data,
-        Handle::<SimpleArchive>::to_hash(result_data),
-    );
-    store
-        .insert(CollectionRecord::Merge(merge))
-        .map_err(PublicationError::RecordInsert)?;
-
-    Ok((merge, result))
-}
-
 fn validate_descriptor(descriptor: &Fragment) -> Result<(), SimpleArchiveUnionValidationError> {
     descriptor_facts::validate(descriptor.facts())?;
     let expected_representation = <SimpleArchive as MetaDescribe>::id();
@@ -1089,6 +762,7 @@ mod tests {
     use super::*;
 
     use std::collections::{BTreeMap, BTreeSet};
+    use std::convert::Infallible;
 
     use ed25519_dalek::SigningKey;
     use hex_literal::hex;
@@ -1161,14 +835,10 @@ mod tests {
     #[derive(Default)]
     struct ProbeStore {
         events: Vec<ProbeEvent>,
-        known: BTreeSet<[u8; 32]>,
         records: BTreeMap<CollectionRecord, CollectionRecord>,
         fail_at: Option<usize>,
-        // The probe records the *sequence* of store operations; the bytes are
-        // delegated so it can also be read from. A merge takes its inputs by
-        // handle now, so a store that cannot be read cannot be merged into --
-        // which is the point of that change, and this is the probe catching up
-        // with it rather than a convenience.
+        // The probe records the sequence of staged commit operations while a
+        // real in-memory backend supplies coherent snapshots for assertions.
         repo: MemoryRepo,
     }
 
@@ -1176,24 +846,6 @@ mod tests {
         // This probe fails before an operation takes effect, so it exercises
         // publication ordering at trait-operation boundaries. BlobStorePut
         // does not promise that a real backend cannot leave torn physical I/O.
-        /// Make a blob resident without recording an operation.
-        ///
-        /// A merge's inputs are states the collection already holds, put there
-        /// by the commits that made them states. Those puts are not part of
-        /// the merge, so seeding them here keeps the recorded sequence about
-        /// what the merge itself writes.
-        fn seed(&mut self, blob: &Blob<SimpleArchive>) {
-            self.known.insert(blob.get_handle().raw);
-            self.repo.blobs.insert(blob.clone());
-        }
-
-        fn failing_before_effect_at(operation: usize) -> Self {
-            Self {
-                fail_at: Some(operation),
-                ..Self::default()
-            }
-        }
-
         fn attempt(&mut self, event: ProbeEvent) -> Result<(), ProbeFailure> {
             self.events.push(event);
             let operation = self.events.len();
@@ -1201,10 +853,6 @@ mod tests {
                 return Err(ProbeFailure(operation));
             }
             Ok(())
-        }
-
-        fn recover(&mut self) {
-            self.fail_at = None;
         }
     }
 
@@ -1229,7 +877,6 @@ mod tests {
             let blob: Blob<S> = item.to_blob();
             let handle = blob.get_handle();
             self.attempt(ProbeEvent::Put(handle.raw))?;
-            self.known.insert(handle.raw);
             self.repo.blobs.insert(blob.clone());
             Ok(handle)
         }
@@ -1334,26 +981,6 @@ mod tests {
         store
             .register_collection::<SimpleArchive>(descriptor.clone())
             .unwrap()
-    }
-
-    fn commit_fixture() -> (
-        Fragment,
-        Blob<SimpleArchive>,
-        Blob<SimpleArchive>,
-        SigningKey,
-        CollectionCommit,
-    ) {
-        let descriptor = root("first");
-        let data_blob = archive([row(1, 1, 1), row(3, 1, 3)]);
-        let metadata = archive([row(9, 1, 9)]);
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let commit = CollectionCommit::sign(
-            &signing_key,
-            identity_for_tests(&descriptor),
-            data(&data_blob),
-            metadata.get_handle(),
-        );
-        (descriptor, data_blob, metadata, signing_key, commit)
     }
 
     #[test]
@@ -1512,8 +1139,7 @@ mod tests {
             .unwrap()
             .expect("root descriptor name");
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
-        let prepared = prepare_commit(&empty, &empty).unwrap();
+        let prepared = PreparedCollectionCommit::from_fragment(Fragment::empty());
         let mut store = MemoryRepo::default();
         let collection = register_collection(&mut store, &descriptor);
 
@@ -1620,435 +1246,6 @@ mod tests {
         assert!(!store
             .records
             .contains_key(&CollectionRecord::Commit(commit)));
-    }
-
-    #[test]
-    fn commit_publication_orders_and_replays_idempotently() {
-        let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
-        let descriptor_embedded = embedded_put_events(&descriptor);
-        let mut sequence = vec![put_event(&data_blob), put_event(&metadata)];
-        sequence.push(insert_event(CollectionRecord::Commit(expected)));
-
-        let mut store = ProbeStore::default();
-        let collection = register_collection(&mut store, &descriptor);
-        store.events.clear();
-        let first =
-            publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key).unwrap();
-        let second =
-            publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key).unwrap();
-
-        assert_eq!(first, expected);
-        assert_eq!(second, expected);
-        assert_eq!(first.data(), data(&data_blob));
-        assert_eq!(first.metadata(), metadata.get_handle());
-        first.verify_strict().unwrap();
-        validate_commit(&descriptor, &first, &data_blob).unwrap();
-
-        let mut expected_events = sequence.clone();
-        expected_events.extend(sequence);
-        assert_eq!(store.events, expected_events);
-        let mut expected_handles: BTreeSet<_> = descriptor_embedded
-            .into_iter()
-            .map(|event| match event {
-                ProbeEvent::Put(handle) => handle,
-                ProbeEvent::Insert(_) => unreachable!(),
-            })
-            .collect();
-        expected_handles.extend([
-            identity_for_tests(&descriptor).raw,
-            data_blob.get_handle().raw,
-            metadata.get_handle().raw,
-        ]);
-        assert_eq!(store.known, expected_handles);
-        assert_eq!(
-            store.records.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([CollectionRecord::Commit(expected)])
-        );
-    }
-
-    #[test]
-    fn fragment_commit_puts_embedded_dependencies_before_record_and_replays_idempotently() {
-        let descriptor = root("first");
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (fragment, _text_handle, _payload_handle) = fragment_fixture();
-        let embedded = embedded_put_events(&fragment);
-        let content_archive: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
-        let metadata_archive: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
-        let descriptor_embedded = embedded_put_events(&descriptor);
-        let expected = CollectionCommit::sign(
-            &signing_key,
-            identity_for_tests(&descriptor),
-            data(&content_archive),
-            metadata_archive.get_handle(),
-        );
-        let mut sequence = [
-            embedded.clone(),
-            vec![put_event(&content_archive), put_event(&metadata_archive)],
-        ]
-        .concat();
-        sequence.push(insert_event(CollectionRecord::Commit(expected)));
-
-        let mut store = ProbeStore::default();
-        let collection = register_collection(&mut store, &descriptor);
-        store.events.clear();
-        let first = publish_fragment_commit(&mut store, collection, fragment.clone(), &signing_key)
-            .unwrap();
-        let second =
-            publish_fragment_commit(&mut store, collection, fragment, &signing_key).unwrap();
-
-        assert_eq!(first, expected);
-        assert_eq!(second, expected);
-        let mut expected_events = sequence.clone();
-        expected_events.extend(sequence);
-        assert_eq!(store.events, expected_events);
-
-        let mut expected_handles: BTreeSet<_> = descriptor_embedded
-            .into_iter()
-            .chain(embedded)
-            .map(|event| match event {
-                ProbeEvent::Put(handle) => handle,
-                ProbeEvent::Insert(_) => {
-                    unreachable!("embedded events are puts")
-                }
-            })
-            .collect();
-        expected_handles.extend([
-            identity_for_tests(&descriptor).raw,
-            content_archive.get_handle().raw,
-            metadata_archive.get_handle().raw,
-        ]);
-        assert_eq!(store.known, expected_handles);
-        assert_eq!(
-            store.records.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([CollectionRecord::Commit(expected)])
-        );
-    }
-
-    /// A merge writes its result and nothing else, and says the same thing
-    /// twice.
-    ///
-    /// It used to normalize the two inputs, because it received them as bytes
-    /// and a caller could hand it anything. It receives them as the identities
-    /// of states the collection already holds, so there is nothing left to
-    /// normalize: the bytes come from the store, and a state was canonicalized
-    /// by the commit that made it one. The forged-input case this test used to
-    /// carry moved with that responsibility -- an input that is not resident is
-    /// now refused by identity, which `a_merge_refuses_an_input_the_store_does_not_hold`
-    /// pins.
-    #[test]
-    fn merge_publication_writes_only_its_result_and_replays_idempotently() {
-        let descriptor = root("first");
-        let left = archive([row(1, 1, 1), row(3, 1, 3)]);
-        let right = archive([row(2, 1, 2), row(3, 1, 3)]);
-        let (low, high) = ordered_inputs(&left, &right);
-        let expected_result = join(low, high).unwrap();
-        let expected_merge = CollectionMerge::new(
-            identity_for_tests(&descriptor),
-            data(low),
-            data(high),
-            data(&expected_result),
-        );
-        // The inputs are already states of the collection, so the merge
-        // writes only what it computed, then publishes.
-        let mut sequence = vec![
-            put_event(&IntoBlob::<SimpleArchive>::to_blob(
-                descriptor.facts().clone(),
-            )),
-            put_event(&expected_result),
-        ];
-        sequence.push(insert_event(CollectionRecord::Merge(expected_merge)));
-
-        let mut store = ProbeStore::default();
-        store.seed(&left);
-        store.seed(&right);
-        let first = publish_merge(&mut store, &descriptor, data(&right), data(&left)).unwrap();
-        let second = publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap();
-
-        assert_eq!(first, (expected_merge.clone(), expected_result.clone()));
-        assert_eq!(second, (expected_merge.clone(), expected_result.clone()));
-        validate_merge(&descriptor, &first.0, low, high, &first.1).unwrap();
-
-        let mut expected_events = sequence.clone();
-        expected_events.extend(sequence);
-        assert_eq!(store.events, expected_events);
-        let expected_handles = BTreeSet::from([
-            identity_for_tests(&descriptor).raw,
-            low.get_handle().raw,
-            high.get_handle().raw,
-            expected_result.get_handle().raw,
-        ]);
-        assert_eq!(store.known, expected_handles);
-        assert_eq!(
-            store.records.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([CollectionRecord::Merge(expected_merge)])
-        );
-    }
-
-    #[test]
-    fn commit_publication_orders_completed_prefixes_and_replays_after_recovery() {
-        let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
-        let insert_at = 3;
-        for fail_at in 1..=insert_at {
-            let mut store = ProbeStore::default();
-            let collection = register_collection(&mut store, &descriptor);
-            store.events.clear();
-            store.fail_at = Some(fail_at);
-            let error = publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key)
-                .unwrap_err();
-            match (fail_at, error) {
-                (at, PublicationError::DependencyPut(ProbeFailure(observed))) if at < insert_at => {
-                    assert_eq!(observed, fail_at)
-                }
-                (at, PublicationError::RecordInsert(ProbeFailure(observed))) if at == insert_at => {
-                    assert_eq!(observed, fail_at)
-                }
-                (_, error) => panic!("unexpected publication error: {error}"),
-            }
-
-            assert!(!store
-                .records
-                .contains_key(&CollectionRecord::Commit(expected)));
-            if fail_at < insert_at {
-                assert!(!store
-                    .events
-                    .contains(&ProbeEvent::Insert(CollectionRecord::Commit(expected))));
-            }
-
-            store.recover();
-            let retried =
-                publish_commit(&mut store, collection, &data_blob, &metadata, &signing_key)
-                    .unwrap();
-            assert_eq!(retried, expected);
-            assert!(store
-                .records
-                .contains_key(&CollectionRecord::Commit(expected)));
-        }
-    }
-
-    #[test]
-    fn merge_publication_orders_completed_prefixes_and_replays_after_recovery() {
-        let descriptor = root("first");
-        let left = archive([row(1, 1, 1), row(3, 1, 3)]);
-        let right = archive([row(2, 1, 2), row(3, 1, 3)]);
-        let (low, high) = ordered_inputs(&left, &right);
-        let result = join(low, high).unwrap();
-        let expected = CollectionMerge::new(
-            identity_for_tests(&descriptor),
-            data(low),
-            data(high),
-            data(&result),
-        );
-        // Descriptor/result puts, then the record. Inputs are read, not
-        // written.
-        for fail_at in 1..=3 {
-            let mut store = ProbeStore::failing_before_effect_at(fail_at);
-            store.seed(&left);
-            store.seed(&right);
-            let error =
-                publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap_err();
-            match (fail_at, error) {
-                (1..=2, PublicationError::DependencyPut(ProbeFailure(at))) => {
-                    assert_eq!(at, fail_at)
-                }
-                (3, PublicationError::RecordInsert(ProbeFailure(at))) => {
-                    assert_eq!(at, fail_at)
-                }
-                (_, error) => panic!("unexpected publication error: {error}"),
-            }
-
-            assert!(!store
-                .records
-                .contains_key(&CollectionRecord::Merge(expected)));
-            if fail_at < 3 {
-                assert!(!store
-                    .events
-                    .contains(&ProbeEvent::Insert(CollectionRecord::Merge(expected))));
-            }
-
-            store.recover();
-            store.seed(&left);
-            store.seed(&right);
-            let retried =
-                publish_merge(&mut store, &descriptor, data(&left), data(&right)).unwrap();
-            assert_eq!(retried, (expected.clone(), result.clone()));
-            assert!(store
-                .records
-                .contains_key(&CollectionRecord::Merge(expected)));
-        }
-    }
-
-    #[test]
-    fn publication_rejects_every_invalid_input_before_writing() {
-        let (descriptor, data_blob, metadata, signing_key, _) = commit_fixture();
-        let mut store = ProbeStore::default();
-        let collection = register_collection(&mut store, &descriptor);
-        store.events.clear();
-
-        let invalid_data = raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]);
-        assert!(matches!(
-            publish_commit(
-                &mut store,
-                collection,
-                &invalid_data,
-                &metadata,
-                &signing_key,
-            ),
-            Err(PublicationError::Validation(
-                SimpleArchiveUnionValidationError::InvalidElement { .. }
-            ))
-        ));
-        assert!(store.events.is_empty());
-
-        let invalid_metadata = raw_archive(vec![row(4, 1, 4), row(3, 1, 3)]);
-        assert!(matches!(
-            publish_commit(
-                &mut store,
-                collection,
-                &data_blob,
-                &invalid_metadata,
-                &signing_key,
-            ),
-            Err(PublicationError::InvalidMetadata(
-                UnarchiveError::BadCanonicalizationOrdering
-            ))
-        ));
-        assert!(store.events.is_empty());
-
-        // Resident but not canonical: the merge must still refuse, and for the
-        // element's own reason rather than for absence.
-        store.seed(&invalid_data);
-        store.seed(&data_blob);
-        assert!(matches!(
-            publish_merge(
-                &mut store,
-                &descriptor,
-                Handle::<SimpleArchive>::to_hash(invalid_data.get_handle()),
-                Handle::<SimpleArchive>::to_hash(data_blob.get_handle()),
-            ),
-            Err(PublicationError::Validation(
-                SimpleArchiveUnionValidationError::InvalidElement { .. }
-            ))
-        ));
-        assert!(store.events.is_empty());
-    }
-
-    #[test]
-    fn pile_publication_roundtrips_through_discovery_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("collections.pile");
-        std::fs::File::create(&path).unwrap();
-
-        let descriptor = root("first");
-        let left = archive([row(1, 1, 1), row(3, 1, 3)]);
-        let right = archive([row(2, 1, 2), row(3, 1, 3)]);
-        let metadata = archive([row(9, 1, 9)]);
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-
-        let (commit, right_commit, merge, result) = {
-            let mut pile = Pile::open(&path).unwrap();
-            let collection = register_collection(&mut pile, &descriptor);
-            let commit =
-                publish_commit(&mut pile, collection, &left, &metadata, &signing_key).unwrap();
-            // Both sides must be states before they can be merged -- the merge
-            // reads them rather than writing them, so a side nobody committed
-            // is refused by identity.
-            let right_commit =
-                publish_commit(&mut pile, collection, &right, &metadata, &signing_key).unwrap();
-            let (merge, result) =
-                publish_merge(&mut pile, &descriptor, data(&right), data(&left)).unwrap();
-            pile.close().unwrap();
-            (commit, right_commit, merge, result)
-        };
-
-        let mut reopened = Pile::open(&path).unwrap();
-        let reader = reopened.snapshot().unwrap();
-        let discovered = discover_collection_records(&reader).unwrap();
-        // Both sides are commits now: a merge is an equation between states,
-        // and each side became a state by being committed.
-        let mut expected_commits = vec![commit.clone(), right_commit.clone()];
-        expected_commits.sort_unstable();
-        assert_eq!(discovered.commits(), expected_commits.as_slice());
-        assert_eq!(discovered.merges(), &[merge.clone()]);
-        assert!(discovered.derives().is_empty());
-        assert!(discovered.diagnostics().is_empty());
-
-        let fetched_descriptor: Blob<SimpleArchive> =
-            reader.get(identity_for_tests(&descriptor)).unwrap();
-        let fetched_left: Blob<SimpleArchive> = reader.get(left.get_handle()).unwrap();
-        let fetched_right: Blob<SimpleArchive> = reader.get(right.get_handle()).unwrap();
-        let fetched_metadata: Blob<SimpleArchive> = reader.get(metadata.get_handle()).unwrap();
-        let fetched_result: Blob<SimpleArchive> = reader.get(result.get_handle()).unwrap();
-        assert_eq!(
-            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
-                fetched_descriptor
-            )
-            .unwrap(),
-            *descriptor.facts()
-        );
-        assert_eq!(fetched_left, left);
-        assert_eq!(fetched_right, right);
-        assert_eq!(fetched_metadata, metadata);
-        assert_eq!(fetched_result, result);
-        validate_commit(&descriptor, &commit, &fetched_left).unwrap();
-        let (low, high) = ordered_inputs(&fetched_left, &fetched_right);
-        validate_merge(&descriptor, &merge, low, high, &fetched_result).unwrap();
-
-        drop(reader);
-        reopened.close().unwrap();
-    }
-
-    #[test]
-    fn fragment_commit_roundtrips_embedded_blobs_through_a_reopened_pile() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fragment-commit.pile");
-        std::fs::File::create(&path).unwrap();
-
-        let descriptor = root("first");
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (fragment, text_handle, payload_handle) = fragment_fixture();
-        let expected_content: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
-        let expected_metadata: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
-
-        let commit = {
-            let mut pile = Pile::open(&path).unwrap();
-            let collection = register_collection(&mut pile, &descriptor);
-            let commit =
-                publish_fragment_commit(&mut pile, collection, fragment, &signing_key).unwrap();
-            pile.close().unwrap();
-            commit
-        };
-
-        let mut reopened = Pile::open(&path).unwrap();
-        let reader = reopened.snapshot().unwrap();
-        let discovered = discover_collection_records(&reader).unwrap();
-        assert_eq!(discovered.commits(), &[commit.clone()]);
-        assert!(discovered.merges().is_empty());
-        assert!(discovered.derives().is_empty());
-        assert!(discovered.diagnostics().is_empty());
-
-        let fetched_descriptor: Blob<SimpleArchive> =
-            reader.get(identity_for_tests(&descriptor)).unwrap();
-        let content_handle: Inline<Handle<SimpleArchive>> = commit.data().transmute();
-        let fetched_content: Blob<SimpleArchive> = reader.get(content_handle).unwrap();
-        let fetched_metadata: Blob<SimpleArchive> = reader.get(commit.metadata()).unwrap();
-        assert_eq!(
-            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
-                fetched_descriptor
-            )
-            .unwrap(),
-            *descriptor.facts()
-        );
-        assert_eq!(fetched_content, expected_content);
-        assert_eq!(fetched_metadata, expected_metadata);
-        validate_commit(&descriptor, &commit, &fetched_content).unwrap();
-
-        let fetched_text: View<str> = reader.get::<View<str>, UTF8String>(text_handle).unwrap();
-        let fetched_payload: Bytes = reader.get::<Bytes, RawBytes>(payload_handle).unwrap();
-        assert_eq!(&*fetched_text, "a self-contained content blob");
-        assert_eq!(&*fetched_payload, &[0, 1, 2, 3, 0xFE, 0xFF]);
-
-        drop(reader);
-        reopened.close().unwrap();
     }
 
     #[test]

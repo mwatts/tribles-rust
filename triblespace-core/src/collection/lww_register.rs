@@ -1007,25 +1007,16 @@ mod tests {
             .unwrap();
         let register = ufoid();
         let state = ufoid();
-        let identity_data = archive(&identity(&state, &register));
-        let order_data = archive(&order(&state, 42));
-        let metadata = TribleSet::new().to_blob();
-        let identity_commit = simplearchive_union::publish_commit(
-            &mut store,
-            source,
-            &identity_data,
-            &metadata,
-            &signing_key,
-        )
-        .unwrap();
-        let order_commit = simplearchive_union::publish_commit(
-            &mut store,
-            source,
-            &order_data,
-            &metadata,
-            &signing_key,
-        )
-        .unwrap();
+        let identity_commit = store
+            .commit(
+                source,
+                &signing_key,
+                Fragment::from(identity(&state, &register)),
+            )
+            .unwrap();
+        let order_commit = store
+            .commit(source, &signing_key, Fragment::from(order(&state, 42)))
+            .unwrap();
         let support = Support::from_data(source, [identity_commit.data(), order_commit.data()]);
 
         let snapshot = store

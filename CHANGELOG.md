@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still stored and published immediately. Tier planning retains only indexed
   member identities and loads one input pair at a time.
 
+- Remove the obsolete `SimpleArchive`-specific publication and materialization
+  facade. Signed publication now has one public path through
+  `CollectionStoreExt::commit` (or the retained prepared/staged commit
+  boundary), merge work through generic collection maintenance, and logical
+  reconstruction through `Cover` / `CollectionSnapshot` and `TryFromCover`.
+
 - Split exact derived construction from physical maintenance. `ensure` and
   `ensure_exact` now publish missing `DERIVE` work only; `maintain` and
   `maintain_exact` additionally perform deterministic dyadic size-tiered LSM
