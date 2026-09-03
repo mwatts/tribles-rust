@@ -4878,7 +4878,10 @@ mod tests {
         CapabilityResource,
     };
     use crate::collection::descriptor::named_for_tests;
-    use crate::collection::{empty_metadata_handle, Collection, CollectionHandle, Cover};
+    use crate::collection::{
+        empty_metadata_handle, AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy,
+        CollectionStoreExt, Cover,
+    };
     use crate::macros::entity;
     use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
@@ -5073,6 +5076,18 @@ mod tests {
 
     fn collection_test_collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
+    }
+
+    fn register_simplearchive_collection(pile: &mut Pile, name: &str) -> Collection<SimpleArchive> {
+        let authority = SigningKey::from_bytes(&[0xAA; 32]).verifying_key();
+        pile.collection(
+            name,
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority),
+                AdmissionPolicy::direct(authority),
+            ),
+        )
+        .unwrap()
     }
 
     fn collection_test_records() -> Vec<CollectionRecord> {
@@ -7467,7 +7482,7 @@ mod tests {
             None,
         );
 
-        let collection = Collection::<SimpleArchive>::from_handle(collection_test_collection(90));
+        let collection = register_simplearchive_collection(&mut pile, "cold-cover-availability");
         let cover = Cover::from_members(collection, [handle]);
         let snapshot = pile.snapshot().unwrap();
         assert_eq!(cover.available(&snapshot).unwrap(), cover);
@@ -7496,7 +7511,7 @@ mod tests {
         append_v3_blob_candidate(&path, handle.into(), b"not the empty archive", 1);
 
         let mut pile = Pile::open(&path).unwrap();
-        let collection = Collection::<SimpleArchive>::from_handle(collection_test_collection(91));
+        let collection = register_simplearchive_collection(&mut pile, "corrupt-cover-availability");
         let cover = Cover::from_members(collection, [handle]);
         let snapshot = pile.snapshot().unwrap();
         let occurrence = first_blob_occurrence(&snapshot.blobs, &handle.raw).unwrap();
@@ -7534,9 +7549,9 @@ mod tests {
         let a_handle = a.get_handle();
         let b_handle = b.get_handle();
         let c_handle = c.get_handle();
-        let collection = Collection::<SimpleArchive>::from_handle(collection_test_collection(94));
 
         let mut pile = Pile::open(&path).unwrap();
+        let collection = register_simplearchive_collection(&mut pile, "corrupt-compacted-cover");
         pile.put::<SimpleArchive, _>(a).unwrap();
         pile.put::<SimpleArchive, _>(b).unwrap();
         pile.insert(CollectionRecord::Merge(CollectionMerge::new(

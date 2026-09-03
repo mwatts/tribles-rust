@@ -483,6 +483,8 @@ mod tests {
         // With only the first fine member resident, the maximal answer is the
         // first requested coordinate and difference names the other one.
         let mut partial = MemoryRepo::default();
+        let (_, _, partial_collection) = collections(&mut partial);
+        assert_eq!(partial_collection, accelerated_collection);
         partial.put::<SuccinctArchiveBlob, _>(a).unwrap();
         partial
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fa)
@@ -533,6 +535,8 @@ mod tests {
             .unwrap();
 
         let mut empty = MemoryRepo::default();
+        let (_, _, empty_collection) = collections(&mut empty);
+        assert_eq!(empty_collection, accelerated_collection);
         let absent = empty.snapshot().unwrap();
         assert!(cover.available(&absent).unwrap().is_empty());
         assert!(matches!(
