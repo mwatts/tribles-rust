@@ -1,18 +1,24 @@
 use ed25519_dalek::SigningKey;
+use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+    CapabilityResource, CapabilityValidity,
+};
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+    ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::SnapshotSource;
+use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 fn one_fact(seed: u8) -> TribleSet {
@@ -22,6 +28,21 @@ fn one_fact(seed: u8) -> TribleSet {
     let mut facts = TribleSet::new();
     facts.insert(&Trible::force_raw(row).unwrap());
     facts
+}
+
+fn store_bundle(store: &mut MemoryRepo, bundle: CapabilityProofBundle) {
+    let (proof, claims) = bundle.into_parts();
+    for claim in claims {
+        store.put::<SimpleArchive, _>(claim).unwrap();
+    }
+    store.insert_proof(proof).unwrap();
+}
+
+fn write_atom(collection: Collection<SimpleArchive>) -> CapabilityAtom {
+    CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(collection.handle()),
+    )
 }
 
 #[test]
@@ -155,4 +176,116 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap();
     assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
+}
+
+#[test]
+fn collection_at_uses_the_supplied_authorization_instant() {
+    let authority = SigningKey::from_bytes(&[44; 32]);
+    let writer = SigningKey::from_bytes(&[45; 32]);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let expected = one_fact(14);
+    let expected_member = expected.clone().to_blob().get_handle();
+    let mut store = MemoryRepo::default();
+    let collection = store.collection("typed-api-clock", policy).unwrap();
+    store
+        .commit(collection, &writer, Fragment::from(expected))
+        .unwrap();
+
+    let validity =
+        CapabilityValidity::new(Epoch::from_tai_seconds(10.0), Epoch::from_tai_seconds(20.0))
+            .unwrap();
+    store_bundle(
+        &mut store,
+        CapabilityProofBundle::issue_root(
+            &authority,
+            CapabilityClaim::root(
+                write_atom(collection),
+                CapabilityMode::Invoke,
+                Some(validity),
+            ),
+            writer.verifying_key(),
+        )
+        .unwrap(),
+    );
+
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot
+        .collection_at(collection, Epoch::from_tai_seconds(9.0))
+        .unwrap()
+        .support()
+        .is_empty());
+
+    let admitted = snapshot
+        .collection_at(collection, Epoch::from_tai_seconds(15.0))
+        .unwrap();
+    assert_eq!(
+        admitted.support().members().collect::<Vec<_>>(),
+        vec![expected_member]
+    );
+    assert_eq!(
+        admitted.cover().members().collect::<Vec<_>>(),
+        vec![expected_member]
+    );
+
+    assert!(snapshot
+        .collection_at(collection, Epoch::from_tai_seconds(21.0))
+        .unwrap()
+        .support()
+        .is_empty());
+}
+
+#[test]
+fn collection_at_returns_the_maximal_resident_partial_realization() {
+    let authority = SigningKey::from_bytes(&[46; 32]);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let first = one_fact(15);
+    let second = one_fact(16);
+    let first_member = first.clone().to_blob().get_handle();
+    let second_member = second.clone().to_blob().get_handle();
+    let mut store = MemoryRepo::default();
+    let source = store
+        .collection("typed-api-partial-source", policy.clone())
+        .unwrap();
+    let target = store
+        .derive(source, SimpleToSuccinctMapping, policy)
+        .unwrap();
+
+    store
+        .commit(source, &authority, Fragment::from(first.clone()))
+        .unwrap();
+    let first_support = source.admitted(&store.snapshot().unwrap()).unwrap();
+    store
+        .ensure_exact::<SimpleToSuccinctMapping>(target, &first_support)
+        .unwrap();
+    store
+        .commit(source, &authority, Fragment::from(second))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let admitted_source = source
+        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
+        .unwrap();
+    assert_eq!(admitted_source.len(), 2);
+    assert!(admitted_source.contains(first_member));
+    assert!(admitted_source.contains(second_member));
+
+    let observed = snapshot
+        .collection_at(target, Epoch::from_tai_seconds(0.0))
+        .unwrap();
+    assert_eq!(observed.support(), &first_support);
+    assert_eq!(observed.cover().len(), 1);
+    assert_eq!(
+        observed
+            .view::<UnionArchive<OrderedUniverse>>()
+            .unwrap()
+            .iter()
+            .collect::<TribleSet>(),
+        first
+    );
 }

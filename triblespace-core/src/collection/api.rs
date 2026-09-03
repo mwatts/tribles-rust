@@ -1719,7 +1719,27 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         E: CollectionEncoding,
         Handle<E>: InlineEncoding,
     {
-        let (support, cover) = super::exact_derived::attach_collection(self, target, None)?;
+        self.collection_at(target, clock::epoch_now())
+    }
+
+    /// Observe what one collection contains at one authorization instant.
+    ///
+    /// This is the deterministic-clock form of [`Self::collection`]. The
+    /// supplied instant is used for every capability decision while selecting
+    /// admitted foundational support. Physical target realization is still
+    /// selected entirely from this immutable store snapshot, and may represent
+    /// only a proper subset of the admitted support.
+    fn collection_at<E>(
+        &self,
+        target: Collection<E>,
+        instant: hifitime::Epoch,
+    ) -> Result<CollectionSnapshot<Self, E>, CollectionRealizationError>
+    where
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
+    {
+        let (support, cover) =
+            super::exact_derived::attach_collection_at(self, target, None, instant)?;
         Ok(CollectionSnapshot::new(self.clone(), support, cover))
     }
 

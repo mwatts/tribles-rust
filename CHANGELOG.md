@@ -105,6 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `CollectionSnapshotExt::collection_at` so a caller can bind admission
+  and maximal resident target selection to one explicit authorization instant.
+
 - Add `Collection::policy` for reading a validated descriptor's immutable
   READ and WRITE policy from one store snapshot without proof discovery.
 

@@ -408,15 +408,32 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
+    attach_collection_at(snapshot, target, requested, crate::clock::epoch_now())
+}
+
+/// Attach one target collection using one caller-supplied authorization instant.
+pub(crate) fn attach_collection_at<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    requested: Option<&Support>,
+    instant: hifitime::Epoch,
+) -> Result<(Support, Cover<E>), CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
     let exact = requested.is_some();
     let lineage = load_lineage(snapshot, target)?;
     let admitted;
     let requested = match requested {
         Some(requested) => requested,
         None => {
-            admitted = lineage.foundation.admitted(snapshot).map_err(|error| {
-                CollectionRealizationError::storage("admit foundational support", error)
-            })?;
+            admitted = lineage
+                .foundation
+                .admitted_at(snapshot, instant)
+                .map_err(|error| {
+                    CollectionRealizationError::storage("admit foundational support", error)
+                })?;
             &admitted
         }
     };
