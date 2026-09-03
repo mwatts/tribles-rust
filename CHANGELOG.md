@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Restore bounded target-carry batching under invariant foundational support.
+  Maintenance resolves collection semantics once per actionable dyadic tier
+  round instead of once per individual `MERGE`, while each disjoint result is
+  still stored and published immediately. Tier planning retains only indexed
+  member identities and loads one input pair at a time.
+
 - Split exact derived construction from physical maintenance. `ensure` and
   `ensure_exact` now publish missing `DERIVE` work only; `maintain` and
   `maintain_exact` additionally perform deterministic dyadic size-tiered LSM

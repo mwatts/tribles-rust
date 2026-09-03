@@ -72,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Restore bounded target-carry batching under invariant foundational support.
+  Maintenance resolves collection semantics once per actionable dyadic tier
+  round instead of once per individual `MERGE`, while each disjoint result is
+  still stored and published immediately. Tier planning retains only indexed
+  member identities and loads one input pair at a time.
+
 - Make `YardSnapshot::blobs_diff` use the PATCH difference of the two immutable
   live-set unions, so exact-provider locator refresh is proportional to changed
   handles instead of relisting the complete Yard twice.

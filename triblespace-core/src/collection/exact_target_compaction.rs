@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, Store};
 
@@ -19,6 +18,14 @@ use super::{
 
 /// Carry one exact target realization to its deterministic dyadic LSM fixed
 /// point.
+///
+/// One semantic probe selects a complete target cover.  The lowest actionable
+/// colliding tier is then carried as one batch of pairwise-disjoint inputs
+/// before semantics are resolved again.  Since publication only adds equations
+/// and never consumes an input, an earlier carry cannot invalidate a later pair
+/// in that batch.  Each result is still stored and published immediately, so a
+/// later failure preserves the complete successful prefix without retaining a
+/// tier of constructed outputs in memory.
 pub(super) fn maintain_target<S, E>(
     store: &mut S,
     target: Collection<E>,
@@ -40,41 +47,37 @@ where
         if !seen.insert(identity.clone()) {
             return Err(CollectionRealizationError::Stalled { cover: identity });
         }
-        let prepared = prepare_next_carry(&snapshot, target, &cover, &mut blocked)?;
+        let prepared = prepare_carry_round(&snapshot, target, &cover)?;
         drop(snapshot);
 
-        let Some((low, high, output)) = prepared else {
+        let Some((descriptor, tiers)) = prepared else {
             return Ok(());
         };
-        let result = data_identity::<E>(&output);
-        store.put::<E, _>(output).map_err(|error| {
-            CollectionRealizationError::storage("store merged target member", error)
-        })?;
-        store
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
-                target.handle(),
-                low,
-                high,
-                result,
-            )))
-            .map_err(|error| CollectionRealizationError::storage("publish target MERGE", error))?;
+        if !publish_carry_round(store, target, &descriptor, tiers, &mut blocked)? {
+            return Ok(());
+        }
     }
 }
 
-fn tier<E: CollectionEncoding>(blob: &Blob<E>) -> u32 {
-    blob.bytes.len().max(1).ilog2()
+fn tier(length: u64) -> u32 {
+    length.max(1).ilog2()
 }
 
 fn cover_identity<E: CollectionEncoding>(cover: &Cover<E>) -> Vec<CollectionData> {
     cover.data_members().collect()
 }
 
-fn prepare_next_carry<R, E>(
+fn prepare_carry_round<R, E>(
     snapshot: &R,
     target: Collection<E>,
     cover: &Cover<E>,
-    blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
-) -> Result<Option<(CollectionData, CollectionData, Blob<E>)>, CollectionRealizationError>
+) -> Result<
+    Option<(
+        crate::trible::Fragment,
+        BTreeMap<u32, BTreeSet<CollectionData>>,
+    )>,
+    CollectionRealizationError,
+>
 where
     R: BlobStoreGet + crate::repo::BlobStoreMeta,
     E: CollectionEncoding,
@@ -95,29 +98,82 @@ where
         ))
     })?;
 
-    let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<E>>>::new();
+    // Keep only member identities across the snapshot boundary.  Payloads can
+    // be arbitrarily large, while size-tier selection needs only indexed
+    // length metadata.  The publisher loads at most one disjoint pair at a
+    // time from a cheap fresh snapshot.
+    let mut tiers = BTreeMap::<u32, BTreeSet<CollectionData>>::new();
     for handle in cover.members() {
         let data = Handle::<E>::to_hash(handle);
-        let blob = snapshot.get(handle).map_err(|error| {
-            CollectionRealizationError::storage("load target-maintenance member", error)
-        })?;
-        tiers.entry(tier(&blob)).or_default().insert(data, blob);
+        let metadata = snapshot
+            .metadata(handle)
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect target-maintenance member", error)
+            })?
+            .ok_or(CollectionRealizationError::MissingDependency { member: data })?;
+        tiers.entry(tier(metadata.length)).or_default().insert(data);
     }
 
+    Ok(Some((descriptor, tiers)))
+}
+
+fn publish_carry_round<S, E>(
+    store: &mut S,
+    target: Collection<E>,
+    descriptor: &crate::trible::Fragment,
+    tiers: BTreeMap<u32, BTreeSet<CollectionData>>,
+    blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
+) -> Result<bool, CollectionRealizationError>
+where
+    S: Store,
+    E: CollectionEncoding,
+{
     for (_, mut members) in tiers {
+        let mut published = false;
         while members.len() >= 2 {
-            let (low_data, low) = members
+            let low_data = members
                 .pop_first()
                 .expect("colliding target tier contains a lower member");
-            let (high_data, high) = members
+            let high_data = members
                 .pop_first()
                 .expect("colliding target tier contains a higher member");
             if blocked.contains(&(low_data, high_data)) {
-                members.insert(high_data, high);
+                members.insert(high_data);
                 continue;
             }
-            match E::join_members(&descriptor, &low, &high, snapshot) {
-                Ok(output) => return Ok(Some((low_data, high_data, output))),
+            let snapshot = store.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("open target-carry snapshot", error)
+            })?;
+            let low = snapshot
+                .get(Handle::<E>::from_hash(low_data))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("load lower target-carry member", error)
+                })?;
+            let high = snapshot
+                .get(Handle::<E>::from_hash(high_data))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("load higher target-carry member", error)
+                })?;
+            let output = E::join_members(descriptor, &low, &high, &snapshot);
+            drop(snapshot);
+            match output {
+                Ok(output) => {
+                    let result = data_identity::<E>(&output);
+                    store.put::<E, _>(output).map_err(|error| {
+                        CollectionRealizationError::storage("store merged target member", error)
+                    })?;
+                    store
+                        .insert(CollectionRecord::Merge(CollectionMerge::new(
+                            target.handle(),
+                            low_data,
+                            high_data,
+                            result,
+                        )))
+                        .map_err(|error| {
+                            CollectionRealizationError::storage("publish target MERGE", error)
+                        })?;
+                    published = true;
+                }
                 Err(CollectionOperationError::Fatal(reason)) => {
                     return Err(CollectionRealizationError::Merge {
                         low: low_data,
@@ -131,10 +187,13 @@ where
                     // the higher one eligible for the next deterministic pair.
                     // The exact finer cover remains the valid result.
                     blocked.insert((low_data, high_data));
-                    members.insert(high_data, high);
+                    members.insert(high_data);
                 }
             }
         }
+        if published {
+            return Ok(true);
+        }
     }
-    Ok(None)
+    Ok(false)
 }

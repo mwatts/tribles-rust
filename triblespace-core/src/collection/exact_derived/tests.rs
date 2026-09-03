@@ -384,6 +384,7 @@ impl Error for GuardStoreError {}
 struct GuardSnapshot {
     inner: MemoryRepoSnapshot,
     live: Arc<AtomicUsize>,
+    semantic_probes: Arc<AtomicUsize>,
 }
 
 impl Clone for GuardSnapshot {
@@ -392,6 +393,7 @@ impl Clone for GuardSnapshot {
         Self {
             inner: self.inner.clone(),
             live: Arc::clone(&self.live),
+            semantic_probes: Arc::clone(&self.semantic_probes),
         }
     }
 }
@@ -494,6 +496,7 @@ impl CollectionRead for GuardSnapshot {
         &self,
         selectors: &std::collections::BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        self.semantic_probes.fetch_add(1, Ordering::SeqCst);
         self.inner.select_records(selectors)
     }
 }
@@ -517,6 +520,7 @@ impl CapabilityProofRead for GuardSnapshot {
 struct GuardStore {
     inner: MemoryRepo,
     live: Arc<AtomicUsize>,
+    semantic_probes: Arc<AtomicUsize>,
     events: Vec<WriteEvent>,
     put_calls: usize,
     insert_calls: usize,
@@ -529,6 +533,7 @@ impl GuardStore {
         Self {
             inner,
             live: Arc::new(AtomicUsize::new(0)),
+            semantic_probes: Arc::new(AtomicUsize::new(0)),
             events: Vec::new(),
             put_calls: 0,
             insert_calls: 0,
@@ -579,6 +584,7 @@ impl SnapshotSource for GuardStore {
         Ok(GuardSnapshot {
             inner,
             live: Arc::clone(&self.live),
+            semantic_probes: Arc::clone(&self.semantic_probes),
         })
     }
 }
@@ -754,6 +760,75 @@ fn maintenance_drops_every_snapshot_and_stores_the_blob_before_merge() {
         .position(|event| matches!(event, WriteEvent::Put(data) if *data == merge.result()))
         .expect("maintenance must store its joined target member");
     assert!(put_position < insert_position);
+}
+
+#[test]
+fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
+    const MEMBERS: usize = 8;
+
+    let (mut inner, root, first, second) = collections();
+    let members: Vec<_> = (0..MEMBERS)
+        .map(|member| archive(member as u8 + 1, member as u8 + 1))
+        .collect();
+    for member in &members {
+        inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+    }
+    let support = support(root, &members);
+    ensure_exact::<_, FirstMapping>(&mut inner, first, &support).unwrap();
+    ensure_exact::<_, SecondMapping>(&mut inner, second, &support).unwrap();
+
+    let mut store = GuardStore::new(inner);
+    maintain_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+
+    let merges = store
+        .events
+        .iter()
+        .filter(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
+        .count();
+    assert_eq!(merges, MEMBERS - 1);
+    assert_eq!(
+        store.semantic_probes.load(Ordering::SeqCst),
+        5,
+        "one ensure probe plus one target-resolution probe for each dyadic tier round",
+    );
+
+    let snapshot = store.inner.snapshot().unwrap();
+    let (_, cover) = attach_collection(&snapshot, second, Some(&support)).unwrap();
+    assert_eq!(cover.len(), 1);
+}
+
+#[test]
+fn failed_target_batch_preserves_every_published_prefix_carry() {
+    for fail_insert in [false, true] {
+        let (mut inner, root, first, second) = collections();
+        let members: Vec<_> = (1..=4).map(|member| archive(member, member)).collect();
+        for member in &members {
+            inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+        }
+        let support = support(root, &members);
+        ensure_exact::<_, FirstMapping>(&mut inner, first, &support).unwrap();
+        ensure_exact::<_, SecondMapping>(&mut inner, second, &support).unwrap();
+
+        let mut store = GuardStore::new(inner);
+        if fail_insert {
+            store.reject_insert_at = Some(2);
+        } else {
+            store.reject_put_at = Some(2);
+        }
+
+        assert!(matches!(
+            maintain_exact::<_, SecondMapping>(&mut store, second, &support),
+            Err(CollectionRealizationError::Storage { .. })
+        ));
+        assert_eq!(store.live.load(Ordering::SeqCst), 0);
+        let merges = records(&mut store.inner)
+            .into_iter()
+            .filter(|record| {
+                matches!(record, CollectionRecord::Merge(merge) if merge.collection() == second.handle())
+            })
+            .count();
+        assert_eq!(merges, 1, "the first target carry remains visible");
+    }
 }
 
 #[test]
