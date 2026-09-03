@@ -171,29 +171,6 @@ where
     Ok(discovered)
 }
 
-/// Discover the source/target equations that may realize one exact source
-/// cover.
-///
-/// The cover already crossed admission or stored collection operations when it
-/// was constructed. Reusing it therefore needs equations, not another
-/// signature scan over provenance claims for the same payloads.
-pub(crate) fn discover_collection_records_for_derived_cover<S, L>(
-    snapshot: &S,
-    cover: &Cover<L>,
-    target: CollectionHandle,
-) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
-where
-    S: CollectionRead,
-    L: CollectionEncoding,
-{
-    let source = cover.collection().handle();
-    let mut selectors = BTreeSet::new();
-    selectors.insert(CollectionRecordSelector::MergeCollection(source));
-    selectors.insert(CollectionRecordSelector::MergeCollection(target));
-    selectors.insert(CollectionRecordSelector::DeriveTarget(target));
-    discover_collection_records_for_cover_selectors(snapshot, cover, &selectors)
-}
-
 /// Discover every stored equation whose collection belongs to one descriptor
 /// lineage.
 ///
@@ -676,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_cover_discovery_selects_only_the_fixed_source_target_equation_domain() {
+    fn lineage_discovery_selects_only_equations_in_the_descriptor_lineage() {
         let source = collection(1);
         let target = collection(2);
         let other = collection(3);
@@ -712,10 +689,8 @@ mod tests {
             ..ProbeStore::default()
         };
 
-        let cover =
-            Support::from_members(source, [Handle::<SimpleArchive>::from_hash(commit.data())]);
-        let discovered =
-            discover_collection_records_for_derived_cover(&store, &cover, target.handle()).unwrap();
+        let lineage = BTreeSet::from([source.handle(), target.handle()]);
+        let discovered = discover_collection_equations_for_lineage(&store, &lineage).unwrap();
 
         let mut expected_merges = vec![source_merge, target_merge];
         expected_merges.sort_unstable();

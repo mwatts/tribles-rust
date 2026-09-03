@@ -314,36 +314,6 @@ impl CollectionSemantics {
         self.frontier.get(&collection)
     }
 
-    /// Canonical source members currently known to map to one exact target
-    /// member.
-    ///
-    /// The reverse relation is intentionally allowed to contain more than one
-    /// member: a join homomorphism need not be injective. Asserted and
-    /// commuting-square-implied derives share the same index, so callers do
-    /// not need a second lineage mechanism for construction planning.
-    pub(crate) fn derive_preimages(
-        &self,
-        source: CollectionHandle,
-        target: CollectionHandle,
-        output: CollectionData,
-    ) -> Vec<CollectionData> {
-        let mut previous = None;
-        self.derive_inputs_by_output
-            .get(&(target, output))
-            .into_iter()
-            .flatten()
-            .filter(|(actual_source, _, _)| *actual_source == source)
-            .filter_map(|(_, input, _)| {
-                if previous == Some(*input) {
-                    None
-                } else {
-                    previous = Some(*input);
-                    Some(*input)
-                }
-            })
-            .collect()
-    }
-
     /// Exact authorized commit records supporting one
     /// member through every known active construction path.
     ///

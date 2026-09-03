@@ -28,8 +28,8 @@ pub mod descriptor;
 pub mod discovery;
 /// Canonical collection encodings and join-preserving mappings.
 pub mod encoding;
-/// Shared exact-cover lifecycle for canonical derived collections.
-pub mod exact_derived;
+/// Exact realization over invariant foundational support.
+mod exact_derived;
 /// Deterministic size-tiered maintenance behind exact derived collections.
 mod exact_target_compaction;
 /// Maintained stated last-write-wins registers over exact source covers.
