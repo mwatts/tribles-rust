@@ -26,6 +26,9 @@ merge or derivation equations preserve reusable physical work.
   Signatures, authors, and metadata remain queryable provenance, but are not
   coordinates of the value. Checked union, intersection, difference, and
   subset operations reject covers from another collection.
+  `collection.cover(members)` names such a coordinate without store access,
+  which lets a durable manifest preserve an exact cover; it does not by itself
+  admit, evidence, or make those members resident.
 - **`Support`** — exactly `Cover<SimpleArchive>`: the distinct admitted
   `COMMIT.data` handles at the foundational fact collection. It is the
   denotational coordinate shared by every representation. `MERGE` and
