@@ -315,7 +315,8 @@ let raw = storage.derive(source, SimpleToSuccinctMapping, raw_policy)?;
 let accelerated = storage.derive(raw, RawToRank9AcceleratedMapping, accelerated_policy)?;
 
 let before = storage.snapshot()?;
-let support = source.admitted(&before)?;
+let instant = triblespace::core::clock::epoch_now();
+let support = before.collection_at(source, instant)?.support().clone();
 drop(before);
 
 // Each edge receives the same foundational Support. Work never flows upward.
@@ -331,7 +332,9 @@ let facts: UnionArchive<OrderedUniverse> = observed.view()?;
 
 - `snapshot.collection` is read-only, performs no collection algebra, and binds
   the maximal resident target cover to the immutable snapshot which observed
-  it. `collection_exact` requires a complete realization for explicit support.
+  it. Taking support from the foundational collection observation excludes
+  admitted COMMITs whose payloads are not resident at that boundary.
+  `collection_exact` requires a complete realization for explicit support.
 - `ensure` freezes the currently admitted foundational support, while
   `ensure_exact` accepts explicit support. Both publish only missing `DERIVE`
   work and return a fresh store snapshot.
