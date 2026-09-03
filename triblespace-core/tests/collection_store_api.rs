@@ -163,6 +163,22 @@ fn typed_collection_open_accepts_the_registered_encoding() {
 }
 
 #[test]
+fn typed_collection_names_an_exact_coordinate_without_store_access() {
+    let root = key(21);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection("durable-exact-cover", policy(root.verifying_key()))
+        .unwrap();
+    let low = Inline::<Handle<SimpleArchive>>::new([0x31; 32]);
+    let high = Inline::<Handle<SimpleArchive>>::new([0x42; 32]);
+
+    let cover = collection.cover([high, low, high]);
+
+    assert_eq!(cover.collection(), collection);
+    assert_eq!(cover.members().collect::<Vec<_>>(), vec![low, high]);
+}
+
+#[test]
 fn typed_collection_reads_its_descriptor_local_policy() {
     let source_root = key(22);
     let target_root = key(23);

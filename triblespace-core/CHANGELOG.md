@@ -32,7 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store watermark with that support and its resident target cover. Remove the
   lifecycle facades and synthetic collection-record entity IDs; exact native
   records carry semantics and provenance, while full-width fingerprints remain
-  nonsemantic storage and transport keys.
+  nonsemantic storage and transport keys. `Collection::cover` names a typed
+  exact coordinate without store access so durable manifests can preserve a
+  cover; later admission and resolution still decide whether it is usable in a
+  particular immutable snapshot.
 
 - Make every collection member an ordinary typed `Blob<E>`.
   `CollectionEncoding` validates that blob and defines one canonical join;

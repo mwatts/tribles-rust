@@ -386,9 +386,10 @@ where
 ///
 /// Members are content identities, not signatures. Several commits may attest
 /// the same member with different authors or metadata without changing this
-/// value. The private constructor makes a `Cover` an opaque result of
-/// admission or stored collection operations rather than a caller-forged set
-/// of hashes.
+/// value. A caller may name an exact typed coordinate through
+/// [`Collection::cover`]; admission, resolution, and materialization still
+/// decide independently whether that coordinate is authorized, evidenced, and
+/// resident in a particular immutable store snapshot.
 pub struct Cover<L: CollectionEncoding> {
     collection: Collection<L>,
     members: PATCH<32, IdentitySchema, (), Blake3Merkle>,
@@ -1369,6 +1370,16 @@ pub fn collection_writer_is_admitted_by_policy_at(
 }
 
 impl<L: CollectionEncoding> Collection<L> {
+    /// Name one exact typed coordinate in this collection lattice.
+    ///
+    /// This performs no store access and makes no claim that the members are
+    /// admitted, related by stored equations, or physically resident. It is
+    /// the construction boundary for durable exact-cover manifests; pass the
+    /// result to snapshot resolution before reading it as a value.
+    pub fn cover(self, members: impl IntoIterator<Item = Inline<Handle<L>>>) -> Cover<L> {
+        Cover::from_members(self, members)
+    }
+
     /// Open an existing descriptor as a typed collection without mutating the
     /// backing store.
     ///
